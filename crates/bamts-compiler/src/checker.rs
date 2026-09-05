@@ -148,6 +148,9 @@ pub const ENUM_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BA
 pub const REST_PARAMETER_NOT_LAST: DiagnosticCode = DiagnosticCode::new("BAMTS-C097");
 pub const INTERFACE_NAME_IS_PRIMITIVE: DiagnosticCode = DiagnosticCode::new("BAMTS-C098");
 pub const SUPER_PROPERTY_NOT_METHOD: DiagnosticCode = DiagnosticCode::new("BAMTS-C099");
+pub const PARAMETER_INITIALIZER_IN_SIGNATURE: DiagnosticCode = DiagnosticCode::new("BAMTS-C100");
+pub(crate) const PARAMETER_INITIALIZER_IN_SIGNATURE_MESSAGE: &str =
+    "A parameter initializer is only allowed in a function or constructor implementation.";
 pub(crate) const SUPER_PROPERTY_NOT_METHOD_MESSAGE: &str =
     "Only public and protected methods of the base class are accessible via the 'super' keyword.";
 pub(crate) const REST_PARAMETER_NOT_LAST_MESSAGE: &str =
@@ -2181,14 +2184,14 @@ mod tests {
         EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS, IMPORTED_CONST_ENUM_CYCLE,
         IMPORTED_CONST_ENUM_NONCONSTANT, INTERFACE_NAME_IS_PRIMITIVE, INVALID_ASSIGNMENT_TARGET,
         MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER,
-        PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
-        PROPERTY_DOES_NOT_EXIST, ProgramCheckInput, ProgramCheckOptions, PropertyType,
-        REST_PARAMETER_NOT_LAST, ResolvedModuleEdge, SUPER_BEFORE_SUPER_PROPERTY,
-        SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
-        SUPER_FIELD_VIA_SUPER, SUPER_PROPERTY_NOT_METHOD, SUPER_REFERENCE_NON_DERIVED,
-        SUPER_STATIC_MEMBER_VIA_SUPER, ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR,
-        TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable,
-        VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
+        PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_INITIALIZER_IN_SIGNATURE,
+        PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, ProgramCheckInput,
+        ProgramCheckOptions, PropertyType, REST_PARAMETER_NOT_LAST, ResolvedModuleEdge,
+        SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
+        SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER, SUPER_PROPERTY_NOT_METHOD,
+        SUPER_REFERENCE_NON_DERIVED, SUPER_STATIC_MEMBER_VIA_SUPER, ScopeKind, SymbolKind,
+        TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId,
+        TypeTable, VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
         check_program_with_options,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
@@ -6025,6 +6028,48 @@ function check(options: Options = {}) {
     /// The superAccess es5 baseline swaps each TS2855 field row for the
     /// single pre-fields rule TS2340; the static row stays TS2576 at both
     /// targets.
+    #[test]
+    fn zz_enumbasics3_probe() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source =
+            std::fs::read_to_string(root.join(
+                "target/authority/typescript-7.0.2-tests/tests/cases/compiler/enumBasics3.ts",
+            ))
+            .unwrap();
+        eprintln!("ZZ eb3: {:?}", checker_codes(&check_text(&source)));
+    }
+
+    /// TS2371: only an implementation may carry parameter defaults. The
+    /// oracle (defaultValueInConstructorOverload1) is exactly one row on a
+    /// constructor overload signature.
+    #[test]
+    fn parameter_initializer_only_in_implementation() {
+        assert_eq!(
+            checker_codes(&check_text("function f(x = 1); function f(x?: number) {}")),
+            vec![PARAMETER_INITIALIZER_IN_SIGNATURE.as_str()]
+        );
+        assert_eq!(
+            checker_codes(&check_text(
+                "class C { constructor(x = ''); constructor(x = '') {} }"
+            )),
+            vec![PARAMETER_INITIALIZER_IN_SIGNATURE.as_str()]
+        );
+        assert_eq!(
+            checker_codes(&check_text("function g(x = 1) {}")),
+            Vec::<&str>::new()
+        );
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source = std::fs::read_to_string(root.join(concat!(
+            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
+            "defaultValueInConstructorOverload1.ts"
+        )))
+        .unwrap();
+        assert_eq!(
+            checker_codes(&check_text(&source)),
+            vec![PARAMETER_INITIALIZER_IN_SIGNATURE.as_str()]
+        );
+    }
+
     #[test]
     fn super_field_flavor_splits_by_target() {
         let source = "class MyBase {
