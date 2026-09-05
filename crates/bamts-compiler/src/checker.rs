@@ -146,6 +146,7 @@ pub const BLOCK_SCOPED_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode:
 pub const CLASS_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C095");
 pub const ENUM_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C096");
 pub const REST_PARAMETER_NOT_LAST: DiagnosticCode = DiagnosticCode::new("BAMTS-C097");
+pub const INTERFACE_NAME_IS_PRIMITIVE: DiagnosticCode = DiagnosticCode::new("BAMTS-C098");
 pub(crate) const REST_PARAMETER_NOT_LAST_MESSAGE: &str =
     "A rest parameter must be last in a parameter list.";
 pub const ASSIGNMENT_TO_FUNCTION: DiagnosticCode = DiagnosticCode::new("BAMTS-C029");
@@ -2175,16 +2176,16 @@ mod tests {
         CLASS_USED_BEFORE_DECLARATION, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED,
         DERIVED_CONSTRUCTOR_MISSING_SUPER, DUPLICATE_DECLARATION, ENUM_USED_BEFORE_DECLARATION,
         EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS, IMPORTED_CONST_ENUM_CYCLE,
-        IMPORTED_CONST_ENUM_NONCONSTANT, INVALID_ASSIGNMENT_TARGET, MISSING_METHOD_RETURN_TYPE,
-        MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER, PARAMETER_DECORATOR_NOT_SUPPORTED,
-        PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, ProgramCheckInput,
-        ProgramCheckOptions, PropertyType, REST_PARAMETER_NOT_LAST, ResolvedModuleEdge,
-        SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
-        SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER, SUPER_REFERENCE_NON_DERIVED,
-        SUPER_STATIC_MEMBER_VIA_SUPER, ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR,
-        TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable,
-        VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
-        check_program_with_options,
+        IMPORTED_CONST_ENUM_NONCONSTANT, INTERFACE_NAME_IS_PRIMITIVE, INVALID_ASSIGNMENT_TARGET,
+        MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER,
+        PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
+        PROPERTY_DOES_NOT_EXIST, ProgramCheckInput, ProgramCheckOptions, PropertyType,
+        REST_PARAMETER_NOT_LAST, ResolvedModuleEdge, SUPER_BEFORE_SUPER_PROPERTY,
+        SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+        SUPER_FIELD_VIA_SUPER, SUPER_REFERENCE_NON_DERIVED, SUPER_STATIC_MEMBER_VIA_SUPER,
+        ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE,
+        TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable, VALUE_CANNOT_BE_USED_HERE,
+        WITH_STATEMENT_NOT_ALLOWED, check, check_program, check_program_with_options,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
     use crate::namespace_plan::{ContainerAcquisition, ExportStorage};
@@ -6014,6 +6015,43 @@ function check(options: Options = {}) {
                 .count(),
             1,
             "{codes:?}"
+        );
+    }
+
+    /// TS2427: an interface may not take a primitive type's name. The
+    /// authority rows cover string, number, boolean, any, never, unknown,
+    /// symbol, and undefined. Reserved-word names (`void`, `null`) need a
+    /// parser-relaxation slice before the checker can see them; the
+    /// implementation bans the full primitive set for the names the parser
+    /// delivers as identifiers.
+    #[test]
+    fn interface_name_cannot_be_primitive() {
+        for name in [
+            "string",
+            "number",
+            "boolean",
+            "any",
+            "never",
+            "unknown",
+            "symbol",
+            "undefined",
+        ] {
+            let source = format!("interface {name} {{}}");
+            let codes = checker_codes(&check_text(&source));
+            assert_eq!(
+                codes,
+                vec![INTERFACE_NAME_IS_PRIMITIVE.as_str()],
+                "{name}: {codes:?}"
+            );
+        }
+        // Ordinary names, including intrinsic globals, stay legal.
+        assert_eq!(
+            checker_codes(&check_text("interface ArrayLike<T> { length: number }")),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            checker_codes(&check_text("interface PromiseLike<T> { then(): T }")),
+            Vec::<&str>::new()
         );
     }
 
