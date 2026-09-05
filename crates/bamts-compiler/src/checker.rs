@@ -149,6 +149,10 @@ pub const REST_PARAMETER_NOT_LAST: DiagnosticCode = DiagnosticCode::new("BAMTS-C
 pub const INTERFACE_NAME_IS_PRIMITIVE: DiagnosticCode = DiagnosticCode::new("BAMTS-C098");
 pub const SUPER_PROPERTY_NOT_METHOD: DiagnosticCode = DiagnosticCode::new("BAMTS-C099");
 pub const PARAMETER_INITIALIZER_IN_SIGNATURE: DiagnosticCode = DiagnosticCode::new("BAMTS-C100");
+pub const DUPLICATE_LABEL: DiagnosticCode = DiagnosticCode::new("BAMTS-C101");
+pub const BREAK_TARGET_NOT_ENCLOSING: DiagnosticCode = DiagnosticCode::new("BAMTS-C102");
+pub(crate) const BREAK_TARGET_NOT_ENCLOSING_MESSAGE: &str =
+    "A 'break' statement can only jump to a label of an enclosing statement.";
 pub(crate) const PARAMETER_INITIALIZER_IN_SIGNATURE_MESSAGE: &str =
     "A parameter initializer is only allowed in a function or constructor implementation.";
 pub(crate) const SUPER_PROPERTY_NOT_METHOD_MESSAGE: &str =
@@ -2178,9 +2182,10 @@ fn imported_enum_error(
 mod tests {
     use super::{
         ARGUMENT_NOT_ASSIGNABLE, BARE_SUPER_EXPRESSION, BLOCK_SCOPED_USED_BEFORE_DECLARATION,
-        CANNOT_FIND_NAME, CANNOT_FIND_NAME_LIB_GATED, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE,
-        CLASS_USED_BEFORE_DECLARATION, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED,
-        DERIVED_CONSTRUCTOR_MISSING_SUPER, DUPLICATE_DECLARATION, ENUM_USED_BEFORE_DECLARATION,
+        BREAK_TARGET_NOT_ENCLOSING, CANNOT_FIND_NAME, CANNOT_FIND_NAME_LIB_GATED,
+        CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE, CLASS_USED_BEFORE_DECLARATION,
+        CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DERIVED_CONSTRUCTOR_MISSING_SUPER,
+        DUPLICATE_DECLARATION, DUPLICATE_LABEL, ENUM_USED_BEFORE_DECLARATION,
         EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS, IMPORTED_CONST_ENUM_CYCLE,
         IMPORTED_CONST_ENUM_NONCONSTANT, INTERFACE_NAME_IS_PRIMITIVE, INVALID_ASSIGNMENT_TARGET,
         MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER,
@@ -6042,6 +6047,69 @@ function check(options: Options = {}) {
     /// TS2371: only an implementation may carry parameter defaults. The
     /// oracle (defaultValueInConstructorOverload1) is exactly one row on a
     /// constructor overload signature.
+    /// TS1114: a label redeclared in one function (sibling or nested).
+    /// TS1116: a labeled break may only target an enclosing label. The
+    /// oracles are duplicateLabel2 (one row) and breakTarget6 (one row).
+    #[test]
+    fn label_rules_matrix() {
+        assert_eq!(
+            checker_codes(&check_text(
+                "target: while (true) { target: while (true) {} }"
+            )),
+            vec![DUPLICATE_LABEL.as_str()]
+        );
+        // Sibling redeclaration in the same function is also a duplicate.
+        assert_eq!(
+            checker_codes(&check_text("a: {} a: {}")),
+            vec![DUPLICATE_LABEL.as_str()]
+        );
+        // A nested function owns its labels; reuse across the boundary is
+        // legal.
+        assert_eq!(
+            checker_codes(&check_text("a: {} function f() { a: {} }")),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            checker_codes(&check_text("while (true) { break target; }")),
+            vec![BREAK_TARGET_NOT_ENCLOSING.as_str()]
+        );
+        assert_eq!(
+            checker_codes(&check_text("target: while (true) { break target; }")),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            checker_codes(&check_text(
+                "target: while (true) { for (;;) { break target; } }"
+            )),
+            Vec::<&str>::new()
+        );
+        // Plain break needs no label context.
+        assert_eq!(
+            checker_codes(&check_text("for (;;) { break; }")),
+            Vec::<&str>::new()
+        );
+        // Authority oracles: one row each.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let duplicate = std::fs::read_to_string(root.join(concat!(
+            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
+            "duplicateLabel2.ts"
+        )))
+        .unwrap();
+        assert_eq!(
+            checker_codes(&check_text(&duplicate)),
+            vec![DUPLICATE_LABEL.as_str()]
+        );
+        let jump = std::fs::read_to_string(root.join(concat!(
+            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
+            "breakTarget6.ts"
+        )))
+        .unwrap();
+        assert_eq!(
+            checker_codes(&check_text(&jump)),
+            vec![BREAK_TARGET_NOT_ENCLOSING.as_str()]
+        );
+    }
+
     #[test]
     fn parameter_initializer_only_in_implementation() {
         assert_eq!(

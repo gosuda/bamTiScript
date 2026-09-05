@@ -28,11 +28,12 @@ use super::{
     ABSTRACT_CONSTRUCTOR, ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
     ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_CONST, ASSIGNMENT_TO_FUNCTION, ASSIGNMENT_TO_NAMESPACE,
     ASSIGNMENT_TO_READONLY, AWAIT_USING_DECLARATION_IN_FOR_IN, BARE_SUPER_EXPRESSION,
-    BLOCK_SCOPED_USED_BEFORE_DECLARATION, CANNOT_FIND_NAME, CANNOT_FIND_NAME_LIB_GATED,
-    CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE, CLASS_USED_BEFORE_DECLARATION,
-    CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, CONSTRUCTOR_TYPE_PARAMETERS,
-    DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL, DERIVED_CONSTRUCTOR_MISSING_SUPER,
-    DUPLICATE_DECLARATION, ENUM_USED_BEFORE_DECLARATION, EXCESS_PROPERTY, EXPRESSION_NOT_CALLABLE,
+    BLOCK_SCOPED_USED_BEFORE_DECLARATION, BREAK_TARGET_NOT_ENCLOSING, CANNOT_FIND_NAME,
+    CANNOT_FIND_NAME_LIB_GATED, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE,
+    CLASS_USED_BEFORE_DECLARATION, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED,
+    CONSTRUCTOR_TYPE_PARAMETERS, DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL,
+    DERIVED_CONSTRUCTOR_MISSING_SUPER, DUPLICATE_DECLARATION, DUPLICATE_LABEL,
+    ENUM_USED_BEFORE_DECLARATION, EXCESS_PROPERTY, EXPRESSION_NOT_CALLABLE,
     EXPRESSION_NOT_CONSTRUCTABLE, FOR_IN_LEFT_HAND_SIDE_INVALID, FOR_OF_ITERABLE_REQUIRED,
     FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT, FUNCTION_IMPLEMENTATION_WRONG_NAME,
     FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
@@ -56,32 +57,32 @@ use super::{
     ARGUMENT_COUNT_MISMATCH_MESSAGE, ARGUMENT_NOT_ASSIGNABLE_MESSAGE, ASSIGNMENT_TO_CONST_MESSAGE,
     ASSIGNMENT_TO_FUNCTION_MESSAGE, ASSIGNMENT_TO_NAMESPACE_MESSAGE,
     ASSIGNMENT_TO_READONLY_MESSAGE, AWAIT_USING_DECLARATION_IN_FOR_IN_MESSAGE,
-    BARE_SUPER_EXPRESSION_MESSAGE, CANNOT_FIND_NAME_LIB_GATED_MESSAGE, CANNOT_FIND_NAME_MESSAGE,
-    CANNOT_FIND_NAMESPACE_MESSAGE, CANNOT_FIND_TYPE_MESSAGE,
-    CONSTRUCTOR_DECORATOR_NOT_SUPPORTED_MESSAGE, CONSTRUCTOR_TYPE_PARAMETERS_MESSAGE,
-    DERIVED_CONSTRUCTOR_MISSING_SUPER_MESSAGE, DUPLICATE_MESSAGE, EXCESS_PROPERTY_MESSAGE,
-    EXPRESSION_NOT_CALLABLE_MESSAGE, EXPRESSION_NOT_CONSTRUCTABLE_MESSAGE,
-    FOR_IN_LEFT_HAND_SIDE_INVALID_MESSAGE, FOR_OF_ITERABLE_REQUIRED_MESSAGE,
-    FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT_MESSAGE, FUNCTION_IMPLEMENTATION_WRONG_NAME_MESSAGE,
-    FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE, GET_ACCESSOR_NO_RETURN_MESSAGE,
-    GET_ACCESSOR_PARAMETERS_MESSAGE, IMPORT_CONFLICTS_WITH_LOCAL_MESSAGE,
-    INVALID_ASSIGNMENT_TARGET_MESSAGE, INVALID_INDEXED_ACCESS_KEY_MESSAGE,
-    MEMBER_NOT_ACCESSIBLE_MESSAGE, MISSING_METHOD_RETURN_TYPE_MESSAGE,
-    MIXED_EXPORT_ASSIGNMENT_MESSAGE, NEW_TARGET_OUTSIDE_FUNCTION_MESSAGE,
-    NON_VOID_FUNCTION_MUST_RETURN_MESSAGE, NOT_ASSIGNABLE_MESSAGE,
-    PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE, PARAMETER_INITIALIZER_IN_SIGNATURE_MESSAGE,
-    PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE, PROPERTY_DOES_NOT_EXIST_MESSAGE,
-    PROPERTY_NOT_INITIALIZED_MESSAGE, REST_PARAMETER_NOT_LAST_MESSAGE,
-    SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE,
-    STRICT_NULL_MEMBER_ACCESS_MESSAGE, SUPER_BEFORE_SUPER_PROPERTY_MESSAGE,
-    SUPER_BEFORE_THIS_MESSAGE, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE,
-    SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE, SUPER_PROPERTY_NOT_METHOD_MESSAGE,
-    SUPER_REFERENCE_NON_DERIVED_MESSAGE, TYPE_ALIAS_CIRCULAR_MESSAGE,
-    TYPE_NESTING_TOO_DEEP_MESSAGE, TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE,
-    UNUSED_EXPECT_ERROR_MESSAGE, USED_BEFORE_ASSIGNED_MESSAGE,
-    USING_DECLARATION_BINDING_PATTERN_MESSAGE, USING_DECLARATION_IN_FOR_IN_MESSAGE,
-    USING_DECLARATION_MISSING_INITIALIZER_MESSAGE, VALUE_CANNOT_BE_USED_HERE_MESSAGE,
-    WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
+    BARE_SUPER_EXPRESSION_MESSAGE, BREAK_TARGET_NOT_ENCLOSING_MESSAGE,
+    CANNOT_FIND_NAME_LIB_GATED_MESSAGE, CANNOT_FIND_NAME_MESSAGE, CANNOT_FIND_NAMESPACE_MESSAGE,
+    CANNOT_FIND_TYPE_MESSAGE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED_MESSAGE,
+    CONSTRUCTOR_TYPE_PARAMETERS_MESSAGE, DERIVED_CONSTRUCTOR_MISSING_SUPER_MESSAGE,
+    DUPLICATE_MESSAGE, EXCESS_PROPERTY_MESSAGE, EXPRESSION_NOT_CALLABLE_MESSAGE,
+    EXPRESSION_NOT_CONSTRUCTABLE_MESSAGE, FOR_IN_LEFT_HAND_SIDE_INVALID_MESSAGE,
+    FOR_OF_ITERABLE_REQUIRED_MESSAGE, FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT_MESSAGE,
+    FUNCTION_IMPLEMENTATION_WRONG_NAME_MESSAGE, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE,
+    GET_ACCESSOR_NO_RETURN_MESSAGE, GET_ACCESSOR_PARAMETERS_MESSAGE,
+    IMPORT_CONFLICTS_WITH_LOCAL_MESSAGE, INVALID_ASSIGNMENT_TARGET_MESSAGE,
+    INVALID_INDEXED_ACCESS_KEY_MESSAGE, MEMBER_NOT_ACCESSIBLE_MESSAGE,
+    MISSING_METHOD_RETURN_TYPE_MESSAGE, MIXED_EXPORT_ASSIGNMENT_MESSAGE,
+    NEW_TARGET_OUTSIDE_FUNCTION_MESSAGE, NON_VOID_FUNCTION_MUST_RETURN_MESSAGE,
+    NOT_ASSIGNABLE_MESSAGE, PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE,
+    PARAMETER_INITIALIZER_IN_SIGNATURE_MESSAGE, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE,
+    PROPERTY_DOES_NOT_EXIST_MESSAGE, PROPERTY_NOT_INITIALIZED_MESSAGE,
+    REST_PARAMETER_NOT_LAST_MESSAGE, SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE,
+    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE, STRICT_NULL_MEMBER_ACCESS_MESSAGE,
+    SUPER_BEFORE_SUPER_PROPERTY_MESSAGE, SUPER_BEFORE_THIS_MESSAGE,
+    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE, SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE,
+    SUPER_PROPERTY_NOT_METHOD_MESSAGE, SUPER_REFERENCE_NON_DERIVED_MESSAGE,
+    TYPE_ALIAS_CIRCULAR_MESSAGE, TYPE_NESTING_TOO_DEEP_MESSAGE,
+    TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE, UNUSED_EXPECT_ERROR_MESSAGE,
+    USED_BEFORE_ASSIGNED_MESSAGE, USING_DECLARATION_BINDING_PATTERN_MESSAGE,
+    USING_DECLARATION_IN_FOR_IN_MESSAGE, USING_DECLARATION_MISSING_INITIALIZER_MESSAGE,
+    VALUE_CANNOT_BE_USED_HERE_MESSAGE, WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{self, EnumDeclarationBinding, EnumFacts};
@@ -5070,6 +5071,13 @@ pub(crate) struct Binder<'src> {
     /// body is a function declaration, function expression, or constructor.
     /// `false` when it is a method, getter, setter, or static block.
     new_target_contexts: Vec<bool>,
+    /// Label names declared in the current function, for TS1114. Nested
+    /// function-likes record a mark so their labels never leak outward.
+    label_declarations: Vec<String>,
+    label_scope_marks: Vec<usize>,
+    /// Labels of enclosing labeled statements, for TS1116. A `break L` is
+    /// only legal when `L` is on this stack.
+    label_ancestors: Vec<String>,
     /// Enclosing `declare` contexts. `true` when the current statement is
     /// directly under a `declare` keyword.
     ambient_stack: Vec<bool>,
@@ -5221,6 +5229,9 @@ impl<'src> Binder<'src> {
             constructor_writable_readonly_properties: Vec::new(),
             readonly_assignment_targets: HashSet::new(),
             new_target_contexts: Vec::new(),
+            label_declarations: Vec::new(),
+            label_scope_marks: Vec::new(),
+            label_ancestors: Vec::new(),
             flow_facts: FlowFacts::new(),
             flow: FlowNodeId::ROOT,
             ambient_stack: Vec::new(),
@@ -9106,7 +9117,42 @@ impl<'src> Binder<'src> {
                 };
                 self.resolve_statement(&with_statement.body, body_scope);
             }
-            Statement::Labeled(statement) => self.resolve_statement(&statement.body, scope),
+            Statement::Labeled(statement) => {
+                let label = self.identifier_text(&statement.label).into_owned();
+                // TS1114: sibling and nested redeclarations in one function
+                // are both duplicate labels.
+                let function_labels_start = self.label_scope_marks.last().copied().unwrap_or(0);
+                if self.label_declarations[function_labels_start..].contains(&label) {
+                    self.emit_with_message(
+                        DUPLICATE_LABEL,
+                        statement.label.range(),
+                        format!("Duplicate label '{label}'."),
+                    );
+                } else {
+                    self.label_declarations.push(label.clone());
+                }
+                self.label_ancestors.push(label);
+                self.resolve_statement(&statement.body, scope);
+                self.label_ancestors.pop();
+            }
+            Statement::Break(jump) => {
+                // TS1116: a labeled break may only target an enclosing
+                // label. (TS1107, crossing a function boundary, needs the
+                // declaring function's labels and is banked.)
+                if let Some(label) = &jump.label
+                    && !self
+                        .label_ancestors
+                        .iter()
+                        .any(|ancestor| ancestor == self.identifier_text(label).as_ref())
+                {
+                    self.emit(
+                        BREAK_TARGET_NOT_ENCLOSING,
+                        label.range(),
+                        BREAK_TARGET_NOT_ENCLOSING_MESSAGE,
+                    );
+                }
+            }
+            Statement::Continue(_) => {}
             Statement::ImportEquals(_) => {}
             Statement::Return(return_statement) => {
                 let context = self.return_contexts.last().copied();
@@ -9687,6 +9733,7 @@ impl<'src> Binder<'src> {
         self.super_flow = SuperFlow::Suspended;
         let outer_guarantees = self.super_call_guarantees;
         self.super_call_guarantees = true;
+        self.label_scope_marks.push(self.label_declarations.len());
         self.bind_implicit_function_values(&function.parameters, scope);
         let function_symbol = function.name.as_ref().map(|name| {
             let symbol_scope = if is_declaration { parent } else { scope };
@@ -9822,6 +9869,9 @@ impl<'src> Binder<'src> {
         let popped_home = self.super_member_homes.pop();
         self.super_flow = outer_super_flow;
         self.super_call_guarantees = outer_guarantees;
+        if let Some(mark) = self.label_scope_marks.pop() {
+            self.label_declarations.truncate(mark);
+        }
         debug_assert_eq!(popped_home, Some(member_home));
     }
 
