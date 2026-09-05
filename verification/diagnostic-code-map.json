@@ -558,6 +558,72 @@
       "evidence": "Derived class reads a base class field through `super` -> TS2855 in the TypeScript 7.0.2 authority baselines: checkSuperCallBeforeThisAccess (lines 9, 12, 17, 22, 45).",
       "status": "mapped",
       "tsCode": 2855
+    },
+    {
+      "bamtsCode": "BAMTS-C093",
+      "evidence": "Derived class reads a base static member through `super` -> TS2576 in the TypeScript 7.0.2 authority baselines: superAccess (line 9, both target variants).",
+      "status": "mapped",
+      "tsCode": 2576
+    },
+    {
+      "bamtsCode": "BAMTS-C094",
+      "evidence": "Block-scoped variable referenced textually before its declaration -> TS2448 in the TypeScript 7.0.2 authority baselines: blockScopedEnumVariablesUseBeforeDef_preserve, useBeforeDeclaration variants.",
+      "status": "mapped",
+      "tsCode": 2448
+    },
+    {
+      "bamtsCode": "BAMTS-C095",
+      "evidence": "Class referenced textually before its declaration -> TS2449 in the TypeScript 7.0.2 authority baselines: useBeforeDeclaration_classDecorators.1 (lines 7, 10, 29, 30).",
+      "status": "mapped",
+      "tsCode": 2449
+    },
+    {
+      "bamtsCode": "BAMTS-C096",
+      "evidence": "Enum referenced textually before its declaration -> TS2450 in the TypeScript 7.0.2 authority baselines: blockScopedEnumVariablesUseBeforeDef (line 2, both target variants).",
+      "status": "mapped",
+      "tsCode": 2450
+    },
+    {
+      "bamtsCode": "BAMTS-C097",
+      "evidence": "Rest parameter followed by another parameter -> TS1014 in the TypeScript 7.0.2 authority baselines: restParameterNotLast (line 1).",
+      "status": "mapped",
+      "tsCode": 1014
+    },
+    {
+      "bamtsCode": "BAMTS-C098",
+      "evidence": "Interface named after a primitive type -> TS2427 in the TypeScript 7.0.2 authority baselines: InterfaceDeclaration8 (line 1).",
+      "status": "mapped",
+      "tsCode": 2427
+    },
+    {
+      "bamtsCode": "BAMTS-C099",
+      "evidence": "Base field read through `super` under an ES5 target -> TS2340 in the TypeScript 7.0.2 authority baselines: superAccess(target=es5) (lines 10, 11).",
+      "status": "mapped",
+      "tsCode": 2340
+    },
+    {
+      "bamtsCode": "BAMTS-C100",
+      "evidence": "Parameter initializer on an overload signature -> TS2371 in the TypeScript 7.0.2 authority baselines: defaultValueInConstructorOverload1 (line 2).",
+      "status": "mapped",
+      "tsCode": 2371
+    },
+    {
+      "bamtsCode": "BAMTS-C101",
+      "evidence": "Label redeclared within one function -> TS1114 in the TypeScript 7.0.2 authority baselines: duplicateLabel2 (line 3).",
+      "status": "mapped",
+      "tsCode": 1114
+    },
+    {
+      "bamtsCode": "BAMTS-C102",
+      "evidence": "Labeled break with no enclosing declaration of the label -> TS1116 in the TypeScript 7.0.2 authority baselines: breakTarget6 (line 2).",
+      "status": "mapped",
+      "tsCode": 1116
+    },
+    {
+      "bamtsCode": "BAMTS-C103",
+      "evidence": "Labeled break whose target crosses a function boundary -> TS1107 in the TypeScript 7.0.2 authority baselines: breakTarget5 (line 5).",
+      "status": "mapped",
+      "tsCode": 1107
     }
   ]
 }

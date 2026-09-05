@@ -51,7 +51,7 @@ pub const DIAGNOSTIC_CODE_MAP_PATH: &str = "verification/diagnostic-code-map.jso
 pub const DIAGNOSTIC_CODE_MAP_SCHEMA_VERSION: u32 = 1;
 
 /// Every current BAMTS diagnostic code the map must cover exactly once.
-pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 93] = [
+pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 104] = [
     "BAMTS-L001",
     "BAMTS-L002",
     "BAMTS-L003",
@@ -145,6 +145,17 @@ pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 93] = [
     "BAMTS-C090",
     "BAMTS-C091",
     "BAMTS-C092",
+    "BAMTS-C093",
+    "BAMTS-C094",
+    "BAMTS-C095",
+    "BAMTS-C096",
+    "BAMTS-C097",
+    "BAMTS-C098",
+    "BAMTS-C099",
+    "BAMTS-C100",
+    "BAMTS-C101",
+    "BAMTS-C102",
+    "BAMTS-C103",
 ];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FacetVerdict {
