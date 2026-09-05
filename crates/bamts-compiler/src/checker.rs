@@ -147,6 +147,9 @@ pub const CLASS_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode::new("B
 pub const ENUM_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C096");
 pub const REST_PARAMETER_NOT_LAST: DiagnosticCode = DiagnosticCode::new("BAMTS-C097");
 pub const INTERFACE_NAME_IS_PRIMITIVE: DiagnosticCode = DiagnosticCode::new("BAMTS-C098");
+pub const SUPER_PROPERTY_NOT_METHOD: DiagnosticCode = DiagnosticCode::new("BAMTS-C099");
+pub(crate) const SUPER_PROPERTY_NOT_METHOD_MESSAGE: &str =
+    "Only public and protected methods of the base class are accessible via the 'super' keyword.";
 pub(crate) const REST_PARAMETER_NOT_LAST_MESSAGE: &str =
     "A rest parameter must be last in a parameter list.";
 pub const ASSIGNMENT_TO_FUNCTION: DiagnosticCode = DiagnosticCode::new("BAMTS-C029");
@@ -2182,10 +2185,11 @@ mod tests {
         PROPERTY_DOES_NOT_EXIST, ProgramCheckInput, ProgramCheckOptions, PropertyType,
         REST_PARAMETER_NOT_LAST, ResolvedModuleEdge, SUPER_BEFORE_SUPER_PROPERTY,
         SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
-        SUPER_FIELD_VIA_SUPER, SUPER_REFERENCE_NON_DERIVED, SUPER_STATIC_MEMBER_VIA_SUPER,
-        ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE,
-        TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable, VALUE_CANNOT_BE_USED_HERE,
-        WITH_STATEMENT_NOT_ALLOWED, check, check_program, check_program_with_options,
+        SUPER_FIELD_VIA_SUPER, SUPER_PROPERTY_NOT_METHOD, SUPER_REFERENCE_NON_DERIVED,
+        SUPER_STATIC_MEMBER_VIA_SUPER, ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR,
+        TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable,
+        VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
+        check_program_with_options,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
     use crate::namespace_plan::{ContainerAcquisition, ExportStorage};
@@ -6015,6 +6019,98 @@ function check(options: Options = {}) {
                 .count(),
             1,
             "{codes:?}"
+        );
+    }
+
+    /// The superAccess es5 baseline swaps each TS2855 field row for the
+    /// single pre-fields rule TS2340; the static row stays TS2576 at both
+    /// targets.
+    #[test]
+    fn super_field_flavor_splits_by_target() {
+        let source = "class MyBase {
+                 static S1: number = 5;
+                 private S2: string = \"test\";
+                 f = () => 5;
+             }
+             class MyDerived extends MyBase {
+                 foo() {
+                     var l3 = super.S1;
+                     var l4 = super.S2;
+                     var l5 = super.f();
+                 }
+             }";
+        let es5 = checker_codes(&check_text_with(
+            source,
+            ProgramCheckOptions::standard().with_target(Some("es5")),
+        ));
+        assert_eq!(
+            es5.iter()
+                .filter(|c| **c == SUPER_PROPERTY_NOT_METHOD.as_str())
+                .count(),
+            2,
+            "{es5:?}"
+        );
+        assert_eq!(
+            es5.iter()
+                .filter(|c| **c == SUPER_FIELD_VIA_SUPER.as_str())
+                .count(),
+            0,
+            "{es5:?}"
+        );
+        assert_eq!(
+            es5.iter()
+                .filter(|c| **c == SUPER_STATIC_MEMBER_VIA_SUPER.as_str())
+                .count(),
+            1,
+            "{es5:?}"
+        );
+        let es2015 = checker_codes(&check_text_with(
+            source,
+            ProgramCheckOptions::standard().with_target(Some("es2015")),
+        ));
+        assert_eq!(
+            es2015
+                .iter()
+                .filter(|c| **c == SUPER_FIELD_VIA_SUPER.as_str())
+                .count(),
+            2,
+            "{es2015:?}"
+        );
+        assert_eq!(
+            es2015
+                .iter()
+                .filter(|c| **c == SUPER_PROPERTY_NOT_METHOD.as_str())
+                .count(),
+            0,
+            "{es2015:?}"
+        );
+        // The authority file itself: es5 swaps both field rows for TS2340
+        // and keeps the static row at TS2576.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source =
+            std::fs::read_to_string(root.join(
+                "target/authority/typescript-7.0.2-tests/tests/cases/compiler/superAccess.ts",
+            ))
+            .unwrap();
+        let oracle_es5 = checker_codes(&check_text_with(
+            &source,
+            ProgramCheckOptions::standard().with_target(Some("es5")),
+        ));
+        assert_eq!(
+            oracle_es5
+                .iter()
+                .filter(|c| **c == SUPER_PROPERTY_NOT_METHOD.as_str())
+                .count(),
+            2,
+            "{oracle_es5:?}"
+        );
+        assert_eq!(
+            oracle_es5
+                .iter()
+                .filter(|c| **c == SUPER_STATIC_MEMBER_VIA_SUPER.as_str())
+                .count(),
+            1,
+            "{oracle_es5:?}"
         );
     }
 
