@@ -151,6 +151,9 @@ pub const SUPER_PROPERTY_NOT_METHOD: DiagnosticCode = DiagnosticCode::new("BAMTS
 pub const PARAMETER_INITIALIZER_IN_SIGNATURE: DiagnosticCode = DiagnosticCode::new("BAMTS-C100");
 pub const DUPLICATE_LABEL: DiagnosticCode = DiagnosticCode::new("BAMTS-C101");
 pub const BREAK_TARGET_NOT_ENCLOSING: DiagnosticCode = DiagnosticCode::new("BAMTS-C102");
+pub const BREAK_TARGET_CROSSES_FUNCTION: DiagnosticCode = DiagnosticCode::new("BAMTS-C103");
+pub(crate) const BREAK_TARGET_CROSSES_FUNCTION_MESSAGE: &str =
+    "Jump target cannot cross function boundary.";
 pub(crate) const BREAK_TARGET_NOT_ENCLOSING_MESSAGE: &str =
     "A 'break' statement can only jump to a label of an enclosing statement.";
 pub(crate) const PARAMETER_INITIALIZER_IN_SIGNATURE_MESSAGE: &str =
@@ -2182,21 +2185,22 @@ fn imported_enum_error(
 mod tests {
     use super::{
         ARGUMENT_NOT_ASSIGNABLE, BARE_SUPER_EXPRESSION, BLOCK_SCOPED_USED_BEFORE_DECLARATION,
-        BREAK_TARGET_NOT_ENCLOSING, CANNOT_FIND_NAME, CANNOT_FIND_NAME_LIB_GATED,
-        CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE, CLASS_USED_BEFORE_DECLARATION,
-        CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DERIVED_CONSTRUCTOR_MISSING_SUPER,
-        DUPLICATE_DECLARATION, DUPLICATE_LABEL, ENUM_USED_BEFORE_DECLARATION,
-        EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS, IMPORTED_CONST_ENUM_CYCLE,
-        IMPORTED_CONST_ENUM_NONCONSTANT, INTERFACE_NAME_IS_PRIMITIVE, INVALID_ASSIGNMENT_TARGET,
-        MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER,
-        PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_INITIALIZER_IN_SIGNATURE,
-        PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, ProgramCheckInput,
-        ProgramCheckOptions, PropertyType, REST_PARAMETER_NOT_LAST, ResolvedModuleEdge,
-        SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
-        SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER, SUPER_PROPERTY_NOT_METHOD,
-        SUPER_REFERENCE_NON_DERIVED, SUPER_STATIC_MEMBER_VIA_SUPER, ScopeKind, SymbolKind,
-        TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId,
-        TypeTable, VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
+        BREAK_TARGET_CROSSES_FUNCTION, BREAK_TARGET_NOT_ENCLOSING, CANNOT_FIND_NAME,
+        CANNOT_FIND_NAME_LIB_GATED, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE,
+        CLASS_USED_BEFORE_DECLARATION, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED,
+        DERIVED_CONSTRUCTOR_MISSING_SUPER, DUPLICATE_DECLARATION, DUPLICATE_LABEL,
+        ENUM_USED_BEFORE_DECLARATION, EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS,
+        IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, INTERFACE_NAME_IS_PRIMITIVE,
+        INVALID_ASSIGNMENT_TARGET, MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT,
+        NAMESPACE_NO_EXPORTED_MEMBER, PARAMETER_DECORATOR_NOT_SUPPORTED,
+        PARAMETER_INITIALIZER_IN_SIGNATURE, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
+        PROPERTY_DOES_NOT_EXIST, ProgramCheckInput, ProgramCheckOptions, PropertyType,
+        REST_PARAMETER_NOT_LAST, ResolvedModuleEdge, SUPER_BEFORE_SUPER_PROPERTY,
+        SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+        SUPER_FIELD_VIA_SUPER, SUPER_PROPERTY_NOT_METHOD, SUPER_REFERENCE_NON_DERIVED,
+        SUPER_STATIC_MEMBER_VIA_SUPER, ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR,
+        TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable,
+        VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
         check_program_with_options,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
@@ -6107,6 +6111,22 @@ function check(options: Options = {}) {
         assert_eq!(
             checker_codes(&check_text(&jump)),
             vec![BREAK_TARGET_NOT_ENCLOSING.as_str()]
+        );
+        // TS1107: the label exists, but in an enclosing function.
+        let crosses = std::fs::read_to_string(root.join(concat!(
+            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
+            "breakTarget5.ts"
+        )))
+        .unwrap();
+        assert_eq!(
+            checker_codes(&check_text(&crosses)),
+            vec![BREAK_TARGET_CROSSES_FUNCTION.as_str()]
+        );
+        assert_eq!(
+            checker_codes(&check_text(
+                "target: while (true) { function f() { for (;;) { break target; } } }"
+            )),
+            vec![BREAK_TARGET_CROSSES_FUNCTION.as_str()]
         );
     }
 
