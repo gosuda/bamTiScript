@@ -6505,6 +6505,91 @@ function check(options: Options = {}) {
         );
     }
 
+    /// The same authority file at target=es5: both `super.x` rows sit in
+    /// static methods reading the base's static field, so the downlevel
+    /// pre-fields rule reports exactly two C099 rows and the TS2576
+    /// misspelling stays silent. On es2015 the access is legal, so neither
+    /// the field rule nor the static rule may report.
+    #[test]
+    fn super_static_field_access_splits_by_target_on_authority_file() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source = std::fs::read_to_string(root.join(concat!(
+            "target/authority/typescript-7.0.2-tests/tests/cases/conformance/",
+            "classes/members/accessibility/",
+            "protectedStaticClassPropertyAccessibleWithinSubclass2.ts"
+        )))
+        .unwrap();
+        let es5 = checker_codes(&check_text_with(
+            &source,
+            ProgramCheckOptions::standard().with_target(Some("es5")),
+        ));
+        assert_eq!(
+            es5.iter()
+                .filter(|c| **c == SUPER_PROPERTY_NOT_METHOD.as_str())
+                .count(),
+            2,
+            "{es5:?}"
+        );
+        for code in [
+            SUPER_FIELD_VIA_SUPER.as_str(),
+            SUPER_STATIC_MEMBER_VIA_SUPER.as_str(),
+        ] {
+            assert_eq!(
+                es5.iter().filter(|c| **c == code).count(),
+                0,
+                "{code} es5: {es5:?}"
+            );
+        }
+        let es2015 = checker_codes(&check_text_with(
+            &source,
+            ProgramCheckOptions::standard().with_target(Some("es2015")),
+        ));
+        for code in [
+            SUPER_PROPERTY_NOT_METHOD.as_str(),
+            SUPER_FIELD_VIA_SUPER.as_str(),
+            SUPER_STATIC_MEMBER_VIA_SUPER.as_str(),
+        ] {
+            assert_eq!(
+                es2015.iter().filter(|c| **c == code).count(),
+                0,
+                "{code} es2015: {es2015:?}"
+            );
+        }
+    }
+
+    /// A base static method reached through a static member's `super` is a
+    /// method on the reached table, so no field rule fires — the boundary
+    /// superInStaticMembers1.ts exercises cleanly at every target,
+    /// including es5.
+    #[test]
+    fn super_static_method_in_static_home_is_not_a_field_violation() {
+        let source = "\
+class A {
+    static w() { return 1; }
+}
+class B extends A {
+    static _ = super.w();
+    static { super.w(); }
+}";
+        for target in ["es5", "es2015"] {
+            let codes = checker_codes(&check_text_with(
+                source,
+                ProgramCheckOptions::standard().with_target(Some(target)),
+            ));
+            for code in [
+                SUPER_PROPERTY_NOT_METHOD.as_str(),
+                SUPER_FIELD_VIA_SUPER.as_str(),
+                SUPER_STATIC_MEMBER_VIA_SUPER.as_str(),
+            ] {
+                assert_eq!(
+                    codes.iter().filter(|c| **c == code).count(),
+                    0,
+                    "{code} {target}: {codes:?}"
+                );
+            }
+        }
+    }
+
     /// The authority baseline checkSuperCallBeforeThisAccess.errors.txt
     /// carries exactly five TS2855 rows (lines 9, 12, 17, 22, 45 of the
     /// directive-stripped source); the count is the pinned oracle.

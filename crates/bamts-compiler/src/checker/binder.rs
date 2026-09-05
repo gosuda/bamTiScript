@@ -12633,20 +12633,24 @@ impl<'src> Binder<'src> {
         self.check_super_property_is_static(property);
     }
 
-    /// TS2855: `super.x` reads the prototype chain, but a class field is an
-    /// own instance property, so the field is never visible through `super`
-    /// even after `super()` has run. Methods and accessors live on the
-    /// prototype and stay reachable.
+    /// `super.x` against class fields. From an instance member `super`
+    /// reads the prototype chain, but a class field is an own instance
+    /// property, so the field is never visible through `super` even after
+    /// `super()` has run; methods and accessors live on the prototype and
+    /// stay reachable. From a static member `super` reads the flattened
+    /// static side, where a static field is a regular member and legal on
+    /// ES2015+.
     fn check_super_property_is_field(&mut self, property: &MemberProperty) {
         let MemberProperty::Named(identifier) = property else {
             return;
         };
-        if !matches!(
-            self.super_member_homes.last(),
-            Some(SuperMemberHome::ClassMember { derived: true, .. })
-        ) {
+        let Some(SuperMemberHome::ClassMember {
+            derived: true,
+            is_static,
+        }) = self.super_member_homes.last().copied()
+        else {
             return;
-        }
+        };
         let Some(&owner) = self.class_owner_stack.last() else {
             return;
         };
@@ -12654,23 +12658,30 @@ impl<'src> Binder<'src> {
             return;
         };
         let name = self.identifier_text(identifier);
-        let is_field = self
-            .types
-            .class_template_properties(base)
-            .iter()
-            .find(|member| member.name() == name.as_ref())
-            .is_some_and(|member| !member.is_method() && !member.accessor());
+        // Each home resolves `super` to its own member table, so the field
+        // question is asked of the table the access actually reaches.
+        let is_field = if is_static {
+            self.static_side_member(base, name.as_ref())
+        } else {
+            self.types
+                .class_template_properties(base)
+                .iter()
+                .find(|member| member.name() == name.as_ref())
+        }
+        .is_some_and(|member| !member.is_method() && !member.accessor());
         if is_field {
             // Downlevel targets keep the single pre-fields rule: fields are
-            // not methods on the prototype, so the whole access is illegal
-            // through super. ES2015+ names the field explicitly.
+            // not methods on the reached object, so the whole access is
+            // illegal through super. ES2015+ names the instance-field rule
+            // explicitly; a static field reached from a static member is
+            // simply legal.
             if self.es5 {
                 self.emit(
                     SUPER_PROPERTY_NOT_METHOD,
                     identifier.range(),
                     SUPER_PROPERTY_NOT_METHOD_MESSAGE,
                 );
-            } else {
+            } else if !is_static {
                 self.emit_with_message(
                     SUPER_FIELD_VIA_SUPER,
                     identifier.range(),
@@ -12705,23 +12716,8 @@ impl<'src> Binder<'src> {
         let Some(&base) = self.class_base_symbols.get(&owner) else {
             return;
         };
-        let Some(&static_type) = self.class_constructor_types.get(&base) else {
-            return;
-        };
         let name = self.identifier_text(identifier);
-        // The static side is a constructor type wrapping the structural
-        // member table.
-        let Type::ConstructorType { structural, .. } = self.types.get(static_type).clone() else {
-            return;
-        };
-        let Type::ObjectType(object) = self.types.get(structural).clone() else {
-            return;
-        };
-        if !object
-            .properties
-            .iter()
-            .any(|member| member.name() == name.as_ref())
-        {
+        if self.static_side_member(base, name.as_ref()).is_none() {
             return;
         }
         let base_name = self.symbols[base.get() as usize].name().to_owned();
@@ -12732,6 +12728,26 @@ impl<'src> Binder<'src> {
                 "Property '{name}' does not exist on type '{base_name}'. Did you mean to access the static member '{base_name}.{name}' instead?"
             ),
         );
+    }
+
+    /// The static side of a base class: the structural member table
+    /// wrapped by the base's constructor type, flattened across the base
+    /// chain, so `Base.x` and a derived static member's `super.x` resolve
+    /// the same table.
+    fn static_side_member(&self, base: SymbolId, name: &str) -> Option<&PropertyType> {
+        let static_type = self.class_constructor_types.get(&base).copied()?;
+        // The static side is a constructor type wrapping the structural
+        // member table.
+        let Type::ConstructorType { structural, .. } = self.types.get(static_type) else {
+            return None;
+        };
+        let Type::ObjectType(object) = self.types.get(*structural) else {
+            return None;
+        };
+        object
+            .properties
+            .iter()
+            .find(|member| member.name() == name)
     }
 
     fn check_super_call_legality(&mut self, range: TextRange) {
