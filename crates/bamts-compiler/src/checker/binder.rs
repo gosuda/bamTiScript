@@ -4843,8 +4843,8 @@ enum SuperCallContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SuperMemberHome {
     /// Inside a member of a class. `derived` records whether that class has
-    /// a base class.
-    ClassMember { derived: bool },
+    /// a base class. `is_static` records whether the member itself is static.
+    ClassMember { derived: bool, is_static: bool },
     /// Inside an object-literal method or accessor.
     ObjectMember,
     /// Inside any other function, which has no member home.
@@ -11880,7 +11880,8 @@ impl<'src> Binder<'src> {
                         AMBIENT_IMPLEMENTATION_MESSAGE,
                     );
                 }
-                let this_type = self.class_this_type(scope, method.modifiers.is_static);
+                let is_static = method.modifiers.is_static;
+                let this_type = self.class_this_type(scope, is_static);
                 let derived = self.class_derived_stack.last().copied().unwrap_or(false);
                 self.resolve_function(
                     &method.function,
@@ -11888,7 +11889,7 @@ impl<'src> Binder<'src> {
                     false,
                     true,
                     this_type,
-                    SuperMemberHome::ClassMember { derived },
+                    SuperMemberHome::ClassMember { derived, is_static },
                 );
             }
             ClassMember::Constructor(constructor) => {
@@ -11940,8 +11941,10 @@ impl<'src> Binder<'src> {
                 if track_super {
                     self.derived_constructor_super_presence.push(false);
                 }
-                self.super_member_homes
-                    .push(SuperMemberHome::ClassMember { derived });
+                self.super_member_homes.push(SuperMemberHome::ClassMember {
+                    derived,
+                    is_static: false,
+                });
                 self.super_call_contexts.push(if derived {
                     SuperCallContext::DerivedConstructor
                 } else {
@@ -11979,13 +11982,21 @@ impl<'src> Binder<'src> {
                 self.new_target_contexts.truncate(new_target_marker);
                 self.super_call_contexts.pop();
                 let popped_home = self.super_member_homes.pop();
-                debug_assert_eq!(popped_home, Some(SuperMemberHome::ClassMember { derived }));
+                debug_assert_eq!(
+                    popped_home,
+                    Some(SuperMemberHome::ClassMember {
+                        derived,
+                        is_static: false
+                    })
+                );
             }
             ClassMember::Property(property) => {
                 self.resolve_property_name(&property.name, scope);
                 let derived = self.class_derived_stack.last().copied().unwrap_or(false);
-                self.super_member_homes
-                    .push(SuperMemberHome::ClassMember { derived });
+                self.super_member_homes.push(SuperMemberHome::ClassMember {
+                    derived,
+                    is_static: property.modifiers.is_static,
+                });
                 let type_id = self.class_property_type(
                     property.type_annotation.as_ref(),
                     property.initializer.as_deref(),
@@ -11994,7 +12005,13 @@ impl<'src> Binder<'src> {
                     true,
                 );
                 let popped_home = self.super_member_homes.pop();
-                debug_assert_eq!(popped_home, Some(SuperMemberHome::ClassMember { derived }));
+                debug_assert_eq!(
+                    popped_home,
+                    Some(SuperMemberHome::ClassMember {
+                        derived,
+                        is_static: property.modifiers.is_static
+                    })
+                );
                 if let Some(name) = self.property_key(&property.name)
                     && let Some(&symbol) = self.scopes[scope.0 as usize].values.get(&name)
                 {
@@ -12004,8 +12021,10 @@ impl<'src> Binder<'src> {
             ClassMember::AutoAccessor(accessor) => {
                 self.resolve_property_name(&accessor.name, scope);
                 let derived = self.class_derived_stack.last().copied().unwrap_or(false);
-                self.super_member_homes
-                    .push(SuperMemberHome::ClassMember { derived });
+                self.super_member_homes.push(SuperMemberHome::ClassMember {
+                    derived,
+                    is_static: accessor.modifiers.is_static,
+                });
                 let type_id = self.class_property_type(
                     accessor.type_annotation.as_ref(),
                     accessor.initializer.as_deref(),
@@ -12014,7 +12033,13 @@ impl<'src> Binder<'src> {
                     true,
                 );
                 let popped_home = self.super_member_homes.pop();
-                debug_assert_eq!(popped_home, Some(SuperMemberHome::ClassMember { derived }));
+                debug_assert_eq!(
+                    popped_home,
+                    Some(SuperMemberHome::ClassMember {
+                        derived,
+                        is_static: accessor.modifiers.is_static
+                    })
+                );
                 if let Some(name) = self.property_key(&accessor.name)
                     && let Some(&symbol) = self.scopes[scope.0 as usize].values.get(&name)
                 {
@@ -12026,12 +12051,20 @@ impl<'src> Binder<'src> {
                 let new_target_marker = self.new_target_contexts.len();
                 self.new_target_contexts.push(false);
                 let derived = self.class_derived_stack.last().copied().unwrap_or(false);
-                self.super_member_homes
-                    .push(SuperMemberHome::ClassMember { derived });
+                self.super_member_homes.push(SuperMemberHome::ClassMember {
+                    derived,
+                    is_static: true,
+                });
                 self.bind_statements(&block.data().statements, child);
                 self.resolve_statements(&block.data().statements, child);
                 let popped_home = self.super_member_homes.pop();
-                debug_assert_eq!(popped_home, Some(SuperMemberHome::ClassMember { derived }));
+                debug_assert_eq!(
+                    popped_home,
+                    Some(SuperMemberHome::ClassMember {
+                        derived,
+                        is_static: true
+                    })
+                );
                 self.new_target_contexts.truncate(new_target_marker);
             }
             _ => {}
@@ -12578,8 +12611,10 @@ impl<'src> Binder<'src> {
             self.emit(BARE_SUPER_EXPRESSION, range, BARE_SUPER_EXPRESSION_MESSAGE);
             return;
         }
-        if self.super_member_homes.last() == Some(&SuperMemberHome::ClassMember { derived: false })
-        {
+        if matches!(
+            self.super_member_homes.last(),
+            Some(SuperMemberHome::ClassMember { derived: false, .. })
+        ) {
             self.emit(
                 SUPER_REFERENCE_NON_DERIVED,
                 range,
@@ -12606,7 +12641,10 @@ impl<'src> Binder<'src> {
         let MemberProperty::Named(identifier) = property else {
             return;
         };
-        if self.super_member_homes.last() != Some(&SuperMemberHome::ClassMember { derived: true }) {
+        if !matches!(
+            self.super_member_homes.last(),
+            Some(SuperMemberHome::ClassMember { derived: true, .. })
+        ) {
             return;
         }
         let Some(&owner) = self.class_owner_stack.last() else {
@@ -12644,13 +12682,21 @@ impl<'src> Binder<'src> {
         }
     }
 
-    /// TS2576: `super` resolves instance members, so a base class static
-    /// reached through it is a misspelling of `Base.member`.
+    /// TS2576: from an instance member, `super` resolves the base
+    /// prototype, so a base class static reached through it is a
+    /// misspelling of `Base.member`. Static members resolve the base
+    /// constructor and may reach base statics legally.
     fn check_super_property_is_static(&mut self, property: &MemberProperty) {
         let MemberProperty::Named(identifier) = property else {
             return;
         };
-        if self.super_member_homes.last() != Some(&SuperMemberHome::ClassMember { derived: true }) {
+        if !matches!(
+            self.super_member_homes.last(),
+            Some(SuperMemberHome::ClassMember {
+                derived: true,
+                is_static: false
+            })
+        ) {
             return;
         }
         let Some(&owner) = self.class_owner_stack.last() else {

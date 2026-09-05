@@ -6403,6 +6403,108 @@ function check(options: Options = {}) {
         );
     }
 
+    /// TS2576 is admissible only from an instance member: a static
+    /// method's `super` resolves the base constructor, so reading and
+    /// writing a base static through `super` is legal, while the same
+    /// read from an instance method is the TS2576 misspelling. Static
+    /// property and auto-accessor initializers, static blocks, and
+    /// lexical arrows inherit the enclosing member's home, so every
+    /// static surface stays silent while an instance arrow still
+    /// reports.
+    #[test]
+    fn super_static_member_home_matrix() {
+        let static_context = checker_codes(&check_text(
+            "class MyBase {
+                 static x: string = 'base';
+             }
+             class MyDerived extends MyBase {
+                 static p = super.x;
+                 static accessor acc = super.x;
+                 static {
+                     super.x;
+                 }
+                 static m() {
+                     super.x;
+                     super.x = 'derived';
+                     () => super.x;
+                 }
+             }",
+        ));
+        assert_eq!(static_context, Vec::<&str>::new(), "{static_context:?}");
+        let instance_context = checker_codes(&check_text(
+            "class MyBase {
+                 static x: string = 'base';
+             }
+             class MyDerived extends MyBase {
+                 m() {
+                     super.x;
+                 }
+             }",
+        ));
+        assert_eq!(
+            instance_context,
+            vec![SUPER_STATIC_MEMBER_VIA_SUPER.as_str()],
+            "{instance_context:?}"
+        );
+
+        let instance_arrow = checker_codes(&check_text(
+            "class MyBase {
+                 static x: string = 'base';
+             }
+             class MyDerived extends MyBase {
+                 m() {
+                     () => super.x;
+                 }
+             }",
+        ));
+        assert_eq!(
+            instance_arrow,
+            vec![SUPER_STATIC_MEMBER_VIA_SUPER.as_str()],
+            "{instance_arrow:?}"
+        );
+
+        let derived_constructor = checker_codes(&check_text(
+            "class MyBase {
+                 static x: string = 'base';
+             }
+             class MyDerived extends MyBase {
+                 constructor() {
+                     super();
+                     super.x;
+                 }
+             }",
+        ));
+        assert_eq!(
+            derived_constructor,
+            vec![SUPER_STATIC_MEMBER_VIA_SUPER.as_str()],
+            "{derived_constructor:?}"
+        );
+    }
+
+    /// The protectedStaticClassPropertyAccessibleWithinSubclass2 es2015
+    /// baseline carries no diagnostics: both `super.x` rows sit in static
+    /// methods, where `super` resolves the base constructor and the
+    /// protected static is reachable.
+    #[test]
+    fn super_static_member_static_context_matches_authority_baseline() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source = std::fs::read_to_string(root.join(concat!(
+            "target/authority/typescript-7.0.2-tests/tests/cases/conformance/",
+            "classes/members/accessibility/",
+            "protectedStaticClassPropertyAccessibleWithinSubclass2.ts"
+        )))
+        .unwrap();
+        let codes = checker_codes(&check_text(&source));
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == SUPER_STATIC_MEMBER_VIA_SUPER.as_str())
+                .count(),
+            0,
+            "{codes:?}"
+        );
+    }
+
     /// The authority baseline checkSuperCallBeforeThisAccess.errors.txt
     /// carries exactly five TS2855 rows (lines 9, 12, 17, 22, 45 of the
     /// directive-stripped source); the count is the pinned oracle.
