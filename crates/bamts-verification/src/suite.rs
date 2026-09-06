@@ -975,7 +975,7 @@ fn utf16_len(text: &str) -> usize {
 /// decoding, a UTF-8 BOM (`EF BB BF`) is stripped, and the leading marker is
 /// dropped. Malformed units decode lossily so the parser still observes a total
 /// source — the parse facet proves recovery, not byte-perfect re-encoding.
-pub(crate) fn decode_case_source(bytes: &[u8]) -> String {
+pub fn decode_case_source(bytes: &[u8]) -> String {
     if let [0xFE, 0xFF, rest @ ..] = bytes {
         let units: Vec<u16> = rest
             .chunks(2)
