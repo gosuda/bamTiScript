@@ -8916,7 +8916,7 @@ impl<'src> Binder<'src> {
                         let else_ok =
                             else_exits || matches!(else_flow, SuperFlow::Tracking { called: true });
                         SuperFlow::Tracking {
-                            called: entry && then_ok && else_ok,
+                            called: entry || (then_ok && else_ok),
                         }
                     }
                     (suspended, _, _) => suspended,

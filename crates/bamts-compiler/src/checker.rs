@@ -5980,21 +5980,28 @@ function check(options: Options = {}) {
         );
     }
 
-    /// TS17009/TS17011: a derived constructor's `this` and `super.x`
-    /// accesses before a guaranteed `super()` call, with the oracle's
-    /// flow shapes: arrows are exempt (deferred `this`), a conditional
-    /// super() covers only its branch, and loops/try never guarantee.
+    fn authority_source(relative: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("target/authority/typescript-7.0.2-tests/tests/cases/compiler")
+            .join(relative);
+        std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "authority fixture {} is unavailable: {error}; run \
+                 `cargo run --locked -p bamts-verification -- source fetch \
+                 typescript-primary-tests --dest target/authority/typescript-7.0.2-tests` \
+                 from the repository root first",
+                path.display()
+            )
+        })
+    }
+
     /// The superAccess es2015 baseline carries one TS2576 (static S1 via
     /// super) and two TS2855 (fields S2 and f); the es5 variant's TS2340
     /// flavor is a separate target-conditional slice.
     #[test]
     fn super_static_member_matches_superaccess_baseline() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let source =
-            std::fs::read_to_string(root.join(
-                "target/authority/typescript-7.0.2-tests/tests/cases/compiler/superAccess.ts",
-            ))
-            .unwrap();
+        let source = authority_source("superAccess.ts");
         let codes = checker_codes(&check_text(&source));
         assert_eq!(
             codes
@@ -6017,12 +6024,7 @@ function check(options: Options = {}) {
     /// AfterObject) are inlined at use sites and stay clean.
     #[test]
     fn enum_used_before_declaration_matches_baseline() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let source = std::fs::read_to_string(root.join(concat!(
-            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
-            "blockScopedEnumVariablesUseBeforeDef.ts"
-        )))
-        .unwrap();
+        let source = authority_source("blockScopedEnumVariablesUseBeforeDef.ts");
         let codes = checker_codes(&check_text(&source));
         assert_eq!(
             codes
@@ -6034,23 +6036,6 @@ function check(options: Options = {}) {
         );
     }
 
-    /// The superAccess es5 baseline swaps each TS2855 field row for the
-    /// single pre-fields rule TS2340; the static row stays TS2576 at both
-    /// targets.
-    #[test]
-    fn zz_enumbasics3_probe() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let source =
-            std::fs::read_to_string(root.join(
-                "target/authority/typescript-7.0.2-tests/tests/cases/compiler/enumBasics3.ts",
-            ))
-            .unwrap();
-        eprintln!("ZZ eb3: {:?}", checker_codes(&check_text(&source)));
-    }
-
-    /// TS2371: only an implementation may carry parameter defaults. The
-    /// oracle (defaultValueInConstructorOverload1) is exactly one row on a
-    /// constructor overload signature.
     /// TS1114: a label redeclared in one function (sibling or nested).
     /// TS1116: a labeled break may only target an enclosing label. The
     /// oracles are duplicateLabel2 (one row) and breakTarget6 (one row).
@@ -6093,31 +6078,18 @@ function check(options: Options = {}) {
             Vec::<&str>::new()
         );
         // Authority oracles: one row each.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let duplicate = std::fs::read_to_string(root.join(concat!(
-            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
-            "duplicateLabel2.ts"
-        )))
-        .unwrap();
+        let duplicate = authority_source("duplicateLabel2.ts");
         assert_eq!(
             checker_codes(&check_text(&duplicate)),
             vec![DUPLICATE_LABEL.as_str()]
         );
-        let jump = std::fs::read_to_string(root.join(concat!(
-            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
-            "breakTarget6.ts"
-        )))
-        .unwrap();
+        let jump = authority_source("breakTarget6.ts");
         assert_eq!(
             checker_codes(&check_text(&jump)),
             vec![BREAK_TARGET_NOT_ENCLOSING.as_str()]
         );
         // TS1107: the label exists, but in an enclosing function.
-        let crosses = std::fs::read_to_string(root.join(concat!(
-            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
-            "breakTarget5.ts"
-        )))
-        .unwrap();
+        let crosses = authority_source("breakTarget5.ts");
         assert_eq!(
             checker_codes(&check_text(&crosses)),
             vec![BREAK_TARGET_CROSSES_FUNCTION.as_str()]
@@ -6130,6 +6102,9 @@ function check(options: Options = {}) {
         );
     }
 
+    /// TS2371: only an implementation may carry parameter defaults. The
+    /// oracle (defaultValueInConstructorOverload1) is exactly one row on a
+    /// constructor overload signature.
     #[test]
     fn parameter_initializer_only_in_implementation() {
         assert_eq!(
@@ -6146,12 +6121,7 @@ function check(options: Options = {}) {
             checker_codes(&check_text("function g(x = 1) {}")),
             Vec::<&str>::new()
         );
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let source = std::fs::read_to_string(root.join(concat!(
-            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
-            "defaultValueInConstructorOverload1.ts"
-        )))
-        .unwrap();
+        let source = authority_source("defaultValueInConstructorOverload1.ts");
         assert_eq!(
             checker_codes(&check_text(&source)),
             vec![PARAMETER_INITIALIZER_IN_SIGNATURE.as_str()]
@@ -6219,12 +6189,7 @@ function check(options: Options = {}) {
         );
         // The authority file itself: es5 swaps both field rows for TS2340
         // and keeps the static row at TS2576.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let source =
-            std::fs::read_to_string(root.join(
-                "target/authority/typescript-7.0.2-tests/tests/cases/compiler/superAccess.ts",
-            ))
-            .unwrap();
+        let source = authority_source("superAccess.ts");
         let oracle_es5 = checker_codes(&check_text_with(
             &source,
             ProgramCheckOptions::standard().with_target(Some("es5")),
@@ -6408,12 +6373,7 @@ function check(options: Options = {}) {
     /// directive-stripped source); the count is the pinned oracle.
     #[test]
     fn super_field_via_super_matches_baseline_count() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let source = std::fs::read_to_string(root.join(concat!(
-            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
-            "checkSuperCallBeforeThisAccess.ts"
-        )))
-        .unwrap();
+        let source = authority_source("checkSuperCallBeforeThisAccess.ts");
         let count = checker_codes(&check_text(&source))
             .into_iter()
             .filter(|code| *code == SUPER_FIELD_VIA_SUPER.as_str())
@@ -6423,12 +6383,8 @@ function check(options: Options = {}) {
         // reaches `this` inside the super() arguments, which evaluate before
         // the call completes.
         for variant in ["2", "5", "8"] {
-            let variant_source = std::fs::read_to_string(
-                root.join(format!(
-                    "target/authority/typescript-7.0.2-tests/tests/cases/compiler/checkSuperCallBeforeThisAccessing{variant}.ts"
-                )),
-            )
-            .unwrap();
+            let variant_source =
+                authority_source(&format!("checkSuperCallBeforeThisAccessing{variant}.ts"));
             let codes = checker_codes(&check_text(&variant_source));
             assert_eq!(
                 codes
@@ -6504,6 +6460,10 @@ function check(options: Options = {}) {
         assert!(codes.contains(&SUPER_FIELD_VIA_SUPER.as_str()));
     }
 
+    /// TS17009/TS17011: a derived constructor's `this` and `super.x`
+    /// accesses before a guaranteed `super()` call, with the oracle's
+    /// flow shapes: arrows are exempt (deferred `this`), a conditional
+    /// super() covers only its branch, and loops/try never guarantee.
     #[test]
     fn super_before_this_flow_matrix() {
         fn codes(text: &str) -> Vec<&'static str> {
@@ -6549,6 +6509,20 @@ function check(options: Options = {}) {
                 "class A extends Object { constructor(c) {\nif (c) { super(); let a = this; }\nelse { let a = this; }\nlet b = this; } }"
             ),
             vec![SUPER_BEFORE_THIS.as_str(), SUPER_BEFORE_THIS.as_str()]
+        );
+        // Every continuing branch has called super, including when the
+        // other branch exits before the merge.
+        assert_eq!(
+            codes(
+                "class A extends Object { constructor(c) { if (c) super(); else super(); this; } }"
+            ),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            codes(
+                "class A extends Object { constructor(c) { if (c) return {}; else super(); this; } }"
+            ),
+            Vec::<&str>::new()
         );
         // A super() inside a loop guarantees nothing after it.
         assert_eq!(

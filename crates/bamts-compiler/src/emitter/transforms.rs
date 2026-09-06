@@ -1695,12 +1695,6 @@ impl<'a> Rewriter<'a> {
         let iterable = self.rewrite_expr(&for_of.iterable);
         let zero = self.number_expr("0");
         let counter_decl = self.make_declarator(counter.clone(), Some(zero), range);
-        let source_decl = self.make_declarator(source.clone(), Some(iterable), range);
-        let initializer = ForInitializer::Variable(VariableDeclaration {
-            range,
-            kind: VariableKind::Var,
-            declarations: vec![counter_decl, source_decl],
-        });
         let counter_expr = self.node(counter.range(), Expression::Identifier(counter.clone()));
         let length = self.member_ident(&source, "length", range);
         let test = self.node(
@@ -1741,7 +1735,6 @@ impl<'a> Rewriter<'a> {
                     declaration.declarations = vec![lowered];
                     self.node(range, Statement::Variable(declaration))
                 } else {
-                    let iterable = for_of.iterable.as_ref().clone();
                     let body = self.rewrite_single_statement(&for_of.body);
                     return vec![self.node(
                         range,
@@ -1758,7 +1751,6 @@ impl<'a> Rewriter<'a> {
             // verbatim statement below keeps the shape (and any
             // applicable diagnostic) instead of dropping it.
             target @ ForBinding::Target(_) => {
-                let iterable = for_of.iterable.as_ref().clone();
                 let body = self.rewrite_single_statement(&for_of.body);
                 return vec![self.node(
                     range,
@@ -1771,6 +1763,12 @@ impl<'a> Rewriter<'a> {
                 )];
             }
         };
+        let source_decl = self.make_declarator(source.clone(), Some(iterable), range);
+        let initializer = ForInitializer::Variable(VariableDeclaration {
+            range,
+            kind: VariableKind::Var,
+            declarations: vec![counter_decl, source_decl],
+        });
         // The binding declaration must itself lower (pattern bindings,
         // defaults) - route it through the statement rewriter.
         let lowered_binding = self.rewrite_statements(&[binding_statement]);
@@ -1813,18 +1811,37 @@ impl<'a> Rewriter<'a> {
             );
         }
         if !Self::needs(LanguageFeature::Destructuring, self.options) {
-            let declarations = declaration
-                .declarations
-                .iter()
-                .map(|declarator| self.rewrite_declarator_initializer(declarator))
-                .collect();
-            return vec![self.node(
+            let outer_key_prelude = std::mem::take(&mut self.key_prelude);
+            let mut statements = Vec::new();
+            let mut declarations = Vec::with_capacity(declaration.declarations.len());
+            for declarator in &declaration.declarations {
+                let rewritten = self.rewrite_declarator_initializer(declarator);
+                let prelude = std::mem::take(&mut self.key_prelude);
+                if !prelude.is_empty() {
+                    if !declarations.is_empty() {
+                        statements.push(self.node(
+                            statement.range(),
+                            Statement::Variable(VariableDeclaration {
+                                range: declaration.range,
+                                kind: declaration.kind,
+                                declarations: std::mem::take(&mut declarations),
+                            }),
+                        ));
+                    }
+                    statements.extend(prelude);
+                }
+                declarations.push(rewritten);
+            }
+            self.key_prelude = outer_key_prelude;
+            statements.push(self.node(
                 statement.range(),
                 Statement::Variable(VariableDeclaration {
+                    range: declaration.range,
+                    kind: declaration.kind,
                     declarations,
-                    ..declaration.clone()
                 }),
-            )];
+            ));
+            return statements;
         }
         // A suspending binding (yield in a default or computed key) cannot
         // live in a ternary: the machine must split the default selection
@@ -9967,6 +9984,21 @@ mod tests {
     }
 
     #[test]
+    fn native_declaration_emits_suspending_class_key_prelude_in_order() {
+        let output = emit_at(
+            "function* g() { const left = before(), C = class { [yield key()]() {} }, right = after(); }\n",
+            ScriptTarget::Es2015,
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let code = javascript(&output);
+        let positions = ["before()", "key()", "C =", "after()"].map(|needle| {
+            assert_eq!(code.matches(needle).count(), 1, "{needle}: {code}");
+            code.find(needle).expect("emitted expression")
+        });
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{code}");
+    }
+
+    #[test]
     fn static_this_and_super_are_rebound_to_the_constructor() {
         let output = emit_at(
             "class B { static p() {} } class C extends B { static x = this; static { super.p(); } }\n",
@@ -10566,6 +10598,17 @@ console.log(JSON.stringify([bar, bar4, log]));
             String::from_utf8_lossy(&result.stdout).contains("1,2,3,a"),
             "the loop must collect every element and key:\n{code}"
         );
+    }
+
+    #[test]
+    fn es5_for_of_fallback_keeps_rewritten_iterable() {
+        let output = emit_at(
+            "async function f() { let x; for (x of await values) {} }\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(!code.contains("await values"), "{code}");
+        assert!(code.contains("yield values"), "{code}");
     }
 
     #[test]
