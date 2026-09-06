@@ -132,7 +132,7 @@ impl<F: FileSystem> ServiceState<F> {
     ) -> Result<Option<Location>, ServiceError> {
         let document = self.ensure_document(path.as_ref())?;
         let Some(symbol) = symbol_at(&document, position)? else {
-            return Ok(None);
+            return Ok(property_definition_location(&document, position));
         };
         Ok(Some(Location {
             path: document.path().to_path_buf(),
@@ -175,7 +175,10 @@ impl<F: FileSystem> ServiceState<F> {
     ) -> Result<Vec<Location>, ServiceError> {
         let document = self.ensure_document(path.as_ref())?;
         let Some(symbol) = symbol_at(&document, position)? else {
-            return Ok(Vec::new());
+            let Some(property_id) = property_anchor_at(&document, position) else {
+                return Ok(Vec::new());
+            };
+            return Ok(property_reference_locations(&document, property_id));
         };
         Ok(reference_locations(&document, symbol))
     }
@@ -387,6 +390,53 @@ fn property_anchor_at(document: &DocumentSnapshot, position: Utf16Pos) -> Option
                     && anchor.range.end() < token_range.end())
         })
         .map(|anchor| anchor.property_id)
+}
+
+/// Resolves the property identity anchored at `position` to its declaration
+/// location. Returns `None` when no anchor sits at the position or the
+/// identity has no recorded declaration anchor.
+fn property_definition_location(
+    document: &DocumentSnapshot,
+    position: Utf16Pos,
+) -> Option<Location> {
+    let property_id = property_anchor_at(document, position)?;
+    let model = document.semantic();
+    let anchor = model
+        .property_anchors()
+        .iter()
+        .filter(|anchor| anchor.property_id == property_id)
+        .find(|anchor| anchor.declaration)?;
+    Some(Location {
+        path: document.path().to_path_buf(),
+        range: anchor.range,
+        is_declaration: true,
+    })
+}
+
+/// Collects every anchored occurrence of a property identity, ordered like
+/// symbol reference locations, with declaration flags preserved for
+/// `includeDeclaration` filtering.
+fn property_reference_locations(
+    document: &DocumentSnapshot,
+    property_id: PropertyId,
+) -> Vec<Location> {
+    let model = document.semantic();
+    let mut ranges = model
+        .property_anchors()
+        .iter()
+        .filter(|anchor| anchor.property_id == property_id)
+        .map(|anchor| (anchor.range, anchor.declaration))
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|(range, _)| (range.start(), range.end()));
+    ranges.dedup();
+    ranges
+        .into_iter()
+        .map(|(range, is_declaration)| Location {
+            path: document.path().to_path_buf(),
+            range,
+            is_declaration,
+        })
+        .collect()
 }
 
 /// Builds the rename edit set for a property identity. Owner-local collision
@@ -891,5 +941,179 @@ mod tests {
             Err(ServiceError::RenameUnavailable)
         ));
         fs::remove_dir_all(spread_root).expect("remove spread root");
+    }
+
+    #[test]
+    fn property_navigation_resolves_definition_and_exact_reference_ranges() {
+        let source = "const a = { value: \"x\" };\na.value;\n";
+        let (root, mut state) = state(source);
+        let declaration = source.find("value: \"x\"").expect("declaration key");
+        let use_position = cursor(source, "a.value", 2);
+        let from_use = state
+            .definition("a.ts", use_position)
+            .expect("property definition from use")
+            .expect("declaration location");
+        assert_eq!(from_use.range.start(), Utf16Pos::new(declaration));
+        assert_eq!(
+            from_use.range.end(),
+            Utf16Pos::new(declaration + "value".len())
+        );
+        assert!(from_use.is_declaration);
+        let from_declaration = state
+            .definition("a.ts", cursor(source, "value: \"x\"", 0))
+            .expect("property definition from declaration")
+            .expect("declaration location");
+        assert_eq!(from_declaration.range, from_use.range);
+        let references = state
+            .references("a.ts", use_position)
+            .expect("property references");
+        assert_eq!(
+            references
+                .iter()
+                .map(|location| (
+                    location.range.start(),
+                    location.range.end(),
+                    location.is_declaration
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Utf16Pos::new(declaration),
+                    Utf16Pos::new(declaration + "value".len()),
+                    true
+                ),
+                (
+                    Utf16Pos::new(use_position.get()),
+                    Utf16Pos::new(use_position.get() + "value".len()),
+                    false
+                ),
+            ]
+        );
+        assert!(matches!(
+            state.references("a.ts", Utf16Pos::new(10_000)),
+            Err(ServiceError::InvalidPosition { .. })
+        ));
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn property_navigation_keeps_same_spelled_properties_distinct() {
+        let source = "const a = { value: 1 };\nconst b = { value: 2 };\na.value;\nb.value;\n";
+        let (root, mut state) = state(source);
+        let a_declaration = source.find("value: 1").expect("a declaration key");
+        let b_declaration = source.find("value: 2").expect("b declaration key");
+        let a_access = source.find("a.value").expect("a access");
+        let definition = state
+            .definition("a.ts", cursor(source, "b.value", 2))
+            .expect("property definition")
+            .expect("declaration location");
+        assert_eq!(definition.range.start(), Utf16Pos::new(b_declaration));
+        assert_eq!(
+            definition.range.end(),
+            Utf16Pos::new(b_declaration + "value".len())
+        );
+        let references = state
+            .references("a.ts", cursor(source, "a.value", 2))
+            .expect("property references");
+        assert_eq!(
+            references
+                .iter()
+                .map(|location| (
+                    location.range.start(),
+                    location.range.end(),
+                    location.is_declaration
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Utf16Pos::new(a_declaration),
+                    Utf16Pos::new(a_declaration + "value".len()),
+                    true
+                ),
+                (
+                    Utf16Pos::new(a_access + 2),
+                    Utf16Pos::new(a_access + "a.value".len()),
+                    false
+                ),
+            ]
+        );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn property_navigation_covers_string_key_bracket_access() {
+        let source = "const a = { \"value\": \"x\" };\na[\"value\"];\n";
+        let (root, mut state) = state(source);
+        let declaration = source.find("\"value\"").expect("string key") + 1;
+        let access = source.find("a[\"value\"]").expect("bracket access");
+        let definition = state
+            .definition("a.ts", cursor(source, "a[\"value\"]", 4))
+            .expect("bracket property definition")
+            .expect("declaration location");
+        assert_eq!(definition.range.start(), Utf16Pos::new(declaration));
+        assert_eq!(
+            definition.range.end(),
+            Utf16Pos::new(declaration + "value".len())
+        );
+        assert!(definition.is_declaration);
+        let references = state
+            .references("a.ts", cursor(source, "a[\"value\"]", 4))
+            .expect("bracket property references");
+        assert_eq!(
+            references
+                .iter()
+                .map(|location| (
+                    location.range.start(),
+                    location.range.end(),
+                    location.is_declaration
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Utf16Pos::new(declaration),
+                    Utf16Pos::new(declaration + "value".len()),
+                    true
+                ),
+                (
+                    Utf16Pos::new(access + 3),
+                    Utf16Pos::new(access + 3 + "value".len()),
+                    false
+                ),
+            ]
+        );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn property_navigation_exposes_declaration_filter_flag() {
+        let source = "const a = { value: \"x\" };\na.value;\na?.value;\n";
+        let (root, mut state) = state(source);
+        let references = state
+            .references("a.ts", cursor(source, "a.value", 2))
+            .expect("property references");
+        let uses = references
+            .iter()
+            .filter(|location| !location.is_declaration)
+            .map(|location| location.range.start())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            uses,
+            [
+                Utf16Pos::new(source.find("a.value").expect("dot access") + 2),
+                Utf16Pos::new(source.find("a?.value").expect("optional access") + 3),
+            ]
+        );
+        let declarations = references
+            .iter()
+            .filter(|location| location.is_declaration)
+            .map(|location| location.range.start())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declarations,
+            [Utf16Pos::new(
+                source.find("value: \"x\"").expect("declaration key")
+            )]
+        );
+        fs::remove_dir_all(root).expect("remove root");
     }
 }
