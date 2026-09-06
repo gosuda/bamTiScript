@@ -2465,6 +2465,7 @@ impl<'table> TypeRelations<'table> {
         let mut combined = ObjectType {
             properties: Vec::new(),
             call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
@@ -2496,6 +2497,7 @@ impl<'table> TypeRelations<'table> {
         let index_target = ObjectType {
             properties: Vec::new(),
             call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: target.index_signatures.clone(),
             generator_return: None,
@@ -4265,6 +4267,7 @@ mod tests {
         let target = table.object_type_with_members(ObjectType {
             properties: Vec::new(),
             call_signatures: vec![call_sig],
+            call_candidate_order: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
@@ -4295,6 +4298,7 @@ mod tests {
         let source = table.object_type_with_members(ObjectType {
             properties: Vec::new(),
             call_signatures: vec![call_sig],
+            call_candidate_order: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
@@ -4326,6 +4330,7 @@ mod tests {
         let target = table.object_type_with_members(ObjectType {
             properties: vec![PropertyType::new("extra", false, string)],
             call_signatures: vec![call_sig],
+            call_candidate_order: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,

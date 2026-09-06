@@ -742,6 +742,11 @@ pub struct IndexSignature {
 pub struct ObjectType {
     pub(crate) properties: Vec<PropertyType>,
     pub(crate) call_signatures: Vec<FunctionSignature>,
+    /// Candidate selection order over `call_signatures`: a complete
+    /// permutation of signature indices, empty for identity. Attached only to
+    /// synthesized merged interface method groups; the renderer never reads
+    /// it and relation checks never inspect it.
+    pub(crate) call_candidate_order: Vec<u32>,
     pub(crate) construct_signatures: Vec<ConstructEntry>,
     pub(crate) index_signatures: Vec<IndexSignature>,
     pub(crate) generator_return: Option<TypeId>,
@@ -757,28 +762,12 @@ impl ObjectType {
 }
 
 /// One parameter of an interned function signature.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FunctionParameter {
     name: String,
     type_id: TypeId,
     optional: bool,
     rest: bool,
-}
-
-impl PartialEq for FunctionParameter {
-    fn eq(&self, other: &Self) -> bool {
-        self.type_id == other.type_id && self.optional == other.optional && self.rest == other.rest
-    }
-}
-
-impl Eq for FunctionParameter {}
-
-impl std::hash::Hash for FunctionParameter {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.type_id.hash(state);
-        self.optional.hash(state);
-        self.rest.hash(state);
-    }
 }
 
 impl FunctionParameter {
@@ -857,38 +846,19 @@ struct CollectionIntrinsicSymbols {
     readonly_map_type: SymbolId,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FunctionSignature {
     type_parameters: Vec<SymbolId>,
     type_parameter_bounds: Vec<TypeParameterBounds>,
     parameters: Vec<FunctionParameter>,
     return_type: TypeId,
+    /// The resolved type of the written return annotation, when the
+    /// signature was declared with one. `None` for unannotated or
+    /// synthesized signatures. Participates in identity so two signatures
+    /// that differ only in their written annotation intern distinctly.
+    pub(crate) declared_return: Option<TypeId>,
     declaring_types: Vec<SymbolId>,
     javascript: bool,
-}
-
-impl PartialEq for FunctionSignature {
-    fn eq(&self, other: &Self) -> bool {
-        self.type_parameters == other.type_parameters
-            && self.type_parameter_bounds == other.type_parameter_bounds
-            && self.parameters == other.parameters
-            && self.return_type == other.return_type
-            && self.declaring_types == other.declaring_types
-            && self.javascript == other.javascript
-    }
-}
-
-impl Eq for FunctionSignature {}
-
-impl std::hash::Hash for FunctionSignature {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.type_parameters.hash(state);
-        self.type_parameter_bounds.hash(state);
-        self.parameters.hash(state);
-        self.return_type.hash(state);
-        self.declaring_types.hash(state);
-        self.javascript.hash(state);
-    }
 }
 
 impl FunctionSignature {
@@ -910,6 +880,12 @@ impl FunctionSignature {
     #[must_use]
     pub const fn return_type(&self) -> TypeId {
         self.return_type
+    }
+
+    /// Returns the resolved written return annotation, when one was written.
+    #[must_use]
+    pub(crate) const fn declared_return(&self) -> Option<TypeId> {
+        self.declared_return
     }
 
     #[must_use]
@@ -2549,6 +2525,7 @@ impl TypeTable {
                 self.object_type_with_members(ObjectType {
                     properties,
                     call_signatures: Vec::new(),
+                    call_candidate_order: Vec::new(),
                     construct_signatures: Vec::new(),
                     index_signatures,
                     generator_return: None,
@@ -3407,6 +3384,7 @@ impl TypeTable {
         self.object_type_with_members(ObjectType {
             properties: Vec::new(),
             call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
@@ -3453,11 +3431,105 @@ impl TypeTable {
         }
     }
 
+    /// Whether `object` is a pure callable: non-empty `call_signatures` and
+    /// no properties, construct signatures, index signatures, or
+    /// generator/iterator members. `call_candidate_order` never participates:
+    /// candidate metadata is not a reason to reject an otherwise pure
+    /// callable.
+    fn is_pure_callable_object(object: &ObjectType) -> bool {
+        !object.call_signatures.is_empty()
+            && object.properties.is_empty()
+            && object.construct_signatures.is_empty()
+            && object.index_signatures.is_empty()
+            && object.generator_return.is_none()
+            && object.iterator_property.is_none()
+            && object.async_iterator_property.is_none()
+    }
+
+    /// The order-insensitive relations view over a callable type: the call
+    /// signatures of a function, a pure callable object type, or an
+    /// intersection of those, in declaration order with duplicates
+    /// preserved.
+    ///
+    /// This view is never a selection order: `call_candidate_order` is
+    /// ignored here and consumed only on the call path. Mixed callables such
+    /// as `{ (x: string): void; extra: string }` return `None` so callers
+    /// fall through to the structural relation path.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the T2/T3 overload and relation paths"
+        )
+    )]
+    pub(crate) fn overload_signatures(
+        &self,
+        type_id: TypeId,
+    ) -> Option<Cow<'_, [FunctionSignature]>> {
+        match self.get(type_id) {
+            Type::Function(signature) => Some(Cow::Borrowed(std::slice::from_ref(signature))),
+            Type::ObjectType(object) if Self::is_pure_callable_object(object) => {
+                Some(Cow::Borrowed(object.call_signatures.as_slice()))
+            }
+            Type::Intersection(members) => {
+                let mut signatures = Vec::new();
+                for &member in members {
+                    match self.get(member) {
+                        Type::Function(signature) => signatures.push(signature.clone()),
+                        Type::ObjectType(object) if Self::is_pure_callable_object(object) => {
+                            signatures.extend(object.call_signatures.iter().cloned());
+                        }
+                        Type::Intersection(_) => {
+                            let nested = self.overload_signatures(member)?;
+                            signatures.extend(nested.iter().cloned());
+                        }
+                        _ => return None,
+                    }
+                }
+                Some(Cow::Owned(signatures))
+            }
+            _ => None,
+        }
+    }
+
+    /// Re-interns a callable object type carrying `order` as its candidate
+    /// selection permutation. `order` indexes into `call_signatures`; an
+    /// empty vector is the identity. A non-empty order must be a complete
+    /// permutation of the signature indices — a mismatch is an internal
+    /// invariant failure, never a silent identity fallback.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed when T4b attaches candidate order")
+    )]
+    pub(crate) fn with_call_candidate_order(&mut self, type_id: TypeId, order: Vec<u32>) -> TypeId {
+        let Type::ObjectType(object) = self.get(type_id).clone() else {
+            unreachable!("call candidate order attaches to a callable object type");
+        };
+        debug_assert!(
+            order.is_empty()
+                || (order.len() == object.call_signatures.len() && {
+                    let mut sorted = order.clone();
+                    sorted.sort_unstable();
+                    sorted
+                        .iter()
+                        .enumerate()
+                        .all(|(index, &slot)| slot as usize == index)
+                }),
+            "call candidate order must be a complete permutation of the call signatures"
+        );
+        let object = ObjectType {
+            call_candidate_order: order,
+            ..object
+        };
+        self.intern(Type::ObjectType(object))
+    }
+
     /// Interns an object type after canonically ordering its members by name.
     pub fn object_type(&mut self, properties: Vec<PropertyType>) -> TypeId {
         self.object_type_with_members(ObjectType {
             properties,
             call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
@@ -3571,6 +3643,8 @@ impl TypeTable {
             type_parameter_bounds,
             parameters,
             return_type,
+            // Synthesized signatures carry no written annotation.
+            declared_return: None,
             declaring_types: Vec::new(),
             javascript,
         }))
@@ -3752,6 +3826,7 @@ impl TypeTable {
         self.object_type_with_members(ObjectType {
             properties: Vec::new(),
             call_signatures,
+            call_candidate_order: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
@@ -3977,7 +4052,7 @@ impl TypeTable {
                             .with_spreadable(property.spreadable)
                         })
                         .collect();
-                    let call_signatures = object
+                    let call_signatures: Vec<FunctionSignature> = object
                         .call_signatures
                         .into_iter()
                         .map(|signature| {
@@ -4069,9 +4144,18 @@ impl TypeTable {
                         .with_method(property.is_method())
                         .with_spreadable(property.spreadable())
                     });
+                    // The copy rebuilds `call_signatures` positionally, so the
+                    // stored permutation stays valid 1:1; a length mismatch is
+                    // an invariant failure, never a silent identity fallback.
+                    debug_assert!(
+                        object.call_candidate_order.is_empty()
+                            || object.call_candidate_order.len() == call_signatures.len(),
+                        "import copy preserves the call candidate permutation positionally"
+                    );
                     target.object_type_with_members(ObjectType {
                         properties,
                         call_signatures,
+                        call_candidate_order: object.call_candidate_order.clone(),
                         construct_signatures,
                         index_signatures,
                         generator_return,
@@ -4311,6 +4395,9 @@ impl TypeTable {
                 type_parameter_bounds,
                 parameters,
                 return_type,
+                declared_return: signature
+                    .declared_return
+                    .map(|type_id| copy(target, source, type_id, imported, next_symbol)),
                 declaring_types,
                 javascript,
             }
@@ -4545,6 +4632,25 @@ pub(crate) fn is_numeric_enum_initializer(expression: &Expr) -> bool {
     }
 }
 
+/// One bound named interface member declaration occurrence.
+///
+/// Duplicate declarations of one member name share the canonical `symbol`
+/// while each keeps its own `declaration` and `name_range`, so consumers can
+/// render every written occurrence without minting extra symbols.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeclarationOccurrence {
+    /// The `TypeMemberNode` id of the declaring member.
+    pub declaration: NodeId,
+    /// The member's full range, modifiers included.
+    pub declaration_range: TextRange,
+    /// The canonical member symbol the occurrence binds to.
+    pub symbol: SymbolId,
+    /// The full UTF-16 declaration-name span: the identifier span, quotes
+    /// included for string keys, digits for numeric keys, and the
+    /// bracket-delimited `[expr]` span for computed keys.
+    pub name_range: TextRange,
+}
+
 /// The immutable product of semantic analysis.
 #[derive(Clone, Debug)]
 pub struct SemanticModel {
@@ -4573,6 +4679,18 @@ pub struct SemanticModel {
     /// feeding the language service's property rename path.
     property_sites: Vec<PropertySite>,
     property_anchors: Vec<PropertyAnchor>,
+    /// Bound named interface member declaration occurrences in source order,
+    /// one per `declare_member_unique` call including every reuse. Consumers
+    /// must not re-sort.
+    declaration_occurrences: Vec<DeclarationOccurrence>,
+    /// Interface signature parameter name node to its bound `Parameter`
+    /// symbol, recorded for method, call, and construct members and for
+    /// index signature parameters.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by T4a parameter-symbol publication")
+    )]
+    signature_parameter_symbols: HashMap<NodeId, SymbolId>,
     types: TypeTable,
     module_scope: ScopeId,
     facts: AnalysisFacts,
@@ -4696,6 +4814,25 @@ impl SemanticModel {
     #[must_use]
     pub fn symbol_references(&self) -> &[(TextRange, SymbolId)] {
         &self.symbol_references
+    }
+
+    /// Returns every bound named interface member declaration occurrence in
+    /// source order, one per declaration including merged duplicates.
+    /// Consumers must not re-sort.
+    #[must_use]
+    pub fn declaration_occurrences(&self) -> &[DeclarationOccurrence] {
+        &self.declaration_occurrences
+    }
+
+    /// Returns the interface signature parameter name node to `Parameter`
+    /// symbol map recorded while binding interface members.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by T4a parameter-symbol publication")
+    )]
+    pub(crate) fn signature_parameter_symbols(&self) -> &HashMap<NodeId, SymbolId> {
+        &self.signature_parameter_symbols
     }
 
     /// Returns every recorded property anchor, in first-seen order.
@@ -4967,6 +5104,12 @@ pub(crate) struct Binder<'src> {
     imported_enum_member_uses: HashMap<NodeId, enum_plan::ImportedEnumMemberUse>,
     local_enum_member_targets: HashMap<NodeId, SymbolId>,
     imported_enum_member_targets: HashSet<NodeId>,
+    /// Bound named interface member declaration occurrences in source
+    /// order, moved into the model by [`Binder::finish`].
+    interface_member_occurrences: Vec<DeclarationOccurrence>,
+    /// Interface signature parameter name node to its bound `Parameter`
+    /// symbol, moved into the model by [`Binder::finish`].
+    signature_parameter_symbols: HashMap<NodeId, SymbolId>,
     pub(crate) namespace_declarations: Vec<NamespaceDeclarationBinding<'src>>,
     pub(crate) namespace_export_scopes: HashMap<SymbolId, ScopeId>,
     pub(crate) namespace_local_scopes: HashMap<NodeId, ScopeId>,
@@ -5170,6 +5313,8 @@ impl<'src> Binder<'src> {
             node_types: HashMap::new(),
             typed_expressions: Vec::new(),
             symbol_references: Vec::new(),
+            interface_member_occurrences: Vec::new(),
+            signature_parameter_symbols: HashMap::new(),
             diagnostics: Vec::new(),
             probing_contextual_type: false,
             pending_constraint_checks: Vec::new(),
@@ -5648,6 +5793,7 @@ impl<'src> Binder<'src> {
         let raw = self.types.object_type_with_members(ObjectType {
             properties,
             call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
@@ -5741,6 +5887,7 @@ impl<'src> Binder<'src> {
         let raw = self.types.object_type_with_members(ObjectType {
             properties,
             call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
@@ -5826,6 +5973,7 @@ impl<'src> Binder<'src> {
         self.types.object_type_with_members(ObjectType {
             properties: vec![PropertyType::new("prototype", false, prototype).with_readonly(true)],
             call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
             construct_signatures: vec![ConstructEntry {
                 signature,
                 is_abstract: false,
@@ -6095,6 +6243,8 @@ impl<'src> Binder<'src> {
             node_types: self.node_types,
             typed_expressions: self.typed_expressions,
             symbol_references: self.symbol_references,
+            declaration_occurrences: self.interface_member_occurrences,
+            signature_parameter_symbols: self.signature_parameter_symbols,
             generic_type_parameters,
             types: self.types,
             module_scope: self.module_scope,
@@ -7680,7 +7830,6 @@ impl<'src> Binder<'src> {
         member: &'src crate::syntax::TypeMemberNode,
         scope: ScopeId,
     ) {
-        let range = |name: &crate::syntax::PropertyName| Self::property_name_range(name);
         let owner = self
             .scopes
             .get(scope.0 as usize)
@@ -7689,12 +7838,12 @@ impl<'src> Binder<'src> {
         match member.data() {
             TypeMember::Property(property) => {
                 if let Some(name) = self.property_key(&property.name) {
-                    self.declare_member_unique(
+                    self.declare_interface_member_occurrence(
                         &name,
                         SymbolKind::Variable(VariableKind::Let),
                         scope,
-                        member.id(),
-                        range(&property.name),
+                        member,
+                        &property.name,
                     );
                     if let (Some(owner), Some(bare)) =
                         (owner, Self::property_bare_range(&property.name))
@@ -7711,12 +7860,12 @@ impl<'src> Binder<'src> {
             }
             TypeMember::Method(method) => {
                 if let Some(name) = self.property_key(&method.name) {
-                    self.declare_member_unique(
+                    self.declare_interface_member_occurrence(
                         &name,
                         SymbolKind::Function,
                         scope,
-                        member.id(),
-                        range(&method.name),
+                        member,
+                        &method.name,
                     );
                     if let (Some(owner), Some(bare)) =
                         (owner, Self::property_bare_range(&method.name))
@@ -7739,23 +7888,67 @@ impl<'src> Binder<'src> {
                 self.bind_signature_parameter_symbols(&construct.function.function, scope);
             }
             TypeMember::Index(index) => {
-                let parameter_scope = self.new_scope(ScopeKind::Function, Some(scope));
-                for parameter in &index.parameters {
-                    let name = self.identifier_text(&parameter.name);
-                    if name.as_ref() == "this" {
-                        continue;
-                    }
-                    self.declare(
-                        name.as_ref(),
-                        SymbolKind::Parameter,
-                        parameter_scope,
-                        parameter.name.id(),
-                        parameter.name.range(),
-                    );
-                }
+                self.bind_parameter_symbols(&index.parameters, scope);
             }
             TypeMember::Missing(_) => {}
         }
+    }
+
+    /// Declares one interface member's name and records its source
+    /// declaration occurrence: one canonical symbol (reusing a merged
+    /// duplicate) plus the full UTF-16 `name_range` span for the key.
+    fn declare_interface_member_occurrence(
+        &mut self,
+        name: &str,
+        kind: SymbolKind,
+        scope: ScopeId,
+        member: &crate::syntax::TypeMemberNode,
+        name_node: &PropertyName,
+    ) {
+        let symbol = self.declare_member_unique(
+            name,
+            kind,
+            scope,
+            member.id(),
+            Self::property_name_range(name_node),
+        );
+        let name_range = self.occurrence_name_range(name_node);
+        self.interface_member_occurrences
+            .push(DeclarationOccurrence {
+                declaration: member.id(),
+                declaration_range: member.range(),
+                symbol,
+                name_range,
+            });
+    }
+
+    /// Binds the named parameters of one type-side signature fragment into a
+    /// fresh function scope under `parent`, recording each name node's
+    /// `Parameter` symbol for publication. Returns the created scope.
+    /// Function declaration binding and signature construction share this
+    /// path so parameter lowering cannot diverge.
+    fn bind_parameter_symbols(
+        &mut self,
+        parameters: &[crate::syntax::FunctionTypeParameter],
+        parent: ScopeId,
+    ) -> ScopeId {
+        let scope = self.new_scope(ScopeKind::Function, Some(parent));
+        for parameter in parameters {
+            let name = self.identifier_text(&parameter.name);
+            if name.as_ref() == "this" {
+                continue;
+            }
+            let symbol = self.declare(
+                name.as_ref(),
+                SymbolKind::Parameter,
+                scope,
+                parameter.name.id(),
+                parameter.name.range(),
+            );
+            self.signature_parameter_symbols
+                .insert(parameter.name.id(), symbol);
+        }
+        scope
     }
 
     /// Binds the named parameters of one type-side signature (method, call,
@@ -7764,20 +7957,7 @@ impl<'src> Binder<'src> {
     /// fresh function scope with no owner, keeping their rendered names
     /// unqualified under the container's member scope.
     fn bind_signature_parameter_symbols(&mut self, function: &'src FunctionType, parent: ScopeId) {
-        let scope = self.new_scope(ScopeKind::Function, Some(parent));
-        for parameter in &function.parameters {
-            let name = self.identifier_text(&parameter.name);
-            if name.as_ref() == "this" {
-                continue;
-            }
-            self.declare(
-                name.as_ref(),
-                SymbolKind::Parameter,
-                scope,
-                parameter.name.id(),
-                parameter.name.range(),
-            );
-        }
+        let scope = self.bind_parameter_symbols(&function.parameters, parent);
         self.bind_type_function_parameter_symbols(&function.return_type, scope);
     }
 
@@ -11078,6 +11258,7 @@ impl<'src> Binder<'src> {
         let raw = self.types.object_type_with_members(ObjectType {
             properties,
             call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
@@ -11178,6 +11359,7 @@ impl<'src> Binder<'src> {
         let structural = self.types.object_type_with_members(ObjectType {
             properties,
             call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
             construct_signatures,
             index_signatures: Vec::new(),
             generator_return: None,
@@ -11266,6 +11448,9 @@ impl<'src> Binder<'src> {
                     };
                 signature.javascript = javascript;
                 signature.return_type = instance_type;
+                // The overwritten return is synthesized, not a written
+                // annotation, so no provenance survives the substitution.
+                signature.declared_return = None;
                 inherited.push(ConstructEntry {
                     signature,
                     is_abstract: class.modifiers.is_abstract,
@@ -11346,6 +11531,55 @@ impl<'src> Binder<'src> {
             )
             .unwrap(),
         }
+    }
+
+    /// Returns the full UTF-16 declaration-name span recorded on a
+    /// [`DeclarationOccurrence`]: [`Self::property_name_range`] for
+    /// identifier, string, and numeric keys, and the bracket-delimited
+    /// `[expr]` span for computed keys. The bracket span is derived from the
+    /// token stream — the `]` token is the first token starting at or after
+    /// the expression's end — never from `+-1` arithmetic, and
+    /// `property_name_range`'s contract is unchanged.
+    fn occurrence_name_range(&self, name: &PropertyName) -> TextRange {
+        let PropertyName::Computed(expression) = name else {
+            return Self::property_name_range(name);
+        };
+        let expression_range = expression.range();
+        let tokens = self.source.tokens();
+        let is_trivia = |token: &Token| {
+            matches!(
+                token.kind(),
+                TokenKind::Whitespace
+                    | TokenKind::LineComment
+                    | TokenKind::BlockComment
+                    | TokenKind::Shebang
+            )
+        };
+        // The parser produces `Computed` only after consuming `[`, so the
+        // first non-trivia token before the expression is that bracket.
+        let mut open_index =
+            tokens.partition_point(|token| token.range().start() < expression_range.start());
+        while open_index > 0 && is_trivia(&tokens[open_index - 1]) {
+            open_index -= 1;
+        }
+        let open = tokens
+            .get(open_index.saturating_sub(1))
+            .filter(|token| token.kind() == TokenKind::LBracket)
+            .expect("computed member name is always preceded by its `[` token");
+        // `]` comes from `expect`, which mints no token under recovery; when
+        // it is absent the span ends at the expression's own end. Every bound
+        // is a real token boundary — there is no fallback span.
+        let mut close_index =
+            tokens.partition_point(|token| token.range().start() < expression_range.end());
+        while matches!(tokens.get(close_index), Some(token) if is_trivia(token)) {
+            close_index += 1;
+        }
+        let end = tokens
+            .get(close_index)
+            .filter(|token| token.kind() == TokenKind::RBracket)
+            .map_or(expression_range.end(), |token| token.range().end());
+        TextRange::new(open.range().start(), end)
+            .expect("computed member name span is well ordered")
     }
 
     /// Returns the bare name span for a renameable property key. Quotes are
@@ -14109,13 +14343,17 @@ impl<'src> Binder<'src> {
             false,
         ));
         parameters.extend(signature.parameters().iter().cloned());
-        self.types.function_with_parameter_bounds(
-            signature.type_parameters().to_vec(),
-            signature.type_parameter_bounds().to_vec(),
+        // The synthesized `.call` member keeps the source signature's
+        // written-annotation provenance as-is.
+        self.types.function_signature(FunctionSignature {
+            type_parameters: signature.type_parameters().to_vec(),
+            type_parameter_bounds: signature.type_parameter_bounds().to_vec(),
             parameters,
-            signature.return_type(),
-            signature.javascript(),
-        )
+            return_type: signature.return_type(),
+            declared_return: signature.declared_return(),
+            declaring_types: Vec::new(),
+            javascript: signature.javascript(),
+        })
     }
 
     fn project_this_type(
@@ -14928,6 +15166,7 @@ impl<'src> Binder<'src> {
                 self.types.object_type_with_members(ObjectType {
                     properties: Vec::new(),
                     call_signatures: Vec::new(),
+                    call_candidate_order: Vec::new(),
                     construct_signatures: vec![ConstructEntry {
                         signature,
                         is_abstract: constructor.is_abstract,
@@ -16063,6 +16302,7 @@ impl<'src> Binder<'src> {
                 let mut merged = ObjectType {
                     properties: Vec::new(),
                     call_signatures: Vec::new(),
+                    call_candidate_order: Vec::new(),
                     construct_signatures: Vec::new(),
                     index_signatures: Vec::new(),
                     generator_return: None,
@@ -16296,6 +16536,7 @@ impl<'src> Binder<'src> {
         let mut object = ObjectType {
             properties: Vec::new(),
             call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
@@ -16472,6 +16713,14 @@ impl<'src> Binder<'src> {
             type_parameter_bounds,
             parameters,
             return_type,
+            // `return_type` stays the resolved annotation as today; the
+            // written-annotation provenance rides alongside it, present iff
+            // an annotation was written.
+            declared_return: if function.return_type_missing {
+                None
+            } else {
+                Some(return_type)
+            },
             declaring_types: Vec::new(),
             javascript: false,
         }
@@ -16603,6 +16852,7 @@ impl<'src> Binder<'src> {
                 let mut combined = ObjectType {
                     properties: Vec::new(),
                     call_signatures: Vec::new(),
+                    call_candidate_order: Vec::new(),
                     construct_signatures: Vec::new(),
                     index_signatures: Vec::new(),
                     generator_return: None,
@@ -16868,6 +17118,7 @@ impl<'src> Binder<'src> {
                 self.types.object_type_with_members(ObjectType {
                     properties: Vec::new(),
                     call_signatures: Vec::new(),
+                    call_candidate_order: Vec::new(),
                     construct_signatures: Vec::new(),
                     index_signatures: Vec::new(),
                     generator_return: None,
@@ -16902,6 +17153,7 @@ impl<'src> Binder<'src> {
         let marker = self.types.object_type_with_members(ObjectType {
             properties: Vec::new(),
             call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: Some(return_type),
@@ -17361,6 +17613,7 @@ impl<'src> Binder<'src> {
         self.types.object_type_with_members(ObjectType {
             properties,
             call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
             construct_signatures: Vec::new(),
             index_signatures,
             generator_return: None,
@@ -18467,6 +18720,15 @@ impl<'src> Binder<'src> {
             type_parameter_bounds: Vec::new(),
             parameters: instantiated_parameters,
             return_type: instantiated_return,
+            // Annotated signatures declare exactly the resolved return type;
+            // reuse the completed instantiation unless the id diverges.
+            declared_return: signature.declared_return().map(|type_id| {
+                if type_id == signature.return_type() {
+                    instantiated_return
+                } else {
+                    inferred.instantiate(&mut self.types, type_id)
+                }
+            }),
             declaring_types: signature.declaring_types().to_vec(),
             javascript: signature.javascript(),
         })
@@ -18523,6 +18785,15 @@ impl<'src> Binder<'src> {
             type_parameters: Vec::new(),
             type_parameter_bounds: Vec::new(),
             parameters: instantiated_parameters,
+            // Annotated signatures declare exactly the resolved return type;
+            // reuse the completed instantiation unless the id diverges.
+            declared_return: signature.declared_return().map(|type_id| {
+                if type_id == signature.return_type() {
+                    instantiated_return
+                } else {
+                    inferred.instantiate(&mut self.types, type_id)
+                }
+            }),
             return_type: instantiated_return,
             declaring_types: signature.declaring_types().to_vec(),
             javascript: signature.javascript(),
@@ -18672,17 +18943,20 @@ mod tests {
     use super::{
         ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
         ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_READONLY, BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME,
-        CANNOT_FIND_TYPE, CONSTRUCTOR_TYPE_PARAMETERS, DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL,
-        DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE, FUNCTION_IMPLEMENTATION_WRONG_NAME,
-        FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
-        MISSING_METHOD_RETURN_TYPE, NAMESPACE_NO_EXPORTED_MEMBER, PROPERTY_NOT_INITIALIZED,
-        PropertyType, SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
-        SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind, SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE,
-        TupleShape, Type, TypeParameterBounds, TypeTable, bind_source,
+        CANNOT_FIND_TYPE, CONSTRUCTOR_TYPE_PARAMETERS, ConstructEntry,
+        DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL, DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE,
+        FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
+        FunctionParameter, FunctionSignature, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
+        MISSING_METHOD_RETURN_TYPE, NAMESPACE_NO_EXPORTED_MEMBER, ObjectType,
+        PROPERTY_NOT_INITIALIZED, PropertyType, SET_ACCESSOR_PARAMETER_INITIALIZER,
+        STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind,
+        SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE, TupleShape, Type, TypeId, TypeParameterBounds,
+        TypeTable, bind_source,
     };
     use crate::diagnostic::Diagnostic;
     use crate::source::{ScriptKind, SourceId, SourceText};
     use crate::syntax::VariableKind;
+    use std::borrow::Cow;
     use std::sync::Arc;
 
     fn source(text: &str) -> Arc<SourceText> {
@@ -21275,5 +21549,392 @@ namespace undefined { export var x = 42; }",
             (2, 7),
             "parameter `n` Decl anchors at the end of `(` in the return type"
         );
+    }
+
+    /// T1: duplicate interface member declarations share one canonical
+    /// symbol while each written occurrence keeps its own declaration node
+    /// and name range.
+    #[test]
+    fn duplicate_interface_members_record_one_occurrence_each() {
+        let (model, diagnostics) = bound("interface I {\n    item: number;\n    item: number;\n}");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == DUPLICATE_DECLARATION),
+            "{diagnostics:?}"
+        );
+        let item = symbol_named(&model, "item");
+        let occurrences = model.declaration_occurrences();
+        assert_eq!(occurrences.len(), 2, "{occurrences:?}");
+        assert_eq!(occurrences[0].symbol, item);
+        assert_eq!(occurrences[1].symbol, item);
+        assert_ne!(occurrences[0].declaration, occurrences[1].declaration);
+        assert_ne!(occurrences[0].name_range, occurrences[1].name_range);
+        for occurrence in occurrences {
+            assert!(
+                occurrence.name_range.start() >= occurrence.declaration_range.start()
+                    && occurrence.name_range.end() <= occurrence.declaration_range.end(),
+                "name range sits inside the member range: {occurrence:?}"
+            );
+        }
+    }
+
+    /// T1: occurrence name ranges are exact UTF-16 spans — quotes included
+    /// for string keys (a non-BMP name counts two units per character),
+    /// digits for numeric keys, and the bracket-delimited `[expr]` span for
+    /// computed keys.
+    #[test]
+    fn interface_member_occurrences_cover_quoted_numeric_and_computed_names() {
+        let text = "interface Q {\n    \"𝒜q\"(x: string): string;\n    42(x: number): number;\n    [ \"Am\" /* key */ ](x: string): string;\n}";
+        let (model, diagnostics) = bound(text);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let occurrences = model.declaration_occurrences();
+        assert_eq!(occurrences.len(), 3, "{occurrences:?}");
+        let source_text = source(text);
+        let utf16_range = |key: &str| {
+            let start = text.find(key).expect("key present");
+            source_text
+                .range(
+                    source_text
+                        .byte_to_utf16(start)
+                        .expect("key start in bounds"),
+                    source_text
+                        .byte_to_utf16(start + key.len())
+                        .expect("key end in bounds"),
+                )
+                .expect("ordered range")
+        };
+        assert_eq!(occurrences[0].name_range, utf16_range("\"𝒜q\""));
+        assert_eq!(occurrences[1].name_range, utf16_range("42"));
+        assert_eq!(
+            occurrences[2].name_range,
+            utf16_range("[ \"Am\" /* key */ ]"),
+            "computed key spans both brackets across interior trivia"
+        );
+        assert_ne!(occurrences[0].symbol, occurrences[1].symbol);
+        assert_ne!(occurrences[1].symbol, occurrences[2].symbol);
+    }
+
+    /// T1: interface signature parameter name nodes map to their bound
+    /// `Parameter` symbols, for method signatures and index signatures.
+    #[test]
+    fn interface_signature_parameter_symbols_key_on_name_nodes() {
+        let (model, diagnostics) =
+            bound("interface I {\n    a(s: string): void;\n    [k: string]: number;\n}");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let map = model.signature_parameter_symbols();
+        for name in ["s", "k"] {
+            let symbol = symbol_named(&model, name);
+            assert_eq!(
+                map.get(&model.symbol(symbol).declaration()),
+                Some(&symbol),
+                "parameter `{name}` name node maps to its symbol"
+            );
+        }
+    }
+
+    /// T1: `declared_return` carries the resolved written annotation and is
+    /// `None` for unannotated signatures; `return_type` is unchanged.
+    #[test]
+    fn interface_method_signature_records_written_return_annotation() {
+        let (model, diagnostics) =
+            bound("interface I {\n    n(x: string): number;\n    u(x: string);\n}");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let interface = type_symbol(&model, "I");
+        let structure = model
+            .types()
+            .interface_structure(interface)
+            .expect("interface structure resolved");
+        let Type::ObjectType(object) = model.types().get(structure) else {
+            panic!("interface structure is an object type");
+        };
+        let member_signature = |name: &str| {
+            let property = object
+                .properties
+                .iter()
+                .find(|property| property.name() == name)
+                .unwrap_or_else(|| panic!("member `{name}`"));
+            let Type::Function(signature) = model.types().get(property.type_id()) else {
+                panic!("member `{name}` is a function");
+            };
+            signature.clone()
+        };
+        let annotated = member_signature("n");
+        assert_eq!(annotated.declared_return(), Some(model.types().number()));
+        assert_eq!(annotated.return_type(), model.types().number());
+        let unannotated = member_signature("u");
+        assert_eq!(unannotated.declared_return(), None);
+    }
+
+    /// T1: `declared_return` participates in signature identity — two
+    /// signatures differing only in their written annotation intern
+    /// distinctly, while identical unannotated signatures dedup. This pins
+    /// the interning surface only; the same-semantic distinction lands with
+    /// projection in T4a.
+    #[test]
+    fn declared_return_participates_in_signature_identity() {
+        let mut table = TypeTable::new();
+        let string = table.string();
+        let number = table.number();
+        let undefined = table.undefined_type();
+        let number_or_undefined = table.union(&[number, undefined]);
+        let signature = |declared_return| FunctionSignature {
+            type_parameters: Vec::new(),
+            type_parameter_bounds: Vec::new(),
+            parameters: vec![FunctionParameter::new("x".to_owned(), string, false, false)],
+            return_type: number,
+            declared_return,
+            declaring_types: Vec::new(),
+            javascript: false,
+        };
+        let annotated = signature(Some(number));
+        let distinct = signature(Some(number_or_undefined));
+        assert!(
+            ![annotated.clone()].contains(&distinct),
+            "distinct written annotations intern distinctly"
+        );
+        assert_ne!(
+            table.function_signature(annotated),
+            table.function_signature(distinct),
+            "distinct written annotations intern to distinct types"
+        );
+        let unannotated = signature(None);
+        let identical = signature(None);
+        assert!(
+            [unannotated.clone()].contains(&identical),
+            "identical unannotated signatures dedup"
+        );
+        assert_eq!(
+            table.function_signature(unannotated),
+            table.function_signature(identical)
+        );
+    }
+
+    /// T1 (Main 1): parameter labels participate in signature identity, so
+    /// `(a: string)` / `(b: string)` / `(c: string)` spellings intern
+    /// distinctly and their labels survive end to end.
+    #[test]
+    fn parameter_labels_intern_distinctly_in_merged_method_groups() {
+        let (model, diagnostics) = bound(
+            "interface I {\n    m(a: string): void;\n    m(b: string): void;\n    m(c: string): void;\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let interface = type_symbol(&model, "I");
+        let structure = model
+            .types()
+            .interface_structure(interface)
+            .expect("interface structure resolved");
+        let Type::ObjectType(object) = model.types().get(structure) else {
+            panic!("interface structure is an object type");
+        };
+        let property = object
+            .properties
+            .iter()
+            .find(|property| property.name() == "m")
+            .expect("merged method member");
+        let Type::Intersection(members) = model.types().get(property.type_id()) else {
+            panic!("three distinctly labelled overloads form an intersection");
+        };
+        assert_eq!(members.len(), 3);
+        assert!(
+            members[0] != members[1] && members[1] != members[2],
+            "distinct labels intern to distinct types"
+        );
+        let names: Vec<String> = members
+            .iter()
+            .map(|&member| {
+                let Type::Function(signature) = model.types().get(member) else {
+                    panic!("overload member is a function");
+                };
+                signature.parameters()[0].name().to_owned()
+            })
+            .collect();
+        assert_eq!(names, ["a", "b", "c"], "parameter labels survive interning");
+    }
+
+    /// T1: `TypeTable::overload_signatures` keys on structural purity, never
+    /// on candidate order — a function yields one borrowed signature, a pure
+    /// callable yields its declaration-order signatures, mixed and
+    /// constructor-bearing objects yield `None`, and intersections flatten
+    /// in declaration order with duplicates preserved.
+    #[test]
+    fn overload_signatures_view_keys_on_purity_not_candidate_order() {
+        let mut table = TypeTable::new();
+        let string = table.string();
+        let number = table.number();
+        let boolean = table.boolean();
+        let void = table.void();
+        let function = |table: &mut TypeTable, name: &str, parameter: TypeId, result: TypeId| {
+            table.function_with_parameters(
+                Vec::new(),
+                vec![FunctionParameter::new(
+                    name.to_owned(),
+                    parameter,
+                    false,
+                    false,
+                )],
+                result,
+            )
+        };
+        let first = function(&mut table, "a", string, number);
+        let second = function(&mut table, "b", number, boolean);
+        let third = function(&mut table, "c", string, void);
+        let signature_of = |table: &TypeTable, type_id| {
+            let Type::Function(signature) = table.get(type_id) else {
+                panic!("function type");
+            };
+            signature.clone()
+        };
+        let first_sig = signature_of(&table, first);
+        let second_sig = signature_of(&table, second);
+        let third_sig = signature_of(&table, third);
+
+        // A bare function yields its single signature, borrowed.
+        match table.overload_signatures(first) {
+            Some(Cow::Borrowed(signatures)) => {
+                assert_eq!(signatures, std::slice::from_ref(&first_sig));
+            }
+            other => panic!("function yields one borrowed signature: {other:?}"),
+        }
+
+        // A pure callable yields its declaration-order signatures, borrowed.
+        let pure = table.object_type_with_members(ObjectType {
+            properties: Vec::new(),
+            call_signatures: vec![first_sig.clone(), second_sig.clone()],
+            call_candidate_order: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        });
+        match table.overload_signatures(pure) {
+            Some(Cow::Borrowed(signatures)) => {
+                assert_eq!(
+                    signatures,
+                    [first_sig.clone(), second_sig.clone()].as_slice()
+                );
+            }
+            other => panic!("pure callable yields borrowed declaration order: {other:?}"),
+        }
+
+        // Candidate order participates in object identity; empty is the
+        // identity permutation.
+        let ordered = table.with_call_candidate_order(pure, vec![1, 0]);
+        assert_ne!(ordered, pure, "candidate order participates in identity");
+        assert_eq!(
+            table.with_call_candidate_order(pure, Vec::new()),
+            pure,
+            "empty order is the identity"
+        );
+
+        // Mixed callables and constructor-bearing objects are not pure.
+        let mixed = table.object_type_with_members(ObjectType {
+            properties: vec![PropertyType::new("extra", false, string)],
+            call_signatures: vec![first_sig.clone()],
+            call_candidate_order: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        });
+        assert!(table.overload_signatures(mixed).is_none());
+        let constructed = table.object_type_with_members(ObjectType {
+            properties: Vec::new(),
+            call_signatures: vec![first_sig.clone()],
+            call_candidate_order: Vec::new(),
+            construct_signatures: vec![ConstructEntry {
+                signature: second_sig.clone(),
+                is_abstract: false,
+            }],
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        });
+        assert!(table.overload_signatures(constructed).is_none());
+
+        // An intersection of functions flattens in declaration order.
+        let pair = table.intersection_ordered(vec![first, second]);
+        match table.overload_signatures(pair) {
+            Some(Cow::Owned(signatures)) => {
+                assert_eq!(
+                    signatures.as_slice(),
+                    [first_sig.clone(), second_sig.clone()]
+                );
+            }
+            other => panic!("intersection flattens in declaration order: {other:?}"),
+        }
+
+        // A pure callable group inside an intersection flattens in
+        // declaration order even when it carries a candidate order.
+        let grouped = table.intersection_ordered(vec![ordered, third]);
+        match table.overload_signatures(grouped) {
+            Some(Cow::Owned(signatures)) => {
+                assert_eq!(
+                    signatures.as_slice(),
+                    [first_sig.clone(), second_sig.clone(), third_sig.clone()],
+                    "declaration order, duplicates preserved, no candidate-order rejection"
+                );
+            }
+            other => panic!("callable group flattens through the view: {other:?}"),
+        }
+    }
+
+    /// T1: the import copy path carries a callable object type's candidate
+    /// order positionally — the same permutation, never a recomputed or
+    /// identity fallback.
+    #[test]
+    fn import_copy_preserves_call_candidate_order_positionally() {
+        let mut source_table = TypeTable::new();
+        let string = source_table.string();
+        let number = source_table.number();
+        let boolean = source_table.boolean();
+        let signature = |table: &mut TypeTable, name: &str, parameter: TypeId, result: TypeId| {
+            let type_id = table.function_with_parameters(
+                Vec::new(),
+                vec![FunctionParameter::new(
+                    name.to_owned(),
+                    parameter,
+                    false,
+                    false,
+                )],
+                result,
+            );
+            let Type::Function(signature) = table.get(type_id) else {
+                panic!("function type");
+            };
+            signature.clone()
+        };
+        let first = signature(&mut source_table, "a", string, number);
+        let second = signature(&mut source_table, "b", number, boolean);
+        let third = signature(&mut source_table, "c", boolean, string);
+        let group = source_table.object_type_with_members(ObjectType {
+            properties: Vec::new(),
+            call_signatures: vec![first, second, third],
+            call_candidate_order: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        });
+        let ordered = source_table.with_call_candidate_order(group, vec![2, 0, 1]);
+
+        let mut target = TypeTable::new();
+        let mut next_symbol = 1_000;
+        let (imported, _) = target.import_type(
+            &source_table,
+            ordered,
+            &[],
+            &mut super::ImportedTypeMap::default(),
+            &mut next_symbol,
+        );
+        let Type::ObjectType(object) = target.get(imported) else {
+            panic!("imported type is the callable object");
+        };
+        assert_eq!(object.call_candidate_order, vec![2, 0, 1]);
+        assert_eq!(object.call_signatures.len(), 3);
     }
 }
