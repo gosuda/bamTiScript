@@ -13,7 +13,7 @@ jobs:
       github.event.pull_request.number == 199 &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.head.ref == 'diamond/walker-lockstep-pins'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
       - name: Checkout exact PR head
@@ -68,7 +68,7 @@ jobs:
       github.event.pull_request.number == 199 &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.head.ref == 'diamond/walker-lockstep-pins'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
       contents: write
