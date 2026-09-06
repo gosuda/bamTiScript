@@ -53,14 +53,14 @@ use std::fmt;
 use bamts_bytecode::EcmaString;
 use bamts_cancel::{CancellationToken, Cancelled};
 
+pub use binder::{
+    DeclarationOccurrence, PropertyType, Scope, ScopeId, ScopeKind, SemanticModel, Symbol,
+    SymbolId, SymbolKind, Type, TypeId, TypeTable,
+};
 pub(crate) use binder::{
     ImportedSymbolType, bind_source_with_cancel, bind_source_with_environment_and_cancel,
     bind_source_with_environment_and_imports_with_cancel, is_numeric_enum_initializer,
     source_is_module,
-};
-pub use binder::{
-    PropertyType, Scope, ScopeId, ScopeKind, SemanticModel, Symbol, SymbolId, SymbolKind, Type,
-    TypeId, TypeTable,
 };
 pub use inference::{
     InferenceContext, InferenceParameter, InferencePriority, InferenceProvenance,

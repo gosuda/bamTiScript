@@ -427,6 +427,7 @@ impl InferredTypeArguments {
                 table.object_type_with_members(ObjectType {
                     properties,
                     call_signatures,
+                    call_candidate_order: Vec::new(),
                     construct_signatures,
                     index_signatures,
                     generator_return,

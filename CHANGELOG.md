@@ -45,6 +45,15 @@ version has shipped, and no tag or stable package exists while any gate in
   previously forbade an authored root changelog; that clause is updated to require
   this file carry in-progress entries only, so no line here asserts a release.
 
+- Interface binding now records additive metadata for the identity and
+  overload work ahead: per-member declaration occurrences, signature
+  parameter symbols, call-candidate order, and written return-type
+  provenance, plus a purity-guarded overload-signature view. Parameter
+  labels and declared returns now participate in signature identity, so
+  `(a: string)` and `(b: string)` spellings intern distinctly. No consumer
+  reads the new surfaces yet; rendered output and relation checks are
+  unchanged.
+
 ### Known incomplete
 
 - F3.2 (final TypeScript-product release gate and tag evidence) is blocked: the
