@@ -12,6 +12,9 @@ version has shipped, and no tag or stable package exists while any gate in
 - Property definition and reference navigation now uses the same property
   identities as rename. Package API and LSP results keep unrelated objects
   separate, and LSP reference filtering respects declaration locations.
+- API startup now duplicates inherited standard input instead of reopening
+  `/dev/stdin`. Node-spawned socket input works with the existing reader
+  cancellation and shutdown path.
 
 - `docs/release/runbook.md`: F3.1 completion runbook reconciled with the completion
   evidence program. The completion-gate ritual is the verified CLI surface:
