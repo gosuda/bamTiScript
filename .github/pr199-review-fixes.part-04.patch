@@ -1,0 +1,96 @@
++            declare function laterKey(): string; \
++            declare function after(): number; \
++            declare function finish(): void; \
++            function* g() { \
++                const left = before(), C = class { [yield key()]() {} }, \
++                    middle = between(), D = class { [yield laterKey()]() {} }, \
++                    right = after(); \
++                finish(); return [left, C, middle, D, right]; \
++            }";
++        for target in [ScriptTarget::Es2015, ScriptTarget::Es2016] {
++            let output = pr199_emit_at(source, target);
++            assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
++            let code = &javascript(&output).code;
++            let positions = [
++                "before()", "key()", "C =", "between()", "laterKey()", "D =",
++                "after()", "finish()",
++            ]
++            .map(|needle| {
++                assert_eq!(code.matches(needle).count(), 1, "{needle}: {code}");
++                code.find(needle).expect("one occurrence")
++            });
++            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{code}");
++        }
++    }
++
++    #[test]
++    fn pr199_async_native_declarations_do_not_lose_key_awaits() {
++        let source = "declare function before(): number; \
++            declare function key(): string; declare function after(): number; \
++            async function g() { \
++                const left = before(), C = class { [await key()]() {} }, right = after(); \
++                return [left, C, right]; \
++            }";
++        let output = pr199_emit_at(source, ScriptTarget::Es2015);
++        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
++        let code = &javascript(&output).code;
++        let positions = ["before()", "key()", "C =", "after()"].map(|needle| {
++            assert_eq!(code.matches(needle).count(), 1, "{needle}: {code}");
++            code.find(needle).expect("one occurrence")
++        });
++        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{code}");
++        assert!(code.contains("yield"), "await must survive as a suspension: {code}");
++        assert!(!code.contains("await key()"), "raw await leaked: {code}");
++    }
++
+     #[test]
+     fn es5_async_for_update_increment_lowers() {
+         // Synthetic probe pinning the walker/machine contract: a for-update
+diff --git a/crates/bamts-compiler/src/emitter/transforms.rs b/crates/bamts-compiler/src/emitter/transforms.rs
+--- a/crates/bamts-compiler/src/emitter/transforms.rs
++++ b/crates/bamts-compiler/src/emitter/transforms.rs
+@@ -1696,9 +1696,3 @@
+         let zero = self.number_expr("0");
+         let counter_decl = self.make_declarator(counter.clone(), Some(zero), range);
+-        let source_decl = self.make_declarator(source.clone(), Some(iterable), range);
+-        let initializer = ForInitializer::Variable(VariableDeclaration {
+-            range,
+-            kind: VariableKind::Var,
+-            declarations: vec![counter_decl, source_decl],
+-        });
+         let counter_expr = self.node(counter.range(), Expression::Identifier(counter.clone()));
+@@ -1743,4 +1737,3 @@
+                 } else {
+-                    let iterable = for_of.iterable.as_ref().clone();
+                     let body = self.rewrite_single_statement(&for_of.body);
+                     return vec![self.node(
+@@ -1760,4 +1753,3 @@
+             target @ ForBinding::Target(_) => {
+-                let iterable = for_of.iterable.as_ref().clone();
+                 let body = self.rewrite_single_statement(&for_of.body);
+                 return vec![self.node(
+@@ -1774,3 +1766,9 @@
+         };
++        let source_decl = self.make_declarator(source.clone(), Some(iterable), range);
++        let initializer = ForInitializer::Variable(VariableDeclaration {
++            range,
++            kind: VariableKind::Var,
++            declarations: vec![counter_decl, source_decl],
++        });
+         // The binding declaration must itself lower (pattern bindings,
+         // defaults) - route it through the statement rewriter.
+@@ -1817,15 +1815,36 @@
+         if !Self::needs(LanguageFeature::Destructuring, self.options) {
+-            let declarations = declaration
+-                .declarations
+-                .iter()
+-                .map(|declarator| self.rewrite_declarator_initializer(declarator))
+-                .collect();
+-            return vec![self.node(
++            let outer_key_prelude = std::mem::take(&mut self.key_prelude);
++            let mut statements = Vec::new();
++            let mut declarations = Vec::with_capacity(declaration.declarations.len());
++            for declarator in &declaration.declarations {
++                let rewritten = self.rewrite_declarator_initializer(declarator);
++                let prelude = std::mem::take(&mut self.key_prelude);
++                if !prelude.is_empty() {

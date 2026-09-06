@@ -1,0 +1,106 @@
++        let jump = authority_source("breakTarget6.ts");
+         assert_eq!(
+             checker_codes(&check_text(&jump)),
+@@ -6126,7 +6102,3 @@
+         // TS1107: the label exists, but in an enclosing function.
+-        let crosses = std::fs::read_to_string(root.join(concat!(
+-            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
+-            "breakTarget5.ts"
+-        )))
+-        .unwrap();
++        let crosses = authority_source("breakTarget5.ts");
+         assert_eq!(
+@@ -6146,3 +6118,6 @@
++    /// TS2371: only an implementation may carry parameter defaults. The
++    /// oracle (defaultValueInConstructorOverload1) is exactly one row on a
++    /// constructor overload signature.
+     #[test]
+     fn parameter_initializer_only_in_implementation() {
+         assert_eq!(
+@@ -6165,8 +6140,3 @@
+-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+-        let source = std::fs::read_to_string(root.join(concat!(
+-            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
+-            "defaultValueInConstructorOverload1.ts"
+-        )))
+-        .unwrap();
++        let source = authority_source("defaultValueInConstructorOverload1.ts");
+         assert_eq!(
+             checker_codes(&check_text(&source)),
+@@ -6177,3 +6147,6 @@
++    /// The superAccess es5 baseline swaps each TS2855 field row for the
++    /// single pre-fields rule TS2340; the static row stays TS2576 at both
++    /// targets.
+     #[test]
+     fn super_field_flavor_splits_by_target() {
+         let source = "class MyBase {
+@@ -6241,9 +6214,4 @@
+         // The authority file itself: es5 swaps both field rows for TS2340
+         // and keeps the static row at TS2576.
+-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+-        let source =
+-            std::fs::read_to_string(root.join(
+-                "target/authority/typescript-7.0.2-tests/tests/cases/compiler/superAccess.ts",
+-            ))
+-            .unwrap();
++        let source = authority_source("superAccess.ts");
+         let oracle_es5 = checker_codes(&check_text_with(
+@@ -6411,8 +6379,3 @@
+     fn super_field_via_super_matches_baseline_count() {
+-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+-        let source = std::fs::read_to_string(root.join(concat!(
+-            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
+-            "checkSuperCallBeforeThisAccess.ts"
+-        )))
+-        .unwrap();
++        let source = authority_source("checkSuperCallBeforeThisAccess.ts");
+         let count = checker_codes(&check_text(&source))
+@@ -6428,8 +6391,5 @@
+         for variant in ["2", "5", "8"] {
+-            let variant_source = std::fs::read_to_string(
+-                root.join(format!(
+-                    "target/authority/typescript-7.0.2-tests/tests/cases/compiler/checkSuperCallBeforeThisAccessing{variant}.ts"
+-                )),
+-            )
+-            .unwrap();
++            let variant_source = authority_source(&format!(
++                "checkSuperCallBeforeThisAccessing{variant}.ts"
++            ));
+             let codes = checker_codes(&check_text(&variant_source));
+@@ -6519,3 +6479,7 @@
++    /// TS17009/TS17011: a derived constructor's `this` and `super.x`
++    /// accesses before a guaranteed `super()` call, with the oracle's
++    /// flow shapes: arrows are exempt (deferred `this`), a conditional
++    /// super() covers only its branch, and loops/try never guarantee.
+     #[test]
+     fn super_before_this_flow_matrix() {
+         fn codes(text: &str) -> Vec<&'static str> {
+@@ -6574,3 +6538,78 @@
++    #[test]
++    fn pr199_super_flow_joins_every_continuing_path() {
++        for (body, safe) in [
++            ("if (c) { super(); } else { super(); }", true),
++            ("if (c) { throw 0; } else { super(); }", true),
++            ("if (c) { super(); } else { throw 0; }", true),
++            ("if (c) { return { method() {} }; } else { super(); }", true),
++            ("super(); if (c) {} else {}", true),
++            ("if (c) { if (c) { super(); } else { super(); } } else { super(); }", true),
++            ("if (c) { super(); }", false),
++            ("if (c) {} else { super(); }", false),
++        ] {
++            let source = format!(
++                "class B {{ method() {{}} }} \
++                 class D extends B {{ constructor(c: boolean) {{ \
++                 {body} this; super.method(); }} }}"
++            );
++            let mut codes = checker_codes(&check_text(&source))
++                .into_iter()
++                .filter(|code| {
++                    *code == SUPER_BEFORE_THIS.as_str()
++                        || *code == SUPER_BEFORE_SUPER_PROPERTY.as_str()
++                })
++                .collect::<Vec<_>>();
++            codes.sort_unstable();
++            let expected = if safe {
++                Vec::new()
++            } else {
