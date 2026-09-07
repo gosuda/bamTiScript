@@ -12041,8 +12041,10 @@ impl<'src> Binder<'src> {
                 let derived = self.class_derived_stack.last().copied().unwrap_or(false);
                 self.super_member_homes
                     .push(SuperMemberHome::ClassMember { derived });
+                self.push_label_scope();
                 self.bind_statements(&block.data().statements, child);
                 self.resolve_statements(&block.data().statements, child);
+                self.pop_label_scope();
                 let popped_home = self.super_member_homes.pop();
                 debug_assert_eq!(popped_home, Some(SuperMemberHome::ClassMember { derived }));
                 self.new_target_contexts.truncate(new_target_marker);

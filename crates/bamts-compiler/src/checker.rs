@@ -6611,8 +6611,13 @@ function check(options: Options = {}) {
                 "L: { class C { constructor() { break L; } } break L; }",
                 Some(BREAK_TARGET_CROSSES_FUNCTION.as_str()),
             ),
+            (
+                "L: { class C { static { break L; } } break L; }",
+                Some(BREAK_TARGET_CROSSES_FUNCTION.as_str()),
+            ),
             ("const f = () => { local: {} }; local: {}", None),
             ("class C { constructor() { local: {} } } local: {}", None),
+            ("class C { static { local: {} } } local: {}", None),
             ("L: {} break L;", Some(BREAK_TARGET_NOT_ENCLOSING.as_str())),
             (
                 "while (true) { break missing; }",
