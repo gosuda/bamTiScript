@@ -26,6 +26,10 @@ pub(crate) enum Lib {
     /// `lib.es2015.*.d.ts` — Proxy, Reflect, Map, Set, Symbol, Promise,
     /// Iterable, Iterator, Generator, and friends.
     Es2015,
+    /// `lib.es2015.core.d.ts` — refinements to existing globals, notably the
+    /// `DateConstructor` overload accepting a `Date` instance; no new
+    /// top-level globals.
+    Es2015Core,
     /// `lib.es2017.sharedmemory.d.ts` — `Atomics`, `SharedArrayBuffer`.
     Es2017SharedMemory,
     /// `lib.es2018.asynciterable.d.ts`, `lib.es2018.asyncgenerator.d.ts` —
@@ -78,7 +82,7 @@ impl LibSet {
     pub(crate) const EMPTY: Self = Self(0);
 
     /// The set containing every category — used when lib scoping is disabled.
-    pub(crate) const ALL: Self = Self((1 << 17) - 1);
+    pub(crate) const ALL: Self = Self((1 << 18) - 1);
 
     #[must_use]
     pub(crate) const fn contains(self, lib: Lib) -> bool {
@@ -105,7 +109,7 @@ impl LibSet {
             .with(Lib::WebworkerImportscripts)
             .with(Lib::Scripthost);
         if (target as u8) >= (ScriptTarget::Es2015 as u8) {
-            set = set.with(Lib::Es2015);
+            set = set.with(Lib::Es2015).with(Lib::Es2015Core);
         }
         if (target as u8) >= (ScriptTarget::Es2017 as u8) {
             set = set.with(Lib::Es2017SharedMemory);
@@ -144,21 +148,23 @@ impl LibSet {
                     set = set.with(Lib::Es5);
                 }
                 "es6" | "es2015" => {
-                    set = set.with(Lib::Es5).with(Lib::Es2015);
+                    set = set.with(Lib::Es5).with(Lib::Es2015).with(Lib::Es2015Core);
                 }
                 "es7" | "es2016" => {
-                    set = set.with(Lib::Es5).with(Lib::Es2015);
+                    set = set.with(Lib::Es5).with(Lib::Es2015).with(Lib::Es2015Core);
                 }
                 "es2017" => {
                     set = set
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
+                        .with(Lib::Es2015Core)
                         .with(Lib::Es2017SharedMemory);
                 }
                 "es2018" => {
                     set = set
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
+                        .with(Lib::Es2015Core)
                         .with(Lib::Es2017SharedMemory)
                         .with(Lib::Es2018AsyncIterable);
                 }
@@ -166,6 +172,7 @@ impl LibSet {
                     set = set
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
+                        .with(Lib::Es2015Core)
                         .with(Lib::Es2017SharedMemory)
                         .with(Lib::Es2018AsyncIterable)
                         .with(Lib::Es2019Array);
@@ -174,6 +181,7 @@ impl LibSet {
                     set = set
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
+                        .with(Lib::Es2015Core)
                         .with(Lib::Es2017SharedMemory)
                         .with(Lib::Es2018AsyncIterable)
                         .with(Lib::Es2019Array)
@@ -183,6 +191,7 @@ impl LibSet {
                     set = set
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
+                        .with(Lib::Es2015Core)
                         .with(Lib::Es2017SharedMemory)
                         .with(Lib::Es2018AsyncIterable)
                         .with(Lib::Es2019Array)
@@ -194,6 +203,7 @@ impl LibSet {
                     set = set
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
+                        .with(Lib::Es2015Core)
                         .with(Lib::Es2017SharedMemory)
                         .with(Lib::Es2018AsyncIterable)
                         .with(Lib::Es2019Array)
@@ -205,6 +215,7 @@ impl LibSet {
                     set = set
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
+                        .with(Lib::Es2015Core)
                         .with(Lib::Es2017SharedMemory)
                         .with(Lib::Es2018AsyncIterable)
                         .with(Lib::Es2019Array)
@@ -218,6 +229,7 @@ impl LibSet {
                     set = set
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
+                        .with(Lib::Es2015Core)
                         .with(Lib::Es2017SharedMemory)
                         .with(Lib::Es2018AsyncIterable)
                         .with(Lib::Es2019Array)
@@ -242,10 +254,15 @@ impl LibSet {
                 "es2017.sharedmemory" => {
                     set = set.with(Lib::Es2017SharedMemory);
                 }
+                // `es2015.core` refines existing interfaces (notably the
+                // `DateConstructor` value overload) without declaring new
+                // top-level globals.
+                "es2015.core" => {
+                    set = set.with(Lib::Es2015Core);
+                }
                 // Sub-lib stems that refine existing interfaces but declare no
                 // new top-level globals beyond what the parent lib provides.
-                "es2015.core"
-                | "es2015.generator"
+                "es2015.generator"
                 | "es2015.iterable"
                 | "es2015.promise"
                 | "es2015.proxy"
