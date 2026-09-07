@@ -160,7 +160,7 @@ impl Binder<'_> {
         self.class_instance_types.insert(type_symbol, instance);
         self.class_instance_types.insert(value_symbol, instance);
 
-        let value = if self.intrinsics.has_lib(Lib::Es2015) {
+        let value = if self.intrinsics.has_lib(Lib::Es2015DateCore) {
             self.types.union(&[number, string, instance])
         } else {
             self.types.union(&[number, string])
@@ -446,6 +446,24 @@ mod tests {
             panic!("Date(value) must expose a union parameter");
         };
         assert_eq!(es2015_members.len(), 3);
+
+          let (core_model, core_diagnostics) = bound_with_libs(
+              "declare const d: Date;",
+              LibSet::from_lib_names(&["es5", "es2015.core"]),
+          );
+          assert!(core_diagnostics.is_empty(), "{core_diagnostics:?}");
+          let core_constructor = core_model.symbol_type(value_symbol(&core_model, "Date"));
+          let Type::ObjectType(core_constructor) = core_model.types().get(core_constructor) else {
+              panic!("Date value must expose an object constructor type");
+          };
+          let core_value_parameter = core_constructor.construct_signatures[1]
+              .signature
+              .parameters()[0]
+              .type_id();
+          let Type::Union(core_members) = core_model.types().get(core_value_parameter) else {
+              panic!("Date(value) must expose a union parameter");
+          };
+          assert_eq!(core_members.len(), 3);
     }
 
     #[test]

@@ -26,6 +26,10 @@ pub(crate) enum Lib {
     /// `lib.es2015.*.d.ts` — Proxy, Reflect, Map, Set, Symbol, Promise,
     /// Iterable, Iterator, Generator, and friends.
     Es2015,
+    /// The Date constructor overload declared by `lib.es2015.core.d.ts`.
+    /// This is tracked separately because the core fragment does not enable
+    /// the other ES2015 globals.
+    Es2015DateCore,
     /// `lib.es2017.sharedmemory.d.ts` — `Atomics`, `SharedArrayBuffer`.
     Es2017SharedMemory,
     /// `lib.es2018.asynciterable.d.ts`, `lib.es2018.asyncgenerator.d.ts` —
@@ -78,7 +82,7 @@ impl LibSet {
     pub(crate) const EMPTY: Self = Self(0);
 
     /// The set containing every category — used when lib scoping is disabled.
-    pub(crate) const ALL: Self = Self((1 << 17) - 1);
+    pub(crate) const ALL: Self = Self((1 << 18) - 1);
 
     #[must_use]
     pub(crate) const fn contains(self, lib: Lib) -> bool {
@@ -105,7 +109,7 @@ impl LibSet {
             .with(Lib::WebworkerImportscripts)
             .with(Lib::Scripthost);
         if (target as u8) >= (ScriptTarget::Es2015 as u8) {
-            set = set.with(Lib::Es2015);
+            set = set.with(Lib::Es2015).with(Lib::Es2015DateCore);
         }
         if (target as u8) >= (ScriptTarget::Es2017 as u8) {
             set = set.with(Lib::Es2017SharedMemory);
@@ -139,12 +143,35 @@ impl LibSet {
         let mut set = Self::EMPTY.with(Lib::Always).with(Lib::DecoratorsLegacy);
         for name in names {
             let lower = name.as_ref().to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "es6"
+                    | "es2015"
+                    | "es7"
+                    | "es2016"
+                    | "es2017"
+                    | "es2018"
+                    | "es2019"
+                    | "es2020"
+                    | "es2021"
+                    | "es2022"
+                    | "es2023"
+                    | "es2024"
+                    | "es2025"
+                    | "esnext"
+                    | "es2015.core"
+            ) {
+                set = set.with(Lib::Es2015DateCore);
+            }
             match lower.as_str() {
                 "es5" | "es3" => {
                     set = set.with(Lib::Es5);
                 }
                 "es6" | "es2015" => {
-                    set = set.with(Lib::Es5).with(Lib::Es2015);
+                    set = set
+                        .with(Lib::Es5)
+                        .with(Lib::Es2015)
+                        .with(Lib::Es2015DateCore);
                 }
                 "es7" | "es2016" => {
                     set = set.with(Lib::Es5).with(Lib::Es2015);
