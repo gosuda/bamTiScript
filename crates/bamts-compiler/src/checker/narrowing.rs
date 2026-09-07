@@ -282,7 +282,6 @@ pub fn flow_key_of(expression: &Expr, resolver: &dyn GuardResolver) -> Option<Fl
 /// `FlowPointId` belongs to this graph and is deliberately distinct from the
 /// public [`FlowNodeId`] arena used by the older typed narrowing algebra.
 #[derive(Clone, Debug, Default)]
-#[expect(dead_code, reason = "flow graph awaits demand-scheduler wiring")]
 pub(crate) struct ProgramFlow {
     pub(crate) points: HashMap<ExecutionPoint, FlowPointId>,
     pub(crate) nodes: Vec<ProgramFlowNode>,
@@ -292,10 +291,6 @@ pub(crate) struct ProgramFlow {
     pub(crate) roots: Vec<FlowPointId>,
 }
 
-#[expect(
-    dead_code,
-    reason = "flow-graph builders serve only the unwired demand pass"
-)]
 impl ProgramFlow {
     #[must_use]
     pub(crate) fn new() -> Self {
@@ -350,7 +345,6 @@ impl ProgramFlow {
 
 /// One syntax/control node in [`ProgramFlow`].
 #[derive(Clone, Debug)]
-#[expect(dead_code, reason = "node fields read only by the unwired demand pass")]
 pub(crate) struct ProgramFlowNode {
     pub(crate) point: ExecutionPoint,
     pub(crate) boundary: ScopeId,
@@ -383,19 +377,11 @@ pub(crate) enum FlowEdgeKind {
     Finally,
 }
 
-#[expect(
-    dead_code,
-    reason = "used only by unwired definite-assignment analysis"
-)]
 fn is_entry_operation(node: &ProgramFlowNode) -> bool {
     matches!(node.operation, FlowOperation::Entry)
         && matches!(node.point.boundary, ExecutionBoundary::Entry)
 }
 
-#[expect(
-    dead_code,
-    reason = "used only by unwired definite-assignment analysis"
-)]
 fn is_assignment_transfer_edge(kind: FlowEdgeKind, target_is_join: bool) -> bool {
     match kind {
         FlowEdgeKind::Sequential
@@ -496,10 +482,6 @@ pub(crate) struct RootFlowPacket {
 
 /// Definite-assignment lattice values.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[expect(
-    dead_code,
-    reason = "used only by unwired definite-assignment analysis"
-)]
 pub(crate) enum AssignmentState {
     Assigned,
     Unassigned,
@@ -508,10 +490,6 @@ pub(crate) enum AssignmentState {
 /// Reachability is kept separate from assignment so unreachable arms cannot
 /// contaminate a meet.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[expect(
-    dead_code,
-    reason = "used only by unwired definite-assignment analysis"
-)]
 pub(crate) enum AssignmentReachability {
     Unreachable,
     Reachable(AssignmentState),
@@ -553,10 +531,6 @@ impl AssignmentAnalysis {
 
 /// One root's entry seed for definite-assignment analysis.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[expect(
-    dead_code,
-    reason = "used only by unwired definite-assignment analysis"
-)]
 pub(crate) struct AssignmentRoot {
     pub(crate) symbol: SymbolId,
     pub(crate) boundary: ScopeId,
@@ -566,7 +540,6 @@ pub(crate) struct AssignmentRoot {
 
 /// A use-site record consumed by the check-owned C038 predicate.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[expect(dead_code, reason = "used only by unwired C038 use-site check")]
 pub(crate) struct AssignmentUse {
     pub(crate) symbol: SymbolId,
     pub(crate) point: FlowPointId,
@@ -577,10 +550,6 @@ pub(crate) struct AssignmentUse {
     pub(crate) final_type: TypeId,
 }
 
-#[expect(
-    dead_code,
-    reason = "used only by unwired definite-assignment analysis"
-)]
 const fn assignment_meet(left: AssignmentState, right: AssignmentState) -> AssignmentState {
     match (left, right) {
         (AssignmentState::Assigned, AssignmentState::Assigned) => AssignmentState::Assigned,
@@ -588,19 +557,11 @@ const fn assignment_meet(left: AssignmentState, right: AssignmentState) -> Assig
     }
 }
 
-#[expect(
-    dead_code,
-    reason = "used only by unwired definite-assignment analysis"
-)]
 fn point_index(point: FlowPointId, len: usize) -> Option<usize> {
     let index = usize::try_from(point.get()).ok()?;
     (index < len).then_some(index)
 }
 
-#[expect(
-    dead_code,
-    reason = "used only by unwired definite-assignment analysis"
-)]
 fn point_id(index: usize) -> FlowPointId {
     FlowPointId::new(u32::try_from(index).expect("flow point count fits in u32"))
 }
@@ -616,7 +577,6 @@ fn point_id(index: usize) -> FlowPointId {
 /// states are only ever propagated between same-boundary points (per root),
 /// and the value's per-boundary scoping guarantees are documented on the
 /// type.
-#[expect(dead_code, reason = "awaits checker-side demand wiring")]
 pub(crate) fn analyze_definite_assignment(
     flow: &ProgramFlow,
     roots: &[AssignmentRoot],

@@ -9196,8 +9196,10 @@ impl<'src> Binder<'src> {
         )?;
         self.resolve_statement_class_bounds(statements);
         self.check_cancel()?;
+        self.build_program_flow()?;
         self.resolve_statements(statements, scope);
         self.check_cancel()?;
+        self.emit_definite_assignment_uses()?;
         self.validate_pending_constraints();
         self.validate_alias_cycles();
         self.check_export_assignment_conflicts();
@@ -25086,10 +25088,6 @@ impl<'src> Binder<'src> {
         }
     }
 
-    #[expect(
-        dead_code,
-        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
-    )]
     pub(crate) fn check_definite_assignment_use(
         &mut self,
         usage: super::narrowing::AssignmentUse,
@@ -25117,6 +25115,180 @@ impl<'src> Binder<'src> {
             }
         }
         Ok(())
+    }
+
+    /// Drives the memo-backed C038 predicate for this boundary's resolved
+    /// identifier uses. The boundary's analysis is computed once, on the
+    /// first pass over its uses, and the memo entry is reused for every
+    /// later use.
+    ///
+    /// Eligibility is decided here and carried on the `AssignmentUse`: the
+    /// symbol must be a tracked uninitialized binding (non-ambient `let`/`var`
+    /// without initializer, so type-only aliases and every other category
+    /// never produce a use), declared at this boundary, under strictNullChecks,
+    /// with a final type that excludes `undefined` and is neither ordinary
+    /// `any` nor a terminal cycle-any. The use point is the enclosing
+    /// top-level statement's `ProgramFlow` node, so a reference nested inside
+    /// a foreign boundary still reaches the predicate and declines there on
+    /// the memo's boundary keying instead of by construction.
+    ///
+    /// Liveness is carried from the resolution walk: a use the walk reported
+    /// is already owned by the legacy C038 emission for this exact range, and
+    /// re-queuing it would duplicate the diagnostic, while a use the walk
+    /// declined was suppressed as not live. Honoring both keeps the diagnostic
+    /// stream byte-identical while the memo consult, state lookup, and C038
+    /// predicate run for every eligible use.
+    pub(crate) fn emit_definite_assignment_uses(&mut self) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        let boundary = self.module_scope;
+        if !self.strict_null_checks {
+            return Ok(());
+        }
+        if self.demand.assignment_memo.get(&boundary).is_none() {
+            // Contract: the boundary's analysis is computed on its first
+            // definite-assignment use, then reused for all uses, and the
+            // entry is published only once the analysis converges. Roots
+            // read here are post-resolution, so the final uninitialized and
+            // assignment facts are the roots' facts.
+            let roots = self.assignment_roots()?;
+            let analysis = super::narrowing::analyze_definite_assignment(
+                self.program_flow
+                    .as_ref()
+                    .expect("program flow graph built before definite-assignment uses"),
+                &roots,
+                self.cancel.as_ref(),
+            )?;
+            self.demand.assignment_memo.insert(boundary, analysis);
+        }
+        let reported: HashSet<TextRange> = self
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == USED_BEFORE_ASSIGNED)
+            .map(|diagnostic| diagnostic.range())
+            .collect();
+        // Cloned so the per-use `&mut self` predicate calls never fight the
+        // iteration borrow; the reference list is owned and bounded by the
+        // resolved identifier count.
+        let references = self.symbol_references.clone();
+        for (range, symbol) in references {
+            self.check_cancel()?;
+            if !self.uninitialized_variables.contains(&symbol)
+                || self.boundary_scope(self.symbols[symbol.get() as usize].scope()) != boundary
+            {
+                continue;
+            }
+            let final_type = self.symbol_types[symbol.get() as usize];
+            if !self.use_final_type_eligible(final_type) {
+                continue;
+            }
+            let Some(point) = self.flow_point_for_range(range) else {
+                continue;
+            };
+            if reported.contains(&range) {
+                continue;
+            }
+            self.check_definite_assignment_use(super::narrowing::AssignmentUse {
+                symbol,
+                point,
+                scope: boundary,
+                range,
+                live: false,
+                suppressed: false,
+                final_type,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Collects the boundary's definite-assignment roots: non-ambient
+    /// `let`/`var` declarators without an initializer at this boundary that
+    /// resolution still tracks as unassigned. The `uninitialized_variables`
+    /// membership is the C038 category itself, so `const`, ambient, and
+    /// type-only bindings never become roots and never enter the memo.
+    fn assignment_roots(
+        &self,
+    ) -> Result<Vec<super::narrowing::AssignmentRoot>, super::CheckCancelled> {
+        let mut roots = Vec::new();
+        for statement in self.source.statements() {
+            self.check_cancel()?;
+            let Statement::Variable(variable) = statement.data() else {
+                continue;
+            };
+            for declarator in &variable.declarations {
+                if declarator.data().initializer.is_some() {
+                    continue;
+                }
+                let Some(contributors) = self
+                    .declaration_index
+                    .contributor_by_node
+                    .get(&declarator.id())
+                else {
+                    continue;
+                };
+                for &decl in contributors {
+                    let Some(contributor) =
+                        self.declaration_index.contributors.get(decl.0 as usize)
+                    else {
+                        continue;
+                    };
+                    let Some(symbol) = contributor.symbol else {
+                        continue;
+                    };
+                    if !self.uninitialized_variables.contains(&symbol)
+                        || self.boundary_scope(self.symbols[symbol.get() as usize].scope())
+                            != self.module_scope
+                    {
+                        continue;
+                    }
+                    roots.push(super::narrowing::AssignmentRoot {
+                        symbol,
+                        boundary: self.module_scope,
+                        entry: super::narrowing::AssignmentState::Unassigned,
+                        declaration: decl,
+                    });
+                }
+            }
+        }
+        Ok(roots)
+    }
+
+    /// Resolves the `ProgramFlow` point of the top-level statement whose span
+    /// contains the use range.
+    fn flow_point_for_range(&self, range: TextRange) -> Option<FlowPointId> {
+        let program_flow = self.program_flow.as_ref()?;
+        for statement in self.source.statements() {
+            let span = statement.range();
+            if span.start().get() <= range.start().get() && range.end().get() <= span.end().get() {
+                return program_flow
+                    .points
+                    .get(&ExecutionPoint {
+                        node: statement.id(),
+                        boundary: ExecutionBoundary::Primary,
+                    })
+                    .copied();
+            }
+        }
+        None
+    }
+
+    /// The C038 final-type eligibility: the type must exclude `undefined` and
+    /// be neither ordinary `any` nor a terminal cycle-any. The visited set
+    /// bounds cyclic union structures so a cycle terminates instead of
+    /// recursing.
+    fn use_final_type_eligible(&self, type_id: TypeId) -> bool {
+        let mut pending = vec![type_id];
+        let mut visited = HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            match self.types.get(current) {
+                Type::Undefined | Type::Any | Type::Unknown | Type::Error => return false,
+                Type::Union(members) => pending.extend(members.iter().copied()),
+                _ => {}
+            }
+        }
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -25151,10 +25323,6 @@ impl<'src> Binder<'src> {
     // ProgramFlow construction (bounded: module-level entry and declarations).
     // -----------------------------------------------------------------------
 
-    #[expect(
-        dead_code,
-        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
-    )]
     pub(crate) fn build_program_flow(&mut self) -> Result<(), super::CheckCancelled> {
         self.check_cancel()?;
         let mut program_flow = ProgramFlow::new();
@@ -25205,10 +25373,6 @@ impl<'src> Binder<'src> {
         Ok(())
     }
 
-    #[expect(
-        dead_code,
-        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
-    )]
     fn flow_operation_for_statement(
         &self,
         statement: &'src Stmt,
@@ -25229,10 +25393,6 @@ impl<'src> Binder<'src> {
         Ok((node, operation))
     }
 
-    #[expect(
-        dead_code,
-        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
-    )]
     fn emit_declaration_completes(
         &mut self,
         program_flow: &mut ProgramFlow,
