@@ -1171,12 +1171,26 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// process boundary, so a user's global gitconfig — especially
 /// `core.excludesfile` — cannot silently hide untracked content.
 ///
+/// The capture is an atomic snapshot of one committed tree. The git probes
+/// are separate processes, so after the gate completes `HEAD` is resolved a
+/// second time and a capture that observed `HEAD` move between resolution
+/// and completion is refused, never digested: the dirty gate and the hashed
+/// enumeration always describe the same commit.
 /// Two captures of the same committed tree always produce the same digest.
 /// The namespace version makes receipts captured by the former full-tree
 /// algorithm (`git-tree\0` prefix) permanently stale at merge/admission; old
 /// receipts require genuine reruns and must never be rewritten to fit.
 fn candidate_tree_digest(root: &Path) -> Result<String> {
     let tree = resolve_head_tree(root)?;
+    candidate_tree_digest_against(root, &tree)
+}
+
+/// Projects one committed tree, already resolved from `HEAD`, through the
+/// dirty gate and the digest, and refuses unless `HEAD` still resolves to
+/// that same tree once the gate completes. Split from
+/// [`candidate_tree_digest`] so tests can replay a capture whose tree was
+/// displaced mid-flight.
+fn candidate_tree_digest_against(root: &Path, tree: &str) -> Result<String> {
     let status = git_probe(
         root,
         &[
@@ -1189,11 +1203,20 @@ fn candidate_tree_digest(root: &Path) -> Result<String> {
     )?;
     let listing = git_probe_bounded(
         root,
-        &["ls-tree", "-r", "-z", "--full-tree", &tree],
+        &["ls-tree", "-r", "-z", "--full-tree", tree],
         TREE_PROBE_OUTPUT_BYTES,
     )?;
     let records = parse_tree_records(&listing)?;
     refuse_dirty_source(root, &status, &records)?;
+    let settled = resolve_head_tree(root)?;
+    if settled != tree {
+        return Err(VerificationError::new(
+            ErrorCode::Digest,
+            format!(
+                "the candidate snapshot is not coherent; `HEAD` moved from tree {tree} to {settled} during the capture"
+            ),
+        ));
+    }
     let mut hasher = Sha256::new();
     hasher.update(CANDIDATE_SOURCE_NAMESPACE);
     hasher.update(b"\x00");
@@ -2855,6 +2878,47 @@ mod tests {
             Some("candidate_tree_digest"),
             "a receipt captured before the source change must be rejected as stale"
         );
+    }
+
+    /// The capture must be an atomic snapshot of one committed tree: if
+    /// `HEAD` moves while the dirty gate and enumeration run, the torn read
+    /// must be refused, never digested. Replaying a capture against a tree
+    /// that a later commit displaced is that torn read, made deterministic.
+    #[test]
+    fn head_move_during_capture_is_refused() {
+        let (scratch, _) = manifest_root("moved-head", &["jit.a"]);
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&scratch.root)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        let commit = |message: &str| {
+            run_git(&[
+                "-c",
+                "user.name=bamts-suite-test",
+                "-c",
+                "user.email=suite@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ]);
+        };
+        let stale_tree = resolve_head_tree(&scratch.root).expect("resolve committed tree");
+
+        scratch.write("src/feature.ts", b"// source");
+        run_git(&["add", "src/feature.ts"]);
+        commit("head moves mid-capture");
+
+        let error = candidate_tree_digest_against(&scratch.root, &stale_tree)
+            .expect_err("a capture overtaken by a commit must be refused");
+        assert_eq!(error.code(), ErrorCode::Digest);
+
+        let fresh_tree = resolve_head_tree(&scratch.root).expect("resolve moved tree");
+        candidate_tree_digest_against(&scratch.root, &fresh_tree)
+            .expect("a capture over one stable tree succeeds");
     }
 
     /// A rename whose original path is candidate source is refused even though
