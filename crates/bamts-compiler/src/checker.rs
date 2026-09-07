@@ -138,6 +138,30 @@ const NOT_ASSIGNABLE_MESSAGE: &str = "Initializer type is not assignable to the 
 /// definitely assigned in the constructor.
 pub const PROPERTY_NOT_INITIALIZED: DiagnosticCode = DiagnosticCode::new("BAMTS-C028");
 /// Diagnostic emitted when an assignment target resolves to a function.
+pub const SUPER_BEFORE_THIS: DiagnosticCode = DiagnosticCode::new("BAMTS-C090");
+pub const SUPER_BEFORE_SUPER_PROPERTY: DiagnosticCode = DiagnosticCode::new("BAMTS-C091");
+pub const SUPER_FIELD_VIA_SUPER: DiagnosticCode = DiagnosticCode::new("BAMTS-C092");
+pub const SUPER_STATIC_MEMBER_VIA_SUPER: DiagnosticCode = DiagnosticCode::new("BAMTS-C093");
+pub const BLOCK_SCOPED_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C094");
+pub const CLASS_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C095");
+pub const ENUM_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C096");
+pub const REST_PARAMETER_NOT_LAST: DiagnosticCode = DiagnosticCode::new("BAMTS-C097");
+pub const INTERFACE_NAME_IS_PRIMITIVE: DiagnosticCode = DiagnosticCode::new("BAMTS-C098");
+pub const SUPER_PROPERTY_NOT_METHOD: DiagnosticCode = DiagnosticCode::new("BAMTS-C099");
+pub const PARAMETER_INITIALIZER_IN_SIGNATURE: DiagnosticCode = DiagnosticCode::new("BAMTS-C100");
+pub const DUPLICATE_LABEL: DiagnosticCode = DiagnosticCode::new("BAMTS-C101");
+pub const BREAK_TARGET_NOT_ENCLOSING: DiagnosticCode = DiagnosticCode::new("BAMTS-C102");
+pub const BREAK_TARGET_CROSSES_FUNCTION: DiagnosticCode = DiagnosticCode::new("BAMTS-C103");
+pub(crate) const BREAK_TARGET_CROSSES_FUNCTION_MESSAGE: &str =
+    "Jump target cannot cross function boundary.";
+pub(crate) const BREAK_TARGET_NOT_ENCLOSING_MESSAGE: &str =
+    "A 'break' statement can only jump to a label of an enclosing statement.";
+pub(crate) const PARAMETER_INITIALIZER_IN_SIGNATURE_MESSAGE: &str =
+    "A parameter initializer is only allowed in a function or constructor implementation.";
+pub(crate) const SUPER_PROPERTY_NOT_METHOD_MESSAGE: &str =
+    "Only public and protected methods of the base class are accessible via the 'super' keyword.";
+pub(crate) const REST_PARAMETER_NOT_LAST_MESSAGE: &str =
+    "A rest parameter must be last in a parameter list.";
 pub const ASSIGNMENT_TO_FUNCTION: DiagnosticCode = DiagnosticCode::new("BAMTS-C029");
 /// Diagnostic emitted when an assignment target resolves to a namespace.
 pub const ASSIGNMENT_TO_NAMESPACE: DiagnosticCode = DiagnosticCode::new("BAMTS-C030");
@@ -302,6 +326,9 @@ pub(crate) const BARE_SUPER_EXPRESSION_MESSAGE: &str =
 pub(crate) const SUPER_REFERENCE_NON_DERIVED_MESSAGE: &str =
     "'super' can only be referenced in a derived class.";
 pub(crate) const SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE: &str = "Super calls are not permitted outside constructors or in nested functions inside constructors.";
+pub(crate) const SUPER_BEFORE_THIS_MESSAGE: &str =
+    "'super' must be called before accessing 'this' in the constructor of a derived class.";
+pub(crate) const SUPER_BEFORE_SUPER_PROPERTY_MESSAGE: &str = "'super' must be called before accessing a property of 'super' in the constructor of a derived class.";
 pub(crate) const SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE: &str =
     "'super' cannot be referenced in constructor arguments.";
 const DERIVED_CONSTRUCTOR_MISSING_SUPER_MESSAGE: &str =
@@ -2157,16 +2184,21 @@ fn imported_enum_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        ARGUMENT_NOT_ASSIGNABLE, BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME,
+        ARGUMENT_NOT_ASSIGNABLE, BARE_SUPER_EXPRESSION, BLOCK_SCOPED_USED_BEFORE_DECLARATION,
+        BREAK_TARGET_CROSSES_FUNCTION, BREAK_TARGET_NOT_ENCLOSING, CANNOT_FIND_NAME,
         CANNOT_FIND_NAME_LIB_GATED, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE,
-        CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DERIVED_CONSTRUCTOR_MISSING_SUPER,
-        DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS,
-        IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, INVALID_ASSIGNMENT_TARGET,
-        MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER,
-        PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
+        CLASS_USED_BEFORE_DECLARATION, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED,
+        DERIVED_CONSTRUCTOR_MISSING_SUPER, DUPLICATE_DECLARATION, DUPLICATE_LABEL,
+        ENUM_USED_BEFORE_DECLARATION, EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS,
+        IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, INTERFACE_NAME_IS_PRIMITIVE,
+        INVALID_ASSIGNMENT_TARGET, MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT,
+        NAMESPACE_NO_EXPORTED_MEMBER, PARAMETER_DECORATOR_NOT_SUPPORTED,
+        PARAMETER_INITIALIZER_IN_SIGNATURE, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
         PROPERTY_DOES_NOT_EXIST, ProgramCheckInput, ProgramCheckOptions, PropertyType,
-        ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
-        SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR,
+        REST_PARAMETER_NOT_LAST, ResolvedModuleEdge, SUPER_BEFORE_SUPER_PROPERTY,
+        SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+        SUPER_FIELD_VIA_SUPER, SUPER_PROPERTY_NOT_METHOD, SUPER_REFERENCE_NON_DERIVED,
+        SUPER_STATIC_MEMBER_VIA_SUPER, ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR,
         TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable,
         VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
         check_program_with_options,
@@ -5946,6 +5978,675 @@ function check(options: Options = {}) {
             !has_with(&check_js("function f() { with ({}) {} }")),
             "sloppy nested function accepts with"
         );
+    }
+
+    fn authority_source(relative: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("target/authority/typescript-7.0.2-tests/tests/cases/compiler")
+            .join(relative);
+        std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "authority fixture {} is unavailable: {error}; run \
+                 `cargo run --locked -p bamts-verification -- source fetch \
+                 typescript-primary-tests --dest target/authority/typescript-7.0.2-tests` \
+                 from the repository root first",
+                path.display()
+            )
+        })
+    }
+
+    /// The superAccess es2015 baseline carries one TS2576 (static S1 via
+    /// super) and two TS2855 (fields S2 and f); the es5 variant's TS2340
+    /// flavor is a separate target-conditional slice.
+    #[test]
+    fn super_static_member_matches_superaccess_baseline() {
+        let source = authority_source("superAccess.ts");
+        let codes = checker_codes(&check_text(&source));
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == SUPER_STATIC_MEMBER_VIA_SUPER.as_str())
+                .count(),
+            1
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == SUPER_FIELD_VIA_SUPER.as_str())
+                .count(),
+            2
+        );
+    }
+
+    /// The blockScopedEnumVariablesUseBeforeDef baseline carries exactly
+    /// one TS2450: the regular enum in foo1. The const enums (foo2,
+    /// AfterObject) are inlined at use sites and stay clean.
+    #[test]
+    fn enum_used_before_declaration_matches_baseline() {
+        let source = authority_source("blockScopedEnumVariablesUseBeforeDef.ts");
+        let codes = checker_codes(&check_text(&source));
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == ENUM_USED_BEFORE_DECLARATION.as_str())
+                .count(),
+            1,
+            "{codes:?}"
+        );
+    }
+
+    /// TS1114: a label redeclared while it still encloses the current statement.
+    /// TS1116: a labeled break may only target an enclosing label. The
+    /// oracles are duplicateLabel2 (one row) and breakTarget6 (one row).
+    #[test]
+    fn label_rules_matrix() {
+        assert_eq!(
+            checker_codes(&check_text(
+                "target: while (true) { target: while (true) {} }"
+            )),
+            vec![DUPLICATE_LABEL.as_str()]
+        );
+        // A completed sibling label is no longer active and may be reused.
+        assert_eq!(
+            checker_codes(&check_text("a: {} a: {}")),
+            Vec::<&str>::new()
+        );
+        // A nested function owns its labels; reuse across the boundary is
+        // legal.
+        assert_eq!(
+            checker_codes(&check_text("a: {} function f() { a: {} }")),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            checker_codes(&check_text("while (true) { break target; }")),
+            vec![BREAK_TARGET_NOT_ENCLOSING.as_str()]
+        );
+        assert_eq!(
+            checker_codes(&check_text("target: while (true) { break target; }")),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            checker_codes(&check_text(
+                "target: while (true) { for (;;) { break target; } }"
+            )),
+            Vec::<&str>::new()
+        );
+        // Plain break needs no label context.
+        assert_eq!(
+            checker_codes(&check_text("for (;;) { break; }")),
+            Vec::<&str>::new()
+        );
+        // Authority oracles: one row each.
+        let duplicate = authority_source("duplicateLabel2.ts");
+        assert_eq!(
+            checker_codes(&check_text(&duplicate)),
+            vec![DUPLICATE_LABEL.as_str()]
+        );
+        let jump = authority_source("breakTarget6.ts");
+        assert_eq!(
+            checker_codes(&check_text(&jump)),
+            vec![BREAK_TARGET_NOT_ENCLOSING.as_str()]
+        );
+        // TS1107: the label exists, but in an enclosing function.
+        let crosses = authority_source("breakTarget5.ts");
+        assert_eq!(
+            checker_codes(&check_text(&crosses)),
+            vec![BREAK_TARGET_CROSSES_FUNCTION.as_str()]
+        );
+        assert_eq!(
+            checker_codes(&check_text(
+                "target: while (true) { function f() { for (;;) { break target; } } }"
+            )),
+            vec![BREAK_TARGET_CROSSES_FUNCTION.as_str()]
+        );
+    }
+
+    /// TS2371: only an implementation may carry parameter defaults. The
+    /// oracle (defaultValueInConstructorOverload1) is exactly one row on a
+    /// constructor overload signature.
+    #[test]
+    fn parameter_initializer_only_in_implementation() {
+        assert_eq!(
+            checker_codes(&check_text("function f(x = 1); function f(x?: number) {}")),
+            vec![PARAMETER_INITIALIZER_IN_SIGNATURE.as_str()]
+        );
+        assert_eq!(
+            checker_codes(&check_text(
+                "class C { constructor(x = ''); constructor(x = '') {} }"
+            )),
+            vec![PARAMETER_INITIALIZER_IN_SIGNATURE.as_str()]
+        );
+        assert_eq!(
+            checker_codes(&check_text("function g(x = 1) {}")),
+            Vec::<&str>::new()
+        );
+        let source = authority_source("defaultValueInConstructorOverload1.ts");
+        assert_eq!(
+            checker_codes(&check_text(&source)),
+            vec![PARAMETER_INITIALIZER_IN_SIGNATURE.as_str()]
+        );
+    }
+
+    /// The superAccess es5 baseline swaps each TS2855 field row for the
+    /// single pre-fields rule TS2340; the static row stays TS2576 at both
+    /// targets.
+    #[test]
+    fn super_field_flavor_splits_by_target() {
+        let source = "class MyBase {
+                 static S1: number = 5;
+                 private S2: string = \"test\";
+                 f = () => 5;
+             }
+             class MyDerived extends MyBase {
+                 foo() {
+                     var l3 = super.S1;
+                     var l4 = super.S2;
+                     var l5 = super.f();
+                 }
+             }";
+        let es5 = checker_codes(&check_text_with(
+            source,
+            ProgramCheckOptions::standard().with_target(Some("es5")),
+        ));
+        assert_eq!(
+            es5.iter()
+                .filter(|c| **c == SUPER_PROPERTY_NOT_METHOD.as_str())
+                .count(),
+            2,
+            "{es5:?}"
+        );
+        assert_eq!(
+            es5.iter()
+                .filter(|c| **c == SUPER_FIELD_VIA_SUPER.as_str())
+                .count(),
+            0,
+            "{es5:?}"
+        );
+        assert_eq!(
+            es5.iter()
+                .filter(|c| **c == SUPER_STATIC_MEMBER_VIA_SUPER.as_str())
+                .count(),
+            1,
+            "{es5:?}"
+        );
+        let es2015 = checker_codes(&check_text_with(
+            source,
+            ProgramCheckOptions::standard().with_target(Some("es2015")),
+        ));
+        assert_eq!(
+            es2015
+                .iter()
+                .filter(|c| **c == SUPER_FIELD_VIA_SUPER.as_str())
+                .count(),
+            2,
+            "{es2015:?}"
+        );
+        assert_eq!(
+            es2015
+                .iter()
+                .filter(|c| **c == SUPER_PROPERTY_NOT_METHOD.as_str())
+                .count(),
+            0,
+            "{es2015:?}"
+        );
+        // The authority file itself: es5 swaps both field rows for TS2340
+        // and keeps the static row at TS2576.
+        let source = authority_source("superAccess.ts");
+        let oracle_es5 = checker_codes(&check_text_with(
+            &source,
+            ProgramCheckOptions::standard().with_target(Some("es5")),
+        ));
+        assert_eq!(
+            oracle_es5
+                .iter()
+                .filter(|c| **c == SUPER_PROPERTY_NOT_METHOD.as_str())
+                .count(),
+            2,
+            "{oracle_es5:?}"
+        );
+        assert_eq!(
+            oracle_es5
+                .iter()
+                .filter(|c| **c == SUPER_STATIC_MEMBER_VIA_SUPER.as_str())
+                .count(),
+            1,
+            "{oracle_es5:?}"
+        );
+    }
+
+    /// TS2427: an interface may not take a primitive type's name. The
+    /// authority rows cover string, number, boolean, any, never, unknown,
+    /// symbol, and undefined. Reserved-word names (`void`, `null`) need a
+    /// parser-relaxation slice before the checker can see them; the
+    /// implementation bans the full primitive set for the names the parser
+    /// delivers as identifiers.
+    #[test]
+    fn interface_name_cannot_be_primitive() {
+        for name in [
+            "string",
+            "number",
+            "boolean",
+            "any",
+            "never",
+            "unknown",
+            "symbol",
+            "undefined",
+        ] {
+            let source = format!("interface {name} {{}}");
+            let codes = checker_codes(&check_text(&source));
+            assert_eq!(
+                codes,
+                vec![INTERFACE_NAME_IS_PRIMITIVE.as_str()],
+                "{name}: {codes:?}"
+            );
+        }
+        // Ordinary names, including intrinsic globals, stay legal.
+        assert_eq!(
+            checker_codes(&check_text("interface ArrayLike<T> { length: number }")),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            checker_codes(&check_text("interface PromiseLike<T> { then(): T }")),
+            Vec::<&str>::new()
+        );
+    }
+
+    /// TS1014: a rest parameter followed by anything else. Arrows and
+    /// constructors carry their own binders, so each shape is pinned; a
+    /// trailing rest parameter stays silent.
+    #[test]
+    fn rest_parameter_not_last_matrix() {
+        let codes = checker_codes(&check_text("function f(...x, y) { }"));
+        assert_eq!(codes, vec![REST_PARAMETER_NOT_LAST.as_str()]);
+        let arrow = checker_codes(&check_text("const g = (...x, y) => x;"));
+        assert_eq!(arrow, vec![REST_PARAMETER_NOT_LAST.as_str()]);
+        let ctor = checker_codes(&check_text("class C { constructor(...x, y) {} }"));
+        assert_eq!(ctor, vec![REST_PARAMETER_NOT_LAST.as_str()]);
+        let method = checker_codes(&check_text("class C { m(...x, y) {} }"));
+        assert_eq!(method, vec![REST_PARAMETER_NOT_LAST.as_str()]);
+        assert_eq!(
+            checker_codes(&check_text("function h(x, ...rest) { }")),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn block_scoped_used_before_declaration_matrix() {
+        fn codes(text: &str) -> Vec<&'static str> {
+            checker_codes(&check_text(text))
+        }
+        // let/const/class/enum referenced textually before declaration.
+        let late_binding = codes(
+            "return_early();
+             function return_early() {
+                 const v = x;
+                 let x = 1;
+                 class C {}
+                 new D();
+                 class D {}
+                 E.A;
+                 enum E { A }
+                 return v;
+             }",
+        );
+        assert!(late_binding.contains(&BLOCK_SCOPED_USED_BEFORE_DECLARATION.as_str()));
+        assert!(late_binding.contains(&CLASS_USED_BEFORE_DECLARATION.as_str()));
+        assert!(
+            late_binding.contains(&ENUM_USED_BEFORE_DECLARATION.as_str()),
+            "{late_binding:?}"
+        );
+        // A reference deferred through a function-like boundary is legal:
+        // the function runs after the binding initializes, and its body
+        // resolves once the binding is already in scope.
+        let deferred = codes(
+            "function g() {
+                 inner();
+                 let y = 1;
+                 function inner() { return y; }
+                 const f = () => y;
+             }
+             g();",
+        );
+        assert!(
+            !deferred.contains(&BLOCK_SCOPED_USED_BEFORE_DECLARATION.as_str()),
+            "{deferred:?}"
+        );
+        // var and function declarations hoist: no error.
+        let hoisted = codes(
+            "h();
+             var shared = 1;
+             function h() { return shared; }",
+        );
+        assert!(
+            !hoisted.contains(&BLOCK_SCOPED_USED_BEFORE_DECLARATION.as_str()),
+            "{hoisted:?}"
+        );
+        // Use at or after the declaration stays silent.
+        assert_eq!(codes("let a = 1; a; const b = a; b;"), Vec::<&str>::new());
+    }
+
+    /// TS2576: super.S1 where S1 is a base static member. Also pins the
+    /// superAccess oracle shape: static fires TS2576, instance fields fire
+    /// TS2855, and a base instance method stays silent.
+    #[test]
+    fn super_static_member_via_super_matrix() {
+        let result = check_text(
+            "class MyBase {
+                 static S1: number = 5;
+                 f = () => 5;
+             }
+             class MyDerived extends MyBase {
+                 foo() {
+                     var l1 = super.S1;
+                     var l3 = super.f;
+                     var l4 = super.toString;
+                 }
+             }",
+        );
+        let codes = checker_codes(&result);
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == SUPER_STATIC_MEMBER_VIA_SUPER.as_str())
+                .count(),
+            1,
+            "{codes:?}"
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == SUPER_FIELD_VIA_SUPER.as_str())
+                .count(),
+            1,
+            "{codes:?}"
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == SUPER_BEFORE_SUPER_PROPERTY.as_str())
+                .count(),
+            0,
+            "{codes:?}"
+        );
+    }
+
+    /// The authority baseline checkSuperCallBeforeThisAccess.errors.txt
+    /// carries exactly five TS2855 rows (lines 9, 12, 17, 22, 45 of the
+    /// directive-stripped source); the count is the pinned oracle.
+    #[test]
+    fn super_field_via_super_matches_baseline_count() {
+        let source = authority_source("checkSuperCallBeforeThisAccess.ts");
+        let count = checker_codes(&check_text(&source))
+            .into_iter()
+            .filter(|code| *code == SUPER_FIELD_VIA_SUPER.as_str())
+            .count();
+        assert_eq!(count, 5);
+        // The Accessing variants each carry a single TS17009 row; variant 5
+        // reaches `this` inside the super() arguments, which evaluate before
+        // the call completes.
+        for variant in ["2", "5", "8"] {
+            let variant_source =
+                authority_source(&format!("checkSuperCallBeforeThisAccessing{variant}.ts"));
+            let codes = checker_codes(&check_text(&variant_source));
+            assert_eq!(
+                codes
+                    .iter()
+                    .filter(|code| **code == SUPER_BEFORE_THIS.as_str())
+                    .count(),
+                1,
+                "variant {}",
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn super_field_via_super_matrix() {
+        fn field_codes(text: &str) -> Vec<&'static str> {
+            let result = check_text(text);
+            checker_codes(&result)
+                .into_iter()
+                .filter(|code| *code == SUPER_FIELD_VIA_SUPER.as_str())
+                .collect()
+        }
+        // A base field read through super fires even after super() ran.
+        assert_eq!(
+            field_codes(
+                "class A { field = 1; }
+                 class C extends A {
+                     constructor() { super(); super.field; }
+                 }"
+            ),
+            vec![SUPER_FIELD_VIA_SUPER.as_str()]
+        );
+        // Base methods and accessor pairs live on the prototype: no fire.
+        assert_eq!(
+            field_codes(
+                "class A { method() {} get pair() { return 1; } set pair(v) {} }
+                 class C extends A {
+                     constructor() { super(); super.method(); super.pair; }
+                 }"
+            ),
+            Vec::<&str>::new()
+        );
+        // A getter-only accessor is reachable too.
+        assert_eq!(
+            field_codes(
+                "class A { get only() { return 1; } }
+                 class C extends A { constructor() { super(); super.only; } }"
+            ),
+            Vec::<&str>::new()
+        );
+        // The inherited grandparent field still fires, and a name the base
+        // chain does not declare stays silent.
+        assert_eq!(
+            field_codes(
+                "class A { shared = 1; }
+                 class B extends A {}
+                 class C extends B { constructor() { super(); super.shared; super.absent; } }"
+            ),
+            vec![SUPER_FIELD_VIA_SUPER.as_str()]
+        );
+        // No base class, no super property check applies.
+        assert_eq!(
+            field_codes("class C { constructor() { super(); } }"),
+            Vec::<&str>::new()
+        );
+        // A field read before super() reports both TS17011 and TS2855.
+        let result = check_text(
+            "class A { field = 1; }
+             class C extends A { constructor() { super.field; super(); } }",
+        );
+        let codes = checker_codes(&result);
+        assert!(codes.contains(&SUPER_BEFORE_SUPER_PROPERTY.as_str()));
+        assert!(codes.contains(&SUPER_FIELD_VIA_SUPER.as_str()));
+    }
+
+    /// TS17009/TS17011: a derived constructor's `this` and `super.x`
+    /// accesses before a guaranteed `super()` call, with the oracle's
+    /// flow shapes: arrows are exempt (deferred `this`), a conditional
+    /// super() covers only its branch, and loops/try never guarantee.
+    #[test]
+    fn super_before_this_flow_matrix() {
+        fn codes(text: &str) -> Vec<&'static str> {
+            let result = check_text(text);
+            let mut found = checker_codes(&result)
+                .into_iter()
+                .filter(|code| {
+                    *code == SUPER_BEFORE_THIS.as_str()
+                        || *code == SUPER_BEFORE_SUPER_PROPERTY.as_str()
+                })
+                .collect::<Vec<_>>();
+            found.sort();
+            found
+        }
+
+        // Straight-line before/after.
+        assert_eq!(
+            codes(
+                "class A extends Object { constructor() { let a = this; super(); let b = this; } }"
+            ),
+            vec![SUPER_BEFORE_THIS.as_str()]
+        );
+        // super.x before super reports the property form.
+        assert_eq!(
+            codes("class A extends Object { constructor() { let a = super.x; super(); } }"),
+            vec![SUPER_BEFORE_SUPER_PROPERTY.as_str()]
+        );
+        // Arrows defer their this: no report inside, and none after.
+        assert_eq!(
+            codes("class A extends Object { constructor() { let f = () => this; super(); f(); } }"),
+            Vec::<&str>::new()
+        );
+        // Plain nested functions own their own this.
+        assert_eq!(
+            codes(
+                "class A extends Object { constructor() { let f = function () { return this; }; super(); } }"
+            ),
+            Vec::<&str>::new()
+        );
+        // A conditional super() covers its branch only.
+        assert_eq!(
+            codes(
+                "class A extends Object { constructor(c) {\nif (c) { super(); let a = this; }\nelse { let a = this; }\nlet b = this; } }"
+            ),
+            vec![SUPER_BEFORE_THIS.as_str(), SUPER_BEFORE_THIS.as_str()]
+        );
+        // Every continuing branch has called super, including when the
+        // other branch exits before the merge.
+        assert_eq!(
+            codes(
+                "class A extends Object { constructor(c) { if (c) super(); else super(); this; } }"
+            ),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            codes(
+                "class A extends Object { constructor(c) { if (c) return {}; else super(); this; } }"
+            ),
+            Vec::<&str>::new()
+        );
+        // A super() inside a loop guarantees nothing after it.
+        assert_eq!(
+            codes(
+                "class A extends Object { constructor(c) { while (c) { super(); break; } let a = this; } }"
+            ),
+            vec![SUPER_BEFORE_THIS.as_str()]
+        );
+        // Base constructors never track.
+        assert_eq!(
+            codes("class A { constructor() { let a = this; } }"),
+            Vec::<&str>::new()
+        );
+        // Field initializer and method this are not constructor-flow.
+        assert_eq!(
+            codes(
+                "class A extends Object { x = this; m() { return this; } constructor() { super(); } }"
+            ),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn pr199_super_flow_joins_every_continuing_path() {
+        for (body, safe) in [
+            ("if (c) { super(); } else { super(); }", true),
+            ("if (c) { throw 0; } else { super(); }", true),
+            ("if (c) { super(); } else { throw 0; }", true),
+            ("if (c) { return { method() {} }; } else { super(); }", true),
+            ("super(); if (c) {} else {}", true),
+            (
+                "if (c) { if (c) { super(); } else { super(); } } else { super(); }",
+                true,
+            ),
+            ("if (c) { super(); }", false),
+            ("if (c) {} else { super(); }", false),
+        ] {
+            let source = format!(
+                "class B {{ method() {{}} }} \
+                 class D extends B {{ constructor(c: boolean) {{ \
+                 {body} this; super.method(); }} }}"
+            );
+            let mut codes = checker_codes(&check_text(&source))
+                .into_iter()
+                .filter(|code| {
+                    *code == SUPER_BEFORE_THIS.as_str()
+                        || *code == SUPER_BEFORE_SUPER_PROPERTY.as_str()
+                })
+                .collect::<Vec<_>>();
+            codes.sort_unstable();
+            let expected = if safe {
+                Vec::new()
+            } else {
+                vec![
+                    SUPER_BEFORE_THIS.as_str(),
+                    SUPER_BEFORE_SUPER_PROPERTY.as_str(),
+                ]
+            };
+            assert_eq!(codes, expected, "{body}");
+        }
+    }
+
+    #[test]
+    fn pr199_label_frames_and_nearest_targets() {
+        let cases = [
+            ("L: {} L: {}", None),
+            ("L: { L: {} }", Some(DUPLICATE_LABEL.as_str())),
+            ("L: { function f() { L: { break L; } } break L; }", None),
+            ("L: { const f = () => { L: { break L; } }; break L; }", None),
+            (
+                "L: { class C { constructor() { L: { break L; } } } break L; }",
+                None,
+            ),
+            (
+                "L: { function f() { break L; } break L; }",
+                Some(BREAK_TARGET_CROSSES_FUNCTION.as_str()),
+            ),
+            (
+                "L: { const f = () => { break L; }; break L; }",
+                Some(BREAK_TARGET_CROSSES_FUNCTION.as_str()),
+            ),
+            (
+                "L: { class C { constructor() { break L; } } break L; }",
+                Some(BREAK_TARGET_CROSSES_FUNCTION.as_str()),
+            ),
+            (
+                "L: { class C { static { break L; } } break L; }",
+                Some(BREAK_TARGET_CROSSES_FUNCTION.as_str()),
+            ),
+            ("const f = () => { local: {} }; local: {}", None),
+            ("class C { constructor() { local: {} } } local: {}", None),
+            ("class C { static { local: {} } } local: {}", None),
+            ("L: {} break L;", Some(BREAK_TARGET_NOT_ENCLOSING.as_str())),
+            (
+                "while (true) { break missing; }",
+                Some(BREAK_TARGET_NOT_ENCLOSING.as_str()),
+            ),
+        ];
+        for (source, expected) in cases {
+            let codes = checker_codes(&check_text(source))
+                .into_iter()
+                .filter(|code| {
+                    *code == DUPLICATE_LABEL.as_str()
+                        || *code == BREAK_TARGET_NOT_ENCLOSING.as_str()
+                        || *code == BREAK_TARGET_CROSSES_FUNCTION.as_str()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(codes, expected.into_iter().collect::<Vec<_>>(), "{source}");
+        }
+    }
+
+    #[test]
+    fn pr199_missing_authority_fixture_explains_the_prerequisite() {
+        let panic = std::panic::catch_unwind(|| {
+            authority_source("__pr199_fixture_that_must_not_exist__.ts")
+        })
+        .expect_err("a missing authority fixture must fail rather than skip");
+        let message = panic.downcast_ref::<String>().expect("formatted panic");
+        assert!(message.contains("__pr199_fixture_that_must_not_exist__.ts"));
+        assert!(message.contains("source fetch typescript-primary-tests"));
+        assert!(message.contains("--dest target/authority/typescript-7.0.2-tests"));
     }
 
     #[test]

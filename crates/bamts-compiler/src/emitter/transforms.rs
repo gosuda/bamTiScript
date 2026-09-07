@@ -97,6 +97,7 @@ pub enum LanguageFeature {
     LogicalAssignment,
     ClassFields,
     Using,
+    ForOf,
 }
 
 impl LanguageFeature {
@@ -114,6 +115,7 @@ impl LanguageFeature {
             Self::LogicalAssignment => ScriptTarget::Es2021,
             Self::ClassFields => ScriptTarget::Es2022,
             Self::Using => ScriptTarget::EsNext,
+            Self::ForOf => ScriptTarget::Es2015,
         }
     }
 }
@@ -1514,6 +1516,16 @@ impl<'a> Rewriter<'a> {
                         "for-await-of requires ScriptTarget::Es2018 or later",
                     );
                 }
+                // tsc's default ES5 for-of: index the iterable
+                // (`for (var _i = 0, src = it; _i < src.length; _i++)`).
+                // The binding moves into the body as a declaration, so
+                // destructuring bindings and defaults compose through
+                // the ordinary destructuring lowering.
+                if for_of.mode == ForOfMode::Sync
+                    && Self::needs(LanguageFeature::ForOf, self.options)
+                {
+                    return self.lower_sync_for_of(statement, for_of);
+                }
                 let iterable = self.rewrite_expr(&for_of.iterable);
                 let body = self.rewrite_single_statement(&for_of.body);
                 vec![self.node(
@@ -1527,12 +1539,24 @@ impl<'a> Rewriter<'a> {
                 )]
             }
             Statement::ForIn(for_in) => {
+                // The for-in construct is native ES5; only the head's
+                // const/let binding needs var conversion there.
+                let binding = match &for_in.binding {
+                    ForBinding::Variable(declaration) => {
+                        let mut declaration = declaration.clone();
+                        if self.options.target <= ScriptTarget::Es5 {
+                            declaration.kind = VariableKind::Var;
+                        }
+                        ForBinding::Variable(declaration)
+                    }
+                    target @ ForBinding::Target(_) => target.clone(),
+                };
                 let object = self.rewrite_expr(&for_in.object);
                 let body = self.rewrite_single_statement(&for_in.body);
                 vec![self.node(
                     statement.range(),
                     Statement::ForIn(ForInStatement {
-                        binding: for_in.binding.clone(),
+                        binding,
                         object: Box::new(object),
                         body: Box::new(body),
                     }),
@@ -1660,6 +1684,125 @@ impl<'a> Rewriter<'a> {
         self.node(block.range(), Block { statements })
     }
 
+    /// tsc's default ES5 for-of lowering: `for (var _i = 0, src = IT;
+    /// _i < src.length; _i++) { BINDING = src[_i]; BODY }`. The binding
+    /// statement enters the body as a rewritten declaration so pattern
+    /// bindings and defaults compose with the destructuring lowering.
+    fn lower_sync_for_of(&mut self, statement: &Stmt, for_of: &ForOfStatement) -> Vec<Stmt> {
+        let range = statement.range();
+        let counter = self.temp_ident();
+        let source = self.temp_ident();
+        let iterable = self.rewrite_expr(&for_of.iterable);
+        let zero = self.number_expr("0");
+        let counter_decl = self.make_declarator(counter.clone(), Some(zero), range);
+        let counter_expr = self.node(counter.range(), Expression::Identifier(counter.clone()));
+        let length = self.member_ident(&source, "length", range);
+        let test = self.node(
+            range,
+            Expression::Binary(BinaryExpression {
+                operator: BinaryOperator::LessThan,
+                left: Box::new(counter_expr.clone()),
+                right: Box::new(length),
+            }),
+        );
+        let counter_target = Box::new(self.node(
+            counter.range(),
+            AssignmentTarget::Identifier(counter.clone()),
+        ));
+        let update = self.node(
+            counter.range(),
+            Expression::Update(UpdateExpression {
+                operator: UpdateOperator::Increment,
+                argument: counter_target,
+                prefix: false,
+            }),
+        );
+        // The body's binding declaration: source[counter].
+        let element = self.member_computed(&source, &counter_expr, range);
+        let binding_statement = match &for_of.binding {
+            ForBinding::Variable(declaration) => {
+                let mut declaration = declaration.clone();
+                declaration.kind = VariableKind::Var;
+                if declaration.declarations.len() == 1 {
+                    let declarator = &declaration.declarations[0];
+                    let lowered = self.node(
+                        declarator.range(),
+                        VariableDeclarator {
+                            initializer: Some(Box::new(element)),
+                            ..declarator.data().clone()
+                        },
+                    );
+                    declaration.declarations = vec![lowered];
+                    self.node(range, Statement::Variable(declaration))
+                } else {
+                    let body = self.rewrite_single_statement(&for_of.body);
+                    return vec![self.node(
+                        range,
+                        Statement::ForOf(ForOfStatement {
+                            mode: for_of.mode,
+                            binding: ForBinding::Variable(declaration),
+                            iterable: Box::new(iterable),
+                            body: Box::new(body),
+                        }),
+                    )];
+                }
+            }
+            // `target = source[counter];` - destructuring targets lower
+            // through the statement rewriter like any assignment.
+            ForBinding::Target(target) => {
+                let left = match target.data() {
+                    AssignmentTarget::Member(member) => {
+                        self.rewrite_member_target(member, target.range())
+                    }
+                    _ => target.clone(),
+                };
+                let assignment = self.node(
+                    range,
+                    Expression::Assignment(AssignmentExpression {
+                        operator: AssignmentOperator::Assign,
+                        left,
+                        right: Box::new(element),
+                    }),
+                );
+                self.node(
+                    range,
+                    Statement::Expression(ExpressionStatement {
+                        expression: Box::new(assignment),
+                    }),
+                )
+            }
+        };
+        let source_decl = self.make_declarator(source.clone(), Some(iterable), range);
+        let initializer = ForInitializer::Variable(VariableDeclaration {
+            range,
+            kind: VariableKind::Var,
+            declarations: vec![counter_decl, source_decl],
+        });
+        // The binding declaration must itself lower (pattern bindings,
+        // defaults) - route it through the statement rewriter.
+        let lowered_binding = self.rewrite_statements(&[binding_statement]);
+        // A non-block body is a single statement, not a missing one:
+        // block_statements returns None for it, so the match form must
+        // push it rather than drop it.
+        let inner = self.rewrite_single_statement(&for_of.body);
+        let mut statements = lowered_binding;
+        match inner.data() {
+            Statement::Block(block) => statements.extend(block.data().statements.iter().cloned()),
+            _ => statements.push(inner.clone()),
+        }
+        let body_node = self.node(range, Block { statements });
+        let body_stmt = self.node(range, Statement::Block(body_node));
+        vec![self.node(
+            range,
+            Statement::For(ForStatement {
+                initializer: Some(initializer),
+                test: Some(Box::new(test)),
+                update: Some(Box::new(update)),
+                body: Box::new(body_stmt),
+            }),
+        )]
+    }
+
     fn rewrite_variable_statement(
         &mut self,
         statement: &Stmt,
@@ -1677,18 +1820,48 @@ impl<'a> Rewriter<'a> {
             );
         }
         if !Self::needs(LanguageFeature::Destructuring, self.options) {
-            let declarations = declaration
-                .declarations
-                .iter()
-                .map(|declarator| self.rewrite_declarator_initializer(declarator))
-                .collect();
-            return vec![self.node(
+            let outer_key_prelude = std::mem::take(&mut self.key_prelude);
+            let mut statements = Vec::new();
+            let mut declarations = Vec::with_capacity(declaration.declarations.len());
+            for declarator in &declaration.declarations {
+                let rewritten = self.rewrite_declarator_initializer(declarator);
+                let prelude = std::mem::take(&mut self.key_prelude);
+                if !prelude.is_empty() {
+                    if !declarations.is_empty() {
+                        statements.push(self.node(
+                            statement.range(),
+                            Statement::Variable(VariableDeclaration {
+                                range: declaration.range,
+                                kind: declaration.kind,
+                                declarations: std::mem::take(&mut declarations),
+                            }),
+                        ));
+                    }
+                    statements.extend(prelude);
+                }
+                declarations.push(rewritten);
+            }
+            self.key_prelude = outer_key_prelude;
+            statements.push(self.node(
                 statement.range(),
                 Statement::Variable(VariableDeclaration {
+                    range: declaration.range,
+                    kind: declaration.kind,
                     declarations,
-                    ..declaration.clone()
                 }),
-            )];
+            ));
+            return statements;
+        }
+        // A suspending binding (yield in a default or computed key) cannot
+        // live in a ternary: the machine must split the default selection
+        // into branch statements it owns, preserving conditional
+        // evaluation. Clean bindings lower to tsc's ternary declarators.
+        let suspending = declaration.declarations.iter().any(|declarator| {
+            count_binding_yields(&declarator.data().binding) > 0
+                || binding_contains_await(&declarator.data().binding)
+        });
+        if suspending {
+            return self.lower_suspending_declaration(declaration);
         }
         let mut declarations = Vec::new();
         self.key_prelude.clear();
@@ -1710,6 +1883,32 @@ impl<'a> Rewriter<'a> {
             }),
         ));
         statements
+    }
+
+    /// tsc's ES5 default shape: `name = read === void 0 ? DEFAULT : read`.
+    /// The default runs only when the read is undefined; the rewrite pass
+    /// owns await conversion inside it.
+    fn default_ternary(&mut self, read: &IdentifierNode, default: &Expr, range: TextRange) -> Expr {
+        let test_left = self.node(range, Expression::Identifier(read.clone()));
+        let void_zero = self.void_zero(range);
+        let test = self.node(
+            range,
+            Expression::Binary(BinaryExpression {
+                operator: BinaryOperator::StrictEqual,
+                left: Box::new(test_left),
+                right: Box::new(void_zero),
+            }),
+        );
+        let consequent = self.rewrite_expr(default);
+        let alternate = self.node(range, Expression::Identifier(read.clone()));
+        self.node(
+            range,
+            Expression::Conditional(ConditionalExpression {
+                test: Box::new(test),
+                consequent: Box::new(consequent),
+                alternate: Box::new(alternate),
+            }),
+        )
     }
 
     fn lower_declarator(
@@ -1765,7 +1964,7 @@ impl<'a> Rewriter<'a> {
                 let start = source.utf16_to_byte(range.start()).expect("binding start");
                 let end = source.utf16_to_byte(range.end()).expect("binding end");
                 let name = source.as_str()[start..end].to_owned();
-                self.lower_class_expression(value, class, Some(&name))
+                self.lower_class_expression(value, class, Some(&name), true)
             } else {
                 self.rewrite_expr(value)
             };
@@ -1779,6 +1978,396 @@ impl<'a> Rewriter<'a> {
             },
         )
     }
+    /// Lowers a declaration whose binding carries suspensions (yield in
+    /// a default or computed key). Every bound name hoists first; reads
+    /// become temp var statements; a default becomes an if/else whose
+    /// arms assign the value temp, so the machine splits exactly at the
+    /// default's suspension and the default evaluates only when the
+    /// read is undefined — tsc's conditional-evaluation semantics in
+    /// this machine's statement protocol.
+    fn lower_suspending_declaration(&mut self, declaration: &VariableDeclaration) -> Vec<Stmt> {
+        let range = declaration.range;
+        let mut out = Vec::new();
+        let mut names = Vec::new();
+        for declarator in &declaration.declarations {
+            collect_binding_names(&declarator.data().binding, &mut names);
+        }
+        if !names.is_empty() {
+            let declarations = names
+                .into_iter()
+                .map(|name| self.make_declarator(name, None, range))
+                .collect();
+            let hoist = self.node(
+                range,
+                Statement::Variable(VariableDeclaration {
+                    range,
+                    kind: VariableKind::Var,
+                    declarations,
+                }),
+            );
+            out.push(hoist);
+        }
+        for declarator in &declaration.declarations {
+            let initializer = declarator.data().initializer.as_deref();
+            if let BindingPattern::Identifier(ident) = declarator.data().binding.data() {
+                // A plain identifier declarator alongside a suspending
+                // binding still needs its assignment; the rewrite pass
+                // owns the initializer's awaits.
+                if let Some(init) = initializer {
+                    let value = self.rewrite_expr(init);
+                    out.push(self.assign_statement(ident, value, range));
+                }
+                continue;
+            }
+            let (rhs, needs_temp) = self.rhs_ident(initializer, range);
+            if needs_temp {
+                let init = initializer
+                    .map(|value| self.rewrite_expr(value))
+                    .unwrap_or_else(|| self.ident_expr("undefined"));
+                let declarations = vec![self.make_declarator(rhs.clone(), Some(init), range)];
+                let temp = self.node(
+                    range,
+                    Statement::Variable(VariableDeclaration {
+                        range,
+                        kind: VariableKind::Var,
+                        declarations,
+                    }),
+                );
+                out.push(temp);
+            }
+            self.emit_binding_statements(&rhs, &declarator.data().binding, range, &mut out);
+        }
+        out
+    }
+
+    /// The statement form of one binding pattern: temp reads, default
+    /// if/else selections, and final assignments. Only runs for
+    /// suspending bindings; the clean form lives in the declarator
+    /// lowering.
+    fn emit_binding_statements(
+        &mut self,
+        rhs: &IdentifierNode,
+        pattern: &Pattern,
+        range: TextRange,
+        out: &mut Vec<Stmt>,
+    ) {
+        match pattern.data() {
+            BindingPattern::Identifier(_) | BindingPattern::Missing(_) => {}
+            BindingPattern::Rest(_) => {}
+            BindingPattern::Object(object) => {
+                let mut rest_keys: Vec<RestExcludeKey> = Vec::new();
+                for property in &object.properties {
+                    // The member expression this property reads.
+                    let member = match &property.name {
+                        PropertyName::Computed(key) => {
+                            let temp = self.temp_ident();
+                            // The key temp needs its `var` even when the
+                            // key suspends: the assignment form would
+                            // otherwise target an undeclared name.
+                            let temp_decl = vec![self.make_declarator(temp.clone(), None, range)];
+                            out.push(self.node(
+                                range,
+                                Statement::Variable(VariableDeclaration {
+                                    range,
+                                    kind: VariableKind::Var,
+                                    declarations: temp_decl,
+                                }),
+                            ));
+                            if contains_yield(key) {
+                                let assign =
+                                    self.assign_statement(&temp, key.as_ref().clone(), range);
+                                out.push(assign);
+                            } else {
+                                let value = self.rewrite_expr(key);
+                                out.push(self.make_temp_declaration(temp.clone(), value, range));
+                            }
+                            rest_keys.push(RestExcludeKey::Computed(temp.clone()));
+                            let reference =
+                                self.node(temp.range(), Expression::Identifier(temp.clone()));
+                            self.member_computed(rhs, &reference, range)
+                        }
+                        _ => match property_key_text(self, property) {
+                            Some(key) => {
+                                rest_keys.push(RestExcludeKey::Static(key.clone()));
+                                self.member_ident(rhs, &key, range)
+                            }
+                            None => continue,
+                        },
+                    };
+                    self.emit_property_statements(property, member, range, rhs, out);
+                }
+                // The rest property binds after the named reads.
+                for property in &object.properties {
+                    if let BindingPattern::Rest(rest) = property.binding.data()
+                        && let BindingPattern::Identifier(ident) = rest.argument.data()
+                    {
+                        let excluded = self.rest_exclude_array(&rest_keys, range);
+                        let call = self.rest_call(rhs, excluded, range);
+                        out.push(self.assign_statement(ident, call, range));
+                    }
+                }
+            }
+            BindingPattern::Array(array) => {
+                let mut index = 0usize;
+                for element in &array.elements {
+                    match element {
+                        ArrayBindingElement::Elision | ArrayBindingElement::Missing(_) => {
+                            index += 1;
+                        }
+                        ArrayBindingElement::Binding(binding) => {
+                            if let BindingPattern::Rest(rest) = binding.data()
+                                && let BindingPattern::Identifier(ident) = rest.argument.data()
+                            {
+                                // Rest consumes the remainder without
+                                // advancing the element index.
+                                let slice = self.slice_call(rhs, index, range);
+                                out.push(self.assign_statement(ident, slice, range));
+                                continue;
+                            }
+                            self.emit_element_statements(rhs, binding, index, range, out);
+                            index += 1;
+                        }
+                    }
+                }
+            }
+            BindingPattern::Assignment(assignment) => {
+                let member = self.member_index(rhs, 0, range);
+                self.emit_defaulted_binding(
+                    &assignment.left,
+                    &assignment.right,
+                    member,
+                    range,
+                    out,
+                );
+            }
+        }
+    }
+
+    /// One object property's statement form: read temp, default if/else,
+    /// then the target bind or nested recursion.
+    fn emit_property_statements(
+        &mut self,
+        property: &ObjectBindingProperty,
+        member: Expr,
+        range: TextRange,
+        _rhs: &IdentifierNode,
+        out: &mut Vec<Stmt>,
+    ) {
+        match property.binding.data() {
+            BindingPattern::Identifier(ident) => {
+                let read = self.temp_ident();
+                let declarations = vec![self.make_declarator(read.clone(), Some(member), range)];
+                out.push(self.node(
+                    range,
+                    Statement::Variable(VariableDeclaration {
+                        range,
+                        kind: VariableKind::Var,
+                        declarations,
+                    }),
+                ));
+                let value = match &property.initializer {
+                    Some(default) => {
+                        let value = self.temp_ident();
+                        let declarations = vec![self.make_declarator(value.clone(), None, range)];
+                        out.push(self.node(
+                            range,
+                            Statement::Variable(VariableDeclaration {
+                                range,
+                                kind: VariableKind::Var,
+                                declarations,
+                            }),
+                        ));
+                        let selection = self.default_selection(&read, default, &value, range);
+                        out.push(selection);
+                        value
+                    }
+                    None => read,
+                };
+                let value_expr = self.node(range, Expression::Identifier(value.clone()));
+                out.push(self.assign_statement(ident, value_expr, range));
+            }
+            _ => {
+                let value = self.emit_read_with_default(
+                    &property.binding,
+                    &property.initializer,
+                    member,
+                    range,
+                    out,
+                );
+                self.emit_binding_statements(&value, &property.binding, range, out);
+            }
+        }
+    }
+
+    fn emit_element_statements(
+        &mut self,
+        rhs: &IdentifierNode,
+        binding: &Pattern,
+        index: usize,
+        range: TextRange,
+        out: &mut Vec<Stmt>,
+    ) {
+        let member = self.member_index(rhs, index, range);
+        match binding.data() {
+            BindingPattern::Identifier(_) => {
+                let value = self.emit_read_with_default(binding, &None, member, range, out);
+                if let BindingPattern::Identifier(ident) = binding.data() {
+                    let value_expr = self.node(range, Expression::Identifier(value.clone()));
+                    out.push(self.assign_statement(ident, value_expr, range));
+                }
+            }
+            BindingPattern::Assignment(assignment) => {
+                self.emit_defaulted_binding(
+                    &assignment.left,
+                    &assignment.right,
+                    member,
+                    range,
+                    out,
+                );
+            }
+            _ => {
+                let value = self.emit_read_with_default(binding, &None, member, range, out);
+                self.emit_binding_statements(&value, binding, range, out);
+            }
+        }
+    }
+
+    /// The read temp for a member, plus the if/else default selection
+    /// when a default exists. Returns the identifier holding the value.
+    fn emit_read_with_default(
+        &mut self,
+        _binding: &Pattern,
+        initializer: &Option<Box<Expr>>,
+        member: Expr,
+        range: TextRange,
+        out: &mut Vec<Stmt>,
+    ) -> IdentifierNode {
+        let read = self.temp_ident();
+        let declarations = vec![self.make_declarator(read.clone(), Some(member), range)];
+        out.push(self.node(
+            range,
+            Statement::Variable(VariableDeclaration {
+                range,
+                kind: VariableKind::Var,
+                declarations,
+            }),
+        ));
+        match initializer {
+            Some(default) => {
+                let value = self.temp_ident();
+                // The value temp needs its `var`: it is assigned only
+                // inside the selection's branches, so nothing else
+                // declares it and strict mode would throw on the
+                // implicit global.
+                let declarations = vec![self.make_declarator(value.clone(), None, range)];
+                out.push(self.node(
+                    range,
+                    Statement::Variable(VariableDeclaration {
+                        range,
+                        kind: VariableKind::Var,
+                        declarations,
+                    }),
+                ));
+                let selection = self.default_selection(&read, default, &value, range);
+                out.push(selection);
+                value
+            }
+            None => read,
+        }
+    }
+
+    /// `if (read === void 0) { value = DEFAULT; } else { value = read; }`
+    fn default_selection(
+        &mut self,
+        read: &IdentifierNode,
+        default: &Expr,
+        value: &IdentifierNode,
+        range: TextRange,
+    ) -> Stmt {
+        let test_left = self.node(range, Expression::Identifier(read.clone()));
+        let void_zero = self.void_zero(range);
+        let test = self.node(
+            range,
+            Expression::Binary(BinaryExpression {
+                operator: BinaryOperator::StrictEqual,
+                left: Box::new(test_left),
+                right: Box::new(void_zero),
+            }),
+        );
+        let rewritten = self.rewrite_expr(default);
+        let then_assign = self.assign_statement(value, rewritten, range);
+        let then_block = self.node(
+            range,
+            Block {
+                statements: vec![then_assign],
+            },
+        );
+        let read_expr = self.node(range, Expression::Identifier(read.clone()));
+        let else_assign = self.assign_statement(value, read_expr, range);
+        let else_block = self.node(
+            range,
+            Block {
+                statements: vec![else_assign],
+            },
+        );
+        let then_stmt = self.node(range, Statement::Block(then_block));
+        let else_stmt = self.node(range, Statement::Block(else_block));
+        self.node(
+            range,
+            Statement::If(IfStatement {
+                test: Box::new(test),
+                consequent: Box::new(then_stmt),
+                alternate: Some(Box::new(else_stmt)),
+            }),
+        )
+    }
+
+    /// Binds a target pattern to a member read with a default: the
+    /// identifier case assigns the if/else value temp; nested patterns
+    /// recurse off the defaulted read.
+    fn emit_defaulted_binding(
+        &mut self,
+        left: &Pattern,
+        right: &Expr,
+        member: Expr,
+        range: TextRange,
+        out: &mut Vec<Stmt>,
+    ) {
+        match left.data() {
+            BindingPattern::Identifier(ident) => {
+                let read = self.temp_ident();
+                let declarations = vec![self.make_declarator(read.clone(), Some(member), range)];
+                out.push(self.node(
+                    range,
+                    Statement::Variable(VariableDeclaration {
+                        range,
+                        kind: VariableKind::Var,
+                        declarations,
+                    }),
+                ));
+                let value = self.temp_ident();
+                let declarations = vec![self.make_declarator(value.clone(), None, range)];
+                out.push(self.node(
+                    range,
+                    Statement::Variable(VariableDeclaration {
+                        range,
+                        kind: VariableKind::Var,
+                        declarations,
+                    }),
+                ));
+                let selection = self.default_selection(&read, right, &value, range);
+                out.push(selection);
+                let value_expr = self.node(range, Expression::Identifier(value.clone()));
+                out.push(self.assign_statement(ident, value_expr, range));
+            }
+            _ => {
+                let boxed = Some(Box::new(right.clone()));
+                let value = self.emit_read_with_default(left, &boxed, member, range, out);
+                self.emit_binding_statements(&value, left, range, out);
+            }
+        }
+    }
+
     fn lower_object_binding(
         &mut self,
         declarator: &VariableDeclaratorNode,
@@ -1790,47 +2379,115 @@ impl<'a> Rewriter<'a> {
         let mut out = Vec::new();
         if needs_temp {
             let init = initializer
-                .cloned()
+                .map(|value| self.rewrite_expr(value))
                 .unwrap_or_else(|| self.ident_expr("undefined"));
             out.push(self.make_declarator(rhs.clone(), Some(init), range));
         }
-        let mut rest_names = Vec::new();
+        self.lower_object_pattern(&rhs, object, range, &mut out);
+        out
+    }
+
+    /// Lowers one object pattern against a source identifier, appending
+    /// declarators. Identifier bindings with defaults emit tsc's shape
+    /// (`var _t = o.a, a = _t === void 0 ? 1 : _t`); nested patterns
+    /// read off the defaulted temp (`{x: {y} = {}}` reads `y` off the
+    /// ternary result, so the default feeds the nested reads).
+    fn lower_object_pattern(
+        &mut self,
+        rhs: &IdentifierNode,
+        object: &ObjectBindingPattern,
+        range: TextRange,
+        out: &mut Vec<VariableDeclaratorNode>,
+    ) -> Vec<RestExcludeKey> {
+        let mut rest_keys = Vec::new();
+        // Properties evaluate in source order: a computed key runs after
+        // the reads and defaults of the properties before it, so its temp
+        // is a declarator in sequence rather than a hoisted prelude.
         for property in &object.properties {
-            let PropertyName::Computed(key) = &property.name else {
-                continue;
-            };
-            let temp = self.temp_ident();
-            let value = self.rewrite_expr(key);
-            let declaration = self.make_temp_declaration(temp.clone(), value, range);
-            self.key_prelude.push(declaration);
-            if let BindingPattern::Identifier(ident) = property.binding.data() {
+            if let PropertyName::Computed(key) = &property.name {
+                let temp = self.temp_ident();
+                let value = self.rewrite_expr(key);
+                out.push(self.make_declarator(temp.clone(), Some(value), range));
+                rest_keys.push(RestExcludeKey::Computed(temp.clone()));
                 let reference = self.node(temp.range(), Expression::Identifier(temp.clone()));
-                let member = self.member_computed(&rhs, &reference, range);
-                out.push(self.make_declarator(ident.clone(), Some(member), range));
-            }
-        }
-        for property in &object.properties {
-            if let PropertyName::Computed(_) = &property.name {
+                let member = self.member_computed(rhs, &reference, range);
+                self.lower_property_binding(property, member, range, out);
                 continue;
             }
             if let BindingPattern::Rest(rest) = property.binding.data() {
                 if let BindingPattern::Identifier(ident) = rest.argument.data() {
-                    let excluded = self.rest_exclude_literal(&rest_names, range);
-                    let call = self.rest_call(&rhs, excluded, range);
+                    let excluded = self.rest_exclude_array(&rest_keys, range);
+                    let call = self.rest_call(rhs, excluded, range);
                     out.push(self.make_declarator(ident.clone(), Some(call), range));
                 }
                 continue;
             }
-            if let BindingPattern::Identifier(ident) = property.binding.data() {
-                let Some(key) = property_key_text(self, property) else {
-                    continue;
-                };
-                rest_names.push(key.clone());
-                let member = self.member_ident(&rhs, &key, range);
-                out.push(self.make_declarator(ident.clone(), Some(member), range));
-            }
+            let Some(key) = property_key_text(self, property) else {
+                continue;
+            };
+            rest_keys.push(RestExcludeKey::Static(key.clone()));
+            let member = self.member_ident(rhs, &key, range);
+            self.lower_property_binding(property, member, range, out);
         }
-        out
+        rest_keys
+    }
+
+    /// Binds one property's value expression: an identifier target with a
+    /// default emits the read-then-ternary pair; a nested pattern reads
+    /// through a temp (defaulted when a default exists); a bare
+    /// identifier clones the read.
+    fn lower_property_binding(
+        &mut self,
+        property: &ObjectBindingProperty,
+        member: Expr,
+        range: TextRange,
+        out: &mut Vec<VariableDeclaratorNode>,
+    ) {
+        match property.binding.data() {
+            BindingPattern::Identifier(ident) => match &property.initializer {
+                Some(default) => {
+                    let read = self.temp_ident();
+                    out.push(self.make_declarator(read.clone(), Some(member), range));
+                    let ternary = self.default_ternary(&read, default, range);
+                    out.push(self.make_declarator(ident.clone(), Some(ternary), range));
+                }
+                None => out.push(self.make_declarator(ident.clone(), Some(member), range)),
+            },
+            BindingPattern::Object(nested) => {
+                let value = self.default_or_read(&property.initializer, member, range, out);
+                self.lower_object_pattern(&value, nested, range, out);
+            }
+            BindingPattern::Array(nested) => {
+                let value = self.default_or_read(&property.initializer, member, range, out);
+                self.lower_array_pattern(&value, nested, range, out);
+            }
+            // Rest and invalid shapes never carry defaults; the caller's
+            // rest pass and parser refusals own them.
+            _ => {}
+        }
+    }
+
+    /// A nested pattern's source: the read temp, or the defaulted temp
+    /// when a default exists (tsc reads nested bindings off the
+    /// ternary's value).
+    fn default_or_read(
+        &mut self,
+        initializer: &Option<Box<Expr>>,
+        member: Expr,
+        range: TextRange,
+        out: &mut Vec<VariableDeclaratorNode>,
+    ) -> IdentifierNode {
+        let read = self.temp_ident();
+        out.push(self.make_declarator(read.clone(), Some(member), range));
+        match initializer {
+            Some(default) => {
+                let value = self.temp_ident();
+                let ternary = self.default_ternary(&read, default, range);
+                out.push(self.make_declarator(value.clone(), Some(ternary), range));
+                value
+            }
+            None => read,
+        }
     }
 
     fn lower_array_binding(
@@ -1844,32 +2501,90 @@ impl<'a> Rewriter<'a> {
         let mut out = Vec::new();
         if needs_temp {
             let init = initializer
-                .cloned()
+                .map(|value| self.rewrite_expr(value))
                 .unwrap_or_else(|| self.ident_expr("undefined"));
             out.push(self.make_declarator(rhs.clone(), Some(init), range));
         }
+        self.lower_array_pattern(&rhs, array, range, &mut out);
+        out
+    }
+
+    /// Lowers one array pattern against a source identifier. Elements
+    /// with defaults (`[a = 1]`) emit the read-then-ternary pair;
+    /// `[a = 1]` under an assignment-wrapped nested pattern
+    /// (`[[d = 2] = []]`) defaults the element read before the nested
+    /// pattern consumes it. Holes advance the index without emitting.
+    fn lower_array_pattern(
+        &mut self,
+        rhs: &IdentifierNode,
+        array: &ArrayBindingPattern,
+        range: TextRange,
+        out: &mut Vec<VariableDeclaratorNode>,
+    ) {
         let mut index = 0usize;
         for element in &array.elements {
             match element {
-                ArrayBindingElement::Elision => index += 1,
+                ArrayBindingElement::Elision | ArrayBindingElement::Missing(_) => index += 1,
                 ArrayBindingElement::Binding(binding) => match binding.data() {
                     BindingPattern::Identifier(ident) => {
-                        let member = self.member_index(&rhs, index, range);
+                        let member = self.member_index(rhs, index, range);
                         out.push(self.make_declarator(ident.clone(), Some(member), range));
                         index += 1;
                     }
                     BindingPattern::Rest(rest) => {
                         if let BindingPattern::Identifier(ident) = rest.argument.data() {
-                            let slice = self.slice_call(&rhs, index, range);
+                            let slice = self.slice_call(rhs, index, range);
                             out.push(self.make_declarator(ident.clone(), Some(slice), range));
                         }
                     }
-                    _ => index += 1,
+                    BindingPattern::Object(nested) => {
+                        let member = self.member_index(rhs, index, range);
+                        let value = self.default_or_read(&None, member, range, out);
+                        self.lower_object_pattern(&value, nested, range, out);
+                        index += 1;
+                    }
+                    BindingPattern::Array(nested) => {
+                        let member = self.member_index(rhs, index, range);
+                        let value = self.default_or_read(&None, member, range, out);
+                        self.lower_array_pattern(&value, nested, range, out);
+                        index += 1;
+                    }
+                    // `[a = 1]`: the default applies to the element read.
+                    BindingPattern::Assignment(assignment) => {
+                        let member = self.member_index(rhs, index, range);
+                        match assignment.left.data() {
+                            BindingPattern::Identifier(ident) => {
+                                let read = self.temp_ident();
+                                out.push(self.make_declarator(read.clone(), Some(member), range));
+                                let ternary = self.default_ternary(&read, &assignment.right, range);
+                                out.push(self.make_declarator(ident.clone(), Some(ternary), range));
+                            }
+                            BindingPattern::Object(nested) => {
+                                let value = self.default_or_read(
+                                    &Some(assignment.right.clone()),
+                                    member,
+                                    range,
+                                    out,
+                                );
+                                self.lower_object_pattern(&value, nested, range, out);
+                            }
+                            BindingPattern::Array(nested) => {
+                                let value = self.default_or_read(
+                                    &Some(assignment.right.clone()),
+                                    member,
+                                    range,
+                                    out,
+                                );
+                                self.lower_array_pattern(&value, nested, range, out);
+                            }
+                            _ => {}
+                        }
+                        index += 1;
+                    }
+                    BindingPattern::Missing(_) => index += 1,
                 },
-                ArrayBindingElement::Missing(_) => index += 1,
             }
         }
-        out
     }
 
     fn make_declarator(
@@ -2150,17 +2865,67 @@ impl<'a> Rewriter<'a> {
         )
     }
 
-    fn rest_exclude_literal(&mut self, names: &[String], range: TextRange) -> Expr {
+    /// The `__rest` exclusion array. Static keys contribute plain
+    /// strings; computed keys contribute tsc's runtime coercion
+    /// (`typeof t === "symbol" ? t : t + ""`), because the excluded
+    /// property name is only known at runtime.
+    fn rest_exclude_array(&mut self, keys: &[RestExcludeKey], range: TextRange) -> Expr {
         let mut elements = Vec::new();
-        for name in names {
-            let literal = self.string_literal(name);
-            let expr = self.node(
-                literal.range(),
-                Expression::Literal(Literal::String(literal)),
-            );
+        for key in keys {
+            let expr = match key {
+                RestExcludeKey::Static(name) => {
+                    let literal = self.string_literal(name);
+                    self.node(
+                        literal.range(),
+                        Expression::Literal(Literal::String(literal)),
+                    )
+                }
+                RestExcludeKey::Computed(temp) => {
+                    let temp_expr = self.node(temp.range(), Expression::Identifier(temp.clone()));
+                    let symbol = self.string_literal("symbol");
+                    let symbol_expr =
+                        self.node(symbol.range(), Expression::Literal(Literal::String(symbol)));
+                    let typeof_argument =
+                        self.node(temp.range(), Expression::Identifier(temp.clone()));
+                    let typeof_expr = self.node(
+                        temp.range(),
+                        Expression::Unary(UnaryExpression {
+                            operator: UnaryOperator::Typeof,
+                            argument: Box::new(typeof_argument),
+                        }),
+                    );
+                    let test = self.node(
+                        temp.range(),
+                        Expression::Binary(BinaryExpression {
+                            operator: BinaryOperator::StrictEqual,
+                            left: Box::new(typeof_expr),
+                            right: Box::new(symbol_expr),
+                        }),
+                    );
+                    let empty = self.string_literal("");
+                    let empty_expr =
+                        self.node(empty.range(), Expression::Literal(Literal::String(empty)));
+                    let concat_left = self.node(temp.range(), Expression::Identifier(temp.clone()));
+                    let concat = self.node(
+                        temp.range(),
+                        Expression::Binary(BinaryExpression {
+                            operator: BinaryOperator::Add,
+                            left: Box::new(concat_left),
+                            right: Box::new(empty_expr),
+                        }),
+                    );
+                    self.node(
+                        temp.range(),
+                        Expression::Conditional(ConditionalExpression {
+                            test: Box::new(test),
+                            consequent: Box::new(temp_expr),
+                            alternate: Box::new(concat),
+                        }),
+                    )
+                }
+            };
             elements.push(ArrayElement::Expression(Box::new(expr)));
         }
-        let _ = range;
         self.node(range, Expression::Array(ArrayLiteral { elements }))
     }
 
@@ -2473,7 +3238,14 @@ impl<'a> Rewriter<'a> {
             range,
             Statement::Variable(VariableDeclaration {
                 range,
-                kind: VariableKind::Let,
+                // Temps can land inside machine bodies that clone
+                // verbatim; `let` there is a SyntaxError at ES5, but
+                // ES2015+ targets keep the tighter binding.
+                kind: if self.options.target >= ScriptTarget::Es2015 {
+                    VariableKind::Let
+                } else {
+                    VariableKind::Var
+                },
                 declarations: vec![declaration],
             }),
         )
@@ -3960,7 +4732,18 @@ impl<'a> Rewriter<'a> {
             body: Some(inner_body),
         };
         let inner = if Self::needs(LanguageFeature::Generators, self.options) {
-            self.lower_generator_function(&inner)
+            let lowered = self.lower_generator_function(&inner);
+            if lowered.is_generator {
+                // The machine declined; the inner stays a native generator
+                // inside __awaiter, which the target cannot run. Signal it
+                // instead of emitting ES2015+ syntax silently.
+                self.diag(
+                    codes::GENERATOR_REQUIRES_ES2015,
+                    range,
+                    "generators require ScriptTarget::Es2015 or later",
+                );
+            }
+            lowered
         } else {
             inner
         };
@@ -4297,14 +5080,24 @@ impl<'a> Rewriter<'a> {
     ) -> Option<()> {
         let range = statement.range();
         let cons_block = block_statements(&if_statement.consequent)?;
-        let alt_block = block_statements(if_statement.alternate.as_deref()?)?;
+        // A missing alternate is the empty else: fallthrough. Refusing
+        // the whole generator over `if (c) { ... }` with no else clause
+        // rejects one of the most common statement shapes.
+        let alt_block: &[Stmt] = match if_statement.alternate.as_deref() {
+            Some(alternate) => block_statements(alternate)?,
+            None => &[],
+        };
         if !branch_is_simple(cons_block) || !branch_is_simple(alt_block) {
             return None;
         }
         let cons_resumes = count_branch_yields(cons_block);
         let alt_resumes = count_branch_yields(alt_block);
 
-        if cons_resumes == 0 && alt_resumes == 0 {
+        if cons_resumes == 0
+            && alt_resumes == 0
+            && !statements_contain_return(cons_block)
+            && !statements_contain_return(alt_block)
+        {
             // Inline reassembly: only the test can suspend.
             if !contains_yield(&if_statement.test) {
                 ctx.push(statement.clone());
@@ -4370,7 +5163,9 @@ impl<'a> Rewriter<'a> {
         match body.data() {
             Statement::While(while_statement) => {
                 let body_block = block_statements(&while_statement.body)?;
-                if count_yields(&while_statement.test) == 0 && count_branch_yields(body_block) == 0
+                if count_yields(&while_statement.test) == 0
+                    && count_branch_yields(body_block) == 0
+                    && !statements_contain_return(body_block)
                 {
                     // Clean loops stay inline, label attached.
                     ctx.push(statement.clone());
@@ -4380,7 +5175,10 @@ impl<'a> Rewriter<'a> {
             }
             Statement::DoWhile(do_statement) => {
                 let body_block = block_statements(&do_statement.body)?;
-                if count_yields(&do_statement.test) == 0 && count_branch_yields(body_block) == 0 {
+                if count_yields(&do_statement.test) == 0
+                    && count_branch_yields(body_block) == 0
+                    && !statements_contain_return(body_block)
+                {
                     ctx.push(statement.clone());
                     return Some(());
                 }
@@ -4388,7 +5186,10 @@ impl<'a> Rewriter<'a> {
             }
             Statement::For(for_statement) => {
                 let body_block = block_statements(&for_statement.body)?;
-                if for_clauses_are_clean(for_statement) && count_branch_yields(body_block) == 0 {
+                if for_clauses_are_clean(for_statement)
+                    && count_branch_yields(body_block) == 0
+                    && !statements_contain_return(body_block)
+                {
                     let rebuilt =
                         self.inline_for_with_hoist(statement.range(), for_statement, ctx)?;
                     let label = match statement.data() {
@@ -4434,7 +5235,7 @@ impl<'a> Rewriter<'a> {
         let body_block = block_statements(&while_statement.body)?;
         let test_resumes = count_yields(&while_statement.test);
         let body_resumes = count_branch_yields(body_block);
-        if test_resumes == 0 && body_resumes == 0 {
+        if test_resumes == 0 && body_resumes == 0 && !statements_contain_return(body_block) {
             ctx.push(statement.clone());
             return Some(());
         }
@@ -4495,7 +5296,7 @@ impl<'a> Rewriter<'a> {
         let body_block = block_statements(&do_statement.body)?;
         let test_resumes = count_yields(&do_statement.test);
         let body_resumes = count_branch_yields(body_block);
-        if test_resumes == 0 && body_resumes == 0 {
+        if test_resumes == 0 && body_resumes == 0 && !statements_contain_return(body_block) {
             ctx.push(statement.clone());
             return Some(());
         }
@@ -4607,7 +5408,10 @@ impl<'a> Rewriter<'a> {
     ) -> Option<()> {
         let range = statement.range();
         let body_block = block_statements(&for_statement.body)?;
-        if for_clauses_are_clean(for_statement) && count_branch_yields(body_block) == 0 {
+        if for_clauses_are_clean(for_statement)
+            && count_branch_yields(body_block) == 0
+            && !statements_contain_return(body_block)
+        {
             let rebuilt = self.inline_for_with_hoist(range, for_statement, ctx)?;
             ctx.push(rebuilt);
             return Some(());
@@ -4621,7 +5425,18 @@ impl<'a> Rewriter<'a> {
         }
         let init_resumes = match &for_statement.initializer {
             Some(ForInitializer::Expression(expression)) => count_yields(expression),
-            Some(ForInitializer::Variable(_)) | None => 0,
+            Some(ForInitializer::Variable(declaration)) => declaration
+                .declarations
+                .iter()
+                .map(|declarator| {
+                    declarator
+                        .data()
+                        .initializer
+                        .as_deref()
+                        .map_or(0, count_yields)
+                })
+                .sum(),
+            None => 0,
         };
         let test_resumes = count_yields(test);
         let update_resumes = for_statement.update.as_deref().map_or(0, count_yields);
@@ -4728,11 +5543,15 @@ impl<'a> Rewriter<'a> {
             .cases
             .iter()
             .any(|case| case_body_resumes(case) > 0);
-        if !disc_suspends && !any_test && !any_body {
+        let any_return = switch_statement
+            .cases
+            .iter()
+            .any(|case| statements_contain_return(&case.data().consequent));
+        if !disc_suspends && !any_test && !any_body && !any_return {
             ctx.push(statement.clone());
             return Some(());
         }
-        if disc_suspends && !any_test && !any_body {
+        if disc_suspends && !any_test && !any_body && !any_return {
             // Only the discriminant suspends: reassemble inline around
             // the resumed value, cases cloned.
             let discriminant = self.eval(&switch_statement.discriminant, ctx)?;
@@ -4769,11 +5588,14 @@ impl<'a> Rewriter<'a> {
         }
 
         let head = ctx.segments.len() as u32 - 1;
+        // One resume segment per yield node, not per suspending case: a
+        // case test like `(yield a) + (yield b)` splits twice, and a
+        // case-count under-count skews every dispatch target past it.
         let suspending_tests = switch_statement
             .cases
             .iter()
-            .filter(|case| case_test_suspends(case))
-            .count() as u32;
+            .map(|case| case.data().test.as_deref().map_or(0, count_yields))
+            .sum::<u32>();
         // Each suspending test's yield lands in the current segment and
         // its resume opens one new segment, so the dispatch phases span
         // head..head+suspending_tests and bodies start after.
@@ -5125,8 +5947,15 @@ impl<'a> Rewriter<'a> {
                 if yielded.delegate {
                     return None;
                 }
-                let argument = yielded.argument.as_ref()?;
-                let evaluated = self.eval(argument, ctx)?;
+                // A bare `yield;` is the same protocol with void 0; refusing
+                // the whole generator over the missing argument drops a
+                // trivial, common shape.
+                let void_argument = self.void_zero(expr.range());
+                let argument = yielded
+                    .argument
+                    .as_ref()
+                    .map_or(void_argument, |argument| argument.as_ref().clone());
+                let evaluated = self.eval(&argument, ctx)?;
                 let sentinel = self.number_expr("4 /*yield*/");
                 let array = self.array_literal(vec![sentinel, evaluated], range);
                 let terminator = self.machine_return(array, range);
@@ -5398,7 +6227,15 @@ impl<'a> Rewriter<'a> {
                 ))
             }
             Expression::Import(import) => {
-                let source = self.eval(&import.source, ctx)?;
+                // Source operands run before the options suspend; a clean
+                // source with side effects must materialize into a temp
+                // ahead of the split, or its effects slip into the resume
+                // segment and run after the suspension.
+                let options_suspends = import.options.as_deref().is_some_and(contains_yield);
+                let source = match self.eval(&import.source, ctx)? {
+                    value if options_suspends => self.materialize(value, ctx, range)?,
+                    value => value,
+                };
                 let options = match &import.options {
                     Some(options) if contains_yield(options) => {
                         Some(Box::new(self.eval(options, ctx)?))
@@ -5701,6 +6538,7 @@ impl<'a> Rewriter<'a> {
         expression: &Expr,
         class_expression: &ClassExpression,
         inferred_name: Option<&str>,
+        hoist_suspending: bool,
     ) -> Expr {
         if matches!(FieldMode::for_options(self.options), FieldMode::Native) {
             let lowered = self.lower_class(&class_expression.class, expression.range(), None);
@@ -5730,6 +6568,48 @@ impl<'a> Rewriter<'a> {
                 child_marked,
             );
         }
+        // A suspending computed key cannot live inside the IIFE: the
+        // arrow is a plain function, so a yield there is a SyntaxError
+        // (tsc 6.0.2 emits exactly that broken shape). Where the caller
+        // drains key_prelude into an enclosing statement list, the
+        // suspending key temps hoist out and the machine splits them;
+        // expression contexts cannot hoist, so they keep the IIFE and
+        // signal the requires-es2015 refusal instead of breaking
+        // silently. Static-field postludes reference the constructed
+        // temp and can never hoist; they refuse the same way.
+        // Whole-prelude move only: partitioning the prelude would
+        // reorder mixed suspending and clean keys, and computed keys
+        // evaluate in member order. Entries never reference the class
+        // temp (its declaration is pushed below), so the move is
+        // order-safe. An await counts too: in expression position the
+        // rewrite pass leaves it raw, and the machine entry gate then
+        // refuses the whole generator loudly.
+        let suspends = |statement: &Stmt| {
+            count_branch_yields(std::slice::from_ref(statement)) > 0
+                || statements_contain_await(std::slice::from_ref(statement))
+        };
+        let refused = lowered.prelude.iter().any(&suspends) && !hoist_suspending;
+        if !refused && hoist_suspending && lowered.prelude.iter().any(&suspends) {
+            self.key_prelude
+                .extend(std::mem::take(&mut lowered.prelude));
+        }
+        let postlude_refused = lowered.postlude.iter().any(suspends);
+        if refused || postlude_refused {
+            self.diag(
+                codes::GENERATOR_REQUIRES_ES2015,
+                expression.range(),
+                "generators require ScriptTarget::Es2015 or later",
+            );
+            // Returning the unlowered class keeps the failure loud and
+            // honest: the machine's class walker (heritage, computed
+            // names, field initializers) sees the suspension, refuses
+            // the conversion, and the generator stays native under the
+            // diagnostic. Lowering anyway would bury a raw yield or
+            // await inside a synthesized plain arrow the machine
+            // cannot see through - the postlude (static-field
+            // initializers) included, not just the key prelude.
+            return expression.clone();
+        }
         let class = self.syn_node(
             expression.range(),
             Expression::Class(ClassExpression {
@@ -5741,7 +6621,11 @@ impl<'a> Rewriter<'a> {
             expression.range(),
             Statement::Variable(VariableDeclaration {
                 range: expression.range(),
-                kind: VariableKind::Let,
+                kind: if self.options.target >= ScriptTarget::Es2015 {
+                    VariableKind::Let
+                } else {
+                    VariableKind::Var
+                },
                 declarations: vec![declaration],
             }),
         ));
@@ -5815,15 +6699,34 @@ impl<'a> Rewriter<'a> {
             );
         }
         match expression.data() {
-            Expression::Class(class) => self.lower_class_expression(expression, class, None),
+            Expression::Class(class) => {
+                let previous = self.replace_await;
+                self.replace_await = false;
+                let lowered = self.lower_class_expression(expression, class, None, false);
+                self.replace_await = previous;
+                lowered
+            }
             Expression::Function(function) => {
+                // A nested function-like owns its awaits: rewriting them
+                // into yields here would emit `yield` inside a non-async
+                // function, so the flag clears for the nested body and
+                // restores after.
+                let previous = self.replace_await;
+                self.replace_await = false;
                 let function = self.rewrite_function_like(&function.function, expression.range());
+                self.replace_await = previous;
                 self.node(
                     expression.range(),
                     Expression::Function(FunctionExpression { function }),
                 )
             }
-            Expression::Arrow(arrow) => self.rewrite_arrow(expression, arrow),
+            Expression::Arrow(arrow) => {
+                let previous = self.replace_await;
+                self.replace_await = false;
+                let rewritten = self.rewrite_arrow(expression, arrow);
+                self.replace_await = previous;
+                rewritten
+            }
             Expression::Await(awaited) => {
                 let argument = self.rewrite_expr(&awaited.argument);
                 self.node(
@@ -6059,20 +6962,7 @@ impl<'a> Rewriter<'a> {
                     // Convert awaits inside the target too, so a
                     // suspending target becomes a visible machine refusal
                     // instead of a live `await` in ES5 output.
-                    let object = self.rewrite_expr(&member.object);
-                    let property = match &member.property {
-                        MemberProperty::Computed(key) => {
-                            MemberProperty::Computed(Box::new(self.rewrite_expr(key)))
-                        }
-                        other => other.clone(),
-                    };
-                    self.node(
-                        assignment.left.range(),
-                        AssignmentTarget::Member(AssignmentMemberTarget {
-                            object: Box::new(object),
-                            property,
-                        }),
-                    )
+                    self.rewrite_member_target(member, assignment.left.range())
                 } else {
                     assignment.left.clone()
                 };
@@ -6094,6 +6984,27 @@ impl<'a> Rewriter<'a> {
             }
             _ => expression.clone(),
         }
+    }
+
+    fn rewrite_member_target(
+        &mut self,
+        member: &AssignmentMemberTarget,
+        range: TextRange,
+    ) -> AssignmentTargetNode {
+        let object = self.rewrite_expr(&member.object);
+        let property = match &member.property {
+            MemberProperty::Computed(key) => {
+                MemberProperty::Computed(Box::new(self.rewrite_expr(key)))
+            }
+            other => other.clone(),
+        };
+        self.node(
+            range,
+            AssignmentTarget::Member(AssignmentMemberTarget {
+                object: Box::new(object),
+                property,
+            }),
+        )
     }
 
     /// `Math.pow(base, exponent)` — the ES2016 exponentiation downlevel form.
@@ -6809,7 +7720,18 @@ impl<'a> Rewriter<'a> {
                 body: Some(body),
             };
             let inner = if Self::needs(LanguageFeature::Generators, self.options) {
-                self.lower_generator_function(&inner)
+                let lowered = self.lower_generator_function(&inner);
+                if lowered.is_generator {
+                    // Same contract as the named-function path: the machine
+                    // declined and the inner stays a native generator inside
+                    // __awaiter, which the target cannot run — signal it.
+                    self.diag(
+                        codes::GENERATOR_REQUIRES_ES2015,
+                        expression.range(),
+                        "generators require ScriptTarget::Es2015 or later",
+                    );
+                }
+                lowered
             } else {
                 inner
             };
@@ -6958,7 +7880,17 @@ fn block_statements(statement: &Stmt) -> Option<&[Stmt]> {
 fn for_clauses_are_clean(for_statement: &ForStatement) -> bool {
     let init_clean = match &for_statement.initializer {
         Some(ForInitializer::Expression(expression)) => !contains_yield(expression),
-        _ => true,
+        Some(ForInitializer::Variable(declaration)) => {
+            declaration.declarations.iter().all(|declarator| {
+                declarator
+                    .data()
+                    .initializer
+                    .as_deref()
+                    .is_none_or(|init| !contains_yield(init))
+                    && count_binding_yields(&declarator.data().binding) == 0
+            })
+        }
+        None => true,
     };
     let test_clean = for_statement
         .test
@@ -6971,6 +7903,92 @@ fn for_clauses_are_clean(for_statement: &ForStatement) -> bool {
     init_clean && test_clean && update_clean
 }
 
+/// One `__rest` exclusion entry: a static property name or the temp
+/// holding an evaluated computed key (excluded at runtime via tsc's
+/// symbol-aware coercion).
+enum RestExcludeKey {
+    Static(String),
+    Computed(IdentifierNode),
+}
+
+/// Suspensions inside a binding pattern: default initializers and
+/// computed key expressions. Destructuring lowering erases nothing once
+/// these count — a clean pattern lowers to ternary declarators, a
+/// suspending one to machine-owned branch statements.
+fn count_binding_yields(pattern: &Pattern) -> u32 {
+    match pattern.data() {
+        BindingPattern::Identifier(_) | BindingPattern::Missing(_) => 0,
+        BindingPattern::Object(object) => object
+            .properties
+            .iter()
+            .map(|property| {
+                let key = match &property.name {
+                    PropertyName::Computed(key) => count_yields(key),
+                    _ => 0,
+                };
+                let default = property.initializer.as_deref().map_or(0, count_yields);
+                key + default + count_binding_yields(&property.binding)
+            })
+            .sum(),
+        BindingPattern::Array(array) => array
+            .elements
+            .iter()
+            .map(|element| match element {
+                ArrayBindingElement::Elision | ArrayBindingElement::Missing(_) => 0,
+                ArrayBindingElement::Binding(binding) => count_binding_yields(binding),
+            })
+            .sum(),
+        BindingPattern::Rest(rest) => count_binding_yields(&rest.argument),
+        BindingPattern::Assignment(assignment) => {
+            count_yields(&assignment.right) + count_binding_yields(&assignment.left)
+        }
+    }
+}
+
+/// Every identifier a pattern binds, in source order.
+fn collect_binding_names(pattern: &Pattern, names: &mut Vec<IdentifierNode>) {
+    match pattern.data() {
+        BindingPattern::Identifier(ident) => names.push(ident.clone()),
+        BindingPattern::Missing(_) => {}
+        BindingPattern::Object(object) => {
+            for property in &object.properties {
+                collect_binding_names(&property.binding, names);
+            }
+        }
+        BindingPattern::Array(array) => {
+            for element in &array.elements {
+                if let ArrayBindingElement::Binding(binding) = element {
+                    collect_binding_names(binding, names);
+                }
+            }
+        }
+        BindingPattern::Rest(rest) => collect_binding_names(&rest.argument, names),
+        BindingPattern::Assignment(assignment) => {
+            collect_binding_names(&assignment.left, names);
+        }
+    }
+}
+
+/// The await view of the same binding-pattern walk.
+fn binding_contains_await(pattern: &Pattern) -> bool {
+    match pattern.data() {
+        BindingPattern::Identifier(_) | BindingPattern::Missing(_) => false,
+        BindingPattern::Object(object) => object.properties.iter().any(|property| {
+            matches!(&property.name, PropertyName::Computed(key) if contains_await(key))
+                || property.initializer.as_deref().is_some_and(contains_await)
+                || binding_contains_await(&property.binding)
+        }),
+        BindingPattern::Array(array) => array.elements.iter().any(|element| match element {
+            ArrayBindingElement::Elision | ArrayBindingElement::Missing(_) => false,
+            ArrayBindingElement::Binding(binding) => binding_contains_await(binding),
+        }),
+        BindingPattern::Rest(rest) => binding_contains_await(&rest.argument),
+        BindingPattern::Assignment(assignment) => {
+            contains_await(&assignment.right) || binding_contains_await(&assignment.left)
+        }
+    }
+}
+
 /// Whether every branch statement is a shape the labeled if slice emits.
 fn branch_is_simple(statements: &[Stmt]) -> bool {
     statements.iter().all(|statement| {
@@ -6981,7 +7999,10 @@ fn branch_is_simple(statements: &[Stmt]) -> bool {
     })
 }
 
-/// The number of yield splits a branch's statements produce.
+/// The number of yield splits a branch's statements produce. Zero gates
+/// the inline verbatim clone, so a statement shape the loop-body emitter
+/// cannot lower must report non-zero (it refuses, keeping the native
+/// form) — never zero.
 fn count_branch_yields(statements: &[Stmt]) -> u32 {
     statements
         .iter()
@@ -6996,11 +8017,77 @@ fn count_branch_yields(statements: &[Stmt]) -> u32 {
                         .initializer
                         .as_deref()
                         .map_or(0, count_yields)
+                        + count_binding_yields(&declarator.data().binding)
                 })
                 .sum(),
-            _ => 0,
+            Statement::Continue(_) | Statement::Break(_) | Statement::Empty => 0,
+            Statement::Return(ret) => ret.argument.as_deref().map_or(0, count_yields),
+            Statement::Throw(throw) => count_yields(&throw.argument),
+            Statement::Block(block) => count_branch_yields(&block.data().statements),
+            // Clean nested control flow clones correctly inside a machine
+            // body, so it counts precisely; suspending nested shapes route
+            // to the body emitter, which refuses what it cannot lower.
+            Statement::If(if_statement) => {
+                count_yields(&if_statement.test)
+                    + count_branch_yields(branch_statements(&if_statement.consequent))
+                    + if_statement
+                        .alternate
+                        .as_ref()
+                        .map_or(0, |alt| count_branch_yields(branch_statements(alt)))
+            }
+            Statement::While(while_statement) => {
+                count_yields(&while_statement.test)
+                    + count_branch_yields(branch_statements(&while_statement.body))
+            }
+            Statement::DoWhile(do_statement) => {
+                count_yields(&do_statement.test)
+                    + count_branch_yields(branch_statements(&do_statement.body))
+            }
+            Statement::Labeled(labeled) => count_branch_yields(branch_statements(&labeled.body)),
+            _ => 1,
         })
         .sum()
+}
+
+/// The statements of a branch or loop body: a block flattens, any other
+/// statement is a single-statement branch. Counters and the return guard
+/// must see through non-block bodies, or a nested `while (x) return z;`
+/// hides its return and the clone gate drops the value.
+fn branch_statements(statement: &Stmt) -> &[Stmt] {
+    match statement.data() {
+        Statement::Block(block) => &block.data().statements,
+        _ => std::slice::from_ref(statement),
+    }
+}
+
+/// Whether any statement in this region returns — at any nesting depth,
+/// but never inside a nested function-like (those own their returns).
+/// A cloned raw return exits the machine's inner function directly and
+/// the runtime silently drops the value, so clone gates must refuse.
+fn statements_contain_return(statements: &[Stmt]) -> bool {
+    statements.iter().any(|statement| match statement.data() {
+        Statement::Return(_) => true,
+        Statement::Block(block) => statements_contain_return(&block.data().statements),
+        Statement::If(if_statement) => {
+            statements_contain_return(branch_statements(&if_statement.consequent))
+                || if_statement
+                    .alternate
+                    .as_ref()
+                    .is_some_and(|alt| statements_contain_return(branch_statements(alt)))
+        }
+        Statement::While(while_statement) => {
+            statements_contain_return(branch_statements(&while_statement.body))
+        }
+        Statement::DoWhile(do_statement) => {
+            statements_contain_return(branch_statements(&do_statement.body))
+        }
+        Statement::Labeled(labeled) => statements_contain_return(branch_statements(&labeled.body)),
+        Statement::Switch(switch_statement) => switch_statement
+            .cases
+            .iter()
+            .any(|case| statements_contain_return(&case.data().consequent)),
+        _ => false,
+    })
 }
 
 impl ChainSegment {
@@ -7011,14 +8098,112 @@ impl ChainSegment {
     }
 }
 
+/// The enclosing-context code of a class: decorators, the heritage
+/// expression, computed member names, and field initializers. Method,
+/// constructor, and static-block bodies are function boundaries and own
+/// their suspensions, so they stay opaque to the enclosing walkers.
+fn count_class_context_yields(class: &ClassDeclaration) -> u32 {
+    let decorators: u32 = class
+        .decorators
+        .iter()
+        .map(|decorator| count_yields(&decorator.data().expression))
+        .sum();
+    let heritage = class
+        .extends
+        .as_ref()
+        .map(|heritage| count_yields(&heritage.expression))
+        .unwrap_or(0);
+    let members: u32 = class
+        .members
+        .iter()
+        .map(|member| match member.data() {
+            ClassMember::Method(method) => match &method.name {
+                PropertyName::Computed(key) => count_yields(key),
+                _ => 0,
+            },
+            ClassMember::Property(property) => match &property.name {
+                PropertyName::Computed(key) => count_yields(key),
+                _ => property.initializer.as_deref().map_or(0, count_yields),
+            },
+            ClassMember::AutoAccessor(accessor) => match &accessor.name {
+                PropertyName::Computed(key) => count_yields(key),
+                _ => accessor.initializer.as_deref().map_or(0, count_yields),
+            },
+            _ => 0,
+        })
+        .sum();
+    decorators + heritage + members
+}
+
+/// The await view of the same class-context walk.
+fn class_context_contains_await(class: &ClassDeclaration) -> bool {
+    if class
+        .decorators
+        .iter()
+        .any(|decorator| contains_await(&decorator.data().expression))
+        || class
+            .extends
+            .as_ref()
+            .is_some_and(|heritage| contains_await(&heritage.expression))
+    {
+        return true;
+    }
+    class.members.iter().any(|member| match member.data() {
+        ClassMember::Method(method) => {
+            matches!(&method.name, PropertyName::Computed(key) if contains_await(key))
+        }
+        ClassMember::Property(property) => {
+            matches!(&property.name, PropertyName::Computed(key) if contains_await(key))
+                || property.initializer.as_deref().is_some_and(contains_await)
+        }
+        ClassMember::AutoAccessor(accessor) => {
+            matches!(&accessor.name, PropertyName::Computed(key) if contains_await(key))
+                || accessor.initializer.as_deref().is_some_and(contains_await)
+        }
+        _ => false,
+    })
+}
+
+/// The yield view of the same class-context walk.
+fn class_context_contains_yield(class: &ClassDeclaration) -> bool {
+    if class
+        .decorators
+        .iter()
+        .any(|decorator| contains_yield(&decorator.data().expression))
+        || class
+            .extends
+            .as_ref()
+            .is_some_and(|heritage| contains_yield(&heritage.expression))
+    {
+        return true;
+    }
+    class.members.iter().any(|member| match member.data() {
+        ClassMember::Method(method) => {
+            matches!(&method.name, PropertyName::Computed(key) if contains_yield(key))
+        }
+        ClassMember::Property(property) => {
+            matches!(&property.name, PropertyName::Computed(key) if contains_yield(key))
+                || property.initializer.as_deref().is_some_and(contains_yield)
+        }
+        ClassMember::AutoAccessor(accessor) => {
+            matches!(&accessor.name, PropertyName::Computed(key) if contains_yield(key))
+                || accessor.initializer.as_deref().is_some_and(contains_yield)
+        }
+        _ => false,
+    })
+}
+
 /// Counts the yield nodes of this function's body (nested function-likes
 /// own their own yields).
 fn count_yields(expression: &Expr) -> u32 {
     match expression.data() {
-        Expression::Yield(_) => 1,
+        Expression::Yield(yielded) => 1 + yielded.argument.as_deref().map_or(0, count_yields),
         Expression::Identifier(_) | Expression::This | Expression::Super => 0,
         Expression::Literal(_) | Expression::Meta(_) | Expression::Missing(_) => 0,
-        Expression::Function(_) | Expression::Class(_) | Expression::Arrow(_) => 0,
+        Expression::Function(_) | Expression::Arrow(_) => 0,
+        // Heritage, computed names, and field initializers run in the
+        // enclosing context; bodies stay owned.
+        Expression::Class(class) => count_class_context_yields(&class.class),
         Expression::Template(template) => template.expressions.iter().map(count_yields).sum(),
         Expression::Array(array) => array
             .elements
@@ -7040,6 +8225,17 @@ fn count_yields(expression: &Expr) -> u32 {
                             _ => 0,
                         }
                 }
+                // A spread element carries an expression; method-like
+                // members (methods/getters/setters) own their own
+                // suspensions, just like nested function-likes, so the
+                // wildcard below is safe for them.
+                ObjectMember::Spread(spread) => count_yields(&spread.argument),
+                // A method's computed name executes in the enclosing
+                // function; its body owns its own suspensions.
+                ObjectMember::Method(method) => match &method.name {
+                    PropertyName::Computed(key) => count_yields(key),
+                    _ => 0,
+                },
                 _ => 0,
             })
             .sum(),
@@ -7050,6 +8246,7 @@ fn count_yields(expression: &Expr) -> u32 {
                     .iter()
                     .map(|argument| match argument {
                         CallArgument::Expression(value) => count_yields(value),
+                        CallArgument::Spread(spread) => count_yields(&spread.argument),
                         _ => 0,
                     })
                     .sum::<u32>()
@@ -7068,12 +8265,27 @@ fn count_yields(expression: &Expr) -> u32 {
                     .iter()
                     .map(|argument| match argument {
                         CallArgument::Expression(value) => count_yields(value),
+                        CallArgument::Spread(spread) => count_yields(&spread.argument),
                         _ => 0,
                     })
                     .sum::<u32>()
         }
         Expression::Await(awaited) => count_yields(&awaited.argument),
         Expression::Unary(unary) => count_yields(&unary.argument),
+        Expression::Update(update) => match update.argument.data() {
+            AssignmentTarget::Member(member) => {
+                count_yields(&member.object)
+                    + match &member.property {
+                        MemberProperty::Computed(key) => count_yields(key),
+                        _ => 0,
+                    }
+            }
+            // Pattern and invalid targets can carry yields in computed
+            // keys and defaults; a sentinel count routes them to eval,
+            // which refuses, rather than the inline verbatim clone.
+            AssignmentTarget::Identifier(_) => 0,
+            _ => 1,
+        },
         Expression::Binary(binary) => count_yields(&binary.left) + count_yields(&binary.right),
         Expression::Logical(logical) => count_yields(&logical.left) + count_yields(&logical.right),
         Expression::Conditional(conditional) => {
@@ -7091,14 +8303,24 @@ fn count_yields(expression: &Expr) -> u32 {
                                 _ => 0,
                             }
                     }
-                    _ => 0,
+                    // Pattern and invalid targets can carry yields; a
+                    // sentinel count routes them to eval, which refuses,
+                    // rather than the inline verbatim clone.
+                    AssignmentTarget::Identifier(_) => 0,
+                    _ => 1,
                 }
         }
         Expression::Sequence(sequence) => sequence.expressions.iter().map(count_yields).sum(),
         Expression::Parenthesized(inner) => count_yields(inner),
         Expression::As(cast) => count_yields(&cast.expression),
         Expression::NonNull(non_null) => count_yields(&non_null.expression),
-        _ => 0,
+        Expression::Import(import) => {
+            count_yields(&import.source) + import.options.as_deref().map_or(0, count_yields)
+        }
+        // Unknown shapes report non-zero: zero means provably clean and
+        // gates the inline verbatim clone; unknown routes to eval, whose
+        // refusal keeps the native form.
+        _ => 1,
     }
 }
 
@@ -7263,7 +8485,12 @@ fn machine_state_name(skip: &std::collections::HashSet<String>, temps: &[String]
     let taken: std::collections::HashSet<&String> = skip.iter().chain(temps.iter()).collect();
     let mut index = 0u32;
     loop {
-        let name = machine_name(index).unwrap_or_else(|| "_state".to_string());
+        // Past the alphabet machine_name returns None forever; a fixed
+        // "_state" fallback would then loop endlessly when _state is also
+        // taken, so the suffix keeps every candidate fresh and the loop
+        // terminates.
+        let name =
+            machine_name(index).unwrap_or_else(|| format!("_state{}", index.saturating_sub(26)));
         if !taken.contains(&name) {
             return name;
         }
@@ -7272,7 +8499,11 @@ fn machine_state_name(skip: &std::collections::HashSet<String>, temps: &[String]
 }
 
 fn call_argument_suspends(argument: &CallArgument) -> bool {
-    matches!(argument, CallArgument::Expression(value) if contains_yield(value))
+    match argument {
+        CallArgument::Expression(value) => contains_yield(value),
+        CallArgument::Spread(spread) => contains_yield(&spread.argument),
+        _ => false,
+    }
 }
 
 /// Whether an assignment target subtree still holds an await, so the
@@ -7292,7 +8523,10 @@ fn contains_await(expression: &Expr) -> bool {
         Expression::Await(_) => true,
         Expression::Identifier(_) | Expression::This | Expression::Super => false,
         Expression::Literal(_) | Expression::Meta(_) | Expression::Missing(_) => false,
-        Expression::Function(_) | Expression::Class(_) | Expression::Arrow(_) => false,
+        Expression::Function(_) | Expression::Arrow(_) => false,
+        // Heritage, computed names, and field initializers run in the
+        // enclosing context; bodies stay owned.
+        Expression::Class(class) => class_context_contains_await(&class.class),
         Expression::Yield(yielded) => yielded.argument.as_deref().is_some_and(contains_await),
         Expression::Template(template) => template.expressions.iter().any(contains_await),
         Expression::Array(array) => array.elements.iter().any(|element| match element {
@@ -7305,27 +8539,45 @@ fn contains_await(expression: &Expr) -> bool {
                 contains_await(&property.value)
                     || matches!(&property.name, PropertyName::Computed(key) if contains_await(key))
             }
-            _ => true,
+            ObjectMember::Spread(spread) => contains_await(&spread.argument),
+            // A method's computed name executes in the enclosing function;
+            // its body owns its own suspensions.
+            ObjectMember::Method(method) => {
+                matches!(&method.name, PropertyName::Computed(key) if contains_await(key))
+            }
+            _ => false,
         }),
         Expression::Call(call) => {
             contains_await(&call.callee)
                 || call.arguments.iter().any(|argument| match argument {
                     CallArgument::Expression(value) => contains_await(value),
+                    CallArgument::Spread(spread) => contains_await(&spread.argument),
                     _ => false,
                 })
         }
-        Expression::Member(member) => {
-            contains_await(&member.object)
-                || matches!(&member.property, MemberProperty::Computed(key) if contains_await(key))
-        }
+        Expression::Member(member) => target_contains_await(&member.object, &member.property),
         Expression::New(new) => {
             contains_await(&new.callee)
                 || new.arguments.iter().any(|argument| match argument {
                     CallArgument::Expression(value) => contains_await(value),
+                    CallArgument::Spread(spread) => contains_await(&spread.argument),
                     _ => false,
                 })
         }
         Expression::Unary(unary) => contains_await(&unary.argument),
+        Expression::Import(import) => {
+            contains_await(&import.source) || import.options.as_deref().is_some_and(contains_await)
+        }
+        Expression::Update(update) => match update.argument.data() {
+            AssignmentTarget::Member(member) => {
+                target_contains_await(&member.object, &member.property)
+            }
+            // Pattern and invalid targets can carry expressions in
+            // computed keys and defaults; report containment so the
+            // machine refuses rather than clones.
+            AssignmentTarget::Identifier(_) => false,
+            _ => true,
+        },
         Expression::Binary(binary) => contains_await(&binary.left) || contains_await(&binary.right),
         Expression::Logical(logical) => {
             contains_await(&logical.left) || contains_await(&logical.right)
@@ -7337,8 +8589,16 @@ fn contains_await(expression: &Expr) -> bool {
         }
         Expression::Assignment(assignment) => {
             contains_await(&assignment.right)
-                || matches!(assignment.left.data(), AssignmentTarget::Member(member)
-                    if contains_await(&member.object))
+                || match assignment.left.data() {
+                    AssignmentTarget::Member(member) => {
+                        target_contains_await(&member.object, &member.property)
+                    }
+                    // Pattern and invalid targets can carry expressions in
+                    // computed keys and defaults; report containment so the
+                    // machine refuses rather than clones.
+                    AssignmentTarget::Identifier(_) => false,
+                    _ => true,
+                }
         }
         Expression::Sequence(sequence) => sequence.expressions.iter().any(contains_await),
         Expression::Parenthesized(inner) => contains_await(inner),
@@ -7360,6 +8620,7 @@ fn statements_contain_await(statements: &[Stmt]) -> bool {
                 .initializer
                 .as_deref()
                 .is_some_and(contains_await)
+                || binding_contains_await(&declarator.data().binding)
         }),
         Statement::Return(returned) => returned.argument.as_deref().is_some_and(contains_await),
         Statement::Block(block) => statements_contain_await(&block.data().statements),
@@ -7377,7 +8638,17 @@ fn statements_contain_await(statements: &[Stmt]) -> bool {
         Statement::For(for_statement) => {
             let init = match &for_statement.initializer {
                 Some(ForInitializer::Expression(expression)) => contains_await(expression),
-                _ => false,
+                Some(ForInitializer::Variable(declaration)) => {
+                    declaration.declarations.iter().any(|declarator| {
+                        declarator
+                            .data()
+                            .initializer
+                            .as_deref()
+                            .is_some_and(contains_await)
+                            || binding_contains_await(&declarator.data().binding)
+                    })
+                }
+                None => false,
             };
             let test = for_statement.test.as_deref().is_some_and(contains_await);
             let update = for_statement.update.as_deref().is_some_and(contains_await);
@@ -7393,6 +8664,9 @@ fn statements_contain_await(statements: &[Stmt]) -> bool {
         Statement::Labeled(labeled) => branch_awaits(&labeled.body),
         // Jumps and empties hold no expressions.
         Statement::Break(_) | Statement::Continue(_) | Statement::Empty => false,
+        // The machine helper wraps the body in try/catch, so a cloned raw
+        // throw is protocol-safe; only its argument's awaits matter.
+        Statement::Throw(throw_statement) => contains_await(&throw_statement.argument),
         _ => true,
     })
 }
@@ -7409,10 +8683,11 @@ fn branch_awaits(statement: &Stmt) -> bool {
 }
 
 fn contains_yield_array(array: &ArrayLiteral) -> bool {
-    array
-        .elements
-        .iter()
-        .any(|element| matches!(element, ArrayElement::Expression(value) if contains_yield(value)))
+    array.elements.iter().any(|element| match element {
+        ArrayElement::Expression(value) => contains_yield(value),
+        ArrayElement::Spread(spread) => contains_yield(&spread.argument),
+        _ => false,
+    })
 }
 
 fn contains_yield(expression: &Expr) -> bool {
@@ -7421,25 +8696,31 @@ fn contains_yield(expression: &Expr) -> bool {
         Expression::Identifier(_) | Expression::This | Expression::Super => false,
         Expression::Literal(_) | Expression::Meta(_) | Expression::Missing(_) => false,
         // A yield inside a nested function belongs to that function.
-        Expression::Function(_) | Expression::Class(_) | Expression::Arrow(_) => false,
+        Expression::Function(_) | Expression::Arrow(_) => false,
+        // Heritage, computed names, and field initializers run in the
+        // enclosing context; bodies stay owned.
+        Expression::Class(class) => class_context_contains_yield(&class.class),
         Expression::Template(template) => template.expressions.iter().any(contains_yield),
         Expression::TaggedTemplate(_) => true,
-        Expression::Array(array) => array.elements.iter().any(|element| match element {
-            ArrayElement::Expression(nested) => contains_yield(nested),
-            ArrayElement::Spread(spread) => contains_yield(&spread.argument),
-            _ => false,
-        }),
+        Expression::Array(array) => contains_yield_array(array),
         Expression::Object(object) => object.members.iter().any(|member| match member.data() {
             ObjectMember::Property(property) => {
                 contains_yield(&property.value)
                     || matches!(&property.name, PropertyName::Computed(key) if contains_yield(key))
             }
-            _ => true,
+            ObjectMember::Spread(spread) => contains_yield(&spread.argument),
+            // A method's computed name executes in the enclosing function;
+            // its body owns its own suspensions.
+            ObjectMember::Method(method) => {
+                matches!(&method.name, PropertyName::Computed(key) if contains_yield(key))
+            }
+            _ => false,
         }),
         Expression::Call(call) => {
             contains_yield(&call.callee)
                 || call.arguments.iter().any(|argument| match argument {
                     CallArgument::Expression(nested) => contains_yield(nested),
+                    CallArgument::Spread(spread) => contains_yield(&spread.argument),
                     _ => false,
                 })
         }
@@ -7451,14 +8732,22 @@ fn contains_yield(expression: &Expr) -> bool {
             contains_yield(&new.callee)
                 || new.arguments.iter().any(|argument| match argument {
                     CallArgument::Expression(nested) => contains_yield(nested),
+                    CallArgument::Spread(spread) => contains_yield(&spread.argument),
                     _ => false,
                 })
         }
         Expression::Await(awaited) => contains_yield(&awaited.argument),
         Expression::Unary(unary) => contains_yield(&unary.argument),
         Expression::Update(update) => match update.argument.data() {
-            AssignmentTarget::Member(member) => contains_yield(&member.object),
-            _ => false,
+            AssignmentTarget::Member(member) => {
+                contains_yield(&member.object)
+                    || matches!(&member.property, MemberProperty::Computed(key) if contains_yield(key))
+            }
+            // Pattern and invalid targets can carry expressions in
+            // computed keys and defaults; report containment so the
+            // machine refuses rather than clones.
+            AssignmentTarget::Identifier(_) => false,
+            _ => true,
         },
         Expression::Binary(binary) => contains_yield(&binary.left) || contains_yield(&binary.right),
         Expression::Logical(logical) => {
@@ -8709,6 +9998,21 @@ mod tests {
     }
 
     #[test]
+    fn native_declaration_emits_suspending_class_key_prelude_in_order() {
+        let output = emit_at(
+            "function* g() { const left = before(), C = class { [yield key()]() {} }, right = after(); }\n",
+            ScriptTarget::Es2015,
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let code = javascript(&output);
+        let positions = ["before()", "key()", "C =", "after()"].map(|needle| {
+            assert_eq!(code.matches(needle).count(), 1, "{needle}: {code}");
+            code.find(needle).expect("emitted expression")
+        });
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{code}");
+    }
+
+    #[test]
     fn static_this_and_super_are_rebound_to_the_constructor() {
         let output = emit_at(
             "class B { static p() {} } class C extends B { static x = this; static { super.p(); } }\n",
@@ -9146,16 +10450,24 @@ console.log(JSON.stringify([bar, bar4, log]));
             ScriptTarget::Es5,
         );
         let code = javascript(&output);
-        let key_temp_at = code.find("let _t").expect("key temp declared");
-        let digits: String = code[key_temp_at + "let _t".len()..]
+        // ES5 temps are `var` (a `let` inside cloned machine bodies is a
+        // SyntaxError at ES5); ES2015+ keeps the tighter `let` binding.
+        assert!(code.contains("var _t"), "ES5 temp kind: {code}");
+        assert!(!code.contains("let _t"), "ES5 temp kind: {code}");
+        let key_read_at = code.find(" = key").expect("key temp declared");
+        let temp_name: String = code[..key_read_at]
             .chars()
-            .take_while(|character| character.is_ascii_digit())
+            .rev()
+            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
             .collect();
-        let temp_name = format!("_t{digits}");
-        let declaration_form = format!("let {temp_name} = key;");
-        assert!(
-            code.contains(&declaration_form),
-            "key evaluates once into a temp ({declaration_form:?}): {code}"
+        assert!(temp_name.starts_with("_t"), "key temp name: {code}");
+        assert_eq!(
+            code.matches(" = key").count(),
+            1,
+            "key evaluates once into a temp: {code}"
         );
         assert!(
             code.contains(&format!("[{temp_name}]")),
@@ -9260,6 +10572,76 @@ console.log(JSON.stringify([bar, bar4, log]));
             code.contains("(_t0 = obj).v = Math.pow(_t0.v, 3)"),
             "{code}"
         );
+    }
+
+    /// ES5 for-of lowers to the index form and still loops: the
+    /// binding lands inside the body, the index bound is the iterable
+    /// length, and one pass collects every element.
+    #[test]
+    fn node_executes_lowered_for_of_collects_every_element() {
+        let output = emit_at(
+            "var out = [];\nfor (const k of [1, 2, 3]) { out.push(k); }\nfor (const k in { a: 1 }) { out.push(k); }\nconsole.log(out.join(\",\"));\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(!code.contains("of "), "for-of must lower at es5:\n{code}");
+        assert!(
+            code.contains("var k in"),
+            "for-in keeps native form:\n{code}"
+        );
+        assert!(
+            !code.contains("const k"),
+            "head bindings convert to var:\n{code}"
+        );
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("bamts-forof-{nonce}.cjs"));
+        std::fs::write(&path, code).expect("write lowered JavaScript");
+        let result = std::process::Command::new("node")
+            .arg(&path)
+            .output()
+            .expect("execute Node");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stdout).contains("1,2,3,a"),
+            "the loop must collect every element and key:\n{code}"
+        );
+    }
+
+    #[test]
+    fn es5_for_of_assignment_target_keeps_rewritten_iterable() {
+        let output = emit_at(
+            "async function f() { let x; for (x of await values) {} }\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(!code.contains("await values"), "{code}");
+        assert!(!code.contains(" of "), "{code}");
+        assert!(code.contains("/*yield*/, values]"), "{code}");
+        assert!(code.contains("x = _t1[_t0]"), "{code}");
+    }
+
+    #[test]
+    fn computed_destructuring_keys_evaluate_after_earlier_properties() {
+        let output = emit_at(
+            "var { a = first(), [second()]: b, c = third() } = source();\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        let position = |needle: &str| {
+            code.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {code}"))
+        };
+        assert!(position("source()") < position("first()"), "{code}");
+        assert!(position("first()") < position("second()"), "{code}");
+        assert!(position("second()") < position("third()"), "{code}");
     }
 
     #[test]

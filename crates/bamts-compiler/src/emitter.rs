@@ -6769,4 +6769,1457 @@ var c = () => 1;
             ["@accessorFirst", "@accessorSecond"]
         );
     }
+
+    #[test]
+    fn pr199_for_of_assignment_targets_lower_to_indexed_loops() {
+        let source = "var target = {}; for (target[2 ** 1] of source(2 ** 3)) { use(target); }";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(source).expect("fits")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let statement = parsed.product().statements().last().expect("loop");
+        let crate::syntax::Statement::ForOf(for_of) = statement.data() else {
+            panic!("expected a for-of AST for {source}");
+        };
+        assert!(matches!(
+            for_of.binding,
+            crate::syntax::ForBinding::Target(_)
+        ));
+        let output = emit_output(
+            parsed.product(),
+            &EmitOptions {
+                target: ScriptTarget::Es5,
+                no_emit_helpers: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = &javascript(&output).code;
+        assert!(!code.contains(" of "), "native for-of survived ES5: {code}");
+        assert_eq!(code.matches("Math.pow(2, 3)").count(), 1, "{code}");
+        assert_eq!(code.matches("Math.pow(2, 1)").count(), 1, "{code}");
+        assert!(!code.contains("**"), "{code}");
+        let assign = code
+            .find("target[Math.pow(2, 1)] = ")
+            .expect("indexed assignment");
+        let use_call = code.find("use(target)").expect("body");
+        assert!(assign < use_call, "{code}");
+    }
+
+    fn pr199_emit_at(input: &str, target: ScriptTarget) -> EmitOutput {
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("fits")),
+        ));
+        assert!(
+            parsed.diagnostics().is_empty(),
+            "{:?}",
+            parsed.diagnostics()
+        );
+        emit_output(
+            parsed.product(),
+            &EmitOptions {
+                target,
+                no_emit_helpers: true,
+                ..EmitOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn pr199_native_declarations_emit_keys_in_declarator_order() {
+        let source = "declare function before(): number; \
+            declare function key(): string; \
+            declare function between(): number; \
+            declare function laterKey(): string; \
+            declare function after(): number; \
+            declare function finish(): void; \
+            function* g() { \
+                const left = before(), C = class { [yield key()]() {} }, \
+                    middle = between(), D = class { [yield laterKey()]() {} }, \
+                    right = after(); \
+                finish(); return [left, C, middle, D, right]; \
+            }";
+        for target in [ScriptTarget::Es2015, ScriptTarget::Es2016] {
+            let output = pr199_emit_at(source, target);
+            assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+            let code = &javascript(&output).code;
+            let positions = [
+                "before()",
+                "key()",
+                "C =",
+                "between()",
+                "laterKey()",
+                "D =",
+                "after()",
+                "finish()",
+            ]
+            .map(|needle| {
+                assert_eq!(code.matches(needle).count(), 1, "{needle}: {code}");
+                code.find(needle).expect("one occurrence")
+            });
+            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{code}");
+        }
+    }
+
+    #[test]
+    fn pr199_async_native_declarations_do_not_lose_key_awaits() {
+        let source = "declare function before(): number; \
+            declare function key(): string; declare function after(): number; \
+            async function g() { \
+                const left = before(), C = class { [await key()]() {} }, right = after(); \
+                return [left, C, right]; \
+            }";
+        let output = pr199_emit_at(source, ScriptTarget::Es2015);
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let code = &javascript(&output).code;
+        let positions = ["before()", "key()", "C =", "after()"].map(|needle| {
+            assert_eq!(code.matches(needle).count(), 1, "{needle}: {code}");
+            code.find(needle).expect("one occurrence")
+        });
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{code}");
+        assert!(
+            code.contains("yield"),
+            "await must survive as a suspension: {code}"
+        );
+        assert!(!code.contains("await key()"), "raw await leaked: {code}");
+    }
+
+    #[test]
+    fn es5_async_for_update_increment_lowers() {
+        // Synthetic probe pinning the walker/machine contract: a for-update
+        // `i++` (Update over an Identifier) counts as zero resumes after the
+        // walker fix, so a suspending for-loop still lowers normally with
+        // the update emitted as plain machine code.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x: any, y: any, i: any;\nasync function f() {\n    for (; x; i++) { await y; }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        let expected = "function f() {\n    return __awaiter(this, void 0, void 0, function () {\n        return __generator(this, function (_a) {\n            switch (_a.label) {\n                case 0: _a.label = 1;\n                case 1:\n                    if (!x) return [3 /*break*/, 4];\n                    return [4 /*yield*/, y];\n                case 2:\n                    _a.sent();\n                    _a.label = 3;\n                case 3:\n                    i++;\n                    return [3 /*break*/, 1];\n                case 4: return [2 /*return*/];\n            }\n        });\n    });\n}";
+        assert!(code.contains(expected), "{code}");
+        assert!(!code.contains("function*"), "{code}");
+    }
+
+    #[test]
+    fn es5_generator_update_computed_key_refuses() {
+        // Synthetic probe pinning the walker/machine contract: a while-test
+        // computed-key yield (`o[yield k]++` inside the test) counts as a
+        // resume, so the loop cannot stay inline; lowering routes to eval,
+        // which refuses with GENERATOR_REQUIRES_ES2015, and the native
+        // generator survives — never the inline machine clone.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input =
+            "declare var o: any, k: any;\nfunction* g() {\n    while (o[yield k]++ < 3) { }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(!code.contains("__generator(this,"), "{code}");
+        assert!(code.contains("function* g("), "{code}");
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+            "{:?}",
+            output.diagnostics
+        );
+    }
+
+    #[test]
+    fn es5_async_temp_collision_with_user_var() {
+        // Authority: awaitBinaryExpression5_es5 / asyncFunctionDeclaration9 —
+        // when a user variable collides with the machine's default temp name,
+        // the machine state parameter is renamed to _b and the user's _a stays
+        // the hoisted var.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input =
+            "async function f(x: any) {\n    var _a = 1;\n    await x;\n    return _a;\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("function (_b)"), "{code}");
+        assert!(code.contains("_b.label"), "{code}");
+        assert!(code.contains("_b.sent()"), "{code}");
+        assert!(code.contains("var _a;"), "{code}");
+        assert!(code.contains("_a = 1;"), "{code}");
+    }
+
+    #[test]
+    fn es5_async_leaked_await_refuses() {
+        // Authority: es5-asyncFunction(target=es5) leaked await in left-hand
+        // of property access assignment cannot be lowered, so the native
+        // generator fallback is kept.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "async function f(a: any, b: any, c: any) {\n    (await a).b = c;\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("function* ()"), "{code}");
+        assert!(!code.contains("__generator(this,"), "{code}");
+        assert!(!code.contains(".sent()"), "{code}");
+    }
+
+    #[test]
+    fn es5_async_binary_expression_await_materializes() {
+        // Authority: awaitBinaryExpression5_es5(target=es5) — the awaited
+        // operand is evaluated first, then combined with the saved left value
+        // through `.sent()`.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "async function f(a: any, b: any) {\n    return a + (await b);\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("function (_b)"), "{code}");
+        assert!(code.contains("_b.label"), "{code}");
+        assert!(code.contains("_a + (_b.sent())"), "{code}");
+    }
+
+    #[test]
+    fn es5_async_switch_discriminant_await_inline() {
+        // Return-bearing cases must not ride the discriminant-inline path:
+        // cloning them verbatim embeds a raw `return 10` in the machine's
+        // inner function, which drops the value through the protocol. Until
+        // the rebuilt-cases path routes returns through machine_statements,
+        // this shape refuses with the diagnostic — never a silent clone.
+        let output = emit_es5_clean(
+            "declare var x: any;\nasync function f() { switch (await x) { case 1: return 10; default: return 20; } }\n",
+        );
+        let code = &javascript(&output).code;
+        assert!(
+            !code.contains("__generator(this,"),
+            "raw returns must not clone into the machine: {code}"
+        );
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+            "refusal must signal: {:?}",
+            output.diagnostics
+        );
+        // A return-free discriminant case still lowers inline.
+        let lowered = emit_es5_clean(
+            "declare var x: any;\nasync function f() { switch (await x) { case 1: r = 10; } }\n",
+        );
+        let code = &javascript(&lowered).code;
+        assert!(code.contains("switch (_a.sent())"), "{code}");
+    }
+
+    #[test]
+    fn es5_async_labeled_loop_with_await_and_break_lowers() {
+        // Authority: es5-asyncFunctionWhileStatements(target=es5) — a labeled
+        // while body with an await and a labeled break lowers to the machine;
+        // the break becomes an explicit branch to the exit label.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x: any, y: any;\nasync function f() {\n    A: while (x) { await y; break A; }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(!code.contains("function*"), "{code}");
+        assert!(
+            code.contains("__awaiter(this, void 0, void 0, function ("),
+            "{code}"
+        );
+        assert!(code.contains("if (!x) return [3 /*break*/, 2];"), "{code}");
+        assert!(code.contains("_a.sent();"), "{code}");
+        assert!(code.contains("return [3 /*break*/, 2];"), "{code}");
+    }
+
+    #[test]
+    fn es5_async_identifier_assignment_test_stays_inline() {
+        // Authority: es5-asyncFunctionWhileStatements(target=es5) — a while
+        // test that only assigns to an identifier carries no resume, so the
+        // whole test clones verbatim into the machine instead of routing the
+        // loop through eval.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x: any, y: any;\nasync function f() {\n    while (x = 1) { await y; }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("if (!(x = 1))"), "{code}");
+        assert_eq!(
+            code.matches("return [4 /*yield*/, y];").count(),
+            1,
+            "{code}"
+        );
+        assert!(!code.contains("function*"), "{code}");
+    }
+    #[test]
+    fn es5_generator_object_spread_yield_refuses() {
+        // Contract pin, not a mutation claim: a while-test object spread
+        // carrying a yield (`{ ...(yield x) }`) is refused upstream by the
+        // machine's object-member wildcard, so the native generator survives
+        // whether or not count_yields tracks the spread — this pins the
+        // refusal shape: never the inline machine clone.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x: any;\nfunction* g() {\n    while ({ ...(yield x) }) { }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("function* g("), "{code}");
+        assert!(!code.contains("__generator(this,"), "{code}");
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+            "{:?}",
+            output.diagnostics
+        );
+    }
+
+    #[test]
+    fn es5_generator_array_spread_yield_never_clones() {
+        // Mutation-provable: an array-literal spread carrying a yield
+        // (`[...(yield x)]` as a statement) must never lower to the inline
+        // machine — contains_yield_array reports the spread's yield, the
+        // lowering bails, and the native generator survives with
+        // GENERATOR_REQUIRES_ES2015. Reverting the Spread arm resurrects
+        // `__generator(this, ...)` wrapping a live yield.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x: any;\nfunction* g() {\n    [...(yield x)];\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("function* g("), "{code}");
+        assert!(!code.contains("__generator(this,"), "{code}");
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+            "{:?}",
+            output.diagnostics
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Adversarial hardening: the walker-duality contract as an invariant,
+    // not a shape list. Assumptions under test (IDs cited per test):
+    //   WD-1 duality: no emitted machine embeds a live yield outside a
+    //       `return [4 /*yield*/, ...]` split (generic leak detector).
+    //   WD-2 sentinel shapes (TaggedTemplate/Satisfies/TypeAssertion/JSX)
+    //       are eval-refused, never inline-cloned.
+    //   WD-3 count == segments eval mints: machine case labels are
+    //       contiguous 0..=max and unique (gap detector; boundaries
+    //       0/1/2/3 suspensions).
+    //   WD-4 nested function-likes own their suspensions: cloning them
+    //       is correct, their internal yield is legal.
+    //   WD-5 non-block loop bodies refuse, never miscompile.
+    //   WD-6/7 Import (source+options) and Conditional/Logical counts
+    //       feed exact label arithmetic.
+    //   WD-8 labeled-loop delegation covers nested awaited bodies.
+    //   WD-9 recursive walkers survive deep nesting without crashing.
+    // ------------------------------------------------------------------
+
+    /// B4: destructuring defaults lower to tsc's ES5 shape - a temp
+    /// read then a `=== void 0` ternary - never erasing the default.
+    #[test]
+    fn destructuring_defaults_lower_to_ternary_declarators() {
+        let cases = [
+            (
+                "var o:any;\nvar { a = 1 } = o;\n",
+                "var _t0 = o.a, a = _t0 === void 0 ? 1 : _t0;",
+            ),
+            (
+                "var o:any;\nvar { p: q = 2 } = o;\n",
+                "var _t0 = o.p, q = _t0 === void 0 ? 2 : _t0;",
+            ),
+            (
+                "var o:any;\nvar { x: { y } = {} } = o;\n",
+                "var _t0 = o.x, _t1 = _t0 === void 0 ? {} : _t0, y = _t1.y;",
+            ),
+            (
+                "var arr:any;\nvar [c = 3, , [d = 4] = []] = arr;\n",
+                "var _t0 = arr[0], c = _t0 === void 0 ? 3 : _t0, _t1 = arr[2], _t2 = _t1 === void 0 ? [] : _t1, _t3 = _t2[0], d = _t3 === void 0 ? 4 : _t3;",
+            ),
+        ];
+        for (src, expected) in cases {
+            let out = emit_es5_clean(src);
+            let code = javascript(&out).code.clone();
+            assert!(
+                code.contains(expected),
+                "missing tsc default shape `{expected}` in:\n{code}"
+            );
+        }
+    }
+
+    /// B4: a default's suspension survives lowering - the machine splits
+    /// the default selection and no live yield leaks.
+    #[test]
+    fn destructuring_default_suspension_splits_the_machine() {
+        let out =
+            emit_es5_clean("var o:any, k:any;\nfunction* g(){ var { m = (yield k) } = o; }\n");
+        let code = javascript(&out).code.clone();
+        assert!(code.contains("__generator(this,"), "machine form: {code}");
+        assert!(
+            code.contains("=== void 0"),
+            "selection test missing:\n{code}"
+        );
+        assert!(
+            code.contains("[4 /*yield*/, k]"),
+            "suspension missing:\n{code}"
+        );
+        assert!(code.contains("m = _t"), "final bind missing:\n{code}");
+        assert!(live_yield_leak(&code).is_none(), "live yield leaked");
+    }
+
+    /// B4: an await default must not land in a ternary - eval refuses
+    /// Conditional, so the __awaiter inner generator would stay native
+    /// `function*` at ES5. The branch form keeps the inner machine.
+    #[test]
+    fn destructuring_default_await_keeps_the_inner_machine() {
+        let out = emit_es5_clean(
+            "var o:any, k:any;\nasync function h(){ var { n = await k } = o; return n; }\n",
+        );
+        let code = javascript(&out).code.clone();
+        assert!(code.contains("__awaiter("), "async wrapper: {code}");
+        assert!(
+            code.contains("__generator(this,"),
+            "inner machine lost - await landed in a ternary:\n{code}"
+        );
+        assert!(!code.contains("? yield"), "ternary yield:\n{code}");
+    }
+
+    /// B4 walker: a suspending for-init binding signals refusal with the
+    /// requires-es2015 diagnostic rather than cloning silently.
+    #[test]
+    fn for_init_suspending_binding_signals_refusal() {
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(
+                "var o:any, k:any;\nfunction* g(){ for (var { a = (yield k) } = o;;) { break; } }\n",
+            )
+            .expect("fits")),
+        ));
+        let out = emit_output(
+            parsed.product(),
+            &EmitOptions {
+                target: ScriptTarget::Es5,
+                no_emit_helpers: true,
+                ..EmitOptions::default()
+            },
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.message().contains("generators require")),
+            "refusal must be signalled"
+        );
+    }
+
+    /// B1: a suspending computed class key hoists out of the class
+    /// IIFE in statement contexts - the arrow is a plain function and
+    /// tsc 6.0.2 itself emits a SyntaxError for the in-IIFE form. The
+    /// machine splits the hoisted key temp and the arrow stays clean.
+    #[test]
+    fn class_computed_key_suspension_hoists_out_of_the_iife() {
+        let out = emit_es5_clean(
+            "var k:any;\nfunction* g(){ var C = class { [yield k]() {} }; return C; }\n",
+        );
+        let code = javascript(&out).code.clone();
+        assert!(code.contains("__generator(this,"), "machine form: {code}");
+        assert!(
+            code.contains("[4 /*yield*/, k]"),
+            "the key's suspension must split:\n{code}"
+        );
+        assert!(
+            code.contains("_t1 = _a.sent()"),
+            "the key temp binds from sent():\n{code}"
+        );
+        assert!(
+            code.contains("[_t1]()"),
+            "the member reads the hoisted temp:\n{code}"
+        );
+        assert!(live_yield_leak(&code).is_none(), "live yield leaked");
+    }
+
+    /// B1: expression-position class expressions cannot hoist (no
+    /// enclosing statement drains key_prelude), so they keep tsc's
+    /// in-IIFE shape but carry the requires-es2015 refusal instead of
+    /// breaking silently.
+    #[test]
+    fn class_computed_key_in_expression_position_signals_refusal() {
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(
+                SourceText::new("var k:any;\nfunction* h(){ foo(class { [yield k]() {} }); }\n")
+                    .expect("fits"),
+            ),
+        ));
+        let out = emit_output(
+            parsed.product(),
+            &EmitOptions {
+                target: ScriptTarget::Es5,
+                no_emit_helpers: true,
+                ..EmitOptions::default()
+            },
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.message().contains("generators require")),
+            "expression-position suspension must refuse loudly"
+        );
+    }
+
+    /// B7: if-without-else is the empty else, not a refusal - both the
+    /// inline clean clone and the suspending labeled shape must lower.
+    #[test]
+    fn if_without_else_lowers_in_the_machine() {
+        let suspending =
+            emit_es5_clean("var c:any, x:any;\nfunction* g(){ if (c) { yield x; } yield 2; }\n");
+        let code = javascript(&suspending).code.clone();
+        assert!(code.contains("__generator(this,"), "machine form: {code}");
+        assert!(
+            code.contains("[4 /*yield*/, x]"),
+            "the branch suspension must split:\n{code}"
+        );
+        assert!(live_yield_leak(&code).is_none(), "live yield leaked");
+        let clean =
+            emit_es5_clean("var c:any, x:any;\nfunction* g(){ yield 1; if (c) { x = 1; } }\n");
+        let code = javascript(&clean).code.clone();
+        assert!(code.contains("__generator(this,"), "machine form: {code}");
+        assert!(code.contains("if (c)"), "clean if clones inline:\n{code}");
+    }
+
+    /// Bot-round B4 gaps: the suspending-declaration path must keep
+    /// sibling identifier declarators, declare computed-key temps,
+    /// bind array rest, exclude computed keys from object rest with
+    /// tsc's runtime coercion, and rewrite awaited sources so the
+    /// __awaiter inner generator still machine-converts.
+    #[test]
+    fn suspending_declarations_keep_sibling_and_rest_semantics() {
+        let out = emit_es5_clean(
+            "var y:any, obj:any;\nfunction* g(){ var x = 5, { a = (yield y) } = obj; }\n",
+        );
+        let code = javascript(&out).code.clone();
+        assert!(
+            code.contains("x = 5"),
+            "sibling declarator dropped:\n{code}"
+        );
+        let out = emit_es5_clean(
+            "var k:any, arr:any;\nfunction* g(){ var [a = (yield k), ...r] = arr; }\n",
+        );
+        let code = javascript(&out).code.clone();
+        assert!(
+            code.contains("r = arr.slice(1)"),
+            "array rest discarded:\n{code}"
+        );
+        let out =
+            emit_es5_clean("var k:any, o:any;\nfunction* g(){ var { [k]: v, ...rest } = o; }\n");
+        let code = javascript(&out).code.clone();
+        assert!(
+            code.contains("typeof _t0 === \"symbol\" ? _t0 : _t0 + \"\""),
+            "computed key must be excluded at runtime (tsc shape):\n{code}"
+        );
+        let out = emit_es5_clean("var k:any, o:any;\nfunction* g(){ var { [yield k]: v } = o; }\n");
+        let code = javascript(&out).code.clone();
+        assert!(code.contains("var v, _t0, _t1"), "temps declared:\n{code}");
+        assert!(live_yield_leak(&code).is_none(), "live yield leaked");
+        let out = emit_es5_clean("var k:any;\nasync function h(){ var { a } = await k; }\n");
+        let code = javascript(&out).code.clone();
+        assert!(
+            code.contains("__generator(this,"),
+            "awaited source must rewrite so the inner machine converts:\n{code}"
+        );
+    }
+
+    /// B1 order: computed keys evaluate in member order, so hoisting
+    /// must move the whole prelude - partitioning suspending keys away
+    /// from clean ones reorders evaluation.
+    #[test]
+    fn class_computed_keys_evaluate_in_member_order() {
+        let out = emit_es5_clean(
+            "var k1:any, k2:any;\nfunction* g(){ var C = class { [k1()](){} [yield k2()](){} }; }\n",
+        );
+        let code = javascript(&out).code.clone();
+        let clean_first = code.find("k1()").expect("clean key evaluated");
+        let suspending = code.find("k2()").expect("suspending key evaluated");
+        assert!(
+            clean_first < suspending,
+            "member order must survive hoisting:\n{code}"
+        );
+        assert!(live_yield_leak(&code).is_none(), "live yield leaked");
+        let out = emit_es5_clean(
+            "var k1:any, k2:any;\nfunction* g(){ var C = class { [yield k1()](){} [k2()](){} }; }\n",
+        );
+        let code = javascript(&out).code.clone();
+        let suspending = code.find("k1()").expect("suspending key evaluated");
+        let clean_second = code.find("k2()").expect("clean key evaluated");
+        assert!(
+            suspending < clean_second,
+            "member order must survive hoisting (suspending first):\n{code}"
+        );
+    }
+
+    /// B1 visibility: an await inside a class computed key or heritage
+    /// clause in expression position cannot lower - there is no hoist
+    /// channel - and must refuse the generator natively under the
+    /// requires-es2015 diagnostic, never bury the raw await inside a
+    /// synthesized arrow the machine cannot see through.
+    #[test]
+    fn class_expression_awaits_refuse_natively() {
+        for src in [
+            "var k:any;\nasync function h(){ foo(class { [await k](){} }); }\n",
+            "var f:any;\nasync function h(){ return class extends (await f()) {}; }\n",
+        ] {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(src).expect("fits")),
+            ));
+            let out = emit_output(
+                parsed.product(),
+                &EmitOptions {
+                    target: ScriptTarget::Es5,
+                    no_emit_helpers: true,
+                    ..EmitOptions::default()
+                },
+            );
+            let code = javascript(&out).code.clone();
+            assert!(
+                !code.contains("__generator(this,"),
+                "machine must refuse: {src}\n{code}"
+            );
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+                "refusal must be signalled: {src}"
+            );
+        }
+    }
+
+    /// A suspending static-field initializer (postlude) refuses the
+    /// same way a key prelude does: the unlowered class keeps the
+    /// suspension visible and the generator stays native under the
+    /// signal - never a live yield inside the synthesized arrow.
+    #[test]
+    fn class_static_field_suspension_refuses_natively() {
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(
+                SourceText::new(
+                    "var k:any;\nfunction* g(){ var C = class { static x = yield k; }; }\n",
+                )
+                .expect("fits"),
+            ),
+        ));
+        let out = emit_output(
+            parsed.product(),
+            &EmitOptions {
+                target: ScriptTarget::Es5,
+                no_emit_helpers: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&out).code.clone();
+        assert!(
+            !code.contains("__generator(this,"),
+            "machine must refuse the static-field suspension:\n{code}"
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+            "refusal must be signalled"
+        );
+    }
+
+    /// A for-of body suspending in a generator machine-splits through
+    /// the lowered classic loop - the ladder's machine slice composing
+    /// with the plain lowering.
+    #[test]
+    fn for_of_suspension_machine_splits_through_the_lowered_loop() {
+        let out =
+            emit_es5_clean("var it:any;\nfunction* g(){ for (const k of it) { yield k; } }\n");
+        let code = javascript(&out).code.clone();
+        assert!(code.contains("__generator(this,"), "machine form: {code}");
+        assert!(
+            code.contains("[4 /*yield*/, k]"),
+            "the body's suspension must split:\n{code}"
+        );
+        assert!(
+            code.contains("_t1[_t0]"),
+            "the binding reads the indexed element:\n{code}"
+        );
+        assert!(live_yield_leak(&code).is_none(), "live yield leaked");
+    }
+
+    /// A braceless for-of body is one statement, not a missing one:
+    /// the emitted loop must still contain it.
+    #[test]
+    fn braceless_for_of_body_survives_lowering() {
+        let out =
+            emit_es5_clean("var arr:any;\nfunction f(){ for (const k of arr) console.log(k); }\n");
+        let code = javascript(&out).code.clone();
+        assert!(
+            code.contains("console.log(k)"),
+            "the braceless body statement must survive:\n{code}"
+        );
+    }
+
+    /// A destructuring binding in a for-of head composes with the
+    /// destructuring lowering: the element read becomes the binding's
+    /// initializer inside the loop body.
+    #[test]
+    fn for_of_pattern_binding_composes_with_destructuring() {
+        let out = emit_es5_clean(
+            "var arr:any;\nfor (const { a, b = 2 } of arr) { console.log(a + b); }\n",
+        );
+        let code = javascript(&out).code.clone();
+        assert!(
+            code.contains("void 0 ? 2 :"),
+            "the binding default must lower inside the loop:\n{code}"
+        );
+        assert!(
+            code.contains(".a"),
+            "the member read must bind from the element:\n{code}"
+        );
+    }
+
+    /// Emits `input` at es5 without helpers; panics on parse diagnostics.
+    fn emit_es5_clean(input: &str) -> EmitOutput {
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        emit_output(
+            parsed.product(),
+            &EmitOptions {
+                target: ScriptTarget::Es5,
+                no_emit_helpers: true,
+                ..EmitOptions::default()
+            },
+        )
+    }
+
+    /// WD-1: in machine form, every `yield` must sit inside a split marker
+    /// `/*yield*/`; a bare yield is a live suspension cloned into a plain
+    /// function (the miscompile class). Returns the offending snippet text.
+    fn live_yield_leak(code: &str) -> Option<String> {
+        if !code.contains("__generator(this,") {
+            return None; // native refusal form: the generator owns its yields
+        }
+        code.lines()
+            // Strip the protocol marker spans first: a line can carry both a
+            // legitimate `return [4 /*yield*/, x]` split and a cloned live
+            // yield; the marker must not exempt the whole line.
+            .find(|line| {
+                let stripped = line.replace("/*yield*/", "");
+                // The match must end as a token: `yielding` is an
+                // identifier, not the keyword.
+                stripped.match_indices("yield").any(|(i, _)| {
+                    stripped[i + 5..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                })
+            })
+            .map(|line| line.trim().to_owned())
+    }
+
+    /// WD-1b: in machine form, every return must be a protocol return
+    /// (`return [`) — a bare `return expr;` in the machine body exits the
+    /// inner function directly and the runtime silently drops the value.
+    /// Battery-scoped: snippets are flat (no nested function bodies, whose
+    /// returns are legal); the nested-ownership contract has its own pin.
+    fn raw_return_leak(code: &str) -> Option<String> {
+        if !code.contains("__generator(this,") {
+            return None;
+        }
+        code.lines()
+            .find(|line| {
+                let l = line.trim();
+                // `return` must end as a token: `returning = 1;` is a
+                // plain assignment, not a protocol-breaking return.
+                let boundary = !l.starts_with("return")
+                    || l[6..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| c.is_whitespace() || c == ';' || c == '}' || c == '(');
+                l.starts_with("return")
+                    && boundary
+                    && !l.starts_with("return [")
+                    && !l.starts_with("return __generator")
+                    && !l.starts_with("return __awaiter")
+                    && l.ends_with(';')
+            })
+            .map(|line| line.trim().to_owned())
+    }
+
+    /// WD-3: the machine switch's case labels must be unique and contiguous
+    /// from 0 (a gap or duplicate means count_yields disagreed with the
+    /// segments eval actually minted).
+    fn machine_case_labels(code: &str) -> Vec<u32> {
+        // Any state parameter (_a, or _b after a temp collision); raw
+        // labels with no dedup — the caller's equality assert fails on a
+        // duplicate, which is the failure this helper guards.
+        let start = code
+            .match_indices("switch (_")
+            .map(|(i, _)| i)
+            .find(|&i| code[i..].contains(".label)"))
+            .expect("machine switch");
+        let body = &code[start..];
+        let mut labels: Vec<u32> = body
+            .split("case ")
+            .skip(1)
+            .filter_map(|rest| rest.split(':').next())
+            .filter_map(|n| n.parse().ok())
+            .collect();
+        labels.sort_unstable();
+        labels
+    }
+
+    #[test]
+    fn es5_async_return_in_loop_body_never_drops_value() {
+        // A cloned `return y` inside the machine body returns straight out
+        // of the inner function; the runtime treats the non-array as done
+        // with `void 0` — the value is silently dropped. The loop body
+        // cannot lower a return, so the machine must refuse (until a
+        // return-protocol slice lands), never clone.
+        let output = emit_es5_clean(
+            "declare var x: any, y: any;\nasync function f() { while (x) { return y; } }\n",
+        );
+        let code = &javascript(&output).code;
+        assert!(
+            !code.contains("__generator(this,"),
+            "machine must not embed a raw return: {code}"
+        );
+        assert!(code.contains("return y;"), "value preserved: {code}");
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+            "refusal must signal: {:?}",
+            output.diagnostics
+        );
+    }
+
+    #[test]
+    fn walker_duality_battery_never_clones_live_yield() {
+        // WD-1: each snippet puts a suspending shape behind each clone gate,
+        // with its derived expectation: `true` lowers to the machine (and
+        // must not leak), `false` refuses (native form + the requires-es2015
+        // diagnostic + no machine). Expectations were derived from emitted
+        // output; all-refusing output fails every `true` row.
+        let snippets: [(&str, &str, bool); 31] = [
+            (
+                "update-computed-while",
+                "declare var o: any, k: any;\nfunction* g() { while (o[k ? k : 0][`x`], o[yield k]++ < 3) { } }\n",
+                false,
+            ),
+            (
+                "array-spread-statement",
+                "declare var x: any;\nfunction* g() { [...(yield x)]; }\n",
+                false,
+            ),
+            (
+                "array-spread-while-body",
+                "declare var x: any, y: any;\nfunction* g() { while (y) { [...(yield x)]; } }\n",
+                false,
+            ),
+            (
+                "object-spread-do-test",
+                "declare var x: any;\nfunction* g() { do { } while ({ ...(yield x) }); }\n",
+                false,
+            ),
+            (
+                "assignment-pattern-while",
+                "declare var x: any, y: any;\nfunction* g() { while ({ a: x } = y) { yield x; } }\n",
+                false,
+            ),
+            (
+                "template-expr-statement",
+                "declare var x: any;\nfunction* g() { `${yield x}`; }\n",
+                true,
+            ),
+            (
+                "conditional-expr-statement",
+                "declare var x: any, y: any;\nfunction* g() { return (yield x) ? y : (yield x); }\n",
+                false,
+            ),
+            (
+                "logical-expr-statement",
+                "declare var x: any, y: any;\nfunction* g() { return (yield x) || (yield y); }\n",
+                false,
+            ),
+            (
+                "import-expr-machine",
+                "declare var x: any;\nfunction* g() { return import(yield x); }\n",
+                true,
+            ),
+            (
+                "new-suspending-args",
+                "declare var x: any;\nfunction* g() { return new C(yield x); }\n",
+                false,
+            ),
+            (
+                "nested-if-await-while",
+                "declare var x: any, y: any, z: any;\nasync function f() { while (x) { if (y) { await z; } } }\n",
+                false,
+            ),
+            (
+                "nested-if-await-labeled",
+                "declare var x: any, y: any, z: any;\nasync function f() { A: while (x) { if (y) { await z; break A; } } }\n",
+                false,
+            ),
+            (
+                "nested-if-await-do",
+                "declare var x: any, y: any, z: any;\nasync function f() { do { if (y) { await z; } } while (x); }\n",
+                false,
+            ),
+            (
+                "nested-if-await-if-arm",
+                "declare var x: any, y: any, z: any;\nasync function f() { if (x) { if (y) { await z; } } }\n",
+                false,
+            ),
+            (
+                "return-in-while-body",
+                "declare var x: any, y: any;\nasync function f() { while (x) { return y; } }\n",
+                false,
+            ),
+            (
+                "return-in-labeled-body",
+                "declare var x: any, y: any;\nasync function f() { A: while (x) { return y; } }\n",
+                false,
+            ),
+            (
+                "return-in-if-branch",
+                "declare var y: any, z: any;\nasync function f() { if (y) { return z; } }\n",
+                false,
+            ),
+            (
+                "clean-nested-while-clones",
+                "declare var x: any, z: any;\nasync function f() { while (x) { while (z) { } } }\n",
+                true,
+            ),
+            (
+                "call-spread-arg",
+                "declare var f: any, x: any;\nfunction* g() { f(...(yield x)); }\n",
+                false,
+            ),
+            (
+                "method-computed-name",
+                "declare var k: any;\nfunction* g() { ({ [yield k]() {} }); }\n",
+                false,
+            ),
+            (
+                "nonblock-nested-return",
+                "declare var x: any, z: any;\nasync function f() { while (x) { while (z) return z; } }\n",
+                false,
+            ),
+            (
+                "as-cast-lowers",
+                "declare var k: any;\nfunction* g() { while ((yield k) as any) { } }\n",
+                true,
+            ),
+            (
+                "call-spread-while-test",
+                "declare var f: any, x: any;\nfunction* g() { while (f(...(yield x)) < 3) { } }\n",
+                false,
+            ),
+            (
+                "method-computed-while-test",
+                "declare var k: any;\nfunction* g() { while ({ [yield k]() {} }) { } }\n",
+                false,
+            ),
+            (
+                "yield-nested-lowers-with-exact-labels",
+                "declare var a: any;\nfunction* g() { while (yield (yield a)) {} }\n",
+                true,
+            ),
+            (
+                "for-var-init-yield-splits",
+                "declare var x: any, c: any;\nfunction* g() { for (var x = yield 1; c;) {} }\n",
+                true,
+            ),
+            (
+                "switch-case-return-refuses",
+                "declare var x: any, y: any;\nfunction* g() { while (y) { switch (x) { case 1: return 42; } } }\n",
+                false,
+            ),
+            (
+                "switch-multi-yield-case-test",
+                "declare var d: any, a: any, b: any, x: any;\nfunction* g() { switch (d) { case (yield a) + (yield b): x = 1; break; default: x = 2; } }\n",
+                true,
+            ),
+            (
+                "computed-key-temps-are-var-at-es5",
+                "declare var x: any, k: any, o: any;\nfunction* g() { while (x) { var { [k]: v } = o; } }\n",
+                true,
+            ),
+            ("bare-yield-lowers", "function* g() { yield; }\n", true),
+            (
+                "async-arrow-refusal-signals",
+                "declare var x: any, y: any, z: any;\nvar f = async () => { while (x) { if (y) { await z; } } };\n",
+                false,
+            ),
+        ];
+        for (name, input, lowers) in snippets {
+            let output = emit_es5_clean(input);
+            let code = &javascript(&output).code;
+            let machine = code.contains("__generator(this,");
+            let native = code.contains("function*");
+            let diag = output
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015);
+            assert_eq!(
+                machine, lowers,
+                "[{name}] expected lower={lowers}: machine={machine} native={native}\n{code}"
+            );
+            if let Some(leak) = live_yield_leak(code) {
+                panic!("[{name}] live yield cloned into machine: {leak}");
+            }
+            if let Some(leak) = raw_return_leak(code) {
+                panic!("[{name}] raw return in machine body drops value: {leak}");
+            }
+            if !lowers {
+                assert!(native, "[{name}] refusal must keep the native form\n{code}");
+                assert!(diag, "[{name}] refusal must signal TS-EMIT-1102\n{code}");
+            }
+        }
+    }
+
+    #[test]
+    fn sentinel_shapes_route_to_refusal_not_clone() {
+        // WD-2: eval has no accepting arms for these shapes; the sentinel
+        // count must send them there, never through the inline clone gate.
+        for (name, input) in [
+            (
+                "tagged-template",
+                "declare var tag: any, k: any;\nfunction* g() { while (tag`x ${yield k}`) { } }\n",
+            ),
+            (
+                "type-assertion",
+                "declare var k: any;\nfunction* g() { while (<any>(yield k)) { } }\n",
+            ),
+        ] {
+            let output = emit_es5_clean(input);
+            let code = &javascript(&output).code;
+            assert!(
+                code.contains("function* g(")
+                    && output
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+                "[{name}] sentinel shape must refuse with the native form + diagnostic:\n{code}"
+            );
+        }
+        // JSX expressions need TypeScriptReact parsing; the same sentinel
+        // contract applies: refuse or lower, never a cloned live yield.
+        let jsx_input = "declare var k: any;\nfunction* g() { while (<div>{yield k}</div>) { } }\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScriptReact,
+            Arc::new(SourceText::new(jsx_input).expect("fits budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(
+            parsed.product(),
+            &EmitOptions {
+                target: ScriptTarget::Es5,
+                no_emit_helpers: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = &javascript(&output).code;
+        assert!(
+            code.contains("function* g(") || live_yield_leak(code).is_none(),
+            "jsx row must refuse or lower safely, got:\n{code}"
+        );
+    }
+
+    #[test]
+    fn machine_case_labels_are_contiguous_and_unique() {
+        // WD-3 + WD-6 + WD-7, boundaries 0/1/2/3 suspensions on both sides
+        // of every count.
+        for (name, input) in [
+            (
+                "zero",
+                "declare var x: any;\nasync function f() { while (x) { } }\n",
+            ),
+            (
+                "one",
+                "declare var x: any, y: any;\nasync function f() { while (x) { await y; } }\n",
+            ),
+            (
+                "two",
+                "declare var x: any, y: any, z: any;\nasync function f() { while (x) { await y; await z; } }\n",
+            ),
+            (
+                "three-test-split",
+                "declare var o: any, k: any, y: any;\nasync function f() { while (o[await k]++ < 3) { await y; } }\n",
+            ),
+            (
+                "import-two-suspensions",
+                "declare var a: any, b: any;\nasync function f() { return import(await a, { m: await b }); }\n",
+            ),
+            (
+                "conditional-three",
+                "declare var a: any, b: any, c: any;\nasync function f() { return (await a) ? await b : await c; }\n",
+            ),
+            (
+                "nested-yield-labels",
+                "declare var a: any;\nfunction* g() { while (yield (yield a)) {} }\n",
+            ),
+            (
+                "for-var-init-split-labels",
+                "declare var x: any, c: any;\nfunction* g() { for (var x = yield 1; yield c;) { yield x; } }\n",
+            ),
+            (
+                "jump-guard-exact-count",
+                "declare var x: any, y: any, z: any;\nasync function f() { while (x) { if (y) continue; await z; } }\n",
+            ),
+        ] {
+            let output = emit_es5_clean(input);
+            let code = &javascript(&output).code;
+            let machine_switch = code
+                .match_indices("switch (_")
+                .map(|(i, _)| i)
+                .find(|&i| code[i..].contains(".label)"));
+            if machine_switch.is_none() {
+                if !code.contains("__generator(this,") {
+                    // Not lowered at all: the only honest alternative is a
+                    // signalled refusal — a silent skip would hide a
+                    // lowering regression.
+                    assert!(
+                        code.contains("function*")
+                            && output.diagnostics.iter().any(|d| {
+                                d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015
+                            }),
+                        "[{name}] neither machine nor signalled refusal:\n{code}"
+                    );
+                }
+                // A degenerate zero-resume machine needs no dispatch
+                // switch; there are no labels to check.
+                continue;
+            }
+            let labels = machine_case_labels(code);
+            assert!(!labels.is_empty(), "[{name}] machine without labels");
+            let expected: Vec<u32> = (0..=*labels.last().expect("non-empty")).collect();
+            assert_eq!(
+                labels, expected,
+                "[{name}] case labels must be contiguous: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_function_likes_own_suspensions_when_cloned() {
+        // WD-4: a method member owns its yields, so the object clones as
+        // clean into the machine and the INTERNAL yield stays legal.
+        // The method body holds a real suspension: ownership means the
+        // machine lowers with exactly one resume (the await) and the
+        // method's yield survives verbatim inside the cloned object —
+        // a walker that wrongly descended into the body would mint a
+        // second resume or refuse outright.
+        let output = emit_es5_clean(
+            "declare var x: any;\nasync function f() {\n    while ({ *m() { yield 1; } }) { await x; }\n}\n",
+        );
+        let code = &javascript(&output).code;
+        assert!(code.contains("__generator(this,"), "lowers: {code}");
+        assert!(
+            code.contains("*m() {"),
+            "generator method cloned intact: {code}"
+        );
+        assert!(code.contains("yield 1;"), "method owns its yield: {code}");
+        assert_eq!(
+            code.matches(".sent()").count(),
+            1,
+            "one machine resume: {code}"
+        );
+        assert!(
+            !code.contains("function* ("),
+            "inner function not native: {code}"
+        );
+    }
+
+    #[test]
+    fn non_block_loop_bodies_refuse() {
+        // WD-5: single-statement bodies are outside the accepted set; the
+        // only valid outcomes are refusal with a diagnostic.
+        for (name, input) in [
+            (
+                "while",
+                "declare var x: any, y: any;\nasync function f() { while (x) await y; }\n",
+            ),
+            (
+                "for",
+                "declare var x: any, y: any;\nasync function f() { for (; x;) await y; }\n",
+            ),
+            (
+                "do",
+                "declare var x: any, y: any;\nasync function f() { do await y; while (x); }\n",
+            ),
+        ] {
+            let output = emit_es5_clean(input);
+            let code = &javascript(&output).code;
+            assert!(
+                !code.contains("__generator(this,")
+                    && code.contains("function*")
+                    && output
+                        .diagnostics
+                        .iter()
+                        .any(|d| { d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015 }),
+                "[{name}] non-block body must refuse with the diagnostic, never lower or clone: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn labeled_nested_await_delegation_refuses_until_nested_if_slice() {
+        // WD-8: branch_awaits delegates through nested statement shapes.
+        let output = emit_es5_clean(
+            "declare var x: any, y: any, z: any;\nasync function f() {\n    A: while (x) { if (y) { await z; break A; } }\n}\n",
+        );
+        let code = &javascript(&output).code;
+        // Safety contract: refuse-or-lower, never a live await cloned
+        // outside the generator that owns it. (Full lowering of nested
+        // control flow inside labeled loop bodies is a banked machine
+        // slice; until then the refusal form is the correct output.)
+        assert!(
+            code.contains("function*") || code.contains("__generator(this,"),
+            "must refuse or lower: {code}"
+        );
+        assert!(live_yield_leak(code).is_none(), "{code}");
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+            "refusal must signal: {:?}",
+            output.diagnostics
+        );
+    }
+
+    #[test]
+    fn deep_nesting_walkers_do_not_crash() {
+        // WD-9: the parser's nesting bound (MAX_DEPTH = 256) is the
+        // boundary, tested from both sides. Below it the fixture parses
+        // clean and the recursive walkers emit some form; above it the
+        // parser declines with the descriptive P010 diagnostic — never a
+        // crash, never a silent skip. (A `-` chain lexes as `--` decrement
+        // pairs and never parses; parens give real expression depth.)
+        let fixture = |depth: usize| {
+            format!(
+                "declare var y: any;\nasync function f() {{ {}await y{}; }}\n",
+                "(".repeat(depth),
+                ")".repeat(depth)
+            )
+        };
+        let parse = |input: String| {
+            crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(input.as_str()).expect("fits budget")),
+            ))
+        };
+        let below = parse(fixture(56));
+        assert!(
+            below.diagnostics().is_empty(),
+            "depth 56 must parse clean: {:?}",
+            below.diagnostics()
+        );
+        let output = emit_output(
+            below.product(),
+            &EmitOptions {
+                target: ScriptTarget::Es5,
+                no_emit_helpers: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = &javascript(&output).code;
+        assert!(
+            code.contains("__generator(this,") || code.contains("function*"),
+            "some emitted form at depth 56: {code}"
+        );
+        let above = parse(fixture(400));
+        assert!(
+            !above.diagnostics().is_empty(),
+            "depth 400 must be rejected, not accepted"
+        );
+        assert!(
+            above
+                .diagnostics()
+                .iter()
+                .any(|d| d.code().as_str().contains("P010")),
+            "rejection must be the descriptive nesting-bound diagnostic: {:?}",
+            above.diagnostics()
+        );
+    }
+
+    #[test]
+    fn es5_generator_import_source_materializes_before_options_yield() {
+        // A clean source operand with side effects must run before the
+        // options suspend: materialize into a temp in the pre-suspension
+        // segment, never reassemble it inside the resume where its effects
+        // would slip past the suspension.
+        let output = emit_es5_clean(
+            "declare var f: any, b: any;\nfunction* g() { return import(f(), { m: yield b }); }\n",
+        );
+        let code = &javascript(&output).code;
+        let case0 = code
+            .split("case 0:")
+            .nth(1)
+            .and_then(|rest| rest.split("case 1:").next())
+            .expect("two segments");
+        let source_pos = case0.find("_a = f();").expect("source temp");
+        let yield_pos = case0.find("/*yield*/").expect("split marker");
+        assert!(
+            source_pos < yield_pos,
+            "source materializes before the yield: {code}"
+        );
+        assert!(
+            code.contains("import(_a,"),
+            "resume reassembles from the temp: {code}"
+        );
+    }
+
+    #[test]
+    fn es5_async_nested_async_arrow_keeps_its_awaits() {
+        // A nested async arrow owns its awaits: the outer function's
+        // await-to-yield rewrite must stop at the nested body, and the
+        // nested arrow keeps its own `await` for its own lowering pass.
+        // (Await inside a NON-async function is invalid input the parser
+        // does not yet reject — banked as a checker slice.)
+        let output = emit_es5_clean(
+            "declare var k: any;\nasync function f() { var g = async () => { return await k; }; }\n",
+        );
+        let code = &javascript(&output).code;
+        // The nested arrow lowers itself: its own __awaiter machine with
+        // the await in protocol form ([4 /*yield*/, k]) — no live yield.
+        assert_eq!(
+            code.matches("__awaiter").count(),
+            2,
+            "both the outer function and the nested arrow lower: {code}"
+        );
+        assert!(code.contains("/*yield*/, k"), "protocol form: {code}");
+        assert!(live_yield_leak(code).is_none(), "{code}");
+    }
+
+    #[test]
+    fn machine_state_name_terminates_past_the_alphabet() {
+        // Declaring _a.._z plus _state exhausted the old allocator's fixed
+        // fallback and hung compilation forever. A regression must fail
+        // this test, not wedge the runner, so the emit runs on a thread
+        // with a hard timeout.
+        // The skip set is built from BODY statements, so the alphabet must
+        // be declared inside the generator, not as ambient `declare var`.
+        let input = "function* g() { var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _state; yield 1; }\n";
+        let (tx, rx) = std::sync::mpsc::channel();
+        let parsed_input = input.to_owned();
+        std::thread::spawn(move || {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(parsed_input.as_str()).expect("fits budget")),
+            ));
+            let output = emit_output(
+                parsed.product(),
+                &EmitOptions {
+                    target: ScriptTarget::Es5,
+                    no_emit_helpers: true,
+                    ..EmitOptions::default()
+                },
+            );
+            let _ = tx.send(javascript(&output).code.clone());
+        });
+        let code = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("allocator must terminate past the alphabet");
+        assert!(code.contains("__generator(this,"), "{code}");
+    }
 }

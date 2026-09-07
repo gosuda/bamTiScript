@@ -58,6 +58,8 @@ const TS1136: DiagnosticCode = DiagnosticCode::new("TS1136");
 const TS1160: DiagnosticCode = DiagnosticCode::new("TS1160");
 /// Unterminated regular expression literal.
 const TS1161: DiagnosticCode = DiagnosticCode::new("TS1161");
+const TS1163: DiagnosticCode = DiagnosticCode::new("TS1163");
+const TS1308: DiagnosticCode = DiagnosticCode::new("TS1308");
 /// Expected corresponding JSX closing tag.
 const TS17002: DiagnosticCode = DiagnosticCode::new("TS17002");
 /// JSX fragment has no corresponding closing tag.
@@ -88,6 +90,8 @@ pub fn typescript_parse_code(code: DiagnosticCode, message: &str) -> Option<Diag
         "BAMTS-P014" => TS1003,
         "BAMTS-P015" => TS17015,
         "BAMTS-P016" => TS17014,
+        "BAMTS-P017" => TS1163,
+        "BAMTS-P018" => TS1308,
         "BAMTS-C051" if is_export_modifier_on_class_element(message) => TS1031,
         _ => return None,
     })
@@ -123,6 +127,10 @@ pub fn typescript_parse_message(code: DiagnosticCode) -> Option<&'static str> {
         "TS1136" => "Property assignment expected.",
         "TS1160" => "Unterminated template literal.",
         "TS1161" => "Unterminated regular expression literal.",
+        "TS1163" => "A 'yield' expression is only allowed in a generator body.",
+        "TS1308" => {
+            "'await' expressions are only allowed within async functions and at the top levels of modules."
+        }
         "TS17002" => "Expected corresponding JSX closing tag for '{0}'.",
         "TS17008" => "JSX element '{0}' has no corresponding closing tag.",
         "TS17014" => "JSX fragment has no corresponding closing tag.",

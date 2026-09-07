@@ -28,32 +28,39 @@ use super::{
     ABSTRACT_CONSTRUCTOR, ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
     ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_CONST, ASSIGNMENT_TO_FUNCTION, ASSIGNMENT_TO_NAMESPACE,
     ASSIGNMENT_TO_READONLY, AWAIT_USING_DECLARATION_IN_FOR_IN, BARE_SUPER_EXPRESSION,
-    CANNOT_FIND_NAME, CANNOT_FIND_NAME_LIB_GATED, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE,
+    BLOCK_SCOPED_USED_BEFORE_DECLARATION, BREAK_TARGET_CROSSES_FUNCTION,
+    BREAK_TARGET_NOT_ENCLOSING, CANNOT_FIND_NAME, CANNOT_FIND_NAME_LIB_GATED,
+    CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE, CLASS_USED_BEFORE_DECLARATION,
     CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, CONSTRUCTOR_TYPE_PARAMETERS,
     DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL, DERIVED_CONSTRUCTOR_MISSING_SUPER,
-    DUPLICATE_DECLARATION, EXCESS_PROPERTY, EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE,
-    FOR_IN_LEFT_HAND_SIDE_INVALID, FOR_OF_ITERABLE_REQUIRED,
-    FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT, FUNCTION_IMPLEMENTATION_WRONG_NAME,
-    FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
-    IMPORT_CONFLICTS_WITH_LOCAL, INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY,
+    DUPLICATE_DECLARATION, DUPLICATE_LABEL, ENUM_USED_BEFORE_DECLARATION, EXCESS_PROPERTY,
+    EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE, FOR_IN_LEFT_HAND_SIDE_INVALID,
+    FOR_OF_ITERABLE_REQUIRED, FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT,
+    FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
+    GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, IMPORT_CONFLICTS_WITH_LOCAL,
+    INTERFACE_NAME_IS_PRIMITIVE, INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY,
     MEMBER_NOT_ACCESSIBLE, MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT,
     NAMESPACE_NO_EXPORTED_MEMBER, NEW_TARGET_OUTSIDE_FUNCTION, NON_VOID_FUNCTION_MUST_RETURN,
-    PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
-    PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED, SET_ACCESSOR_PARAMETER_INITIALIZER,
+    PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_INITIALIZER_IN_SIGNATURE,
+    PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED,
+    REST_PARAMETER_NOT_LAST, SET_ACCESSOR_PARAMETER_INITIALIZER,
     STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, STRICT_NULL_MEMBER_ACCESS,
-    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
-    SUPER_REFERENCE_NON_DERIVED, TYPE_ALIAS_CIRCULAR, TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE,
-    TYPE_PARAMETER_CIRCULAR_DEFAULT, UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED,
-    USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
-    USING_DECLARATION_MISSING_INITIALIZER, VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED,
+    SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
+    SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER, SUPER_PROPERTY_NOT_METHOD,
+    SUPER_REFERENCE_NON_DERIVED, SUPER_STATIC_MEMBER_VIA_SUPER, TYPE_ALIAS_CIRCULAR,
+    TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT,
+    UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED, USING_DECLARATION_BINDING_PATTERN,
+    USING_DECLARATION_IN_FOR_IN, USING_DECLARATION_MISSING_INITIALIZER, VALUE_CANNOT_BE_USED_HERE,
+    WITH_STATEMENT_NOT_ALLOWED,
 };
 use super::{
     ABSTRACT_CONSTRUCTOR_MESSAGE, ACCESSOR_THIS_PARAMETER_MESSAGE, AMBIENT_IMPLEMENTATION_MESSAGE,
     ARGUMENT_COUNT_MISMATCH_MESSAGE, ARGUMENT_NOT_ASSIGNABLE_MESSAGE, ASSIGNMENT_TO_CONST_MESSAGE,
     ASSIGNMENT_TO_FUNCTION_MESSAGE, ASSIGNMENT_TO_NAMESPACE_MESSAGE,
     ASSIGNMENT_TO_READONLY_MESSAGE, AWAIT_USING_DECLARATION_IN_FOR_IN_MESSAGE,
-    BARE_SUPER_EXPRESSION_MESSAGE, CANNOT_FIND_NAME_LIB_GATED_MESSAGE, CANNOT_FIND_NAME_MESSAGE,
-    CANNOT_FIND_NAMESPACE_MESSAGE, CANNOT_FIND_TYPE_MESSAGE,
+    BARE_SUPER_EXPRESSION_MESSAGE, BREAK_TARGET_CROSSES_FUNCTION_MESSAGE,
+    BREAK_TARGET_NOT_ENCLOSING_MESSAGE, CANNOT_FIND_NAME_LIB_GATED_MESSAGE,
+    CANNOT_FIND_NAME_MESSAGE, CANNOT_FIND_NAMESPACE_MESSAGE, CANNOT_FIND_TYPE_MESSAGE,
     CONSTRUCTOR_DECORATOR_NOT_SUPPORTED_MESSAGE, CONSTRUCTOR_TYPE_PARAMETERS_MESSAGE,
     DERIVED_CONSTRUCTOR_MISSING_SUPER_MESSAGE, DUPLICATE_MESSAGE, EXCESS_PROPERTY_MESSAGE,
     EXPRESSION_NOT_CALLABLE_MESSAGE, EXPRESSION_NOT_CONSTRUCTABLE_MESSAGE,
@@ -65,16 +72,19 @@ use super::{
     MEMBER_NOT_ACCESSIBLE_MESSAGE, MISSING_METHOD_RETURN_TYPE_MESSAGE,
     MIXED_EXPORT_ASSIGNMENT_MESSAGE, NEW_TARGET_OUTSIDE_FUNCTION_MESSAGE,
     NON_VOID_FUNCTION_MUST_RETURN_MESSAGE, NOT_ASSIGNABLE_MESSAGE,
-    PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE,
-    PROPERTY_DOES_NOT_EXIST_MESSAGE, PROPERTY_NOT_INITIALIZED_MESSAGE,
+    PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE, PARAMETER_INITIALIZER_IN_SIGNATURE_MESSAGE,
+    PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE, PROPERTY_DOES_NOT_EXIST_MESSAGE,
+    PROPERTY_NOT_INITIALIZED_MESSAGE, REST_PARAMETER_NOT_LAST_MESSAGE,
     SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE,
-    STRICT_NULL_MEMBER_ACCESS_MESSAGE, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE,
-    SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE, SUPER_REFERENCE_NON_DERIVED_MESSAGE,
-    TYPE_ALIAS_CIRCULAR_MESSAGE, TYPE_NESTING_TOO_DEEP_MESSAGE,
-    TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE, UNUSED_EXPECT_ERROR_MESSAGE,
-    USED_BEFORE_ASSIGNED_MESSAGE, USING_DECLARATION_BINDING_PATTERN_MESSAGE,
-    USING_DECLARATION_IN_FOR_IN_MESSAGE, USING_DECLARATION_MISSING_INITIALIZER_MESSAGE,
-    VALUE_CANNOT_BE_USED_HERE_MESSAGE, WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
+    STRICT_NULL_MEMBER_ACCESS_MESSAGE, SUPER_BEFORE_SUPER_PROPERTY_MESSAGE,
+    SUPER_BEFORE_THIS_MESSAGE, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE,
+    SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE, SUPER_PROPERTY_NOT_METHOD_MESSAGE,
+    SUPER_REFERENCE_NON_DERIVED_MESSAGE, TYPE_ALIAS_CIRCULAR_MESSAGE,
+    TYPE_NESTING_TOO_DEEP_MESSAGE, TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE,
+    UNUSED_EXPECT_ERROR_MESSAGE, USED_BEFORE_ASSIGNED_MESSAGE,
+    USING_DECLARATION_BINDING_PATTERN_MESSAGE, USING_DECLARATION_IN_FOR_IN_MESSAGE,
+    USING_DECLARATION_MISSING_INITIALIZER_MESSAGE, VALUE_CANNOT_BE_USED_HERE_MESSAGE,
+    WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{self, EnumDeclarationBinding, EnumFacts};
@@ -229,6 +239,26 @@ pub enum SymbolKind {
     Namespace,
 }
 
+/// Names an interface may not take: they already denote primitive
+/// types, so a same-named interface would shadow them everywhere.
+fn is_primitive_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "any"
+            | "unknown"
+            | "never"
+            | "void"
+            | "undefined"
+            | "null"
+            | "string"
+            | "number"
+            | "boolean"
+            | "bigint"
+            | "symbol"
+            | "object"
+    )
+}
+
 impl SymbolKind {
     const fn occupies_value(self) -> bool {
         matches!(
@@ -369,6 +399,12 @@ pub struct PropertyType {
     /// members default to `false`; properties that legitimately propagate
     /// through spread keep the flag explicitly.
     spreadable: bool,
+    /// Whether this property is backed by a get/set accessor pair. A
+    /// getter+setter pair reports `is_method == false` and
+    /// `getter_only == false`, the same shape as a field; this marker is
+    /// what tells them apart (`super.x` reaches accessors on the
+    /// prototype but never a field).
+    accessor: bool,
 }
 
 impl PropertyType {
@@ -385,6 +421,7 @@ impl PropertyType {
             declaring_types: Vec::new(),
             is_method: false,
             spreadable: false,
+            accessor: false,
         }
     }
 
@@ -438,6 +475,13 @@ impl PropertyType {
         self
     }
 
+    /// Marks this property as accessor-backed (a get or get/set pair).
+    #[must_use]
+    pub fn with_accessor(mut self, accessor: bool) -> Self {
+        self.accessor = accessor;
+        self
+    }
+
     #[must_use]
     pub fn with_spreadable(mut self, spreadable: bool) -> Self {
         self.spreadable = spreadable;
@@ -474,6 +518,13 @@ impl PropertyType {
         self.getter_only
     }
 
+    /// Whether a get/set accessor (not a field or method) backs this
+    /// property.
+    #[must_use]
+    pub const fn accessor(&self) -> bool {
+        self.accessor
+    }
+
     #[must_use]
     pub const fn type_id(&self) -> TypeId {
         self.type_id
@@ -507,6 +558,7 @@ impl PartialEq for PropertyType {
             && self.declaring_types == other.declaring_types
             && self.is_method == other.is_method
             && self.spreadable == other.spreadable
+            && self.accessor == other.accessor
     }
 }
 
@@ -524,6 +576,7 @@ impl std::hash::Hash for PropertyType {
         self.declaring_types.hash(state);
         self.is_method.hash(state);
         self.spreadable.hash(state);
+        self.accessor.hash(state);
     }
 }
 
@@ -2261,6 +2314,25 @@ impl TypeTable {
     }
 
     /// Ensures and returns the finite shallow view for one applied root.
+    /// Instance members of a class symbol's current template, without
+    /// instantiation. Membership kind (field, method, accessor) never
+    /// depends on type arguments, so callers that only ask kind
+    /// questions can skip the applied-view machinery.
+    #[must_use]
+    pub fn class_template_properties(&self, symbol: SymbolId) -> &[PropertyType] {
+        let Some(raw) = self
+            .classes
+            .get(&symbol)
+            .and_then(|metadata| metadata.template.as_ref().map(|template| template.raw))
+        else {
+            return &[];
+        };
+        match self.get(raw) {
+            Type::ObjectType(object) => object.properties(),
+            _ => &[],
+        }
+    }
+
     pub fn prepare_applied_class_view(&mut self, type_id: TypeId) -> Option<TypeId> {
         self.materialize_applied_class_view(type_id);
         self.applied_class_view(type_id)
@@ -3877,7 +3949,7 @@ impl TypeTable {
                     target.intersection_ordered(members)
                 }
                 Type::ObjectType(object) => {
-                    let properties = object
+                    let properties: Vec<PropertyType> = object
                         .properties
                         .into_iter()
                         .map(|property| {
@@ -3901,6 +3973,7 @@ impl TypeTable {
                             .with_accessibility(property.access(), declaring_class)
                             .with_declaring_types(declaring_types)
                             .with_method(property.is_method)
+                            .with_accessor(property.accessor)
                             .with_spreadable(property.spreadable)
                         })
                         .collect();
@@ -4740,6 +4813,16 @@ impl SemanticModel {
 /// derived class constructor body. Every other position (a base-class
 /// constructor, constructor parameter initializers, or any non-constructor
 /// function) maps to a distinct TypeScript diagnostic.
+/// Whether the current position sits inside a derived constructor body
+/// whose `super()` call has been guaranteed on every path so far, or in
+/// a context (nested function-like, non-derived body) where the
+/// before-super rules do not apply.
+#[derive(Clone, Copy, PartialEq)]
+enum SuperFlow {
+    Tracking { called: bool },
+    Suspended,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SuperCallContext {
     DerivedConstructor,
@@ -4971,6 +5054,11 @@ pub(crate) struct Binder<'src> {
     super_call_contexts: Vec<SuperCallContext>,
     /// Legal `super()` presence for active derived constructor bodies.
     derived_constructor_super_presence: Vec<bool>,
+    super_flow: SuperFlow,
+    /// Whether a super() call currently being resolved sits in statement
+    /// position (guarantees the flow) or inside a larger expression (a
+    /// ternary arm, an object member - guarantees nothing).
+    super_call_guarantees: bool,
     /// Whether each lexically enclosing class has a base class, innermost last.
     class_derived_stack: Vec<bool>,
     /// Own readonly storage properties for each lexically enclosing class.
@@ -4985,6 +5073,16 @@ pub(crate) struct Binder<'src> {
     /// body is a function declaration, function expression, or constructor.
     /// `false` when it is a method, getter, setter, or static block.
     new_target_contexts: Vec<bool>,
+    /// Label names declared in the current function, for TS1114. Nested
+    /// function-likes record a mark so their labels never leak outward.
+    label_declarations: Vec<String>,
+    label_scope_marks: Vec<usize>,
+    /// Labels of enclosing labeled statements, tagged with the function
+    /// frame that declared them. A `break L` is only legal when `L` is on
+    /// this stack in the current frame; a hit in an outer frame is TS1107.
+    label_ancestors: Vec<(String, usize)>,
+    /// Current function frame for label ancestry.
+    label_frame: usize,
     /// Enclosing `declare` contexts. `true` when the current statement is
     /// directly under a `declare` keyword.
     ambient_stack: Vec<bool>,
@@ -5130,10 +5228,16 @@ impl<'src> Binder<'src> {
             reassigned_flow_roots_stack: Vec::new(),
             super_call_contexts: Vec::new(),
             derived_constructor_super_presence: Vec::new(),
+            super_flow: SuperFlow::Suspended,
+            super_call_guarantees: true,
             class_derived_stack: Vec::new(),
             constructor_writable_readonly_properties: Vec::new(),
             readonly_assignment_targets: HashSet::new(),
             new_target_contexts: Vec::new(),
+            label_declarations: Vec::new(),
+            label_scope_marks: Vec::new(),
+            label_ancestors: Vec::new(),
+            label_frame: 0,
             flow_facts: FlowFacts::new(),
             flow: FlowNodeId::ROOT,
             ambient_stack: Vec::new(),
@@ -7496,8 +7600,16 @@ impl<'src> Binder<'src> {
         scope: ScopeId,
         declaration: NodeId,
     ) {
+        let name = self.identifier_text(&interface.name);
+        if is_primitive_type_name(&name) {
+            self.emit_with_message(
+                INTERFACE_NAME_IS_PRIMITIVE,
+                interface.name.range(),
+                format!("Interface name cannot be '{name}'."),
+            );
+        }
         let id = self.declare(
-            &self.identifier_text(&interface.name),
+            &name,
             SymbolKind::Interface,
             scope,
             declaration,
@@ -8760,23 +8872,55 @@ impl<'src> Binder<'src> {
                 self.resolve_statements(&block.data().statements, child);
             }
             Statement::Expression(statement) => {
+                let positional = matches!(
+                    statement.expression.data(),
+                    Expression::Call(call) if matches!(call.callee.data(), Expression::Super)
+                );
+                let outer_guarantees = self.super_call_guarantees;
+                self.super_call_guarantees = positional;
                 self.resolve_expr(&statement.expression, scope);
+                self.super_call_guarantees = outer_guarantees;
                 self.type_of_expr(&statement.expression, scope);
             }
             Statement::If(statement) => {
                 self.resolve_expr(&statement.test, scope);
                 self.type_of_expr(&statement.test, scope);
                 let parent = self.flow;
+                let entry_super_flow = self.super_flow;
                 let truthy = self.guards_for(&statement.test, false);
                 let falsy = self.guards_for(&statement.test, true);
                 let then_end = self.in_branch(parent, &truthy, |binder| {
                     binder.resolve_statement(&statement.consequent, scope);
                 });
+                let then_super = self.super_flow;
+                self.super_flow = entry_super_flow;
                 let else_end = self.in_branch(parent, &falsy, |binder| {
                     if let Some(alternate) = &statement.alternate {
                         binder.resolve_statement(alternate, scope);
                     }
                 });
+                let else_super = self.super_flow;
+                // super() guarantees past the if only when every
+                // fall-through path has called it: an always-exiting
+                // branch imposes nothing, and a missing alternate keeps
+                // the entry state for its implicit fall-through.
+                let then_exits = Self::statement_always_exits(statement.consequent.data());
+                let else_exits = statement
+                    .alternate
+                    .as_ref()
+                    .is_some_and(|alt| Self::statement_always_exits(alt.data()));
+                self.super_flow = match (entry_super_flow, then_super, else_super) {
+                    (SuperFlow::Tracking { called: entry }, then_flow, else_flow) => {
+                        let then_ok =
+                            then_exits || matches!(then_flow, SuperFlow::Tracking { called: true });
+                        let else_ok =
+                            else_exits || matches!(else_flow, SuperFlow::Tracking { called: true });
+                        SuperFlow::Tracking {
+                            called: entry || (then_ok && else_ok),
+                        }
+                    }
+                    (suspended, _, _) => suspended,
+                };
                 // Only branches control can fall out of reach the merge, so an
                 // `if (guard) { return; }` leaves the negated guard in force after it.
                 let mut live = Vec::with_capacity(2);
@@ -8806,12 +8950,15 @@ impl<'src> Binder<'src> {
                 for case in &statement.cases {
                     self.publish_statement_class_shapes(&case.data().consequent, child);
                 }
+                let entry_super_flow = self.super_flow;
                 for case in &statement.cases {
                     self.check_bound_statements(&case.data().consequent, child);
+                    self.super_flow = entry_super_flow;
                 }
             }
             Statement::For(for_statement) => {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
+                let entry_super_flow = self.super_flow;
                 if let Some(initializer) = &for_statement.initializer {
                     self.resolve_for_initializer(initializer, child);
                 }
@@ -8838,6 +8985,9 @@ impl<'src> Binder<'src> {
                     self.join_flow(parent, &[skipped, body_exit]);
                 } else {
                     self.flow = body_end;
+                }
+                if let SuperFlow::Tracking { .. } = self.super_flow {
+                    self.super_flow = entry_super_flow;
                 }
             }
             Statement::ForIn(for_statement) => {
@@ -8907,6 +9057,7 @@ impl<'src> Binder<'src> {
                 self.resolve_expr(&statement.test, scope);
                 self.type_of_expr(&statement.test, scope);
                 let parent = self.flow;
+                let entry_super_flow = self.super_flow;
                 let truthy = self.guards_for(&statement.test, false);
                 let falsy = self.guards_for(&statement.test, true);
                 let body_end = self.in_branch(parent, &truthy, |binder| {
@@ -8915,13 +9066,21 @@ impl<'src> Binder<'src> {
                 let skipped = self.branch_guarded(parent, &falsy);
                 let body_exit = self.branch_guarded(body_end, &falsy);
                 self.join_flow(parent, &[skipped, body_exit]);
+                // A super() inside the loop body ran zero times on the
+                // skip path, so it guarantees nothing afterwards.
+                self.super_flow = entry_super_flow;
             }
             Statement::DoWhile(statement) => {
+                let entry_super_flow = self.super_flow;
                 self.resolve_statement(&statement.body, scope);
+                if let SuperFlow::Tracking { .. } = self.super_flow {
+                    self.super_flow = entry_super_flow;
+                }
                 self.resolve_expr(&statement.test, scope);
                 self.type_of_expr(&statement.test, scope);
             }
             Statement::Try(statement) => {
+                let entry_super_flow = self.super_flow;
                 let block = &statement.block;
                 let try_scope = self.new_scope(ScopeKind::Block, Some(scope));
                 self.bind_statements(&block.data().statements, try_scope);
@@ -8939,6 +9098,11 @@ impl<'src> Binder<'src> {
                     let finally_scope = self.new_scope(ScopeKind::Block, Some(scope));
                     self.bind_statements(&finalizer.data().statements, finally_scope);
                     self.resolve_statements(&finalizer.data().statements, finally_scope);
+                }
+                // A throw before the super() call reaches the handler,
+                // so calls inside the try block guarantee nothing after.
+                if let SuperFlow::Tracking { .. } = self.super_flow {
+                    self.super_flow = entry_super_flow;
                 }
             }
             Statement::With(with_statement) => {
@@ -8959,7 +9123,55 @@ impl<'src> Binder<'src> {
                 };
                 self.resolve_statement(&with_statement.body, body_scope);
             }
-            Statement::Labeled(statement) => self.resolve_statement(&statement.body, scope),
+            Statement::Labeled(statement) => {
+                let label = self.identifier_text(&statement.label).into_owned();
+                // TS1114 concerns active labels, not earlier sibling statements.
+                let label_mark = self.label_declarations.len();
+                let function_labels_start = self.label_scope_marks.last().copied().unwrap_or(0);
+                if self.label_declarations[function_labels_start..].contains(&label) {
+                    self.emit_with_message(
+                        DUPLICATE_LABEL,
+                        statement.label.range(),
+                        format!("Duplicate label '{label}'."),
+                    );
+                } else {
+                    self.label_declarations.push(label.clone());
+                }
+                self.label_ancestors.push((label, self.label_frame));
+                self.resolve_statement(&statement.body, scope);
+                self.label_ancestors.pop();
+                self.label_declarations.truncate(label_mark);
+            }
+            Statement::Break(jump) => {
+                // Retain outer frames to distinguish TS1107 from TS1116,
+                // but select the nearest enclosing label first.
+                if let Some(label_node) = &jump.label {
+                    let label = self.identifier_text(label_node);
+                    let hit = self
+                        .label_ancestors
+                        .iter()
+                        .rev()
+                        .find(|(ancestor, _)| *ancestor == label.as_ref());
+                    match hit {
+                        Some((_, frame)) if *frame == self.label_frame => {}
+                        // TS1107: the label encloses, but a function
+                        // boundary sits between it and the break.
+                        Some(_) => self.emit(
+                            BREAK_TARGET_CROSSES_FUNCTION,
+                            label_node.range(),
+                            BREAK_TARGET_CROSSES_FUNCTION_MESSAGE,
+                        ),
+                        // TS1116: no declaration of the label encloses the
+                        // break at all.
+                        None => self.emit(
+                            BREAK_TARGET_NOT_ENCLOSING,
+                            label_node.range(),
+                            BREAK_TARGET_NOT_ENCLOSING_MESSAGE,
+                        ),
+                    }
+                }
+            }
+            Statement::Continue(_) => {}
             Statement::ImportEquals(_) => {}
             Statement::Return(return_statement) => {
                 let context = self.return_contexts.last().copied();
@@ -9518,6 +9730,20 @@ impl<'src> Binder<'src> {
         self.types.generator_return_type(annotation)
     }
 
+    fn push_label_scope(&mut self) {
+        self.label_scope_marks.push(self.label_declarations.len());
+        self.label_frame += 1;
+    }
+
+    fn pop_label_scope(&mut self) {
+        let mark = self
+            .label_scope_marks
+            .pop()
+            .expect("label scope must be entered before it is left");
+        self.label_declarations.truncate(mark);
+        self.label_frame -= 1;
+    }
+
     fn resolve_function(
         &mut self,
         function: &'src FunctionLike,
@@ -9533,6 +9759,14 @@ impl<'src> Binder<'src> {
         self.super_call_contexts
             .push(SuperCallContext::NonConstructor);
         self.super_member_homes.push(member_home);
+        // A nested function-like's `this` is either captured-and-deferred
+        // (arrows) or its own (functions), so the before-super rules do
+        // not apply inside it.
+        let outer_super_flow = self.super_flow;
+        self.super_flow = SuperFlow::Suspended;
+        let outer_guarantees = self.super_call_guarantees;
+        self.super_call_guarantees = true;
+        self.push_label_scope();
         self.bind_implicit_function_values(&function.parameters, scope);
         let function_symbol = function.name.as_ref().map(|name| {
             let symbol_scope = if is_declaration { parent } else { scope };
@@ -9546,6 +9780,20 @@ impl<'src> Binder<'src> {
         });
         self.bind_type_parameters(function.type_parameters.as_ref(), scope);
         let this_type = self.this_parameter_type(&function.parameters, scope, this_type);
+        self.check_rest_parameter_last(&function.parameters);
+        // TS2371: only an implementation may carry parameter defaults; an
+        // overload signature has no body to receive them.
+        if function.body.is_none() {
+            for parameter in &function.parameters {
+                if parameter.data().initializer.is_some() {
+                    self.emit(
+                        PARAMETER_INITIALIZER_IN_SIGNATURE,
+                        parameter.range(),
+                        PARAMETER_INITIALIZER_IN_SIGNATURE_MESSAGE,
+                    );
+                }
+            }
+        }
         for parameter in &function.parameters {
             if self.is_this_parameter(parameter) {
                 continue;
@@ -9652,6 +9900,9 @@ impl<'src> Binder<'src> {
         let popped_context = self.super_call_contexts.pop();
         debug_assert_eq!(popped_context, Some(SuperCallContext::NonConstructor));
         let popped_home = self.super_member_homes.pop();
+        self.super_flow = outer_super_flow;
+        self.super_call_guarantees = outer_guarantees;
+        self.pop_label_scope();
         debug_assert_eq!(popped_home, Some(member_home));
     }
 
@@ -9863,6 +10114,25 @@ impl<'src> Binder<'src> {
                 .or_else(|| initializer_type.map(|ty| self.types.widen(ty, false)))
                 .unwrap_or_else(|| self.types.any());
             self.symbol_types[symbol.get() as usize] = type_id;
+        }
+    }
+
+    /// TS1014: a rest parameter must be the last parameter. Constructor
+    /// and arrow parameter lists route through their own binders, so each
+    /// calls this beside its loop.
+    fn check_rest_parameter_last(&mut self, parameters: &[crate::syntax::ParameterNode]) {
+        for (index, parameter) in parameters.iter().enumerate() {
+            if matches!(
+                parameter.data().binding.data(),
+                crate::syntax::BindingPattern::Rest(_)
+            ) && index + 1 < parameters.len()
+            {
+                self.emit(
+                    REST_PARAMETER_NOT_LAST,
+                    parameter.range(),
+                    REST_PARAMETER_NOT_LAST_MESSAGE,
+                );
+            }
         }
     }
 
@@ -10541,140 +10811,148 @@ impl<'src> Binder<'src> {
                 });
                 continue;
             }
-            let (name, type_id, optional, readonly, getter_only, access, is_method) = match member
-                .data()
-            {
-                ClassMember::Property(property) if side.includes(property.modifiers.is_static) => {
-                    let Some(name) = self.property_key(&property.name) else {
-                        continue;
-                    };
-                    let type_id = self.class_property_type(
-                        property.type_annotation.as_ref(),
-                        property.initializer.as_deref(),
-                        &property.modifiers,
-                        scope,
-                        false,
-                    );
-                    (
-                        name,
-                        type_id,
-                        property.optional,
-                        property.modifiers.is_readonly,
-                        false,
-                        property
-                            .modifiers
-                            .accessibility
-                            .unwrap_or(Accessibility::Public),
-                        false,
-                    )
-                }
-                ClassMember::AutoAccessor(accessor)
-                    if side.includes(accessor.modifiers.is_static) =>
-                {
-                    let Some(name) = self.property_key(&accessor.name) else {
-                        continue;
-                    };
-                    let type_id = self.class_property_type(
-                        accessor.type_annotation.as_ref(),
-                        accessor.initializer.as_deref(),
-                        &accessor.modifiers,
-                        scope,
-                        false,
-                    );
-                    (
-                        name,
-                        type_id,
-                        false,
-                        accessor.modifiers.is_readonly,
-                        false,
-                        accessor
-                            .modifiers
-                            .accessibility
-                            .unwrap_or(Accessibility::Public),
-                        false,
-                    )
-                }
-                ClassMember::Method(method) if side.includes(method.modifiers.is_static) => {
-                    match method.modifier {
-                        PropertyModifier::None => {
-                            let Some(name) = self.property_key(&method.name) else {
-                                continue;
-                            };
-                            if name == "constructor" {
-                                continue;
-                            }
-                            let is_overload_signature =
-                                method.function.body.is_none() && !method.modifiers.is_abstract;
-                            if is_overload_signature {
-                                overload_state.insert(name.clone(), true);
-                            } else if overload_state.get(&name).copied().unwrap_or(false) {
-                                overload_state.insert(name.clone(), false);
-                                continue;
-                            }
-                            let signature_scope = self.class_method_signature_scope(
-                                member.id(),
-                                &method.function,
-                                scope,
-                            );
-                            let type_id = self
-                                .type_of_function_like_in_scope(&method.function, signature_scope);
-                            (
-                                name,
-                                type_id,
-                                method.optional,
-                                false,
-                                false,
-                                method
-                                    .modifiers
-                                    .accessibility
-                                    .unwrap_or(Accessibility::Public),
-                                true,
-                            )
-                        }
-                        PropertyModifier::Get => {
-                            let Some(name) = self.property_key(&method.name) else {
-                                continue;
-                            };
-                            let type_id = match &method.function.return_type {
-                                Some(annotation) => {
-                                    self.resolve_type(&annotation.data().type_node, scope)
-                                }
-                                None => self.types.any(),
-                            };
-                            let has_setter = class.members.iter().any(|candidate| {
-                                let ClassMember::Method(candidate) = candidate.data() else {
-                                    return false;
-                                };
-                                candidate.modifier == PropertyModifier::Set
-                                    && side.includes(candidate.modifiers.is_static)
-                                    && self.property_key(&candidate.name).as_deref()
-                                        == Some(name.as_str())
-                            });
-                            (
-                                name,
-                                type_id,
-                                method.optional,
-                                !has_setter,
-                                !has_setter,
-                                method
-                                    .modifiers
-                                    .accessibility
-                                    .unwrap_or(Accessibility::Public),
-                                false,
-                            )
-                        }
-                        PropertyModifier::Set => continue,
+            let (name, type_id, optional, readonly, getter_only, access, is_method, accessor) =
+                match member.data() {
+                    ClassMember::Property(property)
+                        if side.includes(property.modifiers.is_static) =>
+                    {
+                        let Some(name) = self.property_key(&property.name) else {
+                            continue;
+                        };
+                        let type_id = self.class_property_type(
+                            property.type_annotation.as_ref(),
+                            property.initializer.as_deref(),
+                            &property.modifiers,
+                            scope,
+                            false,
+                        );
+                        (
+                            name,
+                            type_id,
+                            property.optional,
+                            property.modifiers.is_readonly,
+                            false,
+                            property
+                                .modifiers
+                                .accessibility
+                                .unwrap_or(Accessibility::Public),
+                            false,
+                            false,
+                        )
                     }
-                }
-                _ => continue,
-            };
+                    ClassMember::AutoAccessor(accessor)
+                        if side.includes(accessor.modifiers.is_static) =>
+                    {
+                        let Some(name) = self.property_key(&accessor.name) else {
+                            continue;
+                        };
+                        let type_id = self.class_property_type(
+                            accessor.type_annotation.as_ref(),
+                            accessor.initializer.as_deref(),
+                            &accessor.modifiers,
+                            scope,
+                            false,
+                        );
+                        (
+                            name,
+                            type_id,
+                            false,
+                            accessor.modifiers.is_readonly,
+                            false,
+                            accessor
+                                .modifiers
+                                .accessibility
+                                .unwrap_or(Accessibility::Public),
+                            false,
+                            true,
+                        )
+                    }
+                    ClassMember::Method(method) if side.includes(method.modifiers.is_static) => {
+                        match method.modifier {
+                            PropertyModifier::None => {
+                                let Some(name) = self.property_key(&method.name) else {
+                                    continue;
+                                };
+                                if name == "constructor" {
+                                    continue;
+                                }
+                                let is_overload_signature =
+                                    method.function.body.is_none() && !method.modifiers.is_abstract;
+                                if is_overload_signature {
+                                    overload_state.insert(name.clone(), true);
+                                } else if overload_state.get(&name).copied().unwrap_or(false) {
+                                    overload_state.insert(name.clone(), false);
+                                    continue;
+                                }
+                                let signature_scope = self.class_method_signature_scope(
+                                    member.id(),
+                                    &method.function,
+                                    scope,
+                                );
+                                let type_id = self.type_of_function_like_in_scope(
+                                    &method.function,
+                                    signature_scope,
+                                );
+                                (
+                                    name,
+                                    type_id,
+                                    method.optional,
+                                    false,
+                                    false,
+                                    method
+                                        .modifiers
+                                        .accessibility
+                                        .unwrap_or(Accessibility::Public),
+                                    true,
+                                    false,
+                                )
+                            }
+                            PropertyModifier::Get => {
+                                let Some(name) = self.property_key(&method.name) else {
+                                    continue;
+                                };
+                                let type_id = match &method.function.return_type {
+                                    Some(annotation) => {
+                                        self.resolve_type(&annotation.data().type_node, scope)
+                                    }
+                                    None => self.types.any(),
+                                };
+                                let has_setter = class.members.iter().any(|candidate| {
+                                    let ClassMember::Method(candidate) = candidate.data() else {
+                                        return false;
+                                    };
+                                    candidate.modifier == PropertyModifier::Set
+                                        && side.includes(candidate.modifiers.is_static)
+                                        && self.property_key(&candidate.name).as_deref()
+                                            == Some(name.as_str())
+                                });
+                                (
+                                    name,
+                                    type_id,
+                                    method.optional,
+                                    !has_setter,
+                                    !has_setter,
+                                    method
+                                        .modifiers
+                                        .accessibility
+                                        .unwrap_or(Accessibility::Public),
+                                    false,
+                                    true,
+                                )
+                            }
+                            PropertyModifier::Set => continue,
+                        }
+                    }
+                    _ => continue,
+                };
             let _ = seen.insert(name.clone());
             properties.push(
                 PropertyType::new(name, optional, type_id)
                     .with_readonly(readonly)
                     .with_getter_only(getter_only)
                     .with_accessibility(access, declaring_class)
-                    .with_method(is_method),
+                    .with_method(is_method)
+                    .with_accessor(accessor),
             );
         }
         (properties, seen, iterator_property, async_iterator_property)
@@ -11640,11 +11918,24 @@ impl<'src> Binder<'src> {
                 );
                 let derived = self.class_derived_stack.last().copied().unwrap_or(false);
                 let child = self.new_scope(ScopeKind::Function, Some(scope));
+                self.push_label_scope();
                 let new_target_marker = self.new_target_contexts.len();
                 self.new_target_contexts.push(true);
                 self.bind_implicit_function_values(&constructor.parameters, child);
                 self.super_call_contexts
                     .push(SuperCallContext::ConstructorParameters { derived });
+                self.check_rest_parameter_last(&constructor.parameters);
+                if constructor.body.range().is_empty() {
+                    for parameter in &constructor.parameters {
+                        if parameter.data().initializer.is_some() {
+                            self.emit(
+                                PARAMETER_INITIALIZER_IN_SIGNATURE,
+                                parameter.range(),
+                                PARAMETER_INITIALIZER_IN_SIGNATURE_MESSAGE,
+                            );
+                        }
+                    }
+                }
                 for parameter in &constructor.parameters {
                     if self.is_parameter_property(parameter) {
                         self.resolve_parameter_property(parameter, child, scope);
@@ -11671,10 +11962,17 @@ impl<'src> Binder<'src> {
                 let this_type = self.class_this_type(scope, false);
                 self.this_context.push(this_type);
                 self.push_reassigned_scope();
+                let outer_super_flow = self.super_flow;
+                self.super_flow = if derived {
+                    SuperFlow::Tracking { called: false }
+                } else {
+                    SuperFlow::Suspended
+                };
                 self.in_isolated_flow(FlowNodeId::ROOT, |binder| {
                     binder.bind_statements(&constructor.body.data().statements, child);
                     binder.resolve_statements(&constructor.body.data().statements, child);
                 });
+                self.super_flow = outer_super_flow;
                 if track_super {
                     let called = self
                         .derived_constructor_super_presence
@@ -11693,6 +11991,7 @@ impl<'src> Binder<'src> {
                 self.new_target_contexts.truncate(new_target_marker);
                 self.super_call_contexts.pop();
                 let popped_home = self.super_member_homes.pop();
+                self.pop_label_scope();
                 debug_assert_eq!(popped_home, Some(SuperMemberHome::ClassMember { derived }));
             }
             ClassMember::Property(property) => {
@@ -11742,8 +12041,10 @@ impl<'src> Binder<'src> {
                 let derived = self.class_derived_stack.last().copied().unwrap_or(false);
                 self.super_member_homes
                     .push(SuperMemberHome::ClassMember { derived });
+                self.push_label_scope();
                 self.bind_statements(&block.data().statements, child);
                 self.resolve_statements(&block.data().statements, child);
+                self.pop_label_scope();
                 let popped_home = self.super_member_homes.pop();
                 debug_assert_eq!(popped_home, Some(SuperMemberHome::ClassMember { derived }));
                 self.new_target_contexts.truncate(new_target_marker);
@@ -11764,6 +12065,13 @@ impl<'src> Binder<'src> {
                 self.resolve_value(identifier, expression.id(), scope);
             }
             Expression::This => {
+                if let SuperFlow::Tracking { called: false } = self.super_flow {
+                    self.emit(
+                        SUPER_BEFORE_THIS,
+                        expression.range(),
+                        SUPER_BEFORE_THIS_MESSAGE,
+                    );
+                }
                 let owner =
                     self.this_context
                         .last()
@@ -11812,10 +12120,12 @@ impl<'src> Binder<'src> {
             }
             Expression::Arrow(arrow) => {
                 let child = self.new_scope(ScopeKind::Function, Some(scope));
+                self.push_label_scope();
                 // Arrows capture `this` but never inherit super-call legality.
                 self.super_call_contexts
                     .push(SuperCallContext::NonConstructor);
                 self.bind_type_parameters(arrow.type_parameters.as_ref(), child);
+                self.check_rest_parameter_last(&arrow.parameters);
                 for parameter in &arrow.parameters {
                     self.resolve_non_constructor_parameter(parameter, child);
                 }
@@ -11842,6 +12152,12 @@ impl<'src> Binder<'src> {
                     FunctionBody::Expression(_) | FunctionBody::Missing(_) => None,
                 };
                 let body_flow = self.captured_flow_seed();
+                // An arrow defers its captured `this`: before-super rules
+                // do not apply inside its body.
+                let outer_super_flow = self.super_flow;
+                self.super_flow = SuperFlow::Suspended;
+                let outer_guarantees = self.super_call_guarantees;
+                self.super_call_guarantees = true;
                 self.push_reassigned_scope();
                 self.in_isolated_flow(body_flow, |binder| match &arrow.body {
                     FunctionBody::Block(block) => {
@@ -11891,21 +12207,32 @@ impl<'src> Binder<'src> {
                     debug_assert_eq!(popped, Some(body_id));
                 }
                 self.return_contexts.pop();
+                self.super_flow = outer_super_flow;
+                self.super_call_guarantees = outer_guarantees;
                 let popped_context = self.super_call_contexts.pop();
                 debug_assert_eq!(popped_context, Some(SuperCallContext::NonConstructor));
                 let type_id = self.type_of_arrow(arrow, scope);
                 if self.node_types.insert(expression.id(), type_id).is_none() {
                     self.typed_expressions.push((expression.range(), type_id));
                 }
+                self.pop_label_scope();
             }
             Expression::Call(call) => {
-                if matches!(call.callee.data(), Expression::Super) {
-                    self.check_super_call(call.callee.range());
+                let is_super_call = matches!(call.callee.data(), Expression::Super);
+                if is_super_call {
+                    self.check_super_call_legality(call.callee.range());
                 } else {
                     self.resolve_expr(&call.callee, scope);
                 }
                 self.resolve_type_arguments(call.type_arguments.as_ref(), scope);
                 self.resolve_arguments(&call.arguments, scope);
+                // A call's arguments evaluate before the call completes, so
+                // `this` inside `super(this.x)` is still before `super()`;
+                // the flow may only be marked guaranteed once every
+                // argument has resolved.
+                if is_super_call {
+                    self.mark_super_call_completed(call.callee.range());
+                }
                 self.check_call(call, scope, expression.range());
             }
             Expression::New(new) => {
@@ -11916,7 +12243,11 @@ impl<'src> Binder<'src> {
             }
             Expression::Member(member) => {
                 if matches!(member.object.data(), Expression::Super) {
-                    self.check_super_member_access(member.object.range(), member.optional);
+                    self.check_super_member_access(
+                        member.object.range(),
+                        member.optional,
+                        &member.property,
+                    );
                 } else {
                     self.resolve_expr(&member.object, scope);
                     // A property read dereferences its object, so a nullable
@@ -12254,7 +12585,12 @@ impl<'src> Binder<'src> {
     /// classes and object literals are legal. Plain functions and the top
     /// level stay silent: no existing C-band code carries that diagnostic, and
     /// minting one is out of scope.
-    fn check_super_member_access(&mut self, range: TextRange, optional: bool) {
+    fn check_super_member_access(
+        &mut self,
+        range: TextRange,
+        optional: bool,
+        property: &MemberProperty,
+    ) {
         if optional {
             self.emit(BARE_SUPER_EXPRESSION, range, BARE_SUPER_EXPRESSION_MESSAGE);
             return;
@@ -12266,22 +12602,117 @@ impl<'src> Binder<'src> {
                 range,
                 SUPER_REFERENCE_NON_DERIVED_MESSAGE,
             );
+            return;
+        }
+        if let SuperFlow::Tracking { called: false } = self.super_flow {
+            self.emit(
+                SUPER_BEFORE_SUPER_PROPERTY,
+                range,
+                SUPER_BEFORE_SUPER_PROPERTY_MESSAGE,
+            );
+        }
+        self.check_super_property_is_field(property);
+        self.check_super_property_is_static(property);
+    }
+
+    /// TS2855: `super.x` reads the prototype chain, but a class field is an
+    /// own instance property, so the field is never visible through `super`
+    /// even after `super()` has run. Methods and accessors live on the
+    /// prototype and stay reachable.
+    fn check_super_property_is_field(&mut self, property: &MemberProperty) {
+        let MemberProperty::Named(identifier) = property else {
+            return;
+        };
+        if self.super_member_homes.last() != Some(&SuperMemberHome::ClassMember { derived: true }) {
+            return;
+        }
+        let Some(&owner) = self.class_owner_stack.last() else {
+            return;
+        };
+        let Some(&base) = self.class_base_symbols.get(&owner) else {
+            return;
+        };
+        let name = self.identifier_text(identifier);
+        let is_field = self
+            .types
+            .class_template_properties(base)
+            .iter()
+            .find(|member| member.name() == name.as_ref())
+            .is_some_and(|member| !member.is_method() && !member.accessor());
+        if is_field {
+            // Downlevel targets keep the single pre-fields rule: fields are
+            // not methods on the prototype, so the whole access is illegal
+            // through super. ES2015+ names the field explicitly.
+            if self.es5 {
+                self.emit(
+                    SUPER_PROPERTY_NOT_METHOD,
+                    identifier.range(),
+                    SUPER_PROPERTY_NOT_METHOD_MESSAGE,
+                );
+            } else {
+                self.emit_with_message(
+                    SUPER_FIELD_VIA_SUPER,
+                    identifier.range(),
+                    format!(
+                        "Class field '{name}' defined by the parent class is not accessible in the child class via super."
+                    ),
+                );
+            }
         }
     }
 
-    fn check_super_call(&mut self, range: TextRange) {
+    /// TS2576: `super` resolves instance members, so a base class static
+    /// reached through it is a misspelling of `Base.member`.
+    fn check_super_property_is_static(&mut self, property: &MemberProperty) {
+        let MemberProperty::Named(identifier) = property else {
+            return;
+        };
+        if self.super_member_homes.last() != Some(&SuperMemberHome::ClassMember { derived: true }) {
+            return;
+        }
+        let Some(&owner) = self.class_owner_stack.last() else {
+            return;
+        };
+        let Some(&base) = self.class_base_symbols.get(&owner) else {
+            return;
+        };
+        let Some(&static_type) = self.class_constructor_types.get(&base) else {
+            return;
+        };
+        let name = self.identifier_text(identifier);
+        // The static side is a constructor type wrapping the structural
+        // member table.
+        let Type::ConstructorType { structural, .. } = self.types.get(static_type).clone() else {
+            return;
+        };
+        let Type::ObjectType(object) = self.types.get(structural).clone() else {
+            return;
+        };
+        if !object
+            .properties
+            .iter()
+            .any(|member| member.name() == name.as_ref())
+        {
+            return;
+        }
+        let base_name = self.symbols[base.get() as usize].name().to_owned();
+        self.emit_with_message(
+            SUPER_STATIC_MEMBER_VIA_SUPER,
+            identifier.range(),
+            format!(
+                "Property '{name}' does not exist on type '{base_name}'. Did you mean to access the static member '{base_name}.{name}' instead?"
+            ),
+        );
+    }
+
+    fn check_super_call_legality(&mut self, range: TextRange) {
         let context = self
             .super_call_contexts
             .last()
             .copied()
             .unwrap_or(SuperCallContext::NonConstructor);
         let (code, message) = match context {
-            SuperCallContext::DerivedConstructor => {
-                if let Some(called) = self.derived_constructor_super_presence.last_mut() {
-                    *called = true;
-                }
-                return;
-            }
+            SuperCallContext::DerivedConstructor => return,
             SuperCallContext::BaseConstructor
             | SuperCallContext::ConstructorParameters { derived: false } => (
                 SUPER_REFERENCE_NON_DERIVED,
@@ -12297,6 +12728,23 @@ impl<'src> Binder<'src> {
             ),
         };
         self.emit(code, range, message);
+    }
+
+    /// Records a resolved `super()` call: the constructor's missing-super
+    /// presence is satisfied, and in statement position the flow becomes
+    /// guaranteed. Runs after the call's arguments have resolved.
+    fn mark_super_call_completed(&mut self, _range: TextRange) {
+        if self.super_call_contexts.last().copied() != Some(SuperCallContext::DerivedConstructor) {
+            return;
+        }
+        if let Some(called) = self.derived_constructor_super_presence.last_mut() {
+            *called = true;
+        }
+        if self.super_call_guarantees
+            && let SuperFlow::Tracking { called } = &mut self.super_flow
+        {
+            *called = true;
+        }
     }
 
     fn resolve_object_member(&mut self, member: &'src ObjectMember, scope: ScopeId) {
@@ -14016,7 +14464,7 @@ impl<'src> Binder<'src> {
             }
             AssignmentTarget::Member(member) => {
                 if matches!(member.object.data(), Expression::Super) {
-                    self.check_super_member_access(member.object.range(), false);
+                    self.check_super_member_access(member.object.range(), false, &member.property);
                 } else {
                     self.resolve_expr(&member.object, scope);
                 }
@@ -14214,6 +14662,7 @@ impl<'src> Binder<'src> {
                     USED_BEFORE_ASSIGNED_MESSAGE,
                 );
             }
+            self.check_used_before_declaration(identifier, symbol, scope);
         } else if !self.suppresses_unresolved_value(scope) {
             if self.intrinsics.is_lib_gated_value(&name) {
                 self.emit(
@@ -14250,6 +14699,75 @@ impl<'src> Binder<'src> {
         }
         false
     }
+    /// TS2448/TS2449/TS2450: a block-scoped binding referenced textually
+    /// before its declaration. A reference separated from the declaration by
+    /// a function-like boundary is deferred instead - the function runs
+    /// after the binding initializes - so only same-function (or same
+    /// module top-level) uses count.
+    fn check_used_before_declaration(
+        &mut self,
+        identifier: &IdentifierNode,
+        symbol: SymbolId,
+        scope: ScopeId,
+    ) {
+        let symbol_data = &self.symbols[symbol.get() as usize];
+        let code = match symbol_data.kind {
+            SymbolKind::Variable(VariableKind::Let | VariableKind::Const) => {
+                BLOCK_SCOPED_USED_BEFORE_DECLARATION
+            }
+            SymbolKind::Class => CLASS_USED_BEFORE_DECLARATION,
+            SymbolKind::Enum => {
+                // A const enum is inlined at its use sites, so an early
+                // reference reads the cooked value instead of the runtime
+                // binding; tsc leaves it clean.
+                let is_const = self
+                    .enum_declarations
+                    .iter()
+                    .any(|binding| binding.symbol == symbol && binding.declaration.is_const);
+                if is_const {
+                    return;
+                }
+                ENUM_USED_BEFORE_DECLARATION
+            }
+            _ => return,
+        };
+        let declaration_scope = symbol_data.scope();
+        if identifier.range().start() >= symbol_data.range().start()
+            || self.boundary_scope(scope) != self.boundary_scope(declaration_scope)
+            || self.crosses_function_boundary(scope, declaration_scope)
+        {
+            return;
+        }
+        let name = self.identifier_text(identifier);
+        let message = match symbol_data.kind {
+            SymbolKind::Variable(_) => {
+                format!("Block-scoped variable '{name}' used before its declaration.")
+            }
+            SymbolKind::Class => format!("Class '{name}' used before its declaration."),
+            _ => format!("Enum '{name}' used before its declaration."),
+        };
+        self.emit_with_message(code, identifier.range(), message);
+    }
+
+    /// Whether walking from `from` up to `to` crosses a function-like
+    /// boundary.
+    fn crosses_function_boundary(&self, from: ScopeId, to: ScopeId) -> bool {
+        let mut scope = from;
+        loop {
+            if scope == to {
+                return false;
+            }
+            match self.scopes[scope.0 as usize].kind {
+                ScopeKind::Function | ScopeKind::Global | ScopeKind::Module => return true,
+                _ => {}
+            }
+            let Some(parent) = self.scopes[scope.0 as usize].parent else {
+                return true;
+            };
+            scope = parent;
+        }
+    }
+
     fn enclosing_this_owner(&self, mut scope: ScopeId) -> Option<SymbolId> {
         loop {
             let lexical = &self.scopes[scope.0 as usize];

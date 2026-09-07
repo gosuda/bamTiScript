@@ -117,6 +117,10 @@ pub const INVALID_USING_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS
 pub const USING_DECLARATION_REQUIRES_INITIALIZER: DiagnosticCode =
     DiagnosticCode::new("BAMTS-P012");
 const UNTERMINATED_REGEX: DiagnosticCode = DiagnosticCode::new("BAMTS-L004");
+/// An argument-bearing yield expression parsed outside any generator.
+const YIELD_OUTSIDE_GENERATOR: DiagnosticCode = DiagnosticCode::new("BAMTS-P017");
+/// An await expression parsed inside a non-async function-like.
+const AWAIT_OUTSIDE_ASYNC: DiagnosticCode = DiagnosticCode::new("BAMTS-P018");
 
 /// A parser operation was interrupted before completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,6 +284,10 @@ struct ParserCheckpoint {
 struct KeywordContext {
     await_reserved: bool,
     yield_reserved: bool,
+    /// Inside any function-like body or parameter list. Top-level await
+    /// is legal in modules, so TS1308 fires only when this is set;
+    /// yield expressions are illegal outside generators everywhere.
+    in_function: bool,
 }
 
 /// Whether `global` / string-named module forms are recognized as ambient at
@@ -2097,7 +2105,15 @@ impl Parser {
             && property_modifier == PropertyModifier::None
             && !is_async
         {
-            let block = self.parse_block();
+            // The block's own keyword context: neither the enclosing
+            // function's async nor its generator state applies, so both
+            // await and yield are context-illegal inside.
+            let context = KeywordContext {
+                in_function: true,
+                await_reserved: false,
+                yield_reserved: false,
+            };
+            let block = self.with_keyword_context(context, Self::parse_block);
             return self.node(start, ClassMember::StaticBlock(block));
         }
 
@@ -2140,10 +2156,16 @@ impl Parser {
             && self.is_constructor_name(&name)
             && self.at(TokenKind::LParen)
         {
-            let parameters = self.parse_parameter_list();
+            let keyword_context = KeywordContext {
+                in_function: true,
+                await_reserved: false,
+                yield_reserved: false,
+            };
+            let parameters =
+                self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
             let return_type = self.parse_optional_type_annotation();
             if self.at(TokenKind::LBrace) {
-                let body = self.parse_block();
+                let body = self.with_keyword_context(keyword_context, Self::parse_block);
                 let _ = return_type;
                 return self.node(
                     start,
@@ -2182,6 +2204,7 @@ impl Parser {
         // Method, getter, or setter.
         if self.at(TokenKind::LParen) || self.at_less_like() || is_generator {
             let keyword_context = KeywordContext {
+                in_function: true,
                 await_reserved: is_async,
                 yield_reserved: is_generator,
             };
@@ -3244,6 +3267,7 @@ impl Parser {
     }
 
     fn parse_yield_expression(&mut self, start: Utf16Pos, no_in: bool) -> Expr {
+        let keyword_range = self.cur().range();
         self.bump();
         let delegate = self.at(TokenKind::Star) && !self.has_newline_before();
         if delegate {
@@ -3254,6 +3278,19 @@ impl Parser {
         } else {
             None
         };
+        // A yield expression is legal only inside a generator; the
+        // argument-bearing form is unambiguous, so it reports TS1163
+        // wherever it appears outside one. A bare `yield` stays quiet:
+        // in sloppy code it is a plain identifier reference.
+        if !self.keyword_context.yield_reserved && argument.is_some() && self.is_typescript() {
+            // Anchored at the yield keyword; TypeScript sources only,
+            // since sloppy scripts may call `yield(1)` as an identifier.
+            self.error_at(
+                YIELD_OUTSIDE_GENERATOR,
+                keyword_range,
+                "A 'yield' expression is only allowed in a generator body.",
+            );
+        }
         self.node(
             start,
             Expression::Yield(YieldExpression { delegate, argument }),
@@ -3459,8 +3496,23 @@ impl Parser {
         }
 
         if self.at(TokenKind::KwAwait) && self.can_start_expression_after(1) {
+            let keyword_range = self.cur().range();
             self.bump();
             let argument = self.parse_unary_expression();
+            // Await belongs to async functions (or module top level,
+            // which no function-like context covers); a plain nested
+            // function-like parsing one is TS1308. Anchored at the
+            // await keyword, TypeScript sources only.
+            if !self.keyword_context.await_reserved
+                && self.keyword_context.in_function
+                && self.is_typescript()
+            {
+                self.error_at(
+                    AWAIT_OUTSIDE_ASYNC,
+                    keyword_range,
+                    "'await' expressions are only allowed within async functions and at the top levels of modules.",
+                );
+            }
             return self.node(
                 start,
                 Expression::Await(AwaitExpression {
@@ -4475,6 +4527,7 @@ impl Parser {
         // Method.
         if self.at(TokenKind::LParen) || self.at_less_like() {
             let keyword_context = KeywordContext {
+                in_function: true,
                 await_reserved: is_async,
                 yield_reserved: is_generator,
             };
@@ -4889,6 +4942,7 @@ impl Parser {
             None
         };
         let keyword_context = KeywordContext {
+            in_function: true,
             await_reserved: is_async,
             yield_reserved: is_generator,
         };
@@ -5118,6 +5172,7 @@ impl Parser {
 
     fn parse_simple_arrow(&mut self, start: Utf16Pos, is_async: bool, no_in: bool) -> Expr {
         let keyword_context = KeywordContext {
+            in_function: true,
             await_reserved: is_async,
             yield_reserved: false,
         };
@@ -5152,6 +5207,7 @@ impl Parser {
 
     fn parse_paren_arrow(&mut self, start: Utf16Pos, is_async: bool, no_in: bool) -> Expr {
         let keyword_context = KeywordContext {
+            in_function: true,
             await_reserved: is_async,
             yield_reserved: false,
         };
@@ -5190,6 +5246,7 @@ impl Parser {
     ) -> Option<Expr> {
         let checkpoint = self.checkpoint();
         let keyword_context = KeywordContext {
+            in_function: true,
             await_reserved: is_async,
             yield_reserved: false,
         };
@@ -5218,6 +5275,7 @@ impl Parser {
         let checkpoint = self.checkpoint();
         self.bump(); // `async`
         let keyword_context = KeywordContext {
+            in_function: true,
             await_reserved: true,
             yield_reserved: false,
         };
@@ -5258,6 +5316,7 @@ impl Parser {
             return None;
         }
         let keyword_context = KeywordContext {
+            in_function: true,
             await_reserved: is_async,
             yield_reserved: false,
         };
@@ -6553,6 +6612,219 @@ mod tests {
             .iter()
             .filter(|d| d.severity() == DiagnosticSeverity::Error)
             .collect()
+    }
+
+    /// B3: an argument-bearing yield outside any generator reports the
+    /// native code that projects onto TS1163; a bare `yield` stays
+    /// quiet (sloppy identifier reference), and generators stay clean.
+    #[test]
+    fn reports_yield_expression_outside_generators() {
+        let bad = parse_text("function f() { yield 1; }", ScriptKind::TypeScript);
+        assert!(
+            errors(&bad)
+                .iter()
+                .any(|d| d.code().as_str() == "BAMTS-P017"),
+            "yield in plain function must report"
+        );
+        let nested = parse_text(
+            "function* g() { function h() { yield 1; } yield 2; }",
+            ScriptKind::TypeScript,
+        );
+        assert!(
+            errors(&nested)
+                .iter()
+                .any(|d| d.code().as_str() == "BAMTS-P017"),
+            "yield in nested plain function must report"
+        );
+        let bare = parse_text("function f() { var x = yield; }", ScriptKind::TypeScript);
+        assert!(
+            !errors(&bare)
+                .iter()
+                .any(|d| d.code().as_str() == "BAMTS-P017"),
+            "bare yield is a sloppy identifier, not a report"
+        );
+        assert_clean("function* g() { yield 1; }");
+    }
+
+    /// B3: await inside a non-async function-like (nested function or
+    /// arrow) reports the native code that projects onto TS1308;
+    /// async bodies and module top level stay clean.
+    #[test]
+    fn reports_await_outside_async_function_likes() {
+        let nested = parse_text(
+            "async function f() { function g() { return await k; } }",
+            ScriptKind::TypeScript,
+        );
+        assert!(
+            errors(&nested)
+                .iter()
+                .any(|d| d.code().as_str() == "BAMTS-P018"),
+            "await in nested plain function must report"
+        );
+        let arrow = parse_text(
+            "async function f() { var g = () => await k; }",
+            ScriptKind::TypeScript,
+        );
+        assert!(
+            errors(&arrow)
+                .iter()
+                .any(|d| d.code().as_str() == "BAMTS-P018"),
+            "await in non-async arrow must report"
+        );
+        assert_clean("async function f() { return await k; }");
+        assert_clean("await k;");
+    }
+
+    /// B3 follow-ups: the diagnostics anchor at the yield/await keyword
+    /// (not the token after the operand), sloppy JavaScript stays
+    /// silent, and class static blocks carry their own context.
+    #[test]
+    fn context_diagnostics_anchor_gate_and_static_blocks() {
+        let bad = parse_text("function f() { yield 1; }", ScriptKind::TypeScript);
+        let diag = errors(&bad)
+            .iter()
+            .find(|d| d.code().as_str() == "BAMTS-P017")
+            .copied()
+            .expect("yield diagnostic");
+        assert_eq!(
+            diag.range().start().get(),
+            "function f() { ".len(),
+            "range must start at the yield keyword"
+        );
+        let sloppy = parse_text("function f() { yield(1); }", ScriptKind::JavaScript);
+        assert!(
+            !errors(&sloppy)
+                .iter()
+                .any(|d| d.code().as_str() == "BAMTS-P017"),
+            "sloppy js identifier call must stay silent"
+        );
+        let sloppy_await = parse_text("function f() { await(1); }", ScriptKind::JavaScript);
+        assert!(
+            !errors(&sloppy_await)
+                .iter()
+                .any(|d| d.code().as_str() == "BAMTS-P018"),
+            "sloppy js await call must stay silent"
+        );
+        let static_block = parse_text(
+            "async function f() { class C { static { await x; } } }",
+            ScriptKind::TypeScript,
+        );
+        assert!(
+            errors(&static_block)
+                .iter()
+                .any(|d| d.code().as_str() == "BAMTS-P018"),
+            "await in a static block is context-illegal regardless of the enclosing async"
+        );
+        let static_block_yield = parse_text(
+            "function* g() { class C { static { yield x; } } }",
+            ScriptKind::TypeScript,
+        );
+        assert!(
+            errors(&static_block_yield)
+                .iter()
+                .any(|d| d.code().as_str() == "BAMTS-P017"),
+            "yield in a static block is context-illegal regardless of the enclosing generator"
+        );
+    }
+
+    /// B3: the native codes project onto the TypeScript surface the
+    /// driver reports - TS1163 and TS1308 with tsc's exact messages.
+    #[test]
+    fn projects_context_codes_onto_the_typescript_surface() {
+        let bad = parse_text("function f() { yield 1; }", ScriptKind::TypeScript);
+        let projected = crate::diagnostics_parser::typescript_parse_code(
+            bad.diagnostics()[0].code(),
+            bad.diagnostics()[0].message(),
+        )
+        .expect("yield code projects");
+        assert_eq!(projected.as_str(), "TS1163");
+        let awaited = parse_text(
+            "async function f() { function g() { return await k; } }",
+            ScriptKind::TypeScript,
+        );
+        let await_code = errors(&awaited)
+            .iter()
+            .find(|d| d.code().as_str() == "BAMTS-P018")
+            .copied()
+            .expect("await error present");
+        let projected = crate::diagnostics_parser::typescript_parse_code(
+            await_code.code(),
+            await_code.message(),
+        )
+        .expect("await code projects");
+        assert_eq!(projected.as_str(), "TS1308");
+        assert_eq!(
+            crate::diagnostics_parser::typescript_parse_message(projected),
+            Some(
+                "'await' expressions are only allowed within async functions and at the top levels of modules."
+            )
+        );
+    }
+
+    #[test]
+    fn pr199_constructor_keyword_context_is_local() {
+        for (source, expected, keyword) in [
+            (
+                "/* 🦀 */ class C { constructor() { await value; } }",
+                "BAMTS-P018",
+                "await",
+            ),
+            (
+                "async function f() { class C { constructor() { await value; } } await value; }",
+                "BAMTS-P018",
+                "await",
+            ),
+            (
+                "function* f() { class C { constructor() { yield 1; } } yield 2; }",
+                "BAMTS-P017",
+                "yield",
+            ),
+            (
+                "async function f() { class C { constructor(x = await value) {} } await value; }",
+                "BAMTS-P018",
+                "await",
+            ),
+            (
+                "function* f() { class C { constructor(x = yield 1) {} } yield 2; }",
+                "BAMTS-P017",
+                "yield",
+            ),
+            (
+                "class C { constructor(x = await value); constructor(x) {} }",
+                "BAMTS-P018",
+                "await",
+            ),
+        ] {
+            let parsed = parse_text(source, ScriptKind::TypeScript);
+            let diagnostics = errors(&parsed)
+                .into_iter()
+                .filter(|diagnostic| {
+                    matches!(diagnostic.code().as_str(), "BAMTS-P017" | "BAMTS-P018")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].code().as_str(), expected, "{source}");
+            let byte_start = source.find(keyword).expect("keyword in fixture");
+            let utf16_start = source[..byte_start].encode_utf16().count();
+            assert_eq!(
+                diagnostics[0].range().start().get(),
+                utf16_start,
+                "{source}"
+            );
+        }
+        for source in [
+            "class C { constructor() { const f = async () => await value; const g = function*() { yield 1; }; } }",
+            "async function f() { class C { constructor() {} } await value; }",
+            "function* f() { class C { constructor() {} } yield 1; }",
+            "class C { constructor() {} } await value;",
+        ] {
+            let parsed = parse_text(source, ScriptKind::TypeScript);
+            assert!(
+                errors(&parsed).is_empty(),
+                "{source}: {:?}",
+                errors(&parsed)
+            );
+        }
     }
 
     fn assert_clean(text: &str) -> Recovered<SourceFile> {
