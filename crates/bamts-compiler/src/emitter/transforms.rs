@@ -1747,20 +1747,23 @@ impl<'a> Rewriter<'a> {
                     )];
                 }
             }
-            // Assignment-target bindings have no lowering here; the
-            // verbatim statement below keeps the shape (and any
-            // applicable diagnostic) instead of dropping it.
-            target @ ForBinding::Target(_) => {
-                let body = self.rewrite_single_statement(&for_of.body);
-                return vec![self.node(
+            // `target = source[counter];` - destructuring targets lower
+            // through the statement rewriter like any assignment.
+            ForBinding::Target(target) => {
+                let assignment = self.node(
                     range,
-                    Statement::ForOf(ForOfStatement {
-                        mode: for_of.mode,
-                        binding: target.clone(),
-                        iterable: Box::new(iterable),
-                        body: Box::new(body),
+                    Expression::Assignment(AssignmentExpression {
+                        operator: AssignmentOperator::Assign,
+                        left: target.clone(),
+                        right: Box::new(element),
                     }),
-                )];
+                );
+                self.node(
+                    range,
+                    Statement::Expression(ExpressionStatement {
+                        expression: Box::new(assignment),
+                    }),
+                )
             }
         };
         let source_decl = self.make_declarator(source.clone(), Some(iterable), range);
@@ -2391,21 +2394,18 @@ impl<'a> Rewriter<'a> {
         out: &mut Vec<VariableDeclaratorNode>,
     ) -> Vec<RestExcludeKey> {
         let mut rest_keys = Vec::new();
+        // Properties evaluate in source order: a computed key runs after
+        // the reads and defaults of the properties before it, so its temp
+        // is a declarator in sequence rather than a hoisted prelude.
         for property in &object.properties {
-            let PropertyName::Computed(key) = &property.name else {
-                continue;
-            };
-            let temp = self.temp_ident();
-            let value = self.rewrite_expr(key);
-            let declaration = self.make_temp_declaration(temp.clone(), value, range);
-            self.key_prelude.push(declaration);
-            rest_keys.push(RestExcludeKey::Computed(temp.clone()));
-            let reference = self.node(temp.range(), Expression::Identifier(temp.clone()));
-            let member = self.member_computed(rhs, &reference, range);
-            self.lower_property_binding(property, member, range, out);
-        }
-        for property in &object.properties {
-            if let PropertyName::Computed(_) = &property.name {
+            if let PropertyName::Computed(key) = &property.name {
+                let temp = self.temp_ident();
+                let value = self.rewrite_expr(key);
+                out.push(self.make_declarator(temp.clone(), Some(value), range));
+                rest_keys.push(RestExcludeKey::Computed(temp.clone()));
+                let reference = self.node(temp.range(), Expression::Identifier(temp.clone()));
+                let member = self.member_computed(rhs, &reference, range);
+                self.lower_property_binding(property, member, range, out);
                 continue;
             }
             if let BindingPattern::Rest(rest) = property.binding.data() {
@@ -10438,21 +10438,22 @@ console.log(JSON.stringify([bar, bar4, log]));
         let code = javascript(&output);
         // ES5 temps are `var` (a `let` inside cloned machine bodies is a
         // SyntaxError at ES5); ES2015+ keeps the tighter `let` binding.
-        let (kind, key_temp_at) = code
-            .find("var _t")
-            .map(|at| ("var", at))
-            .or_else(|| code.find("let _t").map(|at| ("let", at)))
-            .expect("key temp declared");
-        assert_eq!(kind, "var", "ES5 temp kind: {code}");
-        let digits: String = code[key_temp_at + "var _t".len()..]
+        assert!(code.contains("var _t"), "ES5 temp kind: {code}");
+        assert!(!code.contains("let _t"), "ES5 temp kind: {code}");
+        let key_read_at = code.find(" = key").expect("key temp declared");
+        let temp_name: String = code[..key_read_at]
             .chars()
-            .take_while(|character| character.is_ascii_digit())
+            .rev()
+            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
             .collect();
-        let temp_name = format!("_t{digits}");
-        let declaration_form = format!("var {temp_name} = key;");
-        assert!(
-            code.contains(&declaration_form),
-            "key evaluates once into a temp ({declaration_form:?}): {code}"
+        assert!(temp_name.starts_with("_t"), "key temp name: {code}");
+        assert_eq!(
+            code.matches(" = key").count(),
+            1,
+            "key evaluates once into a temp: {code}"
         );
         assert!(
             code.contains(&format!("[{temp_name}]")),
@@ -10601,14 +10602,32 @@ console.log(JSON.stringify([bar, bar4, log]));
     }
 
     #[test]
-    fn es5_for_of_fallback_keeps_rewritten_iterable() {
+    fn es5_for_of_assignment_target_keeps_rewritten_iterable() {
         let output = emit_at(
             "async function f() { let x; for (x of await values) {} }\n",
             ScriptTarget::Es5,
         );
         let code = javascript(&output);
         assert!(!code.contains("await values"), "{code}");
-        assert!(code.contains("yield values"), "{code}");
+        assert!(!code.contains(" of "), "{code}");
+        assert!(code.contains("/*yield*/, values]"), "{code}");
+        assert!(code.contains("x = _t1[_t0]"), "{code}");
+    }
+
+    #[test]
+    fn computed_destructuring_keys_evaluate_after_earlier_properties() {
+        let output = emit_at(
+            "var { a = first(), [second()]: b, c = third() } = source();\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        let position = |needle: &str| {
+            code.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {code}"))
+        };
+        assert!(position("source()") < position("first()"), "{code}");
+        assert!(position("first()") < position("second()"), "{code}");
+        assert!(position("second()") < position("third()"), "{code}");
     }
 
     #[test]
