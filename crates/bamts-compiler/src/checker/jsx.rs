@@ -1,7 +1,6 @@
-//! JSX/TSX checking as an extension of the [`Binder`] expression pass.
-//!
-//! JSX checking answers three questions for every JSX expression, all on top
-//! of the existing scope tree, symbol table, and interned [`TypeTable`]:
+//! JSX/TSX checking as a demand-only extension of the [`Binder`] expression
+//! engine, split into a pure inference phase and a check-only diagnostic
+//! phase per the WP-JSX cutover contract.
 //!
 //! - **Namespace resolution.** The in-scope `JSX` namespace (value or type
 //!   plane, resolved from the element's lexical scope outward) provides the
@@ -14,33 +13,44 @@
 //! - **Element classification.** A lowercase, single-identifier tag is an
 //!   *intrinsic* element looked up by name in `JSX.IntrinsicElements`; any
 //!   other tag is *value-based* and resolves against the value namespace like
-//!   an ordinary expression reference, registering the same `references`
-//!   entries an identifier expression would.
+//!   an ordinary expression reference, completing the same reference events
+//!   an identifier expression would.
 //! - **Attribute/children checking.** Attributes fold into one structural
 //!   props type — a bare attribute contributes `true`, `name="…"` a string,
 //!   `name={expr}` the expression's type, and `{...spread}` members merge in
-//!   source order with later members winning. Non-whitespace children
-//!   contribute a `children` property typed by the union of all children. The
-//!   props object is checked against the `IntrinsicElements` member or the
-//!   factory's first parameter with the existing assignability relation.
+//!   source order with later members winning, each operand expanded
+//!   demand-typed through the same structural views an object-literal spread
+//!   reads through; a union-typed spread contributes one props branch per
+//!   constituent, and only a truly opaque operand leaves the object
+//!   unchecked. Non-whitespace children contribute a `children` property
+//!   typed by the union of all children, where a `{...spread}` child
+//!   contributes the elements its operand iterates. The props object is
+//!   checked against the `IntrinsicElements` member or the resolved factory
+//!   signature with the existing assignability relation.
 //!
-//! Value-based factories are recovered from the binder's `jsx_callables`
-//! side table (function declarations and function/arrow initializers), since
-//! function symbols intentionally keep `any` as their symbol type. A generic
-//! factory's type arguments are inferred from the synthesized props object
-//! with [`InferenceContext`], and the element's result type is the
-//! instantiated factory return type. Intrinsic elements and fragments take
-//! `JSX.Element`, falling back to `any` when the namespace does not declare
-//! one. Result types are recorded in the binder's `jsx_element_types` side
-//! table so `type_of_expr` propagates them into surrounding checks such as
-//! variable-annotation assignability.
+//! Value-based factories are resolved through [`Binder::signature_group`],
+//! the canonical demand-based candidate list every callable symbol shares —
+//! there is no JSX-specific declaration cache. A generic factory's type
+//! arguments are inferred from the synthesized props object with
+//! [`InferenceContext`], trying candidates in declaration order and keeping
+//! the first whose parameter accepts the props (or that takes none). Intrinsic
+//! elements and fragments take `JSX.Element`, falling back to `any` when the
+//! namespace does not declare one.
 //!
-//! Every lookup failure degrades to an `any`-typed element with at most one
-//! diagnostic anchored at the responsible tag; recovery never cascades into
-//! surrounding expression checking.
+//! [`Binder::infer_jsx_outcome`] computes a [`JsxElementOutcome`] once; the
+//! demand dispatch commits it atomically with the expression's
+//! [`ExpressionResult`] (`type_id: outcome.result()`, `jsx: Some(outcome)`),
+//! and inference itself never emits diagnostics or publishes.
+//! [`Binder::check_jsx_element`] and its self-closing/fragment siblings
+//! retrieve that committed outcome — never re-invoking inference — to decide
+//! at most one diagnostic, then drive every attribute and child expression
+//! through the general selected-check traversal exactly once before
+//! publishing the element's result type.
 
 use super::binder::{
-    Binder, FunctionParameter, PropertyType, ScopeId, ScopeKind, SymbolId, Type, TypeId,
+    Binder, DemandPoll, DemandResult, FunctionParameter, FunctionSignature, IndexSignature,
+    ObjectType, PropertyType, PublicationOrder, ScopeId, SlotContext, SymbolId, Type, TypeId,
+    demand_ready,
 };
 use super::inference::{InferenceContext, InferenceParameter};
 use super::{
@@ -49,103 +59,933 @@ use super::{
     JSX_ELEMENT_TYPE_NOT_CALLABLE_MESSAGE, JSX_INTRINSIC_ELEMENT_NOT_FOUND,
     JSX_INTRINSIC_ELEMENT_NOT_FOUND_MESSAGE,
 };
+use crate::diagnostic::Diagnostic;
 use crate::source::TextRange;
 use crate::syntax::{
-    ArrowFunction, Expr, Expression, FunctionLike, JsxAttributeItem, JsxAttributeName, JsxChild,
-    JsxElement, JsxElementName, JsxFragment, JsxSelfClosingElement, ParameterNode,
-    TypeAnnotationNode, TypeParameterList,
+    Expr, Expression, IdentifierNode, JsxAttributeInitializer, JsxAttributeItem, JsxAttributeName,
+    JsxChild, JsxElement, JsxElementName, JsxFragment, JsxSelfClosingElement, NodeId,
 };
 
-/// A callable declaration usable as a JSX factory: a function declaration or
-/// function expression, or an arrow function.
-#[derive(Clone, Copy)]
-pub(crate) enum JsxCallable<'src> {
-    Function(&'src FunctionLike),
-    Arrow(&'src ArrowFunction),
+/// The `selected` frame input every check-only JSX entry point receives: the
+/// slot the element was demanded under, and the contextual target its parent
+/// expects, if any. Defined by WP-DEMAND; re-declared here only as a type
+/// alias boundary comment — the real type lives in `binder.rs`.
+type SelectedInput = super::binder::SelectedInput;
+
+/// The classified, fully-inferred result of one JSX element, self-closing
+/// element, or fragment expression. Computed once by
+/// [`Binder::infer_jsx_outcome`] and stored atomically in the owning
+/// [`ExpressionResult`]; the check phase replays this value instead of
+/// re-inferring or maintaining a second type cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JsxElementOutcome {
+    /// A lowercase intrinsic tag resolved through `JSX.IntrinsicElements`.
+    /// `target` is the tag's member type there, or `None` when the tag has
+    /// no such member (including when `IntrinsicElements` itself is
+    /// unresolvable, in which case classification degrades to
+    /// [`JsxDegradation::OpaqueCallee`] instead of this variant).
+    Intrinsic {
+        result: TypeId,
+        props: TypeId,
+        target: Option<TypeId>,
+        tag_range: TextRange,
+    },
+    /// A value-based tag resolved as a callable factory. `props_target` is
+    /// the winning candidate's first parameter type, or `None` for a
+    /// zero-parameter candidate that accepts props unconditionally.
+    Value {
+        result: TypeId,
+        props: TypeId,
+        props_target: Option<TypeId>,
+        callee: TypeId,
+        tag_range: TextRange,
+    },
+    /// A `<>...</>` fragment; children are still individually checked but
+    /// their union does not determine the fragment's result type.
+    Fragment { result: TypeId },
+    /// Recovery: at most one diagnostic is anchored at `tag_range`; `result`
+    /// is always a real recovery type (`JSX.Element` or `any`), never a bare
+    /// stand-in for a missing chosen signature.
+    Degraded {
+        result: TypeId,
+        reason: JsxDegradation,
+        tag_range: TextRange,
+    },
 }
 
-impl<'src> JsxCallable<'src> {
-    /// The signature-defining parts shared by both callable forms.
-    pub(crate) fn parts(
-        self,
-    ) -> (
-        Option<&'src TypeParameterList>,
-        &'src [ParameterNode],
-        Option<&'src TypeAnnotationNode>,
-    ) {
+impl JsxElementOutcome {
+    /// The element's result type, common to every classification.
+    #[must_use]
+    pub(crate) const fn result(self) -> TypeId {
         match self {
-            Self::Function(function) => (
-                function.type_parameters.as_ref(),
-                &function.parameters,
-                function.return_type.as_ref(),
-            ),
-            Self::Arrow(arrow) => (
-                arrow.type_parameters.as_ref(),
-                &arrow.parameters,
-                arrow.return_type.as_ref(),
-            ),
+            Self::Intrinsic { result, .. }
+            | Self::Value { result, .. }
+            | Self::Fragment { result }
+            | Self::Degraded { result, .. } => result,
         }
     }
 }
 
-/// A declaration signature resolved once and instantiated independently for
-/// each JSX use.
-pub(crate) struct JsxFactorySignature {
-    inference_parameters: Vec<InferenceParameter>,
-    parameters: Vec<TypeId>,
-    return_type: TypeId,
+/// Why a value-based JSX tag degraded to a recovery result instead of a
+/// checked classification. `Fragment` is a distinct [`JsxElementOutcome`]
+/// variant, never this reason, so it cannot be mistaken for a missing
+/// intrinsic target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JsxDegradation {
+    /// The tag name (or a dotted member step) did not resolve to a value.
+    /// The underlying reference completion — not JSX — accounts for any
+    /// "cannot find name" diagnostic.
+    TagUnresolved,
+    /// The tag resolved to a value type with no call signatures.
+    NotCallable,
+    /// The tag resolved to an opaque (`any`/`unknown`/`error`) type, or to
+    /// no ambient `JSX.IntrinsicElements` at all: there is nothing to check
+    /// against, so the type itself is the unchecked target.
+    OpaqueCallee,
 }
 
 impl<'src> Binder<'src> {
-    /// Checks a balanced JSX element `<name attrs>children</name>` and
-    /// returns its result type.
+    // -- inference --------------------------------------------------------------
+
+    /// Classifies and infers a JSX element, self-closing element, or
+    /// fragment expression in one pass, returning the full combined
+    /// [`JsxElementOutcome`]: its [`JsxElementOutcome::result`] is the
+    /// expression's `TypeId`, so the demand dispatch commits
+    /// `ExpressionResult { type_id, jsx: Some(outcome) }` atomically from
+    /// this single call. Never emits a diagnostic or publishes a reference;
+    /// the check phase alone does that, retrieving the committed outcome
+    /// instead of invoking this a second time.
+    pub(crate) fn infer_jsx_outcome(
+        &mut self,
+        expression: &'src Expr,
+        context: SlotContext,
+    ) -> DemandResult<JsxElementOutcome> {
+        match expression.data() {
+            Expression::JsxElement(element) => {
+                let opening = element.opening.data();
+                self.infer_jsx_tag_outcome(
+                    &opening.name,
+                    &opening.attributes,
+                    &element.children,
+                    jsx_element_name_range(&opening.name),
+                    context,
+                )
+            }
+            Expression::JsxSelfClosingElement(element) => self.infer_jsx_tag_outcome(
+                &element.name,
+                &element.attributes,
+                &[],
+                jsx_element_name_range(&element.name),
+                context,
+            ),
+            Expression::JsxFragment(_) => {
+                let result = self.jsx_element_type(context.scope);
+                Ok(DemandPoll::Ready(JsxElementOutcome::Fragment { result }))
+            }
+            _ => unreachable!("infer_jsx_outcome is dispatched only for JSX expressions"),
+        }
+    }
+
+    /// Dispatches an opening tag to intrinsic or value-based inference.
+    fn infer_jsx_tag_outcome(
+        &mut self,
+        name: &'src JsxElementName,
+        attributes: &'src [JsxAttributeItem],
+        children: &'src [JsxChild],
+        tag_range: TextRange,
+        context: SlotContext,
+    ) -> DemandResult<JsxElementOutcome> {
+        match name {
+            JsxElementName::Identifier(identifier)
+                if is_intrinsic_tag(&self.identifier_text(identifier)) =>
+            {
+                self.infer_intrinsic_outcome(identifier, attributes, children, tag_range, context)
+            }
+            _ => self.infer_value_outcome(name, attributes, children, tag_range, context),
+        }
+    }
+
+    /// Infers an intrinsic tag against `JSX.IntrinsicElements`. With no such
+    /// member resolvable at all, checking is inert: JSX has no ambient
+    /// meaning on its own, so this degrades silently rather than producing
+    /// an `Intrinsic` outcome with nothing to check.
+    fn infer_intrinsic_outcome(
+        &mut self,
+        tag: &'src IdentifierNode,
+        attributes: &'src [JsxAttributeItem],
+        children: &'src [JsxChild],
+        tag_range: TextRange,
+        context: SlotContext,
+    ) -> DemandResult<JsxElementOutcome> {
+        let Some(intrinsics_symbol) = self.jsx_namespace_member(context.scope, "IntrinsicElements")
+        else {
+            let result = self.jsx_element_type(context.scope);
+            return Ok(DemandPoll::Ready(JsxElementOutcome::Degraded {
+                result,
+                reason: JsxDegradation::OpaqueCallee,
+                tag_range,
+            }));
+        };
+        let intrinsics = self.resolve_type_symbol(intrinsics_symbol);
+        let tag_name = self.identifier_text(tag).into_owned();
+        let target = self.types.property_type(intrinsics, &tag_name);
+        let props = demand_ready!(self.infer_jsx_props(attributes, children, target, context));
+        let result = self.jsx_element_type(context.scope);
+        Ok(DemandPoll::Ready(JsxElementOutcome::Intrinsic {
+            result,
+            props,
+            target,
+            tag_range,
+        }))
+    }
+
+    /// Infers a value-based tag: resolves the tag value, selects the first
+    /// applicable candidate from its canonical signature group against the
+    /// synthesized props object, and returns the candidate's return type as
+    /// the element's result type.
+    fn infer_value_outcome(
+        &mut self,
+        name: &'src JsxElementName,
+        attributes: &'src [JsxAttributeItem],
+        children: &'src [JsxChild],
+        tag_range: TextRange,
+        context: SlotContext,
+    ) -> DemandResult<JsxElementOutcome> {
+        let Some((symbol, callee)) = demand_ready!(self.resolve_jsx_value_callee(name, context))
+        else {
+            let result = self.jsx_element_type(context.scope);
+            return Ok(DemandPoll::Ready(JsxElementOutcome::Degraded {
+                result,
+                reason: JsxDegradation::TagUnresolved,
+                tag_range,
+            }));
+        };
+        let signatures = demand_ready!(self.jsx_callable_signatures(symbol, callee));
+        let props = demand_ready!(self.infer_jsx_props(attributes, children, None, context));
+        let Some((props_target, result)) = select_jsx_factory_signature(&signatures, props, self)
+        else {
+            let result = self.jsx_element_type(context.scope);
+            // An opaque callee with no callable shape stays unchecked; a
+            // resolved non-callable value reports the not-callable
+            // diagnostic. The signature demand runs first because a symbol
+            // whose declared value is opaque can still own a canonical
+            // declaration signature (namespaced function members are typed
+            // only on demand).
+            let reason = if matches!(
+                self.types.get(callee),
+                Type::Any | Type::Unknown | Type::Error
+            ) {
+                JsxDegradation::OpaqueCallee
+            } else {
+                JsxDegradation::NotCallable
+            };
+            return Ok(DemandPoll::Ready(JsxElementOutcome::Degraded {
+                result,
+                reason,
+                tag_range,
+            }));
+        };
+        Ok(DemandPoll::Ready(JsxElementOutcome::Value {
+            result,
+            props,
+            props_target,
+            callee,
+            tag_range,
+        }))
+    }
+
+    /// Resolves a value-based JSX tag name to the symbol that names it, when
+    /// it is one directly reachable through lexical resolution (used for
+    /// [`Self::signature_group`]), and its value type — following dotted
+    /// member chains through ordinary structural property demand rather than
+    /// a JSX-specific container scope walk. Namespaced (`ns:name`) tags never
+    /// resolve as values, matching their absence as a runtime JS binding.
+    /// Never emits a diagnostic: inference is pure, and the check phase
+    /// separately completes the root identifier's reference event.
+    fn resolve_jsx_value_callee(
+        &mut self,
+        name: &'src JsxElementName,
+        context: SlotContext,
+    ) -> DemandResult<Option<(Option<SymbolId>, TypeId)>> {
+        match name {
+            JsxElementName::Identifier(identifier) => {
+                let text = self.identifier_text(identifier).into_owned();
+                match self.lookup_value(context.scope, &text) {
+                    Some(symbol) => {
+                        let value_type = demand_ready!(self.declared_value(symbol));
+                        Ok(DemandPoll::Ready(Some((Some(symbol), value_type))))
+                    }
+                    None => Ok(DemandPoll::Ready(None)),
+                }
+            }
+            JsxElementName::Member(member) => {
+                let Some((object_symbol, object_type)) =
+                    demand_ready!(self.resolve_jsx_value_callee(&member.object, context))
+                else {
+                    return Ok(DemandPoll::Ready(None));
+                };
+                let property = self.identifier_text(&member.property).into_owned();
+                // Mirror `Binder::type_of_member`: a namespace (or enum)
+                // container resolves the member step to its declaration
+                // symbol and that symbol's declared type, so the factory
+                // demand below sees the member's own canonical signature
+                // group instead of an opaque container value type with no
+                // function shape.
+                if let Some(object_symbol) = object_symbol
+                    && let Some(member_scope) = self.container_member_scope(object_symbol)
+                    && let Some(member_symbol) = self.scopes[member_scope.get() as usize]
+                        .value(&property)
+                        .or_else(|| {
+                            self.scopes[member_scope.get() as usize].type_binding(&property)
+                        })
+                {
+                    let mut member_symbol = member_symbol;
+                    let mut value_type = demand_ready!(self.declared_value(member_symbol));
+                    // The declared-value demand already reads past an opaque
+                    // raw entry. When it still cannot type the member, the
+                    // namespace's local-scope twin — where `resolve_function`
+                    // re-declares member functions — carries the canonical
+                    // signature, so prefer it before giving up.
+                    if matches!(
+                        self.types.get(value_type),
+                        Type::Any | Type::Unknown | Type::Error
+                    ) && let Some(local_scope) =
+                        self.namespace_local_of_symbol.get(&object_symbol)
+                        && let Some(local_symbol) =
+                            self.scopes[local_scope.get() as usize].value(&property)
+                    {
+                        let local_type = demand_ready!(self.declared_value(local_symbol));
+                        if !matches!(
+                            self.types.get(local_type),
+                            Type::Any | Type::Unknown | Type::Error
+                        ) {
+                            member_symbol = local_symbol;
+                            value_type = local_type;
+                        }
+                    }
+                    return Ok(DemandPoll::Ready(Some((Some(member_symbol), value_type))));
+                }
+                Ok(DemandPoll::Ready(
+                    self.types
+                        .property_type(object_type, &property)
+                        .map(|property_type| (None, property_type)),
+                ))
+            }
+            JsxElementName::Namespace(_) => Ok(DemandPoll::Ready(None)),
+        }
+    }
+
+    /// Returns the callable candidates for a resolved JSX tag value: the
+    /// symbol's own canonical signature group when it names one directly, or
+    /// the value type's function shape (expanding one alias view) otherwise —
+    /// covering dotted-member and aliased-import factories that have no
+    /// symbol of their own to demand a group for.
+    fn jsx_callable_signatures(
+        &mut self,
+        symbol: Option<SymbolId>,
+        callee: TypeId,
+    ) -> DemandResult<Vec<FunctionSignature>> {
+        if let Some(symbol) = symbol {
+            let signatures = demand_ready!(self.signature_group(symbol));
+            if !signatures.is_empty() {
+                return Ok(DemandPoll::Ready(signatures));
+            }
+        }
+        let resolved = self
+            .types
+            .prepare_applied_alias_view(callee)
+            .unwrap_or(callee);
+        let signatures = match self.types.get(resolved) {
+            Type::Function(signature) => vec![signature.clone()],
+            _ => Vec::new(),
+        };
+        Ok(DemandPoll::Ready(signatures))
+    }
+
+    // -- props/children synthesis -------------------------------------------------
+
+    /// Folds the attribute list and children into one structural props type.
+    /// Spread members merge in source order; later members win, a union-typed
+    /// spread contributes one distributable branch per constituent, and only
+    /// a truly opaque (`any`/`unknown`/`error`) operand leaves the props
+    /// object unchecked. `target` is the already-known props schema (an
+    /// intrinsic's resolved member type), used only to look up a contextual
+    /// type for the synthesized `children` property; individual attribute
+    /// values are never contextually typed, matching ordinary call-argument
+    /// inference.
+    pub(crate) fn infer_jsx_props(
+        &mut self,
+        attributes: &'src [JsxAttributeItem],
+        children: &'src [JsxChild],
+        target: Option<TypeId>,
+        context: SlotContext,
+    ) -> DemandResult<TypeId> {
+        // One entry per distributable branch of the props object: the members
+        // merged so far. A union-typed spread multiplies the branches so
+        // later members merge into every constituent, and the folded props
+        // type is the union of the per-branch objects — the same shape an
+        // ordinary call sees when a union argument flows into one parameter.
+        let mut variants: Vec<JsxSpreadBranch> = vec![JsxSpreadBranch {
+            properties: Vec::new(),
+            index_signatures: Vec::new(),
+        }];
+        let mut has_opaque_spread = false;
+        for attribute in attributes {
+            match attribute {
+                JsxAttributeItem::Attribute(attribute) => {
+                    let data = attribute.data();
+                    let name = jsx_attribute_key(self, &data.name);
+                    let value = match &data.initializer {
+                        None => self.types.boolean_literal(true),
+                        Some(JsxAttributeInitializer::String(_)) => self.types.string(),
+                        Some(JsxAttributeInitializer::Expression(container)) => {
+                            match &container.data().expression {
+                                Some(expression) => {
+                                    demand_ready!(self.type_of_expr(expression, context))
+                                }
+                                None => self.types.any(),
+                            }
+                        }
+                    };
+                    for branch in &mut variants {
+                        upsert_property(
+                            &mut branch.properties,
+                            PropertyType::new(name.clone(), false, value),
+                        );
+                    }
+                }
+                JsxAttributeItem::Spread(spread) => {
+                    let spread_type =
+                        demand_ready!(self.type_of_expr(&spread.data().expression, context));
+                    let Some(branches) = self.jsx_spread_branches(spread_type) else {
+                        has_opaque_spread = true;
+                        continue;
+                    };
+                    variants = variants
+                        .iter()
+                        .flat_map(|variant| {
+                            branches.iter().map(|branch| variant.merged_with(branch))
+                        })
+                        .collect();
+                }
+            }
+        }
+        let children_target =
+            target.and_then(|target| self.types.property_type(target, "children"));
+        if let Some(children_type) =
+            demand_ready!(self.infer_jsx_children(children, children_target, context))
+        {
+            for branch in &mut variants {
+                upsert_property(
+                    &mut branch.properties,
+                    PropertyType::new("children", false, children_type),
+                );
+            }
+        }
+        if has_opaque_spread {
+            // A truly opaque spread operand could carry every remaining
+            // member, so no typed answer exists to keep: the merged props
+            // object stays unchecked as a whole.
+            return Ok(DemandPoll::Ready(self.types.any()));
+        }
+        let props = if variants.len() == 1 {
+            jsx_props_object(self, variants.remove(0))
+        } else {
+            let branch_types: Vec<TypeId> = variants
+                .into_iter()
+                .map(|branch| jsx_props_object(self, branch))
+                .collect();
+            self.types.union(&branch_types)
+        };
+        Ok(DemandPoll::Ready(props))
+    }
+
+    /// Infers every child, returning the union of all non-whitespace child
+    /// types; whitespace-only text contributes nothing. `target` contextually
+    /// types only `{expr}` containers, matching what [`Self::infer_jsx_props`]
+    /// passes; spreads and nested elements are typed context-free. Nested
+    /// JSX dispatches through the ordinary `type_of_expr` path, so it commits
+    /// its own outcome without a JSX-specific recursive matcher here.
+    pub(crate) fn infer_jsx_children(
+        &mut self,
+        children: &'src [JsxChild],
+        target: Option<TypeId>,
+        context: SlotContext,
+    ) -> DemandResult<Option<TypeId>> {
+        let mut child_types: Vec<TypeId> = Vec::new();
+        for child in children {
+            match child {
+                JsxChild::Text(text) => {
+                    if self.text(text.data().token()).trim().is_empty() {
+                        continue;
+                    }
+                    child_types.push(self.types.string());
+                }
+                JsxChild::ExpressionContainer(container) => {
+                    if let Some(expression) = &container.data().expression {
+                        let value = match target {
+                            Some(target) => {
+                                demand_ready!(
+                                    self.type_of_expr_with_target(expression, target, context)
+                                )
+                            }
+                            None => demand_ready!(self.type_of_expr(expression, context)),
+                        };
+                        child_types.push(value);
+                    }
+                }
+                JsxChild::Spread(spread) => {
+                    let spread_type =
+                        demand_ready!(self.type_of_expr(&spread.data().expression, context));
+                    child_types.push(self.jsx_spread_child_element(spread_type));
+                }
+                JsxChild::Element(expression) => {
+                    child_types.push(demand_ready!(self.type_of_expr(expression, context)));
+                }
+            }
+        }
+        let union = if child_types.is_empty() {
+            None
+        } else {
+            Some(self.types.union(&child_types))
+        };
+        Ok(DemandPoll::Ready(union))
+    }
+
+    // -- spread operand typing --------------------------------------------------
+
+    /// Resolves a spread operand's type-parameter head to its constraint, so
+    /// spreading `T` reads the shape `T` is known to carry. A cyclic
+    /// constraint chain stops at the repeated head and falls through to the
+    /// structural views.
+    fn jsx_spread_constraint_view(&self, spread_type: TypeId) -> TypeId {
+        let mut current = spread_type;
+        let mut seen: Vec<TypeId> = Vec::new();
+        loop {
+            if seen.contains(&current) {
+                return current;
+            }
+            let constraint = match self.types.get(current) {
+                Type::Named(symbol) => self.types.type_parameter_constraint(*symbol),
+                _ => None,
+            };
+            let Some(constraint) = constraint else {
+                return current;
+            };
+            seen.push(current);
+            current = constraint;
+        }
+    }
+
+    /// Maps [`Self::jsx_spread_branches`] over `members` in source order,
+    /// failing the whole spread on the first opaque constituent.
+    fn jsx_spread_member_branches(&mut self, members: &[TypeId]) -> Option<Vec<JsxSpreadBranch>> {
+        let mut branches = Vec::new();
+        for member in members {
+            branches.extend(self.jsx_spread_branches(*member)?);
+        }
+        Some(branches)
+    }
+
+    /// Reduces one `{...spread}` operand to the typed members it contributes
+    /// to the props object: one branch per union constituent, each expanded
+    /// through the same views an object-literal spread reads through —
+    /// type-parameter constraints, then the structural views for interface
+    /// heads, `this` constraints, applied aliases, and applied classes.
+    /// Returns `None` only when a constituent is truly opaque
+    /// (`any`/`unknown`/`error`): no member list exists, so the merged props
+    /// object stays unchecked as a whole. A known non-object operand
+    /// contributes one empty branch, exactly like an object-literal spread
+    /// whose operand carries no members.
+    fn jsx_spread_branches(&mut self, spread_type: TypeId) -> Option<Vec<JsxSpreadBranch>> {
+        let spread_type = self.jsx_spread_constraint_view(spread_type);
+        let spread_type = self.types.indexed_access_view(spread_type);
+        match self.types.get(spread_type).clone() {
+            // A truly opaque operand has no member list: nothing about the
+            // merged object is knowable, and one opaque union or
+            // intersection member absorbs its whole spread the same way.
+            Type::Any | Type::Unknown | Type::Error => None,
+            Type::ObjectType(object) => Some(vec![JsxSpreadBranch {
+                properties: object.properties.clone(),
+                index_signatures: object.index_signatures.clone(),
+            }]),
+            Type::Record { key, value } => Some(vec![JsxSpreadBranch {
+                properties: Vec::new(),
+                index_signatures: vec![IndexSignature {
+                    readonly: false,
+                    parameters: vec![FunctionParameter::new("key".to_owned(), key, false, false)],
+                    value_type: value,
+                    declaring_types: Vec::new(),
+                }],
+            }]),
+            Type::Intersection(members) => {
+                let mut merged = JsxSpreadBranch {
+                    properties: Vec::new(),
+                    index_signatures: Vec::new(),
+                };
+                for branch in self.jsx_spread_member_branches(&members)? {
+                    for property in branch.properties {
+                        upsert_property(&mut merged.properties, property);
+                    }
+                    merged.index_signatures.extend(branch.index_signatures);
+                }
+                Some(vec![merged])
+            }
+            Type::Union(members) => self.jsx_spread_member_branches(&members),
+            _ => Some(vec![JsxSpreadBranch {
+                properties: Vec::new(),
+                index_signatures: Vec::new(),
+            }]),
+        }
+    }
+
+    /// Types one `{...spread}` child by what its operand iterates: the union
+    /// of each constituent's iteration element, expanded through the same
+    /// views a props spread reads through. A constituent with a typed
+    /// iteration element (array, tuple) contributes it; a known non-iterable
+    /// contributes itself, so the children union still says what the operand
+    /// could add; only a truly opaque (`any`/`unknown`/`error`) constituent
+    /// contributes `any`, because no element type exists to keep.
+    fn jsx_spread_child_element(&mut self, spread_type: TypeId) -> TypeId {
+        let spread_type = self.jsx_spread_constraint_view(spread_type);
+        let spread_type = self.types.indexed_access_view(spread_type);
+        match self.types.get(spread_type).clone() {
+            Type::Union(members) => {
+                let elements: Vec<TypeId> = members
+                    .iter()
+                    .map(|member| self.jsx_spread_child_element(*member))
+                    .collect();
+                self.types.union(&elements)
+            }
+            _ => self
+                .types
+                .array_or_tuple_iteration_element(spread_type)
+                .unwrap_or_else(|| {
+                    if matches!(
+                        self.types.get(spread_type),
+                        Type::Any | Type::Unknown | Type::Error
+                    ) {
+                        self.types.any()
+                    } else {
+                        spread_type
+                    }
+                }),
+        }
+    }
+
+    // -- checking -----------------------------------------------------------------
+
+    /// Checks a balanced JSX element `<name attrs>children</name>`.
     pub(crate) fn check_jsx_element(
         &mut self,
         expression: &'src Expr,
         element: &'src JsxElement,
-        scope: ScopeId,
-    ) -> TypeId {
+        selection: SelectedInput,
+    ) -> Result<(), super::CheckCancelled> {
         let opening = element.opening.data();
-        self.resolve_jsx_attributes(&opening.attributes, scope);
-        let children = self.check_jsx_children(&element.children, scope);
-        let result = self.check_jsx_opening(
+        self.check_jsx_common(
+            expression,
             &opening.name,
             &opening.attributes,
-            children,
-            expression.range(),
-            scope,
-        );
-        self.record_jsx_element_type(expression, scope, result)
+            &element.children,
+            selection,
+        )
     }
 
-    /// Checks a self-closing JSX element `<name attrs />` and returns its
-    /// result type.
+    /// Checks a self-closing JSX element `<name attrs />`.
     pub(crate) fn check_jsx_self_closing_element(
         &mut self,
         expression: &'src Expr,
         element: &'src JsxSelfClosingElement,
-        scope: ScopeId,
-    ) -> TypeId {
-        self.resolve_jsx_attributes(&element.attributes, scope);
-        let result = self.check_jsx_opening(
+        selection: SelectedInput,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_jsx_common(
+            expression,
             &element.name,
             &element.attributes,
-            None,
-            expression.range(),
-            scope,
-        );
-        self.record_jsx_element_type(expression, scope, result)
+            &[],
+            selection,
+        )
     }
 
-    /// Checks a JSX fragment `<>children</>` and returns its result type.
+    /// Checks a JSX fragment `<>children</>`.
     pub(crate) fn check_jsx_fragment(
         &mut self,
         expression: &'src Expr,
         fragment: &'src JsxFragment,
-        scope: ScopeId,
-    ) -> TypeId {
-        let _ = self.check_jsx_children(&fragment.children, scope);
-        self.record_jsx_element_type(expression, scope, None)
+        selection: SelectedInput,
+    ) -> Result<(), super::CheckCancelled> {
+        let context = selection.context;
+        let outcome = ready_demand(self.committed_jsx_outcome(expression, selection))?;
+        for child in &fragment.children {
+            self.check_jsx_child(child, None, context)?;
+        }
+        self.publish_selected_expression(expression, outcome.result())
+    }
+
+    /// Shared element/self-closing-element check path: replays the committed
+    /// [`JsxElementOutcome`], queues at most one diagnostic from it, then
+    /// drives every attribute and child expression through the general
+    /// selected-check traversal exactly once — even on an inference memo hit
+    /// — before publishing the element's result type.
+    fn check_jsx_common(
+        &mut self,
+        expression: &'src Expr,
+        name: &'src JsxElementName,
+        attributes: &'src [JsxAttributeItem],
+        children: &'src [JsxChild],
+        selection: SelectedInput,
+    ) -> Result<(), super::CheckCancelled> {
+        let context = selection.context;
+        let outcome = ready_demand(self.committed_jsx_outcome(expression, selection))?;
+        self.complete_jsx_tag_references(name, context)?;
+        let order = self.diagnostic_order(expression.id());
+        // The outcome's props declaration type drives attribute-name anchor
+        // recording below; fragment and degraded outcomes have none.
+        let props_target = match &outcome {
+            JsxElementOutcome::Intrinsic { target, .. } => *target,
+            JsxElementOutcome::Value { props_target, .. } => *props_target,
+            JsxElementOutcome::Fragment { .. } | JsxElementOutcome::Degraded { .. } => None,
+        };
+        match outcome {
+            JsxElementOutcome::Intrinsic {
+                props,
+                target: Some(target),
+                tag_range,
+                ..
+            } => self.check_jsx_props_assignable(tag_range, props, target, order)?,
+            JsxElementOutcome::Intrinsic {
+                target: None,
+                tag_range,
+                ..
+            } => {
+                self.queue_diagnostic(
+                    Diagnostic::error(
+                        JSX_INTRINSIC_ELEMENT_NOT_FOUND,
+                        self.source.source_id(),
+                        tag_range,
+                        JSX_INTRINSIC_ELEMENT_NOT_FOUND_MESSAGE,
+                    ),
+                    order,
+                    true,
+                )?;
+            }
+            JsxElementOutcome::Value {
+                props,
+                props_target: Some(target),
+                tag_range,
+                ..
+            } => self.check_jsx_props_assignable(tag_range, props, target, order)?,
+            JsxElementOutcome::Value {
+                props_target: None, ..
+            }
+            | JsxElementOutcome::Fragment { .. } => {}
+            JsxElementOutcome::Degraded {
+                reason: JsxDegradation::NotCallable,
+                tag_range,
+                ..
+            } => {
+                self.queue_diagnostic(
+                    Diagnostic::error(
+                        JSX_ELEMENT_TYPE_NOT_CALLABLE,
+                        self.source.source_id(),
+                        tag_range,
+                        JSX_ELEMENT_TYPE_NOT_CALLABLE_MESSAGE,
+                    ),
+                    order,
+                    true,
+                )?;
+            }
+            JsxElementOutcome::Degraded {
+                reason: JsxDegradation::TagUnresolved,
+                tag_range,
+                ..
+            } => {
+                // Inference stays pure, so the unresolved-tag degradation is
+                // republished here as the cannot-find-name diagnostic the
+                // tag's reference completion would have raised — once, in
+                // source order, from the committed outcome rather than a
+                // re-resolution.
+                if !self.suppresses_unresolved_value(context.scope) {
+                    self.queue_diagnostic(
+                        Diagnostic::error(
+                            CANNOT_FIND_NAME,
+                            self.source.source_id(),
+                            tag_range,
+                            CANNOT_FIND_NAME_MESSAGE,
+                        ),
+                        order,
+                        true,
+                    )?;
+                }
+            }
+            JsxElementOutcome::Degraded {
+                reason: JsxDegradation::OpaqueCallee,
+                ..
+            } => {}
+        }
+        for attribute in attributes {
+            self.check_jsx_attribute(attribute, props_target, context)?;
+        }
+        let children_target = match outcome {
+            JsxElementOutcome::Intrinsic { target, .. } => {
+                target.and_then(|target| self.types.property_type(target, "children"))
+            }
+            _ => None,
+        };
+        for child in children {
+            self.check_jsx_child(child, children_target, context)?;
+        }
+        self.publish_selected_expression(expression, outcome.result())
+    }
+
+    /// Completes the reference event reserved at Stage-A for the tag's root
+    /// identifier, so a qualified `UI.Button` (and a plain `Comp`) receive
+    /// source-ordered typed reference completion like any other identifier
+    /// expression. Intrinsic tags and the `.property` steps of a dotted chain
+    /// are structural, not lexical references, so they complete nothing here.
+    fn complete_jsx_tag_references(
+        &mut self,
+        name: &'src JsxElementName,
+        context: SlotContext,
+    ) -> Result<(), super::CheckCancelled> {
+        match name {
+            JsxElementName::Identifier(identifier) => {
+                if is_intrinsic_tag(&self.identifier_text(identifier)) {
+                    return Ok(());
+                }
+                let text = self.identifier_text(identifier).into_owned();
+                let target = self.lookup_value(context.scope, &text);
+                self.complete_jsx_reference(identifier.id(), target)
+            }
+            JsxElementName::Member(member) => {
+                self.complete_jsx_tag_references(&member.object, context)
+            }
+            JsxElementName::Namespace(_) => Ok(()),
+        }
+    }
+
+    fn complete_jsx_reference(
+        &mut self,
+        node: NodeId,
+        target: Option<SymbolId>,
+    ) -> Result<(), super::CheckCancelled> {
+        match self.reference_sequence(node) {
+            Some(sequence) => self.complete_reference_event(sequence, target, None),
+            None => Ok(()),
+        }
+    }
+
+    /// Checks the synthesized props object against the element's expected
+    /// props type. Opaque targets absorb everything.
+    fn check_jsx_props_assignable(
+        &mut self,
+        range: TextRange,
+        props: TypeId,
+        target: TypeId,
+        order: PublicationOrder,
+    ) -> Result<(), super::CheckCancelled> {
+        if matches!(
+            self.types.get(target),
+            Type::Any | Type::Unknown | Type::Error
+        ) {
+            return Ok(());
+        }
+        if !self.types.assignable(props, target) {
+            self.queue_diagnostic(
+                Diagnostic::error(
+                    JSX_ATTRIBUTES_NOT_ASSIGNABLE,
+                    self.source.source_id(),
+                    range,
+                    JSX_ATTRIBUTES_NOT_ASSIGNABLE_MESSAGE,
+                ),
+                order,
+                true,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Checks one attribute item's initializer expression and records the
+    /// attribute name as a property anchor against the props declaration
+    /// owner, so rename and quick info treat JSX attribute names like
+    /// ordinary property references. Recording happens in this check phase
+    /// only — inference stays pure — and the attribute loop above iterates
+    /// in source order, so anchors land in source order. The anchor store
+    /// drops names that fail its identifier invariant, which also covers
+    /// namespaced `ns:local` names on both the attribute and declaration
+    /// sides.
+    fn check_jsx_attribute(
+        &mut self,
+        attribute: &'src JsxAttributeItem,
+        props_target: Option<TypeId>,
+        context: SlotContext,
+    ) -> Result<(), super::CheckCancelled> {
+        match attribute {
+            JsxAttributeItem::Attribute(attribute) => {
+                let data = attribute.data();
+                if let Some(JsxAttributeInitializer::Expression(container)) = &data.initializer
+                    && let Some(expression) = &container.data().expression
+                {
+                    self.check_selected_expr(
+                        expression,
+                        SelectedInput {
+                            context,
+                            target: None,
+                        },
+                    )?;
+                }
+                if let JsxAttributeName::Identifier(identifier) = &data.name {
+                    let name = self.identifier_text(identifier).into_owned();
+                    self.record_jsx_attribute_anchor(props_target, &name, identifier.range());
+                }
+            }
+            JsxAttributeItem::Spread(spread) => {
+                self.check_selected_expr(
+                    &spread.data().expression,
+                    SelectedInput {
+                        context,
+                        target: None,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_jsx_child(
+        &mut self,
+        child: &'src JsxChild,
+        target: Option<TypeId>,
+        context: SlotContext,
+    ) -> Result<(), super::CheckCancelled> {
+        match child {
+            JsxChild::Text(_) => {}
+            JsxChild::ExpressionContainer(container) => {
+                if let Some(expression) = &container.data().expression {
+                    self.check_selected_expr(expression, SelectedInput { context, target })?;
+                }
+            }
+            JsxChild::Spread(spread) => {
+                self.check_selected_expr(
+                    &spread.data().expression,
+                    SelectedInput {
+                        context,
+                        target: None,
+                    },
+                )?;
+            }
+            JsxChild::Element(expression) => {
+                self.check_selected_expr(
+                    expression,
+                    SelectedInput {
+                        context,
+                        target: None,
+                    },
+                )?;
+            }
+        }
+        Ok(())
     }
 
     // -- namespace resolution ---------------------------------------------------
@@ -198,540 +1038,99 @@ impl<'src> Binder<'src> {
             None => self.types.any(),
         }
     }
+}
 
-    // -- element classification ---------------------------------------------------
-
-    /// Dispatches an opening tag to intrinsic or value-based checking and
-    /// returns the element's result type when the tag is value-based with a
-    /// known factory return type.
-    fn check_jsx_opening(
-        &mut self,
-        name: &JsxElementName,
-        attributes: &'src [JsxAttributeItem],
-        children: Option<TypeId>,
-        range: TextRange,
-        scope: ScopeId,
-    ) -> Option<TypeId> {
-        match name {
-            JsxElementName::Identifier(identifier)
-                if is_intrinsic_tag(&self.identifier_text(identifier)) =>
-            {
-                self.check_intrinsic_tag(name, attributes, children, range, scope);
-                None
-            }
-            _ => self.check_value_tag(name, attributes, children, range, scope),
-        }
-    }
-
-    /// Checks an intrinsic tag against `JSX.IntrinsicElements`.
-    fn check_intrinsic_tag(
-        &mut self,
-        name: &JsxElementName,
-        attributes: &'src [JsxAttributeItem],
-        children: Option<TypeId>,
-        range: TextRange,
-        scope: ScopeId,
-    ) {
-        let JsxElementName::Identifier(tag) = name else {
-            return;
+/// Selects the first candidate in `signatures` whose parameters accept
+/// `props` (P1: declaration order, first applicable wins), instantiating
+/// each candidate's own generics independently against `props` with a fresh
+/// cancellable inference session before testing assignability. A
+/// zero-parameter candidate always accepts. Falls back to the first
+/// candidate's instantiation when none match, so a real, non-`any` recovery
+/// type is still produced; returns `None` only when `signatures` is empty.
+fn select_jsx_factory_signature(
+    signatures: &[FunctionSignature],
+    props: TypeId,
+    binder: &mut Binder<'_>,
+) -> Option<(Option<TypeId>, TypeId)> {
+    let mut fallback = None;
+    for signature in signatures {
+        let (target, result) = instantiate_jsx_factory_signature(binder, signature, props);
+        let matches = match target {
+            Some(target) => binder.types.assignable(props, target),
+            None => true,
         };
-        let tag_name = self.identifier_text(tag).into_owned();
-        let Some(intrinsics_symbol) = self.jsx_namespace_member(scope, "IntrinsicElements") else {
-            // With no `JSX` namespace, intrinsic checking is inert: JSX has
-            // no ambient meaning on its own.
-            return;
-        };
-        let intrinsics = self.resolve_type_symbol(intrinsics_symbol);
-        let target = self.types.property_type(intrinsics, &tag_name);
-        let Some(target) = target else {
-            self.emit(
-                JSX_INTRINSIC_ELEMENT_NOT_FOUND,
-                tag.range(),
-                JSX_INTRINSIC_ELEMENT_NOT_FOUND_MESSAGE,
-            );
-            return;
-        };
-        let props = self.jsx_props_type(attributes, children, scope);
-        self.check_jsx_props_assignable(range, props, target);
+        if matches {
+            return Some((target, result));
+        }
+        fallback.get_or_insert((target, result));
     }
+    fallback
+}
 
-    /// Checks a value-based tag: resolves the tag value and matches the props
-    /// object against the factory's first parameter, returning the factory's
-    /// return type as the element's result type.
-    fn check_value_tag(
-        &mut self,
-        name: &JsxElementName,
-        attributes: &'src [JsxAttributeItem],
-        children: Option<TypeId>,
-        range: TextRange,
-        scope: ScopeId,
-    ) -> Option<TypeId> {
-        let symbol = self.resolve_jsx_tag_value(name, scope)?;
-        let props = self.jsx_props_type(attributes, children, scope);
-        // A declared factory wins over the symbol's type: function symbols
-        // intentionally keep `any` as their symbol type.
-        if let Some(callable) = self.jsx_callables.get(&symbol).copied() {
-            let declaration_scope = self.symbols[symbol.get() as usize].scope();
-            return Some(self.check_factory_callable(
-                symbol,
-                callable,
-                props,
-                range,
-                declaration_scope,
-            ));
-        }
-        let callee = self.symbol_types[symbol.get() as usize];
-        match self.types.get(callee) {
-            Type::Function(signature) => {
-                let signature = signature.clone();
-                if let Some(target) = signature
-                    .parameters()
-                    .first()
-                    .map(FunctionParameter::type_id)
-                {
-                    self.check_jsx_props_assignable(range, props, target);
-                }
-                Some(signature.return_type())
-            }
-            // An alias may expand to a callable component (function) or an
-            // element/property object shape. Expand the view and re-classify;
-            // a missing in-progress view stays opaque without inventing a
-            // not-callable diagnostic.
-            Type::AppliedAlias { .. } => {
-                if let Some(view) = self.types.prepare_applied_alias_view(callee) {
-                    match self.types.get(view) {
-                        Type::Function(signature) => {
-                            let signature = signature.clone();
-                            if let Some(target) = signature
-                                .parameters()
-                                .first()
-                                .map(FunctionParameter::type_id)
-                            {
-                                self.check_jsx_props_assignable(range, props, target);
-                            }
-                            Some(signature.return_type())
-                        }
-                        Type::Never
-                        | Type::Void
-                        | Type::Null
-                        | Type::Undefined
-                        | Type::Boolean
-                        | Type::Number
-                        | Type::BigInt
-                        | Type::String
-                        | Type::Symbol
-                        | Type::Object
-                        | Type::BooleanLiteral(_)
-                        | Type::NumberLiteral(_)
-                        | Type::StringLiteral(_)
-                        | Type::BigIntLiteral(_)
-                        | Type::Array(_)
-                        | Type::Tuple(_)
-                        | Type::ObjectType(_)
-                        | Type::NumericEnum(_)
-                        | Type::EnumMember { .. } => {
-                            self.emit(
-                                JSX_ELEMENT_TYPE_NOT_CALLABLE,
-                                range,
-                                JSX_ELEMENT_TYPE_NOT_CALLABLE_MESSAGE,
-                            );
-                            None
-                        }
-                        // Expanded alias to an opaque/nominal/union type:
-                        // accepted unchecked (same policy as Named).
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
-            // Opaque recovery types must not cascade; nominal types (classes,
-            // type parameters) have no visible construct/call side in this
-            // type space and are accepted unchecked.
-            Type::Any
-            | Type::Error
-            | Type::Intersection(_)
-            | Type::Unknown
-            | Type::Named(_)
-            | Type::AppliedClass { .. }
-            | Type::ConstructorType { .. }
-            | Type::Keyof(_)
-            | Type::IndexedAccess { .. }
-            | Type::Record { .. }
-            | Type::This { .. }
-            | Type::Union(_) => None,
-            Type::Never
-            | Type::Void
-            | Type::Null
-            | Type::Undefined
-            | Type::Boolean
-            | Type::Number
-            | Type::BigInt
-            | Type::String
-            | Type::Symbol
-            | Type::Object
-            | Type::BooleanLiteral(_)
-            | Type::NumberLiteral(_)
-            | Type::StringLiteral(_)
-            | Type::BigIntLiteral(_)
-            | Type::Array(_)
-            | Type::Tuple(_)
-            | Type::ObjectType(_)
-            | Type::NumericEnum(_)
-            | Type::EnumMember { .. } => {
-                self.emit(
-                    JSX_ELEMENT_TYPE_NOT_CALLABLE,
-                    range,
-                    JSX_ELEMENT_TYPE_NOT_CALLABLE_MESSAGE,
-                );
-                None
-            }
-        }
+/// Instantiates one candidate signature's first-parameter target and return
+/// type against `props`. Non-generic candidates use their declared types
+/// directly; generic candidates infer their type arguments from `props`
+/// exactly as an ordinary call would.
+fn instantiate_jsx_factory_signature(
+    binder: &mut Binder<'_>,
+    signature: &FunctionSignature,
+    props: TypeId,
+) -> (Option<TypeId>, TypeId) {
+    if signature.type_parameters().is_empty() {
+        let target = signature
+            .parameters()
+            .first()
+            .map(FunctionParameter::type_id);
+        return (target, signature.return_type());
     }
-
-    /// Checks a factory recovered from its declaration. Declaration annotations
-    /// resolve once; each JSX use gets a fresh inference context.
-    fn check_factory_callable(
-        &mut self,
-        symbol: SymbolId,
-        callable: JsxCallable<'src>,
-        props: TypeId,
-        range: TextRange,
-        declaration_scope: ScopeId,
-    ) -> TypeId {
-        if !self.jsx_factory_signatures.contains_key(&symbol) {
-            let signature = self.resolve_jsx_factory_signature(callable, declaration_scope);
-            self.jsx_factory_signatures.insert(symbol, signature);
-        }
-
-        let (target, result) = {
-            let signature = self
-                .jsx_factory_signatures
-                .get(&symbol)
-                .expect("JSX factory signature was cached");
-            if signature.inference_parameters.is_empty() {
-                (signature.parameters.first().copied(), signature.return_type)
-            } else {
-                let mut context = InferenceContext::new_with_cancel(
-                    &mut self.types,
-                    &signature.inference_parameters,
-                    self.cancel.clone(),
-                );
-                if let Some(first) = signature.parameters.first().copied() {
-                    context.infer_from_argument(first, props, 0);
-                }
-                let inferred = context.resolve();
-                let target = signature
-                    .parameters
-                    .first()
-                    .copied()
-                    .map(|first| inferred.instantiate(&mut self.types, first));
-                let result = inferred.instantiate(&mut self.types, signature.return_type);
-                (target, result)
+    let inference_parameters: Vec<InferenceParameter> = signature
+        .type_parameters()
+        .iter()
+        .zip(signature.type_parameter_bounds())
+        .map(|(&symbol, bounds)| {
+            let mut parameter = InferenceParameter::new(symbol);
+            if let Some(constraint) = bounds.constraint() {
+                parameter = parameter.with_constraint(constraint);
             }
-        };
-        if let Some(target) = target {
-            self.check_jsx_props_assignable(range, props, target);
-        }
-        result
+            if let Some(default) = bounds.default() {
+                parameter = parameter.with_default(default);
+            }
+            parameter
+        })
+        .collect();
+    let mut context = InferenceContext::new_with_cancel(
+        &mut binder.types,
+        &inference_parameters,
+        binder.cancel.clone(),
+    );
+    let first = signature
+        .parameters()
+        .first()
+        .map(FunctionParameter::type_id);
+    if let Some(first) = first {
+        context.infer_from_argument(first, props, 0);
     }
+    let inferred = context.resolve();
+    let target = first.map(|first| inferred.instantiate(&mut binder.types, first));
+    let result = inferred.instantiate(&mut binder.types, signature.return_type());
+    (target, result)
+}
 
-    fn resolve_jsx_factory_signature(
-        &mut self,
-        callable: JsxCallable<'src>,
-        declaration_scope: ScopeId,
-    ) -> JsxFactorySignature {
-        let (type_parameters, parameters, return_type) = callable.parts();
-        let type_parameters = type_parameters.filter(|list| !list.parameters.is_empty());
-        let scope = match type_parameters {
-            Some(list) => {
-                let scope = self.new_scope(ScopeKind::Function, Some(declaration_scope));
-                self.bind_type_parameters(Some(list), scope);
-                scope
-            }
-            None => declaration_scope,
-        };
-        let parameters = parameters
-            .iter()
-            .map(|parameter| match &parameter.data().type_annotation {
-                Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
-                None => self.types.any(),
-            })
-            .collect();
-        let return_type = match return_type {
-            Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
-            None => self.types.any(),
-        };
-        let inference_parameters = type_parameters.map_or_else(Vec::new, |list| {
-            let mut resolved = Vec::with_capacity(list.parameters.len());
-            for parameter in &list.parameters {
-                let data = parameter.data();
-                let name = self.identifier_text(&data.name).into_owned();
-                let Some(symbol) = self.scopes[scope.get() as usize].type_binding(&name) else {
-                    self.emit(
-                        CANNOT_FIND_NAME,
-                        data.name.range(),
-                        CANNOT_FIND_NAME_MESSAGE,
-                    );
-                    continue;
-                };
-                let mut inference_parameter = InferenceParameter::new(symbol);
-                if let Some(constraint) = &data.constraint {
-                    inference_parameter =
-                        inference_parameter.with_constraint(self.resolve_type(constraint, scope));
-                }
-                if let Some(default) = &data.default {
-                    inference_parameter =
-                        inference_parameter.with_default(self.resolve_type(default, scope));
-                }
-                resolved.push(inference_parameter);
-            }
-            resolved
-        });
-        JsxFactorySignature {
-            inference_parameters,
-            parameters,
-            return_type,
+/// Unwraps a demand result that selected checking guarantees is `Ready`: the
+/// driver only dispatches selected checking after every frame dependency has
+/// settled, so `Pending`/`Limited` here would be an internal scheduler
+/// invariant violation, not a recoverable state. The JSX check path applies
+/// this to the binder's already-driven
+/// [`Binder::committed_jsx_outcome`] retrieval as well — the scheduler has
+/// settled the expression before replay — and the binder's own demand
+/// commit guarantees the retrieved outcome cache is `Some` for any
+/// completed JSX expression.
+fn ready_demand<T>(result: DemandResult<T>) -> Result<T, super::CheckCancelled> {
+    match result? {
+        DemandPoll::Ready(value) => Ok(value),
+        DemandPoll::Pending(_) | DemandPoll::Limited { .. } => {
+            unreachable!("selected checking only runs after all frame dependencies settle")
         }
-    }
-
-    /// Resolves a JSX tag name through the value namespace, following dotted
-    /// member chains through container scopes and registering `references`
-    /// entries like ordinary identifier resolution.
-    fn resolve_jsx_tag_value(&mut self, name: &JsxElementName, scope: ScopeId) -> Option<SymbolId> {
-        match name {
-            JsxElementName::Identifier(identifier) => {
-                let text = self.identifier_text(identifier).into_owned();
-                match self.lookup_value(scope, &text) {
-                    Some(symbol) => {
-                        self.references.insert(identifier.id(), symbol);
-                        Some(symbol)
-                    }
-                    None => {
-                        if !self.suppresses_unresolved_value(scope) {
-                            self.emit(
-                                CANNOT_FIND_NAME,
-                                identifier.range(),
-                                CANNOT_FIND_NAME_MESSAGE,
-                            );
-                        }
-                        None
-                    }
-                }
-            }
-            JsxElementName::Member(member) => {
-                let object = self.resolve_jsx_tag_value(&member.object, scope)?;
-                self.resolve_tag_member(object, &member.property)
-            }
-            JsxElementName::Namespace(namespaced) => {
-                let text = self.identifier_text(&namespaced.namespace).into_owned();
-                let Some(namespace) = self.lookup_value(scope, &text) else {
-                    if !self.suppresses_unresolved_value(scope) {
-                        self.emit(
-                            CANNOT_FIND_NAME,
-                            namespaced.namespace.range(),
-                            CANNOT_FIND_NAME_MESSAGE,
-                        );
-                    }
-                    return None;
-                };
-                self.resolve_tag_member(namespace, &namespaced.name)
-            }
-        }
-    }
-
-    /// Resolves one member step of a dotted tag through the container's
-    /// member scope. A missing container scope is recovery, not an error.
-    fn resolve_tag_member(
-        &mut self,
-        container: SymbolId,
-        property: &crate::syntax::IdentifierNode,
-    ) -> Option<SymbolId> {
-        let member_scope = self.container_member_scope(container)?;
-        let text = self.identifier_text(property).into_owned();
-        match self.scopes[member_scope.get() as usize].value(&text) {
-            Some(symbol) => {
-                self.references.insert(property.id(), symbol);
-                Some(symbol)
-            }
-            None => {
-                self.emit(CANNOT_FIND_NAME, property.range(), CANNOT_FIND_NAME_MESSAGE);
-                None
-            }
-        }
-    }
-
-    // -- props synthesis ---------------------------------------------------------
-
-    /// Resolves every attribute value expression so reference and type
-    /// information exists before props synthesis.
-    fn resolve_jsx_attributes(&mut self, attributes: &'src [JsxAttributeItem], scope: ScopeId) {
-        for attribute in attributes {
-            match attribute {
-                JsxAttributeItem::Attribute(attribute) => {
-                    if let Some(crate::syntax::JsxAttributeInitializer::Expression(container)) =
-                        &attribute.data().initializer
-                        && let Some(expression) = &container.data().expression
-                    {
-                        self.resolve_expr(expression, scope);
-                    }
-                }
-                JsxAttributeItem::Spread(spread) => {
-                    self.resolve_expr(&spread.data().expression, scope);
-                }
-            }
-        }
-    }
-
-    /// Folds the attribute list and children into one structural props type.
-    /// Spread members merge in source order; later members win.
-    fn jsx_props_type(
-        &mut self,
-        attributes: &'src [JsxAttributeItem],
-        children: Option<TypeId>,
-        scope: ScopeId,
-    ) -> TypeId {
-        let mut properties: Vec<PropertyType> = Vec::new();
-        let mut has_opaque_spread = false;
-        for attribute in attributes {
-            match attribute {
-                JsxAttributeItem::Attribute(attribute) => {
-                    let data = attribute.data();
-                    let Some(name) = jsx_attribute_key(self, &data.name) else {
-                        continue;
-                    };
-                    let value = match &data.initializer {
-                        None => self.types.boolean_literal(true),
-                        Some(crate::syntax::JsxAttributeInitializer::String(_)) => {
-                            self.types.string()
-                        }
-                        Some(crate::syntax::JsxAttributeInitializer::Expression(container)) => {
-                            match &container.data().expression {
-                                Some(expression) => self.type_of_expr(expression, scope),
-                                None => self.types.any(),
-                            }
-                        }
-                    };
-                    upsert_property(&mut properties, PropertyType::new(name, false, value));
-                }
-                JsxAttributeItem::Spread(spread) => {
-                    let spread_type = self.type_of_expr(&spread.data().expression, scope);
-                    if let Type::ObjectType(object) = self.types.get(spread_type) {
-                        let spread_properties = object.properties.clone();
-                        for property in spread_properties {
-                            upsert_property(&mut properties, property);
-                        }
-                    } else {
-                        has_opaque_spread = true;
-                    }
-                }
-            }
-        }
-        if let Some(children) = children {
-            upsert_property(
-                &mut properties,
-                PropertyType::new("children", false, children),
-            );
-        }
-        if has_opaque_spread {
-            self.types.any()
-        } else {
-            self.types.object_type(properties)
-        }
-    }
-
-    /// Checks the synthesized props object against the element's expected
-    /// props type. Opaque targets absorb everything.
-    fn check_jsx_props_assignable(&mut self, range: TextRange, props: TypeId, target: TypeId) {
-        if matches!(
-            self.types.get(target),
-            Type::Any | Type::Unknown | Type::Error
-        ) {
-            return;
-        }
-        if !self.types.assignable(props, target) {
-            self.emit(
-                JSX_ATTRIBUTES_NOT_ASSIGNABLE,
-                range,
-                JSX_ATTRIBUTES_NOT_ASSIGNABLE_MESSAGE,
-            );
-        }
-    }
-
-    // -- children -------------------------------------------------------------------
-
-    /// Resolves every child, checking nested elements recursively, and
-    /// returns the union of all non-whitespace child types. Whitespace-only
-    /// text contributes nothing.
-    fn check_jsx_children(&mut self, children: &'src [JsxChild], scope: ScopeId) -> Option<TypeId> {
-        let mut child_types: Vec<TypeId> = Vec::new();
-        for child in children {
-            match child {
-                JsxChild::Text(text) => {
-                    let raw = self.text(text.data().token());
-                    if raw.trim().is_empty() {
-                        continue;
-                    }
-                    child_types.push(self.types.string());
-                }
-                JsxChild::ExpressionContainer(container) => {
-                    if let Some(expression) = &container.data().expression {
-                        self.resolve_expr(expression, scope);
-                        child_types.push(self.type_of_expr(expression, scope));
-                    }
-                }
-                JsxChild::Spread(spread) => {
-                    self.resolve_expr(&spread.data().expression, scope);
-                    let spread_type = self.type_of_expr(&spread.data().expression, scope);
-                    let child_type = match self.types.get(spread_type) {
-                        Type::Array(element) => *element,
-                        _ => self.types.any(),
-                    };
-                    child_types.push(child_type);
-                }
-                JsxChild::Element(expression) => {
-                    child_types.push(self.check_jsx_nested(expression, scope));
-                }
-            }
-        }
-        if child_types.is_empty() {
-            None
-        } else {
-            Some(self.types.union(&child_types))
-        }
-    }
-
-    /// Checks one nested JSX child expression, returning its result type.
-    fn check_jsx_nested(&mut self, expression: &'src Expr, scope: ScopeId) -> TypeId {
-        match expression.data() {
-            Expression::JsxElement(element) => self.check_jsx_element(expression, element, scope),
-            Expression::JsxSelfClosingElement(element) => {
-                self.check_jsx_self_closing_element(expression, element, scope)
-            }
-            Expression::JsxFragment(fragment) => {
-                self.check_jsx_fragment(expression, fragment, scope)
-            }
-            _ => {
-                self.resolve_expr(expression, scope);
-                self.type_of_expr(expression, scope)
-            }
-        }
-    }
-
-    /// Records the element's result type, defaulting to `JSX.Element` when
-    /// the tag did not yield a factory return type.
-    fn record_jsx_element_type(
-        &mut self,
-        expression: &'src Expr,
-        scope: ScopeId,
-        result: Option<TypeId>,
-    ) -> TypeId {
-        let element_type = match result {
-            Some(result) => result,
-            None => self.jsx_element_type(scope),
-        };
-        self.jsx_element_types.insert(expression.id(), element_type);
-        element_type
     }
 }
 
@@ -743,17 +1142,20 @@ fn is_intrinsic_tag(tag: &str) -> bool {
 }
 
 /// Returns the props member key for an attribute name. Namespaced attribute
-/// names (`xml:lang`) have no props-type key in this type space and are
-/// accepted unchecked.
-fn jsx_attribute_key(binder: &Binder<'_>, name: &JsxAttributeName) -> Option<String> {
+/// names (`xml:lang`) follow the desugar contract's spelling: the quoted
+/// string key `"ns:local"` over the full name span, so a props target
+/// declaring that member checks the attribute instead of silently skipping
+/// a supported label.
+fn jsx_attribute_key(binder: &Binder<'_>, name: &JsxAttributeName) -> String {
     match name {
-        JsxAttributeName::Identifier(identifier) => {
-            Some(binder.identifier_text(identifier).into_owned())
-        }
-        JsxAttributeName::Namespace(_) => None,
+        JsxAttributeName::Identifier(identifier) => binder.identifier_text(identifier).into_owned(),
+        JsxAttributeName::Namespace(namespaced) => format!(
+            "{}:{}",
+            binder.identifier_text(&namespaced.namespace),
+            binder.identifier_text(&namespaced.name)
+        ),
     }
 }
-
 /// Inserts `property` into `properties`, replacing any earlier member with
 /// the same name so later attributes and spreads win in source order.
 fn upsert_property(properties: &mut Vec<PropertyType>, property: PropertyType) {
@@ -764,6 +1166,62 @@ fn upsert_property(properties: &mut Vec<PropertyType>, property: PropertyType) {
         *existing = property;
     } else {
         properties.push(property);
+    }
+}
+/// One demand-reduced `{...spread}` contribution: the property members and
+/// index signatures a single branch of the spread operand supplies.
+struct JsxSpreadBranch {
+    properties: Vec<PropertyType>,
+    index_signatures: Vec<IndexSignature>,
+}
+
+impl JsxSpreadBranch {
+    /// Merges one branch's members behind `self`, later members winning in
+    /// source order.
+    fn merged_with(&self, branch: &Self) -> Self {
+        let mut properties = self.properties.clone();
+        for property in &branch.properties {
+            upsert_property(&mut properties, property.clone());
+        }
+        let mut index_signatures = self.index_signatures.clone();
+        index_signatures.extend(branch.index_signatures.iter().cloned());
+        Self {
+            properties,
+            index_signatures,
+        }
+    }
+}
+
+/// Interns one props branch as its structural object type.
+fn jsx_props_object(binder: &mut Binder<'_>, branch: JsxSpreadBranch) -> TypeId {
+    binder.types.object_type_with_members(ObjectType {
+        properties: branch.properties,
+        call_signatures: Vec::new(),
+        call_candidate_order: Vec::new(),
+        construct_signatures: Vec::new(),
+        index_signatures: branch.index_signatures,
+        generator_return: None,
+        iterator_property: None,
+        async_iterator_property: None,
+    })
+}
+
+/// The source span anchoring diagnostics for a JSX tag name: the identifier
+/// itself, or the full dotted/namespaced span for member and namespaced
+/// names.
+fn jsx_element_name_range(name: &JsxElementName) -> TextRange {
+    match name {
+        JsxElementName::Identifier(identifier) => identifier.range(),
+        JsxElementName::Namespace(namespaced) => TextRange::new(
+            namespaced.namespace.range().start(),
+            namespaced.name.range().end(),
+        )
+        .unwrap_or_else(|_| namespaced.name.range()),
+        JsxElementName::Member(member) => {
+            let start = jsx_element_name_range(&member.object).start();
+            TextRange::new(start, member.property.range().end())
+                .unwrap_or_else(|_| member.property.range())
+        }
     }
 }
 

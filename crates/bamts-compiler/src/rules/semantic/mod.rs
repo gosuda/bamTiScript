@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::{
     checker::{
         AnalysisFacts, HazardFact, ProgramSemanticModel, ResolvedModuleEdge, SemanticHazard,
-        SemanticModel, SymbolKind, is_numeric_enum_initializer,
+        SemanticModel, SymbolKind, is_numeric_enum_initializer, relations::TypeRelations,
     },
     diagnostic::{Diagnostic, Recovered},
     lint::{LintTable, SourceDialect, rule_by_code},
@@ -867,6 +867,7 @@ impl<'a> AstFactCollector<'a> {
             .and_then(|base| self.classes.get(base))
             .cloned();
         let mut accessor_types = HashMap::new();
+        let relations = TypeRelations::new(self.model.types());
         for member in &class.members {
             match member.data() {
                 ClassMember::Constructor(constructor) => {
@@ -900,8 +901,8 @@ impl<'a> AstFactCollector<'a> {
                                 })
                                 .unwrap_or_else(|| self.model.types().any());
                             let key = (method.modifiers.is_static, name);
-                            if let Some(previous) = accessor_types.get(&key)
-                                && previous != &current
+                            if let Some(&previous) = accessor_types.get(&key)
+                                && !relations.equivalent(previous, current)
                             {
                                 self.push(SemanticHazard::DivergentAccessor, member.range());
                             }

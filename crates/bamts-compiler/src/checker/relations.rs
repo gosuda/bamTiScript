@@ -2551,42 +2551,35 @@ impl<'table> TypeRelations<'table> {
         self.signature_relates(source, target, strictness, ParameterVariance::Contravariant)
     }
 
+    /// Bivariant method-overload comparison over the order-insensitive
+    /// overload view: every target overload must be covered by some source
+    /// overload. Types outside the pure-callable view — mixed objects,
+    /// constructor-bearing objects, intersections with non-callable
+    /// members — yield `None` on either side, so this returns false and the
+    /// structural relation path handles them with the ordinary
+    /// contravariant callable rules. Candidate ordering is never inspected.
     fn method_overloads_relate(
         &self,
         source: TypeId,
         target: TypeId,
         strictness: Strictness,
     ) -> bool {
-        match self.table.get(target) {
-            Type::Function(_) => self.method_target_overload_relates(source, target, strictness),
-            Type::Intersection(targets) => targets
-                .iter()
-                .all(|target| self.method_target_overload_relates(source, *target, strictness)),
-            _ => false,
-        }
-    }
-
-    fn method_target_overload_relates(
-        &self,
-        source: TypeId,
-        target: TypeId,
-        strictness: Strictness,
-    ) -> bool {
-        let Type::Function(target_signature) = self.table.get(target) else {
+        let Some(target_signatures) = self.table.overload_signatures(target) else {
             return false;
         };
-        match self.table.get(source) {
-            Type::Function(source_signature) => self.signature_relates(
-                source_signature,
-                target_signature,
-                strictness,
-                ParameterVariance::Bivariant,
-            ),
-            Type::Intersection(sources) => sources
-                .iter()
-                .any(|source| self.method_target_overload_relates(*source, target, strictness)),
-            _ => false,
-        }
+        let Some(source_signatures) = self.table.overload_signatures(source) else {
+            return false;
+        };
+        target_signatures.iter().all(|target_signature| {
+            source_signatures.iter().any(|source_signature| {
+                self.signature_relates(
+                    source_signature,
+                    target_signature,
+                    strictness,
+                    ParameterVariance::Bivariant,
+                )
+            })
+        })
     }
 
     fn signature_relates(
@@ -3014,6 +3007,171 @@ mod tests {
         assert!(!relations.assignable(missing, target));
         assert!(relations.assignable(full, target));
         assert!(!relations.assignable(bad_return_source, literal_return_target));
+    }
+
+    /// Builds a pure callable object type from call signatures.
+    fn callable_object(table: &mut TypeTable, call_signatures: Vec<FunctionSignature>) -> TypeId {
+        table.object_type_with_members(ObjectType {
+            properties: Vec::new(),
+            call_signatures,
+            call_candidate_order: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        })
+    }
+
+    /// Extracts the signature of an interned function type.
+    fn signature_of(table: &TypeTable, id: TypeId) -> FunctionSignature {
+        match table.get(id) {
+            Type::Function(signature) => signature.clone(),
+            _ => panic!("helper requires a function type"),
+        }
+    }
+
+    /// Wraps a type as a method property of an object type.
+    fn as_method(table: &mut TypeTable, type_id: TypeId) -> TypeId {
+        table.object_type(vec![
+            PropertyType::new("accept", false, type_id).with_method(true),
+        ])
+    }
+
+    #[test]
+    fn pure_callable_object_methods_are_bivariant() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let literal = table.number_literal("1");
+        let void = table.void();
+        let narrow_function = table.function(vec![literal], void);
+        let broad_function = table.function(vec![number], void);
+        let narrow_signature = signature_of(&table, narrow_function);
+        let broad_signature = signature_of(&table, broad_function);
+        let narrow = callable_object(&mut table, vec![narrow_signature]);
+        let broad = callable_object(&mut table, vec![broad_signature]);
+        let narrow_method = as_method(&mut table, narrow);
+        let broad_method = as_method(&mut table, broad);
+        let relations = TypeRelations::new(&table);
+
+        // Method properties flatten through the view and relate bivariantly.
+        assert!(relations.assignable(narrow_method, broad_method));
+        assert!(relations.assignable(broad_method, narrow_method));
+        // Ordinary callable objects keep plain contravariance.
+        assert!(!relations.assignable(narrow, broad));
+        assert!(relations.assignable(broad, narrow));
+    }
+
+    #[test]
+    fn pure_callable_object_methods_require_target_coverage_and_covariant_returns() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let string = table.string();
+        let literal = table.number_literal("1");
+        let void = table.void();
+        let number_function = table.function(vec![number], void);
+        let string_function = table.function(vec![string], void);
+        let literal_function = table.function(vec![literal], void);
+        let number_return_function = table.function(vec![number], number);
+        let literal_return_function = table.function(vec![literal], literal);
+        let number_signature = signature_of(&table, number_function);
+        let string_signature = signature_of(&table, string_function);
+        let literal_signature = signature_of(&table, literal_function);
+        let number_return = signature_of(&table, number_return_function);
+        let literal_return = signature_of(&table, literal_return_function);
+        let full_source = callable_object(
+            &mut table,
+            vec![number_signature.clone(), string_signature.clone()],
+        );
+        let missing_source = callable_object(&mut table, vec![number_signature.clone()]);
+        let target_overloads =
+            callable_object(&mut table, vec![literal_signature, string_signature]);
+        let bad_return_source = callable_object(&mut table, vec![number_return]);
+        let literal_return_target = callable_object(&mut table, vec![literal_return]);
+        let missing = as_method(&mut table, missing_source);
+        let full = as_method(&mut table, full_source);
+        let target = as_method(&mut table, target_overloads);
+        let bad_return = as_method(&mut table, bad_return_source);
+        let literal_returns = as_method(&mut table, literal_return_target);
+        let relations = TypeRelations::new(&table);
+
+        assert!(!relations.assignable(missing, target));
+        assert!(relations.assignable(full, target));
+        assert!(!relations.assignable(bad_return, literal_returns));
+    }
+
+    #[test]
+    fn mixed_callable_method_properties_do_not_take_the_overload_path() {
+        let mut table = TypeTable::new();
+        let string = table.string();
+        let word = table.string_literal("s");
+        let void = table.void();
+        let string_function = table.function(vec![string], void);
+        let word_function = table.function(vec![word], void);
+        let string_signature = signature_of(&table, string_function);
+        // `{ (x: string) => void; extra: string }` is a mixed callable, so
+        // the overload view is `None` for it.
+        let mixed = table.object_type_with_members(ObjectType {
+            properties: vec![PropertyType::new("extra", false, string)],
+            call_signatures: vec![string_signature],
+            call_candidate_order: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        });
+        let mixed_method = as_method(&mut table, mixed);
+        let word_method = as_method(&mut table, word_function);
+        let relations = TypeRelations::new(&table);
+
+        // Mixed source still relates structurally: its call signature
+        // accepts the target's argument contravariantly.
+        assert!(relations.assignable(mixed_method, word_method));
+        // The bivariant-only direction must not flow through the mixed
+        // object: the structural path rejects the required `extra` member
+        // and the overload view is `None`.
+        assert!(!relations.assignable(word_method, mixed_method));
+    }
+
+    #[test]
+    fn intersection_embedded_pure_group_flattens_through_the_view() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let boolean = table.boolean();
+        let word = table.string_literal("s");
+        let void = table.void();
+        let number_function = table.function(vec![number], void);
+        let word_function = table.function(vec![word], void);
+        let boolean_function = table.function(vec![boolean], void);
+        let number_signature = signature_of(&table, number_function);
+        let word_signature = signature_of(&table, word_function);
+        let boolean_signature = signature_of(&table, boolean_function);
+        // A pure callable group with a non-identity candidate order embeds
+        // next to a plain function member.
+        let group = callable_object(
+            &mut table,
+            vec![number_signature.clone(), word_signature.clone()],
+        );
+        let ordered = table.with_call_candidate_order(group, vec![1, 0]);
+        let with_function = table.intersection_ordered(vec![ordered, boolean_function]);
+        let without_function = table.intersection_ordered(vec![ordered, word_function]);
+        let target_all = callable_object(
+            &mut table,
+            vec![boolean_signature, word_signature, number_signature],
+        );
+        let with = as_method(&mut table, with_function);
+        let without = as_method(&mut table, without_function);
+        let target = as_method(&mut table, target_all);
+        let relations = TypeRelations::new(&table);
+
+        // The group and the function member both flatten into the view in
+        // declaration order, so the boolean overload is covered through the
+        // bivariant method path while the structural intersection path
+        // drops the function member and fails.
+        assert!(relations.assignable(with, target));
+        // Without the function member the boolean overload is uncovered.
+        assert!(!relations.assignable(without, target));
     }
 
     #[test]
