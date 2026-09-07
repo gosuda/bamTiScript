@@ -6772,7 +6772,7 @@ var c = () => 1;
 
     #[test]
     fn pr199_for_of_assignment_targets_lower_to_indexed_loops() {
-        let source = "var target; for (target of source(2 ** 3)) { use(target); }";
+        let source = "var target = {}; for (target[2 ** 1] of source(2 ** 3)) { use(target); }";
         let parsed = crate::parser::parse(crate::scanner::scan(
             SourceId::new(0),
             ScriptKind::TypeScript,
@@ -6798,8 +6798,11 @@ var c = () => 1;
         let code = &javascript(&output).code;
         assert!(!code.contains(" of "), "native for-of survived ES5: {code}");
         assert_eq!(code.matches("Math.pow(2, 3)").count(), 1, "{code}");
+        assert_eq!(code.matches("Math.pow(2, 1)").count(), 1, "{code}");
         assert!(!code.contains("**"), "{code}");
-        let assign = code.find("target = ").expect("indexed assignment");
+        let assign = code
+            .find("target[Math.pow(2, 1)] = ")
+            .expect("indexed assignment");
         let use_call = code.find("use(target)").expect("body");
         assert!(assign < use_call, "{code}");
     }

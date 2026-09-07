@@ -1750,11 +1750,17 @@ impl<'a> Rewriter<'a> {
             // `target = source[counter];` - destructuring targets lower
             // through the statement rewriter like any assignment.
             ForBinding::Target(target) => {
+                let left = match target.data() {
+                    AssignmentTarget::Member(member) => {
+                        self.rewrite_member_target(member, target.range())
+                    }
+                    _ => target.clone(),
+                };
                 let assignment = self.node(
                     range,
                     Expression::Assignment(AssignmentExpression {
                         operator: AssignmentOperator::Assign,
-                        left: target.clone(),
+                        left,
                         right: Box::new(element),
                     }),
                 );
@@ -6956,20 +6962,7 @@ impl<'a> Rewriter<'a> {
                     // Convert awaits inside the target too, so a
                     // suspending target becomes a visible machine refusal
                     // instead of a live `await` in ES5 output.
-                    let object = self.rewrite_expr(&member.object);
-                    let property = match &member.property {
-                        MemberProperty::Computed(key) => {
-                            MemberProperty::Computed(Box::new(self.rewrite_expr(key)))
-                        }
-                        other => other.clone(),
-                    };
-                    self.node(
-                        assignment.left.range(),
-                        AssignmentTarget::Member(AssignmentMemberTarget {
-                            object: Box::new(object),
-                            property,
-                        }),
-                    )
+                    self.rewrite_member_target(member, assignment.left.range())
                 } else {
                     assignment.left.clone()
                 };
@@ -6991,6 +6984,27 @@ impl<'a> Rewriter<'a> {
             }
             _ => expression.clone(),
         }
+    }
+
+    fn rewrite_member_target(
+        &mut self,
+        member: &AssignmentMemberTarget,
+        range: TextRange,
+    ) -> AssignmentTargetNode {
+        let object = self.rewrite_expr(&member.object);
+        let property = match &member.property {
+            MemberProperty::Computed(key) => {
+                MemberProperty::Computed(Box::new(self.rewrite_expr(key)))
+            }
+            other => other.clone(),
+        };
+        self.node(
+            range,
+            AssignmentTarget::Member(AssignmentMemberTarget {
+                object: Box::new(object),
+                property,
+            }),
+        )
     }
 
     /// `Math.pow(base, exponent)` — the ES2016 exponentiation downlevel form.
