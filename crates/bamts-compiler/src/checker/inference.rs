@@ -1524,25 +1524,33 @@ impl<'table> InferenceContext<'table> {
             .max()?;
         // Naked and nested covariant evidence selects one common supertype.
         // Low-priority contravariant evidence stays in its own tier.
+        let included: Vec<&InferenceCandidate> = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.priority == best_priority
+                    || (best_priority == InferencePriority::Top
+                        && candidate.priority == InferencePriority::Middle)
+            })
+            .collect();
+        // Fresh-literal evidence is ORed across every included candidate
+        // before the type dedup below: the dedup keeps the first candidate
+        // per type, and an earlier nonfresh duplicate must not hide a later
+        // argument's fresh evidence.
+        let widen_literal_union = included
+            .iter()
+            .any(|candidate| candidate.freshness.fresh_array_literal());
+        let fresh_literal = included
+            .iter()
+            .any(|candidate| candidate.freshness.fresh_primitive_literal());
         let mut tier: Vec<&InferenceCandidate> = Vec::new();
-        for candidate in candidates {
-            let include = candidate.priority == best_priority
-                || (best_priority == InferencePriority::Top
-                    && candidate.priority == InferencePriority::Middle);
-            if include
-                && !tier
-                    .iter()
-                    .any(|existing| existing.type_id == candidate.type_id)
+        for candidate in included {
+            if !tier
+                .iter()
+                .any(|existing| existing.type_id == candidate.type_id)
             {
                 tier.push(candidate);
             }
         }
-        let widen_literal_union = tier
-            .iter()
-            .any(|candidate| candidate.freshness.fresh_array_literal());
-        let fresh_literal = tier
-            .iter()
-            .any(|candidate| candidate.freshness.fresh_primitive_literal());
         if tier.len() == 1 {
             return Some((tier[0].type_id, widen_literal_union, fresh_literal));
         }
@@ -1801,6 +1809,78 @@ mod tests {
         let inferred = context.resolve();
 
         assert_eq!(inferred.get(parameter(1)), Some(one));
+    }
+
+    /// Two arguments of the same literal type dedup to one candidate, but
+    /// fresh-literal evidence must survive regardless of which argument is
+    /// fresh: an earlier nonfresh duplicate must not hide a later argument's
+    /// fresh evidence (`pick(var, "1")` widens like `pick("1", var)`).
+    #[test]
+    fn duplicate_candidates_keep_fresh_literal_evidence_in_both_orders() {
+        let mut table = TypeTable::new();
+        let t = table.named(parameter(1));
+        let signature = table.function(vec![t, t], t);
+        let Type::Function(signature) = table.get(signature).clone() else {
+            panic!("function type");
+        };
+
+        let one = table.number_literal("1");
+        for freshness in [
+            [
+                CandidateFreshness::NONFRESH,
+                CandidateFreshness::FRESH_PRIMITIVE_LITERAL,
+            ],
+            [
+                CandidateFreshness::FRESH_PRIMITIVE_LITERAL,
+                CandidateFreshness::NONFRESH,
+            ],
+        ] {
+            let mut context =
+                InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
+            context.infer_from_arguments(&signature, &[one, one], &freshness);
+            let inferred = context.resolve();
+            let resolved = inferred
+                .arguments()
+                .iter()
+                .find(|argument| argument.symbol() == parameter(1))
+                .expect("resolved argument");
+            assert!(
+                resolved.fresh_literal(),
+                "primitive fresh evidence lost for {freshness:?}"
+            );
+            assert!(!resolved.widen_literal_union());
+            assert_eq!(inferred.get(parameter(1)), Some(one));
+        }
+
+        // The array-literal flag reads the same deduped tier and must be
+        // order-independent too.
+        let ones = table.array(one);
+        for freshness in [
+            [
+                CandidateFreshness::NONFRESH,
+                CandidateFreshness::FRESH_ARRAY_LITERAL,
+            ],
+            [
+                CandidateFreshness::FRESH_ARRAY_LITERAL,
+                CandidateFreshness::NONFRESH,
+            ],
+        ] {
+            let mut context =
+                InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
+            context.infer_from_arguments(&signature, &[ones, ones], &freshness);
+            let inferred = context.resolve();
+            let resolved = inferred
+                .arguments()
+                .iter()
+                .find(|argument| argument.symbol() == parameter(1))
+                .expect("resolved argument");
+            assert!(
+                resolved.widen_literal_union(),
+                "array fresh evidence lost for {freshness:?}"
+            );
+            assert!(!resolved.fresh_literal());
+            assert_eq!(inferred.get(parameter(1)), Some(ones));
+        }
     }
 
     /// A candidate that supertypes every sibling in its tier wins without a
