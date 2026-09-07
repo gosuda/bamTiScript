@@ -1191,16 +1191,7 @@ fn candidate_tree_digest(root: &Path) -> Result<String> {
 /// [`candidate_tree_digest`] so tests can replay a capture whose tree was
 /// displaced mid-flight.
 fn candidate_tree_digest_against(root: &Path, tree: &str) -> Result<String> {
-    let status = git_probe(
-        root,
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ],
-    )?;
+    let status = capture_worktree_status(root)?;
     let listing = git_probe_bounded(
         root,
         &["ls-tree", "-r", "-z", "--full-tree", tree],
@@ -1217,11 +1208,43 @@ fn candidate_tree_digest_against(root: &Path, tree: &str) -> Result<String> {
             ),
         ));
     }
+    // A worktree write after the first status read leaves HEAD stable but
+    // tears the dirty gate: re-probe and refuse on any change.
+    let restatus = capture_worktree_status(root)?;
+    worktree_status_stable(&status, &restatus)?;
     let mut hasher = Sha256::new();
     hasher.update(CANDIDATE_SOURCE_NAMESPACE);
     hasher.update(b"\x00");
     hasher.update(committed_source_stream(&records));
     Ok(schema::sha256_hex(&hasher.finalize()))
+}
+
+/// Captures the full porcelain worktree status bytes compared by
+/// [`worktree_status_stable`] to detect writes between probes.
+fn capture_worktree_status(root: &Path) -> Result<Vec<u8>> {
+    git_probe(
+        root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+    )
+}
+
+/// Refuses a capture whose worktree status changed between two probes: even
+/// with a stable HEAD, a mid-capture write tears the dirty gate the first
+/// probe established.
+fn worktree_status_stable(before: &[u8], after: &[u8]) -> Result<()> {
+    if before == after {
+        return Ok(());
+    }
+    Err(VerificationError::new(
+        ErrorCode::Digest,
+        "the candidate snapshot is not coherent; the worktree status changed during the capture",
+    ))
 }
 
 /// Domain separator of the committed-source projection algorithm. A change
@@ -2919,6 +2942,28 @@ mod tests {
         let fresh_tree = resolve_head_tree(&scratch.root).expect("resolve moved tree");
         candidate_tree_digest_against(&scratch.root, &fresh_tree)
             .expect("a capture over one stable tree succeeds");
+    }
+
+    /// A worktree write between the status probe and the end of the capture
+    /// must be refused even when HEAD never moves: the re-probe compares
+    /// full status bytes, so any dirt the first probe missed fails closed.
+    /// Replays the torn read deterministically through two captures.
+    #[test]
+    fn worktree_dirt_between_probes_is_refused() {
+        let (scratch, _) = manifest_root("dirt-between-probes", &["jit.a"]);
+        let before = capture_worktree_status(&scratch.root).expect("capture clean status");
+        scratch.write("src/late.ts", b"// late write");
+        let after = capture_worktree_status(&scratch.root).expect("capture dirty status");
+        assert_ne!(
+            before, after,
+            "a mid-capture write must change the status bytes"
+        );
+        assert!(
+            worktree_status_stable(&before, &after).is_err(),
+            "changed status bytes must refuse the snapshot"
+        );
+        let steady = capture_worktree_status(&scratch.root).expect("recapture status");
+        worktree_status_stable(&after, &steady).expect("stable status must accept");
     }
 
     /// A rename whose original path is candidate source is refused even though
