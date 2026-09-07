@@ -8,6 +8,7 @@
 //! into an immutable [`SemanticModel`] with canonical diagnostics.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use bamts_bytecode::{EcmaString, format_number};
@@ -15,13 +16,15 @@ use bamts_bytecode::{EcmaString, format_number};
 use super::AnalysisFacts;
 use super::ProgramCheckOptions;
 use super::inference::{
-    InferenceContext, InferenceParameter, InferenceProvenance, InferredTypeArgument,
-    InferredTypeArguments,
+    CandidateFreshness, InferenceContext, InferenceParameter, InferenceProvenance,
+    InferredTypeArgument, InferredTypeArguments,
 };
 use super::intrinsic_environment::GlobalEnvironment;
-use super::jsx::{JsxCallable, JsxFactorySignature};
+use super::jsx::{JsxDegradation, JsxElementOutcome};
 use super::narrowing::{
-    FlowFacts, FlowKey, FlowNodeId, GuardResolver, NarrowingContext, NarrowingGuard, flow_key_of,
+    AssignmentReachability, FlowEdge, FlowEdgeKind, FlowFacts, FlowKey, FlowNodeId, FlowOperation,
+    GuardResolver, NarrowingContext, NarrowingGuard, ProgramFlow, RootFlowPacket, SymbolicGuard,
+    flow_key_of,
 };
 use super::relations::{TypeRelation, TypeRelations};
 use super::{
@@ -37,21 +40,22 @@ use super::{
     EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE, FOR_IN_LEFT_HAND_SIDE_INVALID,
     FOR_OF_ITERABLE_REQUIRED, FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT,
     FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
-    GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, IMPORT_CONFLICTS_WITH_LOCAL,
-    INTERFACE_NAME_IS_PRIMITIVE, INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY,
-    MEMBER_NOT_ACCESSIBLE, MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT,
-    NAMESPACE_NO_EXPORTED_MEMBER, NEW_TARGET_OUTSIDE_FUNCTION, NON_VOID_FUNCTION_MUST_RETURN,
-    PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_INITIALIZER_IN_SIGNATURE,
-    PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED,
-    REST_PARAMETER_NOT_LAST, SET_ACCESSOR_PARAMETER_INITIALIZER,
-    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, STRICT_NULL_MEMBER_ACCESS,
-    SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
-    SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER, SUPER_PROPERTY_NOT_METHOD,
-    SUPER_REFERENCE_NON_DERIVED, SUPER_STATIC_MEMBER_VIA_SUPER, TYPE_ALIAS_CIRCULAR,
-    TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT,
-    UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED, USING_DECLARATION_BINDING_PATTERN,
-    USING_DECLARATION_IN_FOR_IN, USING_DECLARATION_MISSING_INITIALIZER, VALUE_CANNOT_BE_USED_HERE,
-    WITH_STATEMENT_NOT_ALLOWED,
+    GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, IMPLICIT_ANY_ANONYMOUS_RETURN_FROM_CYCLE,
+    IMPLICIT_ANY_FROM_INITIALIZER_CYCLE, IMPLICIT_ANY_RETURN_FROM_CYCLE,
+    IMPORT_CONFLICTS_WITH_LOCAL, INTERFACE_NAME_IS_PRIMITIVE, INVALID_ASSIGNMENT_TARGET,
+    INVALID_INDEXED_ACCESS_KEY, MEMBER_NOT_ACCESSIBLE, MISSING_METHOD_RETURN_TYPE,
+    MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER, NEW_TARGET_OUTSIDE_FUNCTION,
+    NON_VOID_FUNCTION_MUST_RETURN, PARAMETER_DECORATOR_NOT_SUPPORTED,
+    PARAMETER_INITIALIZER_IN_SIGNATURE, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
+    PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED, REST_PARAMETER_NOT_LAST,
+    SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
+    STRICT_NULL_MEMBER_ACCESS, SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS,
+    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER,
+    SUPER_PROPERTY_NOT_METHOD, SUPER_REFERENCE_NON_DERIVED, SUPER_STATIC_MEMBER_VIA_SUPER,
+    TYPE_ALIAS_CIRCULAR, TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE,
+    TYPE_PARAMETER_CIRCULAR_DEFAULT, UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED,
+    USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
+    USING_DECLARATION_MISSING_INITIALIZER, VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED,
 };
 use super::{
     ABSTRACT_CONSTRUCTOR_MESSAGE, ACCESSOR_THIS_PARAMETER_MESSAGE, AMBIENT_IMPLEMENTATION_MESSAGE,
@@ -90,19 +94,32 @@ use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{self, EnumDeclarationBinding, EnumFacts};
 use crate::literal::{number_value, string_value};
 use crate::namespace_plan::{self, NamespaceDeclarationBinding, NamespaceFacts};
-use crate::source::{ScriptKind, TextRange};
+use crate::source::{ScriptKind, SourceId, TextRange, Utf16Pos};
 use crate::syntax::{
-    Accessibility, ArrayElement, ArrowFunction, AssignmentExpression, AssignmentOperator,
-    AssignmentTarget, BinaryExpression, BinaryOperator, BindingPattern, CallArgument,
-    CallExpression, ClassDeclaration, ClassMember, ConditionalExpression, DeclarationModifiers,
-    EntityName, Expr, Expression, ForBinding, ForInitializer, ForOfMode, FunctionBody,
-    FunctionLike, FunctionType, IdentifierNode, ImportBinding, InterfaceDeclaration,
+    Accessibility, ArrayElement, ArrowFunction, AsExpression, AssignmentExpression,
+    AssignmentOperator, AssignmentTarget, BinaryExpression, BinaryOperator, BindingPattern,
+    CallArgument, CallExpression, ClassDeclaration, ClassMember, ConditionalExpression,
+    DeclarationModifiers, EntityName, Expr, Expression, ForBinding, ForInitializer, ForOfMode,
+    FunctionBody, FunctionLike, FunctionType, IdentifierNode, ImportBinding, InterfaceDeclaration,
     JsxAttributeInitializer, JsxAttributeItem, JsxChild, KeywordType, Literal, LogicalOperator,
-    MemberProperty, MetaProperty, NamespaceName, NewExpression, NodeId, ObjectLiteral,
-    ObjectMember, ParameterNode, PropertyModifier, PropertyName, SourceFile, Statement, Stmt,
-    Token, TokenKind, Ty, TypeAliasDeclaration, TypeAnnotationNode, TypeLiteral, TypeMember,
-    TypeNode, TypeOperator, TypeReference, UnaryOperator, VariableDeclaration, VariableKind,
+    MemberProperty, MetaProperty, NamespaceName, NewExpression, NodeId, NonNullExpression,
+    ObjectLiteral, ObjectMember, ParameterNode, PropertyModifier, PropertyName,
+    SatisfiesExpression, SourceFile, Statement, Stmt, Token, TokenKind, Ty, TypeAliasDeclaration,
+    TypeAnnotationNode, TypeAssertionExpression, TypeLiteral, TypeMember, TypeNode, TypeOperator,
+    TypeReference, UnaryOperator, VariableDeclaration, VariableKind,
 };
+
+/// Message text for the script-scope conflict with a built-in global
+/// (`globalThis` or `undefined`); the diagnostic code lives in `checker`.
+#[expect(
+    dead_code,
+    reason = "emitted by the WP-CHECK declaration-conflict drain in a later serialized binder step"
+)]
+const DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL_MESSAGE: &str =
+    "Declaration conflicts with a built-in global identifier.";
+
+#[path = "binder/date.rs"]
+mod date;
 
 /// Maximum depth of recursive type resolution before the checker emits
 /// `TYPE_NESTING_TOO_DEEP` and returns the error type. Set higher than the
@@ -111,6 +128,9 @@ use crate::syntax::{
 /// argument resolution), but still bounded to prevent stack overflow on
 /// pathological inputs.
 const MAX_TYPE_DEPTH: u32 = 512;
+
+const INITIALIZER_CYCLE_MESSAGE: &str = "The inferred type of this value recursively references its own initializer and falls back to 'any'.";
+const RETURN_CYCLE_MESSAGE: &str = "The inferred return type of this callable recursively references itself and falls back to 'any'.";
 
 /// A lexical scope's identity within a [`SemanticModel`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -487,6 +507,13 @@ impl PropertyType {
         self.spreadable = spreadable;
         self
     }
+    /// Returns a copy with `type_id` replacing the stored member type.
+    #[must_use]
+    pub(crate) fn with_type_id(&self, type_id: TypeId) -> Self {
+        let mut property = self.clone();
+        property.type_id = type_id;
+        property
+    }
 
     #[must_use]
     pub const fn is_method(&self) -> bool {
@@ -706,7 +733,7 @@ pub(crate) enum PropertyAnchorKind {
 }
 
 /// One property occurrence recorded for rename support.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PropertyAnchor {
     /// Bare name span (Invariant A): quotes excluded, brackets excluded,
     /// receiver excluded, and the source text at that span is byte-identical
@@ -1054,8 +1081,9 @@ enum ResolvedCallArgument<'src> {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ClassSide {
+/// Crate-visible so frozen `pub(crate)` demand records (`Facet::ClassShape`) can carry it.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ClassSide {
     Instance,
     Static,
 }
@@ -1273,9 +1301,11 @@ pub enum Type {
         symbol: SymbolId,
         arguments: Vec<TypeId>,
     },
-    /// The canonical identity of a recursive generic type-alias application.
-    /// Only occurrences resolved while the declaration is in progress are
-    /// interned; its finite structural view is stored separately.
+    /// The canonical identity of a type-alias application. Occurrences
+    /// resolved while the declaration is in progress, occurrences of the
+    /// dependencies of such a resolution, and substitution-closed
+    /// zero-parameter references are interned as heads; the finite structural
+    /// view of each head is stored separately.
     AppliedAlias {
         symbol: SymbolId,
         arguments: Vec<TypeId>,
@@ -3408,29 +3438,6 @@ impl TypeTable {
         self.intern(Type::Intersection(members))
     }
 
-    /// If `type_id` is a function type or an intersection of function types,
-    /// returns the ordered function type ids. Otherwise returns `None`.
-    fn overload_members(&self, type_id: TypeId) -> Option<Vec<TypeId>> {
-        match self.get(type_id) {
-            Type::Function(_) => Some(vec![type_id]),
-            Type::Intersection(members) => {
-                let mut overloads = Vec::new();
-                for &member in members {
-                    match self.get(member) {
-                        Type::Function(_) => overloads.push(member),
-                        Type::Intersection(_) => {
-                            let nested = self.overload_members(member)?;
-                            overloads.extend(nested);
-                        }
-                        _ => return None,
-                    }
-                }
-                Some(overloads)
-            }
-            _ => None,
-        }
-    }
-
     /// Whether `object` is a pure callable: non-empty `call_signatures` and
     /// no properties, construct signatures, index signatures, or
     /// generator/iterator members. `call_candidate_order` never participates:
@@ -3446,6 +3453,41 @@ impl TypeTable {
             && object.async_iterator_property.is_none()
     }
 
+    /// A signature is literal-specialized iff at least one declared
+    /// parameter's resolved type is a concrete single literal (string,
+    /// number, boolean, or bigint literal), read through zero-parameter
+    /// alias heads. Literal unions, broad types, and rest or zero-parameter
+    /// signatures do not qualify — a rest parameter's resolved type is an
+    /// array, never a single literal.
+    fn signature_is_literal_specialized(&self, signature: &FunctionSignature) -> bool {
+        signature.parameters().iter().any(|parameter| {
+            self.is_concrete_single_literal(parameter.type_id(), &mut HashSet::new())
+        })
+    }
+
+    /// Whether a type resolves through alias heads to one concrete literal.
+    /// Unions, arrays, and every other shape stay nonspecialized; the visited
+    /// set terminates circular alias chains.
+    fn is_concrete_single_literal(&self, type_id: TypeId, visiting: &mut HashSet<TypeId>) -> bool {
+        match self.get(type_id) {
+            Type::StringLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::BooleanLiteral(_)
+            | Type::BigIntLiteral(_) => true,
+            Type::AppliedAlias { .. } => {
+                if !visiting.insert(type_id) {
+                    return false;
+                }
+                let specialized = self.applied_alias_view(type_id).is_some_and(|view| {
+                    view != type_id && self.is_concrete_single_literal(view, visiting)
+                });
+                visiting.remove(&type_id);
+                specialized
+            }
+            _ => false,
+        }
+    }
+
     /// The order-insensitive relations view over a callable type: the call
     /// signatures of a function, a pure callable object type, or an
     /// intersection of those, in declaration order with duplicates
@@ -3455,13 +3497,6 @@ impl TypeTable {
     /// ignored here and consumed only on the call path. Mixed callables such
     /// as `{ (x: string): void; extra: string }` return `None` so callers
     /// fall through to the structural relation path.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by the T2/T3 overload and relation paths"
-        )
-    )]
     pub(crate) fn overload_signatures(
         &self,
         type_id: TypeId,
@@ -3497,10 +3532,6 @@ impl TypeTable {
     /// empty vector is the identity. A non-empty order must be a complete
     /// permutation of the signature indices — a mismatch is an internal
     /// invariant failure, never a silent identity fallback.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed when T4b attaches candidate order")
-    )]
     pub(crate) fn with_call_candidate_order(&mut self, type_id: TypeId, order: Vec<u32>) -> TypeId {
         let Type::ObjectType(object) = self.get(type_id).clone() else {
             unreachable!("call candidate order attaches to a callable object type");
@@ -3552,21 +3583,25 @@ impl TypeTable {
             }
             let group = &object.properties[i..j];
             let mut property = group[0].clone();
-            if group.len() > 1
-                && first.is_method()
-                && let Some(mut overloads) = self.overload_members(first.type_id())
-            {
+            if group.len() > 1 && first.is_method() {
+                // Collect each member's signatures through the
+                // order-insensitive view: a fragment-level merged group
+                // contributes its whole call-signature block, a plain method
+                // member one signature. The blocks are what candidate order
+                // is computed from.
+                let mut blocks: Vec<Vec<FunctionSignature>> = Vec::with_capacity(group.len());
                 let mut can_merge = true;
-                for other in &group[1..] {
-                    if !other.is_method() {
+                for member in group {
+                    if !member.is_method() {
                         can_merge = false;
                         break;
                     }
-                    if let Some(members) = self.overload_members(other.type_id()) {
-                        overloads.extend(members);
-                    } else {
-                        can_merge = false;
-                        break;
+                    match self.overload_signatures(member.type_id()) {
+                        Some(signatures) => blocks.push(signatures.into_owned()),
+                        None => {
+                            can_merge = false;
+                            break;
+                        }
                     }
                 }
                 let mut declaring_types = Vec::new();
@@ -3577,11 +3612,26 @@ impl TypeTable {
                         }
                     }
                 }
-                if can_merge && !overloads.is_empty() {
-                    let type_id = if overloads.len() == 1 {
-                        overloads[0]
+                let total: usize = blocks.iter().map(Vec::len).sum();
+                if can_merge && total > 0 {
+                    let signatures: Vec<FunctionSignature> = blocks.into_iter().flatten().collect();
+                    // Pure callable group in declaration order. Candidate
+                    // selection order is attached only by the interface-merge
+                    // path; this shared entry point never reorders.
+                    let type_id = if total == 1 {
+                        let signature = signatures.into_iter().next().expect("one signature");
+                        self.function_signature(signature)
                     } else {
-                        self.intern(Type::Intersection(overloads))
+                        self.intern(Type::ObjectType(ObjectType {
+                            properties: Vec::new(),
+                            call_signatures: signatures,
+                            call_candidate_order: Vec::new(),
+                            construct_signatures: Vec::new(),
+                            index_signatures: Vec::new(),
+                            generator_return: None,
+                            iterator_property: None,
+                            async_iterator_property: None,
+                        }))
                     };
                     property =
                         PropertyType::new(first.name().to_owned(), first.optional(), type_id)
@@ -3889,7 +3939,9 @@ impl TypeTable {
                 }
                 let widened = match self.prepare_applied_alias_view(type_id) {
                     Some(view) if view != type_id => {
-                        self.widen_with_aliases(view, keep_primitive_literals, active_aliases)
+                        let widened =
+                            self.widen_with_aliases(view, keep_primitive_literals, active_aliases);
+                        if widened == view { type_id } else { widened }
                     }
                     _ => type_id,
                 };
@@ -4430,7 +4482,7 @@ enum EntityNameScopeError {
 /// both planes. Runtime/value lowering uses `value.or(ty)`; type resolution uses
 /// `ty.or(value)`.
 #[derive(Clone, Copy, Debug, Default)]
-struct ImportEqualsTarget {
+pub(crate) struct ImportEqualsTarget {
     value: Option<SymbolId>,
     ty: Option<SymbolId>,
 }
@@ -4462,6 +4514,765 @@ enum TypeDef<'src> {
     Enum {
         numeric: bool,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Demand activation: frozen shared identities, query/context/result records,
+// and the WP-LEX source-inventory records. Shapes are frozen by
+// `local://demand-activation-executable-contract.json` (shared_contract plus
+// work_packages/WP-LEX) and `local://demand-lexical-implementation-contract.json`;
+// do not rename fields or variants. Records whose sibling-package consumers
+// land in a later serialized binder step carry an explicit `dead_code` allow
+// with the landing step named, so the allowance is removed at cutover.
+// ---------------------------------------------------------------------------
+
+/// One source-order declaration contributor identity. Allocated by
+/// `Binder::bind_all` in source order; never derived from `SymbolId` or scope
+/// counts, so contributor identity is stable across symbol-count drift.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct DeclId(u32);
+
+#[expect(
+    dead_code,
+    reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+)]
+impl DeclId {
+    #[must_use]
+    pub(crate) const fn get(self) -> u32 {
+        self.0
+    }
+
+    const fn next(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+/// Which value plane of a declaration a demand query resolves.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum Facet {
+    #[expect(
+        dead_code,
+        reason = "resolved by the WP-DEMAND facet engines in a later serialized binder step"
+    )]
+    SignatureHeader,
+    Initializer,
+    #[expect(
+        dead_code,
+        reason = "resolved by the WP-DEMAND facet engines in a later serialized binder step"
+    )]
+    InferredReturn,
+    #[expect(
+        dead_code,
+        reason = "resolved by the WP-DEMAND facet engines in a later serialized binder step"
+    )]
+    ClassShape(ClassSide),
+    ContainerIdentity,
+    #[expect(
+        dead_code,
+        reason = "resolved by the WP-DEMAND facet engines in a later serialized binder step"
+    )]
+    ComputedKey,
+}
+
+/// The demand-cache key for one declaration facet. Contextual identity
+/// (target/substitution/receiver/captured flow) is supplied by the containing
+/// immutable query frame, never by this key.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct DemandKey {
+    pub target: DeclId,
+    pub facet: Facet,
+}
+
+/// The single lexical-to-flow join key. `SlotContext.point` values must exist
+/// in `ProgramFlow.points` once the flow graph is built; a missing entry is a
+/// construction error, never a fabricated `FlowNodeId`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ExecutionPoint {
+    pub node: NodeId,
+    pub boundary: ExecutionBoundary,
+}
+
+#[expect(
+    dead_code,
+    reason = "minted by the WP-FLOW engine in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ExecutionBoundary {
+    Primary,
+    Entry,
+    Exit,
+    Condition,
+    Consequent,
+    Alternate,
+    Guard,
+    Join,
+    LoopTest,
+    LoopBody,
+    Catch,
+    Finally,
+}
+
+/// Indexes the syntax/control graph (`ProgramFlow`) only. The existing public
+/// `FlowNodeId` continues to index `FlowFacts` frames; the two never interchange.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct FlowPointId(u32);
+
+#[expect(
+    dead_code,
+    reason = "driven by the WP-FLOW engine in a later serialized binder step"
+)]
+impl FlowPointId {
+    /// Mints the identity for the `index`-th `ProgramFlow` node. Only
+    /// `build_program_flow` and `ProgramFlow`'s own constructors call this.
+    pub(crate) const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn get(self) -> u32 {
+        self.0
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// The immutable lexical context a contributor or expression is evaluated
+/// under. Never reads `Binder.flow`/`NarrowingContext` and carries no
+/// `FlowPointId` or `TypeId`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SlotContext {
+    pub scope: ScopeId,
+    pub point: ExecutionPoint,
+    pub receiver: ReceiverKind,
+    pub function_body: Option<NodeId>,
+    pub ambient: bool,
+}
+
+/// Frozen receiver derivation (syntax + scopes only): top-level/module
+/// functions and non-arrow functions nested in class members are `None`;
+/// class methods/constructors are `Instance`/`Static`; arrows inside
+/// instance/static members or property initializers are `LexicalCapture`; a
+/// `this`-annotated first parameter is `ExplicitThis` (annotation node only —
+/// no lexical `this` symbol exists before typing); object-literal methods are
+/// `ObjectLiteral`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReceiverKind {
+    None,
+    #[expect(
+        dead_code,
+        reason = "derived by the WP-CTX slot-context engine in a later serialized binder step"
+    )]
+    ExplicitThis {
+        annotation: NodeId,
+    },
+    #[expect(
+        dead_code,
+        reason = "derived by the WP-CTX slot-context engine in a later serialized binder step"
+    )]
+    Instance {
+        class: DeclId,
+    },
+    #[expect(
+        dead_code,
+        reason = "derived by the WP-CTX slot-context engine in a later serialized binder step"
+    )]
+    Static {
+        class: DeclId,
+    },
+    #[expect(
+        dead_code,
+        reason = "derived by the WP-CTX slot-context engine in a later serialized binder step"
+    )]
+    LexicalCapture {
+        owner: DeclId,
+    },
+    #[expect(
+        dead_code,
+        reason = "derived by the WP-CTX slot-context engine in a later serialized binder step"
+    )]
+    ObjectLiteral {
+        literal: NodeId,
+    },
+}
+
+/// Result channel for every demand query. Cancellation stays
+/// `Result<_, CheckCancelled>`; no new public checker error type exists.
+pub(crate) type DemandResult<T> = Result<DemandPoll<T>, super::CheckCancelled>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DemandPoll<T> {
+    Ready(T),
+    Pending(QueryDependency),
+    Limited { owner: DeclId, range: TextRange },
+}
+
+impl<T> DemandPoll<T> {
+    /// Maps a ready value, passing Pending and Limited through unchanged so
+    /// dispatch layers can record WaitingOn dependencies from the result.
+    pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> DemandPoll<U> {
+        match self {
+            DemandPoll::Ready(value) => DemandPoll::Ready(f(value)),
+            DemandPoll::Pending(dependency) => DemandPoll::Pending(dependency),
+            DemandPoll::Limited { owner, range } => DemandPoll::Limited { owner, range },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum QueryKey {
+    Declaration(DemandKey),
+    Expression(ExpressionKey),
+    Flow(FlowQueryKey),
+    #[expect(
+        dead_code,
+        reason = "issued by the WP-DEMAND signature-group engine in a later serialized binder step"
+    )]
+    SignatureGroup(SymbolId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ExpressionKey {
+    pub node: NodeId,
+    pub point: ExecutionPoint,
+    pub target: Option<TypeId>,
+}
+
+#[allow(
+    dead_code,
+    reason = "produced by the WP-FLOW/WP-DEMAND adapters in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct FlowQueryKey {
+    pub point: FlowPointId,
+    pub root: SymbolId,
+}
+
+/// An execution address, not interned semantic-context identity. Frame zero is
+/// canonical storage; positive frame slots are monotonically appended and
+/// never reused within one `Binder`.
+#[allow(
+    dead_code,
+    reason = "produced by the WP-CTX frame engine in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct QueryAddress {
+    pub frame: usize,
+    pub key: QueryKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct QueryDependency {
+    pub target: QueryAddress,
+    pub purpose: DependencyPurpose,
+}
+
+#[allow(
+    dead_code,
+    reason = "produced by the WP-DEMAND/WP-FLOW engines in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum DependencyPurpose {
+    Value,
+    Return,
+    Structural,
+    DeclaredRoot,
+    GuardInput,
+    CfgPredecessor,
+    CfgBackedge,
+    ComputedKey,
+}
+
+/// A completed demand answer. `Header` is a stable inventory handle, never a
+/// signature with a placeholder return.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompletedDemand {
+    Type {
+        type_id: TypeId,
+        origin: CompletionOrigin,
+    },
+    Header(CallableHeader),
+}
+
+#[allow(
+    dead_code,
+    reason = "produced by the WP-DEMAND facet engines in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum CompletionOrigin {
+    Ordinary,
+    InitializerCycle,
+    ReturnCycle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CallableHeader {
+    pub declaration: DeclId,
+    pub scope: ScopeId,
+}
+
+// Contextual frame records (WP-CTX consumers land in a later serialized
+// binder step; shapes frozen now so narrowing.rs/jsx.rs/checker.rs adapters
+// compile against them).
+
+#[allow(
+    dead_code,
+    reason = "constructed by the WP-CTX frame engine in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContextualMode {
+    Speculative,
+    Selected,
+}
+
+/// Immutable after frame entry.
+#[allow(
+    dead_code,
+    reason = "constructed by the WP-CTX frame engine in a later serialized binder step"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EffectiveEnvironment {
+    pub target: Option<TypeId>,
+    pub substitution: Option<InferredTypeArguments>,
+    pub receiver: Option<TypeId>,
+    pub source: SlotContext,
+    pub captured_from: Option<CapturedFlowSource>,
+}
+
+/// A live parent-stack dependency, not a persistent context identity.
+#[allow(
+    dead_code,
+    reason = "constructed by the WP-CTX frame engine in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CapturedFlowSource {
+    pub frame: usize,
+    pub point: FlowPointId,
+    pub boundary: ScopeId,
+}
+
+#[allow(
+    dead_code,
+    reason = "created by query_in_context in a later serialized binder step"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ContextualRequest {
+    pub mode: ContextualMode,
+    pub environment: EffectiveEnvironment,
+    pub root: QueryKey,
+}
+
+#[allow(
+    dead_code,
+    reason = "driven by the WP-CTX frame engine in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrameLifecycle {
+    Active,
+    Suspended,
+    Complete,
+    Discarded,
+}
+
+#[allow(
+    dead_code,
+    reason = "driven by the WP-CHECK selected replay in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SelectedReplayState {
+    NotRequired,
+    Pending,
+    Complete,
+}
+
+// WP-LEX records: bind-once source inventory, readiness, reservations.
+
+#[expect(
+    dead_code,
+    reason = "classified by the WP-LEX reservation pass in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ContributorKind {
+    Declarator,
+    Function,
+    AnonymousCallable,
+    Parameter,
+    DestructuredLeaf,
+    Class,
+    EnumMember,
+    Property,
+    Accessor,
+    Interface,
+    TypeAlias,
+    TypeParameter,
+    ImportedValue,
+    ImportEquals,
+    ImportStar,
+    Namespace,
+    EnumContainer,
+}
+
+/// One source-node declaration identity with its facet obligations. The
+/// context of a contributor inside a not-yet-allocated scope (function body,
+/// nested block, class member body) records the innermost known enclosing
+/// scope as a provisional value; it is corrected when scope allocation moves
+/// to `node_scopes`, and query-facing reads are gated by
+/// [`Binder::slot_context`] through lexical readiness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Contributor {
+    pub id: DeclId,
+    pub node: NodeId,
+    pub symbol: Option<SymbolId>,
+    pub parent: Option<DeclId>,
+    pub kind: ContributorKind,
+    pub facets: Vec<Facet>,
+    pub context: SlotContext,
+    pub diagnostic_anchor: TextRange,
+}
+
+/// Bind-once lexical state per scope. `Binding` is not read-ready.
+#[expect(
+    dead_code,
+    reason = "gated by the WP-LEX readiness barrier in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LexicalReadiness {
+    Reserved,
+    Binding,
+    Ready,
+}
+
+#[allow(
+    dead_code,
+    reason = "stage-A inventory; demand/flow consumers land in later serialized binder steps"
+)]
+#[derive(Debug, Default)]
+pub(crate) struct DeclarationIndex<'src> {
+    pub contributors: Vec<Contributor>,
+    pub contributor_by_node: HashMap<NodeId, Vec<DeclId>>,
+    pub symbol_to_contributor: HashMap<SymbolId, Vec<DeclId>>,
+    /// Query-facing contexts: published only for nodes whose true binding
+    /// scope exists and is lexically ready.
+    pub contexts: HashMap<NodeId, SlotContext>,
+    /// Node-keyed scope associations filled at bind time; scope allocation
+    /// during typing migrates onto this map at the activation cutover.
+    pub node_scopes: HashMap<NodeId, ScopeId>,
+    pub lexical_state: HashMap<ScopeId, LexicalReadiness>,
+    /// Merge contributors per scope. Reuse-based merges (interface, enum,
+    /// namespace) record the shared scope; readiness completes all of them
+    /// before `Ready`.
+    pub merged_scopes: HashMap<ScopeId, Vec<ScopeId>>,
+    pub expressions: HashMap<NodeId, &'src Expr>,
+    pub type_syntax: HashMap<NodeId, &'src Ty>,
+    pub computed_names: HashMap<DeclId, &'src Expr>,
+    pub callables: HashMap<DeclId, CallableInventory<'src>>,
+    pub value_inputs: HashMap<DeclId, ValueInput<'src>>,
+    pub return_yield: HashMap<DeclId, ReturnYieldInventory>,
+    /// Declaration/import-conflict diagnostics recorded instead of emitted.
+    /// Conversion of the existing bind-time emit sites is the WP-CHECK
+    /// cutover; until then this stays empty and bind-time emits keep their
+    /// current behavior.
+    pub facts: Vec<DeclarationFact>,
+    next_decl: u32,
+}
+
+impl<'src> DeclarationIndex<'src> {
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn allocate_decl_id(&mut self) -> DeclId {
+        let id = DeclId::next(self.next_decl);
+        self.next_decl = id.get().checked_add(1).expect("DeclId count fits in u32");
+        id
+    }
+}
+
+/// One callable's source inventory: frozen parameter scope, body, protocol,
+/// and diagnostic anchor. Never fabricates a callable node.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CallableInventory<'src> {
+    pub source: CallableSource<'src>,
+    /// Provisional until scope allocation moves to `node_scopes`: the
+    /// innermost scope allocated at bind time. Interface/type-side callables
+    /// carry their signature-parameter scope.
+    pub parameter_scope: ScopeId,
+    #[expect(
+        dead_code,
+        reason = "read by the WP-DEMAND callable engines in a later serialized binder step"
+    )]
+    pub body: Option<NodeId>,
+    #[expect(
+        dead_code,
+        reason = "read by the WP-DEMAND callable engines in a later serialized binder step"
+    )]
+    pub protocol: FunctionProtocol,
+    #[expect(
+        dead_code,
+        reason = "read by the WP-DEMAND callable engines in a later serialized binder step"
+    )]
+    pub anchor: CallableAnchor,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CallableSource<'src> {
+    #[expect(
+        dead_code,
+        reason = "populated with callable inventory at the WP-DEMAND step"
+    )]
+    Function(&'src FunctionLike),
+    #[expect(
+        dead_code,
+        reason = "populated with callable inventory at the WP-DEMAND step"
+    )]
+    Arrow(&'src ArrowFunction),
+    #[allow(
+        dead_code,
+        reason = "populated with type-plane callable inventory at the WP-DEMAND step"
+    )]
+    TypeFunction(&'src FunctionType),
+    #[expect(
+        dead_code,
+        reason = "populated with callable inventory at the WP-DEMAND step"
+    )]
+    TypeMember(&'src TypeMember),
+    #[expect(
+        dead_code,
+        reason = "populated with callable inventory at the WP-DEMAND step"
+    )]
+    ClassMember(&'src ClassMember),
+    #[allow(
+        dead_code,
+        reason = "populated with constructor-type inventory at the WP-DEMAND step"
+    )]
+    ConstructorType(&'src Ty),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CallableAnchor {
+    Named(TextRange),
+    ArrowExpression(TextRange),
+    FunctionKeyword(TextRange),
+}
+
+/// The syntax-only value input of one contributor.
+#[derive(Clone, Debug)]
+pub(crate) enum ValueInput<'src> {
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-DEMAND value-input engines in a later serialized binder step"
+    )]
+    Binding {
+        annotation: Option<&'src Ty>,
+        initializer: Option<&'src Expr>,
+        pattern: &'src crate::syntax::Pattern,
+        kind: VariableKind,
+    },
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-DEMAND value-input engines in a later serialized binder step"
+    )]
+    Parameter(&'src ParameterNode),
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-DEMAND value-input engines in a later serialized binder step"
+    )]
+    Property {
+        annotation: Option<&'src Ty>,
+        initializer: Option<&'src Expr>,
+    },
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-DEMAND value-input engines in a later serialized binder step"
+    )]
+    ProjectedLeaf {
+        source: DeclId,
+        path: Box<[ProjectionStep]>,
+    },
+    #[allow(
+        dead_code,
+        reason = "seeded by the imported-value install cutover in the WP-CHECK step"
+    )]
+    Installed(TypeId),
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-DEMAND value-input engines in a later serialized binder step"
+    )]
+    ImportEquals(ImportEqualsTarget),
+}
+
+/// Pattern-projection step mirroring the existing binding-projection
+/// semantics, including source-order defaults.
+#[expect(
+    dead_code,
+    reason = "projected by the WP-DEMAND leaf engines in a later serialized binder step"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectionStep {
+    Property(Box<str>),
+    Element(usize),
+    ObjectRest(Box<[Box<str>]>),
+    ArrayRest(usize),
+    Default(NodeId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FunctionProtocol {
+    pub is_async: bool,
+    pub is_generator: bool,
+    pub annotated_return: Option<NodeId>,
+}
+
+/// Return/yield sites of one callable body, from syntax only. Site points are
+/// recorded at `Exit` (returns) / `Primary` (yields); `build_program_flow`
+/// interns every recorded point.
+#[derive(Clone, Debug)]
+pub(crate) struct ReturnYieldInventory {
+    #[expect(
+        dead_code,
+        reason = "read by the WP-DEMAND return/yield engines in a later serialized binder step"
+    )]
+    pub body: NodeId,
+    #[expect(
+        dead_code,
+        reason = "read by the WP-DEMAND return/yield engines in a later serialized binder step"
+    )]
+    pub owner: DeclId,
+    pub protocol: FunctionProtocol,
+    pub returns: Vec<ReturnSite>,
+    #[expect(
+        dead_code,
+        reason = "read by the WP-DEMAND return/yield engines in a later serialized binder step"
+    )]
+    pub yields: Vec<YieldSite>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReturnSite {
+    pub point: ExecutionPoint,
+    pub expression: Option<NodeId>,
+    pub range: TextRange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct YieldSite {
+    pub point: ExecutionPoint,
+    pub expression: Option<NodeId>,
+    pub delegate: bool,
+    pub range: TextRange,
+}
+
+/// Canonical publication ordering key: determined by the source/check event
+/// inventory, never by forcing or buffer arrival.
+#[allow(
+    dead_code,
+    reason = "consumed by the WP-CHECK publication drain in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+pub(crate) struct PublicationOrder {
+    pub owner_position: crate::source::Utf16Pos,
+    pub source_event: u32,
+    pub producer_order: u16,
+    pub local_order: u32,
+}
+
+#[allow(
+    dead_code,
+    reason = "drained by the WP-CHECK publication path in a later serialized binder step"
+)]
+#[derive(Clone, Debug)]
+pub(crate) struct DeclarationFact {
+    pub owner: DeclId,
+    pub diagnostic: Diagnostic,
+    pub order: PublicationOrder,
+}
+
+/// One reserved or resolved source reference row. `events_by_node` is
+/// one-to-many: one syntax site can own lexical and reserved typed steps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReferenceEvent {
+    pub sequence: u32,
+    pub kind: ReferenceKind,
+    pub source: NodeId,
+    pub span: TextRange,
+    pub lexical_target: Option<DeclId>,
+    pub typed_target: Option<SymbolId>,
+    pub anchor: Option<PropertyAnchor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ReferenceKind {
+    Identifier,
+    #[expect(
+        dead_code,
+        reason = "recorded by the WP-LEX reference pass; WP-CHECK completion lands in a later serialized binder step"
+    )]
+    This,
+    #[expect(
+        dead_code,
+        reason = "recorded by the WP-LEX reference pass; WP-CHECK completion lands in a later serialized binder step"
+    )]
+    Super,
+    #[expect(
+        dead_code,
+        reason = "recorded by the WP-LEX reference pass; WP-CHECK completion lands in a later serialized binder step"
+    )]
+    ImportEquals,
+    #[expect(
+        dead_code,
+        reason = "recorded by the WP-LEX reference pass; WP-CHECK completion lands in a later serialized binder step"
+    )]
+    EnumMember,
+    #[expect(
+        dead_code,
+        reason = "recorded by the WP-LEX reference pass; WP-CHECK completion lands in a later serialized binder step"
+    )]
+    Member,
+}
+
+#[allow(
+    dead_code,
+    reason = "stage-A reservations; check-plane completion lands in the WP-CHECK step"
+)]
+#[derive(Debug, Default)]
+pub(crate) struct ReferenceIndex {
+    pub events: Vec<ReferenceEvent>,
+    pub events_by_node: HashMap<NodeId, Vec<u32>>,
+    /// Symbol-valued lexical alias map shared by `EnumBindingView` and query
+    /// resolution; an alias `SymbolId` maps to contributors only through
+    /// [`Binder::contributors_of`].
+    pub lexical_symbols: HashMap<NodeId, SymbolId>,
+    pub reference_aliases: HashMap<NodeId, SymbolId>,
+    pub namespace_reference_blocks: HashMap<NodeId, DeclId>,
+    pub enum_member_identifier_uses: HashSet<NodeId>,
+}
+
+// Imported-enum scalar bootstrap seam (WP-SEAM coordination). `checker.rs`
+// constructs these views over retained lexical `Binder`s before any typed
+// checking; the view never enters `SemanticModel`.
+
+/// Shallow lexical read view over one retained `Binder`, consumed by the
+/// existing enum scalar solver during the bootstrap interval.
+#[derive(Clone, Copy)]
+pub(crate) struct EnumBindingView<'a> {
+    pub scopes: &'a [Scope],
+    pub symbols: &'a [Symbol],
+    pub module_scope: ScopeId,
+    pub references: &'a HashMap<NodeId, SymbolId>,
+    pub reference_aliases: &'a HashMap<NodeId, SymbolId>,
+}
+
+/// Imported type/scalar inputs for the typed continuation. The scalar map is
+/// borrowed for the bind invocation; it is never cloned into symbol records
+/// or retained in `SemanticModel`.
+#[derive(Clone, Copy)]
+#[expect(
+    dead_code,
+    reason = "consumed by the checker bootstrap continuation in a later serialized binder step"
+)]
+pub(crate) struct ImportedSourceInputs<'input, 'model> {
+    pub symbol_types: &'input [ImportedSymbolType<'model>],
+    pub enum_scalars: Option<&'input HashMap<NodeId, enum_plan::ImportedConstEnumValue>>,
 }
 
 /// Whether the file is an external module: it carries a top-level `import` or
@@ -4954,9 +5765,14 @@ impl SemanticModel {
 /// whose `super()` call has been guaranteed on every path so far, or in
 /// a context (nested function-like, non-derived body) where the
 /// before-super rules do not apply.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Default, PartialEq)]
 enum SuperFlow {
-    Tracking { called: bool },
+    Tracking {
+        called: bool,
+    },
+    /// No super-tracking window is open: the neutral state a legacy
+    /// sub-evaluation starts from when its flow context is taken away.
+    #[default]
     Suspended,
 }
 
@@ -5045,16 +5861,18 @@ struct ReturnContext {
     generator_protocol: Option<ForOfMode>,
 }
 
-#[derive(Clone)]
-struct PendingConstraintCheck {
+/// Crate-visible so the frozen `pub`-field [`QueryFrame`] contract can carry it.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingConstraintCheck {
     argument: TypeId,
     parameter: SymbolId,
     substitution: InferredTypeArguments,
     range: TextRange,
 }
 
-#[derive(Clone, Copy)]
-enum TypeParameterDefaultState<'src> {
+/// Crate-visible so the frozen `pub`-field [`QueryFrame`] contract can carry it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TypeParameterDefaultState<'src> {
     Unresolved {
         node: &'src crate::syntax::Ty,
         scope: ScopeId,
@@ -5080,6 +5898,34 @@ pub(crate) struct Binder<'src> {
     interface_merges: HashMap<SymbolId, Vec<&'src InterfaceDeclaration>>,
     pub(crate) references: HashMap<NodeId, SymbolId>,
     reference_aliases: HashMap<NodeId, SymbolId>,
+    /// Bind-once source inventory and readiness state.  This remains private
+    /// to the preparation/continuation boundary; the legacy check path still
+    /// owns the public maps below until activation.
+    pub(crate) declaration_index: DeclarationIndex<'src>,
+    pub(crate) reference_index: ReferenceIndex,
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    lexical_bound: bool,
+    /// Demand scheduler state (WP-CTX / WP-DEMAND / WP-CHECK).
+    demand: DemandState<'src>,
+    /// Program control-flow graph built during typed continuation.
+    program_flow: Option<ProgramFlow>,
+    /// Enum scalar inputs installed from the checker bootstrap (cloned from
+    /// [`ImportedSourceInputs::enum_scalars`]). Never retained in [`SemanticModel`].
+    #[expect(
+        dead_code,
+        reason = "installed by the checker bootstrap; consumed at the WP-CHECK enum cutover"
+    )]
+    installed_enum_scalars: Option<HashMap<NodeId, enum_plan::ImportedConstEnumValue>>,
+    /// Raw, suppression-unconsumed diagnostics from the enum scalar install
+    /// path. Consumed by `finish` at the single program-level boundary.
+    installed_enum_diagnostics: Vec<Diagnostic>,
+    /// Pre-built enum facts when scalars were installed.
+    enum_facts: Option<EnumFacts>,
+    /// Selected-check publication buffer.
+    publication: CheckPublication,
     type_nodes: HashMap<NodeId, TypeId>,
     node_types: HashMap<NodeId, TypeId>,
     typed_expressions: Vec<(TextRange, TypeId)>,
@@ -5143,14 +5989,7 @@ pub(crate) struct Binder<'src> {
     imported_type_parameters: HashMap<SymbolId, Vec<SymbolId>>,
     imported_type_planes: HashMap<SymbolId, TypeId>,
     hoisted_declaration_symbols: HashMap<HoistedDeclarationIdentity, SymbolId>,
-    /// JSX expression node → checked element result type, recorded by
-    /// [`super::jsx`] during expression resolution.
-    pub(crate) jsx_element_types: HashMap<NodeId, TypeId>,
-    /// Callable declarations (function declarations, function/arrow
-    /// initializers) by symbol, so [`super::jsx`] can factory-check
-    /// value-based JSX elements whose symbol type stays `any`.
-    pub(crate) jsx_callables: HashMap<SymbolId, JsxCallable<'src>>,
-    pub(crate) jsx_factory_signatures: HashMap<SymbolId, JsxFactorySignature>,
+    /// Legacy JSX side tables removed: demand-side JSX lives in `super::jsx`.
     /// Class instance structural types keyed by the class symbol, built lazily
     /// during class-body resolution so `new C()` and member access on class-typed
     /// values can resolve declared instance members.
@@ -5309,6 +6148,15 @@ impl<'src> Binder<'src> {
             interface_merges: HashMap::new(),
             references: HashMap::new(),
             reference_aliases: HashMap::new(),
+            declaration_index: DeclarationIndex::default(),
+            reference_index: ReferenceIndex::default(),
+            lexical_bound: false,
+            demand: DemandState::new(),
+            program_flow: None,
+            installed_enum_scalars: None,
+            enum_facts: None,
+            installed_enum_diagnostics: Vec::new(),
+            publication: CheckPublication::default(),
             type_nodes: HashMap::new(),
             node_types: HashMap::new(),
             typed_expressions: Vec::new(),
@@ -5366,9 +6214,7 @@ impl<'src> Binder<'src> {
             class_owner_stack: Vec::new(),
             class_base_symbols: HashMap::new(),
             super_member_homes: Vec::new(),
-            jsx_element_types: HashMap::new(),
-            jsx_callables: HashMap::new(),
-            jsx_factory_signatures: HashMap::new(),
+            // demand-side JSX state lives in QueryFrame entries and super::jsx.
             reassigned_flow_roots: HashSet::new(),
             reassigned_flow_roots_stack: Vec::new(),
             super_call_contexts: Vec::new(),
@@ -5431,14 +6277,2302 @@ impl<'src> Binder<'src> {
         binder.cancel = Some(cancel);
         binder
     }
+    // -- bind-once lexical preparation ---------------------------------------
+
+    /// Builds the source-owned declaration/reference inventory exactly once.
+    ///
+    /// This path deliberately does not call `declare`, `emit`, `finish`, or
+    /// any public projection.  It reserves syntax identities and records
+    /// declaration facts for the later selected-check drain.
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    pub(crate) fn bind_all(&mut self) -> Result<(), super::CheckCancelled> {
+        if self.lexical_bound {
+            return self.ensure_lexical_ready(self.module_scope);
+        }
+
+        self.check_cancel()?;
+        self.declaration_index
+            .lexical_state
+            .insert(self.module_scope, LexicalReadiness::Binding);
+        self.declaration_index
+            .lexical_state
+            .insert(self.global_scope, LexicalReadiness::Binding);
+
+        self.reserve_statements(
+            self.source.statements(),
+            self.module_scope,
+            None,
+            ReceiverKind::None,
+            None,
+        )?;
+        self.check_cancel()?;
+        self.lexical_bound = true;
+        self.ensure_lexical_ready(self.module_scope)
+    }
+
+    /// Completes the lexical readiness barrier for `scope` and all visible
+    /// enclosing/merged scopes.  `Binding` is never exposed as read-ready.
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    pub(crate) fn ensure_lexical_ready(
+        &mut self,
+        scope: ScopeId,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        let mut chain = Vec::new();
+        let mut current = Some(scope);
+        while let Some(scope) = current {
+            self.declaration_index
+                .lexical_state
+                .entry(scope)
+                .or_insert(LexicalReadiness::Reserved);
+            if !matches!(
+                self.declaration_index.lexical_state.get(&scope),
+                Some(LexicalReadiness::Ready)
+            ) {
+                self.declaration_index
+                    .lexical_state
+                    .insert(scope, LexicalReadiness::Binding);
+                chain.push(scope);
+            }
+            current = self
+                .scopes
+                .get(scope.get() as usize)
+                .and_then(|scope| scope.parent);
+        }
+        for scope in chain.into_iter().rev() {
+            self.declaration_index
+                .lexical_state
+                .insert(scope, LexicalReadiness::Ready);
+            if let Some(merged) = self.declaration_index.merged_scopes.get(&scope).cloned() {
+                for merged_scope in merged {
+                    self.declaration_index
+                        .lexical_state
+                        .insert(merged_scope, LexicalReadiness::Ready);
+                }
+            }
+        }
+        self.check_cancel()
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    pub(crate) fn contributors_of(&self, symbol: SymbolId) -> &[DeclId] {
+        self.declaration_index
+            .symbol_to_contributor
+            .get(&symbol)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub(crate) fn slot_context(&self, node: NodeId) -> Option<SlotContext> {
+        self.declaration_index.contexts.get(&node).copied()
+    }
+
+    /// The slot context for one selected expression: the reservation-time
+    /// context when bound, else the live walk state. JSX wrappers that never
+    /// bound inventory must still check through the scheduler, never skip.
+    fn selected_slot_context(&self, node: NodeId, scope: ScopeId) -> SlotContext {
+        self.slot_context(node).unwrap_or_else(|| SlotContext {
+            scope,
+            point: ExecutionPoint {
+                node,
+                boundary: ExecutionBoundary::Primary,
+            },
+            receiver: ReceiverKind::None,
+            function_body: self.function_body_stack.last().copied(),
+            ambient: self.ambient_binding,
+        })
+    }
+
+    /// The reference pass is idempotent: `bind_all` records the source rows,
+    /// while callers that enter through the narrower reference boundary still
+    /// obtain the same readiness guarantee.
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    pub(crate) fn bind_lexical_references(
+        &mut self,
+        scope: ScopeId,
+    ) -> Result<(), super::CheckCancelled> {
+        if !self.lexical_bound {
+            self.bind_all()?;
+        }
+        self.ensure_lexical_ready(scope)
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn reserve_symbol(
+        &mut self,
+        name: &str,
+        kind: SymbolKind,
+        scope: ScopeId,
+        declaration: NodeId,
+        range: TextRange,
+    ) -> SymbolId {
+        let scope = if matches!(
+            kind,
+            SymbolKind::Variable(VariableKind::Var) | SymbolKind::Function
+        ) {
+            self.value_hoist_scope(scope)
+        } else {
+            scope
+        };
+        let merge = self.scopes[scope.get() as usize]
+            .values
+            .get(name)
+            .copied()
+            .filter(|existing| {
+                kind.occupies_value()
+                    && self.symbols[existing.get() as usize]
+                        .kind
+                        .accepts_value_merge_from(kind)
+            })
+            .or_else(|| {
+                self.scopes[scope.get() as usize]
+                    .types
+                    .get(name)
+                    .copied()
+                    .filter(|existing| {
+                        kind.occupies_type()
+                            && self.symbols[existing.get() as usize]
+                                .kind
+                                .accepts_type_merge_from(kind)
+                    })
+            });
+        if let Some(existing) = merge {
+            return existing;
+        }
+
+        let id = SymbolId(u32::try_from(self.symbols.len()).expect("symbol count fits in u32"));
+        let parent = self.scopes[scope.get() as usize].owner;
+        self.symbols.push(Symbol {
+            name: name.to_owned(),
+            kind,
+            scope,
+            declaration,
+            range,
+            parent,
+        });
+        // The typed continuation replaces this provisional storage before any
+        // value is exposed.  No TypeTable lookup occurs during preparation.
+        self.symbol_types.push(TypeId(0));
+        self.overload_signatures.push(Vec::new());
+        self.type_state.push(TypeState::Unresolved);
+
+        let value_conflict = kind
+            .occupies_value()
+            .then(|| self.insert_value(scope, name, id, kind))
+            .flatten();
+        let type_conflict = kind
+            .occupies_type()
+            .then(|| self.insert_type(scope, name, id, kind))
+            .flatten();
+        if let Some(existing) = value_conflict.or(type_conflict) {
+            let existing_kind = self.symbols[existing.get() as usize].kind;
+            let (code, message) =
+                if existing_kind == SymbolKind::Import || kind == SymbolKind::Import {
+                    (
+                        IMPORT_CONFLICTS_WITH_LOCAL,
+                        IMPORT_CONFLICTS_WITH_LOCAL_MESSAGE,
+                    )
+                } else {
+                    (DUPLICATE_DECLARATION, DUPLICATE_MESSAGE)
+                };
+            self.record_declaration_fact(code, range, message);
+        }
+        if !self.is_module
+            && scope == self.module_scope
+            && matches!(name, "globalThis" | "undefined")
+            && !(name == "undefined" && matches!(kind, SymbolKind::Class | SymbolKind::Interface))
+        {
+            self.record_declaration_fact(
+                DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL,
+                range,
+                DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL_MESSAGE,
+            );
+        }
+        id
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn record_declaration_fact(
+        &mut self,
+        code: DiagnosticCode,
+        range: TextRange,
+        message: &'static str,
+    ) {
+        let local_order = self.declaration_index.facts.len() as u32;
+        self.declaration_index.facts.push(DeclarationFact {
+            owner: DeclId::next(local_order),
+            diagnostic: Diagnostic::error(code, self.source.source_id(), range, message),
+            order: PublicationOrder {
+                owner_position: range.start(),
+                source_event: local_order,
+                producer_order: 0,
+                local_order,
+            },
+        });
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    #[expect(clippy::too_many_arguments)]
+    fn reserve_contributor(
+        &mut self,
+        node: NodeId,
+        symbol: Option<SymbolId>,
+        parent: Option<DeclId>,
+        kind: ContributorKind,
+        facets: Vec<Facet>,
+        context: SlotContext,
+        diagnostic_anchor: TextRange,
+    ) -> DeclId {
+        if let Some(ids) = self
+            .declaration_index
+            .contributor_by_node
+            .get(&node)
+            .cloned()
+            && let Some(existing) = ids.into_iter().find(|id| {
+                self.declaration_index
+                    .contributors
+                    .get(id.get() as usize)
+                    .is_some_and(|contributor| {
+                        contributor.kind == kind
+                            && contributor.symbol == symbol
+                            && contributor.parent == parent
+                    })
+            })
+        {
+            return existing;
+        }
+        let id = self.declaration_index.allocate_decl_id();
+        self.declaration_index.contributors.push(Contributor {
+            id,
+            node,
+            symbol,
+            parent,
+            kind,
+            facets,
+            context,
+            diagnostic_anchor,
+        });
+        self.declaration_index
+            .contributor_by_node
+            .entry(node)
+            .or_default()
+            .push(id);
+        if let Some(symbol) = symbol {
+            self.declaration_index
+                .symbol_to_contributor
+                .entry(symbol)
+                .or_default()
+                .push(id);
+        }
+        self.declaration_index
+            .contexts
+            .entry(node)
+            .or_insert(context);
+        id
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn reserve_reference(
+        &mut self,
+        kind: ReferenceKind,
+        source: NodeId,
+        span: TextRange,
+        lexical_target: Option<DeclId>,
+        typed_target: Option<SymbolId>,
+        anchor: Option<PropertyAnchor>,
+    ) {
+        if let Some(events) = self.reference_index.events_by_node.get(&source)
+            && events.iter().any(|index| {
+                self.reference_index
+                    .events
+                    .get(*index as usize)
+                    .is_some_and(|event| event.kind == kind && event.span == span)
+            })
+        {
+            return;
+        }
+        let sequence = self.reference_index.events.len() as u32;
+        self.reference_index.events.push(ReferenceEvent {
+            sequence,
+            kind,
+            source,
+            span,
+            lexical_target,
+            typed_target,
+            anchor,
+        });
+        self.reference_index
+            .events_by_node
+            .entry(source)
+            .or_default()
+            .push(sequence);
+    }
+
+    /// Constructs the lexical bootstrap binder.  It deliberately returns the
+    /// retained binder instead of a `SemanticModel`; typed continuation is the
+    /// only path allowed to finish/publicly project it.
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    pub(crate) fn prepare_source_with_environment_and_cancel(
+        source: &'src SourceFile,
+        environment: GlobalEnvironment,
+        is_module: bool,
+        options: ProgramCheckOptions,
+        cancel: bamts_cancel::CancellationToken,
+    ) -> Result<Self, super::CheckCancelled> {
+        let mut binder =
+            Self::with_environment_and_cancel(source, environment, is_module, options, cancel);
+        binder.bind_all()?;
+        binder.bind_lexical_references(binder.module_scope)?;
+        Ok(binder)
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    pub(crate) fn enum_binding_view(&self) -> EnumBindingView<'_> {
+        EnumBindingView {
+            scopes: &self.scopes,
+            symbols: &self.symbols,
+            module_scope: self.module_scope,
+            references: &self.reference_index.lexical_symbols,
+            reference_aliases: &self.reference_index.reference_aliases,
+        }
+    }
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    /// Continues a prepared binder without invoking the lexical preparation
+    /// pass again.  Imported enum scalars remain borrowed at this boundary;
+    /// the program seam consumes them before final model publication.
+    pub(crate) fn resolve_bound_source_with_cancel(
+        &mut self,
+        imported: ImportedSourceInputs<'_, '_>,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        self.ensure_lexical_ready(self.module_scope)?;
+        if let Some(scalars) = imported.enum_scalars {
+            self.installed_enum_scalars = Some(scalars.clone());
+            let (enum_facts, diagnostics) = self.build_enum_facts_from_inventory(scalars);
+            self.enum_facts = Some(enum_facts);
+            // Suppression is consumed once, at the single program-level
+            // boundary in `finish`; stash raw here to avoid an early or
+            // duplicate consumption pass.
+            self.installed_enum_diagnostics.extend(diagnostics);
+        }
+        let statements = self.source.statements();
+        let scope = self.module_scope;
+        let mut imported_by_source = HashMap::<*const TypeTable, ImportedTypeMap>::new();
+        let mut models_by_source = HashMap::<*const TypeTable, &SemanticModel>::new();
+        let mut next_imported_symbol =
+            u32::try_from(self.symbols.len()).expect("symbol count fits in u32");
+        for input in imported.symbol_types {
+            self.check_cancel()?;
+            let source_types = input.source_model.types();
+            let source_key = std::ptr::from_ref(source_types);
+            models_by_source
+                .entry(source_key)
+                .or_insert(input.source_model);
+            let identities = imported_by_source.entry(source_key).or_default();
+            let (value_type_id, type_parameters) = self.types.import_type(
+                source_types,
+                input.value_type_id,
+                input.type_parameters,
+                identities,
+                &mut next_imported_symbol,
+            );
+            if !type_parameters.is_empty() {
+                self.imported_type_parameters
+                    .insert(input.symbol, type_parameters);
+            }
+            if let Some(source_type_id) = input.type_plane_id {
+                let (type_id, _) = self.types.import_type(
+                    source_types,
+                    source_type_id,
+                    input.type_parameters,
+                    identities,
+                    &mut next_imported_symbol,
+                );
+                self.imported_type_planes.insert(input.symbol, type_id);
+            }
+            if let Some(slot) = self.symbol_types.get_mut(input.symbol.get() as usize) {
+                *slot = value_type_id;
+            }
+            if let Some(slot) = self.type_state.get_mut(input.symbol.get() as usize) {
+                *slot = TypeState::Done(value_type_id);
+            }
+        }
+        self.materialize_imported_symbols(
+            &mut imported_by_source,
+            &models_by_source,
+            &mut next_imported_symbol,
+        )?;
+        self.resolve_statement_class_bounds(statements);
+        self.check_cancel()?;
+        self.build_program_flow()?;
+        self.resolve_statements(statements, scope);
+        self.check_cancel()?;
+        self.validate_pending_constraints();
+        self.validate_alias_cycles();
+        self.check_export_assignment_conflicts();
+        Ok(())
+    }
 
     /// Returns `Err(CheckCancelled)` when the cancellation token has been
     /// triggered, `Ok(())` otherwise. No-op when no token is installed.
-    fn check_cancel(&self) -> Result<(), super::CheckCancelled> {
-        match &self.cancel {
-            Some(token) => token.check().map_err(super::CheckCancelled::from),
-            None => Ok(()),
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn reserve_statements(
+        &mut self,
+        statements: &'src [crate::syntax::Stmt],
+        scope: ScopeId,
+        parent: Option<DeclId>,
+        receiver: ReceiverKind,
+        function_body: Option<NodeId>,
+    ) -> Result<(), super::CheckCancelled> {
+        for statement in statements {
+            self.check_cancel()?;
+            self.reserve_statement(statement, scope, parent, receiver, function_body)?;
         }
+        Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn reserve_statement(
+        &mut self,
+        statement: &'src crate::syntax::Stmt,
+        scope: ScopeId,
+        parent: Option<DeclId>,
+        receiver: ReceiverKind,
+        function_body: Option<NodeId>,
+    ) -> Result<(), super::CheckCancelled> {
+        let context = |binder: &Self, node: NodeId| SlotContext {
+            scope,
+            point: ExecutionPoint {
+                node,
+                boundary: ExecutionBoundary::Primary,
+            },
+            receiver,
+            function_body,
+            ambient: binder.ambient_binding,
+        };
+        match statement.data() {
+            Statement::Variable(variable) => {
+                for declarator in &variable.declarations {
+                    let initializer = declarator.data().initializer.as_deref();
+                    let annotation = declarator
+                        .data()
+                        .type_annotation
+                        .as_ref()
+                        .map(|annotation| annotation.data().type_node.as_ref());
+                    self.reserve_pattern(
+                        &declarator.data().binding,
+                        variable.kind,
+                        scope,
+                        parent,
+                        ContributorKind::Declarator,
+                        annotation,
+                        initializer,
+                    )?;
+                    if let Some(initializer) = initializer {
+                        self.reserve_expr(initializer, scope, parent, receiver, function_body)?;
+                    }
+                    if let Some(annotation) = annotation {
+                        self.declaration_index
+                            .type_syntax
+                            .insert(annotation.id(), annotation);
+                    }
+                }
+            }
+            Statement::Function(function) => {
+                self.reserve_function_like(
+                    &function.function,
+                    CallableSource::Function(&function.function),
+                    statement.id(),
+                    scope,
+                    parent,
+                    receiver,
+                )?;
+            }
+            Statement::Class(class) => {
+                self.reserve_class(class, statement.id(), scope, parent, receiver)?;
+            }
+            Statement::Interface(interface) => {
+                self.reserve_interface(interface, statement.id(), scope, parent)?;
+            }
+            Statement::TypeAlias(alias) => {
+                let symbol = self.reserve_symbol(
+                    &self.identifier_text(&alias.name),
+                    SymbolKind::TypeAlias,
+                    scope,
+                    statement.id(),
+                    alias.name.range(),
+                );
+                let id = self.reserve_contributor(
+                    statement.id(),
+                    Some(symbol),
+                    parent,
+                    ContributorKind::TypeAlias,
+                    vec![Facet::SignatureHeader],
+                    context(self, statement.id()),
+                    alias.name.range(),
+                );
+                self.declaration_index
+                    .type_syntax
+                    .insert(alias.type_node.id(), alias.type_node.as_ref());
+                self.declaration_index
+                    .value_inputs
+                    .insert(id, ValueInput::Installed(TypeId(0)));
+            }
+            Statement::Enum(declaration) => {
+                let symbol = self.reserve_symbol(
+                    &self.identifier_text(&declaration.name),
+                    SymbolKind::Enum,
+                    scope,
+                    statement.id(),
+                    declaration.name.range(),
+                );
+                let id = self.reserve_contributor(
+                    statement.id(),
+                    Some(symbol),
+                    parent,
+                    ContributorKind::EnumContainer,
+                    vec![Facet::ContainerIdentity],
+                    context(self, statement.id()),
+                    declaration.name.range(),
+                );
+                let member_scope = self.new_scope(ScopeKind::Block, Some(scope));
+                self.declaration_index
+                    .node_scopes
+                    .insert(statement.id(), member_scope);
+                self.declaration_index
+                    .lexical_state
+                    .insert(member_scope, LexicalReadiness::Binding);
+                self.declaration_index
+                    .merged_scopes
+                    .entry(member_scope)
+                    .or_default();
+                for member in &declaration.members {
+                    let Some(name) = self.property_key(&member.data().name) else {
+                        continue;
+                    };
+                    let member_symbol = self.reserve_symbol(
+                        &name,
+                        SymbolKind::EnumMember,
+                        member_scope,
+                        member.id(),
+                        member.range(),
+                    );
+                    let member_id = self.reserve_contributor(
+                        member.id(),
+                        Some(member_symbol),
+                        Some(id),
+                        ContributorKind::EnumMember,
+                        vec![Facet::Initializer],
+                        SlotContext {
+                            scope: member_scope,
+                            point: ExecutionPoint {
+                                node: member.id(),
+                                boundary: ExecutionBoundary::Primary,
+                            },
+                            receiver: ReceiverKind::None,
+                            function_body: None,
+                            ambient: self.ambient_binding,
+                        },
+                        member.range(),
+                    );
+                    if let Some(initializer) = &member.data().initializer {
+                        self.reserve_expr(
+                            initializer,
+                            member_scope,
+                            Some(member_id),
+                            ReceiverKind::None,
+                            None,
+                        )?;
+                    }
+                }
+            }
+            Statement::Namespace(namespace) => {
+                if let Some(name) = namespace.name.as_identifier() {
+                    let symbol = self.reserve_symbol(
+                        &self.identifier_text(name),
+                        SymbolKind::Namespace,
+                        scope,
+                        statement.id(),
+                        name.range(),
+                    );
+                    let id = self.reserve_contributor(
+                        statement.id(),
+                        Some(symbol),
+                        parent,
+                        ContributorKind::Namespace,
+                        vec![Facet::ContainerIdentity],
+                        context(self, statement.id()),
+                        name.range(),
+                    );
+                    let namespace_scope = self.new_scope(ScopeKind::Namespace, Some(scope));
+                    self.declaration_index
+                        .node_scopes
+                        .insert(statement.id(), namespace_scope);
+                    self.declaration_index
+                        .lexical_state
+                        .insert(namespace_scope, LexicalReadiness::Binding);
+                    self.reserve_statements(
+                        &namespace.body.data().statements,
+                        namespace_scope,
+                        Some(id),
+                        receiver,
+                        function_body,
+                    )?;
+                }
+            }
+            Statement::Import(import) => {
+                if let Some(clause) = &import.clause {
+                    if let Some(default) = &clause.default {
+                        self.reserve_import_name(
+                            default,
+                            scope,
+                            statement.id(),
+                            parent,
+                            import.type_only,
+                        );
+                    }
+                    if let Some(binding) = &clause.binding {
+                        match binding {
+                            crate::syntax::ImportBinding::Namespace(name) => self
+                                .reserve_import_name(
+                                    name,
+                                    scope,
+                                    statement.id(),
+                                    parent,
+                                    import.type_only,
+                                ),
+                            crate::syntax::ImportBinding::Named(specifiers) => {
+                                for specifier in specifiers {
+                                    self.reserve_import_name(
+                                        &specifier.data().local,
+                                        scope,
+                                        specifier.id(),
+                                        parent,
+                                        import.type_only
+                                            || matches!(
+                                                specifier.data().mode,
+                                                crate::syntax::ImportSpecifierMode::TypeOnly
+                                            ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Statement::ImportEquals(import) => {
+                let symbol = self.reserve_symbol(
+                    &self.identifier_text(&import.local),
+                    SymbolKind::Import,
+                    scope,
+                    statement.id(),
+                    statement.range(),
+                );
+                self.reserve_contributor(
+                    statement.id(),
+                    Some(symbol),
+                    parent,
+                    ContributorKind::ImportEquals,
+                    if import.is_type_only {
+                        vec![Facet::SignatureHeader]
+                    } else {
+                        vec![Facet::ContainerIdentity, Facet::Initializer]
+                    },
+                    context(self, statement.id()),
+                    statement.range(),
+                );
+            }
+            Statement::Declare(inner) => {
+                let saved = self.ambient_binding;
+                self.ambient_binding = true;
+                self.reserve_statement(inner, scope, parent, receiver, function_body)?;
+                self.ambient_binding = saved;
+            }
+            Statement::Export(export) => match export {
+                crate::syntax::ExportDeclaration::Named(
+                    crate::syntax::ExportNamedDeclaration::Declaration(inner),
+                ) => self.reserve_statement(inner, scope, parent, receiver, function_body)?,
+                crate::syntax::ExportDeclaration::Default(default) => match &default.value {
+                    crate::syntax::ExportDefaultValue::Function(function) => self
+                        .reserve_function_like(
+                            function,
+                            CallableSource::Function(function),
+                            statement.id(),
+                            scope,
+                            parent,
+                            receiver,
+                        )?,
+                    crate::syntax::ExportDefaultValue::Class(class) => {
+                        self.reserve_class(class, statement.id(), scope, parent, receiver)?
+                    }
+                    crate::syntax::ExportDefaultValue::Interface(interface) => {
+                        self.reserve_interface(interface, statement.id(), scope, parent)?
+                    }
+                    crate::syntax::ExportDefaultValue::Expression(expression) => {
+                        self.reserve_expr(expression, scope, parent, receiver, function_body)?
+                    }
+                    crate::syntax::ExportDefaultValue::Missing(_) => {}
+                },
+                crate::syntax::ExportDeclaration::Assignment(expression) => {
+                    self.reserve_expr(expression, scope, parent, receiver, function_body)?
+                }
+                _ => {}
+            },
+            Statement::Block(block) => {
+                let child = self.new_scope(ScopeKind::Block, Some(scope));
+                self.declaration_index
+                    .node_scopes
+                    .insert(statement.id(), child);
+                self.declaration_index
+                    .lexical_state
+                    .insert(child, LexicalReadiness::Binding);
+                self.reserve_statements(
+                    &block.data().statements,
+                    child,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+            }
+            Statement::Expression(expression) => {
+                self.reserve_expr(
+                    &expression.expression,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+            }
+            Statement::If(if_statement) => {
+                self.reserve_expr(&if_statement.test, scope, parent, receiver, function_body)?;
+                self.reserve_statement(
+                    &if_statement.consequent,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+                if let Some(alternate) = &if_statement.alternate {
+                    self.reserve_statement(alternate, scope, parent, receiver, function_body)?;
+                }
+            }
+            Statement::Switch(switch_statement) => {
+                self.reserve_expr(
+                    &switch_statement.discriminant,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+                for case in &switch_statement.cases {
+                    if let Some(test) = &case.data().test {
+                        self.reserve_expr(test, scope, parent, receiver, function_body)?;
+                    }
+                    self.reserve_statements(
+                        &case.data().consequent,
+                        scope,
+                        parent,
+                        receiver,
+                        function_body,
+                    )?;
+                }
+            }
+            Statement::For(for_statement) => {
+                if let Some(initializer) = &for_statement.initializer {
+                    match initializer {
+                        crate::syntax::ForInitializer::Variable(variable) => {
+                            self.reserve_variable(variable, scope, parent, receiver, function_body)?
+                        }
+                        crate::syntax::ForInitializer::Expression(expression) => {
+                            self.reserve_expr(expression, scope, parent, receiver, function_body)?
+                        }
+                    }
+                }
+                if let Some(test) = &for_statement.test {
+                    self.reserve_expr(test, scope, parent, receiver, function_body)?;
+                }
+                if let Some(update) = &for_statement.update {
+                    self.reserve_expr(update, scope, parent, receiver, function_body)?;
+                }
+                self.reserve_statement(
+                    &for_statement.body,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+            }
+            Statement::ForIn(for_statement) => {
+                self.reserve_for_binding(
+                    &for_statement.binding,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+                self.reserve_expr(
+                    &for_statement.object,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+                self.reserve_statement(
+                    &for_statement.body,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+            }
+            Statement::ForOf(for_statement) => {
+                self.reserve_for_binding(
+                    &for_statement.binding,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+                self.reserve_expr(
+                    &for_statement.iterable,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+                self.reserve_statement(
+                    &for_statement.body,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+            }
+            Statement::While(statement) => {
+                self.reserve_expr(&statement.test, scope, parent, receiver, function_body)?;
+                self.reserve_statement(&statement.body, scope, parent, receiver, function_body)?;
+            }
+            Statement::DoWhile(statement) => {
+                self.reserve_statement(&statement.body, scope, parent, receiver, function_body)?;
+                self.reserve_expr(&statement.test, scope, parent, receiver, function_body)?;
+            }
+            Statement::Try(statement) => {
+                self.reserve_statements(
+                    &statement.block.data().statements,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+                if let Some(handler) = &statement.handler {
+                    if let Some(binding) = &handler.data().binding {
+                        self.reserve_pattern(
+                            binding,
+                            VariableKind::Let,
+                            scope,
+                            parent,
+                            ContributorKind::DestructuredLeaf,
+                            None,
+                            None,
+                        )?;
+                    }
+                    self.reserve_statements(
+                        &handler.data().body.data().statements,
+                        scope,
+                        parent,
+                        receiver,
+                        function_body,
+                    )?;
+                }
+                if let Some(finalizer) = &statement.finalizer {
+                    self.reserve_statements(
+                        &finalizer.data().statements,
+                        scope,
+                        parent,
+                        receiver,
+                        function_body,
+                    )?;
+                }
+            }
+            Statement::With(statement) => {
+                self.reserve_expr(&statement.object, scope, parent, receiver, function_body)?;
+                self.reserve_statement(&statement.body, scope, parent, receiver, function_body)?;
+            }
+            Statement::Labeled(statement) => {
+                self.reserve_statement(&statement.body, scope, parent, receiver, function_body)?
+            }
+            Statement::Return(statement) => {
+                if let Some(argument) = &statement.argument {
+                    self.reserve_expr(argument, scope, parent, receiver, function_body)?;
+                }
+            }
+            Statement::Throw(statement) => {
+                self.reserve_expr(&statement.argument, scope, parent, receiver, function_body)?
+            }
+            Statement::Empty
+            | Statement::Break(_)
+            | Statement::Continue(_)
+            | Statement::Debugger
+            | Statement::Missing(_) => {}
+        }
+        Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn reserve_import_name(
+        &mut self,
+        name: &IdentifierNode,
+        scope: ScopeId,
+        declaration: NodeId,
+        parent: Option<DeclId>,
+        type_only: bool,
+    ) {
+        let symbol = self.reserve_symbol(
+            &self.identifier_text(name),
+            SymbolKind::Import,
+            scope,
+            declaration,
+            name.range(),
+        );
+        let kind = if type_only {
+            ContributorKind::TypeAlias
+        } else {
+            ContributorKind::ImportedValue
+        };
+        let facets = if type_only {
+            vec![Facet::SignatureHeader]
+        } else {
+            vec![Facet::Initializer]
+        };
+        let context = SlotContext {
+            scope,
+            point: ExecutionPoint {
+                node: declaration,
+                boundary: ExecutionBoundary::Entry,
+            },
+            receiver: ReceiverKind::None,
+            function_body: None,
+            ambient: self.ambient_binding,
+        };
+        self.reserve_contributor(
+            declaration,
+            Some(symbol),
+            parent,
+            kind,
+            facets,
+            context,
+            name.range(),
+        );
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn reserve_variable(
+        &mut self,
+        variable: &'src VariableDeclaration,
+        scope: ScopeId,
+        parent: Option<DeclId>,
+        receiver: ReceiverKind,
+        function_body: Option<NodeId>,
+    ) -> Result<(), super::CheckCancelled> {
+        for declarator in &variable.declarations {
+            let initializer = declarator.data().initializer.as_deref();
+            let annotation = declarator
+                .data()
+                .type_annotation
+                .as_ref()
+                .map(|annotation| annotation.data().type_node.as_ref());
+            self.reserve_pattern(
+                &declarator.data().binding,
+                variable.kind,
+                scope,
+                parent,
+                ContributorKind::Declarator,
+                annotation,
+                initializer,
+            )?;
+            if let Some(initializer) = initializer {
+                self.reserve_expr(initializer, scope, parent, receiver, function_body)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn reserve_for_binding(
+        &mut self,
+        binding: &'src crate::syntax::ForBinding,
+        scope: ScopeId,
+        parent: Option<DeclId>,
+        receiver: ReceiverKind,
+        function_body: Option<NodeId>,
+    ) -> Result<(), super::CheckCancelled> {
+        match binding {
+            crate::syntax::ForBinding::Variable(variable) => {
+                self.reserve_variable(variable, scope, parent, receiver, function_body)
+            }
+            crate::syntax::ForBinding::Target(target) => {
+                self.reserve_assignment_target(target, scope, parent, receiver, function_body)
+            }
+        }
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    #[expect(clippy::too_many_arguments)]
+    fn reserve_pattern(
+        &mut self,
+        pattern: &'src crate::syntax::Pattern,
+        kind: VariableKind,
+        scope: ScopeId,
+        parent: Option<DeclId>,
+        contributor_kind: ContributorKind,
+        annotation: Option<&'src Ty>,
+        initializer: Option<&'src Expr>,
+    ) -> Result<(), super::CheckCancelled> {
+        self.declaration_index
+            .node_scopes
+            .insert(pattern.id(), scope);
+        match pattern.data() {
+            BindingPattern::Identifier(identifier) => {
+                let symbol = self.reserve_symbol(
+                    &self.identifier_text(identifier),
+                    SymbolKind::Variable(kind),
+                    scope,
+                    pattern.id(),
+                    identifier.range(),
+                );
+                let mut facets = Vec::new();
+                if annotation.is_some() {
+                    facets.push(Facet::SignatureHeader);
+                }
+                if initializer.is_some() {
+                    facets.push(Facet::Initializer);
+                }
+                if facets.is_empty() {
+                    facets.push(Facet::Initializer);
+                }
+                let id = self.reserve_contributor(
+                    pattern.id(),
+                    Some(symbol),
+                    parent,
+                    contributor_kind,
+                    facets,
+                    SlotContext {
+                        scope,
+                        point: ExecutionPoint {
+                            node: pattern.id(),
+                            boundary: ExecutionBoundary::Entry,
+                        },
+                        receiver: ReceiverKind::None,
+                        function_body: None,
+                        ambient: self.ambient_binding,
+                    },
+                    identifier.range(),
+                );
+                self.declaration_index.value_inputs.insert(
+                    id,
+                    ValueInput::Binding {
+                        annotation,
+                        initializer,
+                        pattern,
+                        kind,
+                    },
+                );
+            }
+            BindingPattern::Object(object) => {
+                for property in &object.properties {
+                    if let Some(initializer) = &property.initializer {
+                        self.reserve_expr(initializer, scope, parent, ReceiverKind::None, None)?;
+                    }
+                    self.reserve_pattern(
+                        &property.binding,
+                        kind,
+                        scope,
+                        parent,
+                        ContributorKind::DestructuredLeaf,
+                        annotation,
+                        initializer,
+                    )?;
+                }
+            }
+            BindingPattern::Array(array) => {
+                for element in &array.elements {
+                    if let crate::syntax::ArrayBindingElement::Binding(binding) = element {
+                        self.reserve_pattern(
+                            binding,
+                            kind,
+                            scope,
+                            parent,
+                            ContributorKind::DestructuredLeaf,
+                            annotation,
+                            initializer,
+                        )?;
+                    }
+                }
+            }
+            BindingPattern::Rest(rest) => self.reserve_pattern(
+                &rest.argument,
+                kind,
+                scope,
+                parent,
+                ContributorKind::DestructuredLeaf,
+                annotation,
+                initializer,
+            )?,
+            BindingPattern::Assignment(assignment) => {
+                self.reserve_pattern(
+                    &assignment.left,
+                    kind,
+                    scope,
+                    parent,
+                    ContributorKind::DestructuredLeaf,
+                    annotation,
+                    initializer,
+                )?;
+                self.reserve_expr(&assignment.right, scope, parent, ReceiverKind::None, None)?;
+            }
+            BindingPattern::Missing(_) => {}
+        }
+        Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn reserve_function_like(
+        &mut self,
+        function: &'src FunctionLike,
+        source: CallableSource<'src>,
+        declaration: NodeId,
+        parent_scope: ScopeId,
+        parent: Option<DeclId>,
+        receiver: ReceiverKind,
+    ) -> Result<(), super::CheckCancelled> {
+        let symbol = function.name.as_ref().map(|name| {
+            self.reserve_symbol(
+                &self.identifier_text(name),
+                SymbolKind::Function,
+                parent_scope,
+                declaration,
+                name.range(),
+            )
+        });
+        let function_scope = self.new_scope(ScopeKind::Function, Some(parent_scope));
+        self.declaration_index
+            .node_scopes
+            .insert(declaration, function_scope);
+        self.declaration_index
+            .lexical_state
+            .insert(function_scope, LexicalReadiness::Binding);
+        let body = function.body.as_ref().and_then(FunctionBody::id);
+        let protocol = FunctionProtocol {
+            is_async: function.is_async,
+            is_generator: function.is_generator,
+            annotated_return: function
+                .return_type
+                .as_ref()
+                .map(|ty| ty.data().type_node.id()),
+        };
+        let context = SlotContext {
+            scope: parent_scope,
+            point: ExecutionPoint {
+                node: declaration,
+                boundary: ExecutionBoundary::Entry,
+            },
+            receiver,
+            function_body: body,
+            ambient: self.ambient_binding,
+        };
+        let owner = self.reserve_contributor(
+            declaration,
+            symbol,
+            parent,
+            if symbol.is_some() {
+                ContributorKind::Function
+            } else {
+                ContributorKind::AnonymousCallable
+            },
+            vec![Facet::SignatureHeader, Facet::InferredReturn],
+            context,
+            function
+                .name
+                .as_ref()
+                .map_or_else(NodeId::default_range, |name| name.range()),
+        );
+        self.declaration_index.callables.insert(
+            owner,
+            CallableInventory {
+                source,
+                parameter_scope: function_scope,
+                body,
+                protocol,
+                anchor: function.name.as_ref().map_or(
+                    CallableAnchor::FunctionKeyword(NodeId::default_range()),
+                    |name| CallableAnchor::Named(name.range()),
+                ),
+            },
+        );
+        for parameter in &function.parameters {
+            let annotation = parameter
+                .data()
+                .type_annotation
+                .as_ref()
+                .map(|annotation| annotation.data().type_node.as_ref());
+            self.reserve_pattern(
+                &parameter.data().binding,
+                VariableKind::Let,
+                function_scope,
+                Some(owner),
+                ContributorKind::Parameter,
+                annotation,
+                parameter.data().initializer.as_deref(),
+            )?;
+            if let Some(initializer) = &parameter.data().initializer {
+                self.reserve_expr(initializer, function_scope, Some(owner), receiver, body)?;
+            }
+        }
+        if let Some(body_node) = &function.body {
+            match body_node {
+                FunctionBody::Block(block) => self.reserve_statements(
+                    &block.data().statements,
+                    function_scope,
+                    Some(owner),
+                    receiver,
+                    body,
+                )?,
+                FunctionBody::Expression(expression) => {
+                    self.reserve_expr(expression, function_scope, Some(owner), receiver, body)?
+                }
+                FunctionBody::Missing(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn reserve_class(
+        &mut self,
+        class: &'src ClassDeclaration,
+        declaration: NodeId,
+        scope: ScopeId,
+        parent: Option<DeclId>,
+        receiver: ReceiverKind,
+    ) -> Result<(), super::CheckCancelled> {
+        let symbol = class.name.as_ref().map(|name| {
+            self.reserve_symbol(
+                &self.identifier_text(name),
+                SymbolKind::Class,
+                scope,
+                declaration,
+                name.range(),
+            )
+        });
+        let owner = self.reserve_contributor(
+            declaration,
+            symbol,
+            parent,
+            ContributorKind::Class,
+            vec![
+                Facet::ContainerIdentity,
+                Facet::ClassShape(ClassSide::Instance),
+                Facet::ClassShape(ClassSide::Static),
+            ],
+            SlotContext {
+                scope,
+                point: ExecutionPoint {
+                    node: declaration,
+                    boundary: ExecutionBoundary::Entry,
+                },
+                receiver,
+                function_body: None,
+                ambient: self.ambient_binding,
+            },
+            class
+                .name
+                .as_ref()
+                .map_or_else(NodeId::default_range, |name| name.range()),
+        );
+        let class_scope = self.new_scope(ScopeKind::Class, Some(scope));
+        self.declaration_index
+            .node_scopes
+            .insert(declaration, class_scope);
+        self.declaration_index
+            .lexical_state
+            .insert(class_scope, LexicalReadiness::Binding);
+        for member in &class.members {
+            match member.data() {
+                crate::syntax::ClassMember::Method(method) => {
+                    let member_symbol = self.property_key(&method.name).map(|name| {
+                        self.reserve_symbol(
+                            &name,
+                            SymbolKind::Function,
+                            class_scope,
+                            member.id(),
+                            member.range(),
+                        )
+                    });
+                    let member_owner = self.reserve_contributor(
+                        member.id(),
+                        member_symbol,
+                        Some(owner),
+                        ContributorKind::Function,
+                        vec![Facet::SignatureHeader, Facet::InferredReturn],
+                        SlotContext {
+                            scope: class_scope,
+                            point: ExecutionPoint {
+                                node: member.id(),
+                                boundary: ExecutionBoundary::Entry,
+                            },
+                            receiver: if method.modifiers.is_static {
+                                ReceiverKind::Static { class: owner }
+                            } else {
+                                ReceiverKind::Instance { class: owner }
+                            },
+                            function_body: method.function.body.as_ref().and_then(FunctionBody::id),
+                            ambient: self.ambient_binding,
+                        },
+                        member.range(),
+                    );
+                    self.reserve_function_like(
+                        &method.function,
+                        CallableSource::Function(&method.function),
+                        member.id(),
+                        class_scope,
+                        Some(member_owner),
+                        if method.modifiers.is_static {
+                            ReceiverKind::Static { class: owner }
+                        } else {
+                            ReceiverKind::Instance { class: owner }
+                        },
+                    )?;
+                }
+                crate::syntax::ClassMember::Constructor(constructor) => {
+                    let member_owner = self.reserve_contributor(
+                        member.id(),
+                        None,
+                        Some(owner),
+                        ContributorKind::Function,
+                        vec![Facet::SignatureHeader, Facet::InferredReturn],
+                        SlotContext {
+                            scope: class_scope,
+                            point: ExecutionPoint {
+                                node: member.id(),
+                                boundary: ExecutionBoundary::Entry,
+                            },
+                            receiver: ReceiverKind::Instance { class: owner },
+                            function_body: Some(constructor.body.id()),
+                            ambient: self.ambient_binding,
+                        },
+                        member.range(),
+                    );
+                    let function_scope = self.new_scope(ScopeKind::Function, Some(class_scope));
+                    self.declaration_index
+                        .node_scopes
+                        .insert(member.id(), function_scope);
+                    for parameter in &constructor.parameters {
+                        self.reserve_pattern(
+                            &parameter.data().binding,
+                            VariableKind::Let,
+                            function_scope,
+                            Some(member_owner),
+                            ContributorKind::Parameter,
+                            parameter
+                                .data()
+                                .type_annotation
+                                .as_ref()
+                                .map(|annotation| annotation.data().type_node.as_ref()),
+                            parameter.data().initializer.as_deref(),
+                        )?;
+                    }
+                    self.reserve_statements(
+                        &constructor.body.data().statements,
+                        function_scope,
+                        Some(member_owner),
+                        ReceiverKind::Instance { class: owner },
+                        Some(constructor.body.id()),
+                    )?;
+                }
+                crate::syntax::ClassMember::Property(property) => {
+                    let member_symbol = self.property_key(&property.name).map(|name| {
+                        self.reserve_symbol(
+                            &name,
+                            SymbolKind::Variable(VariableKind::Let),
+                            class_scope,
+                            member.id(),
+                            member.range(),
+                        )
+                    });
+                    let member_owner = self.reserve_contributor(
+                        member.id(),
+                        member_symbol,
+                        Some(owner),
+                        ContributorKind::Property,
+                        if property.initializer.is_some() {
+                            vec![Facet::Initializer]
+                        } else {
+                            vec![Facet::SignatureHeader]
+                        },
+                        SlotContext {
+                            scope: class_scope,
+                            point: ExecutionPoint {
+                                node: member.id(),
+                                boundary: ExecutionBoundary::Primary,
+                            },
+                            receiver: ReceiverKind::Instance { class: owner },
+                            function_body: None,
+                            ambient: self.ambient_binding,
+                        },
+                        member.range(),
+                    );
+                    if let Some(initializer) = &property.initializer {
+                        self.reserve_expr(
+                            initializer,
+                            class_scope,
+                            Some(member_owner),
+                            ReceiverKind::Instance { class: owner },
+                            None,
+                        )?;
+                    }
+                }
+                crate::syntax::ClassMember::AutoAccessor(accessor) => {
+                    if let Some(initializer) = &accessor.initializer {
+                        self.reserve_expr(
+                            initializer,
+                            class_scope,
+                            Some(owner),
+                            ReceiverKind::Instance { class: owner },
+                            None,
+                        )?;
+                    }
+                }
+                crate::syntax::ClassMember::StaticBlock(block) => {
+                    self.reserve_statements(
+                        &block.data().statements,
+                        class_scope,
+                        Some(owner),
+                        ReceiverKind::Static { class: owner },
+                        Some(block.id()),
+                    )?;
+                }
+                crate::syntax::ClassMember::IndexSignature(index) => {
+                    for parameter in &index.parameters {
+                        if let Some(annotation) = parameter.data().type_annotation.as_ref() {
+                            let type_node = &annotation.data().type_node;
+                            self.declaration_index
+                                .type_syntax
+                                .insert(type_node.id(), type_node);
+                        }
+                    }
+                    self.declaration_index.type_syntax.insert(
+                        index.type_annotation.data().type_node.id(),
+                        index.type_annotation.data().type_node.as_ref(),
+                    );
+                }
+                crate::syntax::ClassMember::Missing(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn reserve_interface(
+        &mut self,
+        interface: &'src InterfaceDeclaration,
+        declaration: NodeId,
+        scope: ScopeId,
+        parent: Option<DeclId>,
+    ) -> Result<(), super::CheckCancelled> {
+        let symbol = self.reserve_symbol(
+            &self.identifier_text(&interface.name),
+            SymbolKind::Interface,
+            scope,
+            declaration,
+            interface.name.range(),
+        );
+        let owner = self.reserve_contributor(
+            declaration,
+            Some(symbol),
+            parent,
+            ContributorKind::Interface,
+            vec![Facet::ContainerIdentity],
+            SlotContext {
+                scope,
+                point: ExecutionPoint {
+                    node: declaration,
+                    boundary: ExecutionBoundary::Entry,
+                },
+                receiver: ReceiverKind::None,
+                function_body: None,
+                ambient: self.ambient_binding,
+            },
+            interface.name.range(),
+        );
+        let member_scope = self.new_scope(ScopeKind::Class, Some(scope));
+        self.declaration_index
+            .node_scopes
+            .insert(declaration, member_scope);
+        self.declaration_index
+            .lexical_state
+            .insert(member_scope, LexicalReadiness::Binding);
+        for member in &interface.members {
+            let member_owner = match member.data() {
+                crate::syntax::TypeMember::Property(property) => {
+                    if let Some(annotation) = &property.type_annotation {
+                        self.declaration_index.type_syntax.insert(
+                            annotation.data().type_node.id(),
+                            annotation.data().type_node.as_ref(),
+                        );
+                    }
+                    let symbol = self.property_key(&property.name).map(|name| {
+                        self.reserve_symbol(
+                            &name,
+                            SymbolKind::Variable(VariableKind::Let),
+                            member_scope,
+                            member.id(),
+                            member.range(),
+                        )
+                    });
+                    self.reserve_contributor(
+                        member.id(),
+                        symbol,
+                        Some(owner),
+                        ContributorKind::Property,
+                        vec![Facet::SignatureHeader],
+                        SlotContext {
+                            scope: member_scope,
+                            point: ExecutionPoint {
+                                node: member.id(),
+                                boundary: ExecutionBoundary::Primary,
+                            },
+                            receiver: ReceiverKind::None,
+                            function_body: None,
+                            ambient: self.ambient_binding,
+                        },
+                        member.range(),
+                    )
+                }
+                crate::syntax::TypeMember::Method(method) => {
+                    let symbol = self.property_key(&method.name).map(|name| {
+                        self.reserve_symbol(
+                            &name,
+                            SymbolKind::Function,
+                            member_scope,
+                            member.id(),
+                            member.range(),
+                        )
+                    });
+                    for parameter in &method.function.parameters {
+                        let type_node = parameter.type_annotation.data().type_node.as_ref();
+                        self.declaration_index
+                            .type_syntax
+                            .insert(type_node.id(), type_node);
+                    }
+                    let return_type = method.function.return_type.as_ref();
+                    self.declaration_index
+                        .type_syntax
+                        .insert(return_type.id(), return_type);
+                    self.reserve_contributor(
+                        member.id(),
+                        symbol,
+                        Some(owner),
+                        ContributorKind::Function,
+                        vec![Facet::SignatureHeader],
+                        SlotContext {
+                            scope: member_scope,
+                            point: ExecutionPoint {
+                                node: member.id(),
+                                boundary: ExecutionBoundary::Primary,
+                            },
+                            receiver: ReceiverKind::None,
+                            function_body: None,
+                            ambient: self.ambient_binding,
+                        },
+                        member.range(),
+                    )
+                }
+                crate::syntax::TypeMember::Call(call) => {
+                    for parameter in &call.function.parameters {
+                        let type_node = parameter.type_annotation.data().type_node.as_ref();
+                        self.declaration_index
+                            .type_syntax
+                            .insert(type_node.id(), type_node);
+                    }
+                    let return_type = call.function.return_type.as_ref();
+                    self.declaration_index
+                        .type_syntax
+                        .insert(return_type.id(), return_type);
+                    self.reserve_contributor(
+                        member.id(),
+                        None,
+                        Some(owner),
+                        ContributorKind::AnonymousCallable,
+                        vec![Facet::SignatureHeader],
+                        SlotContext {
+                            scope: member_scope,
+                            point: ExecutionPoint {
+                                node: member.id(),
+                                boundary: ExecutionBoundary::Primary,
+                            },
+                            receiver: ReceiverKind::None,
+                            function_body: None,
+                            ambient: self.ambient_binding,
+                        },
+                        member.range(),
+                    )
+                }
+                crate::syntax::TypeMember::Construct(construct) => {
+                    self.declaration_index.type_syntax.insert(
+                        construct.function.function.return_type.id(),
+                        construct.function.function.return_type.as_ref(),
+                    );
+                    self.reserve_contributor(
+                        member.id(),
+                        None,
+                        Some(owner),
+                        ContributorKind::AnonymousCallable,
+                        vec![Facet::SignatureHeader],
+                        SlotContext {
+                            scope: member_scope,
+                            point: ExecutionPoint {
+                                node: member.id(),
+                                boundary: ExecutionBoundary::Primary,
+                            },
+                            receiver: ReceiverKind::None,
+                            function_body: None,
+                            ambient: self.ambient_binding,
+                        },
+                        member.range(),
+                    )
+                }
+                crate::syntax::TypeMember::Index(index) => {
+                    self.declaration_index.type_syntax.insert(
+                        index.type_annotation.data().type_node.id(),
+                        index.type_annotation.data().type_node.as_ref(),
+                    );
+                    self.reserve_contributor(
+                        member.id(),
+                        None,
+                        Some(owner),
+                        ContributorKind::Property,
+                        vec![Facet::SignatureHeader],
+                        SlotContext {
+                            scope: member_scope,
+                            point: ExecutionPoint {
+                                node: member.id(),
+                                boundary: ExecutionBoundary::Primary,
+                            },
+                            receiver: ReceiverKind::None,
+                            function_body: None,
+                            ambient: self.ambient_binding,
+                        },
+                        member.range(),
+                    )
+                }
+                crate::syntax::TypeMember::Missing(_) => continue,
+            };
+            let _ = member_owner;
+        }
+        Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn reserve_assignment_target(
+        &mut self,
+        target: &'src crate::syntax::AssignmentTargetNode,
+        scope: ScopeId,
+        parent: Option<DeclId>,
+        receiver: ReceiverKind,
+        function_body: Option<NodeId>,
+    ) -> Result<(), super::CheckCancelled> {
+        match target.data() {
+            crate::syntax::AssignmentTarget::Identifier(identifier) => {
+                let symbol = self.lookup_symbol(scope, &self.identifier_text(identifier));
+                let lexical_target =
+                    symbol.and_then(|symbol| self.contributors_of(symbol).first().copied());
+                self.reserve_reference(
+                    ReferenceKind::Identifier,
+                    target.id(),
+                    identifier.range(),
+                    lexical_target,
+                    symbol,
+                    None,
+                );
+            }
+            crate::syntax::AssignmentTarget::Member(member) => {
+                self.reserve_expr(&member.object, scope, parent, receiver, function_body)?;
+                if let crate::syntax::MemberProperty::Computed(expression) = &member.property {
+                    self.reserve_expr(expression, scope, parent, receiver, function_body)?;
+                }
+                self.reserve_reference(
+                    ReferenceKind::Member,
+                    target.id(),
+                    target.range(),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            crate::syntax::AssignmentTarget::Object(object) => {
+                for property in &object.properties {
+                    self.reserve_assignment_target(
+                        &property.target,
+                        scope,
+                        parent,
+                        receiver,
+                        function_body,
+                    )?;
+                    if let Some(initializer) = &property.initializer {
+                        self.reserve_expr(initializer, scope, parent, receiver, function_body)?;
+                    }
+                }
+            }
+            crate::syntax::AssignmentTarget::Array(array) => {
+                for element in &array.elements {
+                    if let crate::syntax::AssignmentArrayElement::Target(target) = element {
+                        self.reserve_assignment_target(
+                            target,
+                            scope,
+                            parent,
+                            receiver,
+                            function_body,
+                        )?;
+                    }
+                }
+            }
+            crate::syntax::AssignmentTarget::Invalid(expression) => {
+                self.reserve_expr(expression, scope, parent, receiver, function_body)?
+            }
+            crate::syntax::AssignmentTarget::Missing(_) => {}
+        }
+        Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn reserve_expr(
+        &mut self,
+        expression: &'src Expr,
+        scope: ScopeId,
+        parent: Option<DeclId>,
+        receiver: ReceiverKind,
+        function_body: Option<NodeId>,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        // WP-LEX expression inventory: every reserved node becomes reachable
+        // by a `QueryKey::Expression` address. JSX nodes additionally bind
+        // their slot context exactly once here so the selected check runs on
+        // a prepared context instead of synthesizing or skipping.
+        self.declaration_index
+            .expressions
+            .entry(expression.id())
+            .or_insert(expression);
+        match expression.data() {
+            Expression::Identifier(identifier) => {
+                let symbol = self.lookup_symbol(scope, &self.identifier_text(identifier));
+                let lexical_target =
+                    symbol.and_then(|symbol| self.contributors_of(symbol).first().copied());
+                if let Some(symbol) = symbol {
+                    self.reference_index
+                        .lexical_symbols
+                        .entry(expression.id())
+                        .or_insert(symbol);
+                }
+                self.reserve_reference(
+                    ReferenceKind::Identifier,
+                    expression.id(),
+                    identifier.range(),
+                    lexical_target,
+                    self.references.get(&expression.id()).copied().or(symbol),
+                    None,
+                );
+            }
+            Expression::This => self.reserve_reference(
+                ReferenceKind::This,
+                expression.id(),
+                expression.range(),
+                None,
+                None,
+                None,
+            ),
+            Expression::Super => self.reserve_reference(
+                ReferenceKind::Super,
+                expression.id(),
+                expression.range(),
+                None,
+                None,
+                None,
+            ),
+            Expression::Function(function) => self.reserve_function_like(
+                &function.function,
+                CallableSource::Function(&function.function),
+                expression.id(),
+                scope,
+                parent,
+                receiver,
+            )?,
+            Expression::Arrow(arrow) => {
+                self.reserve_arrow(arrow, expression.id(), scope, parent, receiver)?
+            }
+            Expression::Class(class) => {
+                self.reserve_class(&class.class, expression.id(), scope, parent, receiver)?
+            }
+            Expression::Array(array) => {
+                for element in &array.elements {
+                    match element {
+                        ArrayElement::Expression(value) => {
+                            self.reserve_expr(value, scope, parent, receiver, function_body)?
+                        }
+                        ArrayElement::Spread(spread) => self.reserve_expr(
+                            &spread.argument,
+                            scope,
+                            parent,
+                            receiver,
+                            function_body,
+                        )?,
+                        ArrayElement::Elision | ArrayElement::Missing(_) => {}
+                    }
+                }
+            }
+            Expression::Object(object) => {
+                for member in &object.members {
+                    match member.data() {
+                        crate::syntax::ObjectMember::Property(property) => self.reserve_expr(
+                            &property.value,
+                            scope,
+                            parent,
+                            receiver,
+                            function_body,
+                        )?,
+                        crate::syntax::ObjectMember::Method(method) => self.reserve_function_like(
+                            &method.function,
+                            CallableSource::Function(&method.function),
+                            member.id(),
+                            scope,
+                            parent,
+                            ReceiverKind::ObjectLiteral {
+                                literal: expression.id(),
+                            },
+                        )?,
+                        crate::syntax::ObjectMember::Spread(spread) => self.reserve_expr(
+                            &spread.argument,
+                            scope,
+                            parent,
+                            receiver,
+                            function_body,
+                        )?,
+                        crate::syntax::ObjectMember::Missing(_) => {}
+                    }
+                }
+            }
+            Expression::Call(call) => {
+                self.reserve_expr(&call.callee, scope, parent, receiver, function_body)?;
+                for argument in &call.arguments {
+                    match argument {
+                        CallArgument::Expression(expression) => {
+                            self.reserve_expr(expression, scope, parent, receiver, function_body)?
+                        }
+                        CallArgument::Spread(spread) => self.reserve_expr(
+                            &spread.argument,
+                            scope,
+                            parent,
+                            receiver,
+                            function_body,
+                        )?,
+                        CallArgument::Missing(_) => {}
+                    }
+                }
+            }
+            Expression::Member(member) => {
+                self.reserve_expr(&member.object, scope, parent, receiver, function_body)?;
+                if let MemberProperty::Computed(expression) = &member.property {
+                    self.reserve_expr(expression, scope, parent, receiver, function_body)?;
+                }
+                self.reserve_reference(
+                    ReferenceKind::Member,
+                    expression.id(),
+                    expression.range(),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            Expression::New(new_expression) => {
+                self.reserve_expr(
+                    &new_expression.callee,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+                for argument in &new_expression.arguments {
+                    if let CallArgument::Expression(argument) = argument {
+                        self.reserve_expr(argument, scope, parent, receiver, function_body)?;
+                    }
+                }
+            }
+            Expression::Await(await_expression) => self.reserve_expr(
+                &await_expression.argument,
+                scope,
+                parent,
+                receiver,
+                function_body,
+            )?,
+            Expression::Yield(yield_expression) => {
+                if let Some(argument) = &yield_expression.argument {
+                    self.reserve_expr(argument, scope, parent, receiver, function_body)?;
+                }
+            }
+            Expression::Unary(unary) => {
+                self.reserve_expr(&unary.argument, scope, parent, receiver, function_body)?
+            }
+            Expression::Update(update) => self.reserve_assignment_target(
+                &update.argument,
+                scope,
+                parent,
+                receiver,
+                function_body,
+            )?,
+            Expression::Binary(binary) => {
+                self.reserve_expr(&binary.left, scope, parent, receiver, function_body)?;
+                self.reserve_expr(&binary.right, scope, parent, receiver, function_body)?;
+            }
+            Expression::Logical(logical) => {
+                self.reserve_expr(&logical.left, scope, parent, receiver, function_body)?;
+                self.reserve_expr(&logical.right, scope, parent, receiver, function_body)?;
+            }
+            Expression::Conditional(conditional) => {
+                self.reserve_expr(&conditional.test, scope, parent, receiver, function_body)?;
+                self.reserve_expr(
+                    &conditional.consequent,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+                self.reserve_expr(
+                    &conditional.alternate,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+            }
+            Expression::Assignment(assignment) => {
+                self.reserve_assignment_target(
+                    &assignment.left,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+                self.reserve_expr(&assignment.right, scope, parent, receiver, function_body)?;
+            }
+            Expression::Sequence(sequence) => {
+                for expression in &sequence.expressions {
+                    self.reserve_expr(expression, scope, parent, receiver, function_body)?;
+                }
+            }
+            Expression::Parenthesized(expression)
+            | Expression::NonNull(NonNullExpression { expression })
+            | Expression::As(AsExpression { expression, .. })
+            | Expression::Satisfies(SatisfiesExpression { expression, .. })
+            | Expression::TypeAssertion(TypeAssertionExpression { expression, .. }) => {
+                self.reserve_expr(expression, scope, parent, receiver, function_body)?
+            }
+            Expression::Template(template) => {
+                for expression in &template.expressions {
+                    self.reserve_expr(expression, scope, parent, receiver, function_body)?;
+                }
+            }
+            Expression::TaggedTemplate(tagged) => {
+                self.reserve_expr(&tagged.tag, scope, parent, receiver, function_body)?;
+                for expression in &tagged.template.expressions {
+                    self.reserve_expr(expression, scope, parent, receiver, function_body)?;
+                }
+            }
+            Expression::Import(import) => {
+                self.reserve_expr(&import.source, scope, parent, receiver, function_body)?;
+                if let Some(options) = &import.options {
+                    self.reserve_expr(options, scope, parent, receiver, function_body)?;
+                }
+            }
+            Expression::JsxElement(element) => {
+                self.reserve_jsx(
+                    expression,
+                    &element.opening.data().attributes,
+                    &element.children,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+            }
+            Expression::JsxSelfClosingElement(element) => {
+                self.reserve_jsx(
+                    expression,
+                    &element.attributes,
+                    &[],
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+            }
+            Expression::JsxFragment(fragment) => {
+                self.reserve_jsx(
+                    expression,
+                    &[],
+                    &fragment.children,
+                    scope,
+                    parent,
+                    receiver,
+                    function_body,
+                )?;
+            }
+            Expression::Literal(_) | Expression::Meta(_) | Expression::Missing(_) => {}
+        }
+        Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    /// Reserves one JSX expression: binds the element's slot context exactly
+    /// once (the selected check reads it back), then reserves every attribute
+    /// and child expression so their nodes stay reachable by demand queries.
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_jsx(
+        &mut self,
+        expression: &'src Expr,
+        attributes: &'src [JsxAttributeItem],
+        children: &'src [JsxChild],
+        scope: ScopeId,
+        parent: Option<DeclId>,
+        receiver: ReceiverKind,
+        function_body: Option<NodeId>,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        self.declaration_index
+            .contexts
+            .entry(expression.id())
+            .or_insert(SlotContext {
+                scope,
+                point: ExecutionPoint {
+                    node: expression.id(),
+                    boundary: ExecutionBoundary::Primary,
+                },
+                receiver,
+                function_body,
+                ambient: self.ambient_binding,
+            });
+        for attribute in attributes {
+            match attribute {
+                JsxAttributeItem::Attribute(attribute) => {
+                    if let Some(JsxAttributeInitializer::Expression(container)) =
+                        &attribute.data().initializer
+                        && let Some(value) = &container.data().expression
+                    {
+                        self.reserve_expr(value, scope, parent, receiver, function_body)?;
+                    }
+                }
+                JsxAttributeItem::Spread(spread) => {
+                    self.reserve_expr(
+                        &spread.data().expression,
+                        scope,
+                        parent,
+                        receiver,
+                        function_body,
+                    )?;
+                }
+            }
+        }
+        for child in children {
+            match child {
+                JsxChild::Text(_) => {}
+                JsxChild::ExpressionContainer(container) => {
+                    if let Some(value) = &container.data().expression {
+                        self.reserve_expr(value, scope, parent, receiver, function_body)?;
+                    }
+                }
+                JsxChild::Spread(spread) => {
+                    self.reserve_expr(
+                        &spread.data().expression,
+                        scope,
+                        parent,
+                        receiver,
+                        function_body,
+                    )?;
+                }
+                JsxChild::Element(nested) => {
+                    self.reserve_expr(nested, scope, parent, receiver, function_body)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn reserve_arrow(
+        &mut self,
+        arrow: &'src ArrowFunction,
+        declaration: NodeId,
+        parent_scope: ScopeId,
+        parent: Option<DeclId>,
+        receiver: ReceiverKind,
+    ) -> Result<(), super::CheckCancelled> {
+        let function_scope = self.new_scope(ScopeKind::Function, Some(parent_scope));
+        self.declaration_index
+            .node_scopes
+            .insert(declaration, function_scope);
+        let body = Some(arrow.body.id().unwrap_or(declaration));
+        let owner = self.reserve_contributor(
+            declaration,
+            None,
+            parent,
+            ContributorKind::AnonymousCallable,
+            vec![Facet::SignatureHeader, Facet::InferredReturn],
+            SlotContext {
+                scope: parent_scope,
+                point: ExecutionPoint {
+                    node: declaration,
+                    boundary: ExecutionBoundary::Entry,
+                },
+                receiver,
+                function_body: body,
+                ambient: self.ambient_binding,
+            },
+            NodeId::default_range(),
+        );
+        self.declaration_index.callables.insert(
+            owner,
+            CallableInventory {
+                source: CallableSource::Arrow(arrow),
+                parameter_scope: function_scope,
+                body,
+                protocol: FunctionProtocol {
+                    is_async: arrow.is_async,
+                    is_generator: false,
+                    annotated_return: arrow
+                        .return_type
+                        .as_ref()
+                        .map(|return_type| return_type.data().type_node.id()),
+                },
+                anchor: CallableAnchor::ArrowExpression(NodeId::default_range()),
+            },
+        );
+        for parameter in &arrow.parameters {
+            self.reserve_pattern(
+                &parameter.data().binding,
+                VariableKind::Let,
+                function_scope,
+                Some(owner),
+                ContributorKind::Parameter,
+                parameter
+                    .data()
+                    .type_annotation
+                    .as_ref()
+                    .map(|annotation| annotation.data().type_node.as_ref()),
+                parameter.data().initializer.as_deref(),
+            )?;
+        }
+        match &arrow.body {
+            FunctionBody::Block(block) => self.reserve_statements(
+                &block.data().statements,
+                function_scope,
+                Some(owner),
+                receiver,
+                Some(block.id()),
+            )?,
+            FunctionBody::Expression(expression) => {
+                self.reserve_expr(expression, function_scope, Some(owner), receiver, body)?
+            }
+            FunctionBody::Missing(_) => {}
+        }
+        Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+    )]
+    fn lookup_symbol(&self, scope: ScopeId, name: &str) -> Option<SymbolId> {
+        let mut current = Some(scope);
+        while let Some(scope) = current {
+            if let Some(symbol) = self.scopes[scope.get() as usize].values.get(name) {
+                return Some(*symbol);
+            }
+            if let Some(symbol) = self.scopes[scope.get() as usize].types.get(name) {
+                return Some(*symbol);
+            }
+            current = self.scopes[scope.get() as usize].parent;
+        }
+        None
     }
 
     fn types_assignable(&self, source: TypeId, target: TypeId) -> bool {
@@ -5541,6 +8675,7 @@ impl<'src> Binder<'src> {
         );
         let mut set_value = None;
         let mut map_value = None;
+        let mut date_value = None;
         for name in self
             .intrinsics
             .values()
@@ -5559,6 +8694,9 @@ impl<'src> Binder<'src> {
             }
             if *name == "Map" {
                 map_value = Some(id);
+            }
+            if *name == "Date" {
+                date_value = Some(id);
             }
             if *name == "undefined" {
                 self.symbol_types[id.get() as usize] = self.types.undefined_type();
@@ -5583,6 +8721,7 @@ impl<'src> Binder<'src> {
                 self.class_instance_types.insert(id, applied);
             }
         }
+        let mut date_type = None;
         for name in self.intrinsics.types().iter() {
             let id = self.declare(
                 name,
@@ -5604,6 +8743,9 @@ impl<'src> Binder<'src> {
                 "PropertyKey" => self.types.property_key_symbol = Some(id),
                 "ConcatArray" => self.types.concat_array_symbol = Some(id),
                 _ => {}
+            }
+            if *name == "Date" {
+                date_type = Some(id);
             }
             if *name == "RegExp" {
                 self.types.declare_class(id, Vec::new());
@@ -5643,6 +8785,9 @@ impl<'src> Binder<'src> {
                 self.class_instance_types.insert(id, applied);
                 self.reg_exp_instance_type = Some(applied);
             }
+        }
+        if let (Some(type_symbol), Some(value_symbol)) = (date_type, date_value) {
+            self.bind_intrinsic_date(type_symbol, value_symbol);
         }
         if let (
             Some(set_value),
@@ -6186,7 +9331,14 @@ impl<'src> Binder<'src> {
         )
     }
 
-    pub(crate) fn finish(mut self) -> (SemanticModel, Vec<Diagnostic>) {
+    pub(crate) fn finish(
+        mut self,
+    ) -> Result<(SemanticModel, Vec<Diagnostic>), super::CheckCancelled> {
+        if let Some(err) = self.demand.cancelled.get() {
+            return Err(err);
+        }
+        self.check_cancel()?;
+        let installed_enum_facts = self.enum_facts.take();
         let enum_declarations = std::mem::take(&mut self.enum_declarations);
         let enum_member_symbols = std::mem::take(&mut self.enum_member_symbols);
         let enum_member_names = std::mem::take(&mut self.enum_member_names);
@@ -6255,18 +9407,25 @@ impl<'src> Binder<'src> {
             class_constructor_types: std::mem::take(&mut self.class_constructor_types),
             namespace_local_scopes: std::mem::take(&mut self.namespace_local_scopes),
         };
-        let (enum_facts, diagnostics) = enum_plan::build(
-            &model,
-            self.source,
-            self.source.source_id(),
-            &enum_declarations,
-            &enum_member_symbols,
-            &enum_member_names,
-            &enum_member_identifier_uses,
-            &local_enum_member_targets,
-            &imported_enum_member_uses,
-            &imported_enum_member_targets,
-        );
+        let (enum_facts, diagnostics) = if let Some(installed) = installed_enum_facts {
+            (
+                installed,
+                std::mem::take(&mut self.installed_enum_diagnostics),
+            )
+        } else {
+            enum_plan::build(
+                &model,
+                self.source,
+                self.source.source_id(),
+                &enum_declarations,
+                &enum_member_symbols,
+                &enum_member_names,
+                &enum_member_identifier_uses,
+                &local_enum_member_targets,
+                &imported_enum_member_uses,
+                &imported_enum_member_targets,
+            )
+        };
         model.enum_facts = enum_facts;
         let mut namespace_facts = namespace_plan::build(
             &model,
@@ -6292,6 +9451,14 @@ impl<'src> Binder<'src> {
                 self.diagnostics.push(diagnostic);
             }
         }
+        // Fold the demand publication buffer into the program-level stream.
+        // Full PublicationOrder sort/dedupe lands with the WP-CHECK selected
+        // activation cutover; queued entries are appended in arrival order.
+        for pending in self.publication.diagnostics.drain(..) {
+            if pending.eligible {
+                self.diagnostics.push(pending.diagnostic);
+            }
+        }
         for expectation in &self.expected_diagnostics {
             if !expectation.used {
                 self.diagnostics.push(Diagnostic::error(
@@ -6302,7 +9469,7 @@ impl<'src> Binder<'src> {
                 ));
             }
         }
-        (model, self.diagnostics)
+        Ok((model, self.diagnostics))
     }
 
     // -- text and scope helpers ------------------------------------------------
@@ -6839,6 +10006,23 @@ impl<'src> Binder<'src> {
         if self.probing_contextual_type {
             return;
         }
+        debug_assert!(
+            self.demand.in_demand == 0,
+            "emit() called while a demand query is active; use queue_diagnostic"
+        );
+        if self.demand.in_demand != 0 {
+            // Release-mode fallback: never bypass ordering/dedupe/suppression
+            // for a demand-reachable emission. `next_publication_source_event`
+            // and dedupe are the WP-CHECK program-level pass's job at `finish`;
+            // this only guarantees the diagnostic is not lost.
+            let order = self.publication_order_for_range(range);
+            let _ = self.queue_diagnostic(
+                Diagnostic::error(code, self.source.source_id(), range, message),
+                order,
+                true,
+            );
+            return;
+        }
         let line = self
             .source
             .source_text()
@@ -6864,6 +10048,19 @@ impl<'src> Binder<'src> {
     /// whose wording includes the offending identifier name.
     fn emit_with_message(&mut self, code: DiagnosticCode, range: TextRange, message: String) {
         if self.probing_contextual_type {
+            return;
+        }
+        debug_assert!(
+            self.demand.in_demand == 0,
+            "emit_with_message() called while a demand query is active; use queue_diagnostic"
+        );
+        if self.demand.in_demand != 0 {
+            let order = self.publication_order_for_range(range);
+            let _ = self.queue_diagnostic(
+                Diagnostic::error(code, self.source.source_id(), range, message),
+                order,
+                true,
+            );
             return;
         }
         let line = self
@@ -7306,15 +10503,14 @@ impl<'src> Binder<'src> {
             Statement::Variable(variable) => self.bind_variable(variable, scope, declaration),
             Statement::Function(function) => {
                 if let Some(name) = &function.function.name {
-                    let symbol = self.declare(
+                    self.declare(
                         &self.identifier_text(name),
                         SymbolKind::Function,
                         scope,
                         name.id(),
                         name.range(),
                     );
-                    self.jsx_callables
-                        .insert(symbol, JsxCallable::Function(&function.function));
+                    // legacy jsx_callables side table removed
                 }
             }
             Statement::Class(class) => {
@@ -7374,15 +10570,14 @@ impl<'src> Binder<'src> {
                     crate::syntax::ExportDefaultValue::Function(function)
                         if let Some(name) = &function.name =>
                     {
-                        let symbol = self.declare(
+                        let _symbol = self.declare(
                             &self.identifier_text(name),
                             SymbolKind::Function,
                             scope,
                             declaration,
                             name.range(),
                         );
-                        self.jsx_callables
-                            .insert(symbol, JsxCallable::Function(function));
+                        // legacy jsx_callables side table removed
                     }
                     crate::syntax::ExportDefaultValue::Class(class)
                         if let Some(name) = &class.name =>
@@ -9060,11 +12255,11 @@ impl<'src> Binder<'src> {
                 self.super_call_guarantees = positional;
                 self.resolve_expr(&statement.expression, scope);
                 self.super_call_guarantees = outer_guarantees;
-                self.type_of_expr(&statement.expression, scope);
+                self.legacy_type_of_expr(&statement.expression, scope);
             }
             Statement::If(statement) => {
                 self.resolve_expr(&statement.test, scope);
-                self.type_of_expr(&statement.test, scope);
+                self.legacy_type_of_expr(&statement.test, scope);
                 let parent = self.flow;
                 let entry_super_flow = self.super_flow;
                 let truthy = self.guards_for(&statement.test, false);
@@ -9118,12 +12313,12 @@ impl<'src> Binder<'src> {
             }
             Statement::Switch(statement) => {
                 self.resolve_expr(&statement.discriminant, scope);
-                self.type_of_expr(&statement.discriminant, scope);
+                self.legacy_type_of_expr(&statement.discriminant, scope);
                 let child = self.new_scope(ScopeKind::Block, Some(scope));
                 for case in &statement.cases {
                     if let Some(test) = &case.data().test {
                         self.resolve_expr(test, child);
-                        self.type_of_expr(test, child);
+                        self.legacy_type_of_expr(test, child);
                     }
                     self.bind_statements(&case.data().consequent, child);
                 }
@@ -9144,7 +12339,7 @@ impl<'src> Binder<'src> {
                 }
                 if let Some(test) = &for_statement.test {
                     self.resolve_expr(test, child);
-                    self.type_of_expr(test, child);
+                    self.legacy_type_of_expr(test, child);
                 }
                 let parent = self.flow;
                 let truthy = for_statement
@@ -9155,7 +12350,7 @@ impl<'src> Binder<'src> {
                     binder.resolve_statement(&for_statement.body, child);
                     if let Some(update) = &for_statement.update {
                         binder.resolve_expr(update, child);
-                        binder.type_of_expr(update, child);
+                        binder.legacy_type_of_expr(update, child);
                     }
                 });
                 if let Some(test) = &for_statement.test {
@@ -9194,7 +12389,7 @@ impl<'src> Binder<'src> {
                     self.resolve_for_binding(&for_statement.binding, child, false);
                 }
                 self.resolve_expr(&for_statement.object, child);
-                let object_type = self.type_of_expr(&for_statement.object, child);
+                let object_type = self.legacy_type_of_expr(&for_statement.object, child);
                 if using_diagnostic.is_none() {
                     self.assign_for_in_binding_type(&for_statement.binding, child, object_type);
                 }
@@ -9212,7 +12407,7 @@ impl<'src> Binder<'src> {
                 // nullable iterable is rejected before the element type is
                 // even computed.
                 self.check_non_null_operand(&for_statement.iterable, child);
-                let iterable_type = self.type_of_expr(&for_statement.iterable, child);
+                let iterable_type = self.legacy_type_of_expr(&for_statement.iterable, child);
                 let element_type =
                     match self.iteration_element_type(iterable_type, for_statement.mode) {
                         Some(element_type) => element_type,
@@ -9235,7 +12430,7 @@ impl<'src> Binder<'src> {
             }
             Statement::While(statement) => {
                 self.resolve_expr(&statement.test, scope);
-                self.type_of_expr(&statement.test, scope);
+                self.legacy_type_of_expr(&statement.test, scope);
                 let parent = self.flow;
                 let entry_super_flow = self.super_flow;
                 let truthy = self.guards_for(&statement.test, false);
@@ -9257,7 +12452,7 @@ impl<'src> Binder<'src> {
                     self.super_flow = entry_super_flow;
                 }
                 self.resolve_expr(&statement.test, scope);
-                self.type_of_expr(&statement.test, scope);
+                self.legacy_type_of_expr(&statement.test, scope);
             }
             Statement::Try(statement) => {
                 let entry_super_flow = self.super_flow;
@@ -9295,7 +12490,7 @@ impl<'src> Binder<'src> {
                     );
                 }
                 self.resolve_expr(&with_statement.object, scope);
-                self.type_of_expr(&with_statement.object, scope);
+                self.legacy_type_of_expr(&with_statement.object, scope);
                 let body_scope = if forbidden {
                     scope
                 } else {
@@ -9361,8 +12556,10 @@ impl<'src> Binder<'src> {
                     .map(|argument| {
                         self.resolve_expr(argument, scope);
                         match expected {
-                            Some(target) => self.type_of_expr_with_target(argument, target, scope),
-                            None => self.type_of_expr(argument, scope),
+                            Some(target) => {
+                                self.legacy_type_of_expr_with_target(argument, target, scope)
+                            }
+                            None => self.legacy_type_of_expr(argument, scope),
                         }
                     })
                     .unwrap_or_else(|| self.types.undefined_type());
@@ -9395,7 +12592,7 @@ impl<'src> Binder<'src> {
             }
             Statement::Throw(statement) => {
                 self.resolve_expr(&statement.argument, scope);
-                self.type_of_expr(&statement.argument, scope);
+                self.legacy_type_of_expr(&statement.argument, scope);
             }
             Statement::Enum(declaration) => {
                 let member_scope = self
@@ -9407,7 +12604,7 @@ impl<'src> Binder<'src> {
                 for member in &declaration.members {
                     if let Some(initializer) = &member.data().initializer {
                         self.resolve_expr(initializer, member_scope);
-                        self.type_of_expr(initializer, member_scope);
+                        self.legacy_type_of_expr(initializer, member_scope);
                     }
                 }
             }
@@ -9716,8 +12913,10 @@ impl<'src> Binder<'src> {
                     .initializer
                     .as_ref()
                     .map(|initializer| match annotation {
-                        Some(target) => self.type_of_expr_with_target(initializer, target, scope),
-                        None => self.type_of_expr(initializer, scope),
+                        Some(target) => {
+                            self.legacy_type_of_expr_with_target(initializer, target, scope)
+                        }
+                        None => self.legacy_type_of_expr(initializer, scope),
                     });
 
             if let (Some(target), Some(source)) = (annotation, initializer_type)
@@ -9788,20 +12987,6 @@ impl<'src> Binder<'src> {
                 if let Some(owner) = owner {
                     self.symbol_anchor.insert(symbol, owner);
                 }
-                match declarator
-                    .initializer
-                    .as_ref()
-                    .map(|initializer| initializer.data())
-                {
-                    Some(Expression::Function(function)) => {
-                        self.jsx_callables
-                            .insert(symbol, JsxCallable::Function(&function.function));
-                    }
-                    Some(Expression::Arrow(arrow)) => {
-                        self.jsx_callables.insert(symbol, JsxCallable::Arrow(arrow));
-                    }
-                    _ => {}
-                }
             }
         }
     }
@@ -9811,6 +12996,39 @@ impl<'src> Binder<'src> {
             Expression::Array(_) => true,
             Expression::Parenthesized(parenthesized) => {
                 Self::is_fresh_array_literal(parenthesized.as_ref())
+            }
+            _ => false,
+        }
+    }
+
+    fn is_fresh_primitive_literal(expression: &Expr) -> bool {
+        match expression.data() {
+            Expression::Literal(
+                Literal::String(_) | Literal::Number(_) | Literal::BigInt(_) | Literal::Boolean(_),
+            ) => true,
+            Expression::Parenthesized(parenthesized) => {
+                Self::is_fresh_primitive_literal(parenthesized.as_ref())
+            }
+            _ => false,
+        }
+    }
+
+    /// True when an array literal argument's elements are themselves fresh
+    /// literal expressions, so the element-type candidate it feeds to
+    /// inference is fresh. Freshness is data flow from the literal
+    /// elements: enclosing a variable, call result, assertion, or a spread
+    /// of a nonliteral array in `[...]` does not make it fresh.
+    fn is_fresh_literal_array(expression: &Expr) -> bool {
+        match expression.data() {
+            Expression::Array(array) => array.elements.iter().all(|element| match element {
+                ArrayElement::Expression(inner) => {
+                    Self::is_fresh_primitive_literal(inner) || Self::is_fresh_literal_array(inner)
+                }
+                ArrayElement::Spread(spread) => Self::is_fresh_literal_array(&spread.argument),
+                ArrayElement::Elision | ArrayElement::Missing(_) => true,
+            }),
+            Expression::Parenthesized(parenthesized) => {
+                Self::is_fresh_literal_array(parenthesized.as_ref())
             }
             _ => false,
         }
@@ -10249,8 +13467,8 @@ impl<'src> Binder<'src> {
             .initializer
             .as_ref()
             .map(|initializer| match annotation {
-                Some(target) => self.type_of_expr_with_target(initializer, target, scope),
-                None => self.type_of_expr(initializer, scope),
+                Some(target) => self.legacy_type_of_expr_with_target(initializer, target, scope),
+                None => self.legacy_type_of_expr(initializer, scope),
             });
         if let (Some(target), Some(source)) = (annotation, initializer_type)
             && !self.types_assignable(source, target)
@@ -10335,7 +13553,7 @@ impl<'src> Binder<'src> {
         let type_id = match (&data.type_annotation, &data.initializer) {
             (Some(annotation), _) => self.resolve_type(&annotation.data().type_node, scope),
             (None, Some(initializer)) => {
-                let initializer_type = self.type_of_expr(initializer, scope);
+                let initializer_type = self.legacy_type_of_expr(initializer, scope);
                 if Self::is_fresh_array_literal(initializer) {
                     self.types.widen_fresh_literal(initializer_type)
                 } else {
@@ -11142,7 +14360,7 @@ impl<'src> Binder<'src> {
                     cached
                 } else if diagnose {
                     self.resolve_expr(initializer, scope);
-                    self.type_of_expr_with_target(initializer, annotated, scope)
+                    self.legacy_type_of_expr_with_target(initializer, annotated, scope)
                 } else {
                     return annotated;
                 };
@@ -11163,7 +14381,7 @@ impl<'src> Binder<'src> {
             cached
         } else if diagnose {
             self.resolve_expr(initializer, scope);
-            self.type_of_expr(initializer, scope)
+            self.legacy_type_of_expr(initializer, scope)
         } else if let Expression::Literal(literal) = initializer.data() {
             self.type_of_literal(literal)
         } else {
@@ -11721,6 +14939,22 @@ impl<'src> Binder<'src> {
             Type::This { owner, .. } => Some(PropertyOwner::Member(*owner)),
             _ => None,
         }
+    }
+
+    /// Resolves `target` to its declaration owner and records the bare JSX
+    /// attribute-name span as a non-declaration property anchor; drops the
+    /// anchor (fail-closed) when `target` has no owner or the name fails
+    /// the identifier/invariant checks inside record_property_anchor.
+    pub(crate) fn record_jsx_attribute_anchor(
+        &mut self,
+        target: Option<TypeId>,
+        name: &str,
+        range: TextRange,
+    ) {
+        let Some(owner) = target.and_then(|type_id| self.owner_of_named_type(type_id)) else {
+            return;
+        };
+        self.record_property_anchor(owner, name, range, PropertyAnchorKind::Plain, false);
     }
 
     fn check_set_accessor_parameter_initializer(
@@ -12426,7 +15660,8 @@ impl<'src> Binder<'src> {
                             .last()
                             .and_then(|context| context.expected)
                         {
-                            let actual = binder.type_of_expr_with_target(inner, expected, child);
+                            let actual =
+                                binder.legacy_type_of_expr_with_target(inner, expected, child);
                             let actual = if arrow.is_async {
                                 binder.awaited_type(actual)
                             } else {
@@ -12584,7 +15819,7 @@ impl<'src> Binder<'src> {
                     let yield_type = if yield_expression.delegate {
                         match &yield_expression.argument {
                             Some(argument) => {
-                                let iterable = self.type_of_expr(argument, scope);
+                                let iterable = self.legacy_type_of_expr(argument, scope);
                                 match self.iteration_element_type(iterable, protocol) {
                                     Some(element) => element,
                                     None => {
@@ -12608,7 +15843,7 @@ impl<'src> Binder<'src> {
                         }
                     } else {
                         let value = match &yield_expression.argument {
-                            Some(argument) => self.type_of_expr(argument, scope),
+                            Some(argument) => self.legacy_type_of_expr(argument, scope),
                             None => self.types.undefined_type(),
                         };
                         match protocol {
@@ -12716,7 +15951,8 @@ impl<'src> Binder<'src> {
                         .contains(&assignment.left.id())
                 {
                     let target = self.type_of_assignment_target(&assignment.left, scope);
-                    let source = self.type_of_expr_with_target(&assignment.right, target, scope);
+                    let source =
+                        self.legacy_type_of_expr_with_target(&assignment.right, target, scope);
                     if !self.types_assignable(source, target) {
                         self.emit(
                             TYPE_NOT_ASSIGNABLE,
@@ -12738,7 +15974,7 @@ impl<'src> Binder<'src> {
             Expression::As(cast) => {
                 self.resolve_transparent_expression(expression, &cast.expression, scope);
                 if let Some(type_node) = &cast.type_node {
-                    let source = self.type_of_expr(&cast.expression, scope);
+                    let source = self.legacy_type_of_expr(&cast.expression, scope);
                     let target = self.resolve_type(type_node, scope);
                     if !self.is_assertion_compatible(source, target) {
                         self.emit(
@@ -12752,7 +15988,8 @@ impl<'src> Binder<'src> {
             Expression::Satisfies(satisfies) => {
                 self.resolve_transparent_expression(expression, &satisfies.expression, scope);
                 let target = self.resolve_type(&satisfies.type_node, scope);
-                let source = self.type_of_expr_with_target(&satisfies.expression, target, scope);
+                let source =
+                    self.legacy_type_of_expr_with_target(&satisfies.expression, target, scope);
                 if !self.types_assignable(source, target) {
                     self.emit(
                         TYPE_NOT_ASSIGNABLE,
@@ -12763,7 +16000,7 @@ impl<'src> Binder<'src> {
             }
             Expression::TypeAssertion(assertion) => {
                 self.resolve_transparent_expression(expression, &assertion.expression, scope);
-                let source = self.type_of_expr(&assertion.expression, scope);
+                let source = self.legacy_type_of_expr(&assertion.expression, scope);
                 let target = self.resolve_type(&assertion.type_node, scope);
                 if !self.is_assertion_compatible(source, target) {
                     self.emit(
@@ -12794,14 +16031,44 @@ impl<'src> Binder<'src> {
                     self.resolve_expr(options, scope);
                 }
             }
-            Expression::JsxElement(element) => {
-                let _ = self.check_jsx_element(expression, element, scope);
+            Expression::JsxElement(_element) => {
+                // Every element checks through the demand scheduler; a
+                // wrapper that never bound slot inventory synthesizes its
+                // context from the live walk state instead of skipping.
+                let context = self.selected_slot_context(expression.id(), scope);
+                if let Err(cancelled) = self.check_selected_expr(
+                    expression,
+                    SelectedInput {
+                        context,
+                        target: None,
+                    },
+                ) {
+                    self.demand.cancelled.set(Some(cancelled));
+                }
             }
-            Expression::JsxSelfClosingElement(element) => {
-                let _ = self.check_jsx_self_closing_element(expression, element, scope);
+            Expression::JsxSelfClosingElement(_element) => {
+                let context = self.selected_slot_context(expression.id(), scope);
+                if let Err(cancelled) = self.check_selected_expr(
+                    expression,
+                    SelectedInput {
+                        context,
+                        target: None,
+                    },
+                ) {
+                    self.demand.cancelled.set(Some(cancelled));
+                }
             }
-            Expression::JsxFragment(fragment) => {
-                let _ = self.check_jsx_fragment(expression, fragment, scope);
+            Expression::JsxFragment(_fragment) => {
+                let context = self.selected_slot_context(expression.id(), scope);
+                if let Err(cancelled) = self.check_selected_expr(
+                    expression,
+                    SelectedInput {
+                        context,
+                        target: None,
+                    },
+                ) {
+                    self.demand.cancelled.set(Some(cancelled));
+                }
             }
             Expression::Meta(MetaProperty::NewTarget) => {
                 if !self.new_target_contexts.last().copied().unwrap_or(false) {
@@ -13111,7 +16378,7 @@ impl<'src> Binder<'src> {
             },
             _ => call.callee.range(),
         };
-        let callee_type = self.type_of_expr(&call.callee, scope);
+        let callee_type = self.legacy_type_of_expr(&call.callee, scope);
         let evaluation = self.evaluate_call(call, scope, callee_type);
         for mismatch in evaluation.mismatches {
             let (code, range, message) = match mismatch {
@@ -13196,7 +16463,7 @@ impl<'src> Binder<'src> {
         if !self.is_typescript() {
             return;
         }
-        let callee_type = self.type_of_expr(&new.callee, scope);
+        let callee_type = self.legacy_type_of_expr(&new.callee, scope);
         let evaluation = self.evaluate_new(new, scope, callee_type);
         if evaluation.abstract_constructor {
             self.emit(
@@ -13266,7 +16533,7 @@ impl<'src> Binder<'src> {
         scope: ScopeId,
     ) -> CallEvaluation {
         let mut inference_types = Vec::with_capacity(arguments.len());
-        let mut fresh_literal_sources = Vec::new();
+        let mut argument_freshness = Vec::with_capacity(arguments.len());
         for argument in arguments {
             if let ResolvedCallArgument::Fixed {
                 type_id,
@@ -13274,11 +16541,15 @@ impl<'src> Binder<'src> {
                 ..
             } = argument
             {
-                let source = inference_types.len() as u32;
+                let freshness = if expression.is_some_and(Self::is_fresh_literal_array) {
+                    CandidateFreshness::FRESH_ARRAY_LITERAL
+                } else if expression.is_some_and(Self::is_fresh_primitive_literal) {
+                    CandidateFreshness::FRESH_PRIMITIVE_LITERAL
+                } else {
+                    CandidateFreshness::NONFRESH
+                };
                 inference_types.push(*type_id);
-                if expression.is_some_and(Self::is_fresh_array_literal) {
-                    fresh_literal_sources.push(source);
-                }
+                argument_freshness.push(freshness);
             }
         }
         let mut return_types = Vec::with_capacity(groups.len());
@@ -13298,7 +16569,7 @@ impl<'src> Binder<'src> {
                         .inferred_function_signature(
                             signature,
                             &inference_types,
-                            &fresh_literal_sources,
+                            &argument_freshness,
                         )
                         .ok_or(CallMismatch::ArgumentType(diagnostic_range)),
                 };
@@ -13373,7 +16644,7 @@ impl<'src> Binder<'src> {
                 }
                 let target = self.types.union(&targets);
                 ResolvedCallArgument::Fixed {
-                    type_id: self.type_of_expr_with_target(expression, target, scope),
+                    type_id: self.legacy_type_of_expr_with_target(expression, target, scope),
                     range: *range,
                     expression: Some(expression),
                 }
@@ -13407,13 +16678,13 @@ impl<'src> Binder<'src> {
             match argument {
                 CallArgument::Expression(expression) => {
                     resolved.push(ResolvedCallArgument::Fixed {
-                        type_id: self.type_of_expr(expression, scope),
+                        type_id: self.legacy_type_of_expr(expression, scope),
                         range: expression.range(),
                         expression: Some(expression),
                     });
                 }
                 CallArgument::Spread(spread) => {
-                    let type_id = self.type_of_expr(&spread.argument, scope);
+                    let type_id = self.legacy_type_of_expr(&spread.argument, scope);
                     match self.types.get(type_id).clone() {
                         Type::Tuple(shape) => {
                             for (index, &type_id) in shape.prefix.iter().enumerate() {
@@ -13475,7 +16746,7 @@ impl<'src> Binder<'src> {
             },
             _ => tagged.tag.range(),
         };
-        let callee_type = self.type_of_expr(&tagged.tag, scope);
+        let callee_type = self.legacy_type_of_expr(&tagged.tag, scope);
         let arguments = self.resolve_tagged_template_arguments(tagged, scope, call_range);
         let groups = self.call_signature_groups(&tagged.tag, callee_type);
         if groups.is_empty() {
@@ -13547,7 +16818,7 @@ impl<'src> Binder<'src> {
         }];
         for expression in &tagged.template.expressions {
             resolved.push(ResolvedCallArgument::Fixed {
-                type_id: self.type_of_expr(expression, scope),
+                type_id: self.legacy_type_of_expr(expression, scope),
                 range: expression.range(),
                 expression: Some(expression),
             });
@@ -13596,9 +16867,19 @@ impl<'src> Binder<'src> {
         match self.types.get(type_id).clone() {
             Type::Function(signature) => vec![vec![signature]],
             Type::ObjectType(object) if !object.call_signatures.is_empty() => {
-                let signatures = object
-                    .call_signatures
-                    .iter()
+                // Call selection reads the stored candidate permutation;
+                // relations and rendering keep declaration order.
+                let ordered: Vec<&FunctionSignature> = if object.call_candidate_order.is_empty() {
+                    object.call_signatures.iter().collect()
+                } else {
+                    object
+                        .call_candidate_order
+                        .iter()
+                        .map(|&index| &object.call_signatures[index as usize])
+                        .collect()
+                };
+                let signatures = ordered
+                    .into_iter()
                     .map(|signature| self.project_this_signature(signature, receiver))
                     .collect();
                 vec![signatures]
@@ -14106,7 +17387,7 @@ impl<'src> Binder<'src> {
                     |symbol| self.symbol_types[symbol.get() as usize],
                 ),
             AssignmentTarget::Member(member) => {
-                let object_type = self.type_of_expr(&member.object, scope);
+                let object_type = self.legacy_type_of_expr(&member.object, scope);
                 self.record_member_reference_rows(
                     &member.object,
                     &member.property,
@@ -14168,11 +17449,35 @@ impl<'src> Binder<'src> {
             let MemberProperty::Computed(expression) = property else {
                 return self.types.any();
             };
-            let object_type = self.type_of_expr(object, scope);
-            let object_type = self
-                .flow_narrowed_expression_type(object)
-                .unwrap_or(object_type);
-            let object_was_nullish = match self.types.get(object_type) {
+            let object_type = self.legacy_type_of_expr(object, scope);
+            let narrowed_object_type = self.flow_narrowed_expression_type(object);
+            let object_type = narrowed_object_type.unwrap_or(object_type);
+            // An unguarded optional property read must still participate in
+            // indexed-access rejection when strict null checks are disabled.
+            // Keep the published read type unchanged; this widened view is
+            // used only for the C064 decision below.
+            let rejection_object_type = if !optional && narrowed_object_type.is_none() {
+                match object.data() {
+                    Expression::Member(member) => {
+                        match enum_plan::cook_member_property_name(self.source, &member.property) {
+                            Some(name) => {
+                                let base_type = self.legacy_type_of_expr(&member.object, scope);
+                                self.types
+                                    .read_property_type(
+                                        base_type,
+                                        &Self::semantic_property_key(&name),
+                                    )
+                                    .unwrap_or(object_type)
+                            }
+                            None => object_type,
+                        }
+                    }
+                    _ => object_type,
+                }
+            } else {
+                object_type
+            };
+            let object_was_nullish = match self.types.get(rejection_object_type) {
                 Type::Null | Type::Undefined => true,
                 Type::Union(members) => members
                     .iter()
@@ -14184,11 +17489,11 @@ impl<'src> Binder<'src> {
             } else {
                 object_type
             };
-            let key_type = self.type_of_expr(expression, scope);
+            let key_type = self.legacy_type_of_expr(expression, scope);
             let typescript = self.is_typescript();
             let rejects_any_key = typescript
                 && self.types.is_unconstrained_index_key(key_type)
-                && !self.types.accepts_any_index(lookup_type);
+                && !self.types.accepts_any_index(rejection_object_type);
             let type_id = if rejects_any_key {
                 self.emit(
                     INVALID_INDEXED_ACCESS_KEY,
@@ -14229,7 +17534,7 @@ impl<'src> Binder<'src> {
                 return self.symbol_types[member_symbol.get() as usize];
             }
         }
-        let object_type = self.type_of_expr(object, scope);
+        let object_type = self.legacy_type_of_expr(object, scope);
         let object_type = self
             .flow_narrowed_expression_type(object)
             .unwrap_or(object_type);
@@ -14355,6 +17660,46 @@ impl<'src> Binder<'src> {
             javascript: signature.javascript(),
         })
     }
+    /// Resolves the `.call` member on a pure callable object type: a
+    /// synthesized merged method group produces the same per-signature
+    /// `thisArg`-prepended group the Function/intersection paths produce.
+    /// Returns `None` when the object is not a pure callable so ordinary
+    /// missing-member diagnostics proceed.
+    fn call_member_type_for_callable(&mut self, object_type: TypeId) -> Option<TypeId> {
+        let signatures = match self.types.get(object_type) {
+            Type::ObjectType(object) if TypeTable::is_pure_callable_object(object) => {
+                // The synthesized `.call` group reads the stored candidate
+                // permutation — the same selection order the direct call
+                // path honors — so a merged method group's `.call` tries
+                // overloads in candidate order. Identity when empty.
+                if object.call_candidate_order.is_empty() {
+                    object.call_signatures.clone()
+                } else {
+                    object
+                        .call_candidate_order
+                        .iter()
+                        .map(|&index| object.call_signatures[index as usize].clone())
+                        .collect()
+                }
+            }
+            _ => return None,
+        };
+        let mut members: Vec<TypeId> = Vec::with_capacity(signatures.len());
+        for signature in &signatures {
+            let member = self.function_call_member_type(signature);
+            // Member order is the selection order for intersection call
+            // resolution, so the permutation must survive interning; exact
+            // duplicates still collapse as `intersection` would.
+            if !members.contains(&member) {
+                members.push(member);
+            }
+        }
+        Some(if members.len() == 1 {
+            members.into_iter().next().expect("one member")
+        } else {
+            self.types.intersection_ordered(members)
+        })
+    }
 
     fn project_this_type(
         &mut self,
@@ -14459,7 +17804,7 @@ impl<'src> Binder<'src> {
                         owner_hint,
                         receiver,
                     );
-                    if read && property.optional() {
+                    if read && property.optional() && self.strict_null_checks {
                         let undefined = self.types.undefined_type();
                         type_id = self.types.union(&[type_id, undefined]);
                     }
@@ -14480,6 +17825,14 @@ impl<'src> Binder<'src> {
                         receiver,
                     );
                     return Some(type_id);
+                }
+                // A synthesized merged method group exposes `.call` as the
+                // same per-signature `thisArg`-prepended intersection the
+                // Function/intersection paths produce.
+                if name == "call"
+                    && let Some(property) = self.call_member_type_for_callable(object_type)
+                {
+                    return Some(self.project_this_type(property, owner_hint, receiver));
                 }
                 if self.is_typescript() {
                     self.emit(
@@ -14555,6 +17908,11 @@ impl<'src> Binder<'src> {
                     let property = match self.types.get(view).clone() {
                         Type::Function(signature) if name == "call" => {
                             Some(self.function_call_member_type(&signature))
+                        }
+                        Type::ObjectType(object)
+                            if name == "call" && TypeTable::is_pure_callable_object(&object) =>
+                        {
+                            self.call_member_type_for_callable(view)
                         }
                         _ if read => self.types.read_property_type(view, name),
                         _ => self.types.property_type(view, name),
@@ -14786,7 +18144,7 @@ impl<'src> Binder<'src> {
                     return;
                 };
                 let name_text = name.to_utf8_lossy();
-                let object_type = self.type_of_expr(&member.object, scope);
+                let object_type = self.legacy_type_of_expr(&member.object, scope);
                 let constructor_initialization = matches!(member.object.data(), Expression::This)
                     && matches!(
                         self.super_call_contexts.last(),
@@ -14899,7 +18257,7 @@ impl<'src> Binder<'src> {
         else {
             return;
         };
-        let source_type = self.type_of_expr(source, scope);
+        let source_type = self.legacy_type_of_expr(source, scope);
         let name = name.to_utf8_lossy();
         if let Some(property) = object
             .properties
@@ -15771,6 +19129,9 @@ impl<'src> Binder<'src> {
             return self.types.applied_alias(symbol, arguments);
         }
         if inferred.is_empty() {
+            if self.types.has_alias(symbol) && self.alias_template_is_substitution_closed(symbol) {
+                return self.types.applied_alias(symbol, Vec::new());
+            }
             return base;
         }
         // A recursive generic interface reference is resolved while its raw
@@ -15785,6 +19146,157 @@ impl<'src> Binder<'src> {
         }
         let base = self.types.named_structural_view(base);
         InferredTypeArguments::new(inferred).instantiate(&mut self.types, base)
+    }
+    /// Whether a type alias declares no type parameters and its raw template
+    /// is substitution-closed: the template references no free type
+    /// parameter, so an empty-argument application instantiates back to
+    /// itself. An alias declared inside a generic scope whose template
+    /// references that scope's parameter must keep the raw substitution
+    /// path, because alias application substitutes declared arguments only.
+    fn alias_template_is_substitution_closed(&self, symbol: SymbolId) -> bool {
+        if !self.types.alias_type_parameters(symbol).is_empty() {
+            return false;
+        }
+        let Some(template) = self.types.alias_template_raw(symbol) else {
+            return false;
+        };
+        !self.references_free_type_parameter(template, &mut HashSet::new(), &mut HashSet::new())
+    }
+
+    /// Whether a type graph contains a `Type::Named` reference to a type
+    /// parameter not bound inside the graph itself. Generic signatures bind
+    /// their own parameters, so `<T>(x: T) => T` inside a template is closed.
+    fn references_free_type_parameter(
+        &self,
+        type_id: TypeId,
+        visiting: &mut HashSet<TypeId>,
+        bound: &mut HashSet<SymbolId>,
+    ) -> bool {
+        if !visiting.insert(type_id) {
+            return false;
+        }
+        let found = match self.types.get(type_id) {
+            Type::Named(symbol) => {
+                self.symbols[symbol.get() as usize].kind == SymbolKind::TypeParameter
+                    && !bound.contains(symbol)
+            }
+            Type::Array(element) => self.references_free_type_parameter(*element, visiting, bound),
+            Type::Tuple(shape) => {
+                shape
+                    .prefix
+                    .iter()
+                    .chain(shape.suffix.iter())
+                    .any(|&element| self.references_free_type_parameter(element, visiting, bound))
+                    || shape.rest.is_some_and(|rest| {
+                        self.references_free_type_parameter(rest, visiting, bound)
+                    })
+            }
+            Type::Union(members) | Type::Intersection(members) => members
+                .iter()
+                .any(|&member| self.references_free_type_parameter(member, visiting, bound)),
+            Type::ObjectType(object) => {
+                object.properties.iter().any(|property| {
+                    self.references_free_type_parameter(property.type_id(), visiting, bound)
+                }) || object.call_signatures.iter().any(|signature| {
+                    self.signature_references_free_type_parameter(signature, visiting, bound)
+                }) || object.construct_signatures.iter().any(|entry| {
+                    self.signature_references_free_type_parameter(&entry.signature, visiting, bound)
+                }) || object.index_signatures.iter().any(|signature| {
+                    self.references_free_type_parameter(signature.value_type, visiting, bound)
+                }) || object.generator_return.is_some_and(|returned| {
+                    self.references_free_type_parameter(returned, visiting, bound)
+                }) || object.iterator_property.as_ref().is_some_and(|property| {
+                    self.references_free_type_parameter(property.type_id, visiting, bound)
+                }) || object
+                    .async_iterator_property
+                    .as_ref()
+                    .is_some_and(|property| {
+                        self.references_free_type_parameter(property.type_id, visiting, bound)
+                    })
+            }
+            Type::Function(signature) => {
+                self.signature_references_free_type_parameter(signature, visiting, bound)
+            }
+            Type::AppliedClass { arguments, .. } | Type::AppliedAlias { arguments, .. } => {
+                arguments
+                    .iter()
+                    .any(|&argument| self.references_free_type_parameter(argument, visiting, bound))
+            }
+            Type::ConstructorType {
+                arguments,
+                structural,
+                ..
+            } => {
+                arguments
+                    .iter()
+                    .any(|&argument| self.references_free_type_parameter(argument, visiting, bound))
+                    || self.references_free_type_parameter(*structural, visiting, bound)
+            }
+            Type::Keyof(operand) => self.references_free_type_parameter(*operand, visiting, bound),
+            Type::IndexedAccess { object, index } => {
+                self.references_free_type_parameter(*object, visiting, bound)
+                    || self.references_free_type_parameter(*index, visiting, bound)
+            }
+            Type::Record { key, value } => {
+                self.references_free_type_parameter(*key, visiting, bound)
+                    || self.references_free_type_parameter(*value, visiting, bound)
+            }
+            Type::This { constraint, .. } => {
+                self.references_free_type_parameter(*constraint, visiting, bound)
+            }
+            Type::Error
+            | Type::Any
+            | Type::Unknown
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::NumericEnum(_)
+            | Type::EnumMember { .. } => false,
+        };
+        visiting.remove(&type_id);
+        found
+    }
+
+    fn signature_references_free_type_parameter(
+        &self,
+        signature: &FunctionSignature,
+        visiting: &mut HashSet<TypeId>,
+        bound: &mut HashSet<SymbolId>,
+    ) -> bool {
+        let newly_bound: Vec<SymbolId> = signature
+            .type_parameters()
+            .iter()
+            .copied()
+            .filter(|parameter| bound.insert(*parameter))
+            .collect();
+        let found =
+            signature.type_parameter_bounds().iter().any(|bounds| {
+                bounds.constraint().is_some_and(|constraint| {
+                    self.references_free_type_parameter(constraint, visiting, bound)
+                }) || bounds.default().is_some_and(|default| {
+                    self.references_free_type_parameter(default, visiting, bound)
+                })
+            }) || signature.parameters().iter().any(|parameter| {
+                self.references_free_type_parameter(parameter.type_id(), visiting, bound)
+            }) || self.references_free_type_parameter(signature.return_type(), visiting, bound)
+                || signature.declared_return().is_some_and(|declared| {
+                    self.references_free_type_parameter(declared, visiting, bound)
+                });
+        for parameter in newly_bound {
+            bound.remove(&parameter);
+        }
+        found
     }
 
     fn resolve_explicit_type_arguments(
@@ -16309,6 +19821,10 @@ impl<'src> Binder<'src> {
                     iterator_property: None,
                     async_iterator_property: None,
                 };
+                // Per-fragment method-group signature counts per member key,
+                // in fragment iteration order — the offsets the candidate
+                // permutation is computed from.
+                let mut fragment_group_counts: HashMap<Box<str>, Vec<u32>> = HashMap::new();
                 for interface in declarations {
                     let base =
                         self.resolve_interface_type(scope, &interface.extends, &interface.members);
@@ -16340,6 +19856,20 @@ impl<'src> Binder<'src> {
                                 Some(self.merge_iterator_properties(left, right))
                             }
                         };
+                        for property in &object.properties {
+                            if !property.is_method() {
+                                continue;
+                            }
+                            let Some(signatures) =
+                                self.types.overload_signatures(property.type_id())
+                            else {
+                                continue;
+                            };
+                            fragment_group_counts
+                                .entry(property.name().into())
+                                .or_default()
+                                .push(signatures.len() as u32);
+                        }
                         merged.properties.extend(object.properties);
                         for signature in object.call_signatures {
                             if !merged.call_signatures.contains(&signature) {
@@ -16359,6 +19889,9 @@ impl<'src> Binder<'src> {
                     }
                 }
                 let structure = self.types.object_type_with_members(merged);
+                let structure =
+                    self.attach_interface_call_candidate_orders(structure, &fragment_group_counts);
+                self.publish_interface_member_types(symbol, structure);
                 self.types.set_interface_structure(symbol, structure);
                 if is_generic {
                     self.types.publish_final_class_template(symbol, structure);
@@ -16378,6 +19911,188 @@ impl<'src> Binder<'src> {
         self.symbol_types[symbol.get() as usize] = resolved;
         self.type_state[symbol.get() as usize] = TypeState::Done(resolved);
         resolved
+    }
+    /// The §publication read projection for one canonical member or return
+    /// type: under `strictNullChecks` an optional member's implicit `undefined`
+    /// is added; under `strictNullChecks: false` top-level `null`/`undefined`
+    /// constituents leave an explicit union when a non-nullish constituent
+    /// remains, a wholly nullish multi-member union collapses to `null`, and
+    /// lone `null`/`undefined` pass through. `any`/`never` and nested callable
+    /// annotations are preserved as written.
+    fn project_published_member_type(&mut self, type_id: TypeId, optional: bool) -> TypeId {
+        if self.strict_null_checks {
+            if !optional {
+                return type_id;
+            }
+            let undefined = self.types.undefined_type();
+            return self.types.union(&[type_id, undefined]);
+        }
+        self.project_nonull_published_type(type_id)
+    }
+
+    /// The nonull half of §publication: top-level `null`/`undefined`
+    /// constituents leave an explicit union when a non-nullish constituent
+    /// remains; a wholly nullish multi-member union collapses to `null`; a
+    /// sole nullish constituent stays itself. The read follows alias heads
+    /// and union membership only, so nullish alternatives hidden behind
+    /// aliases are still filtered while the written identity is returned
+    /// whenever projection removes nothing.
+    fn project_nonull_published_type(&mut self, type_id: TypeId) -> TypeId {
+        let Some(flattened) = self.nullish_projection_members(type_id, &mut HashSet::new()) else {
+            return type_id;
+        };
+        let stripped: Vec<TypeId> = flattened
+            .iter()
+            .copied()
+            .filter(|&member| !matches!(self.types.get(member), Type::Null | Type::Undefined))
+            .collect();
+        if !stripped.is_empty() {
+            if stripped.len() == flattened.len() {
+                return type_id;
+            }
+            return self.types.union(&stripped);
+        }
+        if flattened.len() > 1 {
+            return self.types.null_type();
+        }
+        flattened.first().copied().unwrap_or(type_id)
+    }
+
+    /// The top-level union members reachable through alias heads and union
+    /// membership alone: `None` when `type_id` is not a union boundary, so
+    /// function returns, object members, arrays, and type arguments are never
+    /// descended into. The visited set terminates circular alias chains.
+    fn nullish_projection_members(
+        &mut self,
+        type_id: TypeId,
+        visiting: &mut HashSet<TypeId>,
+    ) -> Option<Vec<TypeId>> {
+        match self.types.get(type_id) {
+            Type::Union(members) => {
+                let members = members.clone();
+                let mut flattened = Vec::with_capacity(members.len());
+                for &member in &members {
+                    match self.nullish_projection_members(member, visiting) {
+                        Some(mut inner) => flattened.append(&mut inner),
+                        None => flattened.push(member),
+                    }
+                }
+                Some(flattened)
+            }
+            Type::AppliedAlias { .. } => {
+                if !visiting.insert(type_id) {
+                    return None;
+                }
+                let view = self.types.prepare_applied_alias_view(type_id);
+                let flattened = view
+                    .filter(|view| *view != type_id)
+                    .and_then(|view| self.nullish_projection_members(view, visiting));
+                visiting.remove(&type_id);
+                flattened
+            }
+            _ => None,
+        }
+    }
+
+    /// Attaches the interface-merge candidate selection permutation to every
+    /// merged method group: fragments reversed, source order within each
+    /// fragment, then a stable float of literal-specialized signatures to the
+    /// front. The permutation is always valid and complete; identity
+    /// permutations attach nothing.
+    fn attach_interface_call_candidate_orders(
+        &mut self,
+        structure: TypeId,
+        fragment_counts: &HashMap<Box<str>, Vec<u32>>,
+    ) -> TypeId {
+        let Type::ObjectType(object) = self.types.get(structure).clone() else {
+            return structure;
+        };
+        let mut properties = object.properties.clone();
+        let mut changed = false;
+        for property in &mut properties {
+            if !property.is_method() {
+                continue;
+            }
+            let Some(counts) = fragment_counts.get(property.name()) else {
+                continue;
+            };
+            let signatures = match self.types.get(property.type_id()) {
+                Type::ObjectType(group) if TypeTable::is_pure_callable_object(group) => {
+                    group.call_signatures.clone()
+                }
+                _ => continue,
+            };
+            let total = signatures.len();
+            if total < 2 || counts.iter().map(|&count| count as usize).sum::<usize>() != total {
+                continue;
+            }
+            let mut offsets = Vec::with_capacity(counts.len());
+            let mut cursor = 0u32;
+            for &count in counts {
+                offsets.push(cursor);
+                cursor += count;
+            }
+            let mut order: Vec<u32> = Vec::with_capacity(total);
+            for (block, &count) in counts.iter().enumerate().rev() {
+                order.extend(offsets[block]..offsets[block] + count);
+            }
+            order.sort_by_key(|&index| {
+                u8::from(
+                    !self
+                        .types
+                        .signature_is_literal_specialized(&signatures[index as usize]),
+                )
+            });
+            if order
+                .iter()
+                .enumerate()
+                .all(|(slot, &index)| slot == index as usize)
+            {
+                continue;
+            }
+            let group_type = self
+                .types
+                .with_call_candidate_order(property.type_id(), order);
+            *property = property.with_type_id(group_type);
+            changed = true;
+        }
+        if !changed {
+            return structure;
+        }
+        let object = ObjectType {
+            properties,
+            ..object
+        };
+        self.types.intern(Type::ObjectType(object))
+    }
+
+    /// Publishes each canonical member symbol's read-projected type into
+    /// `symbol_types` and marks it `Done`. The merged structure's stored
+    /// `PropertyType.type_id` stays the raw annotation for relations; only
+    /// the member symbol's type table entry receives the §publication
+    /// projection (strict optional `undefined`, nonull top-level nullish
+    /// stripping).
+    fn publish_interface_member_types(&mut self, symbol: SymbolId, structure: TypeId) {
+        let Some(member_scope) = self.interface_member_scopes.get(&symbol).copied() else {
+            return;
+        };
+        let properties = match self.types.get(structure) {
+            Type::ObjectType(object) => object.properties.clone(),
+            _ => return,
+        };
+        for property in &properties {
+            let Some(member) = self.scopes[member_scope.0 as usize]
+                .values
+                .get(property.name())
+                .copied()
+            else {
+                continue;
+            };
+            let published =
+                self.project_published_member_type(property.type_id(), property.optional());
+            self.symbol_types[member.get() as usize] = published;
+            self.type_state[member.get() as usize] = TypeState::Done(published);
+        }
     }
 
     fn resolve_interface_type(
@@ -16647,12 +20362,17 @@ impl<'src> Binder<'src> {
                         .parameters
                         .iter()
                         .map(|parameter| {
+                            let type_id = self
+                                .resolve_type(&parameter.type_annotation.data().type_node, scope);
+                            if let Some(&symbol) =
+                                self.signature_parameter_symbols.get(&parameter.name.id())
+                            {
+                                self.symbol_types[symbol.get() as usize] = type_id;
+                                self.type_state[symbol.get() as usize] = TypeState::Done(type_id);
+                            }
                             FunctionParameter::new(
                                 self.identifier_text(&parameter.name).into_owned(),
-                                self.resolve_type(
-                                    &parameter.type_annotation.data().type_node,
-                                    scope,
-                                ),
+                                type_id,
                                 parameter.optional,
                                 parameter.rest,
                             )
@@ -16698,6 +20418,10 @@ impl<'src> Binder<'src> {
                     NOT_ASSIGNABLE_MESSAGE,
                 );
             }
+            if let Some(&symbol) = self.signature_parameter_symbols.get(&parameter.name.id()) {
+                self.symbol_types[symbol.get() as usize] = type_id;
+                self.type_state[symbol.get() as usize] = TypeState::Done(type_id);
+            }
             parameters.push(FunctionParameter::new(
                 self.identifier_text(&parameter.name).into_owned(),
                 type_id,
@@ -16705,7 +20429,11 @@ impl<'src> Binder<'src> {
                 parameter.rest,
             ));
         }
-        let return_type = self.resolve_type(&function.return_type, child);
+        let declared_return_type = self.resolve_type(&function.return_type, child);
+        // §publication: under nonull the semantic return drops top-level
+        // nullish constituents; under strict it stays the annotation as
+        // resolved. `declared_return` keeps the written annotation either way.
+        let return_type = self.project_published_member_type(declared_return_type, false);
         let (type_parameters, type_parameter_bounds) =
             self.signature_type_parameters(function.type_parameters.as_ref(), child);
         FunctionSignature {
@@ -16713,13 +20441,10 @@ impl<'src> Binder<'src> {
             type_parameter_bounds,
             parameters,
             return_type,
-            // `return_type` stays the resolved annotation as today; the
-            // written-annotation provenance rides alongside it, present iff
-            // an annotation was written.
             declared_return: if function.return_type_missing {
                 None
             } else {
-                Some(return_type)
+                Some(declared_return_type)
             },
             declaring_types: Vec::new(),
             javascript: false,
@@ -17204,11 +20929,11 @@ impl<'src> Binder<'src> {
 
     // -- expression typing (bounded, permissive) -------------------------------
 
-    pub(crate) fn type_of_expr(&mut self, expression: &'src Expr, scope: ScopeId) -> TypeId {
+    pub(crate) fn legacy_type_of_expr(&mut self, expression: &'src Expr, scope: ScopeId) -> TypeId {
         if let Some(&cached) = self.node_types.get(&expression.id()) {
             return cached;
         }
-        let result = self.compute_type_of_expr(expression, scope);
+        let result = self.legacy_compute_type_of_expr(expression, scope);
         if !self.probing_contextual_type
             && self.node_types.insert(expression.id(), result).is_none()
         {
@@ -17217,7 +20942,7 @@ impl<'src> Binder<'src> {
         result
     }
 
-    fn type_of_expr_with_target(
+    fn legacy_type_of_expr_with_target(
         &mut self,
         expression: &'src Expr,
         target: TypeId,
@@ -17233,7 +20958,7 @@ impl<'src> Binder<'src> {
                 let target = self.types.non_nullable(target);
                 let (target_shape, array_target) = self.contextual_array_target(target);
                 if target_shape.is_none() && array_target.is_none() {
-                    return self.type_of_expr(expression, scope);
+                    return self.legacy_type_of_expr(expression, scope);
                 }
                 let mut element_types = Vec::with_capacity(array.elements.len());
                 let source_length = array.elements.len();
@@ -17249,8 +20974,10 @@ impl<'src> Binder<'src> {
                                 })
                                 .or(array_target);
                             match element_target {
-                                Some(target) => self.type_of_expr_with_target(inner, target, scope),
-                                None => self.type_of_expr(inner, scope),
+                                Some(target) => {
+                                    self.legacy_type_of_expr_with_target(inner, target, scope)
+                                }
+                                None => self.legacy_type_of_expr(inner, scope),
                             }
                         }
                         ArrayElement::Elision => self.types.undefined_type(),
@@ -17277,7 +21004,7 @@ impl<'src> Binder<'src> {
             Expression::Conditional(conditional) => {
                 self.type_of_conditional_expr(conditional, Some(target), scope)
             }
-            _ => return self.type_of_expr(expression, scope),
+            _ => return self.legacy_type_of_expr(expression, scope),
         };
         if !self.probing_contextual_type
             && self.node_types.insert(expression.id(), result).is_none()
@@ -17288,6 +21015,17 @@ impl<'src> Binder<'src> {
     }
 
     fn contextual_array_target(&mut self, target: TypeId) -> (Option<TupleShape>, Option<TypeId>) {
+        let mut target = target;
+        let mut aliases = HashSet::new();
+        while let Type::AppliedAlias { symbol, .. } = self.types.get(target) {
+            if !aliases.insert(*symbol) {
+                return (None, None);
+            }
+            let Some(view) = self.types.prepare_applied_alias_view(target) else {
+                return (None, None);
+            };
+            target = view;
+        }
         match self.types.get(target).clone() {
             Type::Tuple(shape) => (Some(shape), None),
             Type::Array(element) => (None, Some(element)),
@@ -17311,12 +21049,9 @@ impl<'src> Binder<'src> {
 
     /// Checks one contextual method against every target overload.
     fn contextual_overload_method_type(&mut self, source: TypeId, target: TypeId) -> TypeId {
-        fn erase_signature(types: &mut TypeTable, type_id: TypeId) -> Option<TypeId> {
-            let Type::Function(signature) = types.get(type_id).clone() else {
-                return None;
-            };
+        fn erase_signature(types: &mut TypeTable, signature: &FunctionSignature) -> Option<TypeId> {
             if signature.type_parameters().is_empty() {
-                return Some(type_id);
+                return Some(types.function_signature(signature.clone()));
             }
             let any = types.any();
             let arguments = signature
@@ -17325,15 +21060,15 @@ impl<'src> Binder<'src> {
                 .copied()
                 .map(|symbol| InferredTypeArgument::new(symbol, any, InferenceProvenance::Explicit))
                 .collect();
-            Some(InferredTypeArguments::new(arguments).instantiate_signature(types, &signature))
+            Some(InferredTypeArguments::new(arguments).instantiate_signature(types, signature))
         }
 
-        fn constrain_signature(types: &mut TypeTable, type_id: TypeId) -> Option<TypeId> {
-            let Type::Function(signature) = types.get(type_id).clone() else {
-                return None;
-            };
+        fn constrain_signature(
+            types: &mut TypeTable,
+            signature: &FunctionSignature,
+        ) -> Option<TypeId> {
             if signature.type_parameters().is_empty() {
-                return Some(type_id);
+                return Some(types.function_signature(signature.clone()));
             }
             let mut arguments = Vec::with_capacity(signature.type_parameters().len());
             for (&symbol, bound) in signature
@@ -17352,40 +21087,43 @@ impl<'src> Binder<'src> {
                 };
                 arguments.push(InferredTypeArgument::new(symbol, argument, provenance));
             }
-            Some(InferredTypeArguments::new(arguments).instantiate_signature(types, &signature))
+            Some(InferredTypeArguments::new(arguments).instantiate_signature(types, signature))
         }
 
-        let Some(target_overloads) = self.types.overload_members(target) else {
+        let Some(target_overloads) = self.types.overload_signatures(target).map(Cow::into_owned)
+        else {
             return source;
         };
         if target_overloads.len() < 2 {
             return source;
         }
-        let Some(source_overloads) = self.types.overload_members(source) else {
+        let Some(source_overloads) = self.types.overload_signatures(source).map(Cow::into_owned)
+        else {
             return source;
         };
         let mut sources = Vec::with_capacity(source_overloads.len());
-        for source_member in source_overloads {
+        for source_signature in &source_overloads {
             let (Some(erased), Some(constrained)) = (
-                erase_signature(&mut self.types, source_member),
-                constrain_signature(&mut self.types, source_member),
+                erase_signature(&mut self.types, source_signature),
+                constrain_signature(&mut self.types, source_signature),
             ) else {
                 return source;
             };
             sources.push((erased, constrained));
         }
-        for target_member in target_overloads {
-            let Type::Function(target_signature) = self.types.get(target_member) else {
-                return source;
-            };
+        for target_signature in &target_overloads {
             let target_is_generic = !target_signature.type_parameters().is_empty();
             let target_candidate = if target_is_generic {
-                let Some(constrained) = constrain_signature(&mut self.types, target_member) else {
+                let Some(constrained) = constrain_signature(&mut self.types, target_signature)
+                else {
                     return source;
                 };
                 constrained
             } else {
-                target_member
+                let Some(erased) = erase_signature(&mut self.types, target_signature) else {
+                    return source;
+                };
+                erased
             };
             let compatible = sources.iter().any(|&(erased, constrained)| {
                 let candidate = if target_is_generic {
@@ -17437,7 +21175,7 @@ impl<'src> Binder<'src> {
                 ObjectMember::Property(property) => {
                     if let Some(protocol) = self.intrinsic_symbol_iterator_protocol(&property.name)
                     {
-                        let method_type = self.type_of_expr(&property.value, scope);
+                        let method_type = self.legacy_type_of_expr(&property.value, scope);
                         let property = IteratorProperty::new(method_type, false);
                         match protocol {
                             ForOfMode::Sync => iterator_property = Some(property),
@@ -17458,10 +21196,10 @@ impl<'src> Binder<'src> {
                             .and_then(|target| self.types.read_property_type(target, &name));
                         let value_type = match target {
                             Some(target) => {
-                                self.type_of_expr_with_target(&property.value, target, scope)
+                                self.legacy_type_of_expr_with_target(&property.value, target, scope)
                             }
                             None => {
-                                let inferred = self.type_of_expr(&property.value, scope);
+                                let inferred = self.legacy_type_of_expr(&property.value, scope);
                                 self.types.widen_fresh_literal(inferred)
                             }
                         };
@@ -17558,7 +21296,7 @@ impl<'src> Binder<'src> {
                     }
                 }
                 ObjectMember::Spread(spread) => {
-                    let spread_type = self.type_of_expr(&spread.argument, scope);
+                    let spread_type = self.legacy_type_of_expr(&spread.argument, scope);
                     let spread_type = self
                         .types
                         .type_parameter_constraint_view(spread_type)
@@ -17636,16 +21374,20 @@ impl<'src> Binder<'src> {
             };
         match literal_truthy {
             Some(true) => match contextual_target {
-                Some(target) => {
-                    self.type_of_expr_with_target(conditional.consequent.as_ref(), target, scope)
-                }
-                None => self.type_of_expr(conditional.consequent.as_ref(), scope),
+                Some(target) => self.legacy_type_of_expr_with_target(
+                    conditional.consequent.as_ref(),
+                    target,
+                    scope,
+                ),
+                None => self.legacy_type_of_expr(conditional.consequent.as_ref(), scope),
             },
             Some(false) => match contextual_target {
-                Some(target) => {
-                    self.type_of_expr_with_target(conditional.alternate.as_ref(), target, scope)
-                }
-                None => self.type_of_expr(conditional.alternate.as_ref(), scope),
+                Some(target) => self.legacy_type_of_expr_with_target(
+                    conditional.alternate.as_ref(),
+                    target,
+                    scope,
+                ),
+                None => self.legacy_type_of_expr(conditional.alternate.as_ref(), scope),
             },
             None => {
                 let parent = self.flow;
@@ -17654,23 +21396,23 @@ impl<'src> Binder<'src> {
                 let mut consequent = self.types.any();
                 self.in_branch(parent, &truthy, |binder| {
                     consequent = match contextual_target {
-                        Some(target) => binder.type_of_expr_with_target(
+                        Some(target) => binder.legacy_type_of_expr_with_target(
                             conditional.consequent.as_ref(),
                             target,
                             scope,
                         ),
-                        None => binder.type_of_expr(conditional.consequent.as_ref(), scope),
+                        None => binder.legacy_type_of_expr(conditional.consequent.as_ref(), scope),
                     };
                 });
                 let mut alternate = self.types.any();
                 self.in_branch(parent, &falsy, |binder| {
                     alternate = match contextual_target {
-                        Some(target) => binder.type_of_expr_with_target(
+                        Some(target) => binder.legacy_type_of_expr_with_target(
                             conditional.alternate.as_ref(),
                             target,
                             scope,
                         ),
-                        None => binder.type_of_expr(conditional.alternate.as_ref(), scope),
+                        None => binder.legacy_type_of_expr(conditional.alternate.as_ref(), scope),
                     };
                 });
                 if self.types.assignable(consequent, alternate) {
@@ -17795,11 +21537,27 @@ impl<'src> Binder<'src> {
             _ => None,
         }
     }
-    fn compute_type_of_expr(&mut self, expression: &'src Expr, scope: ScopeId) -> TypeId {
+    fn legacy_compute_type_of_expr(&mut self, expression: &'src Expr, scope: ScopeId) -> TypeId {
         match expression.data() {
             Expression::Identifier(identifier) => {
-                let Some(&symbol) = self.references.get(&identifier.id()) else {
-                    return self.types.any();
+                // Demand-typed sites (JSX attribute and child expressions)
+                // are never walked by the legacy reference pass, so their
+                // symbol comes from the Stage-A reservation or, failing that,
+                // a read-only lexical lookup. Publishing into `references`
+                // here would leak inference-time state into the public
+                // projection, so the fallback stays side-effect free.
+                let symbol = match self.references.get(&identifier.id()) {
+                    Some(&symbol) => symbol,
+                    None => {
+                        let text = self.identifier_text(identifier).into_owned();
+                        match self.reference_index.lexical_symbols.get(&identifier.id()) {
+                            Some(&symbol) => symbol,
+                            None => match self.lookup_value(scope, &text) {
+                                Some(symbol) => symbol,
+                                None => return self.types.any(),
+                            },
+                        }
+                    }
                 };
                 let declared = match self.symbols[symbol.get() as usize].kind {
                     SymbolKind::Class => self
@@ -17813,7 +21571,7 @@ impl<'src> Binder<'src> {
             }
             Expression::Literal(literal) => self.type_of_literal(literal),
             Expression::Unary(unary) => {
-                let operand = self.type_of_expr(&unary.argument, scope);
+                let operand = self.legacy_type_of_expr(&unary.argument, scope);
                 match unary.operator {
                     UnaryOperator::Not | UnaryOperator::Delete => self.types.boolean(),
                     UnaryOperator::Typeof => self.types.string(),
@@ -17832,8 +21590,8 @@ impl<'src> Binder<'src> {
                 self.types.widen(target, false)
             }
             Expression::Binary(binary) => {
-                let left = self.type_of_expr(&binary.left, scope);
-                let right = self.type_of_expr(&binary.right, scope);
+                let left = self.legacy_type_of_expr(&binary.left, scope);
+                let right = self.legacy_type_of_expr(&binary.right, scope);
                 match binary.operator {
                     BinaryOperator::LessThan
                     | BinaryOperator::LessThanOrEqual
@@ -17877,16 +21635,16 @@ impl<'src> Binder<'src> {
                 }
             }
             Expression::Logical(logical) => {
-                let left = self.type_of_expr(&logical.left, scope);
+                let left = self.legacy_type_of_expr(&logical.left, scope);
                 let right = if logical.operator == LogicalOperator::Nullish {
-                    self.type_of_expr(&logical.right, scope)
+                    self.legacy_type_of_expr(&logical.right, scope)
                 } else {
                     let parent = self.flow;
                     let guards =
                         self.guards_for(&logical.left, logical.operator == LogicalOperator::Or);
                     let mut right = self.types.any();
                     self.in_branch(parent, &guards, |binder| {
-                        right = binder.type_of_expr(&logical.right, scope);
+                        right = binder.legacy_type_of_expr(&logical.right, scope);
                     });
                     right
                 };
@@ -17904,24 +21662,24 @@ impl<'src> Binder<'src> {
             Expression::Sequence(sequence) => sequence
                 .expressions
                 .last()
-                .map(|last| self.type_of_expr(last, scope))
+                .map(|last| self.legacy_type_of_expr(last, scope))
                 .unwrap_or_else(|| self.types.undefined_type()),
-            Expression::Parenthesized(inner) => self.type_of_expr(inner, scope),
+            Expression::Parenthesized(inner) => self.legacy_type_of_expr(inner, scope),
             Expression::NonNull(non_null) => {
-                let operand = self.type_of_expr(&non_null.expression, scope);
+                let operand = self.legacy_type_of_expr(&non_null.expression, scope);
                 self.types.non_nullable(operand)
             }
             Expression::Assignment(assignment)
                 if assignment.operator == AssignmentOperator::Assign =>
             {
-                self.type_of_expr(&assignment.right, scope)
+                self.legacy_type_of_expr(&assignment.right, scope)
             }
             Expression::Assignment(assignment)
                 if assignment.operator == AssignmentOperator::NullishAssign =>
             {
                 let target = self.type_of_assignment_target(&assignment.left, scope);
                 let target = self.types.non_nullable(target);
-                let source = self.type_of_expr(&assignment.right, scope);
+                let source = self.legacy_type_of_expr(&assignment.right, scope);
                 self.types.union(&[target, source])
             }
             Expression::Assignment(assignment) => {
@@ -17930,19 +21688,21 @@ impl<'src> Binder<'src> {
             }
             Expression::As(cast) => match &cast.type_node {
                 Some(type_node) => self.resolve_type(type_node, scope),
-                None => self.type_of_expr(&cast.expression, scope),
+                None => self.legacy_type_of_expr(&cast.expression, scope),
             },
-            Expression::Satisfies(satisfies) => self.type_of_expr(&satisfies.expression, scope),
+            Expression::Satisfies(satisfies) => {
+                self.legacy_type_of_expr(&satisfies.expression, scope)
+            }
             Expression::TypeAssertion(assertion) => self.resolve_type(&assertion.type_node, scope),
             Expression::Array(array) => {
                 let mut element_types = Vec::new();
                 for element in &array.elements {
                     match element {
                         ArrayElement::Expression(inner) => {
-                            element_types.push(self.type_of_expr(inner, scope));
+                            element_types.push(self.legacy_type_of_expr(inner, scope));
                         }
                         ArrayElement::Spread(spread) => {
-                            let spread_type = self.type_of_expr(&spread.argument, scope);
+                            let spread_type = self.legacy_type_of_expr(&spread.argument, scope);
                             let element = self
                                 .array_element_type(spread_type)
                                 .unwrap_or_else(|| self.types.any());
@@ -17963,11 +21723,12 @@ impl<'src> Binder<'src> {
             }
             Expression::JsxElement(_)
             | Expression::JsxSelfClosingElement(_)
-            | Expression::JsxFragment(_) => self
-                .jsx_element_types
-                .get(&expression.id())
-                .copied()
-                .unwrap_or_else(|| self.types.any()),
+            | Expression::JsxFragment(_) => {
+                // Demand-side JSX classifies through `Binder::infer_jsx_outcome`
+                // in the new `type_of_expr`; the legacy path is kept at `any`
+                // until activation cuts over.
+                self.types.any()
+            }
             Expression::Conditional(conditional) => {
                 self.type_of_conditional_expr(conditional, None, scope)
             }
@@ -17975,7 +21736,7 @@ impl<'src> Binder<'src> {
             Expression::Class(class) => self.resolve_class_expression(&class.class, scope),
             Expression::Arrow(arrow) => self.type_of_arrow(arrow, scope),
             Expression::Member(member) => {
-                let object_type = self.type_of_expr(&member.object, scope);
+                let object_type = self.legacy_type_of_expr(&member.object, scope);
                 let type_id = self.type_of_member(
                     &member.object,
                     &member.property,
@@ -17995,7 +21756,7 @@ impl<'src> Binder<'src> {
             }
 
             Expression::New(new) => {
-                let callee_type = self.type_of_expr(&new.callee, scope);
+                let callee_type = self.legacy_type_of_expr(&new.callee, scope);
                 self.new_return_type(new, callee_type, scope)
                     .unwrap_or_else(|| self.types.any())
             }
@@ -18005,16 +21766,16 @@ impl<'src> Binder<'src> {
                 .copied()
                 .unwrap_or_else(|| self.types.any()),
             Expression::Call(call) => {
-                let callee_type = self.type_of_expr(&call.callee, scope);
+                let callee_type = self.legacy_type_of_expr(&call.callee, scope);
                 self.call_return_type(call, callee_type, scope)
                     .unwrap_or_else(|| self.types.any())
             }
             Expression::Await(await_expression) => {
-                let operand = self.type_of_expr(&await_expression.argument, scope);
+                let operand = self.legacy_type_of_expr(&await_expression.argument, scope);
                 self.awaited_type(operand)
             }
             Expression::TaggedTemplate(tagged) => {
-                let callee_type = self.type_of_expr(&tagged.tag, scope);
+                let callee_type = self.legacy_type_of_expr(&tagged.tag, scope);
                 self.evaluate_tagged_template(tagged, scope, callee_type, expression.range())
                     .return_type
                     .unwrap_or_else(|| self.types.any())
@@ -18067,8 +21828,8 @@ impl<'src> Binder<'src> {
             | BinaryOperator::GreaterThanOrEqual
             | BinaryOperator::In => true,
             BinaryOperator::Add => {
-                let left = self.type_of_expr(&binary.left, scope);
-                let right = self.type_of_expr(&binary.right, scope);
+                let left = self.legacy_type_of_expr(&binary.left, scope);
+                let right = self.legacy_type_of_expr(&binary.right, scope);
                 !self.is_assignable_to_string_like(left)
                     && !self.is_assignable_to_string_like(right)
             }
@@ -18090,7 +21851,7 @@ impl<'src> Binder<'src> {
         if !self.is_nullable_value_word(operand) {
             return;
         }
-        let operand_type = self.type_of_expr(operand, scope);
+        let operand_type = self.legacy_type_of_expr(operand, scope);
         if !self.types.is_exactly_nullish(operand_type) {
             return;
         }
@@ -18126,7 +21887,7 @@ impl<'src> Binder<'src> {
             | AssignmentOperator::BitOrAssign => true,
             AssignmentOperator::AddAssign => {
                 let left = self.type_of_assignment_target(&assignment.left, scope);
-                let right = self.type_of_expr(&assignment.right, scope);
+                let right = self.legacy_type_of_expr(&assignment.right, scope);
                 !self.is_assignable_to_string_like(left)
                     && !self.is_assignable_to_string_like(right)
             }
@@ -18590,7 +22351,7 @@ impl<'src> Binder<'src> {
         }
         match &function.body {
             Some(FunctionBody::Expression(expression)) => {
-                let return_type = self.type_of_expr(expression, parent);
+                let return_type = self.legacy_type_of_expr(expression, parent);
                 if function.is_async {
                     self.awaited_type(return_type)
                 } else {
@@ -18617,7 +22378,7 @@ impl<'src> Binder<'src> {
     ) -> TypeId {
         match &arrow.body {
             FunctionBody::Expression(expression) => {
-                let return_type = self.type_of_expr(expression, parent);
+                let return_type = self.legacy_type_of_expr(expression, parent);
                 if arrow.is_async {
                     self.awaited_type(return_type)
                 } else {
@@ -18738,7 +22499,7 @@ impl<'src> Binder<'src> {
         &mut self,
         signature: &FunctionSignature,
         argument_types: &[TypeId],
-        fresh_literal_sources: &[u32],
+        freshness: &[CandidateFreshness],
     ) -> Option<FunctionSignature> {
         if signature.type_parameters().is_empty() {
             return Some(signature.clone());
@@ -18764,12 +22525,13 @@ impl<'src> Binder<'src> {
             &inference_parameters,
             self.cancel.clone(),
         );
-        for &source in fresh_literal_sources {
-            context.mark_fresh_literal_source(source);
-        }
-        context.infer_from_arguments(signature, argument_types);
+        context.infer_from_arguments(signature, argument_types, freshness);
         let mut inferred = context.resolve();
-        inferred.widen_unconstrained_literals(&mut self.types, &inference_parameters);
+        inferred.widen_unconstrained_literals(
+            &mut self.types,
+            &inference_parameters,
+            signature.return_type(),
+        );
         let mut instantiated_parameters = Vec::with_capacity(signature.parameters().len());
         for parameter in signature.parameters() {
             let type_id = inferred.instantiate(&mut self.types, parameter.type_id());
@@ -18860,6 +22622,29 @@ pub(crate) fn bind_source(source: &SourceFile) -> (SemanticModel, Vec<Diagnostic
 
 /// Binds one parsed source into its immutable semantic model using the
 /// standard intrinsic environment. Fails early when `cancel` is triggered.
+/// Lexically prepares one source and returns the retained binder.  This is the
+/// bootstrap half of the private prepare/continue boundary; it never finishes
+/// a `SemanticModel` or publishes diagnostics.
+#[expect(
+    dead_code,
+    reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
+)]
+pub(crate) fn prepare_source_with_environment_and_cancel<'src>(
+    source: &'src SourceFile,
+    environment: GlobalEnvironment,
+    is_module: bool,
+    options: ProgramCheckOptions,
+    cancel: bamts_cancel::CancellationToken,
+) -> Result<Binder<'src>, super::CheckCancelled> {
+    Binder::prepare_source_with_environment_and_cancel(
+        source,
+        environment,
+        is_module,
+        options,
+        cancel,
+    )
+}
+
 pub(crate) fn bind_source_with_cancel(
     source: &SourceFile,
     cancel: bamts_cancel::CancellationToken,
@@ -18872,7 +22657,7 @@ pub(crate) fn bind_source_with_cancel(
         cancel,
     );
     binder.run_with_imported_types_and_cancel(&[])?;
-    Ok(binder.finish())
+    binder.finish()
 }
 
 /// Binds one parsed source into its immutable semantic model using an
@@ -18935,7 +22720,2861 @@ pub(crate) fn bind_source_with_environment_and_imports_with_cancel(
     let mut binder =
         Binder::with_environment_and_cancel(source, environment, is_module, options, cancel);
     binder.run_with_imported_types_and_cancel(imported_types)?;
-    Ok(binder.finish())
+    binder.finish()
+}
+
+// ---------------------------------------------------------------------------
+// Demand engine records (WP-CTX / WP-DEMAND / WP-CHECK).  These complete the
+// frozen shared identity set and are consumed by the Binder demand scheduler.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub(crate) enum QueryState {
+    Active,
+    WaitingOn(Vec<QueryDependency>),
+    Complete(QueryValue),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum QueryValue {
+    Declaration(CompletedDemand),
+    Expression(ExpressionResult),
+    #[expect(
+        dead_code,
+        reason = "produced by the WP-DEMAND/WP-FLOW engines in a later serialized binder step"
+    )]
+    Flow(RootFlowPacket),
+    #[expect(
+        dead_code,
+        reason = "produced by the WP-DEMAND/WP-FLOW engines in a later serialized binder step"
+    )]
+    SignatureGroup(Vec<FunctionSignature>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExpressionResult {
+    pub type_id: TypeId,
+    pub jsx: Option<JsxElementOutcome>,
+}
+
+impl ExpressionResult {
+    /// The result of a non-JSX expression: a plain type with no classified
+    /// element outcome to replay.
+    pub(crate) const fn plain(type_id: TypeId) -> Self {
+        Self { type_id, jsx: None }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedInput {
+    pub(crate) context: SlotContext,
+    pub(crate) target: Option<TypeId>,
+}
+
+#[expect(
+    dead_code,
+    reason = "consumed by the WP-DEMAND structure engines in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum StructureRef {
+    Declaration(DeclId),
+    Expression(NodeId),
+}
+
+#[expect(
+    dead_code,
+    reason = "consumed by the WP-DEMAND structure engines in a later serialized binder step"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AvailableStructure {
+    Callable(DeclId),
+    Array(Box<[StructureRef]>),
+    Object(Box<[(PropertyKey, StructureRef)]>),
+    Class {
+        declaration: DeclId,
+        side: ClassSide,
+    },
+    Container(DeclId),
+    Final(TypeId),
+}
+
+#[expect(
+    dead_code,
+    reason = "consumed by the WP-DEMAND structure engines in a later serialized binder step"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CallableCandidate {
+    Source(DeclId),
+    Complete(FunctionSignature),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum DemandDiagnosticKind {
+    InitializerCycle,
+    NamedReturnCycle,
+    AnonymousReturnCycle,
+    NestingTooDeep,
+    #[expect(
+        dead_code,
+        reason = "staged by the WP-CHECK fact drain in a later serialized binder step"
+    )]
+    Existing(DiagnosticCode),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DemandFact {
+    pub owner: DeclId,
+    pub range: TextRange,
+    pub payload: DemandDiagnostic,
+    pub order: PublicationOrder,
+    #[expect(
+        dead_code,
+        reason = "drained by the WP-CHECK publication engine in a later serialized binder step"
+    )]
+    pub speculative: bool,
+}
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Existing payload stays inline; the WP-DEMAND fact shape is frozen by contract"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DemandDiagnostic {
+    InitializerCycle,
+    ReturnCycle(CallableAnchor),
+    #[expect(
+        dead_code,
+        reason = "staged by the WP-CHECK fact drain in a later serialized binder step"
+    )]
+    NestingTooDeep,
+    #[expect(
+        dead_code,
+        reason = "staged by the WP-CHECK fact drain in a later serialized binder step"
+    )]
+    Existing(Diagnostic),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingDiagnostic {
+    pub diagnostic: Diagnostic,
+    #[expect(
+        dead_code,
+        reason = "drained by the WP-CHECK publication engine in a later serialized binder step"
+    )]
+    pub order: PublicationOrder,
+    pub eligible: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CheckPublication {
+    pub diagnostics: Vec<PendingDiagnostic>,
+    #[expect(
+        dead_code,
+        reason = "drained by the WP-CHECK publication engine in a later serialized binder step"
+    )]
+    pub selected: HashMap<NodeId, SelectedInput>,
+    #[expect(
+        dead_code,
+        reason = "drained by the WP-CHECK publication engine in a later serialized binder step"
+    )]
+    pub checked: HashSet<NodeId>,
+    pub drained_facts: HashSet<(DeclId, TextRange, DemandDiagnosticKind)>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct QueryFrame<'src> {
+    pub entries: HashMap<QueryKey, QueryState>,
+    #[expect(
+        dead_code,
+        reason = "drained by the WP-CHECK publication engine in a later serialized binder step"
+    )]
+    pub structures: HashMap<StructureRef, AvailableStructure>,
+    #[expect(
+        dead_code,
+        reason = "drained by the WP-CHECK publication engine in a later serialized binder step"
+    )]
+    pub flow_facts: FlowFacts,
+    pub facts: Vec<DemandFact>,
+    #[expect(
+        dead_code,
+        reason = "drained by the WP-CHECK publication engine in a later serialized binder step"
+    )]
+    pub pending_constraints: Vec<PendingConstraintCheck>,
+    #[expect(
+        dead_code,
+        reason = "drained by the WP-CHECK publication engine in a later serialized binder step"
+    )]
+    pub type_defaults: HashMap<SymbolId, TypeParameterDefaultState<'src>>,
+    #[expect(
+        dead_code,
+        reason = "drained by the WP-CHECK publication engine in a later serialized binder step"
+    )]
+    pub selected_inputs: HashMap<NodeId, SelectedInput>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ContextualFrame<'src> {
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-CTX frame engine in a later serialized binder step"
+    )]
+    pub mode: ContextualMode,
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-CTX frame engine in a later serialized binder step"
+    )]
+    pub environment: EffectiveEnvironment,
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-CTX frame engine in a later serialized binder step"
+    )]
+    pub parent: Option<usize>,
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-CTX frame engine in a later serialized binder step"
+    )]
+    pub root: QueryKey,
+    pub lifecycle: FrameLifecycle,
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-CTX frame engine in a later serialized binder step"
+    )]
+    pub replay: SelectedReplayState,
+    /// `None` only after safe release; pending frames always retain `Some`.
+    pub queries: Option<QueryFrame<'src>>,
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-CTX frame engine in a later serialized binder step"
+    )]
+    pub entry_active_depth: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DemandState<'src> {
+    pub canonical: QueryFrame<'src>,
+    pub frames: Vec<ContextualFrame<'src>>,
+    pub active_frame: usize,
+    pub active: Vec<QueryAddress>,
+    pub positions: HashMap<QueryAddress, usize>,
+    pub dependencies: HashMap<QueryAddress, Vec<QueryDependency>>,
+    pub in_demand: u32,
+    /// Queries parked on a settled wait edge: their producer was still being
+    /// computed (or is itself parked) when they re-polled, so `complete_query`
+    /// is the only thing allowed to wake them back onto the worklist.
+    pub parked: HashSet<QueryAddress>,
+    /// Interior-mutable so the single sticky poll stays callable through
+    /// `&self` from read-only binder passes; `CheckCancelled` is `Copy`.
+    pub cancelled: Cell<Option<super::CheckCancelled>>,
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-CTX frame engine in a later serialized binder step"
+    )]
+    pub demand_depth: u32,
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-CTX frame engine in a later serialized binder step"
+    )]
+    pub materialize_depth: u32,
+    pub assignment_memo: HashMap<ScopeId, super::narrowing::AssignmentAnalysis>,
+}
+
+impl<'src> DemandState<'src> {
+    pub fn new() -> Self {
+        Self {
+            canonical: QueryFrame::default(),
+            frames: Vec::new(),
+            active_frame: 0,
+            active: Vec::new(),
+            positions: HashMap::new(),
+            dependencies: HashMap::new(),
+            in_demand: 0,
+            parked: HashSet::new(),
+            cancelled: Cell::new(None),
+            demand_depth: 0,
+            materialize_depth: 0,
+            assignment_memo: HashMap::new(),
+        }
+    }
+
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-CTX frame engine in a later serialized binder step"
+    )]
+    fn get_frame<'a>(&'a self, index: usize) -> Option<&'a ContextualFrame<'src>> {
+        if index == 0 {
+            None
+        } else {
+            self.frames.get(index - 1)
+        }
+    }
+
+    #[expect(
+        dead_code,
+        reason = "consumed by the WP-CTX frame engine in a later serialized binder step"
+    )]
+    fn get_frame_mut<'a>(&'a mut self, index: usize) -> Option<&'a mut ContextualFrame<'src>> {
+        if index == 0 {
+            None
+        } else {
+            self.frames.get_mut(index - 1)
+        }
+    }
+}
+
+#[expect(
+    dead_code,
+    reason = "resolved by the WP-DEMAND computed-key engines in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MemberKeyCompletion {
+    Pending,
+    Complete,
+}
+
+#[expect(
+    dead_code,
+    reason = "resolved by the WP-DEMAND computed-key engines in a later serialized binder step"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ComputedNameOutcome {
+    Pending,
+    Complete(ComputedNameContribution),
+}
+
+#[expect(
+    dead_code,
+    reason = "resolved by the WP-DEMAND computed-key engines in a later serialized binder step"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ComputedNameContribution {
+    Finite(ResolvedPropertyKey),
+    Index { key_type: TypeId },
+    Invalid,
+}
+
+#[expect(
+    dead_code,
+    reason = "resolved by the WP-DEMAND computed-key engines in a later serialized binder step"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedPropertyKey {
+    pub key: PropertyKey,
+    pub literal_type: TypeId,
+}
+
+#[expect(
+    dead_code,
+    reason = "resolved by the WP-DEMAND computed-key engines in a later serialized binder step"
+)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum PropertyKey {
+    Name(Box<str>),
+    Number(TypeId),
+    UniqueSymbol(SymbolId),
+}
+
+/// Shallow lexical inventory over one [`Binder`], passed to
+/// [`enum_plan::build_with_imports_from_inventory`] during the checker scalar
+/// bootstrap and (when installed scalars are present) during [`Binder::finish`].
+///
+/// `'src` is the source borrow the `Binder` itself holds (`&'src SourceFile`
+/// and the source-stable enum declaration rows); `'a` is the borrow of the
+/// `Binder`'s owned inventory tables. The solver borrows the prepared binder
+/// only while it evaluates, so `'a` never needs to outlive `&self`.
+#[derive(Clone, Copy)]
+pub(crate) struct EnumSourceInventory<'src, 'a> {
+    pub view: EnumBindingView<'a>,
+    pub source: &'src SourceFile,
+    #[expect(
+        dead_code,
+        reason = "read by the WP-SEAM enum bootstrap in a later serialized binder step"
+    )]
+    pub source_id: SourceId,
+    pub declarations: &'a [EnumDeclarationBinding<'src>],
+    pub member_symbols: &'a HashMap<NodeId, SymbolId>,
+    pub member_names: &'a HashMap<NodeId, EcmaString>,
+    pub member_identifier_uses: &'a HashSet<NodeId>,
+    pub local_member_targets: &'a HashMap<NodeId, SymbolId>,
+    pub imported_member_uses: &'a HashMap<NodeId, enum_plan::ImportedEnumMemberUse>,
+    pub imported_member_targets: &'a HashSet<NodeId>,
+}
+
+impl<'src, 'a> EnumSourceInventory<'src, 'a> {
+    #[expect(
+        dead_code,
+        clippy::wrong_self_convention,
+        clippy::type_complexity,
+        reason = "WP-SEAM tuple view; consumed when the enum bootstrap cutover lands"
+    )]
+    pub fn into_parts(
+        &self,
+    ) -> (
+        &EnumBindingView<'a>,
+        &'src SourceFile,
+        SourceId,
+        &'a [EnumDeclarationBinding<'src>],
+        &'a HashMap<NodeId, SymbolId>,
+        &'a HashMap<NodeId, EcmaString>,
+        &'a HashSet<NodeId>,
+        &'a HashMap<NodeId, SymbolId>,
+        &'a HashMap<NodeId, enum_plan::ImportedEnumMemberUse>,
+        &'a HashSet<NodeId>,
+    ) {
+        (
+            &self.view,
+            self.source,
+            self.source_id,
+            self.declarations,
+            self.member_symbols,
+            self.member_names,
+            self.member_identifier_uses,
+            self.local_member_targets,
+            self.imported_member_uses,
+            self.imported_member_targets,
+        )
+    }
+}
+
+/// Whether a canonical completion may be reused for a query evaluated under
+/// a contextual frame. Independence requires both an environment-insensitive
+/// producer and canonical-only completed dependencies (WP-CTX lookup order).
+#[expect(
+    dead_code,
+    reason = "driven by the WP-CTX frame engine in a later serialized binder step"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CanonicalReuse {
+    ProvenIndependent,
+    LocalOnly,
+}
+
+macro_rules! demand_ready {
+    ($e:expr) => {
+        match $e {
+            Ok(poll) => match poll {
+                crate::checker::binder::DemandPoll::Ready(value) => value,
+                crate::checker::binder::DemandPoll::Pending(dep) => {
+                    return Ok(crate::checker::binder::DemandPoll::Pending(dep));
+                }
+                crate::checker::binder::DemandPoll::Limited { owner, range } => {
+                    return Ok(crate::checker::binder::DemandPoll::Limited { owner, range });
+                }
+            },
+            Err(cancelled) => return Err(cancelled),
+        }
+    };
+}
+
+pub(crate) use demand_ready;
+
+// ---------------------------------------------------------------------------
+// Demand engine implementation (WP-CTX / WP-DEMAND / WP-CHECK adapters).
+// ---------------------------------------------------------------------------
+
+impl<'src> Binder<'src> {
+    // -----------------------------------------------------------------------
+    // Cancellation / publication helpers.
+    // -----------------------------------------------------------------------
+
+    pub(crate) fn check_cancel(&self) -> Result<(), super::CheckCancelled> {
+        if let Some(cancel) = &self.cancel
+            && let Err(cancelled) = cancel.check()
+        {
+            let err = super::CheckCancelled::from(cancelled);
+            // Sticky: record the first cancellation so every later poll
+            // in this binder keeps failing even though the token check
+            // is consumed with the poll.
+            if self.demand.cancelled.get().is_none() {
+                self.demand.cancelled.set(Some(err));
+            }
+            return Err(err);
+        }
+        if let Some(err) = self.demand.cancelled.get() {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Returns the publication ordering for a diagnostic anchored at `node`.
+    ///
+    /// `node` must be registered in `declaration_index.expressions` — by
+    /// WP-LEX Stage-A (`reserve_expr`) or by the selected-check boundary
+    /// (`check_selected_expr` registers every expression it checks, which
+    /// covers the hybrid legacy path that never ran Stage-A). The current
+    /// caller, jsx.rs, passes a JSX element/fragment expression's own id.
+    /// There is no separate NodeId-to-range registry in this source model;
+    /// the inventory stores the source node itself, so `.range()` is the
+    /// actual UTF16 source range and the order is source-stable.
+    pub(crate) fn diagnostic_order(&mut self, node: NodeId) -> PublicationOrder {
+        let range = self
+            .declaration_index
+            .expressions
+            .get(&node)
+            .expect("diagnostic_order targets a node reserved in declaration_index.expressions")
+            .range();
+        self.publication_order_for_range(range)
+    }
+
+    fn publication_order_for_range(&self, range: TextRange) -> PublicationOrder {
+        PublicationOrder {
+            owner_position: range.start(),
+            source_event: 0,
+            producer_order: 0,
+            local_order: 0,
+        }
+    }
+
+    pub(crate) fn queue_diagnostic(
+        &mut self,
+        diagnostic: Diagnostic,
+        order: PublicationOrder,
+        eligible: bool,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        self.publication.diagnostics.push(PendingDiagnostic {
+            diagnostic,
+            order,
+            eligible,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn reference_sequence(&self, node: NodeId) -> Option<u32> {
+        self.reference_index
+            .events_by_node
+            .get(&node)
+            .and_then(|indices| {
+                indices.iter().find_map(|&index| {
+                    self.reference_index
+                        .events
+                        .get(index as usize)
+                        .and_then(|event| {
+                            if event.kind == ReferenceKind::Identifier {
+                                Some(event.sequence)
+                            } else {
+                                None
+                            }
+                        })
+                })
+            })
+    }
+
+    // -----------------------------------------------------------------------
+    // Demand scheduler.
+    // -----------------------------------------------------------------------
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn contextual_mode(&self) -> Option<ContextualMode> {
+        if self.demand.active_frame == 0 {
+            None
+        } else {
+            Some(self.demand.frames[self.demand.active_frame - 1].mode)
+        }
+    }
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn canonical_reuse(&self, key: &QueryKey) -> CanonicalReuse {
+        match key {
+            QueryKey::Declaration(demand_key) => match demand_key.facet {
+                Facet::SignatureHeader
+                | Facet::ContainerIdentity
+                | Facet::ClassShape(_)
+                | Facet::ComputedKey => CanonicalReuse::ProvenIndependent,
+                Facet::Initializer | Facet::InferredReturn => CanonicalReuse::LocalOnly,
+            },
+            QueryKey::Expression(_) | QueryKey::Flow(_) => CanonicalReuse::LocalOnly,
+            QueryKey::SignatureGroup(_) => CanonicalReuse::ProvenIndependent,
+        }
+    }
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn query_in_context(
+        &mut self,
+        request: ContextualRequest,
+    ) -> DemandResult<QueryValue> {
+        self.check_cancel()?;
+        let frame = self.demand.frames.len() + 1;
+        self.demand.frames.push(ContextualFrame {
+            mode: request.mode,
+            environment: request.environment,
+            parent: if self.demand.active_frame == 0 {
+                None
+            } else {
+                Some(self.demand.active_frame)
+            },
+            root: request.root,
+            lifecycle: FrameLifecycle::Active,
+            replay: SelectedReplayState::NotRequired,
+            queries: Some(QueryFrame::default()),
+            entry_active_depth: self.demand.active.len(),
+        });
+        self.demand.active_frame = frame;
+        let result = self.evaluate_query(QueryAddress {
+            frame,
+            key: request.root,
+        });
+        self.demand.active_frame = self.demand.frames[frame - 1].parent.unwrap_or(0);
+        match (&result, request.mode) {
+            // Returning Pending NEVER releases the frame (WP-CTX pending
+            // rule): entries, facts, evidence and the parent wait edge stay
+            // alive for the scheduler's resume of this stored root query.
+            (Ok(DemandPoll::Pending(_)), _) => {
+                self.demand.frames[frame - 1].lifecycle = FrameLifecycle::Suspended;
+            }
+            // Speculative frames release at this boundary: their frame-local
+            // evidence is discarded here without promotion. Selected frames
+            // stay alive (Complete) until the check driver drains their
+            // pending_constraints exactly once and releases them.
+            (Ok(_), ContextualMode::Speculative) => {
+                self.release_contextual_frame(frame)?;
+            }
+            (Ok(_), ContextualMode::Selected) => {
+                self.demand.frames[frame - 1].lifecycle = FrameLifecycle::Complete;
+            }
+            // Cancellation: the sticky teardown discards every frame payload.
+            (Err(_), _) => {}
+        }
+        result
+    }
+
+    pub(crate) fn resume_query(&mut self, address: QueryAddress) -> DemandResult<QueryValue> {
+        self.check_cancel()?;
+        if address.frame != 0 {
+            let slot = self
+                .demand
+                .frames
+                .get_mut(address.frame - 1)
+                .expect("resume_query targets a frame slot created by query_in_context");
+            // Frame lifecycle contract: Pending frames stay Suspended with
+            // their payload, so a Discarded tombstone can only be reached by
+            // a scheduler bug (a dependency edge that outlived safe release).
+            // Reject it here; recreating the erased frame-local state would
+            // fabricate answers for a query that no longer has a context.
+            assert!(
+                slot.lifecycle != FrameLifecycle::Discarded && slot.queries.is_some(),
+                "resume_query: contextual frame {} was released and cannot be resumed",
+                address.frame,
+            );
+            slot.lifecycle = FrameLifecycle::Active;
+        }
+        self.evaluate_query(address)
+    }
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn release_contextual_frame(
+        &mut self,
+        frame: usize,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        if frame == 0 || frame > self.demand.frames.len() {
+            return Ok(());
+        }
+        let slot = &mut self.demand.frames[frame - 1];
+        if slot.lifecycle == FrameLifecycle::Discarded {
+            return Ok(());
+        }
+        // Rejected speculative evidence, including pending_constraints, is
+        // discarded here and never drained; only canonical plus mode-Selected
+        // frames are ever drained. Dropping `queries` (-> `None`) discards
+        // the whole frame-local payload at once; the numeric slot itself is
+        // never reused within this Binder invocation.
+        slot.queries = None;
+        slot.lifecycle = FrameLifecycle::Discarded;
+        Ok(())
+    }
+
+    pub(crate) fn complete_query(
+        &mut self,
+        address: QueryAddress,
+        value: QueryValue,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        let target_frame = if address.frame == 0 {
+            &mut self.demand.canonical
+        } else {
+            self.demand.frames[address.frame - 1]
+                .queries
+                .as_mut()
+                .expect("active contextual frame retains Some queries payload until release")
+        };
+        target_frame
+            .entries
+            .insert(address.key, QueryState::Complete(value));
+        if let Some(dependents) = self.demand.dependencies.remove(&address) {
+            for dep in dependents {
+                self.demand.active.push(dep.target);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn settle_dependency_cycle(
+        &mut self,
+        dep: QueryDependency,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        let active = self.current_query_address();
+        self.demand
+            .dependencies
+            .entry(dep.target)
+            .or_default()
+            .push(QueryDependency {
+                target: active,
+                purpose: dep.purpose,
+            });
+        Ok(())
+    }
+
+    fn current_query_address(&self) -> QueryAddress {
+        QueryAddress {
+            frame: self.demand.active_frame,
+            key: self.demand.active.last().copied().map_or_else(
+                || {
+                    QueryKey::Declaration(DemandKey {
+                        target: DeclId(0),
+                        facet: Facet::ContainerIdentity,
+                    })
+                },
+                |a| a.key,
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Demand scheduler driver (WP-DEMAND).
+    // -----------------------------------------------------------------------
+
+    /// Drives `root` to a final value through the worklist resumption loop.
+    ///
+    /// Every `Pending` dependency is either enqueued for evaluation (with the
+    /// waiter edge recorded so `complete_query` re-enqueues the waiter) or —
+    /// when the producer is already being computed — settled as a genuine
+    /// cycle and parked. When the worklist drains while the root is still
+    /// unresolved, every remaining waiter sits on a settled value cycle; the
+    /// cycle participants are completed once with the real cycle answer
+    /// (`any` plus the C104-C106 diagnostic), which wakes the parked chain
+    /// and lets the root finish through ordinary re-evaluation. Suspended
+    /// contextual frames are never released here: parked frame queries keep
+    /// their payload and resume through `resume_query` when woken.
+    /// contextual frames are never released here: parked frame queries keep
+    /// their payload and resume through `resume_query` when woken.
+    #[expect(
+        dead_code,
+        reason = "canonical frame driver; production callers land with the WP-CTX cutover"
+    )]
+    pub(crate) fn drive_query(&mut self, root: QueryAddress) -> DemandResult<QueryValue> {
+        self.check_cancel()?;
+        if let Some(value) = self.completed_query_value(root) {
+            return Ok(DemandPoll::Ready(value));
+        }
+        // The shared worklist doubles as the dependency-resume queue: it is
+        // empty between scheduler steps, so this seed coexists with waiters
+        // woken by `complete_query` (including waiters of earlier roots).
+        self.demand.active.push(root);
+        self.run_demand_loop(root)
+    }
+
+    /// The resumption loop shared by `drive_query` and the selected check,
+    /// whose root was already seeded under its full slot context: the caller
+    /// enqueues the seed's first pending producer before entering.
+    fn run_demand_loop(&mut self, root: QueryAddress) -> DemandResult<QueryValue> {
+        loop {
+            if let Some(value) = self.completed_query_value(root) {
+                return Ok(DemandPoll::Ready(value));
+            }
+            let Some(address) = self.demand.active.pop() else {
+                if !self.break_settled_cycles()? {
+                    // Nothing completable remains while the root is still
+                    // unresolved: only the explicitly nonactivated producers
+                    // (flow, computed keys, callable-shape prerequisites) can
+                    // hold a query here, and their `Pending` propagates
+                    // honestly instead of a fabricated answer.
+                    return Ok(DemandPoll::Pending(QueryDependency {
+                        target: root,
+                        purpose: DependencyPurpose::Value,
+                    }));
+                }
+                continue;
+            };
+            self.demand.parked.remove(&address);
+            let poll = if address.frame == 0 {
+                self.evaluate_query(address)?
+            } else {
+                self.resume_query(address)?
+            };
+            match poll {
+                DemandPoll::Ready(value) => {
+                    let is_root = address == root;
+                    // Commit once and wake every recorded waiter of this
+                    // address back onto the worklist.
+                    self.complete_query(address, value.clone())?;
+                    if is_root {
+                        return Ok(DemandPoll::Ready(value));
+                    }
+                }
+                DemandPoll::Pending(dep) => {
+                    let waiter = QueryDependency {
+                        target: address,
+                        purpose: dep.purpose,
+                    };
+                    let already_waiting = self
+                        .demand
+                        .dependencies
+                        .get(&dep.target)
+                        .is_some_and(|waiters| waiters.contains(&waiter));
+                    if already_waiting {
+                        // The edge is settled (a cycle park, or a woken
+                        // waiter whose producer is itself still parked);
+                        // only the producer's completion may resume this
+                        // query, so re-park instead of re-enqueueing.
+                        self.demand.parked.insert(address);
+                    } else {
+                        self.demand
+                            .dependencies
+                            .entry(dep.target)
+                            .or_default()
+                            .push(waiter);
+                        self.demand.active.push(dep.target);
+                    }
+                }
+                // A depth overflow is terminal for the whole drive: the
+                // caller anchors the real nesting diagnostic at its own site.
+                DemandPoll::Limited { owner, range } => {
+                    self.demand.active.clear();
+                    return Ok(DemandPoll::Limited { owner, range });
+                }
+            }
+        }
+    }
+
+    /// Drives the scheduler for a root whose seed evaluation already ran
+    /// inline under its full slot context and returned its first pending
+    /// producer: registers the seed's resume edge, enqueues the producer,
+    /// then runs the shared resumption loop.
+    fn drive_seeded_root(
+        &mut self,
+        root: QueryAddress,
+        dep: QueryDependency,
+    ) -> DemandResult<QueryValue> {
+        self.demand
+            .dependencies
+            .entry(dep.target)
+            .or_default()
+            .push(QueryDependency {
+                target: root,
+                purpose: dep.purpose,
+            });
+        self.demand.active.push(dep.target);
+        self.run_demand_loop(root)
+    }
+
+    /// The committed value of `address`, if its query already completed in
+    /// its own frame.
+    fn completed_query_value(&self, address: QueryAddress) -> Option<QueryValue> {
+        match self.query_state(&address) {
+            Some(QueryState::Complete(value)) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    fn query_state(&self, address: &QueryAddress) -> Option<&QueryState> {
+        if address.frame == 0 {
+            self.demand.canonical.entries.get(&address.key)
+        } else {
+            self.demand
+                .frames
+                .get(address.frame - 1)
+                .and_then(|frame| frame.queries.as_ref())
+                .and_then(|queries| queries.entries.get(&address.key))
+        }
+    }
+
+    /// Terminal resolution for queries parked on a settled value cycle.
+    ///
+    /// Only declaration facets with a value-chain wait (`Value`/`Return`)
+    /// participate: an initializer cycle answers with `any` under C104, a
+    /// return cycle answers through its callable anchor under C105/C106, and
+    /// each answer is recorded exactly once as a demand fact carrying the
+    /// real diagnostic code. Queries parked on the explicitly nonactivated
+    /// producers (flow, computed keys, callable-shape prerequisites) stay
+    /// parked — their `Pending` remains honest until the producer lands.
+    /// Returns whether any cycle participant was completed.
+    fn break_settled_cycles(&mut self) -> Result<bool, super::CheckCancelled> {
+        self.check_cancel()?;
+        let parked: Vec<QueryAddress> = self.demand.parked.iter().copied().collect();
+        let mut broke_any = false;
+        for address in parked {
+            let QueryKey::Declaration(key) = address.key else {
+                continue;
+            };
+            let value_cycle = matches!(
+                self.query_state(&address),
+                Some(QueryState::WaitingOn(deps))
+                    if deps.iter().any(|dep| matches!(
+                        dep.purpose,
+                        DependencyPurpose::Value | DependencyPurpose::Return
+                    ))
+            );
+            if !value_cycle {
+                continue;
+            }
+            match key.facet {
+                Facet::Initializer => {
+                    let range = self.initializer_cycle_range(key.target);
+                    self.record_demand_fact(
+                        address.frame,
+                        DemandFact {
+                            owner: key.target,
+                            range,
+                            payload: DemandDiagnostic::InitializerCycle,
+                            order: self.publication_order_for_range(range),
+                            speculative: false,
+                        },
+                    );
+                    self.demand.parked.remove(&address);
+                    self.complete_query(
+                        address,
+                        QueryValue::Declaration(CompletedDemand::Type {
+                            type_id: self.types.any(),
+                            origin: CompletionOrigin::InitializerCycle,
+                        }),
+                    )?;
+                    self.drain_frame_facts(address.frame)?;
+                    broke_any = true;
+                }
+                Facet::InferredReturn => {
+                    let Some(anchor) = self.return_cycle_anchor(key.target) else {
+                        continue;
+                    };
+                    let range = match anchor {
+                        CallableAnchor::Named(range)
+                        | CallableAnchor::ArrowExpression(range)
+                        | CallableAnchor::FunctionKeyword(range) => range,
+                    };
+                    self.record_demand_fact(
+                        address.frame,
+                        DemandFact {
+                            owner: key.target,
+                            range,
+                            payload: DemandDiagnostic::ReturnCycle(anchor),
+                            order: self.publication_order_for_range(range),
+                            speculative: false,
+                        },
+                    );
+                    let value = QueryValue::Declaration(CompletedDemand::Type {
+                        type_id: self.types.any(),
+                        origin: CompletionOrigin::ReturnCycle,
+                    });
+                    self.demand.parked.remove(&address);
+                    self.complete_query(address, value)?;
+                    self.drain_frame_facts(address.frame)?;
+                    broke_any = true;
+                }
+                _ => {}
+            }
+        }
+        Ok(broke_any)
+    }
+
+    /// The anchor range for an initializer cycle: the recursive initializer
+    /// expression when one exists, the parameter node otherwise.
+    fn initializer_cycle_range(&self, declaration: DeclId) -> TextRange {
+        match self.declaration_index.value_inputs.get(&declaration) {
+            Some(ValueInput::Binding {
+                initializer: Some(initializer),
+                ..
+            })
+            | Some(ValueInput::Property {
+                initializer: Some(initializer),
+                ..
+            }) => initializer.range(),
+            Some(ValueInput::Parameter(parameter)) => parameter.range(),
+            _ => TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO).expect("zero-width range is valid"),
+        }
+    }
+
+    /// The callable anchor for a return cycle: classified by the callable's
+    /// source shape (named forms answer C105, anonymous forms C106) and
+    /// anchored at the first recorded return site.
+    fn return_cycle_anchor(&self, declaration: DeclId) -> Option<CallableAnchor> {
+        let inventory = self.declaration_index.callables.get(&declaration)?;
+        let zero =
+            TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO).expect("zero-width range is valid");
+        let range = self
+            .declaration_index
+            .return_yield
+            .get(&declaration)
+            .and_then(|inventory| inventory.returns.first())
+            .map(|site| site.range)
+            .unwrap_or(zero);
+        Some(match inventory.source {
+            CallableSource::Arrow(_) => CallableAnchor::ArrowExpression(range),
+            CallableSource::TypeFunction(_) | CallableSource::ConstructorType(_) => {
+                CallableAnchor::ArrowExpression(range)
+            }
+            CallableSource::Function(_) => CallableAnchor::FunctionKeyword(range),
+            CallableSource::ClassMember(_) | CallableSource::TypeMember(_) => {
+                CallableAnchor::Named(range)
+            }
+        })
+    }
+
+    /// Stages a demand fact on the owning frame; canonical facts drain
+    /// through the program-level publication stream.
+    fn record_demand_fact(&mut self, frame: usize, fact: DemandFact) {
+        if frame == 0 {
+            self.demand.canonical.facts.push(fact);
+        } else if let Some(slot) = self.demand.frames.get_mut(frame - 1)
+            && let Some(queries) = slot.queries.as_mut()
+        {
+            queries.facts.push(fact);
+        }
+    }
+
+    fn evaluate_query(&mut self, address: QueryAddress) -> DemandResult<QueryValue> {
+        self.check_cancel()?;
+        self.demand.active.push(address);
+        self.demand
+            .positions
+            .insert(address, self.demand.active.len() - 1);
+        if self.demand.active.len() as u32 > MAX_TYPE_DEPTH {
+            self.demand.active.pop();
+            self.demand.positions.remove(&address);
+            // The depth bound can fire for any query shape and this source
+            // model has no node-to-range registry, so the limit carries an
+            // unanchored zero-width range; the nesting diagnostic is anchored
+            // by the selected check at its own site.
+            return Ok(DemandPoll::Limited {
+                owner: DeclId(0),
+                range: TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO)
+                    .expect("zero-width range is valid"),
+            });
+        }
+        let result = if address.frame == 0 {
+            self.evaluate_canonical_query(address.key)
+        } else {
+            self.evaluate_contextual_query(address)
+        };
+        // While this query's chain is still on the stack, a `Pending` whose
+        // producer is already being computed is a genuine cycle, not missing
+        // work: settle the resume edge so `complete_query` wakes this query
+        // when the producer finishes, and park it so the scheduler never
+        // re-enqueues the producer on top of the running evaluation.
+        if let Ok(DemandPoll::Pending(dep)) = &result
+            && self.demand.positions.contains_key(&dep.target)
+        {
+            self.settle_dependency_cycle(*dep)?;
+            self.demand.parked.insert(address);
+        }
+        self.demand.active.pop();
+        self.demand.positions.remove(&address);
+        result
+    }
+
+    fn evaluate_canonical_query(&mut self, key: QueryKey) -> DemandResult<QueryValue> {
+        if let Some(state) = self.demand.canonical.entries.get(&key) {
+            match state {
+                QueryState::Complete(value) => return Ok(DemandPoll::Ready(value.clone())),
+                // An `Active` entry is this very query re-entered through a
+                // cycle: report the wait instead of recursing. A `WaitingOn`
+                // entry is a resumed waiter falling through to re-run: its
+                // finished dependencies now answer `Ready` from their entries.
+                QueryState::Active => {
+                    return Ok(DemandPoll::Pending(QueryDependency {
+                        target: QueryAddress { frame: 0, key },
+                        purpose: DependencyPurpose::Value,
+                    }));
+                }
+                QueryState::WaitingOn(_) => {}
+            }
+        }
+        self.demand
+            .canonical
+            .entries
+            .insert(key, QueryState::Active);
+        let result = match key {
+            QueryKey::Declaration(demand_key) => self
+                .evaluate_declaration_facet(demand_key)
+                .map(|poll| poll.map(QueryValue::Declaration)),
+            QueryKey::SignatureGroup(symbol) => self
+                .signature_group(symbol)
+                .map(|poll| poll.map(QueryValue::SignatureGroup)),
+            QueryKey::Expression(expression_key) => self
+                .evaluate_expression_query(expression_key)
+                .map(|poll| poll.map(QueryValue::Expression)),
+            QueryKey::Flow(flow_key) => self
+                .materialize_root(flow_key.point, flow_key.root)
+                .map(|poll| poll.map(QueryValue::Flow)),
+        };
+        if let Ok(DemandPoll::Ready(value)) = &result {
+            self.demand
+                .canonical
+                .entries
+                .insert(key, QueryState::Complete(value.clone()));
+        } else if let Ok(DemandPoll::Pending(dep)) = &result {
+            self.demand
+                .canonical
+                .entries
+                .insert(key, QueryState::WaitingOn(vec![*dep]));
+        }
+        result
+    }
+
+    fn evaluate_contextual_query(&mut self, address: QueryAddress) -> DemandResult<QueryValue> {
+        let frame = &mut self.demand.frames[address.frame - 1];
+        let queries = frame
+            .queries
+            .as_mut()
+            .expect("active contextual frame retains Some queries payload until release");
+        if let Some(state) = queries.entries.get(&address.key) {
+            match state {
+                QueryState::Complete(value) => return Ok(DemandPoll::Ready(value.clone())),
+                // Same contract as the canonical frame: `Active` is a cycle
+                // re-entry, `WaitingOn` is a resumed waiter re-running.
+                QueryState::Active => {
+                    return Ok(DemandPoll::Pending(QueryDependency {
+                        target: address,
+                        purpose: DependencyPurpose::Value,
+                    }));
+                }
+                QueryState::WaitingOn(_) => {}
+            }
+        }
+        queries.entries.insert(address.key, QueryState::Active);
+        let result = match address.key {
+            QueryKey::Declaration(demand_key) => self
+                .evaluate_declaration_facet(demand_key)
+                .map(|poll| poll.map(QueryValue::Declaration)),
+            QueryKey::SignatureGroup(symbol) => self
+                .signature_group(symbol)
+                .map(|poll| poll.map(QueryValue::SignatureGroup)),
+            QueryKey::Expression(expression_key) => self
+                .evaluate_expression_query(expression_key)
+                .map(|poll| poll.map(QueryValue::Expression)),
+            QueryKey::Flow(flow_key) => self
+                .materialize_root(flow_key.point, flow_key.root)
+                .map(|poll| poll.map(QueryValue::Flow)),
+        };
+        let frame = &mut self.demand.frames[address.frame - 1];
+        let queries = frame
+            .queries
+            .as_mut()
+            .expect("active contextual frame retains Some queries payload until release");
+        if let Ok(DemandPoll::Ready(value)) = &result {
+            queries
+                .entries
+                .insert(address.key, QueryState::Complete(value.clone()));
+        } else if let Ok(DemandPoll::Pending(dep)) = &result {
+            queries
+                .entries
+                .insert(address.key, QueryState::WaitingOn(vec![*dep]));
+        }
+        result
+    }
+
+    // -----------------------------------------------------------------------
+    // Facet evaluation.
+    // -----------------------------------------------------------------------
+
+    fn evaluate_declaration_facet(&mut self, key: DemandKey) -> DemandResult<CompletedDemand> {
+        self.check_cancel()?;
+        match key.facet {
+            Facet::SignatureHeader => {
+                if let Some(inventory) = self.declaration_index.callables.get(&key.target).copied()
+                {
+                    Ok(DemandPoll::Ready(CompletedDemand::Header(CallableHeader {
+                        declaration: key.target,
+                        scope: inventory.parameter_scope,
+                    })))
+                } else {
+                    Ok(DemandPoll::Ready(CompletedDemand::Header(CallableHeader {
+                        declaration: key.target,
+                        scope: self.module_scope,
+                    })))
+                }
+            }
+            Facet::ContainerIdentity => {
+                let symbol = self
+                    .declaration_index
+                    .contributors
+                    .get(key.target.0 as usize)
+                    .and_then(|contributor| contributor.symbol);
+                if let Some(symbol) = symbol {
+                    let result = self.declared_value(symbol)?;
+                    return Ok(result.map(|type_id| CompletedDemand::Type {
+                        type_id,
+                        origin: CompletionOrigin::Ordinary,
+                    }));
+                }
+                Ok(DemandPoll::Ready(CompletedDemand::Type {
+                    type_id: self.types.any(),
+                    origin: CompletionOrigin::Ordinary,
+                }))
+            }
+            Facet::Initializer => {
+                // Copy the `&'src` inputs out of the inventory first: the
+                // sub-demands below take `&mut self`, which cannot run while
+                // the inventory borrow is alive.
+                let (annotation, initializer, installed) =
+                    match self.declaration_index.value_inputs.get(&key.target) {
+                        Some(ValueInput::Binding {
+                            annotation,
+                            initializer,
+                            ..
+                        })
+                        | Some(ValueInput::Property {
+                            annotation,
+                            initializer,
+                        }) => (*annotation, *initializer, None),
+                        Some(ValueInput::Parameter(parameter)) => (
+                            parameter
+                                .data()
+                                .type_annotation
+                                .as_ref()
+                                .map(|annotation| annotation.data().type_node.as_ref()),
+                            None,
+                            None,
+                        ),
+                        Some(ValueInput::Installed(ty)) => (None, None, Some(*ty)),
+                        _ => (None, None, None),
+                    };
+                if let Some(ty) = installed {
+                    return Ok(DemandPoll::Ready(CompletedDemand::Type {
+                        type_id: ty,
+                        origin: CompletionOrigin::Ordinary,
+                    }));
+                }
+                if let Some(annotation) = annotation {
+                    let result = self.resolve_type_demand(annotation)?;
+                    return Ok(result.map(|type_id| CompletedDemand::Type {
+                        type_id,
+                        origin: CompletionOrigin::Ordinary,
+                    }));
+                }
+                if let Some(initializer) = initializer
+                    && let Some(context) = self.slot_context(initializer.id())
+                {
+                    let result = self.type_of_expr(initializer, context)?;
+                    return Ok(result.map(|type_id| CompletedDemand::Type {
+                        type_id,
+                        origin: CompletionOrigin::Ordinary,
+                    }));
+                }
+                Ok(DemandPoll::Ready(CompletedDemand::Type {
+                    type_id: self.types.any(),
+                    origin: CompletionOrigin::Ordinary,
+                }))
+            }
+            Facet::InferredReturn => {
+                let Some(inventory) = self.declaration_index.return_yield.get(&key.target) else {
+                    return Ok(DemandPoll::Ready(CompletedDemand::Type {
+                        type_id: self.types.void(),
+                        origin: CompletionOrigin::Ordinary,
+                    }));
+                };
+                if let Some(annotated) = inventory.protocol.annotated_return
+                    && let Some(&annotation) = self.declaration_index.type_syntax.get(&annotated)
+                {
+                    let result = self.resolve_type_demand(annotation)?;
+                    return Ok(result.map(|type_id| CompletedDemand::Type {
+                        type_id,
+                        origin: CompletionOrigin::Ordinary,
+                    }));
+                }
+                // Copy the return-site expressions out of the inventory before
+                // the sub-demands below retake `self` mutably.
+                let sites: Vec<&'src Expr> = inventory
+                    .returns
+                    .iter()
+                    .filter_map(|site| {
+                        site.expression
+                            .and_then(|node| self.declaration_index.expressions.get(&node))
+                            .copied()
+                    })
+                    .collect();
+                let mut types = Vec::new();
+                for site in sites {
+                    if let Some(context) = self.slot_context(site.id()) {
+                        match self.type_of_expr(site, context)? {
+                            DemandPoll::Ready(type_id) => types.push(type_id),
+                            poll @ (DemandPoll::Pending(_) | DemandPoll::Limited { .. }) => {
+                                return Ok(poll.map(|type_id| CompletedDemand::Type {
+                                    type_id,
+                                    origin: CompletionOrigin::Ordinary,
+                                }));
+                            }
+                        }
+                    }
+                }
+                let result = if types.is_empty() {
+                    self.types.void()
+                } else if types.len() == 1 {
+                    types[0]
+                } else {
+                    self.types.union(&types)
+                };
+                Ok(DemandPoll::Ready(CompletedDemand::Type {
+                    type_id: result,
+                    origin: CompletionOrigin::Ordinary,
+                }))
+            }
+            Facet::ClassShape(side) => {
+                let result = self.class_shape(key.target, side)?;
+                Ok(result.map(|type_id| CompletedDemand::Type {
+                    type_id,
+                    origin: CompletionOrigin::Ordinary,
+                }))
+            }
+            Facet::ComputedKey => {
+                // T-CK canonical key producer is the only allowed pending seam.
+                Ok(DemandPoll::Pending(QueryDependency {
+                    target: QueryAddress {
+                        frame: 0,
+                        key: QueryKey::Declaration(key),
+                    },
+                    purpose: DependencyPurpose::ComputedKey,
+                }))
+            }
+        }
+    }
+
+    fn resolve_type_demand(&mut self, ty: &'src Ty) -> DemandResult<TypeId> {
+        self.check_cancel()?;
+        Ok(DemandPoll::Ready(self.with_demand_isolation(|this| {
+            this.resolve_type(ty, this.module_scope)
+        })))
+    }
+
+    fn evaluate_expression_query(&mut self, key: ExpressionKey) -> DemandResult<ExpressionResult> {
+        self.check_cancel()?;
+        // Missing source inventory here is an internal construction invariant
+        // failure, not a recovery-any result: every expression node reachable
+        // by a `QueryKey::Expression` address is registered by `reserve_expr`
+        // (WP-LEX Stage-A) or by `check_selected_expr` (hybrid legacy
+        // selections).
+        let expression = *self
+            .declaration_index
+            .expressions
+            .get(&key.node)
+            .expect("QueryKey::Expression targets an expression registered by reserve_expr or the selected boundary");
+        let context = SlotContext {
+            scope: self.scope_for_point(key.point),
+            point: key.point,
+            receiver: ReceiverKind::None,
+            function_body: None,
+            ambient: false,
+        };
+        // The canonical frame owns the memo for this address (`evaluate_
+        // canonical_query` inserted `Active` before dispatch), so the raw
+        // evaluator runs directly instead of re-entering the entry check.
+        self.evaluate_expression(expression, context, key.target)
+    }
+
+    fn scope_for_point(&self, point: ExecutionPoint) -> ScopeId {
+        if let Some(scope) = self.declaration_index.node_scopes.get(&point.node) {
+            *scope
+        } else {
+            self.module_scope
+        }
+    }
+
+    fn current_frame_or_canonical(&mut self) -> &mut QueryFrame<'src> {
+        if self.demand.active_frame == 0 {
+            &mut self.demand.canonical
+        } else {
+            self.demand.frames[self.demand.active_frame - 1]
+                .queries
+                .as_mut()
+                .expect("active contextual frame retains Some queries payload until release")
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Public demand surface.
+    // -----------------------------------------------------------------------
+
+    pub(crate) fn demand(&mut self, key: DemandKey) -> DemandResult<CompletedDemand> {
+        self.evaluate_query(QueryAddress {
+            frame: 0,
+            key: QueryKey::Declaration(key),
+        })
+        .map(|poll| match poll {
+            DemandPoll::Ready(QueryValue::Declaration(d)) => DemandPoll::Ready(d),
+            DemandPoll::Pending(dep) => DemandPoll::Pending(dep),
+            DemandPoll::Limited { owner, range } => DemandPoll::Limited { owner, range },
+            _ => DemandPoll::Limited {
+                owner: key.target,
+                range: TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO)
+                    .expect("zero-width range is valid"),
+            },
+        })
+    }
+
+    pub(crate) fn declared_value(&mut self, symbol: SymbolId) -> DemandResult<TypeId> {
+        self.check_cancel()?;
+        if let Some(type_id) = self.symbol_types.get(symbol.get() as usize)
+            && *type_id != self.types.error_type()
+            && *type_id != self.types.any()
+        {
+            return Ok(DemandPoll::Ready(*type_id));
+        }
+        if let Some(overloads) = self.overload_signatures.get(symbol.get() as usize)
+            && let Some(signature) = overloads.first()
+        {
+            return Ok(DemandPoll::Ready(
+                self.types.intern(Type::Function(signature.clone())),
+            ));
+        }
+        let kind = self.symbols.get(symbol.get() as usize).map(|s| s.kind());
+        match kind {
+            Some(SymbolKind::Class) => {
+                if let Some(ty) = self.class_instance_types.get(&symbol) {
+                    return Ok(DemandPoll::Ready(*ty));
+                }
+            }
+            Some(SymbolKind::Function) => {
+                if let Some(overloads) = self.overload_signatures.get(symbol.get() as usize)
+                    && let Some(signature) = overloads.first()
+                {
+                    return Ok(DemandPoll::Ready(
+                        self.types.intern(Type::Function(signature.clone())),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        // Fall back to the first contributor's initializer facet.
+        if let Some(contributors) = self.declaration_index.symbol_to_contributor.get(&symbol)
+            && let Some(&decl) = contributors.first()
+        {
+            return self
+                .demand(DemandKey {
+                    target: decl,
+                    facet: Facet::Initializer,
+                })
+                .map(|poll| match poll {
+                    DemandPoll::Ready(CompletedDemand::Type { type_id, .. }) => {
+                        DemandPoll::Ready(type_id)
+                    }
+                    DemandPoll::Pending(dep) => DemandPoll::Pending(dep),
+                    DemandPoll::Limited { owner, range } => DemandPoll::Limited { owner, range },
+                    _ => DemandPoll::Pending(QueryDependency {
+                        target: QueryAddress {
+                            frame: 0,
+                            key: QueryKey::Declaration(DemandKey {
+                                target: decl,
+                                facet: Facet::Initializer,
+                            }),
+                        },
+                        purpose: DependencyPurpose::Value,
+                    }),
+                });
+        }
+        Ok(DemandPoll::Ready(self.types.any()))
+    }
+
+    pub(crate) fn signature_group(
+        &mut self,
+        symbol: SymbolId,
+    ) -> DemandResult<Vec<FunctionSignature>> {
+        self.check_cancel()?;
+        if let Some(overloads) = self.overload_signatures.get(symbol.get() as usize) {
+            return Ok(DemandPoll::Ready(overloads.clone()));
+        }
+        let ty = match self.declared_value(symbol)? {
+            DemandPoll::Ready(ty) => ty,
+            DemandPoll::Pending(dep) => return Ok(DemandPoll::Pending(dep)),
+            DemandPoll::Limited { owner, range } => {
+                return Ok(DemandPoll::Limited { owner, range });
+            }
+        };
+        let groups =
+            self.with_demand_isolation(|this| this.call_signature_groups_for_type_raw(ty, ty));
+        Ok(DemandPoll::Ready(groups.into_iter().flatten().collect()))
+    }
+
+    pub(crate) fn class_shape(
+        &mut self,
+        declaration: DeclId,
+        side: ClassSide,
+    ) -> DemandResult<TypeId> {
+        self.check_cancel()?;
+        let Some(symbol) = self
+            .declaration_index
+            .contributors
+            .get(declaration.0 as usize)
+            .and_then(|contributor| contributor.symbol)
+        else {
+            return Ok(DemandPoll::Pending(QueryDependency {
+                target: self.current_query_address(),
+                purpose: DependencyPurpose::Structural,
+            }));
+        };
+        match side {
+            ClassSide::Instance => {
+                if let Some(ty) = self.class_instance_types.get(&symbol) {
+                    return Ok(DemandPoll::Ready(*ty));
+                }
+                let Some(&member_scope) = self.class_member_scopes.get(&symbol) else {
+                    // No member scope recorded yet is a genuine structural
+                    // dependency on class-body binding, not an empty class.
+                    return Ok(DemandPoll::Pending(QueryDependency {
+                        target: self.current_query_address(),
+                        purpose: DependencyPurpose::Structural,
+                    }));
+                };
+                let members: Vec<(String, SymbolId)> = self
+                    .scopes
+                    .get(member_scope.get() as usize)
+                    .map(|scope| {
+                        scope
+                            .values
+                            .iter()
+                            .map(|(name, id)| (name.clone(), *id))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut properties = Vec::with_capacity(members.len());
+                for (name, member_symbol) in members {
+                    let member_type = demand_ready!(self.declared_value(member_symbol));
+                    let is_method = self
+                        .symbols
+                        .get(member_symbol.get() as usize)
+                        .is_some_and(|s| matches!(s.kind(), SymbolKind::Function));
+                    properties.push(
+                        PropertyType::new(name, false, member_type)
+                            .with_method(is_method)
+                            .with_declaring_types(vec![symbol]),
+                    );
+                }
+                let ty = self.types.intern(Type::ObjectType(ObjectType {
+                    properties,
+                    call_signatures: Vec::new(),
+                    call_candidate_order: Vec::new(),
+                    construct_signatures: Vec::new(),
+                    index_signatures: Vec::new(),
+                    generator_return: None,
+                    iterator_property: None,
+                    async_iterator_property: None,
+                }));
+                Ok(DemandPoll::Ready(ty))
+            }
+            ClassSide::Static => {
+                if let Some(ty) = self.class_constructor_types.get(&symbol) {
+                    return Ok(DemandPoll::Ready(*ty));
+                }
+                // Constructor (static-side) shape construction, including
+                // real construct-signature extraction from a
+                // `ConstructorDeclaration`, is a genuine missing prerequisite
+                // beyond this pass's reachable engine work.
+                Ok(DemandPoll::Pending(QueryDependency {
+                    target: self.current_query_address(),
+                    purpose: DependencyPurpose::Structural,
+                }))
+            }
+        }
+    }
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn available_structure(
+        &mut self,
+        source: StructureRef,
+    ) -> DemandResult<AvailableStructure> {
+        self.check_cancel()?;
+        match source {
+            StructureRef::Declaration(decl) => {
+                let symbol = self
+                    .declaration_index
+                    .contributors
+                    .get(decl.0 as usize)
+                    .and_then(|contributor| contributor.symbol);
+                if let Some(symbol) = symbol {
+                    let result = self.declared_value(symbol)?;
+                    return Ok(result.map(AvailableStructure::Final));
+                }
+                Ok(DemandPoll::Ready(AvailableStructure::Final(
+                    self.types.any(),
+                )))
+            }
+            StructureRef::Expression(node) => {
+                if let Some(expr) = self.declaration_index.expressions.get(&node).copied()
+                    && let Some(context) = self.slot_context(node)
+                {
+                    let result = self.type_of_expr(expr, context)?;
+                    return Ok(result.map(AvailableStructure::Final));
+                }
+                Ok(DemandPoll::Ready(AvailableStructure::Final(
+                    self.types.any(),
+                )))
+            }
+        }
+    }
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn callable_candidates(
+        &mut self,
+        source: StructureRef,
+    ) -> DemandResult<Vec<Vec<CallableCandidate>>> {
+        self.check_cancel()?;
+        let available = self.available_structure(source)?;
+        let ty = match available {
+            DemandPoll::Ready(AvailableStructure::Final(ty)) => ty,
+            DemandPoll::Pending(dep) => return Ok(DemandPoll::Pending(dep)),
+            DemandPoll::Limited { owner, range } => {
+                return Ok(DemandPoll::Limited { owner, range });
+            }
+            _ => self.types.any(),
+        };
+        let groups =
+            self.with_demand_isolation(|this| this.call_signature_groups_for_type_raw(ty, ty));
+        Ok(DemandPoll::Ready(
+            groups
+                .into_iter()
+                .map(|group| group.into_iter().map(CallableCandidate::Complete).collect())
+                .collect(),
+        ))
+    }
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn header_parameter_target(
+        &mut self,
+        candidate: &CallableCandidate,
+        position: usize,
+    ) -> DemandResult<Option<TypeId>> {
+        self.check_cancel()?;
+        match candidate {
+            CallableCandidate::Source(_) => Ok(DemandPoll::Ready(None)),
+            CallableCandidate::Complete(signature) => Ok(DemandPoll::Ready(
+                signature.parameters().get(position).map(|p| p.type_id()),
+            )),
+        }
+    }
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn complete_callable_signature(
+        &mut self,
+        candidate: &CallableCandidate,
+    ) -> DemandResult<FunctionSignature> {
+        self.check_cancel()?;
+        match candidate {
+            CallableCandidate::Source(decl) => {
+                // A source candidate completes when its header and return are final.
+                let _ = demand_ready!(self.demand(DemandKey {
+                    target: *decl,
+                    facet: Facet::SignatureHeader
+                }));
+                let return_type = demand_ready!(self.demand(DemandKey {
+                    target: *decl,
+                    facet: Facet::InferredReturn
+                }));
+                let CompletedDemand::Type { type_id, .. } = return_type else {
+                    return Ok(DemandPoll::Pending(QueryDependency {
+                        target: QueryAddress {
+                            frame: 0,
+                            key: QueryKey::Declaration(DemandKey {
+                                target: *decl,
+                                facet: Facet::InferredReturn,
+                            }),
+                        },
+                        purpose: DependencyPurpose::Return,
+                    }));
+                };
+                let Some(inventory) = self.declaration_index.callables.get(decl).copied() else {
+                    return Ok(DemandPoll::Pending(QueryDependency {
+                        target: QueryAddress {
+                            frame: 0,
+                            key: QueryKey::Declaration(DemandKey {
+                                target: *decl,
+                                facet: Facet::SignatureHeader,
+                            }),
+                        },
+                        purpose: DependencyPurpose::Structural,
+                    }));
+                };
+                let parameters = demand_ready!(self.function_parameters(&inventory));
+                let parameters = parameters
+                    .into_iter()
+                    .map(|(name, type_id, optional, rest)| {
+                        FunctionParameter::new(name, type_id, optional, rest)
+                    })
+                    .collect();
+                let (type_parameters, type_parameter_bounds) =
+                    self.callable_type_parameters(&inventory);
+                let declared_return = demand_ready!(self.callable_declared_return(&inventory));
+                Ok(DemandPoll::Ready(FunctionSignature {
+                    type_parameters,
+                    type_parameter_bounds,
+                    parameters,
+                    return_type: type_id,
+                    declared_return,
+                    declaring_types: Vec::new(),
+                    javascript: false,
+                }))
+            }
+            CallableCandidate::Complete(signature) => Ok(DemandPoll::Ready(signature.clone())),
+        }
+    }
+
+    /// The declared type-parameter list of one callable source, with bounds
+    /// resolved in the callable's parameter scope. Non-generic sources yield
+    /// empty lists so monomorphic identity is preserved unchanged.
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    fn callable_type_parameters(
+        &mut self,
+        inventory: &CallableInventory<'src>,
+    ) -> (Vec<SymbolId>, Vec<TypeParameterBounds>) {
+        let list = match &inventory.source {
+            CallableSource::Function(function) => function.type_parameters.as_ref(),
+            CallableSource::Arrow(arrow) => arrow.type_parameters.as_ref(),
+            CallableSource::ClassMember(member) => match member {
+                ClassMember::Method(method) => method.function.type_parameters.as_ref(),
+                _ => None,
+            },
+            CallableSource::TypeMember(member) => match member {
+                TypeMember::Method(signature) => signature.function.type_parameters.as_ref(),
+                TypeMember::Call(signature) => signature.function.type_parameters.as_ref(),
+                TypeMember::Construct(signature) => {
+                    signature.function.function.type_parameters.as_ref()
+                }
+                _ => None,
+            },
+            CallableSource::TypeFunction(function) => function.type_parameters.as_ref(),
+            CallableSource::ConstructorType(ty) => match ty.data() {
+                TypeNode::Constructor(constructor) => constructor.function.type_parameters.as_ref(),
+                _ => None,
+            },
+        };
+        self.signature_type_parameters(list, inventory.parameter_scope)
+    }
+
+    /// The written return annotation of one callable, as resolved. `None`
+    /// keeps the unannotated identity; a written annotation is preserved
+    /// beside the inferred return instead of defaulting away.
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    fn callable_declared_return(
+        &mut self,
+        inventory: &CallableInventory<'src>,
+    ) -> DemandResult<Option<TypeId>> {
+        let Some(annotated) = inventory.protocol.annotated_return else {
+            return Ok(DemandPoll::Ready(None));
+        };
+        let Some(&annotation) = self.declaration_index.type_syntax.get(&annotated) else {
+            return Ok(DemandPoll::Ready(None));
+        };
+        let type_id = demand_ready!(self.resolve_type_demand(annotation));
+        Ok(DemandPoll::Ready(Some(type_id)))
+    }
+
+    /// Extracts real positional parameters (name, type, optional, rest) from
+    /// a callable's source syntax — value-plane parameters and type-plane
+    /// function/constructor parameters alike, so every available declaration
+    /// facet executes. Unannotated parameters are legitimately `any`
+    /// (ordinary JS/TS parameter-typing default), not a fake recovery value.
+    /// Destructured bindings receive a synthesized positional name since they
+    /// carry no single canonical identifier.
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    fn function_parameters(
+        &mut self,
+        inventory: &CallableInventory<'src>,
+    ) -> DemandResult<Vec<(String, TypeId, bool, bool)>> {
+        self.check_cancel()?;
+        enum SourceParameters<'a> {
+            Syntax(&'a [crate::syntax::ParameterNode]),
+            Type(&'a [crate::syntax::FunctionTypeParameter]),
+        }
+        let source = match &inventory.source {
+            CallableSource::Function(function) => SourceParameters::Syntax(&function.parameters),
+            CallableSource::Arrow(arrow) => SourceParameters::Syntax(&arrow.parameters),
+            CallableSource::ClassMember(member) => match member {
+                ClassMember::Method(method) => {
+                    SourceParameters::Syntax(&method.function.parameters)
+                }
+                ClassMember::Constructor(constructor) => {
+                    SourceParameters::Syntax(&constructor.parameters)
+                }
+                _ => SourceParameters::Syntax(&[]),
+            },
+            CallableSource::TypeMember(member) => match member {
+                TypeMember::Method(signature) => {
+                    SourceParameters::Type(&signature.function.parameters)
+                }
+                TypeMember::Call(signature) => {
+                    SourceParameters::Type(&signature.function.parameters)
+                }
+                TypeMember::Construct(signature) => {
+                    SourceParameters::Type(&signature.function.function.parameters)
+                }
+                _ => SourceParameters::Type(&[]),
+            },
+            CallableSource::TypeFunction(function) => SourceParameters::Type(&function.parameters),
+            CallableSource::ConstructorType(ty) => match ty.data() {
+                TypeNode::Constructor(constructor) => {
+                    SourceParameters::Type(&constructor.function.parameters)
+                }
+                _ => SourceParameters::Type(&[]),
+            },
+        };
+        let mut parameters = Vec::new();
+        match source {
+            SourceParameters::Syntax(syntax_parameters) => {
+                parameters.reserve(syntax_parameters.len());
+                for (index, parameter) in syntax_parameters.iter().enumerate() {
+                    let data = parameter.data();
+                    let rest = matches!(data.binding.data(), BindingPattern::Rest(_));
+                    let name = match data.binding.data() {
+                        BindingPattern::Identifier(identifier) => {
+                            self.identifier_text(identifier).into_owned()
+                        }
+                        BindingPattern::Rest(rest_pattern) => match rest_pattern.argument.data() {
+                            BindingPattern::Identifier(identifier) => {
+                                self.identifier_text(identifier).into_owned()
+                            }
+                            _ => format!("arg{index}"),
+                        },
+                        _ => format!("arg{index}"),
+                    };
+                    let type_id = match data.type_annotation.as_ref() {
+                        Some(annotation) => {
+                            demand_ready!(self.resolve_type_demand(&annotation.data().type_node))
+                        }
+                        None => self.types.any(),
+                    };
+                    let optional = data.optional || data.initializer.is_some();
+                    parameters.push((name, type_id, optional, rest));
+                }
+            }
+            SourceParameters::Type(type_parameters) => {
+                parameters.reserve(type_parameters.len());
+                for parameter in type_parameters.iter() {
+                    let name = self.identifier_text(&parameter.name).into_owned();
+                    let type_id = demand_ready!(
+                        self.resolve_type_demand(&parameter.type_annotation.data().type_node)
+                    );
+                    parameters.push((name, type_id, parameter.optional, parameter.rest));
+                }
+            }
+        }
+        Ok(DemandPoll::Ready(parameters))
+    }
+
+    // -----------------------------------------------------------------------
+    // Expression typing.
+    // -----------------------------------------------------------------------
+
+    pub(crate) fn type_of_expr(
+        &mut self,
+        expression: &'src Expr,
+        context: SlotContext,
+    ) -> DemandResult<TypeId> {
+        self.demand_expression(expression, context, None)
+            .map(|poll| poll.map(|result| result.type_id))
+    }
+
+    pub(crate) fn type_of_expr_with_target(
+        &mut self,
+        expression: &'src Expr,
+        target: TypeId,
+        context: SlotContext,
+    ) -> DemandResult<TypeId> {
+        self.demand_expression(expression, context, Some(target))
+            .map(|poll| poll.map(|result| result.type_id))
+    }
+
+    /// Memoized demand evaluation of one expression. The frame (or canonical)
+    /// entry is the single commit point for an [`ExpressionResult`], so a JSX
+    /// expression keeps its classified outcome beside the plain type and a
+    /// completed JSX entry never needs re-inference.
+    fn demand_expression(
+        &mut self,
+        expression: &'src Expr,
+        context: SlotContext,
+        target: Option<TypeId>,
+    ) -> DemandResult<ExpressionResult> {
+        self.check_cancel()?;
+        let key = QueryKey::Expression(ExpressionKey {
+            node: expression.id(),
+            point: context.point,
+            target,
+        });
+        if let Some(state) = self.current_frame_or_canonical().entries.get(&key) {
+            match state {
+                QueryState::Complete(QueryValue::Expression(result)) => {
+                    return Ok(DemandPoll::Ready(*result));
+                }
+                QueryState::Complete(_) => {}
+                QueryState::WaitingOn(_) | QueryState::Active => {
+                    return Ok(DemandPoll::Pending(QueryDependency {
+                        target: QueryAddress {
+                            frame: self.demand.active_frame,
+                            key,
+                        },
+                        purpose: DependencyPurpose::Value,
+                    }));
+                }
+            }
+        }
+        self.current_frame_or_canonical()
+            .entries
+            .insert(key, QueryState::Active);
+        let result = self.evaluate_expression(expression, context, target);
+        if let Ok(DemandPoll::Ready(result)) = &result {
+            self.current_frame_or_canonical()
+                .entries
+                .insert(key, QueryState::Complete(QueryValue::Expression(*result)));
+        } else if let Ok(DemandPoll::Pending(dep)) = &result {
+            self.current_frame_or_canonical()
+                .entries
+                .insert(key, QueryState::WaitingOn(vec![*dep]));
+        }
+        result
+    }
+
+    fn evaluate_expression(
+        &mut self,
+        expression: &'src Expr,
+        context: SlotContext,
+        target: Option<TypeId>,
+    ) -> DemandResult<ExpressionResult> {
+        self.check_cancel()?;
+        match expression.data() {
+            Expression::This => self
+                .type_of_this(context)
+                .map(|poll| poll.map(ExpressionResult::plain)),
+            Expression::Super => self
+                .type_of_super(context)
+                .map(|poll| poll.map(ExpressionResult::plain)),
+            Expression::JsxElement(_)
+            | Expression::JsxSelfClosingElement(_)
+            | Expression::JsxFragment(_) => {
+                // The outcome is classified once here and committed atomically
+                // beside the plain type; the check phase replays that same
+                // value instead of re-inferring it.
+                self.infer_jsx_outcome(expression, context).map(|poll| {
+                    poll.map(|outcome| ExpressionResult {
+                        type_id: outcome.result(),
+                        jsx: Some(outcome),
+                    })
+                })
+            }
+            _ => {
+                // All other expressions are routed through the legacy evaluator
+                // inside a demand isolation so public projections are restored.
+                let ty = if let Some(target) = target {
+                    self.with_demand_isolation(|this| {
+                        this.legacy_type_of_expr_with_target(expression, target, context.scope)
+                    })
+                } else {
+                    self.with_demand_isolation(|this| {
+                        this.legacy_type_of_expr(expression, context.scope)
+                    })
+                };
+                Ok(DemandPoll::Ready(ExpressionResult::plain(ty)))
+            }
+        }
+    }
+
+    fn type_of_this(&mut self, context: SlotContext) -> DemandResult<TypeId> {
+        self.check_cancel()?;
+        match context.receiver {
+            ReceiverKind::None => Ok(DemandPoll::Ready(self.types.any())),
+            ReceiverKind::ExplicitThis { annotation } => {
+                if let Some(ty) = self.declaration_index.type_syntax.get(&annotation) {
+                    self.resolve_type_demand(ty)
+                } else {
+                    Ok(DemandPoll::Ready(self.types.any()))
+                }
+            }
+            ReceiverKind::Instance { class } => {
+                if let Some(contributor) = self.declaration_index.contributors.get(class.0 as usize)
+                    && let Some(symbol) = contributor.symbol
+                    && let Some(ty) = self.class_instance_types.get(&symbol)
+                {
+                    return Ok(DemandPoll::Ready(*ty));
+                }
+                Ok(DemandPoll::Ready(self.types.any()))
+            }
+            ReceiverKind::Static { class } => {
+                if let Some(contributor) = self.declaration_index.contributors.get(class.0 as usize)
+                    && let Some(symbol) = contributor.symbol
+                    && let Some(ty) = self.class_constructor_types.get(&symbol)
+                {
+                    return Ok(DemandPoll::Ready(*ty));
+                }
+                Ok(DemandPoll::Ready(self.types.any()))
+            }
+            ReceiverKind::LexicalCapture { owner } => {
+                if let Some(contributor) = self.declaration_index.contributors.get(owner.0 as usize)
+                    && let Some(symbol) = contributor.symbol
+                {
+                    return self.declared_value(symbol);
+                }
+                Ok(DemandPoll::Ready(self.types.any()))
+            }
+            ReceiverKind::ObjectLiteral { .. } => Ok(DemandPoll::Ready(self.types.any())),
+        }
+    }
+
+    fn type_of_super(&mut self, _context: SlotContext) -> DemandResult<TypeId> {
+        self.check_cancel()?;
+        // Super type depends on the active class base; this is a genuine dependency.
+        Ok(DemandPoll::Pending(QueryDependency {
+            target: self.current_query_address(),
+            purpose: DependencyPurpose::Structural,
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Check / publication boundary.
+    // -----------------------------------------------------------------------
+
+    pub(crate) fn check_selected_expr(
+        &mut self,
+        expression: &'src Expr,
+        selection: SelectedInput,
+    ) -> Result<TypeId, super::CheckCancelled> {
+        self.check_cancel()?;
+        // Selected-boundary reservation: every expression entering the
+        // selected check lands in the source-stable inventory before any
+        // query or diagnostic it drives. Prepared binders already hold the
+        // row from WP-LEX Stage-A (`reserve_expr`); the hybrid legacy path
+        // (resolve-driven JSX) never ran Stage-A, and its selections must
+        // still check through the scheduler on real source inventory rather
+        // than panic or synthesize. Insert-only: no symbol, scope, or
+        // contributor is created here, so canonical binding stays owned by
+        // the lexical passes.
+        self.declaration_index
+            .expressions
+            .entry(expression.id())
+            .or_insert(expression);
+        // JSX elements are checked through the dedicated JSX check methods;
+        // each replays the scheduler-committed outcome and publishes the
+        // element's result type itself.
+        match expression.data() {
+            Expression::JsxElement(element) => {
+                self.check_jsx_element(expression, element, selection)?;
+            }
+            Expression::JsxSelfClosingElement(element) => {
+                self.check_jsx_self_closing_element(expression, element, selection)?;
+            }
+            Expression::JsxFragment(fragment) => {
+                self.check_jsx_fragment(expression, fragment, selection)?;
+            }
+            _ => {
+                let key = QueryKey::Expression(ExpressionKey {
+                    node: expression.id(),
+                    point: selection.context.point,
+                    target: selection.target,
+                });
+                let address = QueryAddress {
+                    frame: self.demand.active_frame,
+                    key,
+                };
+                // Seed the root query under the full slot context (the memo
+                // key carries receiver and function body through the context
+                // the caller selected), then drive every dependency the seed
+                // raised to completion.
+                let seeded = match selection.target {
+                    Some(target) => {
+                        self.type_of_expr_with_target(expression, target, selection.context)?
+                    }
+                    None => self.type_of_expr(expression, selection.context)?,
+                };
+                let type_id = match seeded {
+                    DemandPoll::Ready(type_id) => type_id,
+                    DemandPoll::Pending(dep) => {
+                        match self.drive_seeded_root(address, dep)? {
+                            DemandPoll::Ready(QueryValue::Expression(result)) => result.type_id,
+                            DemandPoll::Ready(_) => {
+                                unreachable!(
+                                    "an expression address completes as an expression value"
+                                )
+                            }
+                            // Only the explicitly nonactivated producers
+                            // (flow guards, computed keys, callable-shape
+                            // prerequisites) survive the drive; the error
+                            // type marks the value as uncomputed instead of
+                            // inventing an `any` answer for a pending query.
+                            DemandPoll::Pending(_) => self.types.error_type(),
+                            DemandPoll::Limited { .. } => {
+                                // The demand chain overflowed the depth
+                                // budget: anchor the real nesting diagnostic
+                                // at this check's own site.
+                                self.emit(
+                                    TYPE_NESTING_TOO_DEEP,
+                                    expression.range(),
+                                    TYPE_NESTING_TOO_DEEP_MESSAGE,
+                                );
+                                self.types.error_type()
+                            }
+                        }
+                    }
+                    DemandPoll::Limited { .. } => {
+                        self.emit(
+                            TYPE_NESTING_TOO_DEEP,
+                            expression.range(),
+                            TYPE_NESTING_TOO_DEEP_MESSAGE,
+                        );
+                        self.types.error_type()
+                    }
+                };
+                self.publish_selected_expression(expression, type_id)?;
+                return Ok(type_id);
+            }
+        }
+        Ok(self
+            .node_types
+            .get(&expression.id())
+            .copied()
+            .expect("checked JSX element publishes its result type"))
+    }
+
+    /// Returns the scheduler-committed [`JsxElementOutcome`] for one JSX
+    /// expression, driving the demand query once when no entry exists yet.
+    ///
+    /// This is the check-phase retrieval adapter: inference has already
+    /// classified the element by the time checking replays it, so a completed
+    /// JSX entry always carries its outcome. A post-drive `Pending` means
+    /// only a nonactivated producer remains, which the check plane treats as
+    /// its scheduler invariant.
+    pub(crate) fn committed_jsx_outcome(
+        &mut self,
+        expression: &'src Expr,
+        selection: SelectedInput,
+    ) -> DemandResult<JsxElementOutcome> {
+        self.check_cancel()?;
+        let address = QueryAddress {
+            frame: self.demand.active_frame,
+            key: QueryKey::Expression(ExpressionKey {
+                node: expression.id(),
+                point: selection.context.point,
+                target: selection.target,
+            }),
+        };
+        if let Some(QueryState::Complete(QueryValue::Expression(result))) =
+            self.query_state(&address)
+        {
+            return Ok(DemandPoll::Ready(result.jsx.expect(
+                "completed JSX expression retains its classified outcome",
+            )));
+        }
+        let seeded = match selection.target {
+            Some(target) => self.type_of_expr_with_target(expression, target, selection.context)?,
+            None => self.type_of_expr(expression, selection.context)?,
+        };
+        match seeded {
+            DemandPoll::Ready(_) => {}
+            DemandPoll::Pending(dep) => {
+                self.drive_seeded_root(address, dep)?;
+            }
+            DemandPoll::Limited { .. } => {
+                // Depth overflow inside the element's demand chain: anchor
+                // the real nesting diagnostic here and degrade once.
+                self.emit(
+                    TYPE_NESTING_TOO_DEEP,
+                    expression.range(),
+                    TYPE_NESTING_TOO_DEEP_MESSAGE,
+                );
+                return Ok(DemandPoll::Ready(JsxElementOutcome::Degraded {
+                    result: self.types.error_type(),
+                    reason: JsxDegradation::OpaqueCallee,
+                    tag_range: expression.range(),
+                }));
+            }
+        }
+        match self.completed_query_value(address) {
+            Some(QueryValue::Expression(result)) => {
+                Ok(DemandPoll::Ready(result.jsx.expect(
+                    "completed JSX expression retains its classified outcome",
+                )))
+            }
+            Some(_) => unreachable!("an expression address completes as an expression value"),
+            None => Ok(DemandPoll::Pending(QueryDependency {
+                target: address,
+                purpose: DependencyPurpose::Value,
+            })),
+        }
+    }
+
+    pub(crate) fn publish_selected_expression(
+        &mut self,
+        expression: &'src Expr,
+        type_id: TypeId,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        // Commit-once: a replayed selection (memo hit under a second parent)
+        // keeps the first published projection row instead of duplicating it.
+        if self.node_types.insert(expression.id(), type_id).is_none() {
+            self.typed_expressions.push((expression.range(), type_id));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_reference_event(
+        &mut self,
+        sequence: u32,
+        target: Option<SymbolId>,
+        anchor: Option<PropertyAnchor>,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        if let Some(event) = self.reference_index.events.get_mut(sequence as usize) {
+            event.typed_target = target;
+            event.anchor = anchor;
+        }
+        Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn complete_jsx_attribute_reference(
+        &mut self,
+        schema: Option<TypeId>,
+        name: &str,
+        range: TextRange,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        let Some(schema) = schema else { return Ok(()) };
+        let Some(_type_id) = self.types.read_property_type(schema, name) else {
+            return Ok(());
+        };
+        // Only a nominal owner (interface/class/namespace member type) has a
+        // stable rename identity here; a structural or unresolved schema has
+        // no `PropertyOwner::Site` node to anchor to (that variant is for
+        // object-literal expressions, not JSX prop schemas), so no anchor is
+        // recorded for it, matching the plan's existing anchor-owner rule.
+        let Some(owner) = self.owner_of_named_type(schema) else {
+            return Ok(());
+        };
+        let property_id = self.record_property_site(owner, name);
+        self.property_anchors.push(PropertyAnchor {
+            range,
+            property_id,
+            kind: PropertyAnchorKind::Plain,
+            declaration: false,
+        });
+        let anchor_index = self.property_anchors.len() - 1;
+        self.property_anchor_index.insert(range, anchor_index);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Flow / definite assignment adapters.
+    // -----------------------------------------------------------------------
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn resolve_guard(
+        &mut self,
+        guard: &SymbolicGuard,
+    ) -> DemandResult<Vec<NarrowingGuard>> {
+        self.check_cancel()?;
+        Ok(DemandPoll::Pending(QueryDependency {
+            target: QueryAddress {
+                frame: 0,
+                key: QueryKey::Expression(ExpressionKey {
+                    node: guard.condition,
+                    point: ExecutionPoint {
+                        node: guard.condition,
+                        boundary: ExecutionBoundary::Primary,
+                    },
+                    target: None,
+                }),
+            },
+            purpose: DependencyPurpose::GuardInput,
+        }))
+    }
+
+    pub(crate) fn materialize_root(
+        &mut self,
+        point: FlowPointId,
+        root: SymbolId,
+    ) -> DemandResult<RootFlowPacket> {
+        self.check_cancel()?;
+        if let Some(analysis) = self.demand.assignment_memo.get(&self.module_scope)
+            && let Some(AssignmentReachability::Reachable(_)) = analysis.state_at(point, root)
+        {
+            // Construct real flow packet via FlowFacts
+            if let Some(packet) =
+                self.flow_facts
+                    .root_packet(self.flow, root, self.cancel.as_ref())?
+            {
+                return Ok(DemandPoll::Ready(packet));
+            }
+        }
+        Ok(DemandPoll::Pending(QueryDependency {
+            target: QueryAddress {
+                frame: 0,
+                key: QueryKey::Flow(FlowQueryKey { point, root }),
+            },
+            purpose: DependencyPurpose::DeclaredRoot,
+        }))
+    }
+    #[expect(
+        dead_code,
+        reason = "leaf packet reader; production callers land with the WP-DEMAND cutover"
+    )]
+    pub(crate) fn flow_type_at(
+        &mut self,
+        point: FlowPointId,
+        key: &FlowKey,
+    ) -> DemandResult<Option<TypeId>> {
+        self.check_cancel()?;
+        match self.materialize_root(point, key.root_symbol())? {
+            DemandPoll::Ready(packet) => {
+                let type_id = packet
+                    .paths
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, ty)| *ty);
+                Ok(DemandPoll::Ready(type_id))
+            }
+            DemandPoll::Pending(dep) => Ok(DemandPoll::Pending(dep)),
+            DemandPoll::Limited { owner, range } => Ok(DemandPoll::Limited { owner, range }),
+        }
+    }
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn check_definite_assignment_use(
+        &mut self,
+        usage: super::narrowing::AssignmentUse,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        let boundary = usage.scope;
+        if let Some(analysis) = self.demand.assignment_memo.get(&boundary)
+            && let Some(reachable) = analysis.state_at(usage.point, usage.symbol)
+        {
+            match reachable {
+                super::narrowing::AssignmentReachability::Unreachable => {}
+                super::narrowing::AssignmentReachability::Reachable(state) => {
+                    let assigned = matches!(state, super::narrowing::AssignmentState::Assigned);
+                    if !assigned && usage.live && !usage.suppressed {
+                        let diagnostic = Diagnostic::error(
+                            USED_BEFORE_ASSIGNED,
+                            self.source.source_id(),
+                            usage.range,
+                            USED_BEFORE_ASSIGNED_MESSAGE,
+                        );
+                        let order = self.publication_order_for_range(usage.range);
+                        self.queue_diagnostic(diagnostic, order, true)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Typed-key seam (T-CK producer remains pending).
+    // -----------------------------------------------------------------------
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn complete_interface_member_keys(
+        &mut self,
+        owner: SymbolId,
+    ) -> MemberKeyCompletion {
+        let _ = owner;
+        MemberKeyCompletion::Pending
+    }
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn demand_computed_interface_name(
+        &mut self,
+        contributor: DeclId,
+    ) -> ComputedNameOutcome {
+        let _ = contributor;
+        ComputedNameOutcome::Pending
+    }
+
+    // -----------------------------------------------------------------------
+    // ProgramFlow construction (bounded: module-level entry and declarations).
+    // -----------------------------------------------------------------------
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn build_program_flow(&mut self) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        let mut program_flow = ProgramFlow::new();
+        let entry = program_flow.add_node(
+            ExecutionPoint {
+                node: self.source.id(),
+                boundary: ExecutionBoundary::Entry,
+            },
+            self.module_scope,
+            FlowOperation::Entry,
+        );
+        program_flow.add_root(entry);
+        let exit = program_flow.add_node(
+            ExecutionPoint {
+                node: self.source.id(),
+                boundary: ExecutionBoundary::Exit,
+            },
+            self.module_scope,
+            FlowOperation::Exit,
+        );
+        let mut previous = entry;
+        for statement in self.source.statements() {
+            self.check_cancel()?;
+            let (_node, operation) = self.flow_operation_for_statement(statement)?;
+            let point = program_flow.add_node(
+                ExecutionPoint {
+                    node: statement.id(),
+                    boundary: ExecutionBoundary::Primary,
+                },
+                self.module_scope,
+                operation,
+            );
+            program_flow.add_edge(FlowEdge {
+                from: previous,
+                to: point,
+                kind: FlowEdgeKind::Sequential,
+            });
+            previous = point;
+            // Emit DeclarationComplete for simple initialized bindings at their leaf.
+            self.emit_declaration_completes(&mut program_flow, statement, self.module_scope)?;
+        }
+        program_flow.add_edge(FlowEdge {
+            from: previous,
+            to: exit,
+            kind: FlowEdgeKind::Sequential,
+        });
+        self.program_flow = Some(program_flow);
+        Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    fn flow_operation_for_statement(
+        &self,
+        statement: &'src Stmt,
+    ) -> Result<(NodeId, FlowOperation), super::CheckCancelled> {
+        let node = statement.id();
+        let operation = match statement.data() {
+            Statement::Variable(_)
+            | Statement::Function(_)
+            | Statement::Class(_)
+            | Statement::Enum(_)
+            | Statement::Interface(_)
+            | Statement::TypeAlias(_)
+            | Statement::Namespace(_)
+            | Statement::Import(_)
+            | Statement::ImportEquals(_) => FlowOperation::Pass,
+            _ => FlowOperation::Pass,
+        };
+        Ok((node, operation))
+    }
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    fn emit_declaration_completes(
+        &mut self,
+        program_flow: &mut ProgramFlow,
+        statement: &'src Stmt,
+        _scope: ScopeId,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        if let Statement::Variable(variable) = statement.data() {
+            for declarator in &variable.declarations {
+                if declarator.data().initializer.is_some()
+                    && let Some(contributors) = self
+                        .declaration_index
+                        .contributor_by_node
+                        .get(&declarator.id())
+                {
+                    for &decl in contributors {
+                        if let Some(contributor) =
+                            self.declaration_index.contributors.get(decl.0 as usize)
+                            && let Some(symbol) = contributor.symbol
+                        {
+                            let point = program_flow.add_node(
+                                ExecutionPoint {
+                                    node: declarator.id(),
+                                    boundary: ExecutionBoundary::Primary,
+                                },
+                                _scope,
+                                FlowOperation::DeclarationComplete {
+                                    declaration: decl,
+                                    assigned_roots: Box::new([symbol]),
+                                },
+                            );
+                            program_flow.add_root(point);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Enum scalar installation.
+    // -----------------------------------------------------------------------
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn enum_source_inventory(&self) -> EnumSourceInventory<'src, '_> {
+        EnumSourceInventory {
+            view: self.enum_binding_view(),
+            source: self.source,
+            source_id: self.source.source_id(),
+            declarations: &self.enum_declarations,
+            member_symbols: &self.enum_member_symbols,
+            member_names: &self.enum_member_names,
+            member_identifier_uses: &self.enum_member_identifier_uses,
+            local_member_targets: &self.local_enum_member_targets,
+            imported_member_uses: &self.imported_enum_member_uses,
+            imported_member_targets: &self.imported_enum_member_targets,
+        }
+    }
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    fn build_enum_facts_from_inventory(
+        &mut self,
+        scalars: &std::collections::HashMap<NodeId, enum_plan::ImportedConstEnumValue>,
+    ) -> (EnumFacts, Vec<Diagnostic>) {
+        enum_plan::build_with_imports_from_inventory(
+            &self.enum_binding_view(),
+            self.source,
+            self.source.source_id(),
+            &self.enum_declarations,
+            &self.enum_member_symbols,
+            &self.enum_member_names,
+            &self.enum_member_identifier_uses,
+            &self.local_enum_member_targets,
+            &self.imported_enum_member_uses,
+            &self.imported_enum_member_targets,
+            scalars,
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Demand isolation: run a legacy sub-evaluation and restore public maps.
+    // -----------------------------------------------------------------------
+
+    fn with_demand_isolation<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        // Owned snapshots of every public projection a legacy sub-evaluation
+        // may mutate. The closure runs against emptied state and every field
+        // is moved back afterwards; plain owned moves replace the previous
+        // `ManuallyDrop` swap, so no `unsafe` block is required.
+        struct IsolatedPublicMaps {
+            type_nodes: HashMap<NodeId, TypeId>,
+            node_types: HashMap<NodeId, TypeId>,
+            typed_expressions: Vec<(TextRange, TypeId)>,
+            symbol_references: Vec<(TextRange, SymbolId)>,
+            diagnostics: Vec<Diagnostic>,
+            expected_diagnostics: Vec<ExpectedDiagnostic>,
+            uninitialized_variables: HashSet<SymbolId>,
+            declarator_symbols: HashMap<NodeId, Vec<SymbolId>>,
+            return_types: HashMap<NodeId, Vec<TypeId>>,
+            yield_types: HashMap<NodeId, Vec<TypeId>>,
+            interface_member_occurrences: Vec<DeclarationOccurrence>,
+            signature_parameter_symbols: HashMap<NodeId, SymbolId>,
+            property_sites: Vec<PropertySite>,
+            property_anchors: Vec<PropertyAnchor>,
+            property_site_index: HashMap<(PropertyOwner, Box<str>), PropertyId>,
+            property_anchor_index: HashMap<TextRange, usize>,
+            literal_anchor: HashMap<NodeId, PropertyOwner>,
+            symbol_anchor: HashMap<SymbolId, PropertyOwner>,
+            member_reference_recorded: HashSet<NodeId>,
+            this_context: Vec<TypeId>,
+            function_body_stack: Vec<NodeId>,
+            return_contexts: Vec<ReturnContext>,
+            flow: FlowNodeId,
+            flow_facts: FlowFacts,
+            reassigned_flow_roots: HashSet<SymbolId>,
+            reassigned_flow_roots_stack: Vec<HashSet<SymbolId>>,
+            super_member_homes: Vec<SuperMemberHome>,
+            super_call_contexts: Vec<SuperCallContext>,
+            derived_constructor_super_presence: Vec<bool>,
+            super_flow: SuperFlow,
+            super_call_guarantees: bool,
+            class_derived_stack: Vec<bool>,
+            constructor_writable_readonly_properties: Vec<HashSet<String>>,
+            readonly_assignment_targets: HashSet<NodeId>,
+            new_target_contexts: Vec<bool>,
+            label_declarations: Vec<String>,
+            label_scope_marks: Vec<usize>,
+            label_ancestors: Vec<(String, usize)>,
+            label_frame: usize,
+            ambient_stack: Vec<bool>,
+            class_owner_stack: Vec<SymbolId>,
+            class_base_symbols: HashMap<SymbolId, SymbolId>,
+        }
+
+        let isolated = IsolatedPublicMaps {
+            type_nodes: std::mem::take(&mut self.type_nodes),
+            node_types: std::mem::take(&mut self.node_types),
+            typed_expressions: std::mem::take(&mut self.typed_expressions),
+            symbol_references: std::mem::take(&mut self.symbol_references),
+            diagnostics: std::mem::take(&mut self.diagnostics),
+            expected_diagnostics: std::mem::take(&mut self.expected_diagnostics),
+            uninitialized_variables: std::mem::take(&mut self.uninitialized_variables),
+            declarator_symbols: std::mem::take(&mut self.declarator_symbols),
+            return_types: std::mem::take(&mut self.return_types),
+            yield_types: std::mem::take(&mut self.yield_types),
+            interface_member_occurrences: std::mem::take(&mut self.interface_member_occurrences),
+            signature_parameter_symbols: std::mem::take(&mut self.signature_parameter_symbols),
+            property_sites: std::mem::take(&mut self.property_sites),
+            property_anchors: std::mem::take(&mut self.property_anchors),
+            property_site_index: std::mem::take(&mut self.property_site_index),
+            property_anchor_index: std::mem::take(&mut self.property_anchor_index),
+            literal_anchor: std::mem::take(&mut self.literal_anchor),
+            symbol_anchor: std::mem::take(&mut self.symbol_anchor),
+            member_reference_recorded: std::mem::take(&mut self.member_reference_recorded),
+            this_context: std::mem::take(&mut self.this_context),
+            function_body_stack: std::mem::take(&mut self.function_body_stack),
+            return_contexts: std::mem::take(&mut self.return_contexts),
+            flow: std::mem::take(&mut self.flow),
+            flow_facts: std::mem::take(&mut self.flow_facts),
+            reassigned_flow_roots: std::mem::take(&mut self.reassigned_flow_roots),
+            reassigned_flow_roots_stack: std::mem::take(&mut self.reassigned_flow_roots_stack),
+            super_member_homes: std::mem::take(&mut self.super_member_homes),
+            super_call_contexts: std::mem::take(&mut self.super_call_contexts),
+            derived_constructor_super_presence: std::mem::take(
+                &mut self.derived_constructor_super_presence,
+            ),
+            super_flow: std::mem::take(&mut self.super_flow),
+            super_call_guarantees: self.super_call_guarantees,
+            class_derived_stack: std::mem::take(&mut self.class_derived_stack),
+            constructor_writable_readonly_properties: std::mem::take(
+                &mut self.constructor_writable_readonly_properties,
+            ),
+            readonly_assignment_targets: std::mem::take(&mut self.readonly_assignment_targets),
+            new_target_contexts: std::mem::take(&mut self.new_target_contexts),
+            label_declarations: std::mem::take(&mut self.label_declarations),
+            label_scope_marks: std::mem::take(&mut self.label_scope_marks),
+            label_ancestors: std::mem::take(&mut self.label_ancestors),
+            label_frame: self.label_frame,
+            ambient_stack: std::mem::take(&mut self.ambient_stack),
+            class_owner_stack: std::mem::take(&mut self.class_owner_stack),
+            class_base_symbols: std::mem::take(&mut self.class_base_symbols),
+        };
+
+        self.demand.in_demand += 1;
+        let result = f(self);
+        self.demand.in_demand -= 1;
+
+        self.type_nodes = isolated.type_nodes;
+        self.node_types = isolated.node_types;
+        self.typed_expressions = isolated.typed_expressions;
+        self.symbol_references = isolated.symbol_references;
+        self.diagnostics = isolated.diagnostics;
+        self.expected_diagnostics = isolated.expected_diagnostics;
+        self.uninitialized_variables = isolated.uninitialized_variables;
+        self.declarator_symbols = isolated.declarator_symbols;
+        self.return_types = isolated.return_types;
+        self.yield_types = isolated.yield_types;
+        self.interface_member_occurrences = isolated.interface_member_occurrences;
+        self.signature_parameter_symbols = isolated.signature_parameter_symbols;
+        self.property_sites = isolated.property_sites;
+        self.property_anchors = isolated.property_anchors;
+        self.property_site_index = isolated.property_site_index;
+        self.property_anchor_index = isolated.property_anchor_index;
+        self.literal_anchor = isolated.literal_anchor;
+        self.symbol_anchor = isolated.symbol_anchor;
+        self.member_reference_recorded = isolated.member_reference_recorded;
+        self.this_context = isolated.this_context;
+        self.function_body_stack = isolated.function_body_stack;
+        self.return_contexts = isolated.return_contexts;
+        self.flow = isolated.flow;
+        self.flow_facts = isolated.flow_facts;
+        self.reassigned_flow_roots = isolated.reassigned_flow_roots;
+        self.reassigned_flow_roots_stack = isolated.reassigned_flow_roots_stack;
+        self.super_member_homes = isolated.super_member_homes;
+        self.super_call_contexts = isolated.super_call_contexts;
+        self.derived_constructor_super_presence = isolated.derived_constructor_super_presence;
+        self.super_flow = isolated.super_flow;
+        self.super_call_guarantees = isolated.super_call_guarantees;
+        self.class_derived_stack = isolated.class_derived_stack;
+        self.constructor_writable_readonly_properties =
+            isolated.constructor_writable_readonly_properties;
+        self.readonly_assignment_targets = isolated.readonly_assignment_targets;
+        self.new_target_contexts = isolated.new_target_contexts;
+        self.label_declarations = isolated.label_declarations;
+        self.label_scope_marks = isolated.label_scope_marks;
+        self.label_ancestors = isolated.label_ancestors;
+        self.label_frame = isolated.label_frame;
+        self.ambient_stack = isolated.ambient_stack;
+        self.class_owner_stack = isolated.class_owner_stack;
+        self.class_base_symbols = isolated.class_base_symbols;
+
+        result
+    }
+
+    // -----------------------------------------------------------------------
+    // WP-CHECK fact drain.
+    // -----------------------------------------------------------------------
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn drain_declaration_facts(
+        &mut self,
+        _owner: DeclId,
+    ) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        // Cycle-diagnostic constants are pending WP-SEAM mint; non-cycle facts
+        // are staged as `DemandDiagnostic::Existing` diagnostics and drained
+        // through the program-level publication stream.
+        // Copy the matching facts out first: `queue_diagnostic` takes `&mut
+        // self`, which cannot run while the declaration-index slice borrow is
+        // alive. Fact rows are owned, so the copy is the drain.
+        let facts: Vec<(Diagnostic, PublicationOrder)> = self
+            .declaration_index
+            .facts
+            .iter()
+            .filter(|fact| fact.owner == _owner)
+            .map(|fact| (fact.diagnostic.clone(), fact.order))
+            .collect();
+        for (diagnostic, order) in facts {
+            self.queue_diagnostic(diagnostic, order, true)?;
+        }
+        Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "driven by the WP-DEMAND adapters in a later serialized binder step"
+    )]
+    pub(crate) fn flush_demand_facts(&mut self) -> Result<(), super::CheckCancelled> {
+        let frame = self.demand.active_frame;
+        self.drain_frame_facts(frame)
+    }
+
+    /// Drains one frame's staged demand facts into the publication stream.
+    ///
+    /// Cycle and depth payloads classify to their real diagnostic codes
+    /// here — C104 for initializer cycles, C105/C106 through the callable
+    /// anchor for return cycles, C082 for depth overflow — never a
+    /// placeholder code. `publication.drained_facts` makes each
+    /// (declaration, range, kind) publication fire exactly once.
+    fn drain_frame_facts(&mut self, frame: usize) -> Result<(), super::CheckCancelled> {
+        self.check_cancel()?;
+        let facts: Vec<DemandFact> = if frame == 0 {
+            self.demand.canonical.facts.drain(..).collect()
+        } else {
+            match self
+                .demand
+                .frames
+                .get_mut(frame - 1)
+                .and_then(|slot| slot.queries.as_mut())
+            {
+                Some(queries) => queries.facts.drain(..).collect(),
+                // A released frame has no payload to drain by definition.
+                None => return Ok(()),
+            }
+        };
+        // Only canonical and mode-Selected frames are ever drained here
+        // (speculative frames discard their facts at safe release without
+        // promotion), so drained facts publish ungated.
+        for fact in facts {
+            let (code, message, range, kind) = match &fact.payload {
+                DemandDiagnostic::Existing(diagnostic) => {
+                    self.queue_diagnostic(diagnostic.clone(), fact.order, true)?;
+                    continue;
+                }
+                DemandDiagnostic::InitializerCycle => (
+                    IMPLICIT_ANY_FROM_INITIALIZER_CYCLE,
+                    INITIALIZER_CYCLE_MESSAGE,
+                    fact.range,
+                    DemandDiagnosticKind::InitializerCycle,
+                ),
+                DemandDiagnostic::ReturnCycle(anchor) => {
+                    let anchor_range = match *anchor {
+                        CallableAnchor::Named(range)
+                        | CallableAnchor::ArrowExpression(range)
+                        | CallableAnchor::FunctionKeyword(range) => range,
+                    };
+                    let (code, kind) = match anchor {
+                        CallableAnchor::ArrowExpression(_) => (
+                            IMPLICIT_ANY_ANONYMOUS_RETURN_FROM_CYCLE,
+                            DemandDiagnosticKind::AnonymousReturnCycle,
+                        ),
+                        CallableAnchor::Named(_) | CallableAnchor::FunctionKeyword(_) => (
+                            IMPLICIT_ANY_RETURN_FROM_CYCLE,
+                            DemandDiagnosticKind::NamedReturnCycle,
+                        ),
+                    };
+                    (code, RETURN_CYCLE_MESSAGE, anchor_range, kind)
+                }
+                DemandDiagnostic::NestingTooDeep => (
+                    TYPE_NESTING_TOO_DEEP,
+                    TYPE_NESTING_TOO_DEEP_MESSAGE,
+                    fact.range,
+                    DemandDiagnosticKind::NestingTooDeep,
+                ),
+            };
+            if !self
+                .publication
+                .drained_facts
+                .insert((fact.owner, range, kind))
+            {
+                continue;
+            }
+            self.queue_diagnostic(
+                Diagnostic::error(code, self.source.source_id(), range, message),
+                fact.order,
+                true,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -21732,22 +28371,18 @@ namespace undefined { export var x = 42; }",
             .iter()
             .find(|property| property.name() == "m")
             .expect("merged method member");
-        let Type::Intersection(members) = model.types().get(property.type_id()) else {
-            panic!("three distinctly labelled overloads form an intersection");
-        };
-        assert_eq!(members.len(), 3);
+        let signatures = model
+            .types()
+            .overload_signatures(property.type_id())
+            .expect("merged method group exposes its overload signatures");
+        assert_eq!(signatures.len(), 3);
         assert!(
-            members[0] != members[1] && members[1] != members[2],
-            "distinct labels intern to distinct types"
+            signatures[0] != signatures[1] && signatures[1] != signatures[2],
+            "distinct labels intern to distinct signatures"
         );
-        let names: Vec<String> = members
+        let names: Vec<String> = signatures
             .iter()
-            .map(|&member| {
-                let Type::Function(signature) = model.types().get(member) else {
-                    panic!("overload member is a function");
-                };
-                signature.parameters()[0].name().to_owned()
-            })
+            .map(|signature| signature.parameters()[0].name().to_owned())
             .collect();
         assert_eq!(names, ["a", "b", "c"], "parameter labels survive interning");
     }

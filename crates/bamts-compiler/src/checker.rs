@@ -58,9 +58,9 @@ pub use binder::{
     SymbolId, SymbolKind, Type, TypeId, TypeTable,
 };
 pub(crate) use binder::{
-    ImportedSymbolType, bind_source_with_cancel, bind_source_with_environment_and_cancel,
-    bind_source_with_environment_and_imports_with_cancel, is_numeric_enum_initializer,
-    source_is_module,
+    EnumBindingView, EnumSourceInventory, ImportedSymbolType, bind_source_with_cancel,
+    bind_source_with_environment_and_cancel, bind_source_with_environment_and_imports_with_cancel,
+    is_numeric_enum_initializer, source_is_module,
 };
 pub use inference::{
     InferenceContext, InferenceParameter, InferencePriority, InferenceProvenance,
@@ -152,6 +152,13 @@ pub const PARAMETER_INITIALIZER_IN_SIGNATURE: DiagnosticCode = DiagnosticCode::n
 pub const DUPLICATE_LABEL: DiagnosticCode = DiagnosticCode::new("BAMTS-C101");
 pub const BREAK_TARGET_NOT_ENCLOSING: DiagnosticCode = DiagnosticCode::new("BAMTS-C102");
 pub const BREAK_TARGET_CROSSES_FUNCTION: DiagnosticCode = DiagnosticCode::new("BAMTS-C103");
+/// Diagnostic emitted when an inferred value is recursively referenced by its initializer.
+pub const IMPLICIT_ANY_FROM_INITIALIZER_CYCLE: DiagnosticCode = DiagnosticCode::new("BAMTS-C104");
+/// Diagnostic emitted when an inferred named callable return is recursively referenced.
+pub const IMPLICIT_ANY_RETURN_FROM_CYCLE: DiagnosticCode = DiagnosticCode::new("BAMTS-C105");
+/// Diagnostic emitted when an inferred anonymous callable return is recursively referenced.
+pub const IMPLICIT_ANY_ANONYMOUS_RETURN_FROM_CYCLE: DiagnosticCode =
+    DiagnosticCode::new("BAMTS-C106");
 pub(crate) const BREAK_TARGET_CROSSES_FUNCTION_MESSAGE: &str =
     "Jump target cannot cross function boundary.";
 pub(crate) const BREAK_TARGET_NOT_ENCLOSING_MESSAGE: &str =
@@ -1022,6 +1029,56 @@ struct LinkedEnum {
     source: SourceId,
     symbol: SymbolId,
 }
+/// Borrowed lexical input for the pre-typing enum scalar bootstrap.
+///
+/// The inventory (binding view, source, and lexical enum tables) remains
+/// borrowed from the retained Binder; only the facts produced by the lexical
+/// enum adapter are owned here.
+#[expect(
+    dead_code,
+    reason = "retained for the Main-owned atomic enum bootstrap cutover"
+)]
+struct EnumSource<'src, 'a> {
+    inventory: EnumSourceInventory<'src, 'a>,
+    facts: enum_plan::EnumFacts,
+}
+
+#[expect(
+    dead_code,
+    reason = "retained for the Main-owned atomic enum bootstrap cutover"
+)]
+struct ResolvedProgramEnumScalars {
+    by_source: BTreeMap<SourceId, HashMap<NodeId, enum_plan::ImportedConstEnumValue>>,
+}
+
+trait EnumSourceRead {
+    fn enum_facts(&self) -> &enum_plan::EnumFacts;
+    fn symbol_kind(&self, symbol: SymbolId) -> Option<SymbolKind>;
+}
+
+impl EnumSourceRead for SemanticModel {
+    fn enum_facts(&self) -> &enum_plan::EnumFacts {
+        SemanticModel::enum_facts(self)
+    }
+
+    fn symbol_kind(&self, symbol: SymbolId) -> Option<SymbolKind> {
+        Some(self.symbol(symbol).kind())
+    }
+}
+
+impl<'src, 'a> EnumSourceRead for EnumSource<'src, 'a> {
+    fn enum_facts(&self) -> &enum_plan::EnumFacts {
+        &self.facts
+    }
+
+    fn symbol_kind(&self, symbol: SymbolId) -> Option<SymbolKind> {
+        self.inventory
+            .view
+            .symbols
+            .get(symbol.get() as usize)
+            .map(Symbol::kind)
+    }
+}
 
 #[derive(Clone, Debug)]
 enum ImportTarget {
@@ -1308,6 +1365,347 @@ fn build_imported_symbol_type<'a>(
     })
 }
 
+fn lexical_symbol(
+    source: &SourceFile,
+    bindings: EnumBindingView<'_>,
+    identifier: &IdentifierNode,
+) -> Option<SymbolId> {
+    bindings
+        .references
+        .get(&identifier.id())
+        .copied()
+        .or_else(|| {
+            let name = source.identifier_text(identifier.data().token())?;
+            bindings
+                .scopes
+                .get(bindings.module_scope.get() as usize)?
+                .value(name.as_ref())
+        })
+}
+
+#[expect(
+    dead_code,
+    reason = "retained for the Main-owned atomic enum bootstrap cutover"
+)]
+fn collect_lexical_import_targets(
+    sources: &[Recovered<SourceFile>],
+    files: &BTreeMap<SourceId, EnumSource<'_, '_>>,
+    edges: &HashMap<(SourceId, NodeId), SourceId>,
+) -> HashMap<(SourceId, SymbolId), ImportTarget> {
+    let mut targets = HashMap::new();
+    for recovered in sources {
+        let source = recovered.product();
+        let source_id = source.source_id();
+        let Some(entry) = files.get(&source_id) else {
+            continue;
+        };
+        for statement in source.statements() {
+            let Statement::Import(import) = statement.data() else {
+                continue;
+            };
+            let Some(target_source) = edges
+                .get(&(source_id, statement.id()))
+                .or_else(|| edges.get(&(source_id, import.source.id())))
+                .copied()
+            else {
+                continue;
+            };
+            let Some(clause) = &import.clause else {
+                continue;
+            };
+            if let Some(default) = &clause.default
+                && let Some(symbol) = lexical_symbol(source, entry.inventory.view, default)
+            {
+                targets.insert(
+                    (source_id, symbol),
+                    ImportTarget::Named {
+                        source: target_source,
+                        name: EcmaString::encode("default"),
+                        specifier: None,
+                    },
+                );
+            }
+            match &clause.binding {
+                Some(ImportBinding::Namespace(local)) => {
+                    if let Some(symbol) = lexical_symbol(source, entry.inventory.view, local) {
+                        targets.insert(
+                            (source_id, symbol),
+                            ImportTarget::Namespace {
+                                source: target_source,
+                            },
+                        );
+                    }
+                }
+                Some(ImportBinding::Named(specifiers)) => {
+                    for specifier in specifiers {
+                        let data = specifier.data();
+                        let Some(symbol) =
+                            lexical_symbol(source, entry.inventory.view, &data.local)
+                        else {
+                            continue;
+                        };
+                        let Some(name) = module_export_name(source, &data.imported) else {
+                            continue;
+                        };
+                        targets.insert(
+                            (source_id, symbol),
+                            ImportTarget::Named {
+                                source: target_source,
+                                name,
+                                specifier: Some(specifier.id()),
+                            },
+                        );
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    targets
+}
+
+#[expect(
+    dead_code,
+    reason = "retained for the Main-owned atomic enum bootstrap cutover"
+)]
+fn collect_lexical_export_targets(
+    sources: &[Recovered<SourceFile>],
+    files: &BTreeMap<SourceId, EnumSource<'_, '_>>,
+    edges: &HashMap<(SourceId, NodeId), SourceId>,
+) -> HashMap<(SourceId, EcmaString), ExportTarget> {
+    let mut targets = HashMap::new();
+    for recovered in sources {
+        let source = recovered.product();
+        let source_id = source.source_id();
+        let Some(entry) = files.get(&source_id) else {
+            continue;
+        };
+        for statement in source.statements() {
+            let Statement::Export(export) = statement.data() else {
+                continue;
+            };
+            match export {
+                crate::syntax::ExportDeclaration::Named(named) => match named {
+                    crate::syntax::ExportNamedDeclaration::Declaration(inner) => {
+                        if let Some((declaration, declaration_id)) =
+                            enum_plan::enum_declaration(inner)
+                        {
+                            let Some(symbol) = entry.facts.declaration_symbol(declaration_id)
+                            else {
+                                continue;
+                            };
+                            let Some(name) = source
+                                .identifier_text(declaration.name.data().token())
+                                .map(|name| EcmaString::encode(name.as_ref()))
+                            else {
+                                continue;
+                            };
+                            targets.insert((source_id, name), ExportTarget::Local(symbol));
+                        } else {
+                            for name in crate::lower::declared_names(source, inner) {
+                                let Some(symbol) = entry
+                                    .inventory
+                                    .view
+                                    .scopes
+                                    .get(entry.inventory.view.module_scope.get() as usize)
+                                    .and_then(|scope| scope.value(&name))
+                                else {
+                                    continue;
+                                };
+                                targets.insert(
+                                    (source_id, EcmaString::encode(&name)),
+                                    ExportTarget::Local(symbol),
+                                );
+                            }
+                        }
+                    }
+                    crate::syntax::ExportNamedDeclaration::Specifiers {
+                        type_only,
+                        specifiers,
+                        source: reexport_source,
+                        ..
+                    } if !type_only => {
+                        let target_source = reexport_source.as_ref().and_then(|module| {
+                            edges
+                                .get(&(source_id, statement.id()))
+                                .or_else(|| edges.get(&(source_id, module.id())))
+                                .copied()
+                        });
+                        for specifier in specifiers {
+                            let data = specifier.data();
+                            if data.mode == crate::syntax::ExportSpecifierMode::TypeOnly {
+                                continue;
+                            }
+                            let Some(exported) = module_export_name(source, &data.exported) else {
+                                continue;
+                            };
+                            let target = if let Some(target_source) = target_source {
+                                let Some(name) = module_export_name(source, &data.local) else {
+                                    continue;
+                                };
+                                ExportTarget::Forward {
+                                    source: target_source,
+                                    name,
+                                }
+                            } else {
+                                let Some(symbol) = (match &data.local {
+                                    ModuleExportName::Identifier(identifier) => {
+                                        lexical_symbol(source, entry.inventory.view, identifier)
+                                    }
+                                    ModuleExportName::String(_) | ModuleExportName::Missing(_) => {
+                                        None
+                                    }
+                                }) else {
+                                    continue;
+                                };
+                                ExportTarget::Local(symbol)
+                            };
+                            targets.insert((source_id, exported), target);
+                        }
+                    }
+                    _ => {}
+                },
+                crate::syntax::ExportDeclaration::Default(default) => {
+                    let name = match &default.value {
+                        crate::syntax::ExportDefaultValue::Function(function) => {
+                            function.name.as_ref()
+                        }
+                        crate::syntax::ExportDefaultValue::Class(class) => class.name.as_ref(),
+                        _ => None,
+                    };
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    let Some(symbol) = lexical_symbol(source, entry.inventory.view, name) else {
+                        continue;
+                    };
+                    targets.insert(
+                        (source_id, EcmaString::encode("default")),
+                        ExportTarget::Local(symbol),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    targets
+}
+
+#[expect(
+    dead_code,
+    reason = "retained for the Main-owned atomic enum bootstrap cutover"
+)]
+fn resolve_program_enum_scalars(
+    sources: &[Recovered<SourceFile>],
+    edges: &[ResolvedModuleEdge],
+    files: &mut BTreeMap<SourceId, EnumSource<'_, '_>>,
+    cancel: &CancellationToken,
+) -> Result<ResolvedProgramEnumScalars, CheckCancelled> {
+    let edge_targets: HashMap<_, _> = edges
+        .iter()
+        .map(|edge| ((edge.from, edge.specifier), edge.to))
+        .collect();
+    let imports = collect_lexical_import_targets(sources, files, &edge_targets);
+    let exports = collect_lexical_export_targets(sources, files, &edge_targets);
+    let export_stars = collect_export_stars(sources, &edge_targets);
+
+    let mut values = BTreeMap::new();
+    for (&source_id, entry) in files.iter_mut() {
+        cancel.check()?;
+        let empty = HashMap::new();
+        let (facts, _) = enum_plan::build_with_imports_from_inventory(
+            &entry.inventory.view,
+            entry.inventory.source,
+            source_id,
+            entry.inventory.declarations,
+            entry.inventory.member_symbols,
+            entry.inventory.member_names,
+            entry.inventory.member_identifier_uses,
+            entry.inventory.local_member_targets,
+            entry.inventory.imported_member_uses,
+            entry.inventory.imported_member_targets,
+            &empty,
+        );
+        entry.facts = facts;
+        for (member, site) in entry.facts.imported_member_uses() {
+            if !matches!(
+                site.base(),
+                enum_plan::ImportedEnumMemberBase::Import(symbol)
+                    if matches!(imports.get(&(source_id, symbol)), Some(ImportTarget::Namespace { .. }))
+            ) {
+                values.insert(
+                    (source_id, member),
+                    enum_plan::ImportedConstEnumValue::Pending,
+                );
+            }
+        }
+    }
+
+    loop {
+        let mut changed = false;
+        for (&source_id, entry) in files.iter() {
+            cancel.check()?;
+            for (member, site) in entry.facts.imported_member_uses() {
+                let value = resolve_imported_const_enum_value(
+                    source_id,
+                    site,
+                    &imports,
+                    &exports,
+                    &export_stars,
+                    files,
+                );
+                let slot = values
+                    .get_mut(&(source_id, member))
+                    .expect("every imported enum site has a scalar slot");
+                if matches!(slot, enum_plan::ImportedConstEnumValue::Pending)
+                    && !matches!(value, enum_plan::ImportedConstEnumValue::Pending)
+                {
+                    *slot = value;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            for value in values.values_mut() {
+                if matches!(value, enum_plan::ImportedConstEnumValue::Pending) {
+                    *value = enum_plan::ImportedConstEnumValue::Cycle;
+                }
+            }
+            break;
+        }
+        for (&source_id, entry) in files.iter_mut() {
+            cancel.check()?;
+            let imported_values: HashMap<_, _> = values
+                .iter()
+                .filter(|&(&(candidate_source, _), _)| candidate_source == source_id)
+                .map(|(&(_, node), value)| (node, value.clone()))
+                .collect();
+            let (facts, _) = enum_plan::build_with_imports_from_inventory(
+                &entry.inventory.view,
+                entry.inventory.source,
+                source_id,
+                entry.inventory.declarations,
+                entry.inventory.member_symbols,
+                entry.inventory.member_names,
+                entry.inventory.member_identifier_uses,
+                entry.inventory.local_member_targets,
+                entry.inventory.imported_member_uses,
+                entry.inventory.imported_member_targets,
+                &imported_values,
+            );
+            entry.facts = facts;
+        }
+    }
+    let mut by_source = BTreeMap::new();
+    for ((source, node), value) in values {
+        by_source
+            .entry(source)
+            .or_insert_with(HashMap::new)
+            .insert(node, value);
+    }
+    Ok(ResolvedProgramEnumScalars { by_source })
+}
+
 fn collect_imported_const_enum_facts(
     sources: &[Recovered<SourceFile>],
     edges: &[ResolvedModuleEdge],
@@ -1321,7 +1719,6 @@ fn collect_imported_const_enum_facts(
     let imports = collect_import_targets(sources, files, &edge_targets);
     let exports = collect_export_targets(sources, files, &edge_targets);
     let export_stars = collect_export_stars(sources, &edge_targets);
-
     let mut sites: Vec<_> = files
         .iter()
         .flat_map(|(&source, model)| {
@@ -1331,11 +1728,14 @@ fn collect_imported_const_enum_facts(
                 .map(move |(member, site)| (source, member, site.clone()))
         })
         .filter(|(source, _, site)| {
-            !matches!(site.base(), enum_plan::ImportedEnumMemberBase::Import(symbol) if matches!(imports.get(&(*source, symbol)), Some(ImportTarget::Namespace { .. })))
+            !matches!(
+                site.base(),
+                enum_plan::ImportedEnumMemberBase::Import(symbol)
+                    if matches!(imports.get(&(*source, symbol)), Some(ImportTarget::Namespace { .. }))
+            )
         })
         .collect();
     sites.sort_by_key(|(source, member, _)| (source.get(), member.get()));
-
     let mut values: BTreeMap<_, _> = sites
         .iter()
         .map(|(source, member, _)| {
@@ -1367,16 +1767,12 @@ fn collect_imported_const_enum_facts(
             }
         }
         if !changed {
-            let mut found_cycle = false;
             for value in values.values_mut() {
                 if matches!(value, enum_plan::ImportedConstEnumValue::Pending) {
                     *value = enum_plan::ImportedConstEnumValue::Cycle;
-                    found_cycle = true;
                 }
             }
-            if found_cycle {
-                rebuild_program_enum_facts(sources, files, &values, diagnostics);
-            }
+            rebuild_program_enum_facts(sources, files, &values, diagnostics);
             break;
         }
         rebuild_program_enum_facts(sources, files, &values, diagnostics);
@@ -1397,7 +1793,7 @@ fn collect_imported_const_enum_facts(
                 &exports,
                 &export_stars,
                 files,
-                &mut HashSet::new()
+                &mut HashSet::new(),
             ),
             ExportResolution::Const(_)
         ) {
@@ -1408,48 +1804,26 @@ fn collect_imported_const_enum_facts(
                 .elide_import_specifier(*specifier);
         }
     }
-
     for (source, member, site) in sites {
-        let is_const_enum_target = files
-            .get(&source)
-            .expect("every candidate source has a semantic model")
-            .enum_facts()
-            .is_imported_member_target(member)
-            && matches!(
-                resolve_imported_member_base(
-                    source,
-                    &site,
-                    &files
-                        .get(&source)
-                        .expect("every candidate source has a semantic model")
-                        .enum_facts()
-                        .imported_member_uses()
-                        .map(|(node, candidate)| (node, candidate.clone()))
-                        .collect(),
-                    &imports,
-                    &exports,
-                    &export_stars,
-                    files,
-                    &mut HashSet::new(),
-                ),
-                ImportedMemberBaseResolution::Export(ExportResolution::Const(_))
-            );
-        if is_const_enum_target {
-            files
-                .get_mut(&source)
-                .expect("every candidate source has a semantic model")
-                .enum_facts
-                .add_import_const_enum_member_target(member);
-        }
-        match values
+        let value = values
             .remove(&(source, member))
-            .expect("fixed point covers every imported member")
-        {
-            enum_plan::ImportedConstEnumValue::Constant(value) => files
-                .get_mut(&source)
-                .expect("candidate source has a semantic model")
-                .enum_facts
-                .add_import_const_use(member, value),
+            .expect("fixed point covers every imported member");
+        let is_const_enum = matches!(
+            &value,
+            enum_plan::ImportedConstEnumValue::Constant(_)
+                | enum_plan::ImportedConstEnumValue::Nonconstant
+                | enum_plan::ImportedConstEnumValue::Cycle,
+        );
+        let model = files
+            .get_mut(&source)
+            .expect("candidate source has a semantic model");
+        if is_const_enum && model.enum_facts.is_imported_member_target(member) {
+            model.enum_facts.add_import_const_enum_member_target(member);
+        }
+        match value {
+            enum_plan::ImportedConstEnumValue::Constant(value) => {
+                model.enum_facts.add_import_const_use(member, value);
+            }
             enum_plan::ImportedConstEnumValue::Nonconstant => {
                 diagnostics.push(imported_enum_error(
                     source,
@@ -1478,68 +1852,132 @@ fn collect_imported_const_enum_facts(
             )),
             enum_plan::ImportedConstEnumValue::NotConst => {}
             enum_plan::ImportedConstEnumValue::Pending => {
-                unreachable!("fixed point classifies every pending dependency")
+                unreachable!("fixed point classifies every imported dependency")
             }
         }
     }
 }
 
-fn resolve_imported_const_enum_value(
-    source: SourceId,
-    site: &enum_plan::ImportedEnumMemberUse,
-    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
-    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
-    export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, SemanticModel>,
-) -> enum_plan::ImportedConstEnumValue {
-    let candidates: HashMap<_, _> = files
-        .get(&source)
-        .expect("every candidate source has a semantic model")
-        .enum_facts()
-        .imported_member_uses()
-        .map(|(node, candidate)| (node, candidate.clone()))
+#[expect(
+    dead_code,
+    reason = "retained for the Main-owned atomic enum bootstrap cutover"
+)]
+fn publish_imported_const_enum_facts(
+    sources: &[Recovered<SourceFile>],
+    edges: &[ResolvedModuleEdge],
+    files: &mut BTreeMap<SourceId, SemanticModel>,
+    resolved: &ResolvedProgramEnumScalars,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let edge_targets: HashMap<_, _> = edges
+        .iter()
+        .map(|edge| ((edge.from, edge.specifier), edge.to))
         .collect();
-    match resolve_imported_member_base(
-        source,
-        site,
-        &candidates,
-        imports,
-        exports,
-        export_stars,
-        files,
-        &mut HashSet::new(),
-    ) {
-        ImportedMemberBaseResolution::Export(ExportResolution::Const(enum_id)) => files
-            .get(&enum_id.source)
-            .expect("resolved enum source has a semantic model")
-            .enum_facts()
-            .const_enum_members(enum_id.symbol)
-            .and_then(|members| members.member(site.name()))
-            .map_or(
-                enum_plan::ImportedConstEnumValue::Unresolved,
-                |member| match member {
-                    enum_plan::ConstEnumMember::Constant(value) => {
-                        enum_plan::ImportedConstEnumValue::Constant(value.clone())
+    let imports = collect_import_targets(sources, files, &edge_targets);
+    let exports = collect_export_targets(sources, files, &edge_targets);
+    let export_stars = collect_export_stars(sources, &edge_targets);
+    for (source, values) in &resolved.by_source {
+        let decisions: Vec<_> = files
+            .get(source)
+            .map(|model| {
+                model
+                    .enum_facts()
+                    .imported_member_uses()
+                    .filter_map(|(member, site)| {
+                        let value = values.get(&member)?.clone();
+                        let candidates: HashMap<_, _> = model
+                            .enum_facts()
+                            .imported_member_uses()
+                            .map(|(node, candidate)| (node, candidate.clone()))
+                            .collect();
+                        let is_const_enum_target = model
+                            .enum_facts()
+                            .is_imported_member_target(member)
+                            && matches!(
+                                resolve_imported_member_base(
+                                    *source,
+                                    site,
+                                    &candidates,
+                                    &imports,
+                                    &exports,
+                                    &export_stars,
+                                    files,
+                                    &mut HashSet::new(),
+                                ),
+                                ImportedMemberBaseResolution::Export(ExportResolution::Const(_),)
+                            );
+                        Some((member, site.clone(), value, is_const_enum_target))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (member, site, value, is_const_enum_target) in decisions {
+            if is_const_enum_target && let Some(model) = files.get_mut(source) {
+                model.enum_facts.add_import_const_enum_member_target(member);
+            }
+            match value {
+                enum_plan::ImportedConstEnumValue::Constant(value) => {
+                    if let Some(model) = files.get_mut(source) {
+                        model.enum_facts.add_import_const_use(member, value);
                     }
-                    enum_plan::ConstEnumMember::Nonconstant => {
-                        enum_plan::ImportedConstEnumValue::Nonconstant
-                    }
-                    enum_plan::ConstEnumMember::Pending => {
-                        enum_plan::ImportedConstEnumValue::Pending
-                    }
-                },
+                }
+                enum_plan::ImportedConstEnumValue::Nonconstant => {
+                    diagnostics.push(imported_enum_error(
+                        *source,
+                        IMPORTED_CONST_ENUM_NONCONSTANT,
+                        site.range(),
+                        "Imported const-enum member is not a constant.",
+                    ))
+                }
+                enum_plan::ImportedConstEnumValue::Unresolved => {
+                    diagnostics.push(imported_enum_error(
+                        *source,
+                        IMPORTED_CONST_ENUM_UNRESOLVED,
+                        site.range(),
+                        "Imported const-enum member could not be resolved.",
+                    ))
+                }
+                enum_plan::ImportedConstEnumValue::Ambiguous => {
+                    diagnostics.push(imported_enum_error(
+                        *source,
+                        IMPORTED_CONST_ENUM_AMBIGUOUS,
+                        site.range(),
+                        "Imported const-enum member is ambiguous.",
+                    ))
+                }
+                enum_plan::ImportedConstEnumValue::Cycle => diagnostics.push(imported_enum_error(
+                    *source,
+                    IMPORTED_CONST_ENUM_CYCLE,
+                    site.range(),
+                    "Imported const-enum dependency is cyclic.",
+                )),
+                enum_plan::ImportedConstEnumValue::NotConst
+                | enum_plan::ImportedConstEnumValue::Pending => {}
+            }
+        }
+    }
+    for ((source, _), target) in &imports {
+        let ImportTarget::Named {
+            specifier: Some(specifier),
+            ..
+        } = target
+        else {
+            continue;
+        };
+        if matches!(
+            resolve_import_target(
+                *source,
+                target,
+                &imports,
+                &exports,
+                &export_stars,
+                files,
+                &mut HashSet::new(),
             ),
-        ImportedMemberBaseResolution::Export(ExportResolution::NotConst)
-        | ImportedMemberBaseResolution::Export(ExportResolution::Namespace(_))
-        | ImportedMemberBaseResolution::Scalar => enum_plan::ImportedConstEnumValue::NotConst,
-        ImportedMemberBaseResolution::Export(ExportResolution::Unresolved) => {
-            enum_plan::ImportedConstEnumValue::Unresolved
-        }
-        ImportedMemberBaseResolution::Export(ExportResolution::Ambiguous) => {
-            enum_plan::ImportedConstEnumValue::Ambiguous
-        }
-        ImportedMemberBaseResolution::Export(ExportResolution::Cycle) => {
-            enum_plan::ImportedConstEnumValue::Cycle
+            ExportResolution::Const(_)
+        ) && let Some(model) = files.get_mut(source)
+        {
+            model.enum_facts.elide_import_specifier(*specifier);
         }
     }
 }
@@ -1555,14 +1993,13 @@ fn rebuild_program_enum_facts(
         let source_id = source.source_id();
         let imported_values: HashMap<_, _> = values
             .iter()
-            .filter(|&(&(candidate_source, _node), _value)| candidate_source == source_id)
-            .map(|(&(_candidate_source, node), value)| (node, value.clone()))
+            .filter(|&(&(candidate_source, _), _)| candidate_source == source_id)
+            .map(|(&(_, node), value)| (node, value.clone()))
             .collect();
         let model = files
             .get_mut(&source_id)
             .expect("every source has a semantic model");
-        let rebuilt_diagnostics = rebuild_file_enum_facts(source, model, &imported_values);
-        for diagnostic in rebuilt_diagnostics {
+        for diagnostic in rebuild_file_enum_facts(source, model, &imported_values) {
             let duplicate = diagnostics.iter().any(|existing| {
                 existing.source_id() == diagnostic.source_id()
                     && existing.range() == diagnostic.range()
@@ -1648,6 +2085,65 @@ fn collect_enum_rebuild_bindings<'src>(
             collect_enum_rebuild_bindings(inner, model, ambient, bindings);
         }
         _ => {}
+    }
+}
+fn resolve_imported_const_enum_value<S: EnumSourceRead>(
+    source: SourceId,
+    site: &enum_plan::ImportedEnumMemberUse,
+    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
+    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
+    export_stars: &ExportStars,
+    files: &BTreeMap<SourceId, S>,
+) -> enum_plan::ImportedConstEnumValue {
+    let candidates: HashMap<_, _> = files
+        .get(&source)
+        .expect("every candidate source has an enum source")
+        .enum_facts()
+        .imported_member_uses()
+        .map(|(node, candidate)| (node, candidate.clone()))
+        .collect();
+    match resolve_imported_member_base(
+        source,
+        site,
+        &candidates,
+        imports,
+        exports,
+        export_stars,
+        files,
+        &mut HashSet::new(),
+    ) {
+        ImportedMemberBaseResolution::Export(ExportResolution::Const(enum_id)) => files
+            .get(&enum_id.source)
+            .expect("resolved enum source has a semantic model")
+            .enum_facts()
+            .const_enum_members(enum_id.symbol)
+            .and_then(|members| members.member(site.name()))
+            .map_or(
+                enum_plan::ImportedConstEnumValue::Unresolved,
+                |member| match member {
+                    enum_plan::ConstEnumMember::Constant(value) => {
+                        enum_plan::ImportedConstEnumValue::Constant(value.clone())
+                    }
+                    enum_plan::ConstEnumMember::Nonconstant => {
+                        enum_plan::ImportedConstEnumValue::Nonconstant
+                    }
+                    enum_plan::ConstEnumMember::Pending => {
+                        enum_plan::ImportedConstEnumValue::Pending
+                    }
+                },
+            ),
+        ImportedMemberBaseResolution::Export(ExportResolution::NotConst)
+        | ImportedMemberBaseResolution::Export(ExportResolution::Namespace(_))
+        | ImportedMemberBaseResolution::Scalar => enum_plan::ImportedConstEnumValue::NotConst,
+        ImportedMemberBaseResolution::Export(ExportResolution::Unresolved) => {
+            enum_plan::ImportedConstEnumValue::Unresolved
+        }
+        ImportedMemberBaseResolution::Export(ExportResolution::Ambiguous) => {
+            enum_plan::ImportedConstEnumValue::Ambiguous
+        }
+        ImportedMemberBaseResolution::Export(ExportResolution::Cycle) => {
+            enum_plan::ImportedConstEnumValue::Cycle
+        }
     }
 }
 
@@ -1906,14 +2402,14 @@ fn collect_export_stars(
     clippy::too_many_arguments,
     reason = "imported member base resolution threads the shared import/export lookup tables"
 )]
-fn resolve_imported_member_base(
+fn resolve_imported_member_base<S: EnumSourceRead>(
     source: SourceId,
     site: &enum_plan::ImportedEnumMemberUse,
     candidates: &HashMap<NodeId, enum_plan::ImportedEnumMemberUse>,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, SemanticModel>,
+    files: &BTreeMap<SourceId, S>,
     visited: &mut HashSet<(SourceId, EcmaString)>,
 ) -> ImportedMemberBaseResolution {
     match site.base() {
@@ -1955,14 +2451,14 @@ fn resolve_imported_member_base(
     clippy::too_many_arguments,
     reason = "imported member result resolution threads the shared import/export lookup tables"
 )]
-fn resolve_imported_member_result(
+fn resolve_imported_member_result<S: EnumSourceRead>(
     source: SourceId,
     site: &enum_plan::ImportedEnumMemberUse,
     candidates: &HashMap<NodeId, enum_plan::ImportedEnumMemberUse>,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, SemanticModel>,
+    files: &BTreeMap<SourceId, S>,
     visited: &mut HashSet<(SourceId, EcmaString)>,
 ) -> ImportedMemberBaseResolution {
     match resolve_imported_member_base(
@@ -1996,25 +2492,25 @@ fn resolve_imported_member_result(
     }
 }
 
-fn resolve_import_target(
+fn resolve_import_target<S: EnumSourceRead>(
     _source: SourceId,
     target: &ImportTarget,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, SemanticModel>,
+    files: &BTreeMap<SourceId, S>,
     visited: &mut HashSet<(SourceId, EcmaString)>,
 ) -> ExportResolution {
     resolve_import_target_candidates(target, imports, exports, export_stars, files, visited)
         .into_resolution()
 }
 
-fn resolve_import_target_candidates(
+fn resolve_import_target_candidates<S: EnumSourceRead>(
     target: &ImportTarget,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, SemanticModel>,
+    files: &BTreeMap<SourceId, S>,
     visited: &mut HashSet<(SourceId, EcmaString)>,
 ) -> ExportResolutionSet {
     match target {
@@ -2033,26 +2529,26 @@ fn resolve_import_target_candidates(
     }
 }
 
-fn resolve_export(
+fn resolve_export<S: EnumSourceRead>(
     source: SourceId,
     name: &EcmaString,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, SemanticModel>,
+    files: &BTreeMap<SourceId, S>,
     visited: &mut HashSet<(SourceId, EcmaString)>,
 ) -> ExportResolution {
     resolve_export_candidates(source, name, imports, exports, export_stars, files, visited)
         .into_resolution()
 }
 
-fn resolve_export_candidates(
+fn resolve_export_candidates<S: EnumSourceRead>(
     source: SourceId,
     name: &EcmaString,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, SemanticModel>,
+    files: &BTreeMap<SourceId, S>,
     visited: &mut HashSet<(SourceId, EcmaString)>,
 ) -> ExportResolutionSet {
     let key = (source, name.clone());
@@ -2101,13 +2597,13 @@ fn resolve_export_candidates(
     result
 }
 
-fn resolve_exported_symbol_candidates(
+fn resolve_exported_symbol_candidates<S: EnumSourceRead>(
     source: SourceId,
     symbol: SymbolId,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, SemanticModel>,
+    files: &BTreeMap<SourceId, S>,
     visited: &mut HashSet<(SourceId, EcmaString)>,
 ) -> ExportResolutionSet {
     let Some(model) = files.get(&source) else {
@@ -2120,8 +2616,8 @@ fn resolve_exported_symbol_candidates(
         }));
     }
     let value = ExportCandidate::Value(LinkedExport { source, symbol });
-    match model.symbol(symbol).kind() {
-        SymbolKind::Import => {
+    match model.symbol_kind(symbol) {
+        Some(SymbolKind::Import) => {
             imports
                 .get(&(source, symbol))
                 .map_or_else(ExportResolutionSet::default, |target| {
@@ -2135,10 +2631,10 @@ fn resolve_exported_symbol_candidates(
                     )
                 })
         }
-        _ => ExportResolutionSet::candidate(value),
+        Some(_) => ExportResolutionSet::candidate(value),
+        None => ExportResolutionSet::default(),
     }
 }
-
 fn lookup_identifier(
     model: &SemanticModel,
     source: &SourceFile,
@@ -4450,27 +4946,21 @@ function check(options: Options = {}) {
 
     #[test]
     fn import_equals_chases_aliases_for_qualified_type_members() {
-        let result = check_text(
-            "namespace A { export namespace B { export interface T { value: number } } }              import X = A.B; type U = X.T; let value: U;",
+        let accepted = check_text(
+            "namespace A { export namespace B { export interface T { value: number } } } \
+             import X = A.B; type U = X.T; const accepted: U = { value: 1 };",
         );
         assert!(
-            checker_codes(&result).is_empty(),
+            checker_codes(&accepted).is_empty(),
             "{:?}",
-            checker_codes(&result)
+            accepted.diagnostics()
         );
-        let model = result.product();
-        let value_symbol = model
-            .lookup_value(model.module_scope(), "value")
-            .expect("value is bound");
-        assert_ne!(model.symbol_type(value_symbol), model.types().error_type());
-        assert!(matches!(
-            model.types().get(model.symbol_type(value_symbol)),
-            Type::ObjectType(object)
-                if object
-                    .properties
-                    .iter()
-                    .any(|property| property.name() == "value")
-        ));
+
+        let rejected = check_text(
+            "namespace A { export namespace B { export interface T { value: number } } } \
+             import X = A.B; type U = X.T; const rejected: U = { value: \"wrong\" };",
+        );
+        assert_eq!(checker_codes(&rejected), [TYPE_NOT_ASSIGNABLE.as_str()]);
     }
 
     #[test]
@@ -10334,7 +10824,11 @@ class B extends A {
              declare function input(): Input;\
              const declaredUnion: Input = infer(input());\
              const widened = infer(1);\
+             const widenedStr = infer('x');\
              const exact: 'x' = preserve('x');\
+             const preserved = preserve('x');\
+             let mutableNum = infer(1);\
+             let mutableStr = infer('x');\
              class Box<T> {\
                readonly kind = 'box';\
                readonly value: T;\
@@ -10342,20 +10836,54 @@ class B extends A {
              }\
              function make<T>(value: T): { readonly kind: 'box'; readonly value: T } {\
                return new Box(value);\
-             }",
+             }\
+             const madeNum = make(1);\
+             const boxNum = new Box(1);",
         );
         assert!(
             checker_codes(&result).is_empty(),
             "{:?}",
             result.diagnostics()
         );
-        let widened = result
-            .product()
-            .lookup_value(result.product().module_scope(), "widened")
-            .expect("widened binding exists");
+        assert_interface_binding_types(
+            result.product(),
+            &[
+                ("widened", "1"),
+                ("widenedStr", "\"x\""),
+                ("preserved", "\"x\""),
+                ("exact", "\"x\""),
+                ("declaredUnion", "Input"),
+                ("mutableNum", "number"),
+                ("mutableStr", "string"),
+                (
+                    "madeNum",
+                    "{ readonly kind: \"box\"; readonly value: number; }",
+                ),
+                ("boxNum", "Box<number>"),
+            ],
+        );
+    }
+
+    #[test]
+    fn generic_array_literals_retain_declared_union_elements() {
+        let result = check_text(
+            "type Input = 'object' | 'array' | 'string';\
+             declare function dedup<T>(values: T[]): T[];\
+             declare function getIn(): Input;\
+             declare const x: Input;\
+             declare const arr: Input[];\
+             const fromVariable: Input[] = dedup([x]);\
+             const fromCall: Input[] = dedup([getIn()]);\
+             const fromAssertion: Input[] = dedup([x as Input]);\
+             const fromSpread: Input[] = dedup([...arr]);\
+             const freshLiterals: string[] = dedup(['object', 'array']);\
+             const foreignLiteral: Input[] = dedup(['object', 'not-an-input']);",
+        );
         assert_eq!(
-            result.product().symbol_type(widened),
-            result.product().types().number()
+            checker_codes(&result),
+            ["BAMTS-C004"],
+            "{:?}",
+            result.diagnostics()
         );
     }
 
@@ -10984,6 +11512,599 @@ class B extends A {
         assert!(checker_codes(&result).is_empty());
     }
 
+    fn assert_interface_binding_types(model: &super::SemanticModel, expected: &[(&str, &str)]) {
+        for &(name, rendered) in expected {
+            let symbol = model.lookup_value(model.module_scope(), name).expect(name);
+            assert_eq!(
+                super::render_type(model, model.symbol_type(symbol)),
+                rendered,
+                "binding {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_interface_publication_projects_only_the_member_read() {
+        let text = "interface I {
+            a: number; d?: number; h: any; i: never;
+            q: number | undefined; m?: ((x: string) => number);
+            nil: null; undef: undefined; both: null | undefined;
+            nested: () => number | undefined;
+        }";
+        for strict in [false, true] {
+            let checked = check_text_with(
+                text,
+                ProgramCheckOptions::standard().with_strict_null_checks(strict),
+            );
+            assert!(
+                checker_codes_of(&checked).is_empty(),
+                "{:?}",
+                checked.diagnostics()
+            );
+            let model = checked
+                .product()
+                .file(SourceId::new(0))
+                .expect("source model");
+            let expected = if strict {
+                [
+                    "number",
+                    "number | undefined",
+                    "any",
+                    "never",
+                    "number | undefined",
+                    "((x: string) => number) | undefined",
+                    "null",
+                    "undefined",
+                    "null | undefined",
+                    "() => number | undefined",
+                ]
+            } else {
+                [
+                    "number",
+                    "number",
+                    "any",
+                    "never",
+                    "number",
+                    "(x: string) => number",
+                    "null",
+                    "undefined",
+                    "null",
+                    "() => number | undefined",
+                ]
+            };
+            let actual: Vec<_> = model
+                .declaration_occurrences()
+                .iter()
+                .map(|occurrence| super::render_type(model, model.symbol_type(occurrence.symbol)))
+                .collect();
+            assert_eq!(actual, expected, "strictNullChecks={strict}");
+        }
+    }
+
+    #[test]
+    fn canonical_interface_first_property_wins_even_when_any() {
+        let checked = check_text(
+            "interface I2 { item: any; item: number; }
+             interface A { x: string } interface A { x: number }",
+        );
+        let model = checked.product();
+        let occurrences = model.declaration_occurrences();
+        let [first, repeated, early, late] = occurrences else {
+            panic!("four property declarations: {occurrences:?}");
+        };
+        assert_eq!(first.symbol, repeated.symbol);
+        assert_eq!(early.symbol, late.symbol);
+        assert_ne!(first.symbol, early.symbol);
+        for (occurrence, expected) in occurrences.iter().zip(["any", "any", "string", "string"]) {
+            assert_eq!(
+                super::render_type(model, model.symbol_type(occurrence.symbol)),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_interface_parameters_publish_distinct_resolved_types() {
+        let checked = check_text(
+            "interface I {
+                a(s: string): void; b(): (n: number) => void;
+                f(x: number): number; f(x: string): string;
+            }
+            interface Index { [key: string]: number; }",
+        );
+        let model = checked.product();
+        let mut parameters: Vec<_> = model
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.kind() == SymbolKind::Parameter)
+            .collect();
+        parameters.sort_by_key(|symbol| symbol.range().start());
+        let actual: Vec<_> = parameters
+            .iter()
+            .map(|symbol| {
+                let id = model
+                    .lookup_value(symbol.scope(), symbol.name())
+                    .expect("parameter symbol");
+                (
+                    symbol.name(),
+                    super::render_type(model, model.symbol_type(id)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                ("s", "string".to_owned()),
+                ("n", "number".to_owned()),
+                ("x", "number".to_owned()),
+                ("x", "string".to_owned()),
+                ("key", "string".to_owned()),
+            ]
+        );
+        let identities: std::collections::HashSet<_> = parameters
+            .iter()
+            .map(|symbol| {
+                model
+                    .lookup_value(symbol.scope(), symbol.name())
+                    .expect("parameter")
+            })
+            .collect();
+        assert_eq!(identities.len(), parameters.len());
+    }
+
+    #[test]
+    fn canonical_interface_fragments_publish_complete_groups_and_exact_spans() {
+        let text = "interface A { f(x: string): 1; f(x: number): 2; }\n\
+                    interface A { f(x: string): 3; }\n\
+                    declare const a: A; const g = a.f;\n\
+                    const directString = a.f(\"s\"); const directNumber = a.f(0);\n\
+                    const extractedString = g(\"s\"); const extractedNumber = g(0);";
+        let checked = check_text(text);
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{:?}",
+            checked.diagnostics()
+        );
+        let model = checked.product();
+        let occurrences = model.declaration_occurrences();
+        let [first, second, third] = occurrences else {
+            panic!("three written method declarations: {occurrences:?}");
+        };
+        assert_eq!(first.symbol, second.symbol);
+        assert_eq!(first.symbol, third.symbol);
+        let source_text = source(text);
+        for (occurrence, (declaration, name)) in occurrences.iter().zip([
+            ("f(x: string): 1", "f"),
+            ("f(x: number): 2", "f"),
+            ("f(x: string): 3", "f"),
+        ]) {
+            let byte_start = text.find(declaration).expect("declaration text");
+            let start = source_text.byte_to_utf16(byte_start).expect("UTF-16 start");
+            let end = source_text
+                .byte_to_utf16(byte_start + declaration.len())
+                .expect("UTF-16 end");
+            let name_end = source_text
+                .byte_to_utf16(byte_start + name.len())
+                .expect("UTF-16 name end");
+            assert_eq!(
+                occurrence.declaration_range,
+                source_text.range(start, end).expect("member range")
+            );
+            assert_eq!(
+                occurrence.name_range,
+                source_text.range(start, name_end).expect("name range")
+            );
+            assert_eq!(
+                super::render_type(model, model.symbol_type(occurrence.symbol)),
+                "{ (x: string): 1; (x: number): 2; (x: string): 3; }"
+            );
+        }
+        assert_interface_binding_types(
+            model,
+            &[
+                ("g", "{ (x: string): 1; (x: number): 2; (x: string): 3; }"),
+                ("directString", "3"),
+                ("directNumber", "2"),
+                ("extractedString", "3"),
+                ("extractedNumber", "2"),
+            ],
+        );
+    }
+
+    #[test]
+    fn canonical_interface_return_projection_keeps_written_provenance() {
+        let text = "type NrMaybe = number | undefined;
+            interface Returns {
+                plain(x: string): number; maybe(x: string): number | undefined;
+                nil(): null; undef(): undefined; both(): null | undefined;
+                numNull(): number | null; all(): number | null | undefined;
+                alias(): NrMaybe; make(): () => number | undefined;
+            }
+            declare const r: Returns;
+            const plain = r.plain; const maybe = r.maybe;
+            const plainResult = plain('s'); const maybeResult = maybe('s');
+            const nil = r.nil(); const undef = r.undef(); const both = r.both();
+            const numNull = r.numNull(); const all = r.all();
+            const alias = r.alias; const aliasResult = alias();
+            const outer = r.make(); const inner = outer();";
+        for strict in [false, true] {
+            let checked = check_text_with(
+                text,
+                ProgramCheckOptions::standard().with_strict_null_checks(strict),
+            );
+            assert!(
+                checker_codes_of(&checked).is_empty(),
+                "{:?}",
+                checked.diagnostics()
+            );
+            let model = checked
+                .product()
+                .file(SourceId::new(0))
+                .expect("source model");
+            assert_interface_binding_types(
+                model,
+                &[
+                    ("plain", "(x: string) => number"),
+                    ("maybe", "(x: string) => number | undefined"),
+                    ("plainResult", "number"),
+                    (
+                        "maybeResult",
+                        if strict {
+                            "number | undefined"
+                        } else {
+                            "number"
+                        },
+                    ),
+                    ("nil", "null"),
+                    ("undef", "undefined"),
+                    ("both", if strict { "null | undefined" } else { "null" }),
+                    ("numNull", if strict { "number | null" } else { "number" }),
+                    (
+                        "all",
+                        if strict {
+                            "number | null | undefined"
+                        } else {
+                            "number"
+                        },
+                    ),
+                    ("alias", "() => NrMaybe"),
+                    ("aliasResult", if strict { "NrMaybe" } else { "number" }),
+                    ("outer", "() => number | undefined"),
+                    (
+                        "inner",
+                        if strict {
+                            "number | undefined"
+                        } else {
+                            "number"
+                        },
+                    ),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_interface_provenance_survives_import_and_instantiation() {
+        let checked = linked(
+            &[
+                "export interface Plain<T> { n(x: T): number; }
+             export interface Maybe<T> { n(x: T): number | undefined; }",
+                "import { Plain, Maybe } from './types';
+             declare const p: Plain<string>; declare const m: Maybe<string>;
+             const pn = p.n; const mn = m.n;
+             const pr = pn('s'); const mr = mn('s');",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            checker_codes_of(&checked).is_empty(),
+            "{:?}",
+            checked.diagnostics()
+        );
+        let model = checked
+            .product()
+            .file(SourceId::new(1))
+            .expect("importing model");
+        assert_interface_binding_types(
+            model,
+            &[
+                ("pn", "(x: string) => number"),
+                ("mn", "(x: string) => number | undefined"),
+                ("pr", "number"),
+                ("mr", "number"),
+            ],
+        );
+    }
+
+    #[test]
+    fn canonical_interface_literal_priority_is_existential_and_excludes_unions() {
+        let checked = check_text(
+            "interface P { q(x: 's', y: number): 1 }
+             interface P { q(x: string, y: number): 2; q(x: string, y: string): 3 }
+             declare const p: P; const e = p.q;
+             const p1 = p.q('s', 0); const p2 = p.q('s', 's');
+             const e1 = e('s', 0); const e2 = e('s', 's');
+             interface W { f(x:'s'):1; f(x:'a'|'b'):2; f(x:0):3; }
+             interface W { f(x:string):4; f(x:number):5; }
+             interface W { b(x:true):6; i(x:0n):7; }
+             interface W { b(x:boolean):8; i(x:bigint):9; }
+             declare const w: W; const f = w.f; const b = w.b; const i = w.i;
+             const r1 = w.f('s'); const r2 = w.f('a'); const r3 = w.f('b');
+             const r4 = w.f('z'); const r5 = w.f(0);
+             const r6 = f('s'); const r7 = f('a'); const r8 = f('b');
+             const r9 = f('z'); const r10 = f(0);
+             const b1 = w.b(true); const b2 = w.b(false);
+             const i1 = w.i(0n); const i2 = w.i(1n);
+             const eb1 = b(true); const eb2 = b(false);
+             const ei1 = i(0n); const ei2 = i(1n);",
+        );
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{:?}",
+            checked.diagnostics()
+        );
+        assert_interface_binding_types(
+            checked.product(),
+            &[
+                ("p1", "1"),
+                ("p2", "3"),
+                ("e1", "1"),
+                ("e2", "3"),
+                ("r1", "1"),
+                ("r2", "4"),
+                ("r3", "4"),
+                ("r4", "4"),
+                ("r5", "3"),
+                ("r6", "1"),
+                ("r7", "4"),
+                ("r8", "4"),
+                ("r9", "4"),
+                ("r10", "3"),
+                ("b1", "6"),
+                ("b2", "8"),
+                ("i1", "7"),
+                ("i2", "9"),
+                ("eb1", "6"),
+                ("eb2", "8"),
+                ("ei1", "7"),
+                ("ei2", "9"),
+            ],
+        );
+    }
+
+    #[test]
+    fn canonical_interface_repeated_signatures_keep_labels_and_source_order() {
+        let checked = check_text(
+            "interface R { m(x: number): number; m(x: number): number; }
+             interface R { m(x: number): number; }
+             interface S { m(a: string): string; m(b: string): string; }
+             interface S { m(c: string): string; }
+             interface T { m(a: string): 1; m(b: string): 2; }
+             declare const r: R; declare const s: S; declare const t: T;
+             const er = r.m; const es = s.m; const et = t.m;
+             const rr = er(1); const sr = es('x'); const tr = t.m('x'); const te = et('x');",
+        );
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{:?}",
+            checked.diagnostics()
+        );
+        assert_interface_binding_types(
+            checked.product(),
+            &[
+                (
+                    "er",
+                    "{ (x: number): number; (x: number): number; (x: number): number; }",
+                ),
+                (
+                    "es",
+                    "{ (a: string): string; (b: string): string; (c: string): string; }",
+                ),
+                ("et", "{ (a: string): 1; (b: string): 2; }"),
+                ("rr", "number"),
+                ("sr", "string"),
+                ("tr", "1"),
+                ("te", "1"),
+            ],
+        );
+    }
+
+    #[test]
+    fn canonical_interface_generic_groups_keep_instantiation_and_shadowing() {
+        let checked = check_text(
+            "interface B<T> { foo(x: T): number; foo(x: string): string; }
+             interface B<T> { foo(x: T): Date; foo(x: Date): string; }
+             interface C<T, U> { foo(x: T, y: U): string; foo(x: string, y: string): number; }
+             interface C<T, U> { foo<W>(x: W, y: W): W; }
+             interface G<T> { m(x: T): T; }
+             interface G<T> { n(x: T): T; m<T>(x: T): T; }
+             declare const b: B<boolean>; declare const c: C<number, number>;
+             declare const g: G<string>;
+             const eb = b.foo; const ec = c.foo; const eg = g.m;
+             const br = b.foo(true); const ber = eb(true);
+             const cr = c.foo(1, 2); const cer = ec(1, 2);
+             const gm = g.m('s'); const gn = g.n('s');
+             const ge = eg('s'); const gen = eg(0);",
+        );
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{:?}",
+            checked.diagnostics()
+        );
+        assert_interface_binding_types(
+            checked.product(),
+            &[
+                ("br", "Date"),
+                ("ber", "Date"),
+                ("cr", "1 | 2"),
+                ("cer", "1 | 2"),
+                ("gm", "\"s\""),
+                ("gn", "string"),
+                ("ge", "\"s\""),
+                ("gen", "0"),
+            ],
+        );
+    }
+
+    #[test]
+    fn canonical_interface_optional_calls_and_reads_follow_null_mode() {
+        let text = "interface O { m?(x: string): 1; m?(x: number): 2; }
+            interface O { m?(x: boolean): 3; }
+            declare const o: O; const extracted = o.m;
+            const r1 = o.m?.('s'); const r2 = o.m?.(0); const r3 = o.m?.(true);
+            const e1 = extracted?.('s'); const e2 = extracted?.(0); const e3 = extracted?.(true);
+            interface Opt { maybe?(flag: boolean): number | undefined; }
+            declare const opt: Opt; const returned = opt.maybe?.(true);";
+        for strict in [false, true] {
+            let checked = check_text_with(
+                text,
+                ProgramCheckOptions::standard().with_strict_null_checks(strict),
+            );
+            assert!(
+                checker_codes_of(&checked).is_empty(),
+                "{:?}",
+                checked.diagnostics()
+            );
+            let model = checked.product().file(SourceId::new(0)).expect("model");
+            assert_interface_binding_types(
+                model,
+                &[
+                    (
+                        "extracted",
+                        if strict {
+                            "{ (x: string): 1; (x: number): 2; (x: boolean): 3; } | undefined"
+                        } else {
+                            "{ (x: string): 1; (x: number): 2; (x: boolean): 3; }"
+                        },
+                    ),
+                    ("r1", if strict { "1 | undefined" } else { "1" }),
+                    ("r2", if strict { "2 | undefined" } else { "2" }),
+                    ("r3", if strict { "3 | undefined" } else { "3" }),
+                    ("e1", if strict { "1 | undefined" } else { "1" }),
+                    ("e2", if strict { "2 | undefined" } else { "2" }),
+                    ("e3", if strict { "3 | undefined" } else { "3" }),
+                    (
+                        "returned",
+                        if strict {
+                            "number | undefined"
+                        } else {
+                            "number"
+                        },
+                    ),
+                ],
+            );
+            let unguarded = check_text_with(
+                "interface O { m?(x: string): 1; m?(x: number): 2; }
+                 declare const o: O; o.m('s'); const e = o.m; e('s');",
+                ProgramCheckOptions::standard().with_strict_null_checks(strict),
+            );
+            assert_eq!(
+                checker_codes_of(&unguarded),
+                if strict {
+                    vec![EXPRESSION_NOT_CALLABLE.as_str().to_owned(); 2]
+                } else {
+                    Vec::new()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_interface_call_and_intersection_consumers_keep_group_order() {
+        let checked = check_text(
+            "interface A { f(x: string): 1; f(x: number): 2; }
+             interface A { f(x: string): 3; }
+             declare const a: A; const e = a.f;
+             const c1 = a.f.call(a, 's'); const c2 = a.f.call(a, 0);
+             const c3 = e.call(a, 's'); const c4 = e.call(a, 0);
+             declare const plain: (x: number) => number;
+             const cp = plain.call(null, 1);
+             declare const intersection: ((x: number) => number) & ((x: string) => string);
+             const ci = intersection.call(null, 's');
+             const ir = intersection(0); const is = intersection('s');
+             declare const combined: A['f'] & ((x: boolean) => 4);
+             const extracted = combined;
+             const g1 = combined('s'); const g2 = extracted('s'); const g3 = extracted(true);",
+        );
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{:?}",
+            checked.diagnostics()
+        );
+        assert_interface_binding_types(
+            checked.product(),
+            &[
+                ("c1", "3"),
+                ("c2", "2"),
+                ("c3", "3"),
+                ("c4", "2"),
+                ("cp", "number"),
+                ("ci", "string"),
+                ("ir", "number"),
+                ("is", "string"),
+                (
+                    "intersection",
+                    "((x: number) => number) & ((x: string) => string)",
+                ),
+                ("g1", "3"),
+                ("g2", "3"),
+                ("g3", "4"),
+            ],
+        );
+    }
+
+    #[test]
+    fn canonical_interface_class_and_interface_level_signatures_remain_independent() {
+        let checked = check_text(
+            "declare class C { m(x: string): 2; m(x: 's'): 1; }
+             declare const c: C; const cm = c.m; const cr = c.m('s'); const ce = cm('s');
+             interface Base { (x: number): string; new(x: number): C; [key: string]: any; }
+             interface Derived extends Base { own: boolean; }
+             declare const d: Derived;
+             const call = d(1); const made = new d(1); const indexed = d['other'];
+             const own = d.own;",
+        );
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{:?}",
+            checked.diagnostics()
+        );
+        assert_interface_binding_types(
+            checked.product(),
+            &[
+                ("cm", "{ (x: string): 2; (x: \"s\"): 1; }"),
+                ("cr", "2"),
+                ("ce", "2"),
+                ("call", "string"),
+                ("made", "C"),
+                ("indexed", "any"),
+                ("own", "boolean"),
+            ],
+        );
+    }
+
+    #[test]
+    fn canonical_interface_contextual_overloads_constrain_method_inference() {
+        let checked = check_text(
+            "interface Target { m(x: string): string; }
+             interface Target { m(x: number): number; }
+             const target: Target = { m(x) { return x; } };
+             const a: string = target.m('s'); const b: number = target.m(1);",
+        );
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{:?}",
+            checked.diagnostics()
+        );
+        assert_interface_binding_types(checked.product(), &[("a", "string"), ("b", "number")]);
+        let invalid = check_text(
+            "interface Target { m(x: string): string; }
+             interface Target { m(x: number): number; }
+             const target: Target = { m(x) { return true; } };",
+        );
+        assert_eq!(checker_codes(&invalid), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
     #[test]
     fn interface_call_signatures_drive_argument_and_return_types() {
         let valid = check_text(
@@ -11124,13 +12245,6 @@ class B extends A {
         );
         assert!(checker_codes(&result).is_empty());
         let model = result.product();
-        let list = model
-            .lookup_value(model.module_scope(), "list")
-            .expect("list binding exists");
-        let Type::Array(list_element) = model.types().get(model.symbol_type(list)) else {
-            panic!("list is an array");
-        };
-        assert!(matches!(model.types().get(*list_element), Type::Union(_)));
         let fresh_list = model
             .lookup_value(model.module_scope(), "freshList")
             .expect("fresh list binding exists");
@@ -11138,6 +12252,13 @@ class B extends A {
             panic!("fresh list is an array");
         };
         assert_eq!(*fresh_element, model.types().string());
+
+        let rejected = check_text(
+            "type Mode = 'strict' | 'loose';\
+             declare const list: Mode[];\
+             list[0] = 'invalid';",
+        );
+        assert_eq!(checker_codes(&rejected), [TYPE_NOT_ASSIGNABLE.as_str()]);
     }
 
     #[test]

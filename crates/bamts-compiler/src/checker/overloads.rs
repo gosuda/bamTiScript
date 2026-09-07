@@ -409,14 +409,13 @@ fn inferred_substitution(
         let parameter = signature
             .parameter_at(index)
             .expect("arity validation guarantees a parameter");
-        inference.mark_fresh_literal_source(index as u32);
         inference.infer_from_argument(parameter.type_id, argument.type_id, index as u32);
     }
     if let Some(contextual_return) = call.contextual_return {
         inference.infer_from_argument(signature.return_type, contextual_return, u32::MAX);
     }
     let mut inferred = inference.resolve();
-    inferred.widen_unconstrained_literals(table, &signature.type_parameters);
+    inferred.widen_unconstrained_literals(table, &signature.type_parameters, signature.return_type);
     Ok(inferred
         .arguments()
         .iter()

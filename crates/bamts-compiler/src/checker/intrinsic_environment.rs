@@ -355,6 +355,14 @@ impl GlobalEnvironment {
         }
     }
 
+    /// Returns `true` when `lib` is in the active lib set. Intrinsic
+    /// refinements declared by a later `lib.*.d.ts` (for example the
+    /// `es2015.core` `DateConstructor` overload) gate on this.
+    #[must_use]
+    pub(crate) fn has_lib(&self, lib: Lib) -> bool {
+        self.libs.contains(lib)
+    }
+
     /// Names for which tsc emits TS2583 ("Cannot find name X. Do you need
     /// to change your target library?") instead of the generic TS2304 when
     /// the name is a known global absent from the active lib set. This is a
