@@ -1187,17 +1187,15 @@ fn select_jsx_factory_signature(
     binder: &mut Binder<'_>,
 ) -> Option<(Option<TypeId>, TypeId)> {
     let mut fallback = None;
-    let mut first = None;
+    let mut first: Option<&FunctionSignature> = None;
     for signature in signatures {
         // Arity precedes instantiation: call_arity counts tuple-rest minimums
         // the way an ordinary call does, while arity() stops at the rest
         // parameter and would admit tuple-rest factories JSX cannot satisfy
-        // with its single props argument. Arity-invalid candidates never pay
-        // for an inference session.
+        // with its single props argument. An arity-invalid candidate is only
+        // instantiated when it turns out to be the sole recovery candidate.
         if signature.call_arity(&binder.types).0 > 1 {
-            if first.is_none() {
-                first = Some(instantiate_jsx_factory_signature(binder, signature, props));
-            }
+            first.get_or_insert(signature);
             continue;
         }
         let (target, result) = instantiate_jsx_factory_signature(binder, signature, props);
@@ -1210,7 +1208,9 @@ fn select_jsx_factory_signature(
         }
         fallback.get_or_insert((target, result));
     }
-    fallback.or(first)
+    fallback.or_else(|| {
+        first.map(|signature| instantiate_jsx_factory_signature(binder, signature, props))
+    })
 }
 
 /// Instantiates one candidate signature's first-parameter target and return
