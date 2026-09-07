@@ -49,8 +49,8 @@
 
 use super::binder::{
     Binder, DemandPoll, DemandResult, FunctionParameter, FunctionSignature, IndexSignature,
-    ObjectType, PropertyType, PublicationOrder, ScopeId, SlotContext, SymbolId, Type, TypeId,
-    demand_ready,
+    ObjectType, PropertyType, PublicationOrder, ScopeId, SlotContext, SymbolId, SymbolKind, Type,
+    TypeId, demand_ready,
 };
 use super::inference::{InferenceContext, InferenceParameter};
 use super::{
@@ -133,15 +133,32 @@ impl JsxElementOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum JsxDegradation {
     /// The tag name (or a dotted member step) did not resolve to a value.
-    /// The underlying reference completion — not JSX — accounts for any
-    /// "cannot find name" diagnostic.
-    TagUnresolved,
+    /// The check phase republishes this as the "cannot find name"
+    /// diagnostic: anchored at `anchor` when a resolvable root's dotted
+    /// member step failed (the failed member's own span), otherwise at the
+    /// whole tag span for an unresolvable root or namespaced tag.
+    TagUnresolved { anchor: Option<TextRange> },
     /// The tag resolved to a value type with no call signatures.
     NotCallable,
     /// The tag resolved to an opaque (`any`/`unknown`/`error`) type, or to
     /// no ambient `JSX.IntrinsicElements` at all: there is nothing to check
     /// against, so the type itself is the unchecked target.
     OpaqueCallee,
+}
+
+/// The outcome of resolving a value-based JSX tag name to its value-plane
+/// callee: the tag symbol when one is directly reachable through lexical
+/// resolution (used for [`Self::signature_group`]) and its value type, or
+/// which name step failed to resolve and where that step sits.
+enum JsxTagCalleeResolution {
+    /// The tag resolved to a value.
+    Resolved(Option<SymbolId>, TypeId),
+    /// The tag's root identifier (or the whole namespaced form) never
+    /// resolved as a value; the whole tag span anchors the diagnostic.
+    RootUnresolved,
+    /// The root resolved but a dotted member step did not; the failed
+    /// member identifier's own range anchors the diagnostic.
+    MemberUnresolved(TextRange),
 }
 
 impl<'src> Binder<'src> {
@@ -251,14 +268,26 @@ impl<'src> Binder<'src> {
         tag_range: TextRange,
         context: SlotContext,
     ) -> DemandResult<JsxElementOutcome> {
-        let Some((symbol, callee)) = demand_ready!(self.resolve_jsx_value_callee(name, context))
-        else {
-            let result = self.jsx_element_type(context.scope);
-            return Ok(DemandPoll::Ready(JsxElementOutcome::Degraded {
-                result,
-                reason: JsxDegradation::TagUnresolved,
-                tag_range,
-            }));
+        let (symbol, callee) = match demand_ready!(self.resolve_jsx_value_callee(name, context)) {
+            JsxTagCalleeResolution::Resolved(symbol, callee) => (symbol, callee),
+            JsxTagCalleeResolution::RootUnresolved => {
+                let result = self.jsx_element_type(context.scope);
+                return Ok(DemandPoll::Ready(JsxElementOutcome::Degraded {
+                    result,
+                    reason: JsxDegradation::TagUnresolved { anchor: None },
+                    tag_range,
+                }));
+            }
+            JsxTagCalleeResolution::MemberUnresolved(anchor) => {
+                let result = self.jsx_element_type(context.scope);
+                return Ok(DemandPoll::Ready(JsxElementOutcome::Degraded {
+                    result,
+                    reason: JsxDegradation::TagUnresolved {
+                        anchor: Some(anchor),
+                    },
+                    tag_range,
+                }));
+            }
         };
         let signatures = demand_ready!(self.jsx_callable_signatures(symbol, callee));
         let props = demand_ready!(self.infer_jsx_props(attributes, children, None, context));
@@ -300,30 +329,35 @@ impl<'src> Binder<'src> {
     /// member chains through ordinary structural property demand rather than
     /// a JSX-specific container scope walk. Namespaced (`ns:name`) tags never
     /// resolve as values, matching their absence as a runtime JS binding.
-    /// Never emits a diagnostic: inference is pure, and the check phase
-    /// separately completes the root identifier's reference event.
+    /// Never emits a diagnostic: inference is pure; the resolution reports
+    /// which name step failed so the check phase can anchor the
+    /// cannot-find-name diagnostic at that step, and separately completes
+    /// the root identifier's reference event.
     fn resolve_jsx_value_callee(
         &mut self,
         name: &'src JsxElementName,
         context: SlotContext,
-    ) -> DemandResult<Option<(Option<SymbolId>, TypeId)>> {
+    ) -> DemandResult<JsxTagCalleeResolution> {
         match name {
             JsxElementName::Identifier(identifier) => {
                 let text = self.identifier_text(identifier).into_owned();
                 match self.lookup_value(context.scope, &text) {
                     Some(symbol) => {
                         let value_type = demand_ready!(self.declared_value(symbol));
-                        Ok(DemandPoll::Ready(Some((Some(symbol), value_type))))
+                        Ok(DemandPoll::Ready(JsxTagCalleeResolution::Resolved(
+                            Some(symbol),
+                            value_type,
+                        )))
                     }
-                    None => Ok(DemandPoll::Ready(None)),
+                    None => Ok(DemandPoll::Ready(JsxTagCalleeResolution::RootUnresolved)),
                 }
             }
             JsxElementName::Member(member) => {
-                let Some((object_symbol, object_type)) =
-                    demand_ready!(self.resolve_jsx_value_callee(&member.object, context))
-                else {
-                    return Ok(DemandPoll::Ready(None));
-                };
+                let (object_symbol, object_type) =
+                    match demand_ready!(self.resolve_jsx_value_callee(&member.object, context)) {
+                        JsxTagCalleeResolution::Resolved(symbol, callee) => (symbol, callee),
+                        resolution => return Ok(DemandPoll::Ready(resolution)),
+                    };
                 let property = self.identifier_text(&member.property).into_owned();
                 // Mirror `Binder::type_of_member`: a namespace (or enum)
                 // container resolves the member step to its declaration
@@ -363,23 +397,43 @@ impl<'src> Binder<'src> {
                             value_type = local_type;
                         }
                     }
-                    return Ok(DemandPoll::Ready(Some((Some(member_symbol), value_type))));
+                    return Ok(DemandPoll::Ready(JsxTagCalleeResolution::Resolved(
+                        Some(member_symbol),
+                        value_type,
+                    )));
                 }
-                Ok(DemandPoll::Ready(
-                    self.types
-                        .property_type(object_type, &property)
-                        .map(|property_type| (None, property_type)),
-                ))
+                match self.types.property_type(object_type, &property) {
+                    Some(property_type) => Ok(DemandPoll::Ready(JsxTagCalleeResolution::Resolved(
+                        None,
+                        property_type,
+                    ))),
+                    // The root resolved but this member step did not: the
+                    // failed member's own span anchors the check phase's
+                    // cannot-find-name diagnostic instead of the whole tag.
+                    None => Ok(DemandPoll::Ready(JsxTagCalleeResolution::MemberUnresolved(
+                        member.property.range(),
+                    ))),
+                }
             }
-            JsxElementName::Namespace(_) => Ok(DemandPoll::Ready(None)),
+            JsxElementName::Namespace(_) => {
+                Ok(DemandPoll::Ready(JsxTagCalleeResolution::RootUnresolved))
+            }
         }
     }
 
     /// Returns the callable candidates for a resolved JSX tag value: the
-    /// symbol's own canonical signature group when it names one directly, or
-    /// the value type's function shape (expanding one alias view) otherwise —
-    /// covering dotted-member and aliased-import factories that have no
-    /// symbol of their own to demand a group for.
+    /// symbol's own canonical signature group when it names one directly,
+    /// or — covering dotted-member, aliased-import, object-literal, and
+    /// class factories that have no symbol of their own to demand a group
+    /// for — the value type's shape read through per-shape grouping views
+    /// matching an ordinary call or `new` expression: applied aliases,
+    /// applied classes, function types, object types carrying call or
+    /// construct signatures, constructor types (the class static side), and
+    /// named interfaces via their structural view. Unions and intersections
+    /// return no candidates yet (an ordinary call distributes over them);
+    /// a construct signature contributes its constructor's parameters and
+    /// the class instance type as the element's result, matching the
+    /// "neither a construct nor a call signature" diagnostic contract.
     fn jsx_callable_signatures(
         &mut self,
         symbol: Option<SymbolId>,
@@ -390,13 +444,66 @@ impl<'src> Binder<'src> {
             if !signatures.is_empty() {
                 return Ok(DemandPoll::Ready(signatures));
             }
+            // A class value's declared type is its instance side; the
+            // construct signatures live on the static side (a
+            // constructor type), so a class tag reads its candidates from
+            // there, matching what a `new C` expression uses.
+            if self.symbols[symbol.get() as usize].kind() == SymbolKind::Class
+                && let Some(constructor_type) = self.class_constructor_types.get(&symbol).copied()
+            {
+                return self.jsx_callable_signatures(None, constructor_type);
+            }
         }
         let resolved = self
             .types
             .prepare_applied_alias_view(callee)
             .unwrap_or(callee);
-        let signatures = match self.types.get(resolved) {
-            Type::Function(signature) => vec![signature.clone()],
+        let resolved = self
+            .types
+            .prepare_applied_class_view(resolved)
+            .unwrap_or(resolved);
+        let signatures = match self.types.get(resolved).clone() {
+            Type::Function(signature) => vec![signature],
+            Type::ObjectType(object) if !object.call_signatures.is_empty() => {
+                // Call selection reads the stored candidate permutation;
+                // relations keep declaration order.
+                let ordered: Vec<&FunctionSignature> = if object.call_candidate_order.is_empty() {
+                    object.call_signatures.iter().collect()
+                } else {
+                    object
+                        .call_candidate_order
+                        .iter()
+                        .map(|&index| &object.call_signatures[index as usize])
+                        .collect()
+                };
+                ordered.into_iter().cloned().collect()
+            }
+            Type::ObjectType(object) if !object.construct_signatures.is_empty() => object
+                .construct_signatures
+                .iter()
+                .map(|entry| entry.signature.clone())
+                .collect(),
+            Type::ConstructorType { structural, .. } => {
+                // The class static side wraps its structural member table;
+                // construct signatures live on the table. this-projection is
+                // unnecessary here: construct signatures carry no `this`
+                // members on their fixed parameters.
+                match self.types.get(structural).clone() {
+                    Type::ObjectType(object) => object
+                        .construct_signatures
+                        .iter()
+                        .map(|entry| entry.signature.clone())
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            }
+            Type::Named(symbol) if self.types.interface_structure(symbol).is_some() => {
+                let view = self.types.named_structural_view(resolved);
+                match self.types.get(view).clone() {
+                    Type::ObjectType(object) => object.call_signatures.clone(),
+                    _ => Vec::new(),
+                }
+            }
             _ => Vec::new(),
         };
         Ok(DemandPoll::Ready(signatures))
@@ -457,9 +564,25 @@ impl<'src> Binder<'src> {
                 JsxAttributeItem::Spread(spread) => {
                     let spread_type =
                         demand_ready!(self.type_of_expr(&spread.data().expression, context));
+                    self.check_cancel()?;
                     let Some(branches) = self.jsx_spread_branches(spread_type) else {
                         has_opaque_spread = true;
                         continue;
+                    };
+                    // The fold is a branch product: each spread multiplies
+                    // the variant count by this operand's branch count, so
+                    // unguarded `m^n` products intern an exponential number
+                    // of props objects. Past the cap the operand's
+                    // constituents collapse into one merged branch (later
+                    // members winning) that merges into every existing
+                    // variant — the same bounded approximation an opaque
+                    // spread grants, instead of multiplying further.
+                    let branches = if variants.len().saturating_mul(branches.len())
+                        > MAX_JSX_SPREAD_BRANCHES
+                    {
+                        vec![jsx_merge_spread_branches(&branches)]
+                    } else {
+                        branches
                     };
                     variants = variants
                         .iter()
@@ -797,7 +920,7 @@ impl<'src> Binder<'src> {
                 )?;
             }
             JsxElementOutcome::Degraded {
-                reason: JsxDegradation::TagUnresolved,
+                reason: JsxDegradation::TagUnresolved { anchor },
                 tag_range,
                 ..
             } => {
@@ -805,13 +928,16 @@ impl<'src> Binder<'src> {
                 // republished here as the cannot-find-name diagnostic the
                 // tag's reference completion would have raised — once, in
                 // source order, from the committed outcome rather than a
-                // re-resolution.
+                // re-resolution. A dotted member step that failed after a
+                // resolvable root anchors at the failed member only; a
+                // wholly unresolved root anchors the whole tag span.
                 if !self.suppresses_unresolved_value(context.scope) {
+                    let anchor = anchor.unwrap_or(tag_range);
                     self.queue_diagnostic(
                         Diagnostic::error(
                             CANNOT_FIND_NAME,
                             self.source.source_id(),
-                            tag_range,
+                            anchor,
                             CANNOT_FIND_NAME_MESSAGE,
                         ),
                         order,
@@ -840,10 +966,12 @@ impl<'src> Binder<'src> {
     }
 
     /// Completes the reference event reserved at Stage-A for the tag's root
-    /// identifier, so a qualified `UI.Button` (and a plain `Comp`) receive
-    /// source-ordered typed reference completion like any other identifier
-    /// expression. Intrinsic tags and the `.property` steps of a dotted chain
-    /// are structural, not lexical references, so they complete nothing here.
+    /// identifier: a plain `Comp` and the `UI` root of a qualified
+    /// `UI.Button` get their Stage-A event filled in with the resolved root
+    /// symbol as its typed target. That is the extent of it — the member or
+    /// factory step of a qualified tag is a structural property demand, not
+    /// a lexical reference, so it completes no reference event of its own,
+    /// and intrinsic tags complete nothing here.
     fn complete_jsx_tag_references(
         &mut self,
         name: &'src JsxElementName,
@@ -1044,16 +1172,34 @@ impl<'src> Binder<'src> {
 /// `props` (P1: declaration order, first applicable wins), instantiating
 /// each candidate's own generics independently against `props` with a fresh
 /// cancellable inference session before testing assignability. A
-/// zero-parameter candidate always accepts. Falls back to the first
-/// candidate's instantiation when none match, so a real, non-`any` recovery
-/// type is still produced; returns `None` only when `signatures` is empty.
+/// zero-parameter candidate always accepts. A candidate whose call arity
+/// requires more than the one synthesized props object (tuple-rest
+/// minimums counted exactly as an ordinary call counts them) is skipped:
+/// JSX supplies exactly one argument.
+/// Falls back to the first arity-valid candidate's instantiation when none
+/// match assignability, and to the very first candidate only when every
+/// candidate is arity-invalid, so a single-candidate factory degrades the
+/// same way a checked call would and a real, non-`any` recovery type is
+/// still produced; returns `None` only when `signatures` is empty.
 fn select_jsx_factory_signature(
     signatures: &[FunctionSignature],
     props: TypeId,
     binder: &mut Binder<'_>,
 ) -> Option<(Option<TypeId>, TypeId)> {
     let mut fallback = None;
+    let mut first = None;
     for signature in signatures {
+        // Arity precedes instantiation: call_arity counts tuple-rest minimums
+        // the way an ordinary call does, while arity() stops at the rest
+        // parameter and would admit tuple-rest factories JSX cannot satisfy
+        // with its single props argument. Arity-invalid candidates never pay
+        // for an inference session.
+        if signature.call_arity(&binder.types).0 > 1 {
+            if first.is_none() {
+                first = Some(instantiate_jsx_factory_signature(binder, signature, props));
+            }
+            continue;
+        }
         let (target, result) = instantiate_jsx_factory_signature(binder, signature, props);
         let matches = match target {
             Some(target) => binder.types.assignable(props, target),
@@ -1064,7 +1210,7 @@ fn select_jsx_factory_signature(
         }
         fallback.get_or_insert((target, result));
     }
-    fallback
+    fallback.or(first)
 }
 
 /// Instantiates one candidate signature's first-parameter target and return
@@ -1168,6 +1314,35 @@ fn upsert_property(properties: &mut Vec<PropertyType>, property: PropertyType) {
         properties.push(property);
     }
 }
+
+/// The most props-object branches one element's spread fold may hold. Each
+/// union-typed spread multiplies the variant count by its constituents; a
+/// spread whose multiplication would exceed this bound merges its
+/// constituents into a single branch (later members winning) instead of
+/// distributing, mirroring the conditional-type evaluator's
+/// `DEFAULT_EXPANSION_LIMIT` philosophy: a bounded approximation beats an
+/// unbounded product.
+const MAX_JSX_SPREAD_BRANCHES: usize = 1_000;
+
+/// Collapses one capped spread's branches into a single branch: each
+/// property name carries the last branch's type for it (source order),
+/// and index signatures concatenate in branch order.
+fn jsx_merge_spread_branches(branches: &[JsxSpreadBranch]) -> JsxSpreadBranch {
+    let mut merged = JsxSpreadBranch {
+        properties: Vec::new(),
+        index_signatures: Vec::new(),
+    };
+    for branch in branches {
+        for property in &branch.properties {
+            upsert_property(&mut merged.properties, property.clone());
+        }
+        merged
+            .index_signatures
+            .extend(branch.index_signatures.iter().cloned());
+    }
+    merged
+}
+
 /// One demand-reduced `{...spread}` contribution: the property members and
 /// index signatures a single branch of the spread operand supplies.
 struct JsxSpreadBranch {
@@ -1560,6 +1735,161 @@ mod tests {
             diagnostics.contains(&DUPLICATE_DECLARATION.as_str()),
             "expected DUPLICATE_DECLARATION in {diagnostics:?}"
         );
+    }
+
+    // -- factory arity ---------------------------------------------------------------------------
+
+    /// A candidate requiring more than the single synthesized props argument
+    /// must not win selection: JSX supplies exactly one argument, so an
+    /// arity-invalid candidate is skipped in favor of the first arity-valid
+    /// one. Here the first overload requires two parameters (its props target
+    /// would pass assignability but the second `string` argument is never
+    /// supplied), so the one-parameter overload's `string` return must be
+    /// selected instead of the first overload's `number`.
+    #[test]
+    fn factory_arity_gate_skips_candidates_requiring_more_than_props() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             declare function Comp(props: {{ id?: string }}, extra: string): number; \
+             declare function Comp(props: {{ id?: string }}): string; \
+             const x: string = <Comp />;"
+        );
+        assert_clean(codes(&source));
+    }
+
+    /// A tuple-rest candidate counts its rest minimum toward the arity gate
+    /// exactly as an ordinary call does: `...rest: [string, number]` needs
+    /// two more arguments past props, so the candidate is skipped even
+    /// though a rest-blind arity would stop counting at the rest parameter.
+    #[test]
+    fn factory_arity_gate_counts_tuple_rest_minimum() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             declare function Comp(props: {{ id?: string }}, ...rest: [string, number]): number; \
+             declare function Comp(props: {{ id?: string }}): string; \
+             const x: string = <Comp />;"
+        );
+        assert_clean(codes(&source));
+    }
+
+    // -- callable shapes of value tags ------------------------------------------------------------
+
+    /// A dotted member resolving to an `ObjectType` with call signatures
+    /// must contribute candidates through the same grouping machinery an
+    /// ordinary call uses, not only `Type::Function` values.
+    #[test]
+    fn object_with_call_signatures_resolves_as_a_jsx_factory() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             interface Factory {{ (props: {{ id?: string }}): string; }} \
+             declare const comp: Factory; \
+             const holder = {{ Comp: comp }}; \
+             const x: string = <holder.Comp />;"
+        );
+        assert_clean(codes(&source));
+    }
+
+    /// A class tag constructs its instance through the class's construct
+    /// signature; the diagnostic contract ("neither a construct nor a call
+    /// signature") requires construct support. Props check against the
+    /// constructor's parameter type.
+    #[test]
+    fn class_component_construct_signature_resolves_as_a_jsx_factory() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             class Widget {{ constructor(props: {{ id?: string }}) {{}} }} \
+             const x = <Widget id=\"a\" />;"
+        );
+        assert_clean(codes(&source));
+    }
+
+    // -- dotted-tag member resolution degradation ---------------------------------------------------
+
+    /// A dotted tag whose object resolves but lacks the member must anchor
+    /// CANNOT_FIND_NAME at the failing member only, not the whole dotted
+    /// span: the root identifier resolved fine, so the member step is the
+    /// one that "cannot find" its name.
+    #[test]
+    fn dotted_tag_missing_member_anchors_cannot_find_name_on_the_member() {
+        let source = "namespace JSX { \
+            interface Element {} \
+            interface IntrinsicElements { div: { id?: string } } \
+        } \
+        declare const UI: { label: string }; \
+        const x = <UI.Button />;";
+        let (_model, diagnostics) = bound(source);
+        let member_offset = source.find("Button").expect("fixture contains Button");
+        let member_pos = crate::source::Utf16Pos::new(member_offset);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code().as_str())
+                .collect::<Vec<_>>(),
+            vec![CANNOT_FIND_NAME.as_str()],
+        );
+        let diagnostic = diagnostics
+            .first()
+            .expect("CANNOT_FIND_NAME already asserted");
+        assert!(
+            diagnostic.range().start() == member_pos,
+            "expected CANNOT_FIND_NAME anchored at the failed member (offset {member_offset}), got {:?}",
+            diagnostic.range(),
+        );
+    }
+
+    /// The whole-tag anchor for a resolvable root and missing member stays
+    /// distinguishable from a root miss: an unresolvable root keeps
+    /// anchoring the full dotted span.
+    #[test]
+    fn root_miss_keeps_whole_tag_anchor() {
+        let source = format!("{JSX_PREAMBLE} const x = <Missing.name />;");
+        let (_model, diagnostics) = bound(&source);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code().as_str())
+                .collect::<Vec<_>>(),
+            vec![CANNOT_FIND_NAME.as_str()],
+        );
+        let diagnostic = diagnostics
+            .first()
+            .expect("CANNOT_FIND_NAME already asserted");
+        let name_start = source.find("Missing.name").expect("fixture contains tag") as usize;
+        assert!(
+            diagnostic.range().start().get() == name_start,
+            "root miss anchors the whole dotted span, got {:?}",
+            diagnostic.range(),
+        );
+    }
+
+    // -- spread branch fold cap -----------------------------------------------------------------------
+    /// The spread fold must cap the branch product: past the cap the
+    /// remaining spread constituents merge in order (later members winning)
+    /// instead of distributing. The pads below push the variant count to
+    /// 256 (2^8), and the tail union would double it past the cap; the cap
+    /// collapses the tail into its last-wins merged branch carrying
+    /// `x: string`, which is assignable to the `x?: string` target. Without
+    /// the cap the tail distributes, so branches carrying `x: number` make
+    /// the folded props union fail against the target.
+    #[test]
+    fn spread_branch_fold_caps_branch_count_and_merges_beyond_the_cap() {
+        let preamble = "namespace JSX { \
+            interface Element {} \
+            interface IntrinsicElements { probe: { x?: string } } \
+        } ";
+        let mut spreads = String::new();
+        for index in 0..9 {
+            spreads.push_str(&format!(
+                "const u{index}: {{ x{index}: string }} | {{ y{index}: number }} = {{ x{index}: \"s\" }}; "
+            ));
+        }
+        let source = format!(
+            "{preamble} \
+             {spreads} \
+             const tail: {{ x: number }} | {{ x: string }} = {{ x: \"ok\" }}; \
+             const x = <probe {{...u0}} {{...u1}} {{...u2}} {{...u3}} {{...u4}} {{...u5}} {{...u6}} {{...u7}} {{...u8}} {{...tail}} />;"
+        );
+        assert_clean(codes(&source));
     }
 
     // -- namespace resolution degradation ------------------------------------------------
