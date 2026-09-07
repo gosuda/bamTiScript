@@ -860,15 +860,17 @@ impl FlowFacts {
     /// is what lets a demand frame carry the packet across narrowing sessions
     /// without keeping the producer's frames alive. The root key is
     /// (re-)inserted from `effective_root`, so even a hand-built packet yields
-    /// a closed frame. Installing the same packet twice produces two
-    /// equal-content frames with distinct ids.
-    #[expect(dead_code, reason = "awaits demand-frame producer")]
+    /// a closed frame, and the packet's `declared` type is registered for the
+    /// root so `root_packet` can answer for it. Installing the same packet
+    /// twice produces two equal-content frames with distinct ids.
+    #[cfg_attr(not(test), expect(dead_code, reason = "awaits demand-frame producer"))]
     pub(crate) fn install_root_packet(&mut self, packet: &RootFlowPacket) -> FlowNodeId {
         let mut facts = HashMap::with_capacity(packet.paths.len() + 1);
         for (key, ty) in packet.paths.iter() {
             facts.insert(key.clone(), *ty);
         }
         facts.insert(FlowKey::root(packet.root), packet.effective_root);
+        self.declared.insert(packet.root, packet.declared);
         self.frames.push(FlowFrame {
             parent: None,
             facts,
@@ -2607,6 +2609,42 @@ mod tests {
 
         assert_eq!(context.type_at(flow, &root), Some(declared));
         assert_eq!(context.type_at(flow, &child), Some(kind));
+    }
+
+    #[test]
+    fn install_root_packet_round_trips_every_fact() {
+        let mut table = TypeTable::new();
+        let (string, number) = (table.string(), table.number());
+        let union = table.union(&[string, number]);
+        let root = FlowKey::root(symbol(1));
+        let child = root.clone().child("kind");
+
+        // Take a packet from a real session: a root refinement plus a path
+        // refinement over the declared union.
+        let mut facts = FlowFacts::new();
+        let flow = {
+            let mut context = NarrowingContext::new(&mut table, &mut facts);
+            context.declare(symbol(1), union);
+            let flow = context.branch(FlowNodeId::ROOT);
+            context.refine(flow, root.clone(), string);
+            context.refine(flow, child.clone(), number);
+            flow
+        };
+        let packet = facts
+            .root_packet(flow, symbol(1), None)
+            .expect("root_packet")
+            .expect("declared root yields a packet");
+
+        // Installing into a fresh fact table must register the root's
+        // declared type so the packet → frame → packet round trip is the
+        // documented fixpoint.
+        let mut restored = FlowFacts::new();
+        let installed = restored.install_root_packet(&packet);
+        let round_tripped = restored
+            .root_packet(installed, symbol(1), None)
+            .expect("root_packet")
+            .expect("installed packet declares its root");
+        assert_eq!(round_tripped, packet);
     }
 
     // ---- contextual typing --------------------------------------------------
