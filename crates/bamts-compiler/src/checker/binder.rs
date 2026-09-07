@@ -9125,8 +9125,8 @@ impl<'src> Binder<'src> {
             }
             Statement::Labeled(statement) => {
                 let label = self.identifier_text(&statement.label).into_owned();
-                // TS1114: sibling and nested redeclarations in one function
-                // are both duplicate labels.
+                // TS1114 concerns active labels, not earlier sibling statements.
+                let label_mark = self.label_declarations.len();
                 let function_labels_start = self.label_scope_marks.last().copied().unwrap_or(0);
                 if self.label_declarations[function_labels_start..].contains(&label) {
                     self.emit_with_message(
@@ -9140,16 +9140,17 @@ impl<'src> Binder<'src> {
                 self.label_ancestors.push((label, self.label_frame));
                 self.resolve_statement(&statement.body, scope);
                 self.label_ancestors.pop();
+                self.label_declarations.truncate(label_mark);
             }
             Statement::Break(jump) => {
-                // TS1116: a labeled break may only target an enclosing
-                // label. (TS1107, crossing a function boundary, needs the
-                // declaring function's labels and is banked.)
+                // Retain outer frames to distinguish TS1107 from TS1116,
+                // but select the nearest enclosing label first.
                 if let Some(label_node) = &jump.label {
                     let label = self.identifier_text(label_node);
                     let hit = self
                         .label_ancestors
                         .iter()
+                        .rev()
                         .find(|(ancestor, _)| *ancestor == label.as_ref());
                     match hit {
                         Some((_, frame)) if *frame == self.label_frame => {}
@@ -9729,6 +9730,20 @@ impl<'src> Binder<'src> {
         self.types.generator_return_type(annotation)
     }
 
+    fn push_label_scope(&mut self) {
+        self.label_scope_marks.push(self.label_declarations.len());
+        self.label_frame += 1;
+    }
+
+    fn pop_label_scope(&mut self) {
+        let mark = self
+            .label_scope_marks
+            .pop()
+            .expect("label scope must be entered before it is left");
+        self.label_declarations.truncate(mark);
+        self.label_frame -= 1;
+    }
+
     fn resolve_function(
         &mut self,
         function: &'src FunctionLike,
@@ -9751,8 +9766,7 @@ impl<'src> Binder<'src> {
         self.super_flow = SuperFlow::Suspended;
         let outer_guarantees = self.super_call_guarantees;
         self.super_call_guarantees = true;
-        self.label_scope_marks.push(self.label_declarations.len());
-        self.label_frame += 1;
+        self.push_label_scope();
         self.bind_implicit_function_values(&function.parameters, scope);
         let function_symbol = function.name.as_ref().map(|name| {
             let symbol_scope = if is_declaration { parent } else { scope };
@@ -9888,10 +9902,7 @@ impl<'src> Binder<'src> {
         let popped_home = self.super_member_homes.pop();
         self.super_flow = outer_super_flow;
         self.super_call_guarantees = outer_guarantees;
-        if let Some(mark) = self.label_scope_marks.pop() {
-            self.label_declarations.truncate(mark);
-        }
-        self.label_frame -= 1;
+        self.pop_label_scope();
         debug_assert_eq!(popped_home, Some(member_home));
     }
 
@@ -11907,6 +11918,7 @@ impl<'src> Binder<'src> {
                 );
                 let derived = self.class_derived_stack.last().copied().unwrap_or(false);
                 let child = self.new_scope(ScopeKind::Function, Some(scope));
+                self.push_label_scope();
                 let new_target_marker = self.new_target_contexts.len();
                 self.new_target_contexts.push(true);
                 self.bind_implicit_function_values(&constructor.parameters, child);
@@ -11979,6 +11991,7 @@ impl<'src> Binder<'src> {
                 self.new_target_contexts.truncate(new_target_marker);
                 self.super_call_contexts.pop();
                 let popped_home = self.super_member_homes.pop();
+                self.pop_label_scope();
                 debug_assert_eq!(popped_home, Some(SuperMemberHome::ClassMember { derived }));
             }
             ClassMember::Property(property) => {
@@ -12105,6 +12118,7 @@ impl<'src> Binder<'src> {
             }
             Expression::Arrow(arrow) => {
                 let child = self.new_scope(ScopeKind::Function, Some(scope));
+                self.push_label_scope();
                 // Arrows capture `this` but never inherit super-call legality.
                 self.super_call_contexts
                     .push(SuperCallContext::NonConstructor);
@@ -12199,6 +12213,7 @@ impl<'src> Binder<'src> {
                 if self.node_types.insert(expression.id(), type_id).is_none() {
                     self.typed_expressions.push((expression.range(), type_id));
                 }
+                self.pop_label_scope();
             }
             Expression::Call(call) => {
                 let is_super_call = matches!(call.callee.data(), Expression::Super);

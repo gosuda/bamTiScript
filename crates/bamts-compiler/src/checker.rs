@@ -6036,7 +6036,7 @@ function check(options: Options = {}) {
         );
     }
 
-    /// TS1114: a label redeclared in one function (sibling or nested).
+    /// TS1114: a label redeclared while it still encloses the current statement.
     /// TS1116: a labeled break may only target an enclosing label. The
     /// oracles are duplicateLabel2 (one row) and breakTarget6 (one row).
     #[test]
@@ -6047,10 +6047,10 @@ function check(options: Options = {}) {
             )),
             vec![DUPLICATE_LABEL.as_str()]
         );
-        // Sibling redeclaration in the same function is also a duplicate.
+        // A completed sibling label is no longer active and may be reused.
         assert_eq!(
             checker_codes(&check_text("a: {} a: {}")),
-            vec![DUPLICATE_LABEL.as_str()]
+            Vec::<&str>::new()
         );
         // A nested function owns its labels; reuse across the boundary is
         // legal.
@@ -6128,6 +6128,9 @@ function check(options: Options = {}) {
         );
     }
 
+    /// The superAccess es5 baseline swaps each TS2855 field row for the
+    /// single pre-fields rule TS2340; the static row stays TS2576 at both
+    /// targets.
     #[test]
     fn super_field_flavor_splits_by_target() {
         let source = "class MyBase {
@@ -6543,6 +6546,102 @@ function check(options: Options = {}) {
             ),
             Vec::<&str>::new()
         );
+    }
+
+    #[test]
+    fn pr199_super_flow_joins_every_continuing_path() {
+        for (body, safe) in [
+            ("if (c) { super(); } else { super(); }", true),
+            ("if (c) { throw 0; } else { super(); }", true),
+            ("if (c) { super(); } else { throw 0; }", true),
+            ("if (c) { return { method() {} }; } else { super(); }", true),
+            ("super(); if (c) {} else {}", true),
+            (
+                "if (c) { if (c) { super(); } else { super(); } } else { super(); }",
+                true,
+            ),
+            ("if (c) { super(); }", false),
+            ("if (c) {} else { super(); }", false),
+        ] {
+            let source = format!(
+                "class B {{ method() {{}} }} \
+                 class D extends B {{ constructor(c: boolean) {{ \
+                 {body} this; super.method(); }} }}"
+            );
+            let mut codes = checker_codes(&check_text(&source))
+                .into_iter()
+                .filter(|code| {
+                    *code == SUPER_BEFORE_THIS.as_str()
+                        || *code == SUPER_BEFORE_SUPER_PROPERTY.as_str()
+                })
+                .collect::<Vec<_>>();
+            codes.sort_unstable();
+            let expected = if safe {
+                Vec::new()
+            } else {
+                vec![
+                    SUPER_BEFORE_THIS.as_str(),
+                    SUPER_BEFORE_SUPER_PROPERTY.as_str(),
+                ]
+            };
+            assert_eq!(codes, expected, "{body}");
+        }
+    }
+
+    #[test]
+    fn pr199_label_frames_and_nearest_targets() {
+        let cases = [
+            ("L: {} L: {}", None),
+            ("L: { L: {} }", Some(DUPLICATE_LABEL.as_str())),
+            ("L: { function f() { L: { break L; } } break L; }", None),
+            ("L: { const f = () => { L: { break L; } }; break L; }", None),
+            (
+                "L: { class C { constructor() { L: { break L; } } } break L; }",
+                None,
+            ),
+            (
+                "L: { function f() { break L; } break L; }",
+                Some(BREAK_TARGET_CROSSES_FUNCTION.as_str()),
+            ),
+            (
+                "L: { const f = () => { break L; }; break L; }",
+                Some(BREAK_TARGET_CROSSES_FUNCTION.as_str()),
+            ),
+            (
+                "L: { class C { constructor() { break L; } } break L; }",
+                Some(BREAK_TARGET_CROSSES_FUNCTION.as_str()),
+            ),
+            ("const f = () => { local: {} }; local: {}", None),
+            ("class C { constructor() { local: {} } } local: {}", None),
+            ("L: {} break L;", Some(BREAK_TARGET_NOT_ENCLOSING.as_str())),
+            (
+                "while (true) { break missing; }",
+                Some(BREAK_TARGET_NOT_ENCLOSING.as_str()),
+            ),
+        ];
+        for (source, expected) in cases {
+            let codes = checker_codes(&check_text(source))
+                .into_iter()
+                .filter(|code| {
+                    *code == DUPLICATE_LABEL.as_str()
+                        || *code == BREAK_TARGET_NOT_ENCLOSING.as_str()
+                        || *code == BREAK_TARGET_CROSSES_FUNCTION.as_str()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(codes, expected.into_iter().collect::<Vec<_>>(), "{source}");
+        }
+    }
+
+    #[test]
+    fn pr199_missing_authority_fixture_explains_the_prerequisite() {
+        let panic = std::panic::catch_unwind(|| {
+            authority_source("__pr199_fixture_that_must_not_exist__.ts")
+        })
+        .expect_err("a missing authority fixture must fail rather than skip");
+        let message = panic.downcast_ref::<String>().expect("formatted panic");
+        assert!(message.contains("__pr199_fixture_that_must_not_exist__.ts"));
+        assert!(message.contains("source fetch typescript-primary-tests"));
+        assert!(message.contains("--dest target/authority/typescript-7.0.2-tests"));
     }
 
     #[test]

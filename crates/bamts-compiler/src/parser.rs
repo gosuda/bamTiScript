@@ -2156,10 +2156,16 @@ impl Parser {
             && self.is_constructor_name(&name)
             && self.at(TokenKind::LParen)
         {
-            let parameters = self.parse_parameter_list();
+            let keyword_context = KeywordContext {
+                in_function: true,
+                await_reserved: false,
+                yield_reserved: false,
+            };
+            let parameters =
+                self.with_keyword_context(keyword_context, |this| this.parse_parameter_list());
             let return_type = self.parse_optional_type_annotation();
             if self.at(TokenKind::LBrace) {
-                let body = self.parse_block();
+                let body = self.with_keyword_context(keyword_context, Self::parse_block);
                 let _ = return_type;
                 return self.node(
                     start,
@@ -6753,6 +6759,72 @@ mod tests {
                 "'await' expressions are only allowed within async functions and at the top levels of modules."
             )
         );
+    }
+
+    #[test]
+    fn pr199_constructor_keyword_context_is_local() {
+        for (source, expected, keyword) in [
+            (
+                "/* 🦀 */ class C { constructor() { await value; } }",
+                "BAMTS-P018",
+                "await",
+            ),
+            (
+                "async function f() { class C { constructor() { await value; } } await value; }",
+                "BAMTS-P018",
+                "await",
+            ),
+            (
+                "function* f() { class C { constructor() { yield 1; } } yield 2; }",
+                "BAMTS-P017",
+                "yield",
+            ),
+            (
+                "async function f() { class C { constructor(x = await value) {} } await value; }",
+                "BAMTS-P018",
+                "await",
+            ),
+            (
+                "function* f() { class C { constructor(x = yield 1) {} } yield 2; }",
+                "BAMTS-P017",
+                "yield",
+            ),
+            (
+                "class C { constructor(x = await value); constructor(x) {} }",
+                "BAMTS-P018",
+                "await",
+            ),
+        ] {
+            let parsed = parse_text(source, ScriptKind::TypeScript);
+            let diagnostics = errors(&parsed)
+                .into_iter()
+                .filter(|diagnostic| {
+                    matches!(diagnostic.code().as_str(), "BAMTS-P017" | "BAMTS-P018")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].code().as_str(), expected, "{source}");
+            let byte_start = source.find(keyword).expect("keyword in fixture");
+            let utf16_start = source[..byte_start].encode_utf16().count();
+            assert_eq!(
+                diagnostics[0].range().start().get(),
+                utf16_start,
+                "{source}"
+            );
+        }
+        for source in [
+            "class C { constructor() { const f = async () => await value; const g = function*() { yield 1; }; } }",
+            "async function f() { class C { constructor() {} } await value; }",
+            "function* f() { class C { constructor() {} } yield 1; }",
+            "class C { constructor() {} } await value;",
+        ] {
+            let parsed = parse_text(source, ScriptKind::TypeScript);
+            assert!(
+                errors(&parsed).is_empty(),
+                "{source}: {:?}",
+                errors(&parsed)
+            );
+        }
     }
 
     fn assert_clean(text: &str) -> Recovered<SourceFile> {

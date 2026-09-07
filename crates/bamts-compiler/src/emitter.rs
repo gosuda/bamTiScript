@@ -6771,6 +6771,123 @@ var c = () => 1;
     }
 
     #[test]
+    fn pr199_for_of_fallbacks_keep_the_rewritten_iterable() {
+        let source = "var target; for (target of source(2 ** 3)) {}";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(source).expect("fits")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let statement = parsed.product().statements().last().expect("loop");
+        let crate::syntax::Statement::ForOf(for_of) = statement.data() else {
+            panic!("expected a for-of AST for {source}");
+        };
+        assert!(matches!(
+            for_of.binding,
+            crate::syntax::ForBinding::Target(_)
+        ));
+        let output = emit_output(
+            parsed.product(),
+            &EmitOptions {
+                target: ScriptTarget::Es5,
+                no_emit_helpers: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = &javascript(&output).code;
+        assert!(
+            code.contains(" of "),
+            "existing native fallback is retained: {code}"
+        );
+        assert_eq!(code.matches("Math.pow(2, 3)").count(), 1, "{code}");
+        assert!(
+            !code.contains("**"),
+            "original iterable was restored: {code}"
+        );
+    }
+
+    fn pr199_emit_at(input: &str, target: ScriptTarget) -> EmitOutput {
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("fits")),
+        ));
+        assert!(
+            parsed.diagnostics().is_empty(),
+            "{:?}",
+            parsed.diagnostics()
+        );
+        emit_output(
+            parsed.product(),
+            &EmitOptions {
+                target,
+                no_emit_helpers: true,
+                ..EmitOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn pr199_native_declarations_emit_keys_in_declarator_order() {
+        let source = "declare function before(): number; \
+            declare function key(): string; \
+            declare function between(): number; \
+            declare function laterKey(): string; \
+            declare function after(): number; \
+            declare function finish(): void; \
+            function* g() { \
+                const left = before(), C = class { [yield key()]() {} }, \
+                    middle = between(), D = class { [yield laterKey()]() {} }, \
+                    right = after(); \
+                finish(); return [left, C, middle, D, right]; \
+            }";
+        for target in [ScriptTarget::Es2015, ScriptTarget::Es2016] {
+            let output = pr199_emit_at(source, target);
+            assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+            let code = &javascript(&output).code;
+            let positions = [
+                "before()",
+                "key()",
+                "C =",
+                "between()",
+                "laterKey()",
+                "D =",
+                "after()",
+                "finish()",
+            ]
+            .map(|needle| {
+                assert_eq!(code.matches(needle).count(), 1, "{needle}: {code}");
+                code.find(needle).expect("one occurrence")
+            });
+            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{code}");
+        }
+    }
+
+    #[test]
+    fn pr199_async_native_declarations_do_not_lose_key_awaits() {
+        let source = "declare function before(): number; \
+            declare function key(): string; declare function after(): number; \
+            async function g() { \
+                const left = before(), C = class { [await key()]() {} }, right = after(); \
+                return [left, C, right]; \
+            }";
+        let output = pr199_emit_at(source, ScriptTarget::Es2015);
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let code = &javascript(&output).code;
+        let positions = ["before()", "key()", "C =", "after()"].map(|needle| {
+            assert_eq!(code.matches(needle).count(), 1, "{needle}: {code}");
+            code.find(needle).expect("one occurrence")
+        });
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{code}");
+        assert!(
+            code.contains("yield"),
+            "await must survive as a suspension: {code}"
+        );
+        assert!(!code.contains("await key()"), "raw await leaked: {code}");
+    }
+
+    #[test]
     fn es5_async_for_update_increment_lowers() {
         // Synthetic probe pinning the walker/machine contract: a for-update
         // `i++` (Update over an Identifier) counts as zero resumes after the

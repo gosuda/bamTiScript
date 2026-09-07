@@ -49,6 +49,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Fetch pinned TypeScript test fixtures
+        run: >-
+          cargo run --locked -p bamts-verification -- source fetch
+          typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
+
       - name: Test workspace
         run: cargo test --workspace --locked
 
