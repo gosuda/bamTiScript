@@ -25144,7 +25144,7 @@ impl<'src> Binder<'src> {
         if !self.strict_null_checks {
             return Ok(());
         }
-        if self.demand.assignment_memo.get(&boundary).is_none() {
+        if !self.demand.assignment_memo.contains_key(&boundary) {
             // Contract: the boundary's analysis is computed on its first
             // definite-assignment use, then reused for all uses, and the
             // entry is published only once the analysis converges. Roots
