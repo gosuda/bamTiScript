@@ -160,11 +160,14 @@ impl Binder<'_> {
         self.class_instance_types.insert(type_symbol, instance);
         self.class_instance_types.insert(value_symbol, instance);
 
-        let value = if self.intrinsics.has_lib(Lib::Es2015) {
-            self.types.union(&[number, string, instance])
-        } else {
-            self.types.union(&[number, string])
-        };
+        // The `Date(value: number | string | Date)` overload lives in
+        // `lib.es2015.core.d.ts`; the full es2015 category includes that stem.
+        let value =
+            if self.intrinsics.has_lib(Lib::Es2015) || self.intrinsics.has_lib(Lib::Es2015Core) {
+                self.types.union(&[number, string, instance])
+            } else {
+                self.types.union(&[number, string])
+            };
         let components = [
             "year",
             "monthIndex",
@@ -446,6 +449,32 @@ mod tests {
             panic!("Date(value) must expose a union parameter");
         };
         assert_eq!(es2015_members.len(), 3);
+
+        let (es2015_core_model, es2015_core_diagnostics) = bound_with_libs(
+            "declare const d: Date; new Date(d);",
+            LibSet::from_lib_names(&["es5", "es2015.core"]),
+        );
+        assert!(
+            es2015_core_diagnostics.is_empty(),
+            "{es2015_core_diagnostics:?}"
+        );
+        let es2015_core_constructor =
+            es2015_core_model.symbol_type(value_symbol(&es2015_core_model, "Date"));
+        let Type::ObjectType(es2015_core_constructor) =
+            es2015_core_model.types().get(es2015_core_constructor)
+        else {
+            panic!("Date value must expose an object constructor type");
+        };
+        let es2015_core_value_parameter = es2015_core_constructor.construct_signatures[1]
+            .signature
+            .parameters()[0]
+            .type_id();
+        let Type::Union(es2015_core_members) =
+            es2015_core_model.types().get(es2015_core_value_parameter)
+        else {
+            panic!("Date(value) must expose a union parameter");
+        };
+        assert_eq!(es2015_core_members.len(), 3);
     }
 
     #[test]
