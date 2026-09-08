@@ -23487,8 +23487,6 @@ impl<'src> Binder<'src> {
     /// and lets the root finish through ordinary re-evaluation. Suspended
     /// contextual frames are never released here: parked frame queries keep
     /// their payload and resume through `resume_query` when woken.
-    /// contextual frames are never released here: parked frame queries keep
-    /// their payload and resume through `resume_query` when woken.
     #[expect(
         dead_code,
         reason = "canonical frame driver; production callers land with the WP-CTX cutover"
@@ -25378,18 +25376,7 @@ impl<'src> Binder<'src> {
         statement: &'src Stmt,
     ) -> Result<(NodeId, FlowOperation), super::CheckCancelled> {
         let node = statement.id();
-        let operation = match statement.data() {
-            Statement::Variable(_)
-            | Statement::Function(_)
-            | Statement::Class(_)
-            | Statement::Enum(_)
-            | Statement::Interface(_)
-            | Statement::TypeAlias(_)
-            | Statement::Namespace(_)
-            | Statement::Import(_)
-            | Statement::ImportEquals(_) => FlowOperation::Pass,
-            _ => FlowOperation::Pass,
-        };
+        let operation = FlowOperation::Pass;
         Ok((node, operation))
     }
 
