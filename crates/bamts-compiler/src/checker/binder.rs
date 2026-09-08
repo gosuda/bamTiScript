@@ -12432,7 +12432,13 @@ impl<'src> Binder<'src> {
             .iter()
             .filter_map(|(derived, base)| (*base == symbol).then_some(*derived))
             .collect();
+        // Cyclic heritage (`A extends B`, `B extends A`) must terminate:
+        // mirror `is_derived_from`'s visited guard.
+        let mut visited = HashSet::new();
         while let Some(derived) = stack.pop() {
+            if !visited.insert(derived) {
+                continue;
+            }
             let Some(&existing) = self.class_constructor_types.get(&derived) else {
                 continue;
             };

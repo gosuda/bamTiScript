@@ -3917,6 +3917,18 @@ mod tests {
             .collect();
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
+    /// Regression: cyclic heritage with a merged base terminates. The
+    /// augmentation worklist carries a visited guard (mirroring
+    /// `is_derived_from`); without it this case loops forever, so
+    /// completion itself is the assertion. Circularity diagnostics
+    /// are owned by the heritage checker, not pinned here.
+    #[test]
+    fn cyclic_heritage_merge_terminates() {
+        let case_text = "class A extends B {\n}\nclass B extends A {\n}\nnamespace A {\n    export const x = 1;\n}\nconst n = B.x;\n";
+        let units = split_case_units("tests/cases/compiler/cyclicHeritageMerge.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/cyclicHeritageMerge.ts", &units);
+        let _case = compile_case(&units, &entry).expect("case compiles");
+    }
 
     /// Regression: nested namespaces contribute finalized constructors.
     /// The inner namespace finalizes before the outer snapshots it, so
