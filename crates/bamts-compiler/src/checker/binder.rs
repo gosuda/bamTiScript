@@ -5633,6 +5633,22 @@ impl SemanticModel {
             .unwrap_or(self.symbol_types[id.0 as usize])
     }
 
+    /// Returns the value-side type of a symbol: classes and enums answer
+    /// their constructor, every other kind its declared type. One site
+    /// owns the rule so member, query, and finalizer readers agree.
+    #[must_use]
+    pub(crate) fn value_side_type(&self, symbol: SymbolId) -> TypeId {
+        let constructors = match self.symbols[symbol.get() as usize].kind {
+            SymbolKind::Class => &self.class_constructor_types,
+            SymbolKind::Enum => &self.enum_constructor_types,
+            _ => return self.symbol_types[symbol.get() as usize],
+        };
+        constructors
+            .get(&symbol)
+            .copied()
+            .unwrap_or(self.symbol_types[symbol.get() as usize])
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn overload_signatures(&self, id: SymbolId) -> &[FunctionSignature] {
@@ -12308,6 +12324,21 @@ impl<'src> Binder<'src> {
     /// has been checked. Enum-merged namespaces additionally union the
     /// enum members into the enum's value-side constructor; every other
     /// merged partner keeps its own owner. Unknown statements are skipped.
+    /// Value-side type of a symbol: classes and enums answer their
+    /// constructor, every other kind its declared type. Mirrors
+    /// [`SemanticModel::value_side_type`]; one rule for bind-time readers.
+    fn value_side_type(&self, symbol: SymbolId) -> TypeId {
+        let constructors = match self.symbols[symbol.get() as usize].kind {
+            SymbolKind::Class => &self.class_constructor_types,
+            SymbolKind::Enum => &self.enum_constructor_types,
+            _ => return self.symbol_types[symbol.get() as usize],
+        };
+        constructors
+            .get(&symbol)
+            .copied()
+            .unwrap_or(self.symbol_types[symbol.get() as usize])
+    }
+
     fn finalize_namespace_constructor(&mut self, statement_id: NodeId) {
         let mut target = None;
         for binding in &self.namespace_declarations {
@@ -12343,7 +12374,10 @@ impl<'src> Binder<'src> {
                 ) {
                     continue;
                 }
-                member_types.push((name.clone(), self.symbol_types[member.get() as usize]));
+                // Classes answer their constructor and enums their
+                // value-side constructor; instance slots would mislead
+                // construction and member reads through the alias.
+                member_types.push((name.clone(), self.value_side_type(*member)));
             }
         }
         let numeric_index = matches!(
@@ -18914,19 +18948,7 @@ impl<'src> Binder<'src> {
                     );
                     return self.types.any();
                 };
-                match self.symbols[symbol.get() as usize].kind {
-                    SymbolKind::Class => self
-                        .class_constructor_types
-                        .get(&symbol)
-                        .copied()
-                        .unwrap_or(self.symbol_types[symbol.get() as usize]),
-                    SymbolKind::Enum => self
-                        .enum_constructor_types
-                        .get(&symbol)
-                        .copied()
-                        .unwrap_or(self.symbol_types[symbol.get() as usize]),
-                    _ => self.symbol_types[symbol.get() as usize],
-                }
+                self.value_side_type(symbol)
             }
             EntityName::Qualified { left, right } => {
                 // A qualified `typeof A.B` can be a namespace path (the prefix
@@ -18939,19 +18961,7 @@ impl<'src> Binder<'src> {
                     Ok((member_scope, _path)) => {
                         let name = self.identifier_text(right);
                         match self.scopes[member_scope.0 as usize].value(&name) {
-                            Some(symbol) => match self.symbols[symbol.get() as usize].kind {
-                                SymbolKind::Class => self
-                                    .class_constructor_types
-                                    .get(&symbol)
-                                    .copied()
-                                    .unwrap_or(self.symbol_types[symbol.get() as usize]),
-                                SymbolKind::Enum => self
-                                    .enum_constructor_types
-                                    .get(&symbol)
-                                    .copied()
-                                    .unwrap_or(self.symbol_types[symbol.get() as usize]),
-                                _ => self.symbol_types[symbol.get() as usize],
-                            },
+                            Some(symbol) => self.value_side_type(symbol),
                             None => {
                                 self.emit(
                                     CANNOT_FIND_NAME,
@@ -21806,19 +21816,7 @@ impl<'src> Binder<'src> {
                         }
                     }
                 };
-                let declared = match self.symbols[symbol.get() as usize].kind {
-                    SymbolKind::Class => self
-                        .class_constructor_types
-                        .get(&symbol)
-                        .copied()
-                        .unwrap_or(self.symbol_types[symbol.get() as usize]),
-                    SymbolKind::Enum => self
-                        .enum_constructor_types
-                        .get(&symbol)
-                        .copied()
-                        .unwrap_or(self.symbol_types[symbol.get() as usize]),
-                    _ => self.symbol_types[symbol.get() as usize],
-                };
+                let declared = self.value_side_type(symbol);
                 self.narrowed_type(symbol, declared)
             }
             Expression::Literal(literal) => self.type_of_literal(literal),

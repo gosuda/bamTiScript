@@ -3691,6 +3691,157 @@ mod tests {
         let verdict = compare_diagnostics(&[], &actual, &code_map);
         assert_eq!(verdict, FacetVerdict::Pass);
     }
+    /// TEMP PROBE round 3: forward-order namespace value read.
+    #[test]
+    fn tmprobe_forward_ns_value_read() {
+        let case_text = "const ok: { x: number } = M;\nnamespace M {\n    export const x = 1;\n}\n";
+        let units = split_case_units("tests/cases/compiler/tmForwardNs.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmForwardNs.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "forward-ns codes: {codes:?}");
+    }
+
+    /// TEMP PROBE round 3: merged enum+namespace alias member reads.
+    #[test]
+    fn tmprobe_merged_enum_ns_alias() {
+        let case_text = "enum E {\n    A = 1,\n}\nnamespace E {\n    export const x = 1;\n}\nconst alias = E;\nalias.x;\nalias.A;\n";
+        let units = split_case_units("tests/cases/compiler/tmMergedEnumNs.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmMergedEnumNs.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "merged-enum-ns codes: {codes:?}");
+    }
+
+    /// TEMP PROBE round 3: heterogeneous enum reverse lookup.
+    #[test]
+    fn tmprobe_hetero_enum_reverse() {
+        let case_text = "enum H {\n    A = 1,\n    B = \"s\",\n}\nconst n: string = H[1];\n";
+        let units = split_case_units("tests/cases/compiler/tmHeteroEnum.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmHeteroEnum.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "hetero-enum codes: {codes:?}");
+    }
+
+    /// TEMP PROBE round 3: merged class+namespace value-side members.
+    #[test]
+    fn tmprobe_merged_class_ns() {
+        let case_text = "class C {\n}\nnamespace C {\n    export const x = 1;\n}\nconst alias = C;\nconst n: number = alias.x;\nnew alias();\n";
+        let units = split_case_units("tests/cases/compiler/tmMergedClassNs.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmMergedClassNs.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "merged-class-ns codes: {codes:?}");
+    }
+
+    /// TEMP PROBE round 3: type-only member through merged-namespace value.
+    #[test]
+    fn tmprobe_type_only_member_value_read() {
+        let case_text = "function f() {\n}\nnamespace f {\n    export type T = string;\n    export const x = 1;\n}\nconst v: number = f.x;\nconst w = f.T;\n";
+        let units = split_case_units("tests/cases/compiler/tmTypeOnlyMember.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmTypeOnlyMember.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "type-only-member codes: {codes:?}");
+    }
+    /// TEMP PROBE round 3: type-only member through pure-namespace value.
+    #[test]
+    fn tmprobe_pure_ns_type_only_member() {
+        let case_text = "namespace M {\n    export type T = string;\n    export const x = 1;\n}\nconst v: number = M.x;\nconst w = M.T;\n";
+        let units = split_case_units("tests/cases/compiler/tmPureNsTypeOnly.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmPureNsTypeOnly.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "pure-ns-type-only codes: {codes:?}");
+    }
+    /// Regression: namespace constructor members answer value-side types.
+    /// Classes contribute their constructor (so `new alias.C()` checks)
+    /// and enums their value-side constructor (so `m.A` resolves).
+    #[test]
+    fn namespace_alias_members_use_value_side_types() {
+        let case_text = "namespace N {\n    export class C {\n    }\n    export enum E {\n        A = 1,\n    }\n}\nconst alias = N;\nnew alias.C();\nconst m = alias.E;\nconst k = m.A;\n";
+        let units = split_case_units("tests/cases/compiler/namespaceAliasValueSide.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/namespaceAliasValueSide.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// TEMP PROBE round 3: typeof merged class keeps construct signatures.
+    #[test]
+    fn tmprobe_merged_class_typeof() {
+        let case_text = "class C {\n}\nnamespace C {\n    export const x = 1;\n}\ntype T = typeof C;\nconst m: T = C;\nnew m();\nconst n: number = m.x;\n";
+        let units = split_case_units("tests/cases/compiler/tmMergedClassTypeof.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmMergedClassTypeof.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "merged-class-typeof codes: {codes:?}");
+    }
+
+    /// TEMP PROBE round 3: nested namespace structural assignment.
+    #[test]
+    fn tmprobe_nested_ns_assign() {
+        let case_text = "namespace A {\n    export namespace B {\n        export const x = 1;\n    }\n}\nconst v: { B: { x: number } } = A;\n";
+        let units = split_case_units("tests/cases/compiler/tmNestedNs.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmNestedNs.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "nested-ns codes: {codes:?}");
+    }
 
     /// Regression: two diagnostics at the same line/column in different files
     /// must not compare equal. Before the unit field was carried through
