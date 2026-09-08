@@ -3809,6 +3809,79 @@ mod tests {
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
 
+    /// Regression: chained reads through namespace enum values resolve.
+    /// Direct (`N.E.A`) and alias (`m.A`) chains stay diagnostic-free.
+    #[test]
+    fn namespace_enum_member_chains_resolve() {
+        let case_text = "namespace N {\n    export enum E {\n        A = 1,\n    }\n}\nconst x = N.E.A;\nconst m = N.E;\nconst y = m.A;\n";
+        let units = split_case_units("tests/cases/compiler/namespaceEnumChains.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/namespaceEnumChains.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: classes exported from a merged namespace construct.
+    /// The merged member-access arm answers the constructor, not the
+    /// instance slot.
+    #[test]
+    fn merged_namespace_exported_class_constructs() {
+        let case_text =
+            "class C {\n}\nnamespace C {\n    export class D {\n    }\n}\nconst d = new C.D();\n";
+        let units = split_case_units("tests/cases/compiler/mergedNsExportedClass.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/mergedNsExportedClass.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: a class static wins over a same-named namespace-only
+    /// type. The static is the runtime value; the type binding must not
+    /// mask it with a missing-property diagnostic.
+    #[test]
+    fn class_static_beats_namespace_type_name() {
+        let case_text = "class C {\n    static x = 1;\n}\nnamespace C {\n    export type x = string;\n}\nconst n: number = C.x;\n";
+        let units = split_case_units("tests/cases/compiler/classStaticVsNsType.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/classStaticVsNsType.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: aliases of merged functions keep namespace exports.
+    /// The export-scope fallback keys off the resolved symbol, so
+    /// `alias.x` answers like the direct `f.x` read.
+    #[test]
+    fn merged_function_alias_keeps_exports() {
+        let case_text = "function f() {\n}\nnamespace f {\n    export const x = 1;\n}\nconst alias = f;\nconst n: number = alias.x;\n";
+        let units = split_case_units("tests/cases/compiler/mergedFunctionAlias.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/mergedFunctionAlias.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
     /// Regression: nested namespaces contribute finalized constructors.
     /// The inner namespace finalizes before the outer snapshots it, so
     /// the outer structural carries the inner member types, not a shell.

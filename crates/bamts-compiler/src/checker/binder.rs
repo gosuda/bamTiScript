@@ -17861,14 +17861,29 @@ impl<'src> Binder<'src> {
             } else if let Some(&member_scope) = self.namespace_export_scopes.get(&object_symbol) {
                 // Merged partners (function, class) keep their own kind,
                 // so the arms above miss them; their namespace half still
-                // answers through its export scope. Values only: a
-                // type-only export is not a runtime property, so report
-                // the miss instead of falling through to a silent `any`.
+                // answers through its export scope. Members answer
+                // value-side types, like the finalizer path.
                 if let Some(member_symbol) =
                     self.scopes[member_scope.0 as usize].value(name_str.as_str())
                 {
-                    return self.symbol_types[member_symbol.get() as usize];
+                    return self.value_side_type(member_symbol);
                 }
+                // A same-named class static is the runtime value; the
+                // namespace type binding must not mask it.
+                if let Some(&constructor) = self.class_constructor_types.get(&object_symbol)
+                    && let Type::ConstructorType { structural, .. } =
+                        self.types.get(constructor).clone()
+                    && let Type::ObjectType(object) = self.types.get(structural).clone()
+                    && let Some(property) = object
+                        .properties
+                        .iter()
+                        .find(|property| property.name() == name_str.as_str())
+                    && self.is_member_accessible(property)
+                {
+                    return property.type_id();
+                }
+                // Otherwise a type-only export is not a runtime property:
+                // report the miss instead of falling to a silent `any`.
                 if self.scopes[member_scope.0 as usize]
                     .type_binding(name_str.as_str())
                     .is_some()
