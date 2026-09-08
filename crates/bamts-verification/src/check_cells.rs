@@ -6676,4 +6676,39 @@ interface I {
             "non-BMP columns must count UTF-16 units:\n{emitted_symbols}"
         );
     }
+    /// Regression: a catch-body function shadows its parameter. The body
+    /// binds in a child block like the try body, so tsc-accepted code in
+    /// strict and sloppy modes reports no duplicate (oracle: tsc rc=0).
+    #[test]
+    fn catch_body_function_shadows_parameter() {
+        let case_text = "\"use strict\";\ntry {\n} catch (e) {\n    function e() {\n    }\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchFunctionShadow.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchFunctionShadow.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: the catch parameter stays visible in the child body
+    /// block through the scope chain.
+    #[test]
+    fn catch_parameter_visible_in_body_block() {
+        let case_text = "try {\n} catch (e) {\n    const y = e;\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchParameterVisible.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchParameterVisible.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
 }

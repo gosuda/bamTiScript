@@ -12548,9 +12548,14 @@ impl<'src> Binder<'src> {
                     if let Some(binding) = &handler.data().binding {
                         self.bind_pattern(binding, VariableKind::Let, catch_scope, handler.id());
                     }
+                    // Body declarations live in a child block like the try
+                    // body above, so `function e` shadows the parameter
+                    // instead of conflicting with it (tsc accepts both
+                    // strict and sloppy).
                     let body = &handler.data().body;
-                    self.bind_statements(&body.data().statements, catch_scope);
-                    self.resolve_statements(&body.data().statements, catch_scope);
+                    let catch_body = self.new_scope(ScopeKind::Block, Some(catch_scope));
+                    self.bind_statements(&body.data().statements, catch_body);
+                    self.resolve_statements(&body.data().statements, catch_body);
                 }
                 if let Some(finalizer) = &statement.finalizer {
                     let finally_scope = self.new_scope(ScopeKind::Block, Some(scope));
