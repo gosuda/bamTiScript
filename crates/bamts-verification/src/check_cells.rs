@@ -3766,12 +3766,14 @@ mod tests {
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
 
-    /// TEMP PROBE round 3: type-only member through merged-namespace value.
+    /// Regression: type-only exports are not runtime properties. `f.x`
+    /// still resolves through the merged export scope while `f.T`
+    /// reports a missing-property diagnostic.
     #[test]
-    fn tmprobe_type_only_member_value_read() {
+    fn merged_namespace_type_only_member_rejected() {
         let case_text = "function f() {\n}\nnamespace f {\n    export type T = string;\n    export const x = 1;\n}\nconst v: number = f.x;\nconst w = f.T;\n";
-        let units = split_case_units("tests/cases/compiler/tmTypeOnlyMember.ts", case_text);
-        let entry = entry_virtual_path("tests/cases/compiler/tmTypeOnlyMember.ts", &units);
+        let units = split_case_units("tests/cases/compiler/mergedNamespaceTypeOnly.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/mergedNamespaceTypeOnly.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
         let mut actual = collect_facet_diagnostics(&case);
@@ -3780,14 +3782,15 @@ mod tests {
             .iter()
             .map(|d| (d.code.clone(), d.position.line))
             .collect();
-        assert!(actual.is_empty(), "type-only-member codes: {codes:?}");
+        assert_eq!(codes, vec![("BAMTS-C057".to_owned(), 8)]);
     }
-    /// TEMP PROBE round 3: type-only member through pure-namespace value.
+    /// Regression: pure namespaces reject type-only member reads the
+    /// same way. `M.x` resolves while `M.T` reports missing-property.
     #[test]
-    fn tmprobe_pure_ns_type_only_member() {
+    fn pure_namespace_type_only_member_rejected() {
         let case_text = "namespace M {\n    export type T = string;\n    export const x = 1;\n}\nconst v: number = M.x;\nconst w = M.T;\n";
-        let units = split_case_units("tests/cases/compiler/tmPureNsTypeOnly.ts", case_text);
-        let entry = entry_virtual_path("tests/cases/compiler/tmPureNsTypeOnly.ts", &units);
+        let units = split_case_units("tests/cases/compiler/pureNamespaceTypeOnly.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/pureNamespaceTypeOnly.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
         let mut actual = collect_facet_diagnostics(&case);
@@ -3796,7 +3799,7 @@ mod tests {
             .iter()
             .map(|d| (d.code.clone(), d.position.line))
             .collect();
-        assert!(actual.is_empty(), "pure-ns-type-only codes: {codes:?}");
+        assert_eq!(codes, vec![("BAMTS-C057".to_owned(), 6)]);
     }
     /// Regression: namespace constructor members answer value-side types.
     /// Classes contribute their constructor (so `new alias.C()` checks)

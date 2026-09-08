@@ -17842,13 +17842,12 @@ impl<'src> Binder<'src> {
         let name_str = Self::semantic_property_key(&name);
         if let Some(object_symbol) = self.resolved_expression_reference(object) {
             let kind = self.symbols[object_symbol.get() as usize].kind;
+            // Value bindings only: a type-only export is not a runtime
+            // property, so `M.T` falls through to missing-property paths.
             if kind == SymbolKind::Namespace
                 && let Some(member_scope) = self.container_member_scope(object_symbol)
-                && let Some(member_symbol) = self.scopes[member_scope.0 as usize]
-                    .value(name_str.as_str())
-                    .or_else(|| {
-                        self.scopes[member_scope.0 as usize].type_binding(name_str.as_str())
-                    })
+                && let Some(member_symbol) =
+                    self.scopes[member_scope.0 as usize].value(name_str.as_str())
             {
                 return self.symbol_types[member_symbol.get() as usize];
             } else if kind == SymbolKind::Enum
@@ -17859,17 +17858,33 @@ impl<'src> Binder<'src> {
                     .copied()
             {
                 return self.symbol_types[member_symbol.get() as usize];
-            } else if let Some(&member_scope) = self.namespace_export_scopes.get(&object_symbol)
-                && let Some(member_symbol) = self.scopes[member_scope.0 as usize]
-                    .value(name_str.as_str())
-                    .or_else(|| {
-                        self.scopes[member_scope.0 as usize].type_binding(name_str.as_str())
-                    })
-            {
+            } else if let Some(&member_scope) = self.namespace_export_scopes.get(&object_symbol) {
                 // Merged partners (function, class) keep their own kind,
                 // so the arms above miss them; their namespace half still
-                // answers through its export scope.
-                return self.symbol_types[member_symbol.get() as usize];
+                // answers through its export scope. Values only: a
+                // type-only export is not a runtime property, so report
+                // the miss instead of falling through to a silent `any`.
+                if let Some(member_symbol) =
+                    self.scopes[member_scope.0 as usize].value(name_str.as_str())
+                {
+                    return self.symbol_types[member_symbol.get() as usize];
+                }
+                if self.scopes[member_scope.0 as usize]
+                    .type_binding(name_str.as_str())
+                    .is_some()
+                {
+                    let property_range = match property {
+                        MemberProperty::Named(identifier) => identifier.range(),
+                        MemberProperty::Private(identifier) => identifier.range(),
+                        MemberProperty::Computed(expression) => expression.range(),
+                    };
+                    self.emit(
+                        PROPERTY_DOES_NOT_EXIST,
+                        property_range,
+                        PROPERTY_DOES_NOT_EXIST_MESSAGE,
+                    );
+                    return self.types.error_type();
+                }
             }
         }
         let object_type = self.legacy_type_of_expr(object, scope);
