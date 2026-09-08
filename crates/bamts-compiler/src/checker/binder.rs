@@ -9172,7 +9172,7 @@ impl<'src> Binder<'src> {
         self.check_cancel()?;
         self.bind_statement_names_and_class_headers(statements, scope);
         self.check_cancel()?;
-        self.bind_hoisted_statements(statements, scope);
+        self.bind_hoisted_statements(statements, scope, false);
         self.check_cancel()?;
         self.build_import_equals_targets(statements, scope);
         let mut imported_by_source = HashMap::<*const TypeTable, ImportedTypeMap>::new();
@@ -10125,12 +10125,24 @@ impl<'src> Binder<'src> {
         // `var` and function declarations are hoisted to the nearest Function or
         // Module scope, so a binding textually nested in a block, `for`, or
         // `catch` scope is owned by its enclosing function. `let`/`const` and all
-        // other kinds stay in the scope they were written in.
+        // other kinds stay in the scope they were written in. Strict-mode
+        // function declarations are block-scoped (Annex B hoisting is
+        // sloppy-only): written directly in a strict block, `for`, or
+        // `catch` scope, the binding stays there instead of rising.
+        // `var` hoists regardless of strictness.
         let hoisted = matches!(
             kind,
             SymbolKind::Variable(VariableKind::Var) | SymbolKind::Function
         );
-        let scope = if hoisted {
+        let strict_block_function = kind == SymbolKind::Function && {
+            let declared = &self.scopes[scope.0 as usize];
+            declared.strict
+                && matches!(
+                    declared.kind,
+                    ScopeKind::Block | ScopeKind::For | ScopeKind::Catch
+                )
+        };
+        let scope = if hoisted && !strict_block_function {
             self.value_hoist_scope(scope)
         } else {
             scope
@@ -10419,19 +10431,37 @@ impl<'src> Binder<'src> {
     /// Pre-binds `var` and function names that occur beneath lexical child
     /// scopes. The traversal never enters a function body: its own call to this
     /// pass supplies the correct function hoist target.
-    fn bind_hoisted_statements(&mut self, statements: &'src [crate::syntax::Stmt], scope: ScopeId) {
+    fn bind_hoisted_statements(
+        &mut self,
+        statements: &'src [crate::syntax::Stmt],
+        scope: ScopeId,
+        in_block: bool,
+    ) {
         for statement in statements {
-            self.bind_hoisted_statement(statement, scope);
+            self.bind_hoisted_statement(statement, scope, in_block);
         }
     }
 
-    fn bind_hoisted_statement(&mut self, statement: &'src crate::syntax::Stmt, scope: ScopeId) {
+    fn bind_hoisted_statement(
+        &mut self,
+        statement: &'src crate::syntax::Stmt,
+        scope: ScopeId,
+        in_block: bool,
+    ) {
         match statement.data() {
             Statement::Variable(variable) if variable.kind == VariableKind::Var => {
                 self.bind_variable(variable, scope, statement.id());
             }
             Statement::Function(function) => {
-                if let Some(name) = &function.function.name {
+                // Strict-mode functions nested in a block are block-scoped
+                // (Annex B hoisting is sloppy-only): the resolve pass
+                // declares them in the block scope, so the pre-pass must
+                // not leak them into the enclosing scope. `var` and
+                // top-level/sloppy functions hoist as before.
+                let strict_block = in_block && self.scopes[scope.0 as usize].strict;
+                if let Some(name) = &function.function.name
+                    && !strict_block
+                {
                     self.declare(
                         &self.identifier_text(name),
                         SymbolKind::Function,
@@ -10442,17 +10472,17 @@ impl<'src> Binder<'src> {
                 }
             }
             Statement::Block(block) => {
-                self.bind_hoisted_statements(&block.data().statements, scope)
+                self.bind_hoisted_statements(&block.data().statements, scope, true)
             }
             Statement::If(statement) => {
-                self.bind_hoisted_statement(&statement.consequent, scope);
+                self.bind_hoisted_statement(&statement.consequent, scope, true);
                 if let Some(alternate) = &statement.alternate {
-                    self.bind_hoisted_statement(alternate, scope);
+                    self.bind_hoisted_statement(alternate, scope, true);
                 }
             }
             Statement::Switch(statement) => {
                 for case in &statement.cases {
-                    self.bind_hoisted_statements(&case.data().consequent, scope);
+                    self.bind_hoisted_statements(&case.data().consequent, scope, true);
                 }
             }
             Statement::For(for_statement) => {
@@ -10461,7 +10491,7 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope);
+                self.bind_hoisted_statement(&for_statement.body, scope, true);
             }
             Statement::ForIn(for_statement) => {
                 if let ForBinding::Variable(variable) = &for_statement.binding
@@ -10469,7 +10499,7 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope);
+                self.bind_hoisted_statement(&for_statement.body, scope, true);
             }
             Statement::ForOf(for_statement) => {
                 if let ForBinding::Variable(variable) = &for_statement.binding
@@ -10477,34 +10507,44 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope);
+                self.bind_hoisted_statement(&for_statement.body, scope, true);
             }
-            Statement::While(statement) => self.bind_hoisted_statement(&statement.body, scope),
-            Statement::DoWhile(statement) => self.bind_hoisted_statement(&statement.body, scope),
+            Statement::While(statement) => {
+                self.bind_hoisted_statement(&statement.body, scope, true)
+            }
+            Statement::DoWhile(statement) => {
+                self.bind_hoisted_statement(&statement.body, scope, true)
+            }
             Statement::Try(statement) => {
-                self.bind_hoisted_statements(&statement.block.data().statements, scope);
+                self.bind_hoisted_statements(&statement.block.data().statements, scope, true);
                 if let Some(handler) = &statement.handler {
-                    self.bind_hoisted_statements(&handler.data().body.data().statements, scope);
+                    self.bind_hoisted_statements(
+                        &handler.data().body.data().statements,
+                        scope,
+                        true,
+                    );
                 }
                 if let Some(finalizer) = &statement.finalizer {
-                    self.bind_hoisted_statements(&finalizer.data().statements, scope);
+                    self.bind_hoisted_statements(&finalizer.data().statements, scope, true);
                 }
             }
             Statement::With(with_statement) => {
-                self.bind_hoisted_statement(&with_statement.body, scope)
+                self.bind_hoisted_statement(&with_statement.body, scope, true)
             }
-            Statement::Labeled(statement) => self.bind_hoisted_statement(&statement.body, scope),
+            Statement::Labeled(statement) => {
+                self.bind_hoisted_statement(&statement.body, scope, true)
+            }
             Statement::Namespace(_) => {}
             Statement::Declare(inner) => {
                 let saved = self.ambient_binding;
                 self.ambient_binding = true;
-                self.bind_hoisted_statement(inner, scope);
+                self.bind_hoisted_statement(inner, scope, in_block);
                 self.ambient_binding = saved;
             }
             Statement::Export(export) => match export {
                 crate::syntax::ExportDeclaration::Named(
                     crate::syntax::ExportNamedDeclaration::Declaration(inner),
-                ) => self.bind_hoisted_statement(inner, scope),
+                ) => self.bind_hoisted_statement(inner, scope, in_block),
                 crate::syntax::ExportDeclaration::Default(default)
                     if let crate::syntax::ExportDefaultValue::Function(function) =
                         &default.value
@@ -10824,7 +10864,7 @@ impl<'src> Binder<'src> {
             } else {
                 local_scope
             };
-            self.bind_hoisted_statement(statement, target);
+            self.bind_hoisted_statement(statement, target, false);
         }
     }
 
@@ -13282,7 +13322,7 @@ impl<'src> Binder<'src> {
                     binder.scopes[scope.0 as usize].strict = true;
                 }
                 binder.bind_statements(&block.data().statements, scope);
-                binder.bind_hoisted_statements(&block.data().statements, scope);
+                binder.bind_hoisted_statements(&block.data().statements, scope, false);
                 binder.resolve_statements(&block.data().statements, scope);
             }
             Some(FunctionBody::Expression(expression)) => binder.resolve_expr(expression, scope),
@@ -15705,7 +15745,7 @@ impl<'src> Binder<'src> {
                             binder.scopes[child.0 as usize].strict = true;
                         }
                         binder.bind_statements(&block.data().statements, child);
-                        binder.bind_hoisted_statements(&block.data().statements, child);
+                        binder.bind_hoisted_statements(&block.data().statements, child, false);
                         binder.resolve_statements(&block.data().statements, child);
                     }
                     FunctionBody::Expression(inner) => {

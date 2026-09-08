@@ -13720,6 +13720,50 @@ class B extends A {
         let codes = checker_codes_of(&result);
         assert_eq!(codes, ["BAMTS-C039"], "{codes:?}");
     }
+
+    #[test]
+    fn strict_block_functions_do_not_leak_to_module_scope_es5() {
+        // blockScopedFunctionDeclarationES5 oracle (es5 row): the
+        // in-block declaration reports C040 and the module-scope use
+        // reports C002; the declaration must not hoist out of its block.
+        let result = check_text_with(
+            "if (true) {\n    function foo() { }\n    foo();\n}\nfoo();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es5"))
+                .with_strict(true),
+        );
+        let mut codes = checker_codes_of(&result);
+        codes.sort_unstable();
+        assert_eq!(codes, ["BAMTS-C002", "BAMTS-C040"], "{codes:?}");
+    }
+
+    #[test]
+    fn strict_block_functions_do_not_leak_to_module_scope_es2015() {
+        let result = check_text_with(
+            "if (true) {\n    function foo() { }\n    foo();\n}\nfoo();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert_eq!(checker_codes_of(&result), ["BAMTS-C002"]);
+    }
+
+    #[test]
+    fn sloppy_block_functions_still_hoist_to_module_scope() {
+        // Annex B: without strict mode the block function hoists and
+        // the module-scope use stays clean.
+        let result = check_text_with(
+            "if (true) {\n    function foo() { }\n    foo();\n}\nfoo();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es5"))
+                .with_strict(false),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
     #[test]
     fn f4_computed_symbol_object_members_accept_without_errors() {
         // Upstream acceptSymbolAsWeakType expects zero diagnostics; symbol
