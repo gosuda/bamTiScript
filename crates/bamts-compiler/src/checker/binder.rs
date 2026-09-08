@@ -6055,6 +6055,10 @@ pub(crate) struct Binder<'src> {
     /// for headers while this map holds the member-bearing value-side
     /// constructor — mirroring the class split.
     pub(crate) enum_constructor_types: HashMap<SymbolId, TypeId>,
+    /// Enum symbols with at least one numeric-literal member seen across
+    /// all merged declarations. Scalar classification stays all-members,
+    /// but the reverse-mapping index needs only one numeric member.
+    enum_has_numeric_member: HashSet<SymbolId>,
     reg_exp_instance_type: Option<TypeId>,
     /// Shared by provisional and final class-shape passes so a generic method's
     /// type parameters keep one semantic identity.
@@ -6260,6 +6264,7 @@ impl<'src> Binder<'src> {
             qualified_import_paths: HashMap::new(),
             import_equals_targets: HashMap::new(),
             enum_constructor_types: HashMap::new(),
+            enum_has_numeric_member: HashSet::new(),
             class_constructor_types: HashMap::new(),
             imported_type_parameters: HashMap::new(),
             imported_type_planes: HashMap::new(),
@@ -10766,6 +10771,17 @@ impl<'src> Binder<'src> {
                 .as_deref()
                 .is_none_or(is_numeric_enum_initializer)
         });
+        // Reverse mappings need only one numeric member: heterogeneous
+        // enums still emit `E[1]` entries for their numeric half.
+        if declaration.members.iter().any(|member| {
+            member
+                .data()
+                .initializer
+                .as_deref()
+                .is_none_or(is_numeric_enum_initializer)
+        }) {
+            self.enum_has_numeric_member.insert(symbol);
+        }
         match self.type_defs.get_mut(&symbol) {
             Some(TypeDef::Enum { numeric: existing }) => *existing &= numeric,
             None => {
@@ -10801,7 +10817,8 @@ impl<'src> Binder<'src> {
                 ));
             }
         }
-        let constructor = self.constructor_with_members(symbol, member_types, accumulated_numeric);
+        let reverse_mapped = self.enum_has_numeric_member.contains(&symbol);
+        let constructor = self.constructor_with_members(symbol, member_types, reverse_mapped);
         self.enum_constructor_types.insert(symbol, constructor);
         self.enum_declaration_symbols.insert(declaration_id, symbol);
         self.enum_declarations.push(EnumDeclarationBinding {
@@ -12436,10 +12453,9 @@ impl<'src> Binder<'src> {
                 member_types.push((name.clone(), self.value_side_type(*member)));
             }
         }
-        let numeric_index = matches!(
-            self.type_defs.get(&symbol),
-            Some(TypeDef::Enum { numeric: true })
-        );
+        // Merged rebuilds keep whatever reverse mapping any declaration
+        // earned; pure namespaces never set the flag, so members-only.
+        let numeric_index = self.enum_has_numeric_member.contains(&symbol);
         let constructor = self.constructor_with_members(symbol, member_types, numeric_index);
         if merged_enum {
             self.enum_constructor_types.insert(symbol, constructor);

@@ -3725,12 +3725,14 @@ mod tests {
         assert!(actual.is_empty(), "merged-enum-ns codes: {codes:?}");
     }
 
-    /// TEMP PROBE round 3: heterogeneous enum reverse lookup.
+    /// Regression: heterogeneous enums keep a reverse-mapping index when
+    /// any member is numeric. Scalar classification stays all-members;
+    /// only the `[index: number]: string` signature needs one member.
     #[test]
-    fn tmprobe_hetero_enum_reverse() {
+    fn hetero_enum_numeric_member_reverse_lookup() {
         let case_text = "enum H {\n    A = 1,\n    B = \"s\",\n}\nconst n: string = H[1];\n";
-        let units = split_case_units("tests/cases/compiler/tmHeteroEnum.ts", case_text);
-        let entry = entry_virtual_path("tests/cases/compiler/tmHeteroEnum.ts", &units);
+        let units = split_case_units("tests/cases/compiler/heteroEnumReverseLookup.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/heteroEnumReverseLookup.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
         let mut actual = collect_facet_diagnostics(&case);
@@ -3739,7 +3741,7 @@ mod tests {
             .iter()
             .map(|d| (d.code.clone(), d.position.line))
             .collect();
-        assert!(actual.is_empty(), "hetero-enum codes: {codes:?}");
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
 
     /// Regression: aliases of merged class+namespace partners construct.
