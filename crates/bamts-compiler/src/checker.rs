@@ -13764,6 +13764,39 @@ class B extends A {
             result.diagnostics()
         );
     }
+
+    #[test]
+    fn strict_unbraced_if_body_function_still_hoists() {
+        // An unbraced `if` body creates no lexical scope, so the
+        // strict function hoists to the enclosing scope and the
+        // earlier call resolves: no C002.
+        let result = check_text_with(
+            "declare var cond: boolean;\nfoo();\nif (cond) function foo() { }",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn strict_if_body_function_inside_block_stays_visible_in_block() {
+        // The `if` passes the block context through: `bar` lands in
+        // the outer block scope, so the later in-block use resolves
+        // while the module-scope use still reports C002 (no leak
+        // through the scopeless `if`).
+        let result = check_text_with(
+            "declare var cond: boolean;\nif (cond) {\n    if (cond) function bar() { }\n    bar();\n}\nbar();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert_eq!(checker_codes_of(&result), ["BAMTS-C002"]);
+    }
     #[test]
     fn f4_computed_symbol_object_members_accept_without_errors() {
         // Upstream acceptSymbolAsWeakType expects zero diagnostics; symbol

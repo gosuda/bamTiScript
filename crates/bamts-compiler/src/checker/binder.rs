@@ -10453,11 +10453,13 @@ impl<'src> Binder<'src> {
                 self.bind_variable(variable, scope, statement.id());
             }
             Statement::Function(function) => {
-                // Strict-mode functions nested in a block are block-scoped
-                // (Annex B hoisting is sloppy-only): the resolve pass
-                // declares them in the block scope, so the pre-pass must
-                // not leak them into the enclosing scope. `var` and
-                // top-level/sloppy functions hoist as before.
+                // Only a real block makes a nested strict function
+                // block-scoped (Annex B hoisting is sloppy-only): the
+                // resolve pass declares it in the block scope, so the
+                // pre-pass must not leak it into the enclosing scope.
+                // Unbraced control-flow bodies create no scope, so they
+                // pass `in_block` through instead of setting it. `var`
+                // and top-level/sloppy functions hoist as before.
                 let strict_block = in_block && self.scopes[scope.0 as usize].strict;
                 if let Some(name) = &function.function.name
                     && !strict_block
@@ -10475,14 +10477,14 @@ impl<'src> Binder<'src> {
                 self.bind_hoisted_statements(&block.data().statements, scope, true)
             }
             Statement::If(statement) => {
-                self.bind_hoisted_statement(&statement.consequent, scope, true);
+                self.bind_hoisted_statement(&statement.consequent, scope, in_block);
                 if let Some(alternate) = &statement.alternate {
-                    self.bind_hoisted_statement(alternate, scope, true);
+                    self.bind_hoisted_statement(alternate, scope, in_block);
                 }
             }
             Statement::Switch(statement) => {
                 for case in &statement.cases {
-                    self.bind_hoisted_statements(&case.data().consequent, scope, true);
+                    self.bind_hoisted_statements(&case.data().consequent, scope, in_block);
                 }
             }
             Statement::For(for_statement) => {
@@ -10491,7 +10493,7 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope, true);
+                self.bind_hoisted_statement(&for_statement.body, scope, in_block);
             }
             Statement::ForIn(for_statement) => {
                 if let ForBinding::Variable(variable) = &for_statement.binding
@@ -10499,7 +10501,7 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope, true);
+                self.bind_hoisted_statement(&for_statement.body, scope, in_block);
             }
             Statement::ForOf(for_statement) => {
                 if let ForBinding::Variable(variable) = &for_statement.binding
@@ -10507,13 +10509,13 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope, true);
+                self.bind_hoisted_statement(&for_statement.body, scope, in_block);
             }
             Statement::While(statement) => {
-                self.bind_hoisted_statement(&statement.body, scope, true)
+                self.bind_hoisted_statement(&statement.body, scope, in_block)
             }
             Statement::DoWhile(statement) => {
-                self.bind_hoisted_statement(&statement.body, scope, true)
+                self.bind_hoisted_statement(&statement.body, scope, in_block)
             }
             Statement::Try(statement) => {
                 self.bind_hoisted_statements(&statement.block.data().statements, scope, true);
@@ -10529,10 +10531,10 @@ impl<'src> Binder<'src> {
                 }
             }
             Statement::With(with_statement) => {
-                self.bind_hoisted_statement(&with_statement.body, scope, true)
+                self.bind_hoisted_statement(&with_statement.body, scope, in_block)
             }
             Statement::Labeled(statement) => {
-                self.bind_hoisted_statement(&statement.body, scope, true)
+                self.bind_hoisted_statement(&statement.body, scope, in_block)
             }
             Statement::Namespace(_) => {}
             Statement::Declare(inner) => {
