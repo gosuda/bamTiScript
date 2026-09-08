@@ -3508,6 +3508,65 @@ mod tests {
     }
 
     #[test]
+    fn enum_value_assignable_to_matching_object() {
+        let result = check_text_with(
+            "enum E {\n    A = 1,\n}\nconst v: { A: E } = E;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn enum_value_mismatch_still_rejected() {
+        let result = check_text_with(
+            "enum E {\n    A = 1,\n}\nconst v: { A: string } = E;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            !checker_codes_of(&result).is_empty(),
+            "expected a mismatch diagnostic, got clean: {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn namespace_value_assignable_to_matching_object() {
+        let result = check_text_with(
+            "namespace M {\n    export const x = 1;\n}\nconst v: { x: number } = M;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn namespace_value_mismatch_still_rejected() {
+        let result = check_text_with(
+            "namespace M {\n    export const x = 1;\n}\nconst v: { x: string } = M;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            !checker_codes_of(&result).is_empty(),
+            "expected a mismatch diagnostic, got clean: {:?}",
+            result.diagnostics()
+        );
+    }
+    #[test]
     fn target_es5_default_lib_resolves_dom_but_not_es2015() {
         // At @target: es5 with default lib, document (dom) resolves but
         // Proxy (es2015) does not.

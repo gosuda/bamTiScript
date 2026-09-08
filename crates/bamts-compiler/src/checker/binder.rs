@@ -6020,6 +6020,11 @@ pub(crate) struct Binder<'src> {
     /// declarations, `symbol_types[owner]` stores the instance type and this
     /// map holds the `typeof C` constructor type for value-position references.
     pub(crate) class_constructor_types: HashMap<SymbolId, TypeId>,
+    /// Constructor (`typeof E`) types keyed by the enum symbol. For enum
+    /// declarations, `symbol_types[owner]` stores the enum instance type
+    /// for headers while this map holds the member-bearing value-side
+    /// constructor — mirroring the class split.
+    pub(crate) enum_constructor_types: HashMap<SymbolId, TypeId>,
     reg_exp_instance_type: Option<TypeId>,
     /// Shared by provisional and final class-shape passes so a generic method's
     /// type parameters keep one semantic identity.
@@ -6224,6 +6229,7 @@ impl<'src> Binder<'src> {
             import_equals_symbols: HashMap::new(),
             qualified_import_paths: HashMap::new(),
             import_equals_targets: HashMap::new(),
+            enum_constructor_types: HashMap::new(),
             class_constructor_types: HashMap::new(),
             imported_type_parameters: HashMap::new(),
             imported_type_planes: HashMap::new(),
@@ -10711,6 +10717,26 @@ impl<'src> Binder<'src> {
         };
         self.symbol_types[symbol.get() as usize] = declared;
         self.type_state[symbol.get() as usize] = TypeState::Done(declared);
+        // The value-side constructor carries the members so aliases,
+        // assignments, and member reads through `typeof E` resolve.
+        // Member slots are written Done in the loop above, so this
+        // snapshot is final.
+        let mut member_types = Vec::new();
+        if let Some(members) = self.enum_member_symbols_by_name.get(&symbol) {
+            for (name, member) in members {
+                member_types.push((
+                    name.to_utf8_lossy(),
+                    self.symbol_types[member.get() as usize],
+                ));
+            }
+        }
+        let properties = member_types
+            .into_iter()
+            .map(|(name, type_id)| PropertyType::new(name, false, type_id))
+            .collect();
+        let structural = self.types.object_type(properties);
+        let constructor = self.types.constructor_type(symbol, Vec::new(), structural);
+        self.enum_constructor_types.insert(symbol, constructor);
         self.enum_declaration_symbols.insert(declaration_id, symbol);
         self.enum_declarations.push(EnumDeclarationBinding {
             declaration,
@@ -10843,16 +10869,33 @@ impl<'src> Binder<'src> {
         }
         // The declaration symbol's type is the namespace constructor
         // (`>M : typeof M` in .types baselines), mirroring how class
-        // declarations write the static type. The structural object is
-        // empty: member access resolves through member symbols, never
-        // through this slot. Only namespace-kind symbols take this
-        // write: merged partners (enum, interface, class, alias,
-        // function) keep their own type-side or value-side owners in
-        // every declaration order — sealing anything else here would
-        // block lazy builds or break calls.
+        // declarations write the static type. The structural object
+        // carries the exported value members so aliases, assignments,
+        // and member reads through `typeof M` resolve; direct member
+        // access additionally shortcuts through member symbols. Only
+        // namespace-kind symbols take this write: merged partners
+        // (enum, interface, class, alias, function) keep their own
+        // type-side or value-side owners in every declaration order.
         let pure_namespace = self.symbols[symbol.get() as usize].kind == SymbolKind::Namespace;
         if pure_namespace {
-            let structural = self.types.object_type(Vec::new());
+            let mut member_types = Vec::new();
+            if let Some(export_scope) = self.namespace_export_scopes.get(&symbol) {
+                for (name, member) in &self.scopes[export_scope.0 as usize].values {
+                    let kind = self.symbols[member.get() as usize].kind;
+                    if matches!(
+                        kind,
+                        SymbolKind::Interface | SymbolKind::TypeAlias | SymbolKind::TypeParameter
+                    ) {
+                        continue;
+                    }
+                    member_types.push((name.clone(), self.symbol_types[member.get() as usize]));
+                }
+            }
+            let properties = member_types
+                .into_iter()
+                .map(|(name, type_id)| PropertyType::new(name, false, type_id))
+                .collect();
+            let structural = self.types.object_type(properties);
             let constructor = self.types.constructor_type(symbol, Vec::new(), structural);
             self.symbol_types[symbol.get() as usize] = constructor;
         }
@@ -12228,6 +12271,51 @@ impl<'src> Binder<'src> {
         }
     }
 
+    /// Refresh a pure namespace's constructor with body-checked member
+    /// types. Bind-time member slots are unresolved placeholders, so the
+    /// constructor built in `bind_namespace` is refreshed here, after the
+    /// body has been checked, with the same value-member filter. Merged
+    /// partners keep their own owners; unknown statements are skipped.
+    fn finalize_namespace_constructor(&mut self, statement_id: NodeId) {
+        let mut target = None;
+        for binding in &self.namespace_declarations {
+            if binding.declaration_id == statement_id {
+                target = Some(binding.symbol);
+                break;
+            }
+        }
+        let Some(symbol) = target else {
+            return;
+        };
+        if self.symbols[symbol.get() as usize].kind != SymbolKind::Namespace {
+            return;
+        }
+        let mut member_types = Vec::new();
+        if let Some(export_scope) = self.namespace_export_scopes.get(&symbol) {
+            for (name, member) in &self.scopes[export_scope.0 as usize].values {
+                let kind = self.symbols[member.get() as usize].kind;
+                if matches!(
+                    kind,
+                    SymbolKind::Interface | SymbolKind::TypeAlias | SymbolKind::TypeParameter
+                ) {
+                    continue;
+                }
+                member_types.push((name.clone(), self.symbol_types[member.get() as usize]));
+            }
+        }
+        let properties = member_types
+            .into_iter()
+            .map(|(name, type_id)| PropertyType::new(name, false, type_id))
+            .collect();
+        let structural = self.types.object_type(properties);
+        let constructor = self.types.constructor_type(symbol, Vec::new(), structural);
+        // Seal both the slot and the lazy state: an earlier lazy build
+        // may have sealed an empty structural, and resolve-path readers
+        // must see the same constructor as direct slot readers.
+        self.symbol_types[symbol.get() as usize] = constructor;
+        self.type_state[symbol.get() as usize] = TypeState::Done(constructor);
+    }
+
     fn resolve_statement(&mut self, statement: &'src crate::syntax::Stmt, scope: ScopeId) {
         match statement.data() {
             Statement::Variable(variable) => self.resolve_variable(variable, scope, true),
@@ -12699,6 +12787,7 @@ impl<'src> Binder<'src> {
                 self.resolve_statements(&namespace.body.data().statements, child);
                 let popped = self.active_namespace_declarations.pop();
                 debug_assert_eq!(popped, Some(statement.id()));
+                self.finalize_namespace_constructor(statement.id());
             }
             Statement::Declare(inner) => {
                 self.ambient_stack.push(true);
@@ -18785,6 +18874,11 @@ impl<'src> Binder<'src> {
                         .get(&symbol)
                         .copied()
                         .unwrap_or(self.symbol_types[symbol.get() as usize]),
+                    SymbolKind::Enum => self
+                        .enum_constructor_types
+                        .get(&symbol)
+                        .copied()
+                        .unwrap_or(self.symbol_types[symbol.get() as usize]),
                     _ => self.symbol_types[symbol.get() as usize],
                 }
             }
@@ -18802,6 +18896,11 @@ impl<'src> Binder<'src> {
                             Some(symbol) => match self.symbols[symbol.get() as usize].kind {
                                 SymbolKind::Class => self
                                     .class_constructor_types
+                                    .get(&symbol)
+                                    .copied()
+                                    .unwrap_or(self.symbol_types[symbol.get() as usize]),
+                                SymbolKind::Enum => self
+                                    .enum_constructor_types
                                     .get(&symbol)
                                     .copied()
                                     .unwrap_or(self.symbol_types[symbol.get() as usize]),
@@ -21668,6 +21767,11 @@ impl<'src> Binder<'src> {
                         .get(&symbol)
                         .copied()
                         .unwrap_or(self.symbol_types[symbol.get() as usize]),
+                    SymbolKind::Enum => self
+                        .enum_constructor_types
+                        .get(&symbol)
+                        .copied()
+                        .unwrap_or(self.symbol_types[symbol.get() as usize]),
                     _ => self.symbol_types[symbol.get() as usize],
                 };
                 self.narrowed_type(symbol, declared)
@@ -24225,6 +24329,13 @@ impl<'src> Binder<'src> {
 
     pub(crate) fn declared_value(&mut self, symbol: SymbolId) -> DemandResult<TypeId> {
         self.check_cancel()?;
+        // Enum value positions take the member-bearing constructor, not
+        // the header instance type: `const copy = E` is `typeof E`.
+        if self.symbols.get(symbol.get() as usize).map(|s| s.kind()) == Some(SymbolKind::Enum)
+            && let Some(constructor) = self.enum_constructor_types.get(&symbol)
+        {
+            return Ok(DemandPoll::Ready(*constructor));
+        }
         if let Some(type_id) = self.symbol_types.get(symbol.get() as usize)
             && *type_id != self.types.error_type()
             && *type_id != self.types.any()
