@@ -20244,6 +20244,8 @@ impl<'src> Binder<'src> {
                     head
                 }
             }
+            // Defensive fallback: `bind_enum` seals every enum symbol Done
+            // eagerly, so this arm runs only if a future path reopens one.
             TypeDef::Enum { numeric } => {
                 if numeric {
                     self.types.numeric_enum(symbol)

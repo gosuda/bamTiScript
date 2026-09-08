@@ -3691,39 +3691,6 @@ mod tests {
         let verdict = compare_diagnostics(&[], &actual, &code_map);
         assert_eq!(verdict, FacetVerdict::Pass);
     }
-    /// TEMP PROBE round 3: forward-order namespace value read.
-    #[test]
-    fn tmprobe_forward_ns_value_read() {
-        let case_text = "const ok: { x: number } = M;\nnamespace M {\n    export const x = 1;\n}\n";
-        let units = split_case_units("tests/cases/compiler/tmForwardNs.ts", case_text);
-        let entry = entry_virtual_path("tests/cases/compiler/tmForwardNs.ts", &units);
-        let case = compile_case(&units, &entry).expect("case compiles");
-        let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
-        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
-        let codes: Vec<_> = actual
-            .iter()
-            .map(|d| (d.code.clone(), d.position.line))
-            .collect();
-        assert!(actual.is_empty(), "forward-ns codes: {codes:?}");
-    }
-
-    /// TEMP PROBE round 3: merged enum+namespace alias member reads.
-    #[test]
-    fn tmprobe_merged_enum_ns_alias() {
-        let case_text = "enum E {\n    A = 1,\n}\nnamespace E {\n    export const x = 1;\n}\nconst alias = E;\nalias.x;\nalias.A;\n";
-        let units = split_case_units("tests/cases/compiler/tmMergedEnumNs.ts", case_text);
-        let entry = entry_virtual_path("tests/cases/compiler/tmMergedEnumNs.ts", &units);
-        let case = compile_case(&units, &entry).expect("case compiles");
-        let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
-        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
-        let codes: Vec<_> = actual
-            .iter()
-            .map(|d| (d.code.clone(), d.position.line))
-            .collect();
-        assert!(actual.is_empty(), "merged-enum-ns codes: {codes:?}");
-    }
 
     /// Regression: heterogeneous enums keep a reverse-mapping index when
     /// any member is numeric. Scalar classification stays all-members;
@@ -3842,12 +3809,14 @@ mod tests {
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
 
-    /// TEMP PROBE round 3: nested namespace structural assignment.
+    /// Regression: nested namespaces contribute finalized constructors.
+    /// The inner namespace finalizes before the outer snapshots it, so
+    /// the outer structural carries the inner member types, not a shell.
     #[test]
-    fn tmprobe_nested_ns_assign() {
+    fn nested_namespace_structural_assignment() {
         let case_text = "namespace A {\n    export namespace B {\n        export const x = 1;\n    }\n}\nconst v: { B: { x: number } } = A;\n";
-        let units = split_case_units("tests/cases/compiler/tmNestedNs.ts", case_text);
-        let entry = entry_virtual_path("tests/cases/compiler/tmNestedNs.ts", &units);
+        let units = split_case_units("tests/cases/compiler/nestedNamespaceAssign.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/nestedNamespaceAssign.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
         let mut actual = collect_facet_diagnostics(&case);
@@ -3856,7 +3825,7 @@ mod tests {
             .iter()
             .map(|d| (d.code.clone(), d.position.line))
             .collect();
-        assert!(actual.is_empty(), "nested-ns codes: {codes:?}");
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
 
     /// Regression: two diagnostics at the same line/column in different files
@@ -4691,7 +4660,7 @@ export const a2 = 3;
     #[test]
     fn emit_types_interface_namespace_merge_keeps_members() {
         let logical = "tests/cases/compiler/interfaceNamespaceMergePin.ts";
-        let case_text = "interface M {\n    value: number;\n}\nnamespace M {\n    export const tag = 1;\n}\ndeclare const m: M;\nm.value;\n";
+        let case_text = "interface M {\n    value: number;\n}\nnamespace M {\n    export const tag = 1;\n}\ndeclare const m: M;\nm.value;\nM.tag;\n";
         let units = split_case_units(logical, case_text);
         let entry = entry_virtual_path(logical, &units);
         let case = compile_case(&units, &entry).expect("case compiles");
@@ -4699,6 +4668,10 @@ export const a2 = 3;
         assert!(
             emitted.lines().any(|line| line == ">m.value : number"),
             "missing `>m.value : number`:\n{emitted}"
+        );
+        assert!(
+            emitted.lines().any(|line| line == ">M.tag : 1"),
+            "missing `>M.tag : 1`:\n{emitted}"
         );
     }
 
@@ -4714,8 +4687,8 @@ export const a2 = 3;
         let case = compile_case(&units, &entry).expect("case compiles");
         let emitted = emit_types_baseline(&case, logical);
         assert!(
-            !emitted.contains("NOT_CALLABLE"),
-            "merged function not callable:\n{emitted}"
+            emitted.lines().any(|line| line == ">f : () => void"),
+            "merged function lost its callable type:\n{emitted}"
         );
         assert!(
             emitted.lines().any(|line| line == ">f.x : 1"),
