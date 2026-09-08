@@ -180,6 +180,9 @@ pub enum ScopeKind {
     For,
     Catch,
     Class,
+    /// A class static block: a `var`-hoist boundary like a function body,
+    /// but block-like for function-declaration and overload rules.
+    StaticBlock,
     Namespace,
     /// Marks the body of a sloppy-mode `with` statement. Unresolved value
     /// references inside this scope may bind to the runtime object instead.
@@ -238,6 +241,33 @@ impl Scope {
     pub fn type_binding(&self, name: &str) -> Option<SymbolId> {
         self.types.get(name).copied()
     }
+}
+
+/// Resolves a value name from `scope` outward through its ancestors. Class
+/// and interface member scopes collect member declarations for the type
+/// layer, but upstream never exposes them as bare lexical bindings: `foo`
+/// in a method body does not see the property `foo`. Type parameters live
+/// in `types` and the class's own name is a Class binding, so both stay
+/// visible. [`Binder::lookup_value`] and [`SemanticModel::lookup_value`]
+/// share this rule so post-check consumers observe checker resolution.
+fn lookup_value_in(
+    scopes: &[Scope],
+    symbols: &[Symbol],
+    scope: ScopeId,
+    name: &str,
+) -> Option<SymbolId> {
+    let mut current = Some(scope);
+    while let Some(id) = current {
+        let scope = &scopes[id.0 as usize];
+        if let Some(symbol) = scope.values.get(name)
+            && (scope.kind != ScopeKind::Class
+                || symbols[symbol.get() as usize].kind == SymbolKind::Class)
+        {
+            return Some(*symbol);
+        }
+        current = scope.parent;
+    }
+    None
 }
 
 /// What a bound name declares. This drives namespace membership and whether a
@@ -5722,15 +5752,7 @@ impl SemanticModel {
     /// Resolves a value name from `scope` outward through its ancestors.
     #[must_use]
     pub fn lookup_value(&self, scope: ScopeId, name: &str) -> Option<SymbolId> {
-        let mut current = Some(scope);
-        while let Some(id) = current {
-            let scope = &self.scopes[id.0 as usize];
-            if let Some(symbol) = scope.values.get(name) {
-                return Some(*symbol);
-            }
-            current = scope.parent;
-        }
-        None
+        lookup_value_in(&self.scopes, &self.symbols, scope, name)
     }
 
     /// Resolves a type name from `scope` outward through its ancestors.
@@ -9993,7 +10015,11 @@ impl<'src> Binder<'src> {
             let node = &self.scopes[current.0 as usize];
             if matches!(
                 node.kind,
-                ScopeKind::Class | ScopeKind::Function | ScopeKind::Module | ScopeKind::Namespace
+                ScopeKind::Class
+                    | ScopeKind::Function
+                    | ScopeKind::Module
+                    | ScopeKind::Namespace
+                    | ScopeKind::StaticBlock
             ) {
                 return current;
             }
@@ -12064,7 +12090,11 @@ impl<'src> Binder<'src> {
                 .is_some_and(|namespace_scope| *namespace_scope == scope);
         if !matches!(
             kind,
-            ScopeKind::Global | ScopeKind::Module | ScopeKind::Namespace | ScopeKind::Block
+            ScopeKind::Global
+                | ScopeKind::Module
+                | ScopeKind::Namespace
+                | ScopeKind::Block
+                | ScopeKind::StaticBlock
         ) && !is_namespace_body
         {
             return;
@@ -12174,7 +12204,11 @@ impl<'src> Binder<'src> {
             Statement::Function(function) => {
                 if self.es5 && self.scopes[scope.0 as usize].strict {
                     match self.scopes[scope.0 as usize].kind {
-                        ScopeKind::Block | ScopeKind::For | ScopeKind::Catch | ScopeKind::With => {
+                        ScopeKind::Block
+                        | ScopeKind::For
+                        | ScopeKind::Catch
+                        | ScopeKind::With
+                        | ScopeKind::StaticBlock => {
                             let range = function
                                 .function
                                 .name
@@ -15531,9 +15565,9 @@ impl<'src> Binder<'src> {
             }
             ClassMember::StaticBlock(block) => {
                 // Static blocks are `var`-hoist boundaries like function
-                // bodies: upstream scopes a block `var` to the block, never
-                // to the class member table.
-                let child = self.new_scope(ScopeKind::Function, Some(scope));
+                // bodies, but block-like for function-declaration and
+                // overload rules (see `ScopeKind::StaticBlock`).
+                let child = self.new_scope(ScopeKind::StaticBlock, Some(scope));
                 let new_target_marker = self.new_target_contexts.len();
                 self.new_target_contexts.push(false);
                 let derived = self.class_derived_stack.last().copied().unwrap_or(false);
@@ -18354,6 +18388,7 @@ impl<'src> Binder<'src> {
                 ScopeKind::Module | ScopeKind::Global | ScopeKind::Namespace => return false,
                 ScopeKind::Function
                 | ScopeKind::Class
+                | ScopeKind::StaticBlock
                 | ScopeKind::Block
                 | ScopeKind::For
                 | ScopeKind::Catch => {}
@@ -18421,7 +18456,10 @@ impl<'src> Binder<'src> {
                 return false;
             }
             match self.scopes[scope.0 as usize].kind {
-                ScopeKind::Function | ScopeKind::Global | ScopeKind::Module => return true,
+                ScopeKind::Function
+                | ScopeKind::Global
+                | ScopeKind::Module
+                | ScopeKind::StaticBlock => return true,
                 _ => {}
             }
             let Some(parent) = self.scopes[scope.0 as usize].parent else {
@@ -18462,7 +18500,7 @@ impl<'src> Binder<'src> {
                     }
                     return scope;
                 }
-                ScopeKind::Class => return scope,
+                ScopeKind::Class | ScopeKind::StaticBlock => return scope,
                 ScopeKind::Block | ScopeKind::For | ScopeKind::Catch | ScopeKind::With => {
                     scope = self.scopes[scope.0 as usize]
                         .parent
@@ -18480,23 +18518,7 @@ impl<'src> Binder<'src> {
     }
 
     pub(crate) fn lookup_value(&self, scope: ScopeId, name: &str) -> Option<SymbolId> {
-        let mut current = Some(scope);
-        while let Some(id) = current {
-            let scope = &self.scopes[id.0 as usize];
-            // Class and interface member scopes collect member declarations
-            // for the type layer, but upstream never exposes them as bare
-            // lexical bindings: `foo` in a method body does not see the
-            // property `foo`. Type parameters live in `types` and the
-            // class's own name is a Class binding, so both stay visible.
-            if let Some(symbol) = scope.values.get(name)
-                && (scope.kind != ScopeKind::Class
-                    || self.symbols[symbol.get() as usize].kind == SymbolKind::Class)
-            {
-                return Some(*symbol);
-            }
-            current = scope.parent;
-        }
-        None
+        lookup_value_in(&self.scopes, &self.symbols, scope, name)
     }
 
     pub(crate) fn lookup_type(&self, scope: ScopeId, name: &str) -> Option<SymbolId> {
@@ -26264,6 +26286,33 @@ mod tests {
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
+    #[test]
+    fn semantic_model_lookup_agrees_with_checker_on_bare_member_names() {
+        let (model, _) = bound("let foo = 0; class C { foo = 1; m() { return foo; } }");
+        let outer = model
+            .lookup_value(model.module_scope(), "foo")
+            .expect("outer foo binds");
+        let method = model
+            .scopes()
+            .iter()
+            .enumerate()
+            .find(|(_, scope)| {
+                scope.kind() == ScopeKind::Function
+                    && scope
+                        .parent()
+                        .is_some_and(|parent| model.scope(parent).kind() == ScopeKind::Class)
+            })
+            .map(|(index, _)| super::ScopeId(index as u32))
+            .expect("method scope exists");
+        assert_eq!(model.lookup_value(method, "foo"), Some(outer));
+    }
+
+    #[test]
+    fn static_block_var_shadows_outer_bindings() {
+        let (_, diagnostics) =
+            bound("let x = 0; class C { static { var x = 1; const y: number = x; } }");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
     #[test]
     fn this_member_access_still_resolves() {
         let (_, diagnostics) = bound("class C { foo = 1; bar() { return this.foo; } }");
