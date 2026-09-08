@@ -1931,6 +1931,22 @@ mod tests {
         );
         assert_eq!(codes(&source), [JSX_ATTRIBUTES_NOT_ASSIGNABLE.as_str()]);
     }
+
+    /// A bare tag over a union of function types with identical props
+    /// must union the member returns: merged groups would select the
+    /// first member and stay silent, per-member groups report the
+    /// second member's return on a narrowed annotation.
+    #[test]
+    fn bare_function_union_tag_unions_member_returns() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             declare const Comp: ((props: {{ a: string }}) => string) | ((props: {{ a: string }}) => number); \
+             const ok: string | number = <Comp a=\"s\" />; \
+             const narrowed: string = <Comp a=\"s\" />;"
+        );
+        assert_eq!(codes(&source), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
     /// A dotted member whose property type is a union must distribute its
     /// members through the same per-shape views an ordinary call uses;
     /// every member admits the given props and the result unions every
