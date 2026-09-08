@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use bamts_bytecode::{EcmaString, EcmaStringBuilder, NumberBits, format_number};
 
-use crate::checker::{SemanticModel, SymbolId, SymbolKind};
+use crate::checker::{EnumBindingView, SemanticModel, Symbol, SymbolId, SymbolKind};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::literal::{cook_escapes, number_value, string_value};
 use crate::source::{SourceId, TextRange};
@@ -383,6 +383,55 @@ enum Evaluated {
     ImportedInvalid,
 }
 
+/// Minimal lexical read view needed by enum scalar evaluation: reference
+/// resolution by node, symbol kind/name lookup for the NaN/Infinity
+/// intrinsics, and the resolved-reference sweep for const uses.  Implemented
+/// by the typed [`SemanticModel`] and by the bootstrap [`EnumBindingView`],
+/// so one evaluator serves both without a dummy model.
+pub(crate) trait EnumLexicalView {
+    /// Symbol a reference resolved to (identifier or alias node).
+    fn enum_reference(&self, node: NodeId) -> Option<SymbolId>;
+
+    /// Bound symbol by identity (used only for the NaN/Infinity intrinsics).
+    fn enum_symbol(&self, id: SymbolId) -> &Symbol;
+
+    /// Every resolved reference by node, for the const-use sweep.
+    fn enum_references(&self) -> impl Iterator<Item = (NodeId, SymbolId)> + '_;
+}
+
+impl EnumLexicalView for SemanticModel {
+    fn enum_reference(&self, node: NodeId) -> Option<SymbolId> {
+        self.reference(node)
+    }
+
+    fn enum_symbol(&self, id: SymbolId) -> &Symbol {
+        self.symbol(id)
+    }
+
+    fn enum_references(&self) -> impl Iterator<Item = (NodeId, SymbolId)> + '_ {
+        self.references()
+    }
+}
+
+impl EnumLexicalView for EnumBindingView<'_> {
+    fn enum_reference(&self, node: NodeId) -> Option<SymbolId> {
+        self.references
+            .get(&node)
+            .or_else(|| self.reference_aliases.get(&node))
+            .copied()
+    }
+
+    fn enum_symbol(&self, id: SymbolId) -> &Symbol {
+        &self.symbols[id.get() as usize]
+    }
+
+    fn enum_references(&self) -> impl Iterator<Item = (NodeId, SymbolId)> + '_ {
+        self.references
+            .iter()
+            .map(|(&node, &symbol)| (node, symbol))
+    }
+}
+
 /// Builds checked enum facts after binding and reference resolution.
 #[expect(
     clippy::too_many_arguments,
@@ -415,12 +464,84 @@ pub(crate) fn build(
     )
 }
 
+/// Builds checked enum facts from the typed semantic model.
 #[expect(
     clippy::too_many_arguments,
     reason = "enum fact construction with imports takes the full checker binding/use tables"
 )]
 pub(crate) fn build_with_imports(
     model: &SemanticModel,
+    source: &crate::syntax::SourceFile,
+    source_id: SourceId,
+    bindings: &[EnumDeclarationBinding<'_>],
+    member_symbols: &HashMap<NodeId, SymbolId>,
+    member_names: &HashMap<NodeId, EcmaString>,
+    direct_member_uses: &HashSet<NodeId>,
+    local_member_targets: &HashMap<NodeId, SymbolId>,
+    imported_member_uses: &HashMap<NodeId, ImportedEnumMemberUse>,
+    imported_member_targets: &HashSet<NodeId>,
+    imported_values: &HashMap<NodeId, ImportedConstEnumValue>,
+) -> (EnumFacts, Vec<Diagnostic>) {
+    build_with_imports_view(
+        model,
+        source,
+        source_id,
+        bindings,
+        member_symbols,
+        member_names,
+        direct_member_uses,
+        local_member_targets,
+        imported_member_uses,
+        imported_member_targets,
+        imported_values,
+    )
+}
+
+/// Builds checked enum facts from a retained lexical binder's view before any
+/// typed checking, e.g. `build_with_imports_from_inventory(
+/// &binder.enum_binding_view(), ...)`.  Shares the evaluator with
+/// [`build_with_imports`]; no dummy model is constructed.  The returned facts
+/// carry the final local const-enum member scalars in `const_enum_members`,
+/// which the cross-file fixed point reads to populate the next round's
+/// `imported_values` until no member stays `Pending`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "inventory entry mirrors build_with_imports"
+)]
+pub(crate) fn build_with_imports_from_inventory<V: EnumLexicalView + ?Sized>(
+    view: &V,
+    source: &crate::syntax::SourceFile,
+    source_id: SourceId,
+    bindings: &[EnumDeclarationBinding<'_>],
+    member_symbols: &HashMap<NodeId, SymbolId>,
+    member_names: &HashMap<NodeId, EcmaString>,
+    direct_member_uses: &HashSet<NodeId>,
+    local_member_targets: &HashMap<NodeId, SymbolId>,
+    imported_member_uses: &HashMap<NodeId, ImportedEnumMemberUse>,
+    imported_member_targets: &HashSet<NodeId>,
+    imported_values: &HashMap<NodeId, ImportedConstEnumValue>,
+) -> (EnumFacts, Vec<Diagnostic>) {
+    build_with_imports_view(
+        view,
+        source,
+        source_id,
+        bindings,
+        member_symbols,
+        member_names,
+        direct_member_uses,
+        local_member_targets,
+        imported_member_uses,
+        imported_member_targets,
+        imported_values,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "enum fact construction with imports takes the full checker binding/use tables"
+)]
+fn build_with_imports_view<V: EnumLexicalView + ?Sized>(
+    view: &V,
     source: &crate::syntax::SourceFile,
     source_id: SourceId,
     bindings: &[EnumDeclarationBinding<'_>],
@@ -560,7 +681,7 @@ pub(crate) fn build_with_imports(
                     Some(initializer) => evaluate(
                         initializer,
                         entry,
-                        model,
+                        view,
                         source,
                         &entries,
                         &symbol_to_entry,
@@ -715,7 +836,7 @@ pub(crate) fn build_with_imports(
         );
     }
     for reference in direct_member_uses {
-        let Some(symbol) = model.reference(*reference) else {
+        let Some(symbol) = view.enum_reference(*reference) else {
             continue;
         };
         let Some(index) = symbol_to_entry.get(&symbol) else {
@@ -735,7 +856,7 @@ pub(crate) fn build_with_imports(
             facts.const_uses.insert(*reference, value.clone());
         }
     }
-    for (reference, symbol) in model.references() {
+    for (reference, symbol) in view.enum_references() {
         let Some(index) = symbol_to_entry.get(&symbol) else {
             continue;
         };
@@ -747,6 +868,23 @@ pub(crate) fn build_with_imports(
             facts.const_uses.insert(reference, value.clone());
         }
     }
+    for reference in imported_member_uses.keys() {
+        if let Some(ImportedConstEnumValue::Constant(value)) = imported_values.get(reference) {
+            facts.const_uses.insert(*reference, value.clone());
+        }
+        if imported_member_targets.contains(reference)
+            && matches!(
+                imported_values.get(reference),
+                Some(
+                    ImportedConstEnumValue::Constant(_)
+                        | ImportedConstEnumValue::Nonconstant
+                        | ImportedConstEnumValue::Cycle,
+                )
+            )
+        {
+            facts.const_enum_member_targets.insert(*reference);
+        }
+    }
     (facts, diagnostics)
 }
 
@@ -754,10 +892,10 @@ pub(crate) fn build_with_imports(
     clippy::too_many_arguments,
     reason = "const-enum expression evaluation needs the member tables and import value maps"
 )]
-fn evaluate(
+fn evaluate<V: EnumLexicalView + ?Sized>(
     expression: &Expr,
     current: &MemberEntry<'_>,
-    model: &SemanticModel,
+    view: &V,
     source: &crate::syntax::SourceFile,
     entries: &[MemberEntry<'_>],
     symbol_to_entry: &HashMap<SymbolId, usize>,
@@ -812,13 +950,13 @@ fn evaluate(
                 .unwrap_or(Evaluated::Runtime)
         }
         Expression::Identifier(_) => {
-            let Some(symbol) = model.reference(expression.id()) else {
+            let Some(symbol) = view.enum_reference(expression.id()) else {
                 return Evaluated::Runtime;
             };
-            if matches!(model.symbol(symbol).kind(), SymbolKind::IntrinsicValue)
-                && matches!(model.symbol(symbol).name(), "NaN" | "Infinity")
+            if matches!(view.enum_symbol(symbol).kind(), SymbolKind::IntrinsicValue)
+                && matches!(view.enum_symbol(symbol).name(), "NaN" | "Infinity")
             {
-                return Evaluated::Constant(number(if model.symbol(symbol).name() == "NaN" {
+                return Evaluated::Constant(number(if view.enum_symbol(symbol).name() == "NaN" {
                     f64::NAN
                 } else {
                     f64::INFINITY
@@ -836,7 +974,7 @@ fn evaluate(
             )
         }
         Expression::Member(member) if !member.optional => {
-            let Some(enum_symbol) = model.reference(member.object.id()) else {
+            let Some(enum_symbol) = view.enum_reference(member.object.id()) else {
                 return Evaluated::Runtime;
             };
             let Some(name) = cook_member_property_name(source, &member.property) else {
@@ -863,7 +1001,7 @@ fn evaluate(
         Expression::Unary(unary) => match evaluate(
             &unary.argument,
             current,
-            model,
+            view,
             source,
             entries,
             symbol_to_entry,
@@ -898,7 +1036,7 @@ fn evaluate(
             let left = evaluate(
                 &binary.left,
                 current,
-                model,
+                view,
                 source,
                 entries,
                 symbol_to_entry,
@@ -912,7 +1050,7 @@ fn evaluate(
             let right = evaluate(
                 &binary.right,
                 current,
-                model,
+                view,
                 source,
                 entries,
                 symbol_to_entry,

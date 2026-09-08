@@ -142,12 +142,61 @@ impl InferenceParameter {
     }
 }
 
+/// Fresh-literal provenance carried by one inference candidate: whether
+/// the argument expression the candidate flowed from was a fresh literal.
+/// Freshness is data flow — a nonfresh value (a variable, call result,
+/// assertion, or spread) does not become fresh by appearing inside a fresh
+/// array literal — so the flag travels with each candidate instead of the
+/// argument slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CandidateFreshness {
+    /// The candidate flowed from a fresh array literal whose elements are
+    /// themselves fresh literals; its literal element type may widen even
+    /// when the type parameter is returned naked.
+    fresh_array_literal: bool,
+    /// The candidate flowed from a fresh primitive literal (number, string,
+    /// boolean, bigint); it only widens when the type parameter is nested.
+    fresh_primitive_literal: bool,
+}
+
+impl CandidateFreshness {
+    /// Candidate from an argument expression that is not a fresh literal.
+    pub const NONFRESH: Self = Self {
+        fresh_array_literal: false,
+        fresh_primitive_literal: false,
+    };
+
+    /// Candidate from a fresh array literal of fresh literal elements.
+    pub const FRESH_ARRAY_LITERAL: Self = Self {
+        fresh_array_literal: true,
+        fresh_primitive_literal: false,
+    };
+
+    /// Candidate from a fresh primitive literal argument.
+    pub const FRESH_PRIMITIVE_LITERAL: Self = Self {
+        fresh_array_literal: false,
+        fresh_primitive_literal: true,
+    };
+
+    /// True when the candidate flowed from a fresh array literal.
+    #[must_use]
+    pub const fn fresh_array_literal(self) -> bool {
+        self.fresh_array_literal
+    }
+
+    /// True when the candidate flowed from a fresh primitive literal.
+    #[must_use]
+    pub const fn fresh_primitive_literal(self) -> bool {
+        self.fresh_primitive_literal
+    }
+}
 /// One candidate type recorded for a type parameter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InferenceCandidate {
     type_id: TypeId,
     priority: InferencePriority,
     source: u32,
+    freshness: CandidateFreshness,
 }
 /// The variance of the position currently being walked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,7 +211,12 @@ pub struct InferredTypeArgument {
     symbol: SymbolId,
     type_id: TypeId,
     provenance: InferenceProvenance,
+    /// True when the winning tier contained a candidate from a fresh array
+    /// literal.
     widen_literal_union: bool,
+    /// True when the winning tier contained a candidate from a fresh
+    /// primitive literal.
+    fresh_literal: bool,
 }
 
 impl InferredTypeArgument {
@@ -184,6 +238,20 @@ impl InferredTypeArgument {
         self.provenance
     }
 
+    /// True when the winning tier contained a candidate from a fresh array
+    /// literal.
+    #[must_use]
+    pub const fn widen_literal_union(&self) -> bool {
+        self.widen_literal_union
+    }
+
+    /// True when the winning tier contained a candidate from a fresh
+    /// primitive literal.
+    #[must_use]
+    pub const fn fresh_literal(&self) -> bool {
+        self.fresh_literal
+    }
+
     /// Creates a resolved argument for `symbol` from `type_id` with the given provenance.
     #[must_use]
     pub const fn new(symbol: SymbolId, type_id: TypeId, provenance: InferenceProvenance) -> Self {
@@ -192,7 +260,22 @@ impl InferredTypeArgument {
             type_id,
             provenance,
             widen_literal_union: false,
+            fresh_literal: false,
         }
+    }
+
+    /// Marks the resolved candidate as coming from a fresh array literal.
+    #[must_use]
+    pub const fn with_widen_literal_union(mut self, widen_literal_union: bool) -> Self {
+        self.widen_literal_union = widen_literal_union;
+        self
+    }
+
+    /// Marks the resolved candidate as coming from a fresh primitive literal.
+    #[must_use]
+    pub const fn with_fresh_literal(mut self, fresh_literal: bool) -> Self {
+        self.fresh_literal = fresh_literal;
+        self
     }
 }
 
@@ -239,24 +322,28 @@ impl InferredTypeArguments {
     }
 
     /// Widens primitive-literal type arguments whose type parameter has no
-    /// `extends` constraint, in place. Constrained parameters and non-literal
-    /// arguments are untouched. The binder calls this after
-    /// [`InferenceContext::resolve`] so the inferred function signature
-    /// matches TypeScript's literal-widening for unconstrained generics
-    /// (`infer(1)` yields `number`), while raw inference preserves literals.
+    /// `extends` constraint and is not the naked top-level return type, in
+    /// place. Constrained parameters, non-literal arguments, and type
+    /// parameters that are returned nakedly are untouched. The binder calls
+    /// this after [`InferenceContext::resolve`] so the inferred function
+    /// signature matches TypeScript's literal-widening: `infer(1)` preserves
+    /// the literal, while `make(1)` widens the nested `value` to `number`.
     pub fn widen_unconstrained_literals(
         &mut self,
         table: &mut TypeTable,
         parameters: &[InferenceParameter],
+        return_type: TypeId,
     ) {
         for argument in self.arguments.iter_mut() {
             let unconstrained = parameters
                 .iter()
                 .find(|parameter| parameter.symbol() == argument.symbol())
                 .is_some_and(|parameter| parameter.constraint().is_none());
-            let literal_union = matches!(table.get(argument.type_id), Type::Union(_));
-            let should_widen = !literal_union || argument.widen_literal_union;
-            if unconstrained && should_widen && is_literal_union(table, argument.type_id) {
+            let is_literal = is_literal_union(table, argument.type_id);
+            let naked = type_parameter_is_naked_return(table, return_type, argument.symbol());
+            let should_widen =
+                is_literal && (argument.widen_literal_union || (argument.fresh_literal && !naked));
+            if unconstrained && should_widen {
                 argument.type_id = table.widen(argument.type_id, false);
             }
         }
@@ -360,7 +447,7 @@ impl InferredTypeArguments {
                         .with_spreadable(property.spreadable())
                     })
                     .collect();
-                let call_signatures = object
+                let call_signatures: Vec<FunctionSignature> = object
                     .call_signatures
                     .iter()
                     .map(|signature| {
@@ -424,15 +511,27 @@ impl InferredTypeArguments {
                     object.async_iterator_property.as_ref().map(|property| {
                         property.with_type_id(self.instantiate_inner(table, property.type_id()))
                     });
-                table.object_type_with_members(ObjectType {
+                let call_signature_count = call_signatures.len();
+                let type_id = table.object_type_with_members(ObjectType {
                     properties,
                     call_signatures,
+                    call_candidate_order: Vec::new(),
                     construct_signatures,
                     index_signatures,
                     generator_return,
                     iterator_property,
                     async_iterator_property,
-                })
+                });
+                debug_assert!(
+                    object.call_candidate_order.is_empty()
+                        || object.call_candidate_order.len() == call_signature_count,
+                    "rebuilt call_signatures must match the length of the inherited candidate order"
+                );
+                if object.call_candidate_order.is_empty() {
+                    type_id
+                } else {
+                    table.with_call_candidate_order(type_id, object.call_candidate_order.clone())
+                }
             }
             Type::Function(signature) => {
                 self.instantiate_function(table, signature.type_parameters(), &signature)
@@ -554,6 +653,9 @@ impl InferredTypeArguments {
             }
         }
         let return_type = self.instantiate_inner(table, signature.return_type());
+        let declared_return = signature
+            .declared_return()
+            .map(|declared| self.instantiate_inner(table, declared));
         let type_id = table.function_with_parameter_bounds(
             type_parameters.to_vec(),
             bounds,
@@ -561,22 +663,64 @@ impl InferredTypeArguments {
             return_type,
             signature.javascript(),
         );
-        if signature.declaring_types().is_empty() {
+        if signature.declaring_types().is_empty() && declared_return.is_none() {
             return type_id;
         }
         let Type::Function(instantiated) = table.get(type_id) else {
             unreachable!("function construction returns a function type");
         };
+        let mut instantiated = instantiated.clone();
+        instantiated.declared_return = declared_return;
         table.function_signature(
-            instantiated
-                .clone()
-                .with_declaring_types(signature.declaring_types().to_vec()),
+            instantiated.with_declaring_types(signature.declaring_types().to_vec()),
         )
     }
 }
-/// Returns true when `type_id` is a primitive literal or a union consisting
-/// only of primitive literals, so unconstrained generic inference can widen it
-/// to its base primitive type.
+/// Returns `true` when `symbol` occurs as the direct return type or in a
+/// top-level union/intersection branch. Applied aliases are expanded before
+/// checking; nested containers are deliberately opaque because they are not
+/// naked return positions.
+fn naked_return_occurrence(
+    table: &mut TypeTable,
+    type_id: TypeId,
+    symbol: SymbolId,
+    seen: &mut HashSet<TypeId>,
+) -> bool {
+    if !seen.insert(type_id) {
+        return false;
+    }
+
+    let result = if let Some(view) = table.prepare_applied_alias_view(type_id) {
+        if view != type_id {
+            naked_return_occurrence(table, view, symbol, seen)
+        } else {
+            false
+        }
+    } else {
+        match table.get(type_id).clone() {
+            Type::Named(candidate) => candidate == symbol,
+            Type::Union(members) | Type::Intersection(members) => members
+                .iter()
+                .copied()
+                .any(|member| naked_return_occurrence(table, member, symbol, seen)),
+            _ => false,
+        }
+    };
+
+    seen.remove(&type_id);
+    result
+}
+
+/// Returns `true` when `symbol` is a naked top-level return type parameter.
+fn type_parameter_is_naked_return(
+    table: &mut TypeTable,
+    return_type: TypeId,
+    symbol: SymbolId,
+) -> bool {
+    let mut seen = HashSet::new();
+    naked_return_occurrence(table, return_type, symbol, &mut seen)
+}
+
 fn is_literal_union(table: &TypeTable, type_id: TypeId) -> bool {
     match table.get(type_id) {
         Type::StringLiteral(_)
@@ -605,7 +749,6 @@ enum AliasInferenceKey {
 pub struct InferenceContext<'table> {
     table: &'table mut TypeTable,
     parameters: Vec<ParameterInference>,
-    fresh_literal_sources: HashSet<u32>,
     active_pairs: HashSet<(TypeId, TypeId)>,
     active_aliases: HashSet<AliasInferenceKey>,
     /// Type parameters whose inferred candidates flowed through an
@@ -646,7 +789,6 @@ impl<'table> InferenceContext<'table> {
                     candidates: Vec::new(),
                 })
                 .collect(),
-            fresh_literal_sources: HashSet::new(),
             active_pairs: HashSet::new(),
             active_aliases: HashSet::new(),
             substitute_candidate_symbols: HashSet::new(),
@@ -654,18 +796,33 @@ impl<'table> InferenceContext<'table> {
         }
     }
 
-    /// Marks one call argument as a fresh literal whose nested literal
-    /// candidates use TypeScript's widening inference.
-    pub fn mark_fresh_literal_source(&mut self, source: u32) {
-        self.fresh_literal_sources.insert(source);
-    }
-
     /// Records inferences from one argument against its declared parameter
-    /// type. `argument_type` is covariant: it flows into the parameter.
+    /// type. `argument_type` is covariant: it flows into the parameter. The
+    /// candidates carry no fresh-literal provenance.
     pub fn infer_from_argument(
         &mut self,
         parameter_type: TypeId,
         argument_type: TypeId,
+        source: u32,
+    ) {
+        self.infer_from_argument_with_freshness(
+            parameter_type,
+            argument_type,
+            CandidateFreshness::NONFRESH,
+            source,
+        );
+    }
+
+    /// Records inferences from one argument with explicit fresh-literal
+    /// provenance: `freshness` describes whether the argument expression
+    /// the type flowed from is a fresh literal, so literal-widening
+    /// decisions follow the candidate's own data flow instead of the
+    /// argument slot.
+    pub fn infer_from_argument_with_freshness(
+        &mut self,
+        parameter_type: TypeId,
+        argument_type: TypeId,
+        freshness: CandidateFreshness,
         source: u32,
     ) {
         self.infer_types(
@@ -673,13 +830,21 @@ impl<'table> InferenceContext<'table> {
             argument_type,
             true,
             Variance::Covariant,
+            freshness,
             source,
         );
     }
     /// Records inferences for a whole call: each argument is zipped against
     /// the declared parameters of `signature` in order. Extra arguments and
-    /// missing (optional/rest) parameters are ignored.
-    pub fn infer_from_arguments(&mut self, signature: &FunctionSignature, arguments: &[TypeId]) {
+    /// missing (optional/rest) parameters are ignored. `freshness` is
+    /// indexed by argument position and carries each argument's
+    /// fresh-literal provenance.
+    pub fn infer_from_arguments(
+        &mut self,
+        signature: &FunctionSignature,
+        arguments: &[TypeId],
+        freshness: &[CandidateFreshness],
+    ) {
         for (argument_index, parameter) in signature.parameters().iter().enumerate() {
             if parameter.rest() {
                 // A rest parameter collects arguments[argument_index..], but
@@ -694,9 +859,10 @@ impl<'table> InferenceContext<'table> {
                 }
                 if let Type::Array(element) = self.table.get(parameter.type_id()).clone() {
                     for (offset, &argument_type) in arguments[argument_index..].iter().enumerate() {
-                        self.infer_from_argument(
+                        self.infer_from_argument_with_freshness(
                             element,
                             argument_type,
+                            freshness[argument_index + offset],
                             (argument_index + offset) as u32,
                         );
                     }
@@ -704,9 +870,10 @@ impl<'table> InferenceContext<'table> {
                     let rest_length = arguments.len() - argument_index;
                     for (offset, &argument_type) in arguments[argument_index..].iter().enumerate() {
                         for element in shape.element_types_at_length(offset, rest_length) {
-                            self.infer_from_argument(
+                            self.infer_from_argument_with_freshness(
                                 element,
                                 argument_type,
+                                freshness[argument_index + offset],
                                 (argument_index + offset) as u32,
                             );
                         }
@@ -717,9 +884,10 @@ impl<'table> InferenceContext<'table> {
             if argument_index >= arguments.len() {
                 break;
             }
-            self.infer_from_argument(
+            self.infer_from_argument_with_freshness(
                 parameter.type_id(),
                 arguments[argument_index],
+                freshness[argument_index],
                 argument_index as u32,
             );
         }
@@ -737,14 +905,13 @@ impl<'table> InferenceContext<'table> {
         for index in 0..self.parameters.len() {
             let state = &self.parameters[index];
             let (parameter, candidates) = (state.parameter, state.candidates.clone());
-            let (type_id, provenance, widen_literal_union) =
+            let (type_id, provenance, widen_literal_union, fresh_literal) =
                 self.resolve_parameter(&parameter, &candidates, &resolved);
-            resolved.push(InferredTypeArgument {
-                symbol: parameter.symbol(),
-                type_id,
-                provenance,
-                widen_literal_union,
-            });
+            resolved.push(
+                InferredTypeArgument::new(parameter.symbol(), type_id, provenance)
+                    .with_widen_literal_union(widen_literal_union)
+                    .with_fresh_literal(fresh_literal),
+            );
         }
         InferredTypeArguments {
             arguments: resolved.into_boxed_slice(),
@@ -763,6 +930,7 @@ impl<'table> InferenceContext<'table> {
         symbol: SymbolId,
         type_id: TypeId,
         priority: InferencePriority,
+        freshness: CandidateFreshness,
         source: u32,
     ) {
         if let Some(state) = self
@@ -773,6 +941,7 @@ impl<'table> InferenceContext<'table> {
             state.candidates.push(InferenceCandidate {
                 type_id,
                 priority,
+                freshness,
                 source,
             });
         }
@@ -784,6 +953,7 @@ impl<'table> InferenceContext<'table> {
         argument_type: TypeId,
         naked: bool,
         variance: Variance,
+        freshness: CandidateFreshness,
         source: u32,
     ) {
         // Poll the cancellation token on every recursive entry. A cancelled
@@ -831,11 +1001,18 @@ impl<'table> InferenceContext<'table> {
                     Variance::Covariant if naked => InferencePriority::Top,
                     Variance::Covariant => InferencePriority::Middle,
                 };
-                self.add_candidate(symbol, argument_type, priority, source);
+                self.add_candidate(symbol, argument_type, priority, freshness, source);
             }
             Type::Array(parameter_element) => match self.table.get(argument_type).clone() {
                 Type::Array(argument_element) => {
-                    self.infer_types(parameter_element, argument_element, false, variance, source);
+                    self.infer_types(
+                        parameter_element,
+                        argument_element,
+                        false,
+                        variance,
+                        freshness,
+                        source,
+                    );
                 }
                 Type::Tuple(argument_shape) => {
                     let elements = argument_shape.all_element_types();
@@ -845,7 +1022,14 @@ impl<'table> InferenceContext<'table> {
                         } else {
                             self.table.union(&elements)
                         };
-                        self.infer_types(parameter_element, unioned, false, variance, source);
+                        self.infer_types(
+                            parameter_element,
+                            unioned,
+                            false,
+                            variance,
+                            freshness,
+                            source,
+                        );
                     }
                 }
                 _ => {}
@@ -873,6 +1057,7 @@ impl<'table> InferenceContext<'table> {
                                     argument_element,
                                     false,
                                     variance,
+                                    freshness,
                                     source,
                                 );
                                 back_count += 1;
@@ -896,6 +1081,7 @@ impl<'table> InferenceContext<'table> {
                                 argument_shape.prefix[index],
                                 false,
                                 variance,
+                                freshness,
                                 source,
                             );
                         }
@@ -918,11 +1104,12 @@ impl<'table> InferenceContext<'table> {
                                     middle,
                                     false,
                                     variance,
+                                    freshness,
                                     source,
                                 );
                             }
                             if let Some(rest) = parameter_shape.rest {
-                                self.infer_types(rest, middle, false, variance, source);
+                                self.infer_types(rest, middle, false, variance, freshness, source);
                             }
                             for offset in (back_count + 1)..=parameter_shape.suffix.len() {
                                 let suffix_index = parameter_shape.suffix.len() - offset;
@@ -931,6 +1118,7 @@ impl<'table> InferenceContext<'table> {
                                     middle,
                                     false,
                                     variance,
+                                    freshness,
                                     source,
                                 );
                             }
@@ -943,6 +1131,7 @@ impl<'table> InferenceContext<'table> {
                                 argument_element,
                                 false,
                                 variance,
+                                freshness,
                                 source,
                             );
                         }
@@ -952,7 +1141,7 @@ impl<'table> InferenceContext<'table> {
             }
             Type::Union(members) => {
                 for member in members {
-                    self.infer_types(member, argument_type, false, variance, source);
+                    self.infer_types(member, argument_type, false, variance, freshness, source);
                 }
             }
             Type::ObjectType(object) => {
@@ -975,6 +1164,7 @@ impl<'table> InferenceContext<'table> {
                                 argument_property.type_id(),
                                 false,
                                 variance,
+                                freshness,
                                 source,
                             );
                         }
@@ -986,7 +1176,14 @@ impl<'table> InferenceContext<'table> {
                         self.sync_iterator_yield(parameter_iterator.type_id()),
                         self.sync_iterator_yield(argument_iterator.type_id()),
                     ) {
-                        self.infer_types(parameter_yield, argument_yield, false, variance, source);
+                        self.infer_types(
+                            parameter_yield,
+                            argument_yield,
+                            false,
+                            variance,
+                            freshness,
+                            source,
+                        );
                     }
                 }
             }
@@ -1004,6 +1201,7 @@ impl<'table> InferenceContext<'table> {
                                         first.type_id(),
                                         false,
                                         Variance::Contravariant,
+                                        freshness,
                                         source,
                                     );
                                 }
@@ -1037,6 +1235,7 @@ impl<'table> InferenceContext<'table> {
                                         tuple,
                                         false,
                                         Variance::Contravariant,
+                                        freshness,
                                         source,
                                     );
                                 }
@@ -1052,6 +1251,7 @@ impl<'table> InferenceContext<'table> {
                             actual.type_id(),
                             false,
                             Variance::Contravariant,
+                            freshness,
                             source,
                         );
                     }
@@ -1060,6 +1260,7 @@ impl<'table> InferenceContext<'table> {
                         argument_signature.return_type(),
                         false,
                         variance,
+                        freshness,
                         source,
                     );
                 }
@@ -1081,6 +1282,7 @@ impl<'table> InferenceContext<'table> {
                             argument_argument,
                             false,
                             variance,
+                            freshness,
                             source,
                         );
                     }
@@ -1237,12 +1439,15 @@ impl<'table> InferenceContext<'table> {
         parameter: &InferenceParameter,
         candidates: &[InferenceCandidate],
         earlier: &[InferredTypeArgument],
-    ) -> (TypeId, InferenceProvenance, bool) {
-        let Some((candidate, widen_literal_union)) = self.combine_candidates(candidates) else {
+    ) -> (TypeId, InferenceProvenance, bool, bool) {
+        let Some((candidate, widen_literal_union, fresh_literal)) =
+            self.combine_candidates(candidates)
+        else {
             return if let Some(default) = parameter.default() {
                 (
                     self.substitute_earlier_arguments(default, earlier),
                     InferenceProvenance::Default,
+                    false,
                     false,
                 )
             } else if let Some(constraint) = parameter.constraint() {
@@ -1250,9 +1455,15 @@ impl<'table> InferenceContext<'table> {
                     self.substitute_earlier_arguments(constraint, earlier),
                     InferenceProvenance::Constraint,
                     false,
+                    false,
                 )
             } else {
-                (self.table.unknown(), InferenceProvenance::Unknown, false)
+                (
+                    self.table.unknown(),
+                    InferenceProvenance::Unknown,
+                    false,
+                    false,
+                )
             };
         };
         if let Some(constraint) = parameter.constraint()
@@ -1261,6 +1472,7 @@ impl<'table> InferenceContext<'table> {
             return (
                 self.substitute_earlier_arguments(constraint, earlier),
                 InferenceProvenance::Constraint,
+                false,
                 false,
             );
         }
@@ -1276,6 +1488,7 @@ impl<'table> InferenceContext<'table> {
             candidate,
             InferenceProvenance::Inferred,
             widen_literal_union,
+            fresh_literal,
         )
     }
 
@@ -1301,31 +1514,45 @@ impl<'table> InferenceContext<'table> {
 
     /// Combines the candidates of one parameter into a single type following
     /// the documented priority tiers. Returns `None` with no candidates.
-    fn combine_candidates(&mut self, candidates: &[InferenceCandidate]) -> Option<(TypeId, bool)> {
+    fn combine_candidates(
+        &mut self,
+        candidates: &[InferenceCandidate],
+    ) -> Option<(TypeId, bool, bool)> {
         let best_priority = candidates
             .iter()
             .map(|candidate| candidate.priority)
             .max()?;
         // Naked and nested covariant evidence selects one common supertype.
         // Low-priority contravariant evidence stays in its own tier.
+        let included: Vec<&InferenceCandidate> = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.priority == best_priority
+                    || (best_priority == InferencePriority::Top
+                        && candidate.priority == InferencePriority::Middle)
+            })
+            .collect();
+        // Fresh-literal evidence is ORed across every included candidate
+        // before the type dedup below: the dedup keeps the first candidate
+        // per type, and an earlier nonfresh duplicate must not hide a later
+        // argument's fresh evidence.
+        let widen_literal_union = included
+            .iter()
+            .any(|candidate| candidate.freshness.fresh_array_literal());
+        let fresh_literal = included
+            .iter()
+            .any(|candidate| candidate.freshness.fresh_primitive_literal());
         let mut tier: Vec<&InferenceCandidate> = Vec::new();
-        for candidate in candidates {
-            let include = candidate.priority == best_priority
-                || (best_priority == InferencePriority::Top
-                    && candidate.priority == InferencePriority::Middle);
-            if include
-                && !tier
-                    .iter()
-                    .any(|existing| existing.type_id == candidate.type_id)
+        for candidate in included {
+            if !tier
+                .iter()
+                .any(|existing| existing.type_id == candidate.type_id)
             {
                 tier.push(candidate);
             }
         }
-        let widen_literal_union = tier
-            .iter()
-            .any(|candidate| self.fresh_literal_sources.contains(&candidate.source));
         if tier.len() == 1 {
-            return Some((tier[0].type_id, widen_literal_union));
+            return Some((tier[0].type_id, widen_literal_union, fresh_literal));
         }
         let best = {
             let relations = TypeRelations::new(self.table);
@@ -1345,10 +1572,12 @@ impl<'table> InferenceContext<'table> {
             }
         };
         match (best_priority, best) {
-            (_, Some(best)) => Some((best, widen_literal_union)),
+            (_, Some(best)) => Some((best, widen_literal_union, fresh_literal)),
             // Contravariant candidates with no common subtype keep the first
             // candidate in encounter order; intersection types are not modeled.
-            (InferencePriority::Low, None) => Some((tier[0].type_id, widen_literal_union)),
+            (InferencePriority::Low, None) => {
+                Some((tier[0].type_id, widen_literal_union, fresh_literal))
+            }
             // Covariant candidates from the same argument position must agree;
             // with no common supertype, keep the first candidate so the call
             // argument check reports the mismatch. Candidates from different
@@ -1358,12 +1587,13 @@ impl<'table> InferenceContext<'table> {
                     .iter()
                     .all(|candidate| candidate.source == tier[0].source)
                 {
-                    Some((tier[0].type_id, widen_literal_union))
+                    Some((tier[0].type_id, widen_literal_union, fresh_literal))
                 } else {
                     Some((
                         self.table
                             .union(&tier.iter().map(|c| c.type_id).collect::<Vec<_>>()),
                         widen_literal_union,
+                        fresh_literal,
                     ))
                 }
             }
@@ -1393,7 +1623,7 @@ mod tests {
         let one = table.number_literal("1");
         let mut context =
             InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
-        context.infer_from_arguments(&signature, &[one]);
+        context.infer_from_arguments(&signature, &[one], &[CandidateFreshness::NONFRESH]);
         let inferred = context.resolve();
 
         assert_eq!(inferred.get(parameter(1)), Some(one));
@@ -1421,7 +1651,7 @@ mod tests {
         let strings = table.array(table.string());
         let mut context =
             InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
-        context.infer_from_arguments(&signature, &[strings]);
+        context.infer_from_arguments(&signature, &[strings], &[CandidateFreshness::NONFRESH]);
         let inferred = context.resolve();
 
         assert_eq!(inferred.get(parameter(1)), Some(table.string()));
@@ -1455,7 +1685,11 @@ mod tests {
                 InferenceParameter::new(parameter(2)),
             ],
         );
-        context.infer_from_arguments(&signature, &[numbers, argument_callback]);
+        context.infer_from_arguments(
+            &signature,
+            &[numbers, argument_callback],
+            &[CandidateFreshness::NONFRESH; 2],
+        );
         let inferred = context.resolve();
 
         // The array's middle-priority `number` beats the callback's
@@ -1489,7 +1723,7 @@ mod tests {
         };
         let mut ctx = InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
         // No arguments supplied — fixed param and rest both unsupplied.
-        ctx.infer_from_arguments(&sig, &[]);
+        ctx.infer_from_arguments(&sig, &[], &[]);
         let inferred = ctx.resolve();
         // No panic, and T has no candidates so it falls back to `unknown`.
         assert_eq!(inferred.get(parameter(1)), Some(table.unknown()));
@@ -1516,7 +1750,7 @@ mod tests {
         };
         let string = table.string();
         let mut ctx = InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
-        ctx.infer_from_arguments(&outer_sig, &[string]);
+        ctx.infer_from_arguments(&outer_sig, &[string], &[CandidateFreshness::NONFRESH]);
         let inferred = ctx.resolve();
         assert_eq!(inferred.get(parameter(1)), Some(string));
         // Instantiate the outer return type (the inner function) — T -> string, U preserved.
@@ -1543,7 +1777,7 @@ mod tests {
         let (one, two) = (table.number_literal("1"), table.number_literal("2"));
         let mut context =
             InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
-        context.infer_from_arguments(&signature, &[one, two]);
+        context.infer_from_arguments(&signature, &[one, two], &[CandidateFreshness::NONFRESH; 2]);
         let inferred = context.resolve();
 
         assert_eq!(inferred.get(parameter(1)), Some(table.union(&[one, two])));
@@ -1571,10 +1805,82 @@ mod tests {
         ]);
         let mut context =
             InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
-        context.infer_from_arguments(&signature, &[arg]);
+        context.infer_from_arguments(&signature, &[arg], &[CandidateFreshness::NONFRESH]);
         let inferred = context.resolve();
 
         assert_eq!(inferred.get(parameter(1)), Some(one));
+    }
+
+    /// Two arguments of the same literal type dedup to one candidate, but
+    /// fresh-literal evidence must survive regardless of which argument is
+    /// fresh: an earlier nonfresh duplicate must not hide a later argument's
+    /// fresh evidence (`pick(var, "1")` widens like `pick("1", var)`).
+    #[test]
+    fn duplicate_candidates_keep_fresh_literal_evidence_in_both_orders() {
+        let mut table = TypeTable::new();
+        let t = table.named(parameter(1));
+        let signature = table.function(vec![t, t], t);
+        let Type::Function(signature) = table.get(signature).clone() else {
+            panic!("function type");
+        };
+
+        let one = table.number_literal("1");
+        for freshness in [
+            [
+                CandidateFreshness::NONFRESH,
+                CandidateFreshness::FRESH_PRIMITIVE_LITERAL,
+            ],
+            [
+                CandidateFreshness::FRESH_PRIMITIVE_LITERAL,
+                CandidateFreshness::NONFRESH,
+            ],
+        ] {
+            let mut context =
+                InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
+            context.infer_from_arguments(&signature, &[one, one], &freshness);
+            let inferred = context.resolve();
+            let resolved = inferred
+                .arguments()
+                .iter()
+                .find(|argument| argument.symbol() == parameter(1))
+                .expect("resolved argument");
+            assert!(
+                resolved.fresh_literal(),
+                "primitive fresh evidence lost for {freshness:?}"
+            );
+            assert!(!resolved.widen_literal_union());
+            assert_eq!(inferred.get(parameter(1)), Some(one));
+        }
+
+        // The array-literal flag reads the same deduped tier and must be
+        // order-independent too.
+        let ones = table.array(one);
+        for freshness in [
+            [
+                CandidateFreshness::NONFRESH,
+                CandidateFreshness::FRESH_ARRAY_LITERAL,
+            ],
+            [
+                CandidateFreshness::FRESH_ARRAY_LITERAL,
+                CandidateFreshness::NONFRESH,
+            ],
+        ] {
+            let mut context =
+                InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
+            context.infer_from_arguments(&signature, &[ones, ones], &freshness);
+            let inferred = context.resolve();
+            let resolved = inferred
+                .arguments()
+                .iter()
+                .find(|argument| argument.symbol() == parameter(1))
+                .expect("resolved argument");
+            assert!(
+                resolved.widen_literal_union(),
+                "array fresh evidence lost for {freshness:?}"
+            );
+            assert!(!resolved.fresh_literal());
+            assert_eq!(inferred.get(parameter(1)), Some(ones));
+        }
     }
 
     /// A candidate that supertypes every sibling in its tier wins without a
@@ -1592,7 +1898,11 @@ mod tests {
         for arguments in [[one, number], [number, one]] {
             let mut context =
                 InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
-            context.infer_from_arguments(&signature, &arguments);
+            context.infer_from_arguments(
+                &signature,
+                &arguments,
+                &[CandidateFreshness::NONFRESH; 2],
+            );
             assert_eq!(context.resolve().get(parameter(1)), Some(number));
         }
     }
@@ -1618,17 +1928,29 @@ mod tests {
         // 1 subtypes number, so the literal wins the lower tier.
         let mut context =
             InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
-        context.infer_from_arguments(&signature, &[takes_number, takes_one]);
+        context.infer_from_arguments(
+            &signature,
+            &[takes_number, takes_one],
+            &[CandidateFreshness::NONFRESH; 2],
+        );
         assert_eq!(context.resolve().get(parameter(1)), Some(one));
 
         // string and number are incomparable: encounter order decides.
         let mut context =
             InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
-        context.infer_from_arguments(&signature, &[takes_number, takes_string]);
+        context.infer_from_arguments(
+            &signature,
+            &[takes_number, takes_string],
+            &[CandidateFreshness::NONFRESH; 2],
+        );
         assert_eq!(context.resolve().get(parameter(1)), Some(number));
         let mut context =
             InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
-        context.infer_from_arguments(&signature, &[takes_string, takes_number]);
+        context.infer_from_arguments(
+            &signature,
+            &[takes_string, takes_number],
+            &[CandidateFreshness::NONFRESH; 2],
+        );
         assert_eq!(context.resolve().get(parameter(1)), Some(string));
     }
 
@@ -1732,7 +2054,7 @@ mod tests {
                 InferenceParameter::new(parameter(2)).with_constraint(constraint),
             ],
         );
-        context.infer_from_arguments(&signature, &[string]);
+        context.infer_from_arguments(&signature, &[string], &[CandidateFreshness::NONFRESH]);
         let inferred = context.resolve();
 
         let expected = table.object_type(vec![PropertyType::new("value", false, number)]);
@@ -1767,7 +2089,7 @@ mod tests {
             &mut table,
             &[InferenceParameter::new(parameter(1)).with_constraint(number)],
         );
-        context.infer_from_arguments(&signature, &[string]);
+        context.infer_from_arguments(&signature, &[string], &[CandidateFreshness::NONFRESH]);
         let inferred = context.resolve();
 
         assert_eq!(inferred.get(parameter(1)), Some(number));
@@ -1793,7 +2115,7 @@ mod tests {
             &mut table,
             &[InferenceParameter::new(parameter(1)).with_constraint(number)],
         );
-        context.infer_from_arguments(&signature, &[one]);
+        context.infer_from_arguments(&signature, &[one], &[CandidateFreshness::NONFRESH]);
         let inferred = context.resolve();
 
         assert_eq!(inferred.get(parameter(1)), Some(one));
@@ -1833,7 +2155,11 @@ mod tests {
                 InferenceParameter::new(parameter(2)),
             ],
         );
-        context.infer_from_arguments(&signature, &[argument_pair, string]);
+        context.infer_from_arguments(
+            &signature,
+            &[argument_pair, string],
+            &[CandidateFreshness::NONFRESH; 2],
+        );
         let inferred = context.resolve();
 
         // `T` sees `string` from the property and from the union member;
@@ -1934,7 +2260,11 @@ mod tests {
             let numbers = table.array(table.number());
             let mut context =
                 InferenceContext::new(&mut table, &[InferenceParameter::new(parameter(1))]);
-            context.infer_from_arguments(&signature, &[numbers, one]);
+            context.infer_from_arguments(
+                &signature,
+                &[numbers, one],
+                &[CandidateFreshness::NONFRESH; 2],
+            );
             let inferred = context.resolve();
             let resolved = inferred.get(parameter(1)).expect("resolved");
             table.get(resolved).clone()
@@ -1967,7 +2297,11 @@ mod tests {
                 InferenceParameter::new(parameter(2)),
             ],
         );
-        context.infer_from_arguments(&signature, &[one, string]);
+        context.infer_from_arguments(
+            &signature,
+            &[one, string],
+            &[CandidateFreshness::NONFRESH; 2],
+        );
         let inferred = context.resolve();
 
         assert_eq!(inferred.get(parameter(1)), Some(one));
@@ -2002,7 +2336,7 @@ mod tests {
                 InferenceParameter::new(parameter(2)),
             ],
         );
-        context.infer_from_arguments(&signature, &[one]);
+        context.infer_from_arguments(&signature, &[one], &[CandidateFreshness::NONFRESH]);
         let inferred = context.resolve();
         assert_eq!(inferred.get(parameter(1)), Some(one));
         assert_eq!(inferred.get(parameter(2)), Some(table.unknown()));
@@ -2015,7 +2349,11 @@ mod tests {
                 InferenceParameter::new(parameter(2)),
             ],
         );
-        context.infer_from_arguments(&signature, &[one, string]);
+        context.infer_from_arguments(
+            &signature,
+            &[one, string],
+            &[CandidateFreshness::NONFRESH; 2],
+        );
         let inferred = context.resolve();
         assert_eq!(inferred.get(parameter(1)), Some(one));
         assert_eq!(inferred.get(parameter(2)), Some(string));
@@ -2052,7 +2390,11 @@ mod tests {
                 InferenceParameter::new(parameter(2)),
             ],
         );
-        context.infer_from_arguments(&signature, &[one, string, boolean]);
+        context.infer_from_arguments(
+            &signature,
+            &[one, string, boolean],
+            &[CandidateFreshness::NONFRESH; 3],
+        );
         let inferred = context.resolve();
 
         assert_eq!(inferred.get(parameter(1)), Some(one));
@@ -2060,5 +2402,181 @@ mod tests {
             inferred.get(parameter(2)),
             Some(table.union(&[string, boolean]))
         );
+    }
+
+    /// `with_call_candidate_order` permutations must survive generic
+    /// instantiation of the containing object type, with each signature
+    /// substituted positionally and the same candidate indices re-attached.
+    #[test]
+    fn generic_instantiation_preserves_call_candidate_order() {
+        let mut table = TypeTable::new();
+        let t = table.named(parameter(1));
+        let number = table.number();
+
+        let make_sig = |table: &mut TypeTable, name: &str| {
+            table.function_with_parameters(
+                vec![parameter(1)],
+                vec![FunctionParameter::new(name.to_owned(), t, false, false)],
+                t,
+            )
+        };
+
+        let first = make_sig(&mut table, "x");
+        let second = make_sig(&mut table, "y");
+        let third = make_sig(&mut table, "z");
+
+        let Type::Function(first_sig) = table.get(first).clone() else {
+            panic!("function type");
+        };
+        let Type::Function(second_sig) = table.get(second).clone() else {
+            panic!("function type");
+        };
+        let Type::Function(third_sig) = table.get(third).clone() else {
+            panic!("function type");
+        };
+
+        // Original order is [third, first, second]; selection permutation is
+        // [second, third, first] (indices 2, 0, 1 into the rebuilt vector).
+        let object = table.object_type_with_members(ObjectType {
+            properties: Vec::new(),
+            call_signatures: vec![third_sig.clone(), first_sig.clone(), second_sig.clone()],
+            call_candidate_order: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        });
+        let ordered = table.with_call_candidate_order(object, vec![2, 0, 1]);
+
+        let inferred = InferredTypeArguments::new(vec![InferredTypeArgument::new(
+            parameter(1),
+            number,
+            InferenceProvenance::Explicit,
+        )]);
+        let instantiated = inferred.instantiate(&mut table, ordered);
+
+        let Type::ObjectType(object) = table.get(instantiated).clone() else {
+            panic!("instantiated object type");
+        };
+
+        assert_eq!(object.call_candidate_order, vec![2, 0, 1]);
+        assert_eq!(object.call_signatures.len(), 3);
+        // All return types were T and were substituted to number.
+        for signature in &object.call_signatures {
+            assert_eq!(signature.return_type(), number);
+        }
+    }
+
+    /// The written return annotation (`declared_return`) is substituted through
+    /// the same generic mapping as the semantic `return_type`, so a method can
+    /// render its written annotation while callers see the projected semantic
+    /// type once T4a lands.
+    #[test]
+    fn generic_instantiation_maps_declared_return() {
+        let mut table = TypeTable::new();
+        let t = table.named(parameter(1));
+        let number = table.number();
+        let undefined = table.undefined_type();
+        let declared = table.union(&[t, undefined]);
+
+        let sig = table.function_with_parameters(
+            vec![parameter(1)],
+            vec![FunctionParameter::new("x".to_owned(), t, false, false)],
+            t,
+        );
+
+        // The binder would set `declared_return` on the resolved signature; we
+        // hand-inject it here to test the T5 carry path in isolation.
+        let Type::Function(mut signature) = table.get(sig).clone() else {
+            panic!("function type");
+        };
+        signature.declared_return = Some(declared);
+        let sig = table.function_signature(signature);
+
+        let Type::Function(signature) = table.get(sig).clone() else {
+            panic!("function type");
+        };
+
+        let inferred = InferredTypeArguments::new(vec![InferredTypeArgument::new(
+            parameter(1),
+            number,
+            InferenceProvenance::Explicit,
+        )]);
+        let instantiated = inferred.instantiate_signature(&mut table, &signature);
+
+        let Type::Function(instantiated) = table.get(instantiated).clone() else {
+            panic!("function type");
+        };
+
+        assert_eq!(instantiated.return_type(), number);
+        let expected_declared = table.union(&[number, undefined]);
+        assert_eq!(instantiated.declared_return(), Some(expected_declared));
+    }
+
+    /// An ObjectType carrying both a non-trivial call_candidate_order and
+    /// call signatures with written return annotations must carry both the
+    /// permutation and the declared_return through generic instantiation.
+    #[test]
+    fn object_type_instantiation_carries_declared_return_and_candidate_order() {
+        let mut table = TypeTable::new();
+        let t = table.named(parameter(1));
+        let number = table.number();
+        let undefined = table.undefined_type();
+        let declared = table.union(&[t, undefined]);
+
+        let make_sig = |table: &mut TypeTable, name: &str| {
+            let sig = table.function_with_parameters(
+                vec![parameter(1)],
+                vec![FunctionParameter::new(name.to_owned(), t, false, false)],
+                t,
+            );
+            let Type::Function(mut signature) = table.get(sig).clone() else {
+                panic!("function type");
+            };
+            signature.declared_return = Some(declared);
+            table.function_signature(signature)
+        };
+
+        let first = make_sig(&mut table, "x");
+        let second = make_sig(&mut table, "y");
+
+        let Type::Function(first_sig) = table.get(first).clone() else {
+            panic!("function type");
+        };
+        let Type::Function(second_sig) = table.get(second).clone() else {
+            panic!("function type");
+        };
+
+        let object = table.object_type_with_members(ObjectType {
+            properties: Vec::new(),
+            call_signatures: vec![second_sig.clone(), first_sig.clone()],
+            call_candidate_order: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        });
+        let ordered = table.with_call_candidate_order(object, vec![1, 0]);
+
+        let inferred = InferredTypeArguments::new(vec![InferredTypeArgument::new(
+            parameter(1),
+            number,
+            InferenceProvenance::Explicit,
+        )]);
+        let instantiated = inferred.instantiate(&mut table, ordered);
+
+        let Type::ObjectType(object) = table.get(instantiated).clone() else {
+            panic!("instantiated object type");
+        };
+
+        assert_eq!(object.call_candidate_order, vec![1, 0]);
+        assert_eq!(object.call_signatures.len(), 2);
+        for signature in &object.call_signatures {
+            assert_eq!(signature.return_type(), number);
+            let expected_declared = table.union(&[number, undefined]);
+            assert_eq!(signature.declared_return(), Some(expected_declared));
+        }
     }
 }

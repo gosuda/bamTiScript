@@ -19,11 +19,13 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+use bamts_verification::catalog::parse_case_configuration;
 use bamts_verification::check_cells::{
     CasePragmas, case_stem, compile_case_with_pragmas, emit_types_baseline, entry_virtual_path,
     parse_case_pragmas, split_case_units,
 };
 use bamts_verification::facets::{FacetVerdict, compare_types};
+use bamts_verification::suite::decode_case_source;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -43,6 +45,33 @@ fn baseline_dir() -> PathBuf {
 struct SampleCase {
     logical_path: String,
     cfg: String,
+}
+
+impl SampleCase {
+    /// Pragmas driving compile and baseline selection for this case.
+    ///
+    /// A supplied cfg names the exact catalog configuration to compile (the
+    /// compiler-lane `<variant>` from `<variant>#<observable>`); an empty cfg
+    /// keeps the source-directive behavior (`parse_case_pragmas`, first
+    /// declared value per option). Unknown variants and directive parse
+    /// failures panic: the sampler never silently falls back to a variant
+    /// the caller did not request.
+    fn pragmas(&self, source_text: &str) -> CasePragmas {
+        match self.cfg.as_str() {
+            "" => parse_case_pragmas(source_text),
+            variant => {
+                let configurations = parse_case_configuration(source_text)
+                    .unwrap_or_else(|error| panic!("{}: {error}", self.logical_path));
+                let configuration = configurations
+                    .iter()
+                    .find(|item| item.name == variant)
+                    .unwrap_or_else(|| {
+                        panic!("{}: no configuration `{variant}`", self.logical_path)
+                    });
+                CasePragmas::from_configuration(configuration)
+            }
+        }
+    }
 }
 
 /// Result of analyzing one case.
@@ -464,7 +493,7 @@ fn types_facet_sample() {
 
     for case in &sample {
         let case_path = authority_case_path(&case.logical_path);
-        let source_text = match fs::read_to_string(&case_path) {
+        let source_text = match fs::read(&case_path).map(|bytes| decode_case_source(&bytes)) {
             Ok(text) => text,
             Err(_) => {
                 results.push(AnalysisResult {
@@ -482,7 +511,7 @@ fn types_facet_sample() {
             .unwrap_or(&case.logical_path)
             .to_owned();
 
-        let pragmas = parse_case_pragmas(&source_text);
+        let pragmas = case.pragmas(&source_text);
         if pragmas.no_types_and_symbols {
             results.push(AnalysisResult {
                 case: case.logical_path.clone(),
@@ -800,7 +829,7 @@ fn types_facet_wrong_expr_diagnostic() {
 
     for case in &sample {
         let case_path = authority_case_path(&case.logical_path);
-        let source_text = match fs::read_to_string(&case_path) {
+        let source_text = match fs::read(&case_path).map(|bytes| decode_case_source(&bytes)) {
             Ok(text) => text,
             Err(_) => continue,
         };
@@ -810,7 +839,7 @@ fn types_facet_wrong_expr_diagnostic() {
             .or_else(|| case.logical_path.strip_prefix("conformance/"))
             .unwrap_or(&case.logical_path)
             .to_owned();
-        let pragmas = parse_case_pragmas(&source_text);
+        let pragmas = case.pragmas(&source_text);
         if pragmas.no_types_and_symbols {
             continue;
         }

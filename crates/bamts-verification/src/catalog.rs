@@ -1784,41 +1784,10 @@ fn relative_posix(root: &Path, path: &Path) -> Result<String> {
 
 fn read_text(path: &Path) -> Result<String> {
     let bytes = fs::read(path).map_err(|error| io_error(path, &error))?;
-    let (encoding, payload) = if let Some(payload) = bytes.strip_prefix(&[0xff, 0xfe]) {
-        ("UTF-16LE", payload)
-    } else if let Some(payload) = bytes.strip_prefix(&[0xfe, 0xff]) {
-        ("UTF-16BE", payload)
-    } else {
-        let payload = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
-        return Ok(String::from_utf8_lossy(payload).into_owned());
-    };
-    if payload.len() % 2 != 0 {
-        return Err(VerificationError::new(
-            ErrorCode::Schema,
-            format!(
-                "{}: {encoding} source has an odd byte count",
-                path.display()
-            ),
-        ));
-    }
-    let big_endian = encoding == "UTF-16BE";
-    let code_units = payload.chunks_exact(2).map(|pair| {
-        let bytes = [pair[0], pair[1]];
-        if big_endian {
-            u16::from_be_bytes(bytes)
-        } else {
-            u16::from_le_bytes(bytes)
-        }
-    });
-    String::from_utf16(&code_units.collect::<Vec<_>>()).map_err(|error| {
-        VerificationError::new(
-            ErrorCode::Schema,
-            format!(
-                "{}: source is not valid {encoding}: {error}",
-                path.display()
-            ),
-        )
-    })
+    // One decoding contract with suite verification: odd trailing bytes pad
+    // and malformed units decode lossily (see decode_case_source), so catalog
+    // extract and regenerate accept exactly what the suite accepts.
+    Ok(crate::suite::decode_case_source(&bytes))
 }
 
 fn is_ts_source(path: &str) -> bool {
@@ -2274,5 +2243,27 @@ mod tests {
         let error = check_generated_manifest(&path, b"generated\n").unwrap_err();
         assert_eq!(error.code(), ErrorCode::Digest);
         assert!(error.to_string().contains("catalog regenerate"));
+    }
+
+    /// Catalog extraction must accept exactly what suite verification
+    /// accepts: odd trailing bytes pad and malformed units decode lossily
+    /// through the shared contract instead of failing strict.
+    #[test]
+    fn read_text_shares_suite_lossy_decoding_contract() {
+        let root = scratch("decode-contract");
+        // Odd trailing byte: strict UTF-16 rejects, the suite pads lossy.
+        let odd = [0xFF, 0xFE, b'h', b'i', 0x00];
+        fs::write(root.join("odd.ts"), odd).expect("write odd fixture");
+        // Lone surrogate: strict from_utf16 rejects, the suite emits U+FFFD.
+        let lone = [0xFF, 0xFE, 0x00, 0xD8, b'x', 0x00];
+        fs::write(root.join("lone.ts"), lone).expect("write lone fixture");
+        let odd_text = read_text(&root.join("odd.ts")).expect("odd bytes must decode");
+        assert_eq!(odd_text, crate::suite::decode_case_source(&odd));
+        let lone_text = read_text(&root.join("lone.ts")).expect("lone surrogate must decode");
+        assert_eq!(lone_text, crate::suite::decode_case_source(&lone));
+        assert!(
+            lone_text.contains('\u{FFFD}'),
+            "lossy unit must surface: {lone_text:?}"
+        );
     }
 }

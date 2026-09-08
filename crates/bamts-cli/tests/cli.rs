@@ -1,5 +1,9 @@
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::io::OwnedFd;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -104,6 +108,84 @@ fn api_execution_reports_bounded_resource_exhaustion() {
         .as_str()
         .expect("resource exhaustion is an API error");
     assert!(message.contains("fuel exhausted"), "{message}");
+}
+
+/// Node spawns `--api` with `stdio: "pipe"`, which is a socket pair on Unix;
+/// the transport must serve the inherited descriptor because no pathname can
+/// reopen a socket.
+#[cfg(unix)]
+#[test]
+fn api_transport_serves_socket_backed_stdin() {
+    let directory = ScratchDirectory::new();
+    let (mut peer, child_stdin) = UnixStream::pair().expect("socket pair for child stdin");
+    let child = directory
+        .command()
+        .arg("--api")
+        .current_dir(&directory.path)
+        .stdin(Stdio::from(OwnedFd::from(child_stdin)))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("bamts API child starts");
+
+    let requests = [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "root": directory.path },
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "shutdown",
+        }),
+    ];
+    let mut input = Vec::new();
+    for request in requests {
+        let payload = serde_json::to_vec(&request).expect("API request serializes");
+        input.extend(framed(&payload));
+    }
+    peer.write_all(&input).expect("API requests are written");
+
+    // `peer` stays open across the wait: the child must exit because shutdown
+    // was requested and its reader reaped, not because stdin reached EOF.
+    let output = wait_for_output(child, "bamts --api");
+    drop(peer);
+
+    assert_success(&output, "bamts --api");
+    let canonical_root = fs::canonicalize(&directory.path).expect("session root canonicalizes");
+    let responses = decode_frames(&output.stdout);
+    assert_eq!(
+        responses,
+        vec![
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "root": canonical_root.to_string_lossy(),
+                    "methods": [
+                        "service/open",
+                        "service/update",
+                        "service/close",
+                        "service/snapshot",
+                        "service/completions",
+                        "service/definition",
+                        "service/quickInfo",
+                        "service/references",
+                        "service/rename",
+                        "service/diagnostics",
+                    ],
+                },
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": null,
+            }),
+        ],
+        "initialize and shutdown return exact protocol responses"
+    );
 }
 
 #[test]

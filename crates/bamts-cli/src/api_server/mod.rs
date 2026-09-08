@@ -7,6 +7,8 @@ mod session;
 mod wire;
 
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::thread;
 
@@ -203,8 +205,14 @@ pub fn maybe_run(argv: &[String]) -> Option<i32> {
         return None;
     }
 
+    // fd0 may be a socket (Node `stdio: "pipe"`), which no pathname can reopen;
+    // duplicating the inherited descriptor preserves it. `io::stdin()` itself is
+    // buffered, so it cannot feed the poll-driven reader directly.
     #[cfg(unix)]
-    let result = std::fs::File::open("/dev/stdin")
+    let result = io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .map(std::fs::File::from)
         .and_then(|stdin| serve(PollInput(stdin), io::stdout().lock(), io::stderr().lock()));
     #[cfg(windows)]
     let result = serve(

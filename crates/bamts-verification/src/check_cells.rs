@@ -22,7 +22,9 @@ use std::{
 
 #[cfg(test)]
 use bamts_compiler::checker::Type;
-use bamts_compiler::checker::{SemanticModel, SymbolId, SymbolKind, render_type};
+use bamts_compiler::checker::{
+    DeclarationOccurrence, SemanticModel, SymbolId, SymbolKind, render_type,
+};
 use bamts_compiler::diagnostic::DiagnosticSeverity;
 use bamts_compiler::emitter::{EmitFileNames, EmitOptions, ModuleKind, emit_checked};
 use bamts_compiler::pipeline::{
@@ -1425,9 +1427,21 @@ fn dedup_type_records(mut records: Vec<TypeAnnotation>) -> Vec<TypeAnnotation> {
 
 fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, out: &mut String) {
     let mut records: Vec<TypeAnnotation> = Vec::new();
+    // Symbols covered by interface-member declaration occurrences emit one
+    // record per written occurrence below; the covered symbol's own row is
+    // skipped here so every duplicate declaration gets its own span. The
+    // skip is mandatory and independent of `dedup_type_records`.
+    let occurrence_covered: HashSet<SymbolId> = model
+        .declaration_occurrences()
+        .iter()
+        .map(|occurrence| occurrence.symbol)
+        .collect();
     // Declaration-name records come from source-declared symbols (intrinsics
     // carry an empty range, which the range check below filters out).
     for (index, symbol) in model.symbols().iter().enumerate() {
+        if occurrence_covered.contains(&SymbolId::new(index as u32)) {
+            continue;
+        }
         // Interface declaration names carry no `>name : type` record
         // upstream: `interface I { (): number; }` baselines echo only
         // member records (`duplicateConstructSignature.types`,
@@ -1461,6 +1475,37 @@ fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, ou
             range,
             symbol.name().to_owned(),
             render_type(model, type_id),
+        ) {
+            records.push(annotation);
+        }
+    }
+    // Interface member declaration occurrences: one record per written
+    // occurrence at its own `name_range` — the identifier span, quotes
+    // included for string keys, digits for numeric keys, and the
+    // bracket-delimited `[expr]` span for computed keys. The rendered type
+    // is the member's semantic `symbol_type` (never `declared_return`), and
+    // the symbol loop's exclusions apply against the occurrence's symbol
+    // kind and `name_range`.
+    for occurrence in model.declaration_occurrences() {
+        let symbol = model.symbol(occurrence.symbol);
+        if matches!(
+            symbol.kind(),
+            SymbolKind::TypeParameter | SymbolKind::Interface
+        ) {
+            continue;
+        }
+        if symbol.kind() == SymbolKind::Function && symbol.name() == "constructor" {
+            continue;
+        }
+        let range = occurrence.name_range;
+        if range.start() == range.end() {
+            continue;
+        }
+        if let Some(annotation) = annotation_for(
+            source,
+            range,
+            slice_source(source, range),
+            render_type(model, model.symbol_type(occurrence.symbol)),
         ) {
             records.push(annotation);
         }
@@ -2865,34 +2910,61 @@ pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
     for (unit, output) in &units {
         let section = unit_basename(&unit.virtual_path);
         let source_file = output.source_file();
-        for (symbol_index, symbol) in output.semantic_model().symbols().iter().enumerate() {
-            // Only mergeable kinds participate in the cross-unit overlay;
-            // non-mergeable kinds (type parameters, `let`/`const` locals,
-            // parameters, …) use their own per-unit anchor via the
-            // `local_decl_positions` fallback in `emit_unit_symbols`.
-            if !kind_is_mergeable(symbol.kind()) {
-                continue;
-            }
-            let Some((line, character)) =
-                symbol_decl_position(source_file.tokens(), source_file.source_text(), symbol)
-            else {
-                continue;
+        let model = output.semantic_model();
+        // Occurrence-covered interface members contribute every written
+        // declaration's anchor — each derived from the occurrence's
+        // `declaration_range` (modifiers included) — so foreign units union
+        // in every fragment. A singleton canonical anchor would lose
+        // duplicate fragments and mis-anchor modifier-led members such as
+        // `readonly p`.
+        let occurrence_anchors = occurrence_decl_anchors(
+            source_file.tokens(),
+            source_file.source_text(),
+            &section,
+            model.declaration_occurrences(),
+        );
+        for (symbol_index, symbol) in model.symbols().iter().enumerate() {
+            let symbol_id = SymbolId::new(symbol_index as u32);
+            // Overlay membership: mergeable kinds keep the legacy singleton
+            // `symbol_decl_position` anchor; occurrence-covered Function
+            // method members and Variable(Let) property members join with
+            // every occurrence anchor. `kind_is_mergeable` is unchanged, so
+            // arbitrary `let`/`const` locals stay out of the overlay.
+            let anchors: Vec<SymbolDeclAnchor> = if let Some(covered) =
+                occurrence_anchors.get(&symbol_id)
+            {
+                if !kind_is_occurrence_overlay_member(symbol.kind()) {
+                    continue;
+                }
+                covered.clone()
+            } else {
+                // Only mergeable kinds participate in the cross-unit
+                // overlay; non-mergeable kinds (type parameters,
+                // `let`/`const` locals, parameters, …) use their own
+                // per-unit anchor via the `local_decl_positions` fallback
+                // in `emit_unit_symbols`.
+                if !kind_is_mergeable(symbol.kind()) {
+                    continue;
+                }
+                let Some((line, character)) =
+                    symbol_decl_position(source_file.tokens(), source_file.source_text(), symbol)
+                else {
+                    continue;
+                };
+                vec![SymbolDeclAnchor {
+                    section: section.clone(),
+                    line,
+                    character,
+                }]
             };
-            let anchor = SymbolDeclAnchor {
-                section: section.clone(),
-                line,
-                character,
-            };
-            let model = output.semantic_model();
-            for name in [
-                symbol.name().to_owned(),
-                model.qualified_name(SymbolId::new(symbol_index as u32)),
-            ] {
-                let anchors = declaration_anchors
+            for name in [symbol.name().to_owned(), model.qualified_name(symbol_id)] {
+                let entries = declaration_anchors
                     .entry((name, symbol.kind()))
                     .or_default();
-                if !anchors.contains(&anchor) {
-                    anchors.push(anchor.clone());
+                for anchor in &anchors {
+                    if !entries.contains(anchor) {
+                        entries.push(anchor.clone());
+                    }
                 }
             }
         }
@@ -2955,43 +3027,73 @@ fn emit_unit_symbols(
         .iter()
         .map(|symbol| symbol_decl_position(tokens, source, symbol))
         .collect();
+    // Interface member declaration occurrences: each covered symbol's own
+    // declaration row is replaced by one row per written occurrence, and its
+    // Decl list unions this unit's per-occurrence anchors with the
+    // cross-unit overlay.
+    let occurrence_covered: HashSet<SymbolId> = model
+        .declaration_occurrences()
+        .iter()
+        .map(|occurrence| occurrence.symbol)
+        .collect();
+    let occurrence_anchors =
+        occurrence_decl_anchors(tokens, source, section, model.declaration_occurrences());
     let render = |symbol_id: SymbolId| -> Option<String> {
         let index = symbol_id.get() as usize;
         let symbol = model.symbols().get(index)?;
         let name = model.qualified_name(symbol_id);
-        let anchors =
-            if kind_is_mergeable(symbol.kind()) {
-                declaration_anchors
+        let anchors = if let Some(occurrence) = occurrence_anchors.get(&symbol_id) {
+            // Occurrence-covered interface member: the Decl list unions this
+            // unit's per-occurrence anchors with the (qualified-name-first)
+            // cross-unit overlay, so foreign-unit declarations survive for
+            // both Function method members and Variable(Let) property
+            // members. The union is narrow — only occurrence-covered members
+            // of those kinds read the overlay.
+            let mut union = occurrence.clone();
+            if kind_is_occurrence_overlay_member(symbol.kind())
+                && let Some(overlay) = declaration_anchors
                     .get(&(name.clone(), symbol.kind()))
                     .or_else(|| declaration_anchors.get(&(symbol.name().to_owned(), symbol.kind())))
-                    .cloned()
-                    .or_else(|| {
-                        local_decl_positions.get(index).copied().flatten().map(
-                            |(line, character)| {
-                                vec![SymbolDeclAnchor {
-                                    section: section.to_owned(),
-                                    line,
-                                    character,
-                                }]
-                            },
-                        )
-                    })?
-            } else {
-                // Non-mergeable kinds use their own per-unit anchor only,
-                // preventing same-named distinct symbols (e.g. type parameters
-                // `T` in different scopes) from collapsing into one Decl list.
-                local_decl_positions
-                    .get(index)
-                    .copied()
-                    .flatten()
-                    .map(|(line, character)| {
-                        vec![SymbolDeclAnchor {
-                            section: section.to_owned(),
-                            line,
-                            character,
-                        }]
-                    })?
-            };
+            {
+                union.extend(overlay.iter().cloned());
+            }
+            union.sort();
+            union.dedup();
+            union
+        } else if kind_is_mergeable(symbol.kind()) {
+            declaration_anchors
+                .get(&(name.clone(), symbol.kind()))
+                .or_else(|| declaration_anchors.get(&(symbol.name().to_owned(), symbol.kind())))
+                .cloned()
+                .or_else(|| {
+                    local_decl_positions
+                        .get(index)
+                        .copied()
+                        .flatten()
+                        .map(|(line, character)| {
+                            vec![SymbolDeclAnchor {
+                                section: section.to_owned(),
+                                line,
+                                character,
+                            }]
+                        })
+                })?
+        } else {
+            // Non-mergeable kinds use their own per-unit anchor only,
+            // preventing same-named distinct symbols (e.g. type parameters
+            // `T` in different scopes) from collapsing into one Decl list.
+            local_decl_positions
+                .get(index)
+                .copied()
+                .flatten()
+                .map(|(line, character)| {
+                    vec![SymbolDeclAnchor {
+                        section: section.to_owned(),
+                        line,
+                        character,
+                    }]
+                })?
+        };
         let declarations = anchors
             .iter()
             .map(|anchor| {
@@ -3006,17 +3108,41 @@ fn emit_unit_symbols(
     };
 
     let mut records: Vec<SymbolRecord> = Vec::new();
-    // Declaration-name records: each source-declared symbol at its identifier.
+    // Declaration-name records: each source-declared symbol at its
+    // identifier. Symbols covered by interface-member declaration
+    // occurrences are skipped — each occurrence emits its own row at its
+    // `name_range` below, replacing the covered symbol's single row.
     for (index, symbol) in model.symbols().iter().enumerate() {
         if symbol.range().is_empty() {
             continue;
         }
         let symbol_id = SymbolId::new(index as u32);
+        if occurrence_covered.contains(&symbol_id) {
+            continue;
+        }
         if let Some(rendered) = render(symbol_id)
             && let Some(record) =
                 symbol_record_for(source, symbol.range(), symbol.name().to_owned(), rendered)
         {
             records.push(record);
+        }
+    }
+    // Interface member declaration occurrences: one row per written
+    // occurrence at its own `name_range` — the identifier span, quotes
+    // included for string keys, digits for numeric keys, and the
+    // bracket-delimited `[expr]` span for computed keys — rendered with the
+    // unioned Decl list.
+    for occurrence in model.declaration_occurrences() {
+        if occurrence.name_range.is_empty() {
+            continue;
+        }
+        if let Some(rendered) = render(occurrence.symbol) {
+            let display = collapse_whitespace(&slice_source(source, occurrence.name_range));
+            if let Some(record) =
+                symbol_record_for(source, occurrence.name_range, display, rendered)
+            {
+                records.push(record);
+            }
         }
     }
     // Reference records: each resolved value/type occurrence at its use site.
@@ -3184,6 +3310,62 @@ fn symbol_decl_position(
     source.line_column(full_start).ok()
 }
 
+/// Per-unit `Decl` anchors for interface member declaration occurrences,
+/// keyed by the canonical member `SymbolId`: every written occurrence
+/// contributes its own `declaration_range`-derived anchor, so duplicate and
+/// merged fragments each keep a distinct anchor.
+fn occurrence_decl_anchors(
+    tokens: &[Token],
+    source: &SourceText,
+    section: &str,
+    occurrences: &[DeclarationOccurrence],
+) -> HashMap<SymbolId, Vec<SymbolDeclAnchor>> {
+    let mut anchors: HashMap<SymbolId, Vec<SymbolDeclAnchor>> = HashMap::new();
+    for occurrence in occurrences {
+        let Some((line, character)) =
+            occurrence_decl_position(tokens, source, occurrence.declaration_range)
+        else {
+            continue;
+        };
+        anchors
+            .entry(occurrence.symbol)
+            .or_default()
+            .push(SymbolDeclAnchor {
+                section: section.to_owned(),
+                line,
+                character,
+            });
+    }
+    anchors
+}
+
+/// The 0-based `(line, character)` a declaration occurrence anchors its
+/// `Decl(...)` marker at: the end of the significant token immediately
+/// preceding the member's first token (TypeScript's `node.pos`, which counts
+/// leading trivia). `declaration_range` already starts at the member's first
+/// modifier or name token, so no keyword-led or decorator walk is needed —
+/// this routes around `kind_is_keyword_led`, which never fires for
+/// `Variable(Let)` members, so `readonly p` anchors before `readonly`.
+fn occurrence_decl_position(
+    tokens: &[Token],
+    source: &SourceText,
+    declaration_range: TextRange,
+) -> Option<(usize, usize)> {
+    if declaration_range.is_empty() {
+        return None;
+    }
+    let first = tokens.iter().position(|token| {
+        !token.is_missing()
+            && !is_trivia_token(token.kind())
+            && token.range().start() >= declaration_range.start()
+    })?;
+    let full_start = match prev_significant_token(tokens, first) {
+        Some(prev) => tokens[prev].range().end(),
+        None => Utf16Pos::ZERO,
+    };
+    source.line_column(full_start).ok()
+}
+
 /// The index of the significant (non-trivia, non-missing) token before `index`.
 fn prev_significant_token(tokens: &[Token], index: usize) -> Option<usize> {
     tokens[..index]
@@ -3229,6 +3411,18 @@ const fn kind_is_mergeable(kind: SymbolKind) -> bool {
             | SymbolKind::Interface
             | SymbolKind::Enum
             | SymbolKind::Namespace
+    )
+}
+
+/// Occurrence-covered interface member kinds that join the cross-unit `Decl`
+/// overlay: `Function` method members and `Variable(Let)` property members.
+/// This is the narrow occurrence union — `kind_is_mergeable` itself is
+/// unchanged, so arbitrary `let` locals outside occurrence coverage keep the
+/// legacy per-unit boundary.
+const fn kind_is_occurrence_overlay_member(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Function | SymbolKind::Variable(bamts_compiler::syntax::VariableKind::Let)
     )
 }
 
@@ -6215,6 +6409,240 @@ class C {\n\
         assert!(
             emitted.contains(">C : C"),
             "class name record must be present:\n{emitted}"
+        );
+    }
+
+    // ---- T3: interface member declaration occurrences --------------------
+
+    /// Duplicate member declarations emit one `.types` row per written
+    /// occurrence — `interface I { item: any; item: number; }` produces
+    /// exactly two `>item` rows, both rendering the canonical member type —
+    /// and one `.symbols` row per occurrence, each carrying BOTH `Decl`
+    /// anchors (Let properties unite; no residual single-anchor row).
+    #[test]
+    fn emit_types_and_symbols_emit_one_row_per_member_occurrence() {
+        let logical = "tests/cases/compiler/duplicateMemberPin.ts";
+        let case_text = "interface I {\n    item: any;\n    item: number;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+
+        let emitted_types = emit_types_baseline(&case, logical);
+        let item_type_rows: Vec<&str> = emitted_types
+            .lines()
+            .filter(|line| line.starts_with(">item :"))
+            .collect();
+        assert_eq!(
+            item_type_rows,
+            [">item : any", ">item : any"],
+            "each written `item` occurrence emits its own row with the \
+             canonical type:\n{emitted_types}"
+        );
+
+        let emitted_symbols = emit_symbols_baseline(&case, logical);
+        let item_symbol_rows: Vec<&str> = emitted_symbols
+            .lines()
+            .filter(|line| line.starts_with(">item :"))
+            .collect();
+        // First occurrence anchors at the end of `{` (0, 13); the second at
+        // the end of the first member's `;` (1, 14) — the `node.pos`
+        // full-start convention. Both rows carry both anchors.
+        assert_eq!(
+            item_symbol_rows,
+            [
+                ">item : Symbol(I.item, Decl(duplicateMemberPin.ts, 0, 13), \
+                 Decl(duplicateMemberPin.ts, 1, 14))",
+                ">item : Symbol(I.item, Decl(duplicateMemberPin.ts, 0, 13), \
+                 Decl(duplicateMemberPin.ts, 1, 14))",
+            ],
+            "each `item` row carries both occurrence Decl anchors:\
+             \n{emitted_symbols}"
+        );
+    }
+
+    /// Merged interface fragments (`twoMergedInterfacesWithDifferingOverloads`
+    /// shape): three `foo` occurrences across two `interface I` fragments
+    /// share one canonical symbol, so every `foo` name row carries all three
+    /// `Decl` anchors and `.types` emits one row per occurrence.
+    #[test]
+    fn emit_symbols_merged_interface_fragments_union_all_occurrence_anchors() {
+        let logical = "tests/cases/compiler/mergedOverloadsPin.ts";
+        let case_text = "interface I {\n    foo(x: string): 1;\n}\n\
+                         interface I {\n    foo(x: number): 2;\n    foo(x: boolean): 3;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+
+        let emitted_types = emit_types_baseline(&case, logical);
+        let foo_type_rows = emitted_types
+            .lines()
+            .filter(|line| line.starts_with(">foo :"))
+            .count();
+        assert_eq!(
+            foo_type_rows, 3,
+            "one `.types` row per written `foo` occurrence:\n{emitted_types}"
+        );
+
+        let emitted_symbols = emit_symbols_baseline(&case, logical);
+        let foo_symbol_rows: Vec<&str> = emitted_symbols
+            .lines()
+            .filter(|line| line.starts_with(">foo :"))
+            .collect();
+        // Anchors: end of `{` on line 0 (0, 13), end of `{` on line 3
+        // (3, 13), end of the second fragment's first `;` (4, 22).
+        let expected = ">foo : Symbol(I.foo, Decl(mergedOverloadsPin.ts, 0, 13), \
+            Decl(mergedOverloadsPin.ts, 3, 13), Decl(mergedOverloadsPin.ts, 4, 22))";
+        assert_eq!(
+            foo_symbol_rows,
+            [expected, expected, expected],
+            "every `foo` row carries all three Decl anchors:\n{emitted_symbols}"
+        );
+    }
+
+    /// Cross-unit union for occurrence-covered Function method members:
+    /// `foo` declared once per unit must render each unit's `foo` row with
+    /// BOTH units' `Decl` anchors — foreign-unit declarations survive, no
+    /// residual local-only row is permitted.
+    #[test]
+    fn emit_symbols_two_unit_method_members_union_decl_lists() {
+        let logical = "tests/cases/compiler/twoUnitMethodPin.ts";
+        let case_text = "\
+// @filename: a.ts
+interface I {
+    foo(x: string): 1;
+}
+// @filename: b.ts
+interface I {
+    foo(x: number): 2;
+}
+";
+        let pragmas = parse_case_pragmas(case_text);
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let foo_rows: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with(">foo :"))
+            .collect();
+        assert_eq!(
+            foo_rows,
+            [
+                ">foo : Symbol(I.foo, Decl(a.ts, 0, 13), Decl(b.ts, 0, 13))",
+                ">foo : Symbol(I.foo, Decl(a.ts, 0, 13), Decl(b.ts, 0, 13))",
+            ],
+            "each unit's `foo` row carries both units' Decls:\n{emitted}"
+        );
+    }
+
+    /// Cross-unit union for occurrence-covered Variable(Let) property
+    /// members: `item` is not globally mergeable, yet occurrence-covered
+    /// interface properties enter the overlay, so each unit's `item` row
+    /// carries BOTH units' `Decl` anchors while `kind_is_mergeable` stays
+    /// unchanged for arbitrary let locals.
+    #[test]
+    fn emit_symbols_two_unit_let_property_members_union_decl_lists() {
+        let logical = "tests/cases/compiler/twoUnitPropertyPin.ts";
+        let case_text = "\
+// @filename: a.ts
+interface I {
+    item: any;
+}
+// @filename: b.ts
+interface I {
+    item: number;
+}
+";
+        let pragmas = parse_case_pragmas(case_text);
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let item_rows: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with(">item :"))
+            .collect();
+        assert_eq!(
+            item_rows,
+            [
+                ">item : Symbol(I.item, Decl(a.ts, 0, 13), Decl(b.ts, 0, 13))",
+                ">item : Symbol(I.item, Decl(a.ts, 0, 13), Decl(b.ts, 0, 13))",
+            ],
+            "each unit's `item` row carries both units' Decls:\n{emitted}"
+        );
+    }
+
+    /// A modifier-led member anchors its `Decl` before the modifier:
+    /// `readonly p` anchors at the end of the previous member's `;` (the
+    /// `node.pos` full start), not at `p` and not after `readonly`. The
+    /// occurrence `declaration_range` includes modifiers, routing around the
+    /// `kind_is_keyword_led` gate that never fires for `Variable(Let)`.
+    #[test]
+    fn emit_symbols_readonly_member_anchors_before_modifier() {
+        let logical = "tests/cases/compiler/readonlyMemberPin.ts";
+        let case_text = "interface I {\n    a: number;\n    readonly p: string;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let a_line = emitted
+            .lines()
+            .find(|line| line.starts_with(">a :"))
+            .unwrap_or_else(|| panic!("missing a symbol line:\n{emitted}"));
+        assert_eq!(
+            a_line, ">a : Symbol(I.a, Decl(readonlyMemberPin.ts, 0, 13))",
+            "emitted:\n{emitted}"
+        );
+        let p_line = emitted
+            .lines()
+            .find(|line| line.starts_with(">p :"))
+            .unwrap_or_else(|| panic!("missing p symbol line:\n{emitted}"));
+        assert_eq!(
+            p_line, ">p : Symbol(I.p, Decl(readonlyMemberPin.ts, 1, 14))",
+            "`readonly p` must anchor before `readonly` (end of `a`'s `;`), \
+             not at the name:\n{emitted}"
+        );
+    }
+
+    /// Occurrence `name_range`s are UTF-16 spans: a quoted non-BMP member
+    /// name slices to its exact source text (`"𝒜q"`, quotes included), and a
+    /// member following it on the same line anchors at a UTF-16 column that
+    /// counts `𝒜` as two code units.
+    #[test]
+    fn emit_symbols_occurrence_spans_count_utf16_units() {
+        let logical = "tests/cases/compiler/nonBmpMemberPin.ts";
+        let case_text = "interface Q { \"𝒜q\"(x: string): string; tail: number; }\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+
+        let emitted_types = emit_types_baseline(&case, logical);
+        assert!(
+            emitted_types
+                .lines()
+                .any(|line| line.starts_with(">\"𝒜q\" :")),
+            "the quoted non-BMP name must slice exactly:\n{emitted_types}"
+        );
+
+        let emitted_symbols = emit_symbols_baseline(&case, logical);
+        let quoted_line = emitted_symbols
+            .lines()
+            .find(|line| line.starts_with(">\"𝒜q\" :"))
+            .unwrap_or_else(|| panic!("missing \"𝒜q\" symbol line:\n{emitted_symbols}"));
+        assert_eq!(
+            quoted_line, ">\"𝒜q\" : Symbol(Q.𝒜q, Decl(nonBmpMemberPin.ts, 0, 13))",
+            "emitted:\n{emitted_symbols}"
+        );
+        // `tail` follows `"𝒜q"(x: string): string;` on line 0; its anchor is
+        // the end of that `;` at UTF-16 column 39 — `𝒜` occupies two units,
+        // so a byte- or char-counted column would land at 40 or 38.
+        let tail_line = emitted_symbols
+            .lines()
+            .find(|line| line.starts_with(">tail :"))
+            .unwrap_or_else(|| panic!("missing tail symbol line:\n{emitted_symbols}"));
+        assert_eq!(
+            tail_line, ">tail : Symbol(Q.tail, Decl(nonBmpMemberPin.ts, 0, 39))",
+            "non-BMP columns must count UTF-16 units:\n{emitted_symbols}"
         );
     }
 }

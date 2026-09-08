@@ -1,8 +1,9 @@
 //! Control-flow narrowing and contextual typing over the interned
 //! [`TypeTable`].
 //!
-//! The module has three layers, all driven by an outside caller (a future
-//! statement-level flow pass); nothing here walks statements on its own.
+//! The module has four layers, each driven by an outside caller (the
+//! statement-level flow pass or the checker-side demand scheduler); nothing
+//! here walks statements on its own.
 //!
 //! - **Flow facts.** A [`NarrowingContext`] owns an arena of flow frames.
 //!   [`NarrowingContext::branch`] forks a frame, [`NarrowingContext::join`]
@@ -31,6 +32,15 @@
 //!   [`NarrowingContext::contextual_function`] types a function literal
 //!   against a contextual signature, filling unannotated parameters and
 //!   unwrapping the awaited body return of `async` literals.
+//! - **Demand-side packets.** The binder-prepared `ProgramFlow` graph models
+//!   the syntax/control flow of one execution boundary. `FlowFacts` carries
+//!   complete root/path state between narrowing sessions through
+//!   `root_packet` and `install_root_packet`, and `analyze_definite_assignment`
+//!   solves definite assignment for the C038 use-before-assignment check.
+//!   Solutions are pure values; the single memo owner is the checker-side
+//!   demand state (`assignment_memo`), keyed by the entry [`ScopeId`] of the
+//!   analyzed boundary — one analysis per boundary, never cached in this
+//!   module.
 //!
 //! Every operation is total. Opaque inputs — `any`, `unknown`, `error`, and
 //! the nominal [`Type::Named`] / generic [`Type::Object`] members whose
@@ -39,13 +49,17 @@
 //! unresolvable input never collapses a fact to `never`. When no guard
 //! applies, the result is the input type unchanged.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::binder::{FunctionParameter, SymbolId, Type, TypeId, TypeTable};
+use super::binder::{
+    DeclId, ExecutionBoundary, ExecutionPoint, FlowPointId, FunctionParameter, ScopeId, SymbolId,
+    Type, TypeId, TypeTable,
+};
 use crate::literal::number_value;
+use crate::source::TextRange;
 use crate::syntax::{
     BinaryExpression, BinaryOperator, Expr, Expression, IdentifierNode, Literal, LogicalOperator,
-    MemberProperty, Token, UnaryOperator,
+    MemberProperty, NodeId, Token, UnaryOperator,
 };
 
 /// A program point in the flow graph: one frame in the narrowing arena.
@@ -63,6 +77,12 @@ impl FlowNodeId {
 
     const fn index(self) -> usize {
         self.0 as usize
+    }
+}
+
+impl Default for FlowNodeId {
+    fn default() -> Self {
+        Self::ROOT
     }
 }
 
@@ -252,12 +272,478 @@ pub fn flow_key_of(expression: &Expr, resolver: &dyn GuardResolver) -> Option<Fl
             let name = resolver.token_text(property.data().token());
             Some(key.child(name))
         }
+
         _ => None,
     }
 }
 
+/// The syntax/control-flow graph built by the lexical preparation pass.
+///
+/// `FlowPointId` belongs to this graph and is deliberately distinct from the
+/// public [`FlowNodeId`] arena used by the older typed narrowing algebra.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProgramFlow {
+    pub(crate) points: HashMap<ExecutionPoint, FlowPointId>,
+    pub(crate) nodes: Vec<ProgramFlowNode>,
+    pub(crate) edges: Vec<FlowEdge>,
+    pub(crate) incoming: Vec<Vec<usize>>,
+    pub(crate) outgoing: Vec<Vec<usize>>,
+    pub(crate) roots: Vec<FlowPointId>,
+}
+
+impl ProgramFlow {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds one point and returns its graph identity.
+    ///
+    /// The binder owns source traversal and therefore decides which
+    /// operation belongs at the point. This helper only maintains the graph's
+    /// point index.
+    pub(crate) fn add_node(
+        &mut self,
+        point: ExecutionPoint,
+        boundary: ScopeId,
+        operation: FlowOperation,
+    ) -> FlowPointId {
+        let id = FlowPointId::new(
+            u32::try_from(self.nodes.len()).expect("program flow point count fits in u32"),
+        );
+        self.points.insert(point, id);
+        self.nodes.push(ProgramFlowNode {
+            point,
+            boundary,
+            operation,
+        });
+        self.incoming.push(Vec::new());
+        self.outgoing.push(Vec::new());
+        id
+    }
+
+    /// Adds an edge while keeping incoming/outgoing indexes in sync.
+    pub(crate) fn add_edge(&mut self, edge: FlowEdge) {
+        let edge_index = self.edges.len();
+        self.edges.push(edge);
+        let from = usize::try_from(edge.from.get()).expect("flow point index fits in usize");
+        let to = usize::try_from(edge.to.get()).expect("flow point index fits in usize");
+        if let Some(outgoing) = self.outgoing.get_mut(from) {
+            outgoing.push(edge_index);
+        }
+        if let Some(incoming) = self.incoming.get_mut(to) {
+            incoming.push(edge_index);
+        }
+    }
+
+    pub(crate) fn add_root(&mut self, root: FlowPointId) {
+        if !self.roots.contains(&root) {
+            self.roots.push(root);
+        }
+    }
+}
+
+/// One syntax/control node in [`ProgramFlow`].
+#[derive(Clone, Debug)]
+pub(crate) struct ProgramFlowNode {
+    pub(crate) point: ExecutionPoint,
+    pub(crate) boundary: ScopeId,
+    pub(crate) operation: FlowOperation,
+}
+
+/// One directed control-flow edge.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct FlowEdge {
+    pub(crate) from: FlowPointId,
+    pub(crate) to: FlowPointId,
+    pub(crate) kind: FlowEdgeKind,
+}
+
+/// The semantic role of a control-flow edge.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[expect(
+    dead_code,
+    reason = "variants constructed only by the unwired demand pass"
+)]
+pub(crate) enum FlowEdgeKind {
+    Sequential,
+    Guarded,
+    Join,
+    Assignment,
+    Captured,
+    LoopBackedge,
+    Abrupt,
+    ConservativeCatch,
+    Finally,
+}
+
+fn is_entry_operation(node: &ProgramFlowNode) -> bool {
+    matches!(node.operation, FlowOperation::Entry)
+        && matches!(node.point.boundary, ExecutionBoundary::Entry)
+}
+
+fn is_assignment_transfer_edge(kind: FlowEdgeKind, target_is_join: bool) -> bool {
+    match kind {
+        FlowEdgeKind::Sequential
+        | FlowEdgeKind::Guarded
+        | FlowEdgeKind::Join
+        | FlowEdgeKind::Assignment
+        | FlowEdgeKind::ConservativeCatch => true,
+        // A backedge feeds the loop test but is not a normal post-loop join
+        // predecessor.
+        FlowEdgeKind::LoopBackedge => !target_is_join,
+        // A normal try path may enter a finally block. It must not be
+        // mistaken for a direct predecessor of the post-finally join.
+        FlowEdgeKind::Finally => !target_is_join,
+        FlowEdgeKind::Captured | FlowEdgeKind::Abrupt => false,
+    }
+}
+
+/// The operation performed at one graph point.
+#[derive(Clone, Debug)]
+#[expect(
+    dead_code,
+    reason = "variants constructed only by the unwired demand pass"
+)]
+pub(crate) enum FlowOperation {
+    Entry,
+    Pass,
+    Guard {
+        condition: NodeId,
+        polarity: GuardPolarity,
+        value_point: FlowPointId,
+    },
+    Write {
+        target: FlowKey,
+        value: Option<NodeId>,
+        value_point: FlowPointId,
+    },
+    DeclarationComplete {
+        declaration: DeclId,
+        assigned_roots: Box<[SymbolId]>,
+    },
+    Capture {
+        source: FlowPointId,
+        boundary: ScopeId,
+    },
+    Join,
+    LoopSummary {
+        entry: FlowPointId,
+        body_exit: FlowPointId,
+        skipped: Option<FlowPointId>,
+    },
+    Exit,
+}
+
+/// Branch polarity for a symbolic guard.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[expect(dead_code, reason = "used only by unwired symbolic-guard demand facet")]
+pub(crate) enum GuardPolarity {
+    Truthy,
+    Falsy,
+}
+
+/// A guard retained symbolically until its expression/type dependencies are
+/// available to the demand scheduler.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[expect(
+    dead_code,
+    reason = "guards retained for the not-yet-wired demand scheduler"
+)]
+pub(crate) struct SymbolicGuard {
+    pub(crate) condition: NodeId,
+    pub(crate) polarity: GuardPolarity,
+    pub(crate) value_point: FlowPointId,
+}
+
+/// The complete root/path type state at one flow frame, as a value snapshot.
+///
+/// A packet is *closed*: it always contains the root key for `root`
+/// ([`FlowKey::root`]) mapped to `effective_root`, plus every path
+/// refinement visible at the frame it was taken from. `paths` is sorted in
+/// *packet order* — root symbol id, then path segments — so packets for the
+/// same visible state compare equal and the order is stable across
+/// re-computation. [`FlowFacts::install_root_packet`] turns a packet back
+/// into a self-contained frame: the round trip packet → frame → packet is a
+/// fixpoint, no fact gained or lost.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RootFlowPacket {
+    /// The root symbol the packet describes.
+    pub(crate) root: SymbolId,
+    /// The declared type, as registered with [`NarrowingContext::declare`];
+    /// the fallback when no refinement touches the root.
+    pub(crate) declared: TypeId,
+    /// The innermost visible refinement of the root key, or `declared`.
+    pub(crate) effective_root: TypeId,
+    /// Every visible key for `root` (the root key included) with its
+    /// effective type, sorted as described above.
+    pub(crate) paths: Box<[(FlowKey, TypeId)]>,
+}
+
+/// Definite-assignment lattice values.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum AssignmentState {
+    Assigned,
+    Unassigned,
+}
+
+/// Reachability is kept separate from assignment so unreachable arms cannot
+/// contaminate a meet.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum AssignmentReachability {
+    Unreachable,
+    Reachable(AssignmentState),
+}
+
+/// One finite assignment solution for a complete `ProgramFlow`, as a pure
+/// memo value.
+///
+/// A solution covers exactly one execution boundary. The single memo owner
+/// is the checker-side demand state (`assignment_memo`), keyed by the entry
+/// [`ScopeId`] of the analyzed boundary — one analysis per boundary,
+/// computed once. This module only produces fresh solutions; the analyzer
+/// is pure (same graph and roots yield the same result), so a memo miss is
+/// safe but never expected for an already-analyzed boundary.
+///
+/// Per root, only same-boundary points carry
+/// [`AssignmentReachability::Reachable`] states; every other point of the
+/// graph records [`AssignmentReachability::Unreachable`], keeping foreign
+/// boundaries from contaminating a query.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AssignmentAnalysis {
+    /// `(FlowPointId, SymbolId)` → state. Keys are graph-local indices into
+    /// the analyzed `ProgramFlow` and must never be mixed across graphs.
+    pub(crate) states: HashMap<(FlowPointId, SymbolId), AssignmentReachability>,
+}
+
+impl AssignmentAnalysis {
+    /// The recorded state at one graph point, or `None` when the analysis
+    /// never visited that point/root pair.
+    #[must_use]
+    pub(crate) fn state_at(
+        &self,
+        point: FlowPointId,
+        root: SymbolId,
+    ) -> Option<AssignmentReachability> {
+        self.states.get(&(point, root)).copied()
+    }
+}
+
+/// One root's entry seed for definite-assignment analysis.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct AssignmentRoot {
+    pub(crate) symbol: SymbolId,
+    pub(crate) boundary: ScopeId,
+    pub(crate) entry: AssignmentState,
+    pub(crate) declaration: DeclId,
+}
+
+/// A use-site record consumed by the check-owned C038 predicate.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct AssignmentUse {
+    pub(crate) symbol: SymbolId,
+    pub(crate) point: FlowPointId,
+    pub(crate) scope: ScopeId,
+    pub(crate) range: TextRange,
+    pub(crate) live: bool,
+    pub(crate) suppressed: bool,
+    pub(crate) final_type: TypeId,
+}
+
+const fn assignment_meet(left: AssignmentState, right: AssignmentState) -> AssignmentState {
+    match (left, right) {
+        (AssignmentState::Assigned, AssignmentState::Assigned) => AssignmentState::Assigned,
+        _ => AssignmentState::Unassigned,
+    }
+}
+
+fn point_index(point: FlowPointId, len: usize) -> Option<usize> {
+    let index = usize::try_from(point.get()).ok()?;
+    (index < len).then_some(index)
+}
+
+fn point_id(index: usize) -> FlowPointId {
+    FlowPointId::new(u32::try_from(index).expect("flow point count fits in u32"))
+}
+
+/// Computes definite assignment with a finite monotone worklist.
+///
+/// Reachability is solved first. Assignment then starts at the top element
+/// (`Assigned`) for reachable non-entry points and descends only when a
+/// reachable, same-boundary predecessor proves `Unassigned`. Captured and
+/// abrupt edges never transfer assignment state; a normal `Finally` edge may
+/// enter the finally body but cannot act as a direct post-finally join input.
+/// The result is one [`AssignmentAnalysis`] for this graph: assignment
+/// states are only ever propagated between same-boundary points (per root),
+/// and the value's per-boundary scoping guarantees are documented on the
+/// type.
+pub(crate) fn analyze_definite_assignment(
+    flow: &ProgramFlow,
+    roots: &[AssignmentRoot],
+    cancel: Option<&bamts_cancel::CancellationToken>,
+) -> Result<AssignmentAnalysis, bamts_cancel::Cancelled> {
+    let node_count = flow.nodes.len();
+    let mut reachable = vec![false; node_count];
+    let mut reach_queue = VecDeque::new();
+
+    let initial_roots = if flow.roots.is_empty() {
+        flow.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| is_entry_operation(node).then_some(index))
+            .collect::<Vec<_>>()
+    } else {
+        flow.roots
+            .iter()
+            .filter_map(|point| point_index(*point, node_count))
+            .collect::<Vec<_>>()
+    };
+    for index in initial_roots {
+        if !reachable[index] {
+            reachable[index] = true;
+            reach_queue.push_back(index);
+        }
+    }
+    while let Some(index) = reach_queue.pop_front() {
+        if let Some(token) = cancel {
+            token.check()?;
+        }
+        let Some(outgoing) = flow.outgoing.get(index) else {
+            continue;
+        };
+        for edge_index in outgoing {
+            let Some(edge) = flow.edges.get(*edge_index) else {
+                continue;
+            };
+            let Some(target) = point_index(edge.to, node_count) else {
+                continue;
+            };
+            if !reachable[target] {
+                reachable[target] = true;
+                reach_queue.push_back(target);
+            }
+        }
+    }
+
+    let mut analysis = AssignmentAnalysis::default();
+    for root in roots {
+        if let Some(token) = cancel {
+            token.check()?;
+        }
+        let mut queue = VecDeque::new();
+        let mut queued = HashSet::new();
+
+        for (index, node) in flow.nodes.iter().enumerate() {
+            if !reachable[index] {
+                analysis.states.insert(
+                    (point_id(index), root.symbol),
+                    AssignmentReachability::Unreachable,
+                );
+                continue;
+            }
+            let point = point_id(index);
+            let initial = if node.boundary == root.boundary && is_entry_operation(node) {
+                AssignmentReachability::Reachable(root.entry)
+            } else if node.boundary == root.boundary {
+                AssignmentReachability::Reachable(AssignmentState::Assigned)
+            } else {
+                AssignmentReachability::Unreachable
+            };
+            analysis.states.insert((point, root.symbol), initial);
+            if node.boundary == root.boundary {
+                queue.push_back(index);
+                queued.insert(index);
+            }
+        }
+
+        while let Some(index) = queue.pop_front() {
+            queued.remove(&index);
+            if let Some(token) = cancel {
+                token.check()?;
+            }
+            let node = &flow.nodes[index];
+            if !reachable[index] || node.boundary != root.boundary {
+                continue;
+            }
+
+            let point = point_id(index);
+            let desired = if is_entry_operation(node) {
+                AssignmentReachability::Reachable(root.entry)
+            } else {
+                let mut meet = None;
+                if let Some(incoming) = flow.incoming.get(index) {
+                    for edge_index in incoming {
+                        let Some(edge) = flow.edges.get(*edge_index) else {
+                            continue;
+                        };
+                        let target_is_join = matches!(node.operation, FlowOperation::Join);
+                        if !is_assignment_transfer_edge(edge.kind, target_is_join) {
+                            continue;
+                        }
+                        let Some(predecessor) = point_index(edge.from, node_count) else {
+                            continue;
+                        };
+                        if !reachable[predecessor]
+                            || flow.nodes[predecessor].boundary != root.boundary
+                        {
+                            continue;
+                        }
+                        let predecessor_point = point_id(predecessor);
+                        let Some(AssignmentReachability::Reachable(state)) =
+                            analysis.state_at(predecessor_point, root.symbol)
+                        else {
+                            continue;
+                        };
+                        meet = Some(match meet {
+                            Some(current) => assignment_meet(current, state),
+                            None => state,
+                        });
+                    }
+                }
+                AssignmentReachability::Reachable(meet.unwrap_or(AssignmentState::Unassigned))
+            };
+
+            let desired = match (&node.operation, desired) {
+                (
+                    FlowOperation::DeclarationComplete { assigned_roots, .. },
+                    AssignmentReachability::Reachable(_),
+                ) if assigned_roots.contains(&root.symbol) => {
+                    AssignmentReachability::Reachable(AssignmentState::Assigned)
+                }
+                (FlowOperation::Write { target, .. }, AssignmentReachability::Reachable(_))
+                    if target.root_symbol() == root.symbol && target.path().is_empty() =>
+                {
+                    AssignmentReachability::Reachable(AssignmentState::Assigned)
+                }
+                (_, state) => state,
+            };
+
+            if analysis.states.get(&(point, root.symbol)).copied() != Some(desired) {
+                analysis.states.insert((point, root.symbol), desired);
+                if let Some(outgoing) = flow.outgoing.get(index) {
+                    for edge_index in outgoing {
+                        let Some(edge) = flow.edges.get(*edge_index) else {
+                            continue;
+                        };
+                        let Some(successor) = point_index(edge.to, node_count) else {
+                            continue;
+                        };
+                        if flow.nodes[successor].boundary == root.boundary
+                            && queued.insert(successor)
+                        {
+                            queue.push_back(successor);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(analysis)
+}
+
 /// One frame of flow facts: the refinements that hold at one program point,
 /// relative to the frame it forked from.
+#[derive(Clone, Debug)]
 struct FlowFrame {
     parent: Option<FlowNodeId>,
     facts: HashMap<FlowKey, TypeId>,
@@ -272,11 +758,16 @@ enum Narrow {
 }
 
 /// Flow facts accumulated over one flow pass: the declared type of every
-/// trackable symbol plus the frame tree of refinements.
+/// trackable symbol plus the frame forest of refinements.
+///
+/// Walk frames chain to the frame they forked from; packet frames installed
+/// by `FlowFacts::install_root_packet` are parentless baselines, so the
+/// frames form a forest of independent rooted snapshots.
 ///
 /// State lives here rather than in [`NarrowingContext`] so the checker can own
 /// it across a whole walk while the [`TypeTable`] stays borrowable between
 /// narrowing steps.
+#[derive(Clone, Debug)]
 pub struct FlowFacts {
     declared: HashMap<SymbolId, TypeId>,
     frames: Vec<FlowFrame>,
@@ -299,6 +790,92 @@ impl FlowFacts {
                 facts: HashMap::new(),
             }],
         }
+    }
+
+    /// Materializes all effective root/path facts visible at one frame.
+    ///
+    /// The walk starts at `flow` and ascends the parent chain, innermost
+    /// frame first: the first frame that refines a key wins, and the walk
+    /// stops at a frame with no parent. Packet frames are deliberately
+    /// parentless, so a packet frame's answers come entirely from the packet.
+    /// The root is undeclared → `Ok(None)`.
+    ///
+    /// The returned packet meets the [`RootFlowPacket`] contract: closed, in
+    /// packet order, and a value snapshot safe for a demand frame to retain
+    /// while another frame computes a different root.
+    pub(crate) fn root_packet(
+        &self,
+        flow: FlowNodeId,
+        root: SymbolId,
+        cancel: Option<&bamts_cancel::CancellationToken>,
+    ) -> Result<Option<RootFlowPacket>, bamts_cancel::Cancelled> {
+        let Some(declared) = self.declared.get(&root).copied() else {
+            return Ok(None);
+        };
+        let mut visible = HashMap::<FlowKey, TypeId>::new();
+        let mut current = Some(flow);
+        while let Some(id) = current {
+            if let Some(token) = cancel {
+                token.check()?;
+            }
+            let Some(frame) = self.frames.get(id.index()) else {
+                break;
+            };
+            for (key, ty) in &frame.facts {
+                if key.root_symbol() == root && !visible.contains_key(key) {
+                    visible.insert(key.clone(), *ty);
+                }
+            }
+            current = frame.parent;
+        }
+
+        let root_key = FlowKey::root(root);
+        let effective_root = visible.get(&root_key).copied().unwrap_or(declared);
+        visible.insert(root_key, effective_root);
+        let mut paths = visible.into_iter().collect::<Vec<_>>();
+        paths.sort_by(|(left, _), (right, _)| {
+            left.root_symbol()
+                .get()
+                .cmp(&right.root_symbol().get())
+                .then_with(|| {
+                    left.path()
+                        .iter()
+                        .map(|segment| segment.as_ref())
+                        .cmp(right.path().iter().map(|segment| segment.as_ref()))
+                })
+        });
+        Ok(Some(RootFlowPacket {
+            root,
+            declared,
+            effective_root,
+            paths: paths.into_boxed_slice(),
+        }))
+    }
+
+    /// Installs a packet as a fresh parentless baseline frame.
+    ///
+    /// The new frame has no parent, so it terminates the parent chain and every
+    /// later lookup (`type_at`, `root_packet`, or refinements forked from the
+    /// returned id) resolves entirely inside the packet. That self-containment
+    /// is what lets a demand frame carry the packet across narrowing sessions
+    /// without keeping the producer's frames alive. The root key is
+    /// (re-)inserted from `effective_root`, so even a hand-built packet yields
+    /// a closed frame, and the packet's `declared` type is registered for the
+    /// root so `root_packet` can answer for it. Installing the same packet
+    /// twice produces two equal-content frames with distinct ids.
+    #[cfg_attr(not(test), expect(dead_code, reason = "awaits demand-frame producer"))]
+    pub(crate) fn install_root_packet(&mut self, packet: &RootFlowPacket) -> FlowNodeId {
+        let mut facts = HashMap::with_capacity(packet.paths.len() + 1);
+        for (key, ty) in packet.paths.iter() {
+            facts.insert(key.clone(), *ty);
+        }
+        facts.insert(FlowKey::root(packet.root), packet.effective_root);
+        self.declared.insert(packet.root, packet.declared);
+        self.frames.push(FlowFrame {
+            parent: None,
+            facts,
+        });
+        FlowNodeId(u32::try_from(self.frames.len() - 1).expect("flow frame count fits in u32"))
     }
 }
 
@@ -2032,6 +2609,42 @@ mod tests {
 
         assert_eq!(context.type_at(flow, &root), Some(declared));
         assert_eq!(context.type_at(flow, &child), Some(kind));
+    }
+
+    #[test]
+    fn install_root_packet_round_trips_every_fact() {
+        let mut table = TypeTable::new();
+        let (string, number) = (table.string(), table.number());
+        let union = table.union(&[string, number]);
+        let root = FlowKey::root(symbol(1));
+        let child = root.clone().child("kind");
+
+        // Take a packet from a real session: a root refinement plus a path
+        // refinement over the declared union.
+        let mut facts = FlowFacts::new();
+        let flow = {
+            let mut context = NarrowingContext::new(&mut table, &mut facts);
+            context.declare(symbol(1), union);
+            let flow = context.branch(FlowNodeId::ROOT);
+            context.refine(flow, root.clone(), string);
+            context.refine(flow, child.clone(), number);
+            flow
+        };
+        let packet = facts
+            .root_packet(flow, symbol(1), None)
+            .expect("root_packet")
+            .expect("declared root yields a packet");
+
+        // Installing into a fresh fact table must register the root's
+        // declared type so the packet → frame → packet round trip is the
+        // documented fixpoint.
+        let mut restored = FlowFacts::new();
+        let installed = restored.install_root_packet(&packet);
+        let round_tripped = restored
+            .root_packet(installed, symbol(1), None)
+            .expect("root_packet")
+            .expect("installed packet declares its root");
+        assert_eq!(round_tripped, packet);
     }
 
     // ---- contextual typing --------------------------------------------------

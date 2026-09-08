@@ -112,6 +112,16 @@ fn render_type_grouped(
             }
         }
         Type::AppliedAlias { symbol, arguments } => {
+            // A registered alias that declares no type parameters is an identity,
+            // not an application: its written name is the display form whether or
+            // not a structural view has been materialized for it. Parameterized
+            // aliases keep the view-first expansion below.
+            if arguments.is_empty()
+                && model.types().has_alias(*symbol)
+                && model.types().alias_type_parameters(*symbol).is_empty()
+            {
+                return model.symbol(*symbol).name().to_owned();
+            }
             if !visiting_aliases.contains(symbol)
                 && let Some(view) = model.types().applied_alias_view(type_id)
             {
@@ -318,15 +328,12 @@ fn render_signature_declaration(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let displayed_return = signature
+        .declared_return()
+        .unwrap_or(signature.return_type());
     format!(
         "{type_params}({params}){return_separator}{}",
-        render_type_declaration_grouped(
-            model,
-            signature.return_type(),
-            false,
-            indent,
-            visiting_aliases
-        )
+        render_type_declaration_grouped(model, displayed_return, false, indent, visiting_aliases)
     )
 }
 
@@ -491,9 +498,12 @@ fn render_signature(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let displayed_return = signature
+        .declared_return()
+        .unwrap_or(signature.return_type());
     format!(
         "{type_params}({params}){return_separator}{}",
-        render_type_grouped(model, signature.return_type(), false, visiting_aliases)
+        render_type_grouped(model, displayed_return, false, visiting_aliases)
     )
 }
 
@@ -695,11 +705,14 @@ fn render_string_literal(value: &EcmaString) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        render_signature, render_signature_declaration, render_string_literal, render_type,
+        render_type_declaration, render_type_grouped,
+    };
+    use bamts_bytecode::EcmaString;
     use std::sync::Arc;
 
-    use bamts_bytecode::EcmaString;
-
-    use super::{render_string_literal, render_type};
+    use crate::checker::binder::Type;
     use crate::checker::{SemanticModel, TypeId, check};
     use crate::parser;
     use crate::scanner;
@@ -839,5 +852,200 @@ mod tests {
         assert_eq!(render_type(model, b), "1");
         let c = typed_expression_of(model, &source, "c", text.find("let w").unwrap());
         assert_eq!(render_type(model, c), "1");
+    }
+
+    /// The renderer reads `declared_return` before the semantic `return_type`,
+    /// so two signatures with the same semantic return can render differently
+    /// based on their written annotations. This hand-built test uses model-owned
+    /// TypeIds from bound signatures and only mutates local clones, never the
+    /// semantic model's private type table.
+    #[test]
+    fn declared_return_preferred_over_return_type_in_signature_renderer() {
+        let text = "declare var u: number | undefined;\n\
+                    declare var f: () => number;\n\
+                    let z = f;\n\
+                    let w = u;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let f_id = typed_expression_of(model, &source, "f", text.find("let z").unwrap());
+        let u_id = typed_expression_of(model, &source, "u", text.find("let w").unwrap());
+
+        let Type::Function(base) = model.types().get(f_id).clone() else {
+            panic!("f should be a function type");
+        };
+        assert_eq!(base.return_type(), base.declared_return().unwrap());
+
+        let mut with_alias = base.clone();
+        with_alias.declared_return = Some(u_id);
+        assert_eq!(
+            render_signature(model, &with_alias, " => ", &mut Vec::new()),
+            "() => number | undefined"
+        );
+        assert_eq!(
+            render_signature_declaration(model, &with_alias, " => ", 0, &mut Vec::new()),
+            "() => number | undefined"
+        );
+
+        assert_eq!(
+            render_signature(model, &base, " => ", &mut Vec::new()),
+            "() => number"
+        );
+    }
+
+    /// Methods render the written `declared_return`, not the semantic
+    /// `return_type`. We hand-build a same-semantic pair by attaching `n`'s
+    /// written return annotation to `m`'s signature; both have semantic
+    /// `number` (m directly, n after T4a nonull projection), but the renderer
+    /// shows the declared `number | undefined` for the clone.
+    #[test]
+    fn interface_method_displays_declared_return_not_semantic() {
+        let text = "declare var o: { n(x: string): number | undefined; m(x: string): number; };\n\
+                    let z = o;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let o_id = typed_expression_of(model, &source, "o", text.find("let z").unwrap());
+        let Type::ObjectType(object) = model.types().get(o_id).clone() else {
+            panic!("o should be an object type");
+        };
+
+        let n_property = object
+            .properties
+            .iter()
+            .find(|p| p.name() == "n")
+            .expect("n method");
+        let m_property = object
+            .properties
+            .iter()
+            .find(|p| p.name() == "m")
+            .expect("m method");
+
+        let Type::Function(n_sig) = model.types().get(n_property.type_id()).clone() else {
+            panic!("n should be a method");
+        };
+        let Type::Function(base) = model.types().get(m_property.type_id()).clone() else {
+            panic!("m should be a method");
+        };
+
+        assert_eq!(
+            render_signature(model, &base, ": ", &mut Vec::new()),
+            "(x: string): number"
+        );
+
+        let mut with_declared = base.clone();
+        with_declared.declared_return = n_sig.declared_return();
+        assert_eq!(
+            render_signature(model, &with_declared, ": ", &mut Vec::new()),
+            "(x: string): number | undefined"
+        );
+    }
+
+    /// Call expressions resolve to the semantic `return_type`, never to the
+    /// written `declared_return`. Pre-T4a the two are the same; after T4a
+    /// projection this test guards that callers still see the projected
+    /// semantic return while display remains on declared_return.
+    #[test]
+    fn call_result_type_uses_semantic_return_not_declared() {
+        let text = "declare var f: () => number | undefined;\n\
+                    let x = f();\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let from = text.find("let x").unwrap();
+        let f_id = typed_expression_of(model, &source, "f", from);
+        let x_id = typed_expression_of(model, &source, "f()", from);
+
+        let Type::Function(signature) = model.types().get(f_id).clone() else {
+            panic!("f should be a function type");
+        };
+
+        assert_eq!(x_id, signature.return_type());
+    }
+
+    /// Explicitly-written intersection call signatures keep the ` & ` separator
+    /// and per-member parentheses after the declared_return renderer change.
+    #[test]
+    fn explicit_intersection_call_signatures_keep_ampersand_separator() {
+        let text = "declare var f: ((x: number) => number) & ((x: string) => string);\n\
+                    let z = f;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let z_id = typed_expression_of(model, &source, "f", text.find("let z").unwrap());
+        assert_eq!(
+            render_type(model, z_id),
+            "((x: number) => number) & ((x: string) => string)"
+        );
+    }
+
+    /// A registered alias that declares no type parameters renders as its
+    /// written name, never as its structural view.
+    ///
+    /// `type R = { x: R }` interns the recursive occurrence as
+    /// `AppliedAlias(R, [])` and the table eagerly materializes that head's
+    /// view, so the renderer must not let the cached view reach the output.
+    /// The two legs below are the two ways the old renderer could disagree
+    /// with itself: consulting the cached view, and taking the name path the
+    /// recursion guard (or an absent view) forces. They must now agree.
+    #[test]
+    fn zero_parameter_alias_head_renders_its_name_regardless_of_view_state() {
+        let text = "type R = { x: R };\n\
+                    declare var v: R;\n\
+                    let z = v;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let v_id = typed_expression_of(model, &source, "v", text.find("let z").unwrap());
+        let view_id = model
+            .types()
+            .applied_alias_view(v_id)
+            .expect("R's semantic view is materialized");
+        let Type::ObjectType(object) = model.types().get(view_id).clone() else {
+            panic!("R's semantic view should be an object type");
+        };
+        let head = object
+            .properties
+            .iter()
+            .find(|property| property.name() == "x")
+            .expect("x property")
+            .type_id();
+
+        let Type::AppliedAlias { symbol, arguments } = model.types().get(head).clone() else {
+            panic!("R's recursive occurrence should be an AppliedAlias head");
+        };
+        assert!(arguments.is_empty(), "R declares no type parameters");
+        assert!(model.types().has_alias(symbol));
+        assert!(model.types().alias_type_parameters(symbol).is_empty());
+        // The discriminating cache state: the head's structural view really is
+        // materialized, so a view-first renderer would expand it here.
+        assert!(model.types().applied_alias_view(head).is_some());
+
+        assert_eq!(render_type(model, head), "R");
+        assert_eq!(render_type_declaration(model, head, 0), "R");
+        // The name path — what an uncached view produces — agrees exactly.
+        assert_eq!(
+            render_type_grouped(model, head, false, &mut vec![symbol]),
+            "R"
+        );
+        // A consumer reaching the head through the object keeps the name
+        // instead of inlining the cached view.
+        assert_eq!(render_type(model, view_id), "{ x: R; }");
+        assert_eq!(render_type(model, v_id), "R");
+    }
+
+    /// Parameterized aliases keep their existing expansion: a bare reference
+    /// to a generic alias still renders the substituted structure, so the
+    /// zero-parameter name policy did not widen into generic aliases.
+    #[test]
+    fn parameterized_alias_reference_still_expands() {
+        let text = "type Pair<T> = [T, T];\n\
+                    declare var p: Pair<string>;\n\
+                    let z = p;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let p_id = typed_expression_of(model, &source, "p", text.find("let z").unwrap());
+        assert_eq!(render_type(model, p_id), "[string, string]");
     }
 }

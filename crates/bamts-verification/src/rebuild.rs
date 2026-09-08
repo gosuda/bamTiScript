@@ -52,8 +52,10 @@ pub const RECEIPTS_DIR: &str = "verification/receipts";
 /// populated directory; combining roots would mix independent workflow runs.
 /// The release-named directory (`verification/evidence/<release>`) is the
 /// canonical home for committed release evidence, as declared by the
-/// completion program's `owns` list and the A3.1 gate ledger.
-const RECEIPT_SET_DIRS: [&str; 6] = [
+/// completion program's `owns` list and the A3.1 gate ledger. The same list
+/// defines the generated-run-output boundary shared by receipt discovery and
+/// the candidate-source projection, so the two can never drift apart.
+pub(crate) const RECEIPT_SET_DIRS: [&str; 6] = [
     RECEIPTS_DIR,
     "verification/evidence/pr-merged",
     "verification/evidence/nightly-merged",
@@ -61,6 +63,51 @@ const RECEIPT_SET_DIRS: [&str; 6] = [
     "verification/evidence/release",
     "verification/evidence/typescript-7.0.2",
 ];
+
+/// Whether one canonical repository-relative Git path is a generated run
+/// output rather than candidate source.
+///
+/// The generated-output boundary is byte-exact and closed:
+///
+/// 1. exactly `proof/completeness-ledger.json`;
+/// 2. immediate children with the case-sensitive `.jsonl` suffix of exactly
+///    the directories in [`RECEIPT_SET_DIRS`].
+///
+/// `path` is the raw Git path as Git enumerates it (no filesystem
+/// canonicalization, no symlink resolution, no Unicode rewriting): matching
+/// is `&[u8]` equality so non-UTF-8 paths can never decode into an allowed
+/// name. Prefix lookalikes stay source: a nested file
+/// (`<owner>/sub/a.jsonl`), a sibling directory (`release-extra/a.jsonl`),
+/// a different suffix (`.json`, `.jsonl.tmp`, `foo.jsonl.rs`), and a
+/// different case (`.JSONL`) all return `false`. Nothing outside this
+/// allowlist is ever exempt — toolchain JSON, the locked manifest,
+/// classification, source locks, formal material, `.gitignore`, Cargo files,
+/// and raw shards remain candidate source.
+///
+/// This predicate answers the path question only. Every caller must also
+/// enforce the file kind: the committed-tree projection excludes an allowed
+/// path only when it is a regular blob (mode `100644`/`100755`), and the
+/// dirty gate permits an allowed path only when the worktree entry is a
+/// regular file. A symlink, submodule, or directory standing at an allowed
+/// path is therefore never exempt — it stays bound in candidate identity and
+/// cannot hide source.
+pub(crate) fn is_generated_run_output(path: &[u8]) -> bool {
+    if path == LEDGER_PATH.as_bytes() {
+        return true;
+    }
+    for dir in RECEIPT_SET_DIRS {
+        if let Some(name) = path
+            .strip_prefix(dir.as_bytes())
+            .and_then(|suffix| suffix.strip_prefix(b"/"))
+            && !name.contains(&b'/')
+            && name.ends_with(b".jsonl")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Schema tag the G0 ledger verifier requires.
 pub const LEDGER_SCHEMA: &str = "bamti.completeness-ledger/v1";
 
@@ -374,7 +421,6 @@ fn declared_configuration(identifier: &str) -> String {
             |(_, configuration)| configuration.to_owned(),
         )
 }
-
 fn native_platform() -> String {
     let environment = if cfg!(target_env = "musl") {
         "musl"
@@ -2170,5 +2216,67 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The generated-output allowlist is byte-exact and closed: the ledger
+    /// path matches only itself, each canonical owner directory admits only
+    /// its own immediate `.jsonl` children, and nested paths, sibling
+    /// directories, wrong suffixes, and case variants are all candidate
+    /// source. This is the shared predicate `suite/completion.rs` relies on
+    /// for both the committed-tree projection and the dirty gate, so its
+    /// contract is pinned here independent of any real Git repository.
+    #[test]
+    fn is_generated_run_output_matches_exact_allowlist_only() {
+        assert!(is_generated_run_output(b"proof/completeness-ledger.json"));
+        assert!(!is_generated_run_output(
+            b"proof/completeness-ledger.json.bak"
+        ));
+        assert!(!is_generated_run_output(b"proof/completeness-ledger"));
+        assert!(!is_generated_run_output(b"Proof/completeness-ledger.json"));
+        assert!(!is_generated_run_output(b"proof/completeness_ledger.json"));
+
+        for dir in RECEIPT_SET_DIRS {
+            let direct = format!("{dir}/a.jsonl");
+            assert!(
+                is_generated_run_output(direct.as_bytes()),
+                "{direct} must be accepted"
+            );
+
+            let nested = format!("{dir}/sub/a.jsonl");
+            assert!(
+                !is_generated_run_output(nested.as_bytes()),
+                "{nested} must be rejected"
+            );
+
+            let sibling = format!("{dir}-extra/a.jsonl");
+            assert!(
+                !is_generated_run_output(sibling.as_bytes()),
+                "{sibling} must be rejected"
+            );
+
+            let wrong_suffix = format!("{dir}/a.json");
+            assert!(
+                !is_generated_run_output(wrong_suffix.as_bytes()),
+                "{wrong_suffix} must be rejected"
+            );
+
+            let tmp_suffix = format!("{dir}/a.jsonl.tmp");
+            assert!(
+                !is_generated_run_output(tmp_suffix.as_bytes()),
+                "{tmp_suffix} must be rejected"
+            );
+
+            let embedded_suffix = format!("{dir}/foo.jsonl.rs");
+            assert!(
+                !is_generated_run_output(embedded_suffix.as_bytes()),
+                "{embedded_suffix} must be rejected"
+            );
+
+            let wrong_case = format!("{dir}/a.JSONL");
+            assert!(
+                !is_generated_run_output(wrong_case.as_bytes()),
+                "{wrong_case} must be rejected"
+            );
+        }
     }
 }

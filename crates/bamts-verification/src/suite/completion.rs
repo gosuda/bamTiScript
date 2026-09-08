@@ -1139,8 +1139,136 @@ fn file_sha256(path: &Path) -> Result<String> {
 /// Bounded runtime for host-identity probes.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Runs `git` through the bounded corpus process boundary.
+/// Candidate tree identity for a committed tree: a versioned projection of
+/// committed source, not the raw tree hash.
+///
+/// The digest is `sha256("bamti-candidate-source/v1\0" + stream)`. The stream
+/// is the deterministic, byte-sorted sequence of every committed Git tree
+/// entry of the resolved `HEAD` tree except exact generated run outputs:
+/// `proof/completeness-ledger.json` and the immediate regular-file `.jsonl`
+/// children of the canonical receipt-set directories declared by
+/// [`crate::rebuild::RECEIPT_SET_DIRS`]. Each retained entry contributes its
+/// mode, object type, object ID, and exact path bytes, so executable bits,
+/// symlink targets, submodules, and path names stay bound; parent tree IDs
+/// are never hashed, so a receipt-only landing commit that only rewrites
+/// generated leaves leaves this digest unchanged.
+///
+/// Generated outputs are excluded only as regular blob files. A symlink or
+/// submodule standing at an output path is retained and therefore cannot use
+/// that location to hide source; nested files, sibling directories, and
+/// suffix or case lookalikes were never outputs to begin with.
+///
+/// A v2 receipt is only valid for a clean committed tree. The dirty gate
+/// mirrors the identical path policy over
+/// `git status --porcelain=v1 -z --untracked-files=all`: modification,
+/// staging, deletion, addition, type change, conflict, and untracked entries
+/// at source paths are refused, a rename or copy crossing the source/output
+/// boundary is refused on either end, an unmerged record is refused even at
+/// an output name, and an untracked entry at an output path is permitted only
+/// as a regular file. Deletion or modification of a generated output never
+/// dirties the tree. Truncated or malformed Git output is refused; no digest
+/// is ever produced from partial records. Git runs through the pinned
+/// process boundary, so a user's global gitconfig — especially
+/// `core.excludesfile` — cannot silently hide untracked content.
+///
+/// The capture is an atomic snapshot of one committed tree. The git probes
+/// are separate processes, so after the gate completes `HEAD` is resolved a
+/// second time and a capture that observed `HEAD` move between resolution
+/// and completion is refused, never digested: the dirty gate and the hashed
+/// enumeration always describe the same commit.
+/// Two captures of the same committed tree always produce the same digest.
+/// The namespace version makes receipts captured by the former full-tree
+/// algorithm (`git-tree\0` prefix) permanently stale at merge/admission; old
+/// receipts require genuine reruns and must never be rewritten to fit.
+fn candidate_tree_digest(root: &Path) -> Result<String> {
+    let tree = resolve_head_tree(root)?;
+    candidate_tree_digest_against(root, &tree)
+}
+
+/// Projects one committed tree, already resolved from `HEAD`, through the
+/// dirty gate and the digest, and refuses unless `HEAD` still resolves to
+/// that same tree once the gate completes. Split from
+/// [`candidate_tree_digest`] so tests can replay a capture whose tree was
+/// displaced mid-flight.
+fn candidate_tree_digest_against(root: &Path, tree: &str) -> Result<String> {
+    let status = capture_worktree_status(root)?;
+    let listing = git_probe_bounded(
+        root,
+        &["ls-tree", "-r", "-z", "--full-tree", tree],
+        TREE_PROBE_OUTPUT_BYTES,
+    )?;
+    let records = parse_tree_records(&listing)?;
+    refuse_dirty_source(root, &status, &records)?;
+    let settled = resolve_head_tree(root)?;
+    if settled != tree {
+        return Err(VerificationError::new(
+            ErrorCode::Digest,
+            format!(
+                "the candidate snapshot is not coherent; `HEAD` moved from tree {tree} to {settled} during the capture"
+            ),
+        ));
+    }
+    // A worktree write after the first status read leaves HEAD stable but
+    // tears the dirty gate: re-probe and refuse on any change.
+    let restatus = capture_worktree_status(root)?;
+    worktree_status_stable(&status, &restatus)?;
+    let mut hasher = Sha256::new();
+    hasher.update(CANDIDATE_SOURCE_NAMESPACE);
+    hasher.update(b"\x00");
+    hasher.update(committed_source_stream(&records));
+    Ok(schema::sha256_hex(&hasher.finalize()))
+}
+
+/// Captures the full porcelain worktree status bytes compared by
+/// [`worktree_status_stable`] to detect writes between probes.
+fn capture_worktree_status(root: &Path) -> Result<Vec<u8>> {
+    git_probe(
+        root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+    )
+}
+
+/// Refuses a capture whose worktree status changed between two probes: even
+/// with a stable HEAD, a mid-capture write tears the dirty gate the first
+/// probe established.
+fn worktree_status_stable(before: &[u8], after: &[u8]) -> Result<()> {
+    if before == after {
+        return Ok(());
+    }
+    Err(VerificationError::new(
+        ErrorCode::Digest,
+        "the candidate snapshot is not coherent; the worktree status changed during the capture",
+    ))
+}
+
+/// Domain separator of the committed-source projection algorithm. A change
+/// to the exclusion policy or to the stream encoding must bump the version.
+const CANDIDATE_SOURCE_NAMESPACE: &[u8] = b"bamti-candidate-source/v1";
+
+/// Bounded window for the recursive committed-tree enumeration. The 64-KiB
+/// probe window would silently truncate the `ls-tree` listing of any
+/// real-world repository, and a truncated enumeration must never feed the
+/// digest, so the tree probe uses an explicitly justified larger window:
+/// a full recursive listing of a large monorepo stays in the low megabytes,
+/// and the boundary still fails closed through `stdout_truncated`.
+const TREE_PROBE_OUTPUT_BYTES: usize = 64 << 20;
+
+/// Runs `git` through the bounded corpus process boundary with the default
+/// 64-KiB probe window.
 fn git_probe(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    git_probe_bounded(root, args, PROBE_OUTPUT_BYTES)
+}
+
+/// Runs `git` through the bounded corpus process boundary, pinned
+/// environment included, and refuses any output that outgrew its window: a
+/// truncated prefix is a non-answer, never a digest input.
+fn git_probe_bounded(root: &Path, args: &[&str], max_output_bytes: usize) -> Result<Vec<u8>> {
     use crate::oracles::{self, ProcessBoundary};
     let invocation = oracles::ProcessInvocation {
         program: PathBuf::from("git"),
@@ -1149,7 +1277,7 @@ fn git_probe(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
         environment: oracles::pinned_environment(),
         limits: crate::corpus::OracleLimits {
             timeout: PROBE_TIMEOUT,
-            max_output_bytes: PROBE_OUTPUT_BYTES,
+            max_output_bytes,
         },
     };
     let outcome = oracles::CorpusProcessBoundary
@@ -1160,6 +1288,15 @@ fn git_probe(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
                 format!("git probe `git {}` failed: {error}", args.join(" ")),
             )
         })?;
+    if outcome.stdout_truncated {
+        return Err(VerificationError::new(
+            ErrorCode::ToolFailed,
+            format!(
+                "git probe `git {}` output exceeded the bounded {max_output_bytes}-byte window",
+                args.join(" ")
+            ),
+        ));
+    }
     if outcome.exit_code != Some(0) {
         return Err(VerificationError::new(
             ErrorCode::ToolFailed,
@@ -1173,19 +1310,10 @@ fn git_probe(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(outcome.stdout)
 }
 
-/// Candidate tree identity for a committed tree: the HEAD tree hash.
-///
-/// A v2 receipt is only valid for a clean committed tree.  If the working
-/// tree is dirty (modified, staged, untracked, or deleted files), this
-/// returns an error so the writer never produces a non-deterministic
-/// digest.  Two captures of the same committed tree always produce the
-/// same digest because it is solely `sha256("git-tree\0" + HEAD_tree_hash)`.
-fn candidate_tree_digest(root: &Path) -> Result<String> {
-    // Use git_probe (pinned environment) so the user's global gitconfig —
-    // especially `core.excludesfile` — cannot silently hide untracked files
-    // from the dirty-tree check.  A raw `Command::new("git")` inherits HOME,
-    // reads ~/.gitconfig, and may honor a global excludesfile that masks
-    // embedded repositories or other untracked content.
+/// Resolves `HEAD` once to its committed tree ID. An unborn `HEAD`, a
+/// malformed object ID, or a failed resolution is a refusal, never an empty
+/// projection.
+fn resolve_head_tree(root: &Path) -> Result<String> {
     let tree_bytes = git_probe(root, &["rev-parse", "HEAD^{tree}"])?;
     let tree = String::from_utf8_lossy(&tree_bytes).trim().to_owned();
     if !matches!(tree.len(), 40 | 64)
@@ -1198,20 +1326,323 @@ fn candidate_tree_digest(root: &Path) -> Result<String> {
             format!("git reported a malformed tree digest `{tree}`"),
         ));
     }
-    let status = git_probe(
-        root,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    )?;
-    if !status.is_empty() {
-        return Err(VerificationError::new(
-            ErrorCode::Schema,
-            "candidate tree is dirty; a v2 receipt requires a clean committed tree",
-        ));
+    Ok(tree)
+}
+
+/// One committed Git tree entry as `git ls-tree -r -z` enumerates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeRecord {
+    mode: String,
+    kind: String,
+    object: String,
+    path: Vec<u8>,
+}
+
+/// Parses the raw `-z` listing. `mode SP kind SP object TAB path NUL` per
+/// record; paths are raw bytes and may contain any byte except NUL. Every
+/// deviation — a missing tab, an unknown mode or kind, a malformed object ID,
+/// an unterminated record — is a refusal, so a truncated or corrupted
+/// listing can never contribute a partial projection.
+fn parse_tree_records(listing: &[u8]) -> Result<Vec<TreeRecord>> {
+    let malformed = |detail: String| {
+        VerificationError::new(
+            ErrorCode::ToolFailed,
+            format!("git ls-tree enumeration is malformed: {detail}"),
+        )
+    };
+    let mut records = Vec::new();
+    let mut rest = listing;
+    while !rest.is_empty() {
+        let Some(tab) = rest.iter().position(|byte| *byte == b'\t') else {
+            return Err(malformed("record has no path separator".to_owned()));
+        };
+        let meta = std::str::from_utf8(&rest[..tab])
+            .map_err(|_| malformed("record metadata is not UTF-8".to_owned()))?;
+        let mut fields = meta.split(' ');
+        let (mode, kind, object) =
+            match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                (Some(mode), Some(kind), Some(object), None) => (mode, kind, object),
+                _ => {
+                    return Err(malformed(format!(
+                        "record metadata `{meta}` is not three fields"
+                    )));
+                }
+            };
+        if !matches!(
+            (mode, kind),
+            ("100644" | "100755" | "120000", "blob") | ("160000", "commit")
+        ) {
+            return Err(malformed(format!("invalid mode/type pair `{mode} {kind}`")));
+        }
+        if !matches!(object.len(), 40 | 64)
+            || !object
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(malformed(format!("record object `{object}` is malformed")));
+        }
+        let path_bytes = &rest[tab + 1..];
+        let Some(nul) = path_bytes.iter().position(|byte| *byte == b'\0') else {
+            return Err(malformed("record path is not NUL-terminated".to_owned()));
+        };
+        if nul == 0 {
+            return Err(malformed("record path is empty".to_owned()));
+        }
+        records.push(TreeRecord {
+            mode: mode.to_owned(),
+            kind: kind.to_owned(),
+            object: object.to_owned(),
+            path: path_bytes[..nul].to_vec(),
+        });
+        rest = &path_bytes[nul + 1..];
     }
-    let mut hasher = Sha256::new();
-    hasher.update(b"git-tree\x00");
-    hasher.update(tree.as_bytes());
-    Ok(schema::sha256_hex(&hasher.finalize()))
+    Ok(records)
+}
+
+/// Encodes the deterministic committed-source stream: every record except
+/// exact generated run outputs, sorted by exact path bytes (then mode and
+/// object for a total order), each contributing
+/// `mode SP kind SP object TAB path NUL`. Exclusion applies only to regular
+/// blobs; a symlink or submodule at an output path stays in the stream.
+fn committed_source_stream(records: &[TreeRecord]) -> Vec<u8> {
+    let mut retained: Vec<&TreeRecord> = records
+        .iter()
+        .filter(|record| {
+            !(record.kind == "blob"
+                && matches!(record.mode.as_str(), "100644" | "100755")
+                && crate::rebuild::is_generated_run_output(&record.path))
+        })
+        .collect();
+    retained.sort_by(|left, right| {
+        (&left.path, &left.mode, &left.object).cmp(&(&right.path, &right.mode, &right.object))
+    });
+    let mut stream = Vec::new();
+    for record in retained {
+        stream.extend_from_slice(record.mode.as_bytes());
+        stream.push(b' ');
+        stream.extend_from_slice(record.kind.as_bytes());
+        stream.push(b' ');
+        stream.extend_from_slice(record.object.as_bytes());
+        stream.push(b'\t');
+        stream.extend_from_slice(&record.path);
+        stream.push(b'\0');
+    }
+    stream
+}
+
+/// One `git status --porcelain=v1 -z` record: the XY state pair plus one
+/// raw path (and the original path of a rename or copy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusRecord {
+    index_state: u8,
+    worktree_state: u8,
+    path: Vec<u8>,
+    orig_path: Option<Vec<u8>>,
+}
+
+impl StatusRecord {
+    /// The closed unmerged vocabulary. `DD` (both deleted) and `AA`
+    /// (both added) carry no `U`, so they are matched explicitly.
+    fn is_unmerged(&self) -> bool {
+        matches!(
+            (self.index_state, self.worktree_state),
+            (b'D', b'D') | (b'A', b'A')
+        ) || self.index_state == b'U'
+            || self.worktree_state == b'U'
+    }
+
+    /// Whether the record takes the path out of the worktree, in which case
+    /// no worktree file kind can be observed.
+    fn removes_from_worktree(&self) -> bool {
+        self.index_state == b'D' || self.worktree_state == b'D'
+    }
+}
+
+/// Parses the raw `-z` status: `XY SP path NUL` per record, and rename/copy
+/// records carry the original path as one further NUL-delimited field. Any
+/// deviation — a short record, a missing state separator, an empty path, a
+/// record that is not NUL-terminated — is a refusal.
+fn parse_status_records(status: &[u8]) -> Result<Vec<StatusRecord>> {
+    let malformed = |detail: String| {
+        VerificationError::new(
+            ErrorCode::ToolFailed,
+            format!("git status enumeration is malformed: {detail}"),
+        )
+    };
+    let mut records = Vec::new();
+    let mut rest = status;
+    while !rest.is_empty() {
+        if rest.len() < 4 || rest[2] != b' ' {
+            return Err(malformed("record is shorter than `XY SP path`".to_owned()));
+        }
+        let (index_state, worktree_state) = (rest[0], rest[1]);
+        if !matches!(
+            index_state,
+            b' ' | b'M' | b'T' | b'A' | b'D' | b'R' | b'C' | b'U' | b'?'
+        ) || !matches!(
+            worktree_state,
+            b' ' | b'M' | b'T' | b'A' | b'D' | b'R' | b'C' | b'U' | b'?'
+        ) || ((index_state == b'?') != (worktree_state == b'?'))
+            || (index_state == b' ' && worktree_state == b' ')
+        {
+            return Err(malformed("invalid status state pair".to_owned()));
+        }
+        let path_bytes = &rest[3..];
+        let Some(nul) = path_bytes.iter().position(|byte| *byte == b'\0') else {
+            return Err(malformed("record path is not NUL-terminated".to_owned()));
+        };
+        let path = path_bytes[..nul].to_vec();
+        rest = &path_bytes[nul + 1..];
+        let orig_path =
+            if matches!(index_state, b'R' | b'C') || matches!(worktree_state, b'R' | b'C') {
+                let Some(nul) = rest.iter().position(|byte| *byte == b'\0') else {
+                    return Err(malformed("rename record has no original path".to_owned()));
+                };
+                let orig_path = rest[..nul].to_vec();
+                rest = &rest[nul + 1..];
+                if orig_path.is_empty() {
+                    return Err(malformed(
+                        "rename record has an empty original path".to_owned(),
+                    ));
+                }
+                Some(orig_path)
+            } else {
+                None
+            };
+        if path.is_empty() {
+            return Err(malformed("record path is empty".to_owned()));
+        }
+        records.push(StatusRecord {
+            index_state,
+            worktree_state,
+            path,
+            orig_path,
+        });
+    }
+    Ok(records)
+}
+
+/// Addresses one raw Git path against the repository root. On Unix the bytes
+/// pass through exactly.
+#[cfg(unix)]
+fn worktree_path(root: &Path, path: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(root.join(std::ffi::OsStr::from_bytes(path)))
+}
+
+#[cfg(not(unix))]
+fn worktree_path(root: &Path, path: &[u8]) -> Result<PathBuf> {
+    let text = std::str::from_utf8(path).map_err(|_| {
+        VerificationError::new(
+            ErrorCode::Schema,
+            "non-UTF-8 Git path cannot be addressed on this platform",
+        )
+    })?;
+    Ok(root.join(text))
+}
+
+/// Whether the worktree entry at one raw Git path is a regular file. Symlink
+/// metadata is used so a symlink standing at an output path is never
+/// mistaken for the generated file it names.
+fn worktree_file_is_regular(root: &Path, path: &[u8]) -> Result<bool> {
+    let addressed = worktree_path(root, path)?;
+    Ok(fs::symlink_metadata(&addressed).is_ok_and(|meta| meta.is_file()))
+}
+
+fn dirty_source(detail: String) -> VerificationError {
+    VerificationError::new(
+        ErrorCode::Schema,
+        format!("candidate tree is dirty; a v2 receipt requires a clean committed tree: {detail}"),
+    )
+}
+
+/// The dirty gate. Mirrors the exact generated-output policy of the
+/// committed-source projection: every status record must name only generated
+/// run outputs, unmerged records are refused even at output names, a rename
+/// or copy is refused when either end leaves the output boundary, and an
+/// untracked or modified output is tolerated only while the worktree entry
+/// is a regular file. Existing HEAD and index entries must also be regular:
+/// deleting or replacing a source-bound symlink is still a source change.
+fn refuse_dirty_source(root: &Path, status: &[u8], committed: &[TreeRecord]) -> Result<()> {
+    let changes = parse_status_records(status)?;
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let index = git_probe_bounded(
+        root,
+        &["ls-files", "--stage", "-z"],
+        TREE_PROBE_OUTPUT_BYTES,
+    )?;
+    let mut index_modes = BTreeMap::new();
+    for entry in index
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let Some((metadata, path)) = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .map(|tab| entry.split_at(tab))
+        else {
+            return Err(dirty_source("malformed index enumeration".to_owned()));
+        };
+        let fields: Vec<_> = metadata.split(|byte| *byte == b' ').collect();
+        if fields.len() != 3 || fields.last().copied() != Some(b"0".as_slice()) {
+            return Err(dirty_source("unmerged or malformed index".to_owned()));
+        }
+        let mode = fields.first().copied().unwrap_or_default();
+        index_modes.insert(path.strip_prefix(b"\t").unwrap_or_default(), mode);
+    }
+    if !index.is_empty() && !index.ends_with(b"\0") {
+        return Err(dirty_source("truncated index enumeration".to_owned()));
+    }
+    let committed_modes: BTreeMap<_, _> = committed
+        .iter()
+        .map(|entry| (entry.path.as_slice(), entry.mode.as_bytes()))
+        .collect();
+    for record in changes {
+        if record.is_unmerged() {
+            return Err(dirty_source(format!(
+                "unmerged index record at `{}`",
+                String::from_utf8_lossy(&record.path)
+            )));
+        }
+        let mut paths: Vec<&[u8]> = vec![&record.path];
+        if let Some(orig_path) = &record.orig_path {
+            paths.push(orig_path);
+        }
+        for path in paths {
+            if !crate::rebuild::is_generated_run_output(path) {
+                return Err(dirty_source(format!(
+                    "`{}` is candidate source, not a generated run output",
+                    String::from_utf8_lossy(path)
+                )));
+            }
+            for modes in [&committed_modes, &index_modes] {
+                if modes
+                    .get(path)
+                    .is_some_and(|mode| !matches!(*mode, b"100644" | b"100755"))
+                {
+                    return Err(dirty_source(
+                        "generated path has a source-bound file kind".to_owned(),
+                    ));
+                }
+            }
+        }
+        // Even a staged deletion may have been recreated in the worktree.
+        // A recreated symlink or directory must not inherit the deletion exemption.
+        if (!record.removes_from_worktree()
+            || worktree_path(root, &record.path)?
+                .symlink_metadata()
+                .is_ok())
+            && !worktree_file_is_regular(root, &record.path)?
+        {
+            return Err(dirty_source(format!(
+                "`{}` stands at a generated output path but is not a regular file",
+                String::from_utf8_lossy(&record.path)
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Toolchain pin: the `rustc` version string and the SHA-256 of
@@ -2296,5 +2727,594 @@ mod tests {
         )
         .expect("key");
         assert!(fourslash_lane_outcome(&compiler).is_none());
+    }
+
+    /// Landing a generated receipt through every lifecycle phase — untracked,
+    /// staged, committed, modified, deleted, and re-added — never perturbs the
+    /// projected candidate-source digest. Only the receipt changes; the
+    /// candidate identity it is bound to must not.
+    #[test]
+    fn receipt_landing_transaction_is_tree_invariant() {
+        let (scratch, _) = manifest_root("landing-invariance", &["jit.a"]);
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&scratch.root)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        let commit = |message: &str| {
+            run_git(&[
+                "-c",
+                "user.name=bamts-suite-test",
+                "-c",
+                "user.email=suite@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ]);
+        };
+        // The shared fixture's `.gitignore` hides `*.jsonl` so unrelated tests
+        // can scatter scratch receipts; this test needs the real project
+        // policy, which ignores only build output, so a fresh receipt is
+        // genuinely untracked and visible to `git status`.
+        scratch.write(".gitignore", b"/target/\n");
+        run_git(&["add", "-A"]);
+        commit("realistic gitignore");
+
+        let baseline = candidate_tree_digest(&scratch.root).expect("clean baseline digest");
+
+        // Untracked.
+        let receipt = scratch.write("verification/receipts/a.jsonl", b"receipt-v1");
+        assert_eq!(
+            candidate_tree_digest(&scratch.root).expect("untracked output digest"),
+            baseline,
+            "an untracked generated output must not perturb the projection"
+        );
+
+        // Staged.
+        run_git(&["add", "verification/receipts/a.jsonl"]);
+        assert_eq!(
+            candidate_tree_digest(&scratch.root).expect("staged output digest"),
+            baseline,
+            "a staged generated output must not perturb the projection"
+        );
+
+        // Committed.
+        commit("land receipt");
+        assert_eq!(
+            candidate_tree_digest(&scratch.root).expect("committed output digest"),
+            baseline,
+            "a committed generated output must not perturb the projection"
+        );
+
+        // Modified, untracked.
+        fs::write(&receipt, b"receipt-v2").expect("rewrite receipt");
+        assert_eq!(
+            candidate_tree_digest(&scratch.root).expect("modified output digest"),
+            baseline,
+            "an untracked modification to a generated output must not perturb the projection"
+        );
+
+        // Deleted, untracked.
+        fs::remove_file(&receipt).expect("delete receipt");
+        assert_eq!(
+            candidate_tree_digest(&scratch.root).expect("deleted output digest"),
+            baseline,
+            "an untracked deletion of a generated output must not perturb the projection"
+        );
+
+        // Deletion committed.
+        run_git(&["add", "-A"]);
+        commit("remove receipt");
+        assert_eq!(
+            candidate_tree_digest(&scratch.root).expect("committed deletion digest"),
+            baseline,
+            "committing the removal of a generated output must not perturb the projection"
+        );
+
+        // Re-added as output only, committed.
+        scratch.write("verification/receipts/a.jsonl", b"receipt-v3");
+        run_git(&["add", "-A"]);
+        commit("re-land receipt");
+        assert_eq!(
+            candidate_tree_digest(&scratch.root).expect("re-landed output digest"),
+            baseline,
+            "re-landing a generated output must not perturb the projection"
+        );
+    }
+
+    /// A source file staged in the index — never committed — dirties the tree
+    /// and is refused; a v2 receipt requires a clean committed tree.
+    #[test]
+    fn staged_source_file_is_rejected_by_dirty_gate() {
+        let (scratch, _) = manifest_root("staged-source", &["jit.a"]);
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&scratch.root)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        candidate_tree_digest(&scratch.root).expect("clean baseline");
+
+        scratch.write("src/feature.ts", b"// new source");
+        run_git(&["add", "src/feature.ts"]);
+        let error =
+            candidate_tree_digest(&scratch.root).expect_err("staged source must be refused");
+        assert_eq!(error.code(), ErrorCode::Schema);
+    }
+
+    /// A new source file that is merely untracked — never staged — dirties the
+    /// tree exactly the same way a staged one does.
+    #[test]
+    fn untracked_source_file_is_rejected_by_dirty_gate() {
+        let (scratch, _) = manifest_root("untracked-source", &["jit.a"]);
+        candidate_tree_digest(&scratch.root).expect("clean baseline");
+
+        scratch.write("src/feature.ts", b"// untracked source");
+        let error =
+            candidate_tree_digest(&scratch.root).expect_err("untracked source must be refused");
+        assert_eq!(error.code(), ErrorCode::Schema);
+    }
+
+    /// A real, committed source change permanently moves the candidate
+    /// identity, so a binding captured beforehand is provably stale afterward:
+    /// `first_mismatch_field` names exactly `candidate_tree_digest`, with
+    /// every other bound field — authority, harness, binary, toolchain —
+    /// unchanged.
+    #[test]
+    fn committed_source_change_produces_stale_binding() {
+        let (scratch, _) = manifest_root("committed-source", &["jit.a"]);
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&scratch.root)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        let commit = |message: &str| {
+            run_git(&[
+                "-c",
+                "user.name=bamts-suite-test",
+                "-c",
+                "user.email=suite@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ]);
+        };
+        let stale_binding =
+            current_run_binding(&scratch.root, "catalog-a").expect("binding before change");
+
+        scratch.write("src/feature.ts", b"// source changed");
+        run_git(&["add", "src/feature.ts"]);
+        commit("source change");
+
+        let fresh_binding =
+            current_run_binding(&scratch.root, "catalog-a").expect("binding after change");
+        assert_eq!(
+            stale_binding.first_mismatch_field(&fresh_binding),
+            Some("candidate_tree_digest"),
+            "a receipt captured before the source change must be rejected as stale"
+        );
+    }
+
+    /// The capture must be an atomic snapshot of one committed tree: if
+    /// `HEAD` moves while the dirty gate and enumeration run, the torn read
+    /// must be refused, never digested. Replaying a capture against a tree
+    /// that a later commit displaced is that torn read, made deterministic.
+    #[test]
+    fn head_move_during_capture_is_refused() {
+        let (scratch, _) = manifest_root("moved-head", &["jit.a"]);
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&scratch.root)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        let commit = |message: &str| {
+            run_git(&[
+                "-c",
+                "user.name=bamts-suite-test",
+                "-c",
+                "user.email=suite@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ]);
+        };
+        let stale_tree = resolve_head_tree(&scratch.root).expect("resolve committed tree");
+
+        scratch.write("src/feature.ts", b"// source");
+        run_git(&["add", "src/feature.ts"]);
+        commit("head moves mid-capture");
+
+        let error = candidate_tree_digest_against(&scratch.root, &stale_tree)
+            .expect_err("a capture overtaken by a commit must be refused");
+        assert_eq!(error.code(), ErrorCode::Digest);
+
+        let fresh_tree = resolve_head_tree(&scratch.root).expect("resolve moved tree");
+        candidate_tree_digest_against(&scratch.root, &fresh_tree)
+            .expect("a capture over one stable tree succeeds");
+    }
+
+    /// A worktree write between the status probe and the end of the capture
+    /// must be refused even when HEAD never moves: the re-probe compares
+    /// full status bytes, so any dirt the first probe missed fails closed.
+    /// Replays the torn read deterministically through two captures.
+    #[test]
+    fn worktree_dirt_between_probes_is_refused() {
+        let (scratch, _) = manifest_root("dirt-between-probes", &["jit.a"]);
+        let before = capture_worktree_status(&scratch.root).expect("capture clean status");
+        scratch.write("src/late.ts", b"// late write");
+        let after = capture_worktree_status(&scratch.root).expect("capture dirty status");
+        assert_ne!(
+            before, after,
+            "a mid-capture write must change the status bytes"
+        );
+        assert!(
+            worktree_status_stable(&before, &after).is_err(),
+            "changed status bytes must refuse the snapshot"
+        );
+        let steady = capture_worktree_status(&scratch.root).expect("recapture status");
+        worktree_status_stable(&after, &steady).expect("stable status must accept");
+    }
+
+    /// A rename whose original path is candidate source is refused even though
+    /// its destination lands at an eligible output path: the projection reads
+    /// both sides of a rename record, and cannot let a source edit disguise
+    /// itself as a generated output by walking through one.
+    #[test]
+    fn rename_source_to_output_path_is_rejected() {
+        let (scratch, _) = manifest_root("rename-source-to-output", &["jit.a"]);
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&scratch.root)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        let commit = |message: &str| {
+            run_git(&[
+                "-c",
+                "user.name=bamts-suite-test",
+                "-c",
+                "user.email=suite@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ]);
+        };
+        scratch.write(".gitignore", b"/target/\n");
+        run_git(&["add", "-A"]);
+        commit("realistic gitignore");
+        scratch.write("src/feature.ts", b"// source");
+        run_git(&["add", "src/feature.ts"]);
+        commit("add source");
+        candidate_tree_digest(&scratch.root).expect("clean before rename");
+
+        // `git mv` never creates the destination directory itself.
+        fs::create_dir_all(scratch.root.join("verification/receipts"))
+            .expect("create destination directory");
+        run_git(&[
+            "mv",
+            "src/feature.ts",
+            "verification/receipts/feature.jsonl",
+        ]);
+        let error = candidate_tree_digest(&scratch.root)
+            .expect_err("a rename from source to an output-eligible path must be refused");
+        assert_eq!(error.code(), ErrorCode::Schema);
+    }
+
+    /// A rename whose destination is candidate source is refused even though
+    /// its original path was a generated output: an output cannot walk itself
+    /// out of the exclusion set and start masquerading as source either.
+    #[test]
+    fn rename_output_to_source_path_is_rejected() {
+        let (scratch, _) = manifest_root("rename-output-to-source", &["jit.a"]);
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&scratch.root)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        let commit = |message: &str| {
+            run_git(&[
+                "-c",
+                "user.name=bamts-suite-test",
+                "-c",
+                "user.email=suite@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ]);
+        };
+        scratch.write(".gitignore", b"/target/\n");
+        run_git(&["add", "-A"]);
+        commit("realistic gitignore");
+        scratch.write("verification/receipts/feature.jsonl", b"{}");
+        run_git(&["add", "verification/receipts/feature.jsonl"]);
+        commit("add output");
+        candidate_tree_digest(&scratch.root).expect("clean before rename");
+
+        // `git mv` never creates the destination directory itself.
+        fs::create_dir_all(scratch.root.join("src")).expect("create destination directory");
+        run_git(&[
+            "mv",
+            "verification/receipts/feature.jsonl",
+            "src/feature.txt",
+        ]);
+        let error = candidate_tree_digest(&scratch.root)
+            .expect_err("a rename from an output-eligible path to source must be refused");
+        assert_eq!(error.code(), ErrorCode::Schema);
+    }
+
+    /// A staged rename between two output-eligible paths stays on the exempt
+    /// side of the boundary on both ends, so it must not dirty the tree. This
+    /// is the contrasting case to the two tests above: only a boundary
+    /// crossing is refused, not every rename record that touches an output.
+    #[test]
+    fn rename_within_output_set_is_invariant() {
+        let (scratch, _) = manifest_root("rename-within-output", &["jit.a"]);
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&scratch.root)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        let commit = |message: &str| {
+            run_git(&[
+                "-c",
+                "user.name=bamts-suite-test",
+                "-c",
+                "user.email=suite@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ]);
+        };
+        scratch.write(".gitignore", b"/target/\n");
+        run_git(&["add", "-A"]);
+        commit("realistic gitignore");
+        scratch.write("verification/receipts/old.jsonl", b"{}");
+        run_git(&["add", "verification/receipts/old.jsonl"]);
+        commit("add output");
+        let baseline = candidate_tree_digest(&scratch.root).expect("clean baseline");
+
+        run_git(&[
+            "mv",
+            "verification/receipts/old.jsonl",
+            "verification/receipts/new.jsonl",
+        ]);
+        let digest = candidate_tree_digest(&scratch.root)
+            .expect("a rename between two output-eligible paths must not dirty the tree");
+        assert_eq!(
+            digest, baseline,
+            "renaming within the output set must not perturb the projection"
+        );
+    }
+
+    /// A symlink standing at an eligible output path is source-kind, not a
+    /// generated output: uncommitted, it fails the regular-file worktree
+    /// check; committed, it stays retained in the projection stream instead of
+    /// being excluded, so it cannot use its path to hide from candidate
+    /// identity.
+    #[test]
+    #[cfg(unix)]
+    fn symlink_at_output_path_is_retained_as_source() {
+        let (scratch, _) = manifest_root("symlink-output", &["jit.a"]);
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&scratch.root)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        let commit = |message: &str| {
+            run_git(&[
+                "-c",
+                "user.name=bamts-suite-test",
+                "-c",
+                "user.email=suite@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ]);
+        };
+        scratch.write(".gitignore", b"/target/\n");
+        run_git(&["add", "-A"]);
+        commit("realistic gitignore");
+        let baseline = candidate_tree_digest(&scratch.root).expect("clean baseline");
+
+        // `symlink` does not create the directory its link path names, unlike
+        // `Scratch::write`, so the receipt-set parent must exist first.
+        fs::create_dir_all(scratch.root.join("verification/receipts"))
+            .expect("create output directory");
+
+        std::os::unix::fs::symlink(
+            "/tmp",
+            scratch.root.join("verification/receipts/link.jsonl"),
+        )
+        .expect("create symlink");
+
+        // Uncommitted: an untracked symlink at an eligible output path is
+        // refused — it is not a regular file, so the untracked-output
+        // exemption does not apply.
+        let error = candidate_tree_digest(&scratch.root)
+            .expect_err("an untracked symlink at an output path must be refused");
+        assert_eq!(error.code(), ErrorCode::Schema);
+
+        run_git(&["add", "verification/receipts/link.jsonl"]);
+        commit("land symlink");
+
+        // Committed: the symlink is retained in the projection stream, not
+        // excluded, so the digest changes even though its path matches the
+        // output allowlist.
+        let after = candidate_tree_digest(&scratch.root)
+            .expect("a clean commit containing a symlink must still project");
+        assert_ne!(
+            after, baseline,
+            "a symlink at an output path must remain bound in candidate identity"
+        );
+    }
+
+    /// The mirror case of the symlink test: an executable-mode regular file is
+    /// still a regular file, so it stays exempt at an eligible output path
+    /// exactly like a non-executable one.
+    #[test]
+    #[cfg(unix)]
+    fn executable_bit_generated_output_remains_exempt() {
+        let (scratch, _) = manifest_root("executable-output", &["jit.a"]);
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&scratch.root)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        let commit = |message: &str| {
+            run_git(&[
+                "-c",
+                "user.name=bamts-suite-test",
+                "-c",
+                "user.email=suite@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ]);
+        };
+        scratch.write(".gitignore", b"/target/\n");
+        run_git(&["add", "-A"]);
+        commit("realistic gitignore");
+        let baseline = candidate_tree_digest(&scratch.root).expect("clean baseline");
+
+        let output = scratch.write("verification/receipts/tool.jsonl", b"{}");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&output).expect("stat output").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&output, perms).expect("chmod +x");
+        run_git(&["add", "verification/receipts/tool.jsonl"]);
+        commit("land executable output");
+
+        let after = candidate_tree_digest(&scratch.root)
+            .expect("an executable generated output must still project cleanly");
+        assert_eq!(
+            after, baseline,
+            "an executable-mode generated output is still a regular file and stays exempt"
+        );
+    }
+
+    /// Spaces, a leading dash, and other unusual-but-valid path bytes must
+    /// neither break the `ls-tree`/`status` parsers nor confuse exact-path
+    /// matching: an odd-byte output stays exempt, an odd-byte source stays
+    /// bound, and neither is ever conflated with the other.
+    #[test]
+    fn unusual_path_bytes_are_handled_exactly() {
+        let (scratch, _) = manifest_root("odd-path-bytes", &["jit.a"]);
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&scratch.root)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        let commit = |message: &str| {
+            run_git(&[
+                "-c",
+                "user.name=bamts-suite-test",
+                "-c",
+                "user.email=suite@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ]);
+        };
+        scratch.write(".gitignore", b"/target/\n");
+        run_git(&["add", "-A"]);
+        commit("realistic gitignore");
+
+        scratch.write("-weird source name.txt", b"v1");
+        scratch.write("verification/receipts/name with space.jsonl", b"{}");
+        run_git(&["add", "-A"]);
+        commit("odd path bytes");
+        let baseline = candidate_tree_digest(&scratch.root)
+            .expect("odd path bytes must not break the ls-tree/status parsers");
+
+        // Modifying the odd-byte OUTPUT path, untracked, must remain exempt.
+        fs::write(
+            scratch
+                .root
+                .join("verification/receipts/name with space.jsonl"),
+            b"{}\n",
+        )
+        .expect("mutate output");
+        assert_eq!(
+            candidate_tree_digest(&scratch.root).expect("modified odd-path output digest"),
+            baseline,
+            "an odd-byte generated-output path must still be recognized by exact matching"
+        );
+        run_git(&[
+            "checkout",
+            "--",
+            "verification/receipts/name with space.jsonl",
+        ]);
+
+        // Modifying the odd-byte SOURCE path, staged only, must still dirty
+        // the tree.
+        fs::write(scratch.root.join("-weird source name.txt"), b"v2").expect("mutate source");
+        run_git(&["add", "--", "-weird source name.txt"]);
+        let error = candidate_tree_digest(&scratch.root)
+            .expect_err("an odd-byte source path must still be recognized as candidate source");
+        assert_eq!(error.code(), ErrorCode::Schema);
+    }
+
+    /// A binding computed under the retired full-tree algorithm — the
+    /// `sha256("git-tree\0" + HEAD^{tree})` digest the projection replaced —
+    /// is permanently stale against the current namespaced projection, even
+    /// though nothing else about the run changed: authority, candidate
+    /// binary, harness, and toolchain all still match. The version bump in
+    /// `CANDIDATE_SOURCE_NAMESPACE` is exactly what a legacy receipt cannot
+    /// satisfy, and `first_mismatch_field` must name the one field that
+    /// carries that version, `candidate_tree_digest`, and nothing else.
+    #[test]
+    fn domain_version_change_rejects_legacy_namespace_digest() {
+        let (scratch, _) = manifest_root("legacy-namespace", &["jit.a"]);
+
+        let mut snapshot = current_run_snapshot(&scratch.root).expect("current snapshot");
+        let real_binding =
+            binding_from_snapshot(&scratch.root, "catalog-a", &snapshot).expect("real binding");
+
+        let tree_bytes = git_probe(&scratch.root, &["rev-parse", "HEAD^{tree}"])
+            .expect("resolve committed tree");
+        let tree = String::from_utf8_lossy(&tree_bytes).trim().to_owned();
+        let legacy_digest = schema::sha256_hex(format!("git-tree\0{tree}").as_bytes());
+        assert_ne!(
+            legacy_digest, snapshot.candidate_tree_digest,
+            "the legacy full-tree digest must differ from the current projection"
+        );
+
+        snapshot.candidate_tree_digest = legacy_digest;
+        let legacy_binding = binding_from_snapshot(&scratch.root, "catalog-a", &snapshot)
+            .expect("legacy-namespace binding");
+
+        assert_eq!(
+            legacy_binding.first_mismatch_field(&real_binding),
+            Some("candidate_tree_digest"),
+            "a receipt captured under the retired full-tree algorithm must be rejected as stale"
+        );
     }
 }

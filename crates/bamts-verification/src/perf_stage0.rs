@@ -710,10 +710,15 @@ fn capture_aot_child_maps(root: &Path, workload: &Path) -> Result<ChildMapSample
     sample_child_maps(child, &executable, CHILD_MAP_TIMEOUT)
 }
 
-fn sample_child_maps(
+fn sample_child_maps(child: Child, executable: &Path, timeout: Duration) -> Result<ChildMapSample> {
+    sample_child_maps_with_observer(child, executable, timeout, |_, _| Ok(()))
+}
+
+fn sample_child_maps_with_observer(
     mut child: Child,
     executable: &Path,
     timeout: Duration,
+    mut observed: impl FnMut(&mut Child, &[ProcessMapping]) -> Result<()>,
 ) -> Result<ChildMapSample> {
     let stdout = child
         .stdout
@@ -762,6 +767,10 @@ fn sample_child_maps(
             break Err(anyhow::anyhow!(
                 "live child used anonymous executable mappings: {anonymous:?}"
             ));
+        }
+        // Coordinate fixtures only after this snapshot passes the real mapping checks.
+        if let Err(error) = observed(&mut child, &mappings) {
+            break Err(error);
         }
         for mapping in mappings {
             union.entry(mapping.identity.clone()).or_insert(mapping);
@@ -950,6 +959,7 @@ fn parse_whitespace_list(text: &str) -> Result<Vec<u32>> {
 mod tests {
     use super::*;
     use crate::suite::TempDir;
+    use std::io::Write;
 
     #[derive(Default)]
     struct CheckedProvider {
@@ -1146,14 +1156,37 @@ requires="live map captured"
 
     #[test]
     fn continuous_sampler_accepts_safe_child_through_exit() {
-        let executable = fs::canonicalize("/bin/sleep").unwrap();
+        let executable = fs::canonicalize("/bin/cat").unwrap();
         let child = Command::new(&executable)
-            .arg("0.1")
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let sample = sample_child_maps(child, &executable, Duration::from_secs(2)).unwrap();
+        let mut executable_samples = 0;
+        let sample = sample_child_maps_with_observer(
+            child,
+            &executable,
+            Duration::from_secs(2),
+            |child, mappings| {
+                if mappings.iter().any(|mapping| {
+                    mapping.permissions.contains('x')
+                        && mapping
+                            .pathname
+                            .as_deref()
+                            .is_some_and(|path| Path::new(path) == executable)
+                }) {
+                    executable_samples += 1;
+                    if executable_samples == 2 {
+                        // EOF lets cat exit only after multiple executable observations.
+                        drop(child.stdin.take());
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(executable_samples >= 2);
         assert!(sample.samples > 1);
         assert!(sample.executable_mappings > 0);
         assert!(anonymous_executable_mappings(&sample.mappings).is_empty());
@@ -1170,12 +1203,14 @@ requires="live map captured"
 #include <sys/mman.h>
 #include <unistd.h>
 int main(void) {
-    usleep(100000);
+    char observed;
+    if (read(STDIN_FILENO, &observed, 1) != 1) return 3;
     void *page = mmap(0, 4096, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (page == MAP_FAILED || mprotect(page, 4096, PROT_READ | PROT_EXEC) != 0) return 2;
-    usleep(150000);
-    return 0;
+    /* Keep the forbidden mapping live until the sampler rejects and kills us. */
+    if (read(STDIN_FILENO, &observed, 1) != 1) return 4;
+    return 5;
 }
 "#,
         )
@@ -1190,11 +1225,39 @@ int main(void) {
         assert!(compiled.success());
         let executable = fs::canonicalize(executable).unwrap();
         let child = Command::new(&executable)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let error = sample_child_maps(child, &executable, Duration::from_secs(2)).unwrap_err();
+        let mut executable_observed = false;
+        let error = sample_child_maps_with_observer(
+            child,
+            &executable,
+            Duration::from_secs(2),
+            |child, mappings| {
+                if !executable_observed
+                    && mappings.iter().any(|mapping| {
+                        mapping.permissions.contains('x')
+                            && mapping
+                                .pathname
+                                .as_deref()
+                                .is_some_and(|path| Path::new(path) == executable)
+                    })
+                {
+                    child
+                        .stdin
+                        .as_mut()
+                        .context("late-map child stdin was not piped")?
+                        .write_all(b"x")
+                        .context("releasing late-map child after executable observation")?;
+                    executable_observed = true;
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(executable_observed);
         let message = error.to_string();
         assert!(
             message.contains("anonymous executable") || message.contains("RWX"),
