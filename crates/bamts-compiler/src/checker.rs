@@ -1324,13 +1324,9 @@ fn build_imported_symbol_type<'a>(
     )?;
     let source_model = files.get(&linked.source)?;
     let symbol_kind = source_model.symbol(linked.symbol).kind();
-    // A class symbol's value plane is its constructor type; the structural
-    // static side hangs off it, and the type plane is its instance type.
-    let value_type_id = if symbol_kind == SymbolKind::Class {
-        source_model.constructor_type(linked.symbol)
-    } else {
-        source_model.symbol_type(linked.symbol)
-    };
+    // Classes and enums answer their constructor on the value plane;
+    // the helper owns that rule for every reader.
+    let value_type_id = source_model.value_side_type(linked.symbol);
     let value_type = source_model.types().get(value_type_id);
     if matches!(value_type, Type::Error | Type::Any | Type::Unknown) {
         return None;
@@ -1351,9 +1347,10 @@ fn build_imported_symbol_type<'a>(
                 .filter(|_| signatures.all(|entry| entry.signature.return_type() == return_type))
             })
         }
-        (SymbolKind::Interface | SymbolKind::TypeAlias | SymbolKind::Enum, _) => {
-            Some(value_type_id)
-        }
+        (SymbolKind::Interface | SymbolKind::TypeAlias, _) => Some(value_type_id),
+        // Enums split planes like classes: the value plane is the
+        // constructor, the type plane stays the scalar enum type.
+        (SymbolKind::Enum, _) => Some(source_model.symbol_type(linked.symbol)),
         _ => None,
     };
     Some(ImportedSymbolType {
@@ -3503,6 +3500,96 @@ mod tests {
         assert!(
             codes.contains(&CANNOT_FIND_NAME.as_str()),
             "es5 lib must not resolve Proxy or document: {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn enum_value_assignable_to_matching_object() {
+        let result = check_text_with(
+            "enum E {\n    A = 1,\n}\nconst v: { A: E } = E;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn enum_value_mismatch_still_rejected() {
+        let result = check_text_with(
+            "enum E {\n    A = 1,\n}\nconst v: { A: string } = E;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            !checker_codes_of(&result).is_empty(),
+            "expected a mismatch diagnostic, got clean: {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn namespace_value_assignable_to_matching_object() {
+        let result = check_text_with(
+            "namespace M {\n    export const x = 1;\n}\nconst v: { x: number } = M;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn namespace_value_mismatch_still_rejected() {
+        let result = check_text_with(
+            "namespace M {\n    export const x = 1;\n}\nconst v: { x: string } = M;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            !checker_codes_of(&result).is_empty(),
+            "expected a mismatch diagnostic, got clean: {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn enum_reverse_mapping_reads_string() {
+        let result = check_text_with(
+            "enum E {\n    A = 1,\n}\nconst v = E[0];",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn merged_enum_namespace_alias_member() {
+        let result = check_text_with(
+            "enum E {\n    A = 1,\n}\nnamespace E {\n    export const x = 1;\n}\nconst v = E;\nv.x;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
             result.diagnostics()
         );
     }

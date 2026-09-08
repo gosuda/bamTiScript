@@ -3692,6 +3692,341 @@ mod tests {
         assert_eq!(verdict, FacetVerdict::Pass);
     }
 
+    /// Regression: heterogeneous enums keep a reverse-mapping index when
+    /// any member is numeric. Scalar classification stays all-members;
+    /// only the `[index: number]: string` signature needs one member.
+    #[test]
+    fn hetero_enum_numeric_member_reverse_lookup() {
+        let case_text = "enum H {\n    A = 1,\n    B = \"s\",\n}\nconst n: string = H[1];\n";
+        let units = split_case_units("tests/cases/compiler/heteroEnumReverseLookup.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/heteroEnumReverseLookup.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
+    /// Regression: aliases of merged class+namespace partners construct.
+    /// The legacy identifier path answers the class constructor, so
+    /// `new alias()` keeps its construct signatures plus `alias.x`.
+    #[test]
+    fn merged_class_namespace_alias_constructs() {
+        let case_text = "class C {\n}\nnamespace C {\n    export const x = 1;\n}\nconst alias = C;\nconst n: number = alias.x;\nnew alias();\n";
+        let units = split_case_units(
+            "tests/cases/compiler/mergedClassNamespaceAlias.ts",
+            case_text,
+        );
+        let entry = entry_virtual_path("tests/cases/compiler/mergedClassNamespaceAlias.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
+    /// Regression: type-only exports are not runtime properties. `f.x`
+    /// still resolves through the merged export scope while `f.T`
+    /// reports a missing-property diagnostic.
+    #[test]
+    fn merged_namespace_type_only_member_rejected() {
+        let case_text = "function f() {\n}\nnamespace f {\n    export type T = string;\n    export const x = 1;\n}\nconst v: number = f.x;\nconst w = f.T;\n";
+        let units = split_case_units("tests/cases/compiler/mergedNamespaceTypeOnly.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/mergedNamespaceTypeOnly.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C057".to_owned(), 8)]);
+    }
+    /// Regression: pure namespaces reject type-only member reads the
+    /// same way. `M.x` resolves while `M.T` reports missing-property.
+    #[test]
+    fn pure_namespace_type_only_member_rejected() {
+        let case_text = "namespace M {\n    export type T = string;\n    export const x = 1;\n}\nconst v: number = M.x;\nconst w = M.T;\n";
+        let units = split_case_units("tests/cases/compiler/pureNamespaceTypeOnly.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/pureNamespaceTypeOnly.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C057".to_owned(), 6)]);
+    }
+    /// Regression: namespace constructor members answer value-side types.
+    /// Classes contribute their constructor (so `new alias.C()` checks)
+    /// and enums their value-side constructor (so `m.A` resolves).
+    #[test]
+    fn namespace_alias_members_use_value_side_types() {
+        let case_text = "namespace N {\n    export class C {\n    }\n    export enum E {\n        A = 1,\n    }\n}\nconst alias = N;\nnew alias.C();\nconst m = alias.E;\nconst k = m.A;\n";
+        let units = split_case_units("tests/cases/compiler/namespaceAliasValueSide.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/namespaceAliasValueSide.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: `typeof` a merged class keeps construct signatures and
+    /// gains the namespace exports. The finalizer augments the class
+    /// constructor instead of skipping class-kind partners.
+    #[test]
+    fn merged_class_namespace_typeof_keeps_additions() {
+        let case_text = "class C {\n}\nnamespace C {\n    export const x = 1;\n}\ntype T = typeof C;\nconst m: T = C;\nnew m();\nconst n: number = m.x;\n";
+        let units = split_case_units(
+            "tests/cases/compiler/mergedClassNamespaceTypeof.ts",
+            case_text,
+        );
+        let entry =
+            entry_virtual_path("tests/cases/compiler/mergedClassNamespaceTypeof.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
+    /// Regression: chained reads through namespace enum values resolve.
+    /// Direct (`N.E.A`) and alias (`m.A`) chains stay diagnostic-free.
+    #[test]
+    fn namespace_enum_member_chains_resolve() {
+        let case_text = "namespace N {\n    export enum E {\n        A = 1,\n    }\n}\nconst x = N.E.A;\nconst m = N.E;\nconst y = m.A;\n";
+        let units = split_case_units("tests/cases/compiler/namespaceEnumChains.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/namespaceEnumChains.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: classes exported from a merged namespace construct.
+    /// The merged member-access arm answers the constructor, not the
+    /// instance slot.
+    #[test]
+    fn merged_namespace_exported_class_constructs() {
+        let case_text =
+            "class C {\n}\nnamespace C {\n    export class D {\n    }\n}\nconst d = new C.D();\n";
+        let units = split_case_units("tests/cases/compiler/mergedNsExportedClass.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/mergedNsExportedClass.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: a class static wins over a same-named namespace-only
+    /// type. The static is the runtime value; the type binding must not
+    /// mask it with a missing-property diagnostic.
+    #[test]
+    fn class_static_beats_namespace_type_name() {
+        let case_text = "class C {\n    static x = 1;\n}\nnamespace C {\n    export type x = string;\n}\nconst n: number = C.x;\n";
+        let units = split_case_units("tests/cases/compiler/classStaticVsNsType.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/classStaticVsNsType.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: aliases of merged functions keep namespace exports.
+    /// The export-scope fallback keys off the resolved symbol, so
+    /// `alias.x` answers like the direct `f.x` read.
+    #[test]
+    fn merged_function_alias_keeps_exports() {
+        let case_text = "function f() {\n}\nnamespace f {\n    export const x = 1;\n}\nconst alias = f;\nconst n: number = alias.x;\n";
+        let units = split_case_units("tests/cases/compiler/mergedFunctionAlias.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/mergedFunctionAlias.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
+    /// Regression: numeric constant-expression initializers keep the
+    /// reverse-mapping index (`1 << 1` is numeric at runtime).
+    #[test]
+    fn const_expr_enum_member_reverse_lookup() {
+        let case_text = "enum E {\n    A = 1 << 1,\n}\nconst s: string = E[2];\n";
+        let units = split_case_units("tests/cases/compiler/constExprEnumReverse.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/constExprEnumReverse.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
+    /// Regression: derived constructors refresh when the base merges
+    /// later. `B` resolved before `namespace C` still sees `x`.
+    #[test]
+    fn derived_class_sees_late_namespace_additions() {
+        let case_text = "class C {\n}\nclass B extends C {\n}\nnamespace C {\n    export const x = 1;\n}\nconst n: number = B.x;\n";
+        let units = split_case_units("tests/cases/compiler/derivedLateNsAdditions.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/derivedLateNsAdditions.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: cyclic heritage with a merged base terminates. The
+    /// augmentation worklist carries a visited guard (mirroring
+    /// `is_derived_from`); without it this case loops forever, so
+    /// completion itself is the assertion. Circularity diagnostics
+    /// are owned by the heritage checker, not pinned here.
+    #[test]
+    fn cyclic_heritage_merge_terminates() {
+        let case_text = "class A extends B {\n}\nclass B extends A {\n}\nnamespace A {\n    export const x = 1;\n}\nconst n = B.x;\n";
+        let units = split_case_units("tests/cases/compiler/cyclicHeritageMerge.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/cyclicHeritageMerge.ts", &units);
+        let _case = compile_case(&units, &entry).expect("case compiles");
+    }
+
+    /// Regression: an own static colliding with a namespace value export
+    /// is a duplicate declaration (tsc TS2300, approximated by C001).
+    /// Inherited statics yield instead; only the own collision fires.
+    /// A second fragment must not re-fire the same diagnostic.
+    #[test]
+    fn own_static_namespace_export_collision() {
+        let case_text = "class C {\n    static x = 1;\n}\nnamespace C {\n    export const x = 2;\n}\nnamespace C {\n    export const y = 3;\n}\nconst n = C.x;\n";
+        let units = split_case_units("tests/cases/compiler/ownStaticNsCollision.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/ownStaticNsCollision.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C001".to_owned(), 5)]);
+    }
+    /// Regression: multiple namespace fragments sharing one export
+    /// scope stay silent. Each fragment finalizes over the accumulated
+    /// scope; appends must not collide with themselves.
+    #[test]
+    fn namespace_fragments_share_export_scope_silently() {
+        let case_text = "class C {\n}\nnamespace C {\n    export const x = 2;\n}\nnamespace C {\n    export const y = 3;\n}\nconst n = C.x;\n";
+        let units = split_case_units(
+            "tests/cases/compiler/namespaceFragmentsSilent.ts",
+            case_text,
+        );
+        let entry = entry_virtual_path("tests/cases/compiler/namespaceFragmentsSilent.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: a namespace export validly narrows an inherited
+    /// static. Unlike own-static collisions, the derived merge replaces
+    /// the flattened base property (tsc accepts).
+    #[test]
+    fn derived_merge_narrows_inherited_static() {
+        let case_text = "class C {\n    static x: number = 1;\n}\nclass B extends C {\n}\nnamespace B {\n    export const x = 1;\n}\nconst n: number = B.x;\n";
+        let units = split_case_units("tests/cases/compiler/derivedNarrowingMerge.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/derivedNarrowingMerge.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
+    /// Regression: callable synthesis survives same-named type exports.
+    /// `f.call` resolves through `Function.call` even with
+    /// `export type call` present; `apply`/`bind` are unaffected.
+    #[test]
+    fn callable_member_survives_type_name_collision() {
+        let case_text = "function f() {\n}\nnamespace f {\n    export type call = string;\n}\nf.call(undefined);\nconst g = f.apply;\nconst h = f.bind;\n";
+        let units = split_case_units("tests/cases/compiler/callableTypeCollision.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/callableTypeCollision.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
+    /// Regression: nested namespaces contribute finalized constructors.
+    /// The inner namespace finalizes before the outer snapshots it, so
+    /// the outer structural carries the inner member types, not a shell.
+    #[test]
+    fn nested_namespace_structural_assignment() {
+        let case_text = "namespace A {\n    export namespace B {\n        export const x = 1;\n    }\n}\nconst v: { B: { x: number } } = A;\n";
+        let units = split_case_units("tests/cases/compiler/nestedNamespaceAssign.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/nestedNamespaceAssign.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
     /// Regression: two diagnostics at the same line/column in different files
     /// must not compare equal. Before the unit field was carried through
     /// `FacetDiagnostic`, the comparator keyed only on position/category/
@@ -4449,6 +4784,117 @@ export const a2 = 3;
         );
     }
 
+    /// Numeric enum declaration headers carry the enum type (`>E1 : E1`,
+    /// enumBasics3.types:8), not `any`.
+    #[test]
+    fn emit_types_numeric_enum_header_names_enum_type() {
+        let logical = "tests/cases/compiler/enumHeaderPin.ts";
+        let case_text = "enum E1 {\n    a = 1,\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">E1 : E1"),
+            "missing `>E1 : E1` header:\n{emitted}"
+        );
+        assert!(
+            !emitted.lines().any(|line| line == ">E1 : any"),
+            "stale `any` header:\n{emitted}"
+        );
+    }
+
+    /// String enum declaration headers carry the named type (`>S : S`).
+    #[test]
+    fn emit_types_string_enum_header_names_enum_type() {
+        let logical = "tests/cases/compiler/stringEnumHeaderPin.ts";
+        let case_text = "enum S {\n    a = \"a\",\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">S : S"),
+            "missing `>S : S` header:\n{emitted}"
+        );
+    }
+
+    /// Namespace declaration headers carry the constructor type
+    /// (`>M : typeof M`, FunctionDeclaration7.types:5).
+    #[test]
+    fn emit_types_namespace_header_names_constructor_type() {
+        let logical = "tests/cases/compiler/namespaceHeaderPin.ts";
+        let case_text = "namespace M {\n    export var x = 1;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">M : typeof M"),
+            "missing `>M : typeof M` header:\n{emitted}"
+        );
+    }
+
+    /// Merged `enum E` + `namespace E` keeps the enum type on the shared
+    /// symbol: the enum header still reads `>E : E`
+    /// (augmentedTypesEnum:88). The namespace declaration's own
+    /// `>E : typeof E` row needs per-declaration headers, which the
+    /// per-symbol loop cannot render yet — banked follow-up.
+    #[test]
+    fn emit_types_merged_enum_namespace_keeps_enum_type() {
+        let logical = "tests/cases/compiler/mergedEnumNamespacePin.ts";
+        let case_text = "enum E {\n    A = 1,\n}\nnamespace E {\n    export var x = 1;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">E : E"),
+            "missing `>E : E` header:\n{emitted}"
+        );
+    }
+
+    /// Interface+namespace merges keep interface members readable
+    /// through the type side.
+    #[test]
+    fn emit_types_interface_namespace_merge_keeps_members() {
+        let logical = "tests/cases/compiler/interfaceNamespaceMergePin.ts";
+        let case_text = "interface M {\n    value: number;\n}\nnamespace M {\n    export const tag = 1;\n}\ndeclare const m: M;\nm.value;\nM.tag;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">m.value : number"),
+            "missing `>m.value : number`:\n{emitted}"
+        );
+        assert!(
+            emitted.lines().any(|line| line == ">M.tag : 1"),
+            "missing `>M.tag : 1`:\n{emitted}"
+        );
+    }
+
+    /// Function+namespace merges keep the function callable: the
+    /// namespace write must not replace a function-kind symbol's type.
+    #[test]
+    fn emit_types_function_namespace_merge_stays_callable() {
+        let logical = "tests/cases/compiler/functionNamespaceMergePin.ts";
+        let case_text =
+            "function f() {\n}\nnamespace f {\n    export const x = 1;\n}\nf();\nf.x;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">f : () => void"),
+            "merged function lost its callable type:\n{emitted}"
+        );
+        assert!(
+            emitted.lines().any(|line| line == ">f.x : 1"),
+            "missing `>f.x : 1`:\n{emitted}"
+        );
+    }
+
     /// A multi-file case's preamble before the first `@Filename:` marker is
     /// global options, not a unit: upstream `ParseTestFilesAndSymlinks`
     /// (`AllowImplicitFirstFile: false`) drops a comment-only preamble, so
@@ -4463,7 +4909,6 @@ export const a2 = 3;
 // @target: es2015\n\
 // @filename: class.ts\n\
 class Point { x: number; }\n\
-\n\
 // @filename: simple.ts\n\
 var a = 1;\n";
         let units = split_case_units(logical, case_text);
@@ -4477,6 +4922,26 @@ var a = 1;\n";
         assert!(
             emitted.contains("=== class.ts ==="),
             "first @Filename unit keeps its section; emitted:\n{emitted}"
+        );
+    }
+
+    /// Cross-file enum values keep their constructor through named
+    /// imports: structural assignment in the importing unit accepts.
+    #[test]
+    fn emit_types_imported_enum_value_assignable() {
+        let logical = "tests/cases/compiler/importedEnumPin.ts";
+        let case_text = "// @filename: e.ts\nenum E {\n    A = 1,\n}\nexport { E };\n// @filename: use.ts\nimport { E } from \"./e\";\nconst v: { A: E } = E;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">v : { A: E; }"),
+            "missing value line:\n{emitted}"
+        );
+        assert!(
+            emitted.lines().any(|line| line == ">E : typeof E"),
+            "missing imported typeof line:\n{emitted}"
         );
     }
 
