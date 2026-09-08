@@ -7233,6 +7233,62 @@ interface I {
             ]
         );
     }
+    /// Three colliding declarations flag each site exactly once (tsc
+    /// TS2300 at (1,10), (3,5) and (4,5), both modes): the shared
+    /// earlier site must not duplicate.
+    #[test]
+    fn triple_conflict_reports_each_site_once() {
+        let case_text = "function f() {\n}\nlet f = 1;\nlet f = 2;\n";
+        let units = split_case_units("tests/cases/compiler/tripleConflict.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tripleConflict.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 9),
+                ("BAMTS-C001".to_owned(), 3, 4),
+                ("BAMTS-C001".to_owned(), 4, 4),
+            ]
+        );
+    }
+    /// Sloppy twin of the triple-conflict pin (tsc TS2300 at all
+    /// three sites in sloppy too).
+    #[test]
+    fn sloppy_triple_conflict_reports_each_site_once() {
+        let case_text = "function f() {\n}\nlet f = 1;\nlet f = 2;\n";
+        let units = split_case_units("tests/cases/compiler/sloppyTriple.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/sloppyTriple.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 9),
+                ("BAMTS-C001".to_owned(), 3, 4),
+                ("BAMTS-C001".to_owned(), 4, 4),
+            ]
+        );
+    }
     /// the same shape with `var` stays silent (tsc clean, both modes).
     #[test]
     fn loop_header_var_merges_with_body_function() {
