@@ -1009,7 +1009,9 @@ fn types_facet_wrong_expr_diagnostic() {
 /// sorted-first file from another area.
 #[test]
 fn resolve_prefers_owning_area_for_stem_twins() {
-    let root = std::env::temp_dir().join(format!("bamts-twin-{}", std::process::id()));
+    // Crate convention keeps regenerable scratch under target/tmp
+    // (see the sampler report path), honoring TMPDIR redirects.
+    let root = repo_root().join(format!("target/tmp/bamts-twin-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     for area in ["compiler", "conformance"] {
         fs::create_dir_all(root.join(area)).expect("fixture area");
