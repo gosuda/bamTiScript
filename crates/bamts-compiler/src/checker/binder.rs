@@ -5457,24 +5457,44 @@ fn diagnostic_suppressions(source: &SourceFile) -> DiagnosticSuppressions {
     }
 }
 
-/// Returns whether an enum initializer is a numeric literal expression.
+/// Returns whether an enum initializer is a numeric constant expression:
+/// literals, parenthesized numerics, sign/bitwise-not applications, and
+/// numeric binary operators over numeric operands. Matches the runtime
+/// reverse-mapping rule without a full constant folder.
 pub(crate) fn is_numeric_enum_initializer(expression: &Expr) -> bool {
     match expression.data() {
         Expression::Literal(Literal::Number(_)) => true,
+        Expression::Parenthesized(inner) => is_numeric_enum_initializer(inner),
         Expression::Unary(unary)
-            if matches!(unary.operator, UnaryOperator::Plus | UnaryOperator::Minus) =>
+            if matches!(
+                unary.operator,
+                UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::BitNot
+            ) =>
         {
-            matches!(
-                unary.argument.data(),
-                Expression::Literal(Literal::Number(_))
-            )
+            is_numeric_enum_initializer(&unary.argument)
+        }
+        Expression::Binary(binary)
+            if matches!(
+                binary.operator,
+                BinaryOperator::Add
+                    | BinaryOperator::Subtract
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Remainder
+                    | BinaryOperator::Exponentiate
+                    | BinaryOperator::LeftShift
+                    | BinaryOperator::SignedRightShift
+                    | BinaryOperator::UnsignedRightShift
+                    | BinaryOperator::BitAnd
+                    | BinaryOperator::BitXor
+                    | BinaryOperator::BitOr
+            ) =>
+        {
+            is_numeric_enum_initializer(&binary.left) && is_numeric_enum_initializer(&binary.right)
         }
         _ => false,
     }
 }
-
-/// One bound named interface member declaration occurrence.
-///
 /// Duplicate declarations of one member name share the canonical `symbol`
 /// while each keeps its own `declaration` and `name_range`, so consumers can
 /// render every written occurrence without minting extra symbols.

@@ -3882,6 +3882,24 @@ mod tests {
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
 
+    /// Regression: numeric constant-expression initializers keep the
+    /// reverse-mapping index (`1 << 1` is numeric at runtime).
+    #[test]
+    fn const_expr_enum_member_reverse_lookup() {
+        let case_text = "enum E {\n    A = 1 << 1,\n}\nconst s: string = E[2];\n";
+        let units = split_case_units("tests/cases/compiler/constExprEnumReverse.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/constExprEnumReverse.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
     /// Regression: nested namespaces contribute finalized constructors.
     /// The inner namespace finalizes before the outer snapshots it, so
     /// the outer structural carries the inner member types, not a shell.
