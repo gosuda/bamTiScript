@@ -13830,18 +13830,16 @@ class B extends A {
     }
 
     #[test]
-    fn strict_unbraced_for_body_function_still_hoists() {
+    fn strict_unbraced_for_body_function_stays_loop_scoped() {
+        // tsc reports TS2304 on the pre-loop use (oracle-verified):
+        // a for-body function never reaches the enclosing scope.
         let result = check_text_with(
             "declare var cond: boolean;\nf();\nfor (; cond;) function f() { }",
             ProgramCheckOptions::standard()
                 .with_target(Some("es2015"))
                 .with_strict(true),
         );
-        assert!(
-            checker_codes_of(&result).is_empty(),
-            "{:?}",
-            result.diagnostics()
-        );
+        assert_eq!(checker_codes_of(&result), ["BAMTS-C002"]);
     }
 
     #[test]

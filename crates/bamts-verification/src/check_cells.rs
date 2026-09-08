@@ -6815,6 +6815,27 @@ interface I {
             .collect();
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
+    /// Regression: a call before a nested for-body declaration resolves
+    /// (tsc silent: the function hoists to the loop scope). The outer
+    /// pre-pass skips the for-body subtree, so the loop-local prebind
+    /// must declare it before earlier statements resolve.
+    #[test]
+    fn for_nested_function_precedes_use() {
+        let case_text =
+            "declare var cond: boolean;\nfor (;;) {\nf();\nif (cond) function f() {\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/forNestedPrecede.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/forNestedPrecede.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
     /// Regression: an unbraced for-body function stays loop-scoped (tsc
     /// TS2304 on the post-loop use); it must not leak outward as `any`.
     #[test]

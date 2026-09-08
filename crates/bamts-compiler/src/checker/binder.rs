@@ -9177,7 +9177,7 @@ impl<'src> Binder<'src> {
         self.check_cancel()?;
         self.bind_statement_names_and_class_headers(statements, scope);
         self.check_cancel()?;
-        self.bind_hoisted_statements(statements, scope, false, false);
+        self.bind_hoisted_statements(statements, scope, false, false, false);
         self.check_cancel()?;
         self.build_import_equals_targets(statements, scope);
         let mut imported_by_source = HashMap::<*const TypeTable, ImportedTypeMap>::new();
@@ -10545,9 +10545,10 @@ impl<'src> Binder<'src> {
         scope: ScopeId,
         in_block: bool,
         in_for_body: bool,
+        local: bool,
     ) {
         for statement in statements {
-            self.bind_hoisted_statement(statement, scope, in_block, in_for_body);
+            self.bind_hoisted_statement(statement, scope, in_block, in_for_body, local);
         }
     }
     fn bind_hoisted_statement(
@@ -10556,6 +10557,7 @@ impl<'src> Binder<'src> {
         scope: ScopeId,
         in_block: bool,
         in_for_body: bool,
+        local: bool,
     ) {
         match statement.data() {
             Statement::Variable(variable) if variable.kind == VariableKind::Var => {
@@ -10575,8 +10577,11 @@ impl<'src> Binder<'src> {
                 // them in the `For` child scope. `var` and
                 // top-level/sloppy functions hoist as before.
                 let strict_block = in_block && self.scopes[scope.0 as usize].strict;
+                // A block-local prebind (`local`) declares into the block
+                // itself, so the strict-block skip does not apply: the
+                // later resolve declares the same identity.
                 if let Some(name) = &function.function.name
-                    && !strict_block
+                    && (!strict_block || local)
                     && !in_for_body
                 {
                     self.declare(
@@ -10588,13 +10593,23 @@ impl<'src> Binder<'src> {
                     );
                 }
             }
-            Statement::Block(block) => {
-                self.bind_hoisted_statements(&block.data().statements, scope, true, in_for_body)
-            }
+            Statement::Block(block) => self.bind_hoisted_statements(
+                &block.data().statements,
+                scope,
+                true,
+                in_for_body,
+                false,
+            ),
             Statement::If(statement) => {
-                self.bind_hoisted_statement(&statement.consequent, scope, in_block, in_for_body);
+                self.bind_hoisted_statement(
+                    &statement.consequent,
+                    scope,
+                    in_block,
+                    in_for_body,
+                    local,
+                );
                 if let Some(alternate) = &statement.alternate {
-                    self.bind_hoisted_statement(alternate, scope, in_block, in_for_body);
+                    self.bind_hoisted_statement(alternate, scope, in_block, in_for_body, local);
                 }
             }
             Statement::Switch(statement) => {
@@ -10602,7 +10617,13 @@ impl<'src> Binder<'src> {
                 // child scope, so case functions are switch-scoped:
                 // suppress the enclosing pre-declaration like a block.
                 for case in &statement.cases {
-                    self.bind_hoisted_statements(&case.data().consequent, scope, true, in_for_body);
+                    self.bind_hoisted_statements(
+                        &case.data().consequent,
+                        scope,
+                        true,
+                        in_for_body,
+                        local,
+                    );
                 }
             }
             Statement::For(for_statement) => {
@@ -10611,7 +10632,7 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope, in_block, true);
+                self.bind_hoisted_statement(&for_statement.body, scope, in_block, true, false);
             }
             Statement::ForIn(for_statement) => {
                 if let ForBinding::Variable(variable) = &for_statement.binding
@@ -10619,7 +10640,7 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope, in_block, true);
+                self.bind_hoisted_statement(&for_statement.body, scope, in_block, true, false);
             }
             Statement::ForOf(for_statement) => {
                 if let ForBinding::Variable(variable) = &for_statement.binding
@@ -10627,13 +10648,13 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope, in_block, true);
+                self.bind_hoisted_statement(&for_statement.body, scope, in_block, true, false);
             }
             Statement::While(statement) => {
-                self.bind_hoisted_statement(&statement.body, scope, in_block, in_for_body)
+                self.bind_hoisted_statement(&statement.body, scope, in_block, in_for_body, local)
             }
             Statement::DoWhile(statement) => {
-                self.bind_hoisted_statement(&statement.body, scope, in_block, in_for_body)
+                self.bind_hoisted_statement(&statement.body, scope, in_block, in_for_body, local)
             }
             Statement::Try(statement) => {
                 self.bind_hoisted_statements(
@@ -10641,6 +10662,7 @@ impl<'src> Binder<'src> {
                     scope,
                     true,
                     in_for_body,
+                    local,
                 );
                 if let Some(handler) = &statement.handler {
                     self.bind_hoisted_statements(
@@ -10648,6 +10670,7 @@ impl<'src> Binder<'src> {
                         scope,
                         true,
                         in_for_body,
+                        local,
                     );
                 }
                 if let Some(finalizer) = &statement.finalizer {
@@ -10656,26 +10679,31 @@ impl<'src> Binder<'src> {
                         scope,
                         true,
                         in_for_body,
+                        local,
                     );
                 }
             }
-            Statement::With(with_statement) => {
-                self.bind_hoisted_statement(&with_statement.body, scope, in_block, in_for_body)
-            }
+            Statement::With(with_statement) => self.bind_hoisted_statement(
+                &with_statement.body,
+                scope,
+                in_block,
+                in_for_body,
+                local,
+            ),
             Statement::Labeled(statement) => {
-                self.bind_hoisted_statement(&statement.body, scope, in_block, in_for_body)
+                self.bind_hoisted_statement(&statement.body, scope, in_block, in_for_body, local)
             }
             Statement::Namespace(_) => {}
             Statement::Declare(inner) => {
                 let saved = self.ambient_binding;
                 self.ambient_binding = true;
-                self.bind_hoisted_statement(inner, scope, in_block, in_for_body);
+                self.bind_hoisted_statement(inner, scope, in_block, in_for_body, local);
                 self.ambient_binding = saved;
             }
             Statement::Export(export) => match export {
                 crate::syntax::ExportDeclaration::Named(
                     crate::syntax::ExportNamedDeclaration::Declaration(inner),
-                ) => self.bind_hoisted_statement(inner, scope, in_block, in_for_body),
+                ) => self.bind_hoisted_statement(inner, scope, in_block, in_for_body, local),
                 crate::syntax::ExportDeclaration::Default(default)
                     if let crate::syntax::ExportDefaultValue::Function(function) =
                         &default.value
@@ -10995,7 +11023,7 @@ impl<'src> Binder<'src> {
             } else {
                 local_scope
             };
-            self.bind_hoisted_statement(statement, target, false, false);
+            self.bind_hoisted_statement(statement, target, false, false, false);
         }
     }
 
@@ -12451,6 +12479,21 @@ impl<'src> Binder<'src> {
             Statement::Block(block) => {
                 let child = self.new_scope(ScopeKind::Block, Some(scope));
                 self.bind_statements(&block.data().statements, child);
+                // Block-local prebind: nested functions must resolve for
+                // earlier sibling statements. Strict mode has no outer
+                // prebind covering them, so declare into the block
+                // itself (`local` bypasses the strict-block skip); the
+                // later resolve declares the same identity. Sloppy mode
+                // stays on the outer prebind, which already covers it.
+                if self.scopes[child.0 as usize].strict {
+                    self.bind_hoisted_statements(
+                        &block.data().statements,
+                        child,
+                        true,
+                        false,
+                        true,
+                    );
+                }
                 self.resolve_statements(&block.data().statements, child);
             }
             Statement::Expression(statement) => {
@@ -12540,6 +12583,11 @@ impl<'src> Binder<'src> {
             }
             Statement::For(for_statement) => {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
+                // Loop-local prebind: the outer hoist pre-pass skips the
+                // for-body subtree to avoid leaking it outward, so declare
+                // its functions here into the loop scope before the
+                // initializer, test, and earlier body statements resolve.
+                self.bind_hoisted_statement(&for_statement.body, child, false, false, false);
                 let entry_super_flow = self.super_flow;
                 if let Some(initializer) = &for_statement.initializer {
                     self.resolve_for_initializer(initializer, child);
@@ -12574,6 +12622,9 @@ impl<'src> Binder<'src> {
             }
             Statement::ForIn(for_statement) => {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
+                // Loop-local prebind into the loop scope (see the `For`
+                // arm): the binding and object expressions resolve below.
+                self.bind_hoisted_statement(&for_statement.body, child, false, false, false);
                 let mut using_diagnostic = None;
                 if let ForBinding::Variable(variable) = &for_statement.binding {
                     using_diagnostic = match variable.kind {
@@ -12609,6 +12660,9 @@ impl<'src> Binder<'src> {
             }
             Statement::ForOf(for_statement) => {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
+                // Loop-local prebind into the loop scope (see the `For`
+                // arm): the iterable expression resolves below.
+                self.bind_hoisted_statement(&for_statement.body, child, false, false, false);
                 self.resolve_expr(&for_statement.iterable, child);
                 // `for-of` reads the iterator protocol off the iterable, so a
                 // nullable iterable is rejected before the element type is
@@ -13464,7 +13518,13 @@ impl<'src> Binder<'src> {
                     binder.scopes[scope.0 as usize].strict = true;
                 }
                 binder.bind_statements(&block.data().statements, scope);
-                binder.bind_hoisted_statements(&block.data().statements, scope, false, false);
+                binder.bind_hoisted_statements(
+                    &block.data().statements,
+                    scope,
+                    false,
+                    false,
+                    false,
+                );
                 binder.resolve_statements(&block.data().statements, scope);
             }
             Some(FunctionBody::Expression(expression)) => binder.resolve_expr(expression, scope),
@@ -15890,6 +15950,7 @@ impl<'src> Binder<'src> {
                         binder.bind_hoisted_statements(
                             &block.data().statements,
                             child,
+                            false,
                             false,
                             false,
                         );
