@@ -647,6 +647,118 @@ pub fn case_stem(logical_path: &str) -> &str {
     name
 }
 
+/// The `tests/cases/<area>/` segment owning a harness logical path;
+/// empty when the path carries no area (flat trees). Shared by the
+/// facet samplers so baseline selection agrees on ownership.
+#[must_use]
+pub fn baseline_area(harness_logical: &str) -> &str {
+    harness_logical
+        .split("cases/")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+}
+
+/// Resolve a `{stem}[ (variant)].{extension}` authority baseline file
+/// under `base`, preferring the owning `area` directory when one stem
+/// exists in several areas, then the variant matching the compile
+/// options. Authority trees nest baselines one level down
+/// (`reference/<area>/*`); the top level is scanned too.
+#[must_use]
+pub fn resolve_baseline_file(
+    base: &Path,
+    stem: &str,
+    area: &str,
+    extension: &str,
+    pragmas: &CasePragmas,
+) -> Option<std::path::PathBuf> {
+    let area_dir = base.join(area);
+    let mut dirs = vec![area_dir.clone()];
+    dirs.push(base.to_path_buf());
+    if let Ok(entries) = fs::read_dir(base) {
+        dirs.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir() && path != &area_dir),
+        );
+    }
+    let plain_name = format!("{stem}.{extension}");
+    let prefix = format!("{stem}(");
+    let suffix_end = format!(").{extension}");
+    let mut plain: Option<std::path::PathBuf> = None;
+    let mut variants: Vec<(String, std::path::PathBuf, bool)> = Vec::new();
+    for dir in &dirs {
+        let in_area = dir == &area_dir;
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == plain_name && plain.is_none() {
+                plain = Some(entry.path());
+            } else if name.starts_with(&prefix) && name.ends_with(&suffix_end) {
+                let suffix = &name[prefix.len()..name.len() - suffix_end.len()];
+                variants.push((suffix.to_owned(), entry.path(), in_area));
+            }
+        }
+        if plain.is_some() {
+            break;
+        }
+    }
+    let compile_options: Vec<(String, String)> = pragmas
+        .options
+        .iter()
+        .filter_map(|(name, values)| values.first().map(|v| (name.clone(), v.clone())))
+        .collect();
+    if !compile_options.is_empty() {
+        let matches: Vec<_> = variants
+            .iter()
+            .filter(|(suffix, _, _)| baseline_suffix_matches(suffix, &compile_options))
+            .collect();
+        let area_matches: Vec<_> = matches.iter().filter(|(_, _, in_area)| *in_area).collect();
+        if area_matches.len() == 1 {
+            return Some(area_matches[0].1.clone());
+        }
+        if matches.len() == 1 {
+            return Some(matches[0].1.clone());
+        }
+    }
+    if let Some(plain) = plain {
+        return Some(plain);
+    }
+    variants.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    variants.into_iter().next().map(|(_, p, _)| p)
+}
+
+/// Whether a `(variant)` suffix selects the given compile options.
+fn baseline_suffix_matches(suffix: &str, compile_options: &[(String, String)]) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    let options: HashMap<String, String> = compile_options
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for part in suffix.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = part.split_once('=') else {
+            return false;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().to_ascii_lowercase();
+        let Some(compile_value) = options.get(&key) else {
+            return false;
+        };
+        if compile_value.to_ascii_lowercase() != value {
+            return false;
+        }
+    }
+    true
+}
 /// Resolve the `.errors.txt` baselines owned by one case, filtered to the
 /// variant that matches the compile options actually used.
 ///
@@ -6675,5 +6787,29 @@ interface I {
             tail_line, ">tail : Symbol(Q.tail, Decl(nonBmpMemberPin.ts, 0, 39))",
             "non-BMP columns must count UTF-16 units:\n{emitted_symbols}"
         );
+    }
+
+    /// Cross-area stem twins resolve to the owning area, never to a
+    /// sorted-first file from another area.
+    #[test]
+    fn baseline_file_prefers_owning_area_for_stem_twins() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp/bamts-baseline-twins");
+        let _ = std::fs::remove_dir_all(&root);
+        for area in ["compiler", "conformance"] {
+            std::fs::create_dir_all(root.join(area)).expect("fixture area");
+        }
+        std::fs::write(root.join("compiler/twin.types"), "compiler").expect("fixture");
+        std::fs::write(root.join("conformance/twin.types"), "conformance").expect("fixture");
+        let pragmas = CasePragmas::default();
+        assert_eq!(
+            resolve_baseline_file(&root, "twin", "conformance", "types", &pragmas),
+            Some(root.join("conformance/twin.types"))
+        );
+        assert_eq!(
+            resolve_baseline_file(&root, "twin", "compiler", "types", &pragmas),
+            Some(root.join("compiler/twin.types"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
