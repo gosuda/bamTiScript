@@ -6055,6 +6055,16 @@ pub(crate) struct Binder<'src> {
     /// Variable/parameter symbol → property owner, seeded at declaration so
     /// member accesses resolve to the annotated owner.
     symbol_anchor: HashMap<SymbolId, PropertyOwner>,
+    /// Namespace-export/static collisions already reported, keyed by
+    /// constructor owner and member name. Fragments finalize
+    /// independently over one accumulated export scope, so without this
+    /// the same duplicate would fire once per fragment.
+    reported_static_collisions: HashSet<(SymbolId, String)>,
+    /// Namespace-appended static names per constructor owner, marking
+    /// properties this augmentation added. Merged symbols share one
+    /// identity, so class-owned statics carry no distinguishing mark
+    /// from our additions without this set.
+    ns_appended_statics: HashSet<(SymbolId, String)>,
     import_equals_symbols: HashMap<NodeId, SymbolId>,
     qualified_import_paths: HashMap<NodeId, Box<[SymbolId]>>,
     import_equals_targets: HashMap<SymbolId, ImportEqualsTarget>,
@@ -6276,10 +6286,12 @@ impl<'src> Binder<'src> {
             member_reference_recorded: HashSet::new(),
             property_sites: Vec::new(),
             property_site_index: HashMap::new(),
+            ns_appended_statics: HashSet::new(),
             property_anchors: Vec::new(),
             property_anchor_index: HashMap::new(),
             literal_anchor: HashMap::new(),
             symbol_anchor: HashMap::new(),
+            reported_static_collisions: HashSet::new(),
             import_equals_symbols: HashMap::new(),
             qualified_import_paths: HashMap::new(),
             import_equals_targets: HashMap::new(),
@@ -12377,8 +12389,9 @@ impl<'src> Binder<'src> {
     }
 
     /// Merge a merged namespace's value exports into its class partner's
-    /// constructor static shape. Class statics win name collisions; the
-    /// construct signatures and type arguments are preserved, so `typeof C`
+    /// constructor static shape. Own-static collisions report a
+    /// duplicate; inherited statics yield to the export. Construct
+    /// signatures and type arguments are preserved, so `typeof C`
     /// and aliases see one constructor with both halves.
     fn augment_class_constructor_with_namespace_exports(&mut self, symbol: SymbolId) {
         let Some(&export_scope) = self.namespace_export_scopes.get(&symbol) else {
@@ -12393,36 +12406,12 @@ impl<'src> Binder<'src> {
             ) {
                 continue;
             }
-            additions.push((name.clone(), self.value_side_type(*member)));
+            additions.push((name.clone(), self.value_side_type(*member), *member));
         }
         if additions.is_empty() {
             return;
         }
-        let Some(&existing) = self.class_constructor_types.get(&symbol) else {
-            return;
-        };
-        let Type::ConstructorType {
-            arguments,
-            structural,
-            ..
-        } = self.types.get(existing).clone()
-        else {
-            return;
-        };
-        let Type::ObjectType(mut object) = self.types.get(structural).clone() else {
-            return;
-        };
-        for (name, type_id) in &additions {
-            if object.properties.iter().any(|p| p.name() == name.as_str()) {
-                continue;
-            }
-            object
-                .properties
-                .push(PropertyType::new(name.clone(), false, *type_id));
-        }
-        let structural = self.types.object_type_with_members(object);
-        let constructor = self.types.constructor_type(symbol, arguments, structural);
-        self.class_constructor_types.insert(symbol, constructor);
+        self.merge_ns_additions_into_static(symbol, &additions);
         // Derived constructors resolved before this augmentation
         // snapshotted the base statics: refresh them with the same
         // additions so late-merged members stay visible through
@@ -12439,40 +12428,79 @@ impl<'src> Binder<'src> {
             if !visited.insert(derived) {
                 continue;
             }
-            let Some(&existing) = self.class_constructor_types.get(&derived) else {
-                continue;
-            };
-            let Type::ConstructorType {
-                arguments,
-                structural,
-                ..
-            } = self.types.get(existing).clone()
-            else {
-                continue;
-            };
-            let Type::ObjectType(mut object) = self.types.get(structural).clone() else {
-                continue;
-            };
-            let mut changed = false;
-            for (name, type_id) in &additions {
-                if object.properties.iter().any(|p| p.name() == name.as_str()) {
-                    continue;
-                }
-                object
-                    .properties
-                    .push(PropertyType::new(name.clone(), false, *type_id));
-                changed = true;
-            }
-            if changed {
-                let structural = self.types.object_type_with_members(object);
-                let constructor = self.types.constructor_type(derived, arguments, structural);
-                self.class_constructor_types.insert(derived, constructor);
-            }
+            self.merge_ns_additions_into_static(derived, &additions);
             stack.extend(
                 self.class_base_symbols
                     .iter()
                     .filter_map(|(child, base)| (*base == derived).then_some(*child)),
             );
+        }
+    }
+    /// Fold namespace exports into one class static shape. An own static
+    /// colliding with a value export is a duplicate declaration (tsc
+    /// TS2300, approximated by C001 pending a dedicated code); inherited
+    /// statics and earlier namespace appends yield to the export (a
+    /// derived merge validly narrows a base static, and fragments must
+    /// not collide with themselves). The append set tells our own
+    /// additions apart from class-owned statics, which share no
+    /// distinguishing mark on merged symbols.
+    fn merge_ns_additions_into_static(
+        &mut self,
+        owner: SymbolId,
+        additions: &[(String, TypeId, SymbolId)],
+    ) {
+        let Some(&existing) = self.class_constructor_types.get(&owner) else {
+            return;
+        };
+        let Type::ConstructorType {
+            arguments,
+            structural,
+            ..
+        } = self.types.get(existing).clone()
+        else {
+            return;
+        };
+        let Type::ObjectType(mut object) = self.types.get(structural).clone() else {
+            return;
+        };
+        let mut changed = false;
+        for (name, type_id, member) in additions {
+            match object
+                .properties
+                .iter()
+                .position(|p| p.name() == name.as_str())
+            {
+                None => {
+                    object
+                        .properties
+                        .push(PropertyType::new(name.clone(), false, *type_id));
+                    self.ns_appended_statics.insert((owner, name.clone()));
+                    changed = true;
+                }
+                Some(index) => {
+                    let ours = self.ns_appended_statics.contains(&(owner, name.clone()));
+                    let own_static =
+                        !ours && object.properties[index].declaring_class() == Some(owner);
+                    if own_static {
+                        if self
+                            .reported_static_collisions
+                            .insert((owner, name.clone()))
+                        {
+                            let range = self.symbols[member.get() as usize].range;
+                            self.emit(DUPLICATE_DECLARATION, range, DUPLICATE_MESSAGE);
+                        }
+                    } else {
+                        object.properties[index] = PropertyType::new(name.clone(), false, *type_id);
+                        self.ns_appended_statics.insert((owner, name.clone()));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            let structural = self.types.object_type_with_members(object);
+            let constructor = self.types.constructor_type(owner, arguments, structural);
+            self.class_constructor_types.insert(owner, constructor);
         }
     }
 

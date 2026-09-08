@@ -3930,6 +3930,65 @@ mod tests {
         let _case = compile_case(&units, &entry).expect("case compiles");
     }
 
+    /// Regression: an own static colliding with a namespace value export
+    /// is a duplicate declaration (tsc TS2300, approximated by C001).
+    /// Inherited statics yield instead; only the own collision fires.
+    /// A second fragment must not re-fire the same diagnostic.
+    #[test]
+    fn own_static_namespace_export_collision() {
+        let case_text = "class C {\n    static x = 1;\n}\nnamespace C {\n    export const x = 2;\n}\nnamespace C {\n    export const y = 3;\n}\nconst n = C.x;\n";
+        let units = split_case_units("tests/cases/compiler/ownStaticNsCollision.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/ownStaticNsCollision.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C001".to_owned(), 5)]);
+    }
+    /// Regression: multiple namespace fragments sharing one export
+    /// scope stay silent. Each fragment finalizes over the accumulated
+    /// scope; appends must not collide with themselves.
+    #[test]
+    fn namespace_fragments_share_export_scope_silently() {
+        let case_text = "class C {\n}\nnamespace C {\n    export const x = 2;\n}\nnamespace C {\n    export const y = 3;\n}\nconst n = C.x;\n";
+        let units = split_case_units(
+            "tests/cases/compiler/namespaceFragmentsSilent.ts",
+            case_text,
+        );
+        let entry = entry_virtual_path("tests/cases/compiler/namespaceFragmentsSilent.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: a namespace export validly narrows an inherited
+    /// static. Unlike own-static collisions, the derived merge replaces
+    /// the flattened base property (tsc accepts).
+    #[test]
+    fn derived_merge_narrows_inherited_static() {
+        let case_text = "class C {\n    static x: number = 1;\n}\nclass B extends C {\n}\nnamespace B {\n    export const x = 1;\n}\nconst n: number = B.x;\n";
+        let units = split_case_units("tests/cases/compiler/derivedNarrowingMerge.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/derivedNarrowingMerge.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
     /// Regression: nested namespaces contribute finalized constructors.
     /// The inner namespace finalizes before the outer snapshots it, so
     /// the outer structural carries the inner member types, not a shell.
