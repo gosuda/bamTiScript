@@ -429,8 +429,11 @@ impl<'src> Binder<'src> {
     /// matching an ordinary call or `new` expression: applied aliases,
     /// applied classes, function types, object types carrying call or
     /// construct signatures, constructor types (the class static side), and
-    /// named interfaces via their structural view. Unions and intersections
-    /// return no candidates yet (an ordinary call distributes over them);
+    /// named interfaces via their structural view. Unions distribute their
+    /// members in source order and stay callable only when every member
+    /// contributes a callable shape; intersections flatten every member's
+    /// candidates into one list — both matching how an ordinary call
+    /// distributes over them;
     /// a construct signature contributes its constructor's parameters and
     /// the class instance type as the element's result, matching the
     /// "neither a construct nor a call signature" diagnostic contract.
@@ -503,6 +506,36 @@ impl<'src> Binder<'src> {
                     Type::ObjectType(object) => object.call_signatures.clone(),
                     _ => Vec::new(),
                 }
+            }
+            Type::Union(members) => {
+                // A union is callable only when every member contributes a
+                // callable shape — `number | (() => void)` is not — and
+                // member candidates concatenate in source order so selection
+                // picks the first admissible member's result, matching the
+                // canonical call grouping an ordinary call uses.
+                let mut candidates = Vec::new();
+                for member in members {
+                    let member_signatures =
+                        demand_ready!(self.jsx_callable_signatures(None, member));
+                    if member_signatures.is_empty() {
+                        return Ok(DemandPoll::Ready(Vec::new()));
+                    }
+                    candidates.extend(member_signatures);
+                }
+                return Ok(DemandPoll::Ready(candidates));
+            }
+            Type::Intersection(members) => {
+                // An intersection flattens every member's candidates into
+                // one list in member order; a member without candidates
+                // simply contributes none, and an empty overall list means
+                // the intersection is not callable.
+                let mut flattened = Vec::new();
+                for member in members {
+                    let member_signatures =
+                        demand_ready!(self.jsx_callable_signatures(None, member));
+                    flattened.extend(member_signatures);
+                }
+                return Ok(DemandPoll::Ready(flattened));
             }
             _ => Vec::new(),
         };
@@ -1799,6 +1832,69 @@ mod tests {
             "{JSX_PREAMBLE} \
              class Widget {{ constructor(props: {{ id?: string }}) {{}} }} \
              const x = <Widget id=\"a\" />;"
+        );
+        assert_clean(codes(&source));
+    }
+
+    /// A bare union const resolves through its symbol's canonical
+    /// signature group: members distribute in source order and selection
+    /// picks the first admissible one, so the first member's `string`
+    /// return wins over the second member's `number`.
+    #[test]
+    fn union_of_factories_distributes_candidates_for_a_jsx_tag() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             interface ReturnsString {{ (props: {{ id?: string }}): string; }} \
+             interface ReturnsNumber {{ (props: {{ id?: string }}): number; }} \
+             declare const Comp: ReturnsString | ReturnsNumber; \
+             const x: string = <Comp id=\"a\" />;"
+        );
+        assert_clean(codes(&source));
+    }
+
+    /// A dotted member whose property type is a union must distribute its
+    /// members through the same per-shape views an ordinary call uses;
+    /// both members accept the given props, so the first member's `string`
+    /// return must win instead of a not-callable report.
+    #[test]
+    fn dotted_union_member_distributes_through_the_fallthrough() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             interface ReturnsString {{ (props: {{ id?: string }}): string; }} \
+             interface ReturnsNumber {{ (props: {{ id?: string }}): number; }} \
+             declare const comp: ReturnsString | ReturnsNumber; \
+             const holder = {{ Comp: comp }}; \
+             const x: string = <holder.Comp id=\"a\" />;"
+        );
+        assert_clean(codes(&source));
+    }
+
+    /// One non-callable member poisons the whole union, exactly as an
+    /// ordinary call rejects `(() => void) | number`.
+    #[test]
+    fn union_with_a_non_callable_member_reports_not_callable() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             interface ReturnsString {{ (props: {{ id?: string }}): string; }} \
+             declare const comp: ReturnsString | number; \
+             const holder = {{ Comp: comp }}; \
+             const x = <holder.Comp id=\"a\" />;"
+        );
+        assert_eq!(codes(&source), [JSX_ELEMENT_TYPE_NOT_CALLABLE.as_str()]);
+    }
+
+    /// An intersection of factories flattens every member's candidates
+    /// into one list in member order; the selector picks the first
+    /// admissible one and no not-callable diagnostic is raised.
+    #[test]
+    fn intersection_of_callables_flattens_and_distributes() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             interface ReturnsString {{ (props: {{ id?: string }}): string; }} \
+             interface ReturnsNumber {{ (props: {{ id?: string }}): number; }} \
+             declare const comp: ReturnsString & ReturnsNumber; \
+             const holder = {{ Comp: comp }}; \
+             const x: string = <holder.Comp id=\"a\" />;"
         );
         assert_clean(codes(&source));
     }
