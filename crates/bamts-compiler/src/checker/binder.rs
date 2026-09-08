@@ -10696,6 +10696,20 @@ impl<'src> Binder<'src> {
             }
             Some(_) => unreachable!("enum symbol has an enum type definition"),
         }
+        // The declaration symbol's type is the enum type itself
+        // (`>E1 : E1` in .types baselines), mirroring how class
+        // declarations write the instance type. The accumulated
+        // numeric flag keeps merged declarations order-stable.
+        let accumulated_numeric = matches!(
+            self.type_defs.get(&symbol),
+            Some(TypeDef::Enum { numeric: true })
+        );
+        let declared = if accumulated_numeric {
+            self.types.numeric_enum(symbol)
+        } else {
+            self.types.named(symbol)
+        };
+        self.symbol_types[symbol.get() as usize] = declared;
         self.enum_declaration_symbols.insert(declaration_id, symbol);
         self.enum_declarations.push(EnumDeclarationBinding {
             declaration,
@@ -10826,6 +10840,14 @@ impl<'src> Binder<'src> {
             };
             self.bind_hoisted_statement(statement, target);
         }
+        // The declaration symbol's type is the namespace constructor
+        // (`>M : typeof M` in .types baselines), mirroring how class
+        // declarations write the static type. The structural object is
+        // empty: member access resolves through member symbols, never
+        // through this slot.
+        let structural = self.types.object_type(Vec::new());
+        let constructor = self.types.constructor_type(symbol, Vec::new(), structural);
+        self.symbol_types[symbol.get() as usize] = constructor;
     }
 
     fn bind_namespace_member(

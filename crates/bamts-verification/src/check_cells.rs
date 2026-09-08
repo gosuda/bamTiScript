@@ -4449,6 +4449,57 @@ export const a2 = 3;
         );
     }
 
+    /// Numeric enum declaration headers carry the enum type (`>E1 : E1`,
+    /// enumBasics3.types:8), not `any`.
+    #[test]
+    fn emit_types_numeric_enum_header_names_enum_type() {
+        let logical = "tests/cases/compiler/enumHeaderPin.ts";
+        let case_text = "enum E1 {\n    a = 1,\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">E1 : E1"),
+            "missing `>E1 : E1` header:\n{emitted}"
+        );
+        assert!(
+            !emitted.lines().any(|line| line == ">E1 : any"),
+            "stale `any` header:\n{emitted}"
+        );
+    }
+
+    /// String enum declaration headers carry the named type (`>S : S`).
+    #[test]
+    fn emit_types_string_enum_header_names_enum_type() {
+        let logical = "tests/cases/compiler/stringEnumHeaderPin.ts";
+        let case_text = "enum S {\n    a = \"a\",\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">S : S"),
+            "missing `>S : S` header:\n{emitted}"
+        );
+    }
+
+    /// Namespace declaration headers carry the constructor type
+    /// (`>M : typeof M`, FunctionDeclaration7.types:5).
+    #[test]
+    fn emit_types_namespace_header_names_constructor_type() {
+        let logical = "tests/cases/compiler/namespaceHeaderPin.ts";
+        let case_text = "namespace M {\n    export var x = 1;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">M : typeof M"),
+            "missing `>M : typeof M` header:\n{emitted}"
+        );
+    }
+
     /// A multi-file case's preamble before the first `@Filename:` marker is
     /// global options, not a unit: upstream `ParseTestFilesAndSymlinks`
     /// (`AllowImplicitFirstFile: false`) drops a comment-only preamble, so
