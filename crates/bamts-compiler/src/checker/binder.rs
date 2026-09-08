@@ -4704,7 +4704,10 @@ impl SemanticModel {
         let mut current = Some(scope);
         while let Some(id) = current {
             let scope = &self.scopes[id.0 as usize];
-            if let Some(symbol) = scope.values.get(name) {
+            if let Some(symbol) = scope.values.get(name)
+                && (scope.kind != ScopeKind::Class
+                    || self.symbols[symbol.get() as usize].kind == SymbolKind::Class)
+            {
                 return Some(*symbol);
             }
             current = scope.parent;
