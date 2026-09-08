@@ -4484,6 +4484,38 @@ export const a2 = 3;
         );
     }
 
+    /// Merging a namespace into a numeric enum preserves the enum type on
+    /// the shared declaration symbol.
+    #[test]
+    fn emit_types_numeric_enum_namespace_merge_keeps_enum_type() {
+        let logical = "tests/cases/compiler/numericEnumNamespaceMergePin.ts";
+        let case_text = "enum E {\n    a = 1,\n}\nnamespace E {\n    export const b = 2;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">E : E"),
+            "merged enum header must retain enum type:\n{emitted}"
+        );
+    }
+
+    /// Merging a namespace into a string enum preserves the enum type on
+    /// the shared declaration symbol.
+    #[test]
+    fn emit_types_string_enum_namespace_merge_keeps_enum_type() {
+        let logical = "tests/cases/compiler/stringEnumNamespaceMergePin.ts";
+        let case_text = "enum S {\n    a = \"a\",\n}\nnamespace S {\n    export const b = 2;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">S : S"),
+            "merged enum header must retain enum type:\n{emitted}"
+        );
+    }
+
     /// Namespace declaration headers carry the constructor type
     /// (`>M : typeof M`, FunctionDeclaration7.types:5).
     #[test]

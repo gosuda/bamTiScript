@@ -10845,9 +10845,15 @@ impl<'src> Binder<'src> {
         // declarations write the static type. The structural object is
         // empty: member access resolves through member symbols, never
         // through this slot.
-        let structural = self.types.object_type(Vec::new());
-        let constructor = self.types.constructor_type(symbol, Vec::new(), structural);
-        self.symbol_types[symbol.get() as usize] = constructor;
+        // An enum followed by a same-name namespace reuses the enum symbol;
+        // preserve its canonical enum type rather than replacing it with the
+        // namespace constructor. Standalone namespaces still use the
+        // constructor type.
+        if !matches!(self.type_defs.get(&symbol), Some(TypeDef::Enum { .. })) {
+            let structural = self.types.object_type(Vec::new());
+            let constructor = self.types.constructor_type(symbol, Vec::new(), structural);
+            self.symbol_types[symbol.get() as usize] = constructor;
+        }
     }
 
     fn bind_namespace_member(
