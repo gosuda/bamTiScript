@@ -10845,17 +10845,17 @@ impl<'src> Binder<'src> {
         // (`>M : typeof M` in .types baselines), mirroring how class
         // declarations write the static type. The structural object is
         // empty: member access resolves through member symbols, never
-        // through this slot. A symbol already carrying an enum type
-        // keeps it: `enum E` + `namespace E` merges emit one header row
-        // per declaration (`>E : E`, then `>E : typeof E`), and one slot
-        // cannot render both — the enum row wins deterministically
-        // regardless of declaration order (augmentedTypesEnum:88-94).
-        let merged_enum = matches!(self.type_defs.get(&symbol), Some(TypeDef::Enum { .. }));
-        if !merged_enum {
+        // through this slot. Only pure namespaces take this write: a
+        // symbol already carrying an enum definition keeps the enum
+        // type (merged `enum E` + `namespace E` rows read `>E : E`),
+        // and interface/class/alias owners keep their lazy builds —
+        // sealing Done here would block interface structure
+        // construction in any declaration order.
+        let pure_namespace = !self.type_defs.contains_key(&symbol);
+        if pure_namespace {
             let structural = self.types.object_type(Vec::new());
             let constructor = self.types.constructor_type(symbol, Vec::new(), structural);
             self.symbol_types[symbol.get() as usize] = constructor;
-            self.type_state[symbol.get() as usize] = TypeState::Done(constructor);
         }
     }
 
@@ -19848,6 +19848,16 @@ impl<'src> Binder<'src> {
             TypeState::Unresolved => {}
         }
         let Some(definition) = self.type_defs.get(&symbol).copied() else {
+            // Pure namespaces carry no type definition entry; their
+            // constructor is built on demand so lazy resolution can
+            // never clobber the bind-time write with the error type.
+            if self.symbols[symbol.get() as usize].kind == SymbolKind::Namespace {
+                let structural = self.types.object_type(Vec::new());
+                let id = self.types.constructor_type(symbol, Vec::new(), structural);
+                self.symbol_types[symbol.get() as usize] = id;
+                self.type_state[symbol.get() as usize] = TypeState::Done(id);
+                return id;
+            }
             let id = self.types.error_type();
             self.type_state[symbol.get() as usize] = TypeState::Done(id);
             return id;

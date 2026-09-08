@@ -4519,6 +4519,22 @@ export const a2 = 3;
         );
     }
 
+    /// Interface+namespace merges keep interface members readable
+    /// through the type side.
+    #[test]
+    fn emit_types_interface_namespace_merge_keeps_members() {
+        let logical = "tests/cases/compiler/interfaceNamespaceMergePin.ts";
+        let case_text = "interface M {\n    value: number;\n}\nnamespace M {\n    export const tag = 1;\n}\ndeclare const m: M;\nm.value;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">m.value : number"),
+            "missing `>m.value : number`:\n{emitted}"
+        );
+    }
+
     /// A multi-file case's preamble before the first `@Filename:` marker is
     /// global options, not a unit: upstream `ParseTestFilesAndSymlinks`
     /// (`AllowImplicitFirstFile: false`) drops a comment-only preamble, so
