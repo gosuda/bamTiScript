@@ -26308,6 +26308,20 @@ mod tests {
     }
 
     #[test]
+    fn forward_references_from_static_blocks_stay_silent() {
+        // Cross-boundary references are silent in every scope-kind
+        // version (Block, Function, StaticBlock): the boundary gate
+        // skips before any deferral question arises.
+        for source in [
+            "class A { static { C; } } class C {}",
+            "class A { static { x; } } let x = 1;",
+        ] {
+            let (_, diagnostics) = bound(source);
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
     fn static_block_var_shadows_outer_bindings() {
         let (_, diagnostics) =
             bound("let x = 0; class C { static { var x = 1; const y: number = x; } }");
