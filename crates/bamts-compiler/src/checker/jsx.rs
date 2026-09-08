@@ -289,9 +289,9 @@ impl<'src> Binder<'src> {
                 }));
             }
         };
-        let signatures = demand_ready!(self.jsx_callable_signatures(symbol, callee));
+        let signature_groups = demand_ready!(self.jsx_callable_signatures(symbol, callee));
         let props = demand_ready!(self.infer_jsx_props(attributes, children, None, context));
-        let Some((props_target, result)) = select_jsx_factory_signature(&signatures, props, self)
+        let Some((props_target, result)) = select_jsx_factory_signature_groups(&signature_groups, props, self)
         else {
             let result = self.jsx_element_type(context.scope);
             // An opaque callee with no callable shape stays unchecked; a
@@ -441,11 +441,11 @@ impl<'src> Binder<'src> {
         &mut self,
         symbol: Option<SymbolId>,
         callee: TypeId,
-    ) -> DemandResult<Vec<FunctionSignature>> {
+    ) -> DemandResult<Vec<Vec<FunctionSignature>>> {
         if let Some(symbol) = symbol {
             let signatures = demand_ready!(self.signature_group(symbol));
             if !signatures.is_empty() {
-                return Ok(DemandPoll::Ready(signatures));
+                return Ok(DemandPoll::Ready(vec![signatures]));
             }
             // A class value's declared type is its instance side; the
             // construct signatures live on the static side (a
@@ -520,7 +520,7 @@ impl<'src> Binder<'src> {
                     if member_signatures.is_empty() {
                         return Ok(DemandPoll::Ready(Vec::new()));
                     }
-                    candidates.extend(member_signatures);
+                    candidates.push(member_signatures);
                 }
                 return Ok(DemandPoll::Ready(candidates));
             }
@@ -535,11 +535,11 @@ impl<'src> Binder<'src> {
                         demand_ready!(self.jsx_callable_signatures(None, member));
                     flattened.extend(member_signatures);
                 }
-                return Ok(DemandPoll::Ready(flattened));
+                return Ok(DemandPoll::Ready(vec![flattened]));
             }
             _ => Vec::new(),
         };
-        Ok(DemandPoll::Ready(signatures))
+        Ok(DemandPoll::Ready(vec![signatures]))
     }
 
     // -- props/children synthesis -------------------------------------------------
@@ -1246,7 +1246,21 @@ fn select_jsx_factory_signature(
     })
 }
 
-/// Instantiates one candidate signature's first-parameter target and return
+/// Selects one candidate from every union signature group and unions their results.
+  fn select_jsx_factory_signature_groups(
+      groups: &[Vec<FunctionSignature>], props: TypeId, binder: &mut Binder<'_>,
+  ) -> Option<(Option<TypeId>, TypeId)> {
+      let mut results = Vec::with_capacity(groups.len());
+      let mut targets = Vec::new();
+      for group in groups {
+          let selected = select_jsx_factory_signature(group, props, binder)?;
+          if let Some(target) = selected.0 { targets.push(target); }
+          results.push(selected.1);
+      }
+      Some(((!targets.is_empty()).then(|| binder.types.union(&targets)), binder.types.union(&results)))
+  }
+
+  /// Instantiates one candidate signature's first-parameter target and return
 /// type against `props`. Non-generic candidates use their declared types
 /// directly; generic candidates infer their type arguments from `props`
 /// exactly as an ordinary call would.
