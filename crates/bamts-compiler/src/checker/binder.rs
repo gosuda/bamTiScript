@@ -18480,7 +18480,15 @@ impl<'src> Binder<'src> {
         let mut current = Some(scope);
         while let Some(id) = current {
             let scope = &self.scopes[id.0 as usize];
-            if let Some(symbol) = scope.values.get(name) {
+            // Class and interface member scopes collect member declarations
+            // for the type layer, but upstream never exposes them as bare
+            // lexical bindings: `foo` in a method body does not see the
+            // property `foo`. Type parameters live in `types` and the
+            // class's own name is a Class binding, so both stay visible.
+            if let Some(symbol) = scope.values.get(name)
+                && (scope.kind != ScopeKind::Class
+                    || self.symbols[symbol.get() as usize].kind == SymbolKind::Class)
+            {
                 return Some(*symbol);
             }
             current = scope.parent;
@@ -26187,6 +26195,38 @@ mod tests {
             .map(|diagnostic| diagnostic.code().as_str())
             .collect();
         assert_eq!(codes, [super::CANNOT_FIND_NAME.as_str()]);
+    }
+
+    #[test]
+    fn class_members_are_not_visible_as_bare_names_in_static_methods() {
+        let (_, diagnostics) = bound("class C { foo: string; static bar() { let k = foo; } }");
+        let codes: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code().as_str())
+            .collect();
+        assert_eq!(codes, [super::CANNOT_FIND_NAME.as_str()]);
+    }
+
+    #[test]
+    fn class_members_are_not_visible_as_bare_names_in_instance_methods() {
+        let (_, diagnostics) = bound("class C { foo = 1; bar() { return foo; } }");
+        let codes: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code().as_str())
+            .collect();
+        assert_eq!(codes, [super::CANNOT_FIND_NAME.as_str()]);
+    }
+
+    #[test]
+    fn named_class_expression_name_stays_visible_in_its_body() {
+        let (_, diagnostics) = bound("const X = class Inner { m() { return Inner; } };");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn this_member_access_still_resolves() {
+        let (_, diagnostics) = bound("class C { foo = 1; bar() { return this.foo; } }");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]
