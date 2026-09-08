@@ -6924,9 +6924,11 @@ interface I {
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
 
-    /// Regression: an inner-loop function stays inner-loop-scoped (tsc
-    /// TS2304 on the outer-loop use, sloppy and strict alike); the outer
-    /// prebind must not claim it into the ancestor loop scope.
+    /// Regression: an inner-loop function stays inner-loop-scoped in
+    /// strict mode (tsc TS2304 on the outer-loop use); the outer
+    /// prebind must not claim it into the ancestor loop scope. The
+    /// sloppy half is pinned separately below: the harness forces
+    /// strict on every unit unless pragmas switch it off.
     #[test]
     fn nested_loop_function_stays_inner_scoped() {
         let case_text = "for (;;) {\ng();\nfor (;;) function g() {\n}\n}\n";
@@ -6942,6 +6944,33 @@ interface I {
             .collect();
         assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 2)]);
     }
+    /// Regression: an inner-loop function stays inner-loop-scoped in
+    /// sloppy mode too (tsc TS2304 on the outer-loop use). Compiled
+    /// with strict+alwaysStrict off; the harness otherwise forces
+    /// strict on every unit.
+    #[test]
+    fn sloppy_nested_loop_function_stays_inner_scoped() {
+        let case_text = "for (;;) {\ng();\nfor (;;) function g() {\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/sloppyNestedLoop.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/sloppyNestedLoop.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysStrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 2)]);
+    }
+
     /// Guard: a use inside the inner loop resolves (the inner loop-local
     /// prebind declares with the inner-loop identity).
     #[test]
