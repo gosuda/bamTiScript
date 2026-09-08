@@ -6011,6 +6011,10 @@ pub(crate) struct Binder<'src> {
     imported_type_parameters: HashMap<SymbolId, Vec<SymbolId>>,
     imported_type_planes: HashMap<SymbolId, TypeId>,
     hoisted_declaration_symbols: HashMap<HoistedDeclarationIdentity, SymbolId>,
+    /// Catch scopes whose binding is not a simple identifier. The legacy
+    /// same-name `var` tolerance applies to simple bindings only; against
+    /// a destructured parameter even `var` conflicts.
+    complex_catch_scopes: HashSet<ScopeId>,
     /// Legacy JSX side tables removed: demand-side JSX lives in `super::jsx`.
     /// Class instance structural types keyed by the class symbol, built lazily
     /// during class-body resolution so `new C()` and member access on class-typed
@@ -6228,6 +6232,7 @@ impl<'src> Binder<'src> {
             imported_type_parameters: HashMap::new(),
             imported_type_planes: HashMap::new(),
             hoisted_declaration_symbols: HashMap::new(),
+            complex_catch_scopes: HashSet::new(),
             class_instance_types: HashMap::new(),
             reg_exp_instance_type: None,
             class_method_signature_scopes: HashMap::new(),
@@ -10142,6 +10147,42 @@ impl<'src> Binder<'src> {
                     ScopeKind::Block | ScopeKind::For | ScopeKind::Catch
                 )
         };
+        // Written scope before hoisting: `var` rises to its hoist scope,
+        // but catch-claim checks need the textual position.
+        let written_scope = scope;
+        // Catch parameters stay claimed across the child body block, but
+        // only against lexical redeclarations: tsc reports TS2492 for
+        // `let`/`const` (oracle-verified) while classes, enums, `var`,
+        // and functions shadow a simple-identifier parameter legally.
+        // Against a destructured parameter even `var` conflicts. Computed
+        // here because hoisted declarations return early below.
+        let catch_parent = if self.scopes[written_scope.0 as usize].kind == ScopeKind::Block {
+            match self.scopes[written_scope.0 as usize].parent {
+                Some(parent) if self.scopes[parent.0 as usize].kind == ScopeKind::Catch => {
+                    Some(parent)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let catch_conflict = match (kind, catch_parent) {
+            (
+                SymbolKind::Variable(
+                    VariableKind::Let
+                    | VariableKind::Const
+                    | VariableKind::Using
+                    | VariableKind::AwaitUsing,
+                ),
+                Some(parent),
+            ) => self.scopes[parent.0 as usize].values.get(name).copied(),
+            (SymbolKind::Variable(VariableKind::Var), Some(parent))
+                if self.complex_catch_scopes.contains(&parent) =>
+            {
+                self.scopes[parent.0 as usize].values.get(name).copied()
+            }
+            _ => None,
+        };
         let scope = if hoisted && !strict_block_function {
             self.value_hoist_scope(scope)
         } else {
@@ -10153,10 +10194,14 @@ impl<'src> Binder<'src> {
             range,
             kind,
         });
-        if let Some(identity) = hoisted_identity
-            && let Some(symbol) = self.hoisted_declaration_symbols.get(&identity)
-        {
-            return *symbol;
+        if let Some(identity) = hoisted_identity {
+            let hoisted = self.hoisted_declaration_symbols.get(&identity).copied();
+            if let Some(symbol) = hoisted {
+                if catch_conflict.is_some() {
+                    self.emit(DUPLICATE_DECLARATION, range, DUPLICATE_MESSAGE);
+                }
+                return symbol;
+            }
         }
         let merge = self.scopes[scope.0 as usize]
             .values
@@ -10244,25 +10289,8 @@ impl<'src> Binder<'src> {
         if let Some(identity) = hoisted_identity {
             self.hoisted_declaration_symbols.insert(identity, id);
         }
-        // Catch parameters stay claimed across the child body block:
-        // lexical redeclarations conflict with the parameter while
-        // `var` and functions shadow it legally.
-        let catch_conflict = if matches!(
-            kind,
-            SymbolKind::Function | SymbolKind::Variable(VariableKind::Var)
-        ) || !kind.occupies_value()
-        {
-            None
-        } else if self.scopes[scope.0 as usize].kind == ScopeKind::Block {
-            match self.scopes[scope.0 as usize].parent {
-                Some(parent) if self.scopes[parent.0 as usize].kind == ScopeKind::Catch => {
-                    self.scopes[parent.0 as usize].values.get(name).copied()
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
+        // `catch_conflict` was computed above, before hoisting, so
+        // hoisted declarations keep their claim diagnostic here too.
         let conflict = value_conflict.or(type_conflict).or(catch_conflict);
         if let Some(existing) = conflict {
             let existing_kind = self.symbols[existing.get() as usize].kind;
@@ -12565,6 +12593,12 @@ impl<'src> Binder<'src> {
                 if let Some(handler) = &statement.handler {
                     let catch_scope = self.new_scope(ScopeKind::Catch, Some(scope));
                     if let Some(binding) = &handler.data().binding {
+                        // Only simple-identifier bindings tolerate a
+                        // same-name `var`; destructured parameters claim
+                        // every name they bind against `var` too.
+                        if !matches!(binding.data(), BindingPattern::Identifier(_)) {
+                            self.complex_catch_scopes.insert(catch_scope);
+                        }
                         self.bind_pattern(binding, VariableKind::Let, catch_scope, handler.id());
                     }
                     // Body declarations live in a child block like the try

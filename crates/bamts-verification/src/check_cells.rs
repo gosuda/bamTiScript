@@ -6729,4 +6729,55 @@ interface I {
             .collect();
         assert_eq!(codes, vec![("BAMTS-C001".to_owned(), 3)]);
     }
+    /// Regression: classes shadow catch parameters legally (tsc rc=0).
+    /// Only lexical variable redeclarations conflict across the body.
+    #[test]
+    fn catch_body_class_shadows_parameter() {
+        let case_text = "try {\n} catch (e) {\n    class e {\n    }\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchClassShadow.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchClassShadow.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: enums shadow catch parameters legally (tsc rc=0).
+    #[test]
+    fn catch_body_enum_shadows_parameter() {
+        let case_text = "try {\n} catch (e) {\n    enum e {\n        A = 1,\n    }\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchEnumShadow.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchEnumShadow.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: `var` against a destructured catch param conflicts.
+    /// The legacy same-name tolerance applies to simple identifiers
+    /// only (tsc TS2492 on the `var`, alongside the pattern error).
+    #[test]
+    fn catch_destructured_param_var_conflicts() {
+        let case_text = "try {\n} catch ({ e }) {\n    var e;\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchDestructuredVar.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchDestructuredVar.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C001".to_owned(), 3)]);
+    }
 }
