@@ -148,36 +148,60 @@ fn authority_case_path(logical: &str) -> PathBuf {
     authority_root().join("tests/cases").join(stripped)
 }
 
+/// The `tests/cases/<area>/` segment owning a harness logical path;
+/// empty when the path carries no area (flat trees).
+fn baseline_area(harness_logical: &str) -> &str {
+    harness_logical
+        .split("cases/")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+}
+
 /// Resolve the baseline file for a case stem and its compile options.
-fn resolve_baseline_fs(stem: &str, pragmas: &CasePragmas) -> Option<PathBuf> {
+///
+/// `area` is the `tests/cases/<area>/` segment owning the case; its
+/// directory wins over other areas when one stem exists in several
+/// (e.g. `compiler/` and `conformance/` twins), so a sorted-first
+/// fallback can never diff against the wrong baseline.
+fn resolve_baseline_fs(stem: &str, area: &str, pragmas: &CasePragmas) -> Option<PathBuf> {
     let base = baseline_dir();
     // Authority trees nest baselines one level down
-    // (`reference/<area>/*.types`); scan the top level and one down.
-    let mut dirs = vec![base.clone()];
+    // (`reference/<area>/*.types`); scan the top level and one down,
+    // trying the owning area first.
+    let area_dir = base.join(area);
+    let mut dirs = vec![area_dir.clone()];
+    dirs.push(base.clone());
     if let Ok(entries) = fs::read_dir(&base) {
         dirs.extend(
             entries
                 .flatten()
                 .map(|entry| entry.path())
-                .filter(|path| path.is_dir()),
+                .filter(|path| path.is_dir() && path != &area_dir),
         );
     }
     let plain_name = format!("{stem}.types");
     let prefix = format!("{stem}(");
     let mut plain: Option<PathBuf> = None;
-    let mut variants: Vec<(String, PathBuf)> = Vec::new();
+    // Third tuple slot marks the owning area; area matches win every
+    // tie-break so cross-area stem twins never misattribute.
+    let mut variants: Vec<(String, PathBuf, bool)> = Vec::new();
     for dir in &dirs {
+        let in_area = dir == &area_dir;
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == plain_name {
+            if name == plain_name && plain.is_none() {
                 plain = Some(entry.path());
             } else if name.starts_with(&prefix) && name.ends_with(").types") {
                 let suffix = &name[prefix.len()..name.len() - ".types".len() - 1];
-                variants.push((suffix.to_owned(), entry.path()));
+                variants.push((suffix.to_owned(), entry.path(), in_area));
             }
+        }
+        if plain.is_some() {
+            break;
         }
     }
 
@@ -190,8 +214,12 @@ fn resolve_baseline_fs(stem: &str, pragmas: &CasePragmas) -> Option<PathBuf> {
     if !compile_options.is_empty() {
         let matches: Vec<_> = variants
             .iter()
-            .filter(|(suffix, _)| suffix_matches_options(suffix, &compile_options))
+            .filter(|(suffix, _, _)| suffix_matches_options(suffix, &compile_options))
             .collect();
+        let area_matches: Vec<_> = matches.iter().filter(|(_, _, in_area)| *in_area).collect();
+        if area_matches.len() == 1 {
+            return Some(area_matches[0].1.clone());
+        }
         if matches.len() == 1 {
             return Some(matches[0].1.clone());
         }
@@ -201,8 +229,8 @@ fn resolve_baseline_fs(stem: &str, pragmas: &CasePragmas) -> Option<PathBuf> {
         return Some(plain);
     }
 
-    variants.sort_by(|a, b| a.0.cmp(&b.0));
-    variants.into_iter().next().map(|(_, p)| p)
+    variants.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    variants.into_iter().next().map(|(_, p, _)| p)
 }
 
 /// Check if a variant suffix matches compile options.
@@ -554,17 +582,18 @@ fn types_facet_sample() {
 
         let emitted = emit_types_baseline(&compiled, &harness_logical);
         let stem = case_stem(&harness_logical);
-        let baseline_path = match resolve_baseline_fs(stem, &pragmas) {
-            Some(path) => path,
-            None => {
-                results.push(AnalysisResult {
-                    case: case.logical_path.clone(),
-                    cfg: case.cfg.clone(),
-                    outcome: Outcome::NoBaseline,
-                });
-                continue;
-            }
-        };
+        let baseline_path =
+            match resolve_baseline_fs(stem, baseline_area(&harness_logical), &pragmas) {
+                Some(path) => path,
+                None => {
+                    results.push(AnalysisResult {
+                        case: case.logical_path.clone(),
+                        cfg: case.cfg.clone(),
+                        outcome: Outcome::NoBaseline,
+                    });
+                    continue;
+                }
+            };
 
         let expected = match fs::read_to_string(&baseline_path) {
             Ok(text) => text,
@@ -867,10 +896,11 @@ fn types_facet_wrong_expr_diagnostic() {
         };
         let emitted = emit_types_baseline(&compiled, &harness_logical);
         let stem = case_stem(&harness_logical);
-        let baseline_path = match resolve_baseline_fs(stem, &pragmas) {
-            Some(p) => p,
-            None => continue,
-        };
+        let baseline_path =
+            match resolve_baseline_fs(stem, baseline_area(&harness_logical), &pragmas) {
+                Some(p) => p,
+                None => continue,
+            };
         let expected = match fs::read_to_string(&baseline_path) {
             Ok(t) => t,
             Err(_) => continue,
