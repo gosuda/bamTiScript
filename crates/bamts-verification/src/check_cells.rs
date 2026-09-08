@@ -7194,7 +7194,10 @@ interface I {
         );
     }
     /// Boundary: a `let` established first keeps the single diagnostic
-    /// against a later `var` (settled catch-adjacent behavior).
+    /// against a later `var`. Known divergence, kept deliberately: tsc
+    /// dual-reports this pair (TS2451 at both sites), but the repo
+    /// single-reports lexical-first collisions by design (catch
+    /// settlement), and the top-level shape follows the same rule.
     #[test]
     fn let_var_conflict_reports_once() {
         let case_text = "let f = 1;\nvar f = 0;\n";
@@ -7286,6 +7289,31 @@ interface I {
                 ("BAMTS-C001".to_owned(), 1, 9),
                 ("BAMTS-C001".to_owned(), 3, 4),
                 ("BAMTS-C001".to_owned(), 4, 4),
+            ]
+        );
+    }
+    /// Mixed triple: each later conflict sees the lexical incumbent
+    /// left by the previous one, so every site still reports exactly
+    /// once (no repeated peer-report).
+    #[test]
+    fn mixed_triple_conflict_reports_each_site_once() {
+        let case_text = "function f() {\n}\nlet f;\nclass f {\n}\n";
+        let units = split_case_units("tests/cases/compiler/mixedTriple.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/mixedTriple.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 9),
+                ("BAMTS-C001".to_owned(), 3, 4),
+                ("BAMTS-C001".to_owned(), 4, 6),
             ]
         );
     }
