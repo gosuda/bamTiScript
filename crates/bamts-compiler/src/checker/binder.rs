@@ -15530,7 +15530,10 @@ impl<'src> Binder<'src> {
                 }
             }
             ClassMember::StaticBlock(block) => {
-                let child = self.new_scope(ScopeKind::Block, Some(scope));
+                // Static blocks are `var`-hoist boundaries like function
+                // bodies: upstream scopes a block `var` to the block, never
+                // to the class member table.
+                let child = self.new_scope(ScopeKind::Function, Some(scope));
                 let new_target_marker = self.new_target_contexts.len();
                 self.new_target_contexts.push(false);
                 let derived = self.class_derived_stack.last().copied().unwrap_or(false);
@@ -26221,6 +26224,28 @@ mod tests {
     fn named_class_expression_name_stays_visible_in_its_body() {
         let (_, diagnostics) = bound("const X = class Inner { m() { return Inner; } };");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn class_type_parameters_stay_visible_in_method_bodies() {
+        let (_, diagnostics) = bound("class C<T> { m(p: T): T { return p; } }");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn var_in_static_block_stays_visible_in_its_block() {
+        let (_, diagnostics) = bound("class C { static { var v = 1; v; } }");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn var_in_static_block_is_not_visible_in_methods() {
+        let (_, diagnostics) = bound("class C { static { var v = 1; } m() { return v; } }");
+        let codes: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code().as_str())
+            .collect();
+        assert_eq!(codes, [super::CANNOT_FIND_NAME.as_str()]);
     }
 
     #[test]
