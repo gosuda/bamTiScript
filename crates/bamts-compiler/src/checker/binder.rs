@@ -12412,17 +12412,62 @@ impl<'src> Binder<'src> {
         let Type::ObjectType(mut object) = self.types.get(structural).clone() else {
             return;
         };
-        for (name, type_id) in additions {
-            if object.properties.iter().any(|p| p.name() == name) {
+        for (name, type_id) in &additions {
+            if object.properties.iter().any(|p| p.name() == name.as_str()) {
                 continue;
             }
             object
                 .properties
-                .push(PropertyType::new(name, false, type_id));
+                .push(PropertyType::new(name.clone(), false, *type_id));
         }
         let structural = self.types.object_type_with_members(object);
         let constructor = self.types.constructor_type(symbol, arguments, structural);
         self.class_constructor_types.insert(symbol, constructor);
+        // Derived constructors resolved before this augmentation
+        // snapshotted the base statics: refresh them with the same
+        // additions so late-merged members stay visible through
+        // subclasses. Worklist covers transitive descendants.
+        let mut stack: Vec<SymbolId> = self
+            .class_base_symbols
+            .iter()
+            .filter_map(|(derived, base)| (*base == symbol).then_some(*derived))
+            .collect();
+        while let Some(derived) = stack.pop() {
+            let Some(&existing) = self.class_constructor_types.get(&derived) else {
+                continue;
+            };
+            let Type::ConstructorType {
+                arguments,
+                structural,
+                ..
+            } = self.types.get(existing).clone()
+            else {
+                continue;
+            };
+            let Type::ObjectType(mut object) = self.types.get(structural).clone() else {
+                continue;
+            };
+            let mut changed = false;
+            for (name, type_id) in &additions {
+                if object.properties.iter().any(|p| p.name() == name.as_str()) {
+                    continue;
+                }
+                object
+                    .properties
+                    .push(PropertyType::new(name.clone(), false, *type_id));
+                changed = true;
+            }
+            if changed {
+                let structural = self.types.object_type_with_members(object);
+                let constructor = self.types.constructor_type(derived, arguments, structural);
+                self.class_constructor_types.insert(derived, constructor);
+            }
+            stack.extend(
+                self.class_base_symbols
+                    .iter()
+                    .filter_map(|(child, base)| (*base == derived).then_some(*child)),
+            );
+        }
     }
 
     fn finalize_namespace_constructor(&mut self, statement_id: NodeId) {

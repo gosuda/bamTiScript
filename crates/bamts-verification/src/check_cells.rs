@@ -3900,6 +3900,24 @@ mod tests {
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
 
+    /// Regression: derived constructors refresh when the base merges
+    /// later. `B` resolved before `namespace C` still sees `x`.
+    #[test]
+    fn derived_class_sees_late_namespace_additions() {
+        let case_text = "class C {\n}\nclass B extends C {\n}\nnamespace C {\n    export const x = 1;\n}\nconst n: number = B.x;\n";
+        let units = split_case_units("tests/cases/compiler/derivedLateNsAdditions.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/derivedLateNsAdditions.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
     /// Regression: nested namespaces contribute finalized constructors.
     /// The inner namespace finalizes before the outer snapshots it, so
     /// the outer structural carries the inner member types, not a shell.
