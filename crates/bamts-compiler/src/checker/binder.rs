@@ -10376,6 +10376,20 @@ impl<'src> Binder<'src> {
                 );
             } else {
                 self.emit(DUPLICATE_DECLARATION, range, DUPLICATE_MESSAGE);
+                // A hoisted earlier declaration (loop-prebound or hoisted
+                // function) shares the fault: tsc reports the collision at
+                // both sites (TS2300/TS2451 pairs), while lexical-first
+                // collisions keep the single diagnostic.
+                if self
+                    .hoisted_declaration_symbols
+                    .values()
+                    .any(|symbol| *symbol == existing)
+                {
+                    let existing_range = self.symbols[existing.get() as usize].range;
+                    if existing_range != range {
+                        self.emit(DUPLICATE_DECLARATION, existing_range, DUPLICATE_MESSAGE);
+                    }
+                }
             }
         }
         id
