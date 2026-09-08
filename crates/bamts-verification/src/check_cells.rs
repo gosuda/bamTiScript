@@ -6780,4 +6780,39 @@ interface I {
             .collect();
         assert_eq!(codes, vec![("BAMTS-C001".to_owned(), 3)]);
     }
+    /// Regression: nested `var` under a destructured catch conflicts.
+    /// `var` hoists through transparent scopes, so the claim walk
+    /// climbs to the complex catch instead of stopping at the block.
+    #[test]
+    fn catch_nested_var_conflicts_with_destructured_param() {
+        let case_text = "try {\n} catch ({ x }) {\n    {\n        var x;\n    }\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchNestedVar.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchNestedVar.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C001".to_owned(), 4)]);
+    }
+    /// Regression: nested `var` under a simple catch stays silent. The
+    /// legacy tolerance survives hoisting through transparent scopes.
+    #[test]
+    fn catch_nested_var_tolerated_for_simple_param() {
+        let case_text = "try {\n} catch (e) {\n    {\n        var e;\n    }\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchNestedVarSimple.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchNestedVarSimple.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
 }

@@ -10154,17 +10154,46 @@ impl<'src> Binder<'src> {
         // only against lexical redeclarations: tsc reports TS2492 for
         // `let`/`const` (oracle-verified) while classes, enums, `var`,
         // and functions shadow a simple-identifier parameter legally.
-        // Against a destructured parameter even `var` conflicts. Computed
-        // here because hoisted declarations return early below.
-        let catch_parent = if self.scopes[written_scope.0 as usize].kind == ScopeKind::Block {
-            match self.scopes[written_scope.0 as usize].parent {
-                Some(parent) if self.scopes[parent.0 as usize].kind == ScopeKind::Catch => {
+        // Against a destructured parameter even `var` conflicts — and
+        // `var` hoists, so the walk climbs through transparent scopes
+        // to the claiming catch, stopping at hoist boundaries. Lexical
+        // declarations stay put, so only the immediate parent counts
+        // for them. Computed here because hoisted declarations return
+        // early below.
+        let catch_parent = match kind {
+            SymbolKind::Variable(
+                VariableKind::Let
+                | VariableKind::Const
+                | VariableKind::Using
+                | VariableKind::AwaitUsing,
+            ) => match self.scopes[written_scope.0 as usize].parent {
+                Some(parent)
+                    if self.scopes[written_scope.0 as usize].kind == ScopeKind::Block
+                        && self.scopes[parent.0 as usize].kind == ScopeKind::Catch =>
+                {
                     Some(parent)
                 }
                 _ => None,
+            },
+            SymbolKind::Variable(VariableKind::Var) => {
+                let mut current = written_scope;
+                loop {
+                    if !matches!(
+                        self.scopes[current.0 as usize].kind,
+                        ScopeKind::Block | ScopeKind::For | ScopeKind::With
+                    ) {
+                        break None;
+                    }
+                    match self.scopes[current.0 as usize].parent {
+                        Some(parent) if self.scopes[parent.0 as usize].kind == ScopeKind::Catch => {
+                            break Some(parent);
+                        }
+                        Some(parent) => current = parent,
+                        None => break None,
+                    }
+                }
             }
-        } else {
-            None
+            _ => None,
         };
         let catch_conflict = match (kind, catch_parent) {
             (
