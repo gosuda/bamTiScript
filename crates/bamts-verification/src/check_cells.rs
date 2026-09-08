@@ -7103,6 +7103,59 @@ interface I {
             .collect();
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
+    /// Sloppy twin of the func-first dual (tsc TS2300 at both sites
+    /// in sloppy too).
+    #[test]
+    fn sloppy_function_let_conflict_reports_both_sites() {
+        let case_text = "function f() {\n}\nlet f = 1;\n";
+        let units = split_case_units("tests/cases/compiler/sloppyFunctionLet.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/sloppyFunctionLet.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 9),
+                ("BAMTS-C001".to_owned(), 3, 4),
+            ]
+        );
+    }
+    /// Sloppy twin of the var-merge guard (tsc clean in sloppy too).
+    #[test]
+    fn sloppy_loop_header_var_merges_with_body_function() {
+        let case_text = "for (var f = 0;;) function f() {\n}\n";
+        let units = split_case_units("tests/cases/compiler/sloppyLoopHeaderVar.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/sloppyLoopHeaderVar.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
     /// Sloppy twin of the header-let conflict (tsc TS2451 at both
     /// sites in sloppy too).
     #[test]
