@@ -5963,7 +5963,18 @@ export const t = 1;
                     continue;
                 }
                 let stem = name.trim_end_matches(".ts");
-                if !std::path::Path::new(&format!("{baseline_dir}/{stem}.types")).exists() {
+                // Authority trees nest baselines one level down
+                // (`reference/<area>/*.types`); the area is the segment
+                // after `cases/` in the case path.
+                let area = rel_dir
+                    .split("cases/")
+                    .nth(1)
+                    .and_then(|rest| rest.split('/').next())
+                    .unwrap_or("");
+                let nested = format!("{baseline_dir}/{area}/{stem}.types");
+                if !std::path::Path::new(&nested).exists()
+                    && !std::path::Path::new(&format!("{baseline_dir}/{stem}.types")).exists()
+                {
                     continue;
                 }
                 let Ok(text) = std::fs::read_to_string(&path) else {
@@ -5980,8 +5991,18 @@ export const t = 1;
         let mut unmatched_samples: Vec<String> = Vec::new();
         for (logical, text) in &sample {
             let stem = logical.rsplit('/').next().unwrap().trim_end_matches(".ts");
-            let Ok(expected) = std::fs::read_to_string(format!("{baseline_dir}/{stem}.types"))
-            else {
+            let area = logical
+                .split("cases/")
+                .nth(1)
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or("");
+            let nested = format!("{baseline_dir}/{area}/{stem}.types");
+            let baseline = if std::path::Path::new(&nested).exists() {
+                nested
+            } else {
+                format!("{baseline_dir}/{stem}.types")
+            };
+            let Ok(expected) = std::fs::read_to_string(baseline) else {
                 continue;
             };
             let units = split_case_units(logical, text);
@@ -6007,6 +6028,16 @@ export const t = 1;
                 }
             }
             let _ = per_case;
+        }
+        // Regression floor, not a parity target: when the authority tree
+        // is present the match ratio must hold; with no authority checked
+        // out the sample is empty and there is nothing to gate.
+        if member_records > 0 {
+            let ratio = matched_records as f64 / member_records as f64;
+            assert!(
+                ratio > 0.7,
+                "enum member record match ratio collapsed to {ratio:.3} ({matched_records}/{member_records})"
+            );
         }
         let mut report =
             format!("enum_member_access_records: total={member_records} matched={matched_records}");
