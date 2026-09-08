@@ -165,13 +165,23 @@ fn baseline_area(harness_logical: &str) -> &str {
 /// (e.g. `compiler/` and `conformance/` twins), so a sorted-first
 /// fallback can never diff against the wrong baseline.
 fn resolve_baseline_fs(stem: &str, area: &str, pragmas: &CasePragmas) -> Option<PathBuf> {
-    let base = baseline_dir();
+    resolve_baseline_in(stem, area, pragmas, &baseline_dir())
+}
+
+/// [`resolve_baseline_fs`] over an explicit root, so tests can prove
+/// cross-area twin discrimination against fixture trees.
+fn resolve_baseline_in(
+    stem: &str,
+    area: &str,
+    pragmas: &CasePragmas,
+    base: &std::path::Path,
+) -> Option<PathBuf> {
     // Authority trees nest baselines one level down
     // (`reference/<area>/*.types`); scan the top level and one down,
     // trying the owning area first.
     let area_dir = base.join(area);
     let mut dirs = vec![area_dir.clone()];
-    dirs.push(base.clone());
+    dirs.push(base.to_path_buf());
     if let Ok(entries) = fs::read_dir(&base) {
         dirs.extend(
             entries
@@ -993,4 +1003,27 @@ fn types_facet_wrong_expr_diagnostic() {
     for l in &ambiguous {
         eprintln!("  {l}");
     }
+}
+
+/// Cross-area stem twins resolve to the owning area, never to a
+/// sorted-first file from another area.
+#[test]
+fn resolve_prefers_owning_area_for_stem_twins() {
+    let root = std::env::temp_dir().join(format!("bamts-twin-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    for area in ["compiler", "conformance"] {
+        fs::create_dir_all(root.join(area)).expect("fixture area");
+    }
+    fs::write(root.join("compiler/twin.types"), "compiler").expect("fixture file");
+    fs::write(root.join("conformance/twin.types"), "conformance").expect("fixture file");
+    let pragmas = CasePragmas::default();
+    assert_eq!(
+        resolve_baseline_in("twin", "conformance", &pragmas, &root),
+        Some(root.join("conformance/twin.types"))
+    );
+    assert_eq!(
+        resolve_baseline_in("twin", "compiler", &pragmas, &root),
+        Some(root.join("compiler/twin.types"))
+    );
+    let _ = fs::remove_dir_all(&root);
 }
