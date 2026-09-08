@@ -3742,12 +3742,17 @@ mod tests {
         assert!(actual.is_empty(), "hetero-enum codes: {codes:?}");
     }
 
-    /// TEMP PROBE round 3: merged class+namespace value-side members.
+    /// Regression: aliases of merged class+namespace partners construct.
+    /// The legacy identifier path answers the class constructor, so
+    /// `new alias()` keeps its construct signatures plus `alias.x`.
     #[test]
-    fn tmprobe_merged_class_ns() {
+    fn merged_class_namespace_alias_constructs() {
         let case_text = "class C {\n}\nnamespace C {\n    export const x = 1;\n}\nconst alias = C;\nconst n: number = alias.x;\nnew alias();\n";
-        let units = split_case_units("tests/cases/compiler/tmMergedClassNs.ts", case_text);
-        let entry = entry_virtual_path("tests/cases/compiler/tmMergedClassNs.ts", &units);
+        let units = split_case_units(
+            "tests/cases/compiler/mergedClassNamespaceAlias.ts",
+            case_text,
+        );
+        let entry = entry_virtual_path("tests/cases/compiler/mergedClassNamespaceAlias.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
         let mut actual = collect_facet_diagnostics(&case);
@@ -3756,7 +3761,7 @@ mod tests {
             .iter()
             .map(|d| (d.code.clone(), d.position.line))
             .collect();
-        assert!(actual.is_empty(), "merged-class-ns codes: {codes:?}");
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
 
     /// TEMP PROBE round 3: type-only member through merged-namespace value.
@@ -3809,12 +3814,18 @@ mod tests {
             .collect();
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
-    /// TEMP PROBE round 3: typeof merged class keeps construct signatures.
+    /// Regression: `typeof` a merged class keeps construct signatures and
+    /// gains the namespace exports. The finalizer augments the class
+    /// constructor instead of skipping class-kind partners.
     #[test]
-    fn tmprobe_merged_class_typeof() {
+    fn merged_class_namespace_typeof_keeps_additions() {
         let case_text = "class C {\n}\nnamespace C {\n    export const x = 1;\n}\ntype T = typeof C;\nconst m: T = C;\nnew m();\nconst n: number = m.x;\n";
-        let units = split_case_units("tests/cases/compiler/tmMergedClassTypeof.ts", case_text);
-        let entry = entry_virtual_path("tests/cases/compiler/tmMergedClassTypeof.ts", &units);
+        let units = split_case_units(
+            "tests/cases/compiler/mergedClassNamespaceTypeof.ts",
+            case_text,
+        );
+        let entry =
+            entry_virtual_path("tests/cases/compiler/mergedClassNamespaceTypeof.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
         let mut actual = collect_facet_diagnostics(&case);
@@ -3823,7 +3834,7 @@ mod tests {
             .iter()
             .map(|d| (d.code.clone(), d.position.line))
             .collect();
-        assert!(actual.is_empty(), "merged-class-typeof codes: {codes:?}");
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
 
     /// TEMP PROBE round 3: nested namespace structural assignment.

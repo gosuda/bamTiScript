@@ -12339,6 +12339,55 @@ impl<'src> Binder<'src> {
             .unwrap_or(self.symbol_types[symbol.get() as usize])
     }
 
+    /// Merge a merged namespace's value exports into its class partner's
+    /// constructor static shape. Class statics win name collisions; the
+    /// construct signatures and type arguments are preserved, so `typeof C`
+    /// and aliases see one constructor with both halves.
+    fn augment_class_constructor_with_namespace_exports(&mut self, symbol: SymbolId) {
+        let Some(&export_scope) = self.namespace_export_scopes.get(&symbol) else {
+            return;
+        };
+        let mut additions = Vec::new();
+        for (name, member) in &self.scopes[export_scope.0 as usize].values {
+            let kind = self.symbols[member.get() as usize].kind;
+            if matches!(
+                kind,
+                SymbolKind::Interface | SymbolKind::TypeAlias | SymbolKind::TypeParameter
+            ) {
+                continue;
+            }
+            additions.push((name.clone(), self.value_side_type(*member)));
+        }
+        if additions.is_empty() {
+            return;
+        }
+        let Some(&existing) = self.class_constructor_types.get(&symbol) else {
+            return;
+        };
+        let Type::ConstructorType {
+            arguments,
+            structural,
+            ..
+        } = self.types.get(existing).clone()
+        else {
+            return;
+        };
+        let Type::ObjectType(mut object) = self.types.get(structural).clone() else {
+            return;
+        };
+        for (name, type_id) in additions {
+            if object.properties.iter().any(|p| p.name() == name) {
+                continue;
+            }
+            object
+                .properties
+                .push(PropertyType::new(name, false, type_id));
+        }
+        let structural = self.types.object_type_with_members(object);
+        let constructor = self.types.constructor_type(symbol, arguments, structural);
+        self.class_constructor_types.insert(symbol, constructor);
+    }
+
     fn finalize_namespace_constructor(&mut self, statement_id: NodeId) {
         let mut target = None;
         for binding in &self.namespace_declarations {
@@ -12353,6 +12402,13 @@ impl<'src> Binder<'src> {
         let kind = self.symbols[symbol.get() as usize].kind;
         let merged_enum =
             kind == SymbolKind::Enum && self.enum_constructor_types.contains_key(&symbol);
+        // Merged classes keep their own constructor: augment its static
+        // shape with the namespace exports instead of replacing it, so
+        // `typeof C` and aliases keep construct signatures plus additions.
+        if kind == SymbolKind::Class {
+            self.augment_class_constructor_with_namespace_exports(symbol);
+            return;
+        }
         if kind != SymbolKind::Namespace && !merged_enum {
             return;
         }
