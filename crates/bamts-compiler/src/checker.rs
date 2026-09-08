@@ -1324,13 +1324,9 @@ fn build_imported_symbol_type<'a>(
     )?;
     let source_model = files.get(&linked.source)?;
     let symbol_kind = source_model.symbol(linked.symbol).kind();
-    // A class symbol's value plane is its constructor type; the structural
-    // static side hangs off it, and the type plane is its instance type.
-    let value_type_id = if symbol_kind == SymbolKind::Class {
-        source_model.constructor_type(linked.symbol)
-    } else {
-        source_model.symbol_type(linked.symbol)
-    };
+    // Classes and enums answer their constructor on the value plane;
+    // the helper owns that rule for every reader.
+    let value_type_id = source_model.value_side_type(linked.symbol);
     let value_type = source_model.types().get(value_type_id);
     if matches!(value_type, Type::Error | Type::Any | Type::Unknown) {
         return None;
@@ -1351,9 +1347,10 @@ fn build_imported_symbol_type<'a>(
                 .filter(|_| signatures.all(|entry| entry.signature.return_type() == return_type))
             })
         }
-        (SymbolKind::Interface | SymbolKind::TypeAlias | SymbolKind::Enum, _) => {
-            Some(value_type_id)
-        }
+        (SymbolKind::Interface | SymbolKind::TypeAlias, _) => Some(value_type_id),
+        // Enums split planes like classes: the value plane is the
+        // constructor, the type plane stays the scalar enum type.
+        (SymbolKind::Enum, _) => Some(source_model.symbol_type(linked.symbol)),
         _ => None,
     };
     Some(ImportedSymbolType {
@@ -3503,6 +3500,96 @@ mod tests {
         assert!(
             codes.contains(&CANNOT_FIND_NAME.as_str()),
             "es5 lib must not resolve Proxy or document: {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn enum_value_assignable_to_matching_object() {
+        let result = check_text_with(
+            "enum E {\n    A = 1,\n}\nconst v: { A: E } = E;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn enum_value_mismatch_still_rejected() {
+        let result = check_text_with(
+            "enum E {\n    A = 1,\n}\nconst v: { A: string } = E;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            !checker_codes_of(&result).is_empty(),
+            "expected a mismatch diagnostic, got clean: {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn namespace_value_assignable_to_matching_object() {
+        let result = check_text_with(
+            "namespace M {\n    export const x = 1;\n}\nconst v: { x: number } = M;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn namespace_value_mismatch_still_rejected() {
+        let result = check_text_with(
+            "namespace M {\n    export const x = 1;\n}\nconst v: { x: string } = M;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            !checker_codes_of(&result).is_empty(),
+            "expected a mismatch diagnostic, got clean: {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn enum_reverse_mapping_reads_string() {
+        let result = check_text_with(
+            "enum E {\n    A = 1,\n}\nconst v = E[0];",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn merged_enum_namespace_alias_member() {
+        let result = check_text_with(
+            "enum E {\n    A = 1,\n}\nnamespace E {\n    export const x = 1;\n}\nconst v = E;\nv.x;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
             result.diagnostics()
         );
     }
@@ -13720,6 +13807,128 @@ class B extends A {
         let codes = checker_codes_of(&result);
         assert_eq!(codes, ["BAMTS-C039"], "{codes:?}");
     }
+
+    #[test]
+    fn strict_block_functions_do_not_leak_to_module_scope_es5() {
+        // blockScopedFunctionDeclarationES5 oracle (es5 row): the
+        // in-block declaration reports C040 and the module-scope use
+        // reports C002; the declaration must not hoist out of its block.
+        let result = check_text_with(
+            "if (true) {\n    function foo() { }\n    foo();\n}\nfoo();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es5"))
+                .with_strict(true),
+        );
+        let mut codes = checker_codes_of(&result);
+        codes.sort_unstable();
+        assert_eq!(codes, ["BAMTS-C002", "BAMTS-C040"], "{codes:?}");
+    }
+
+    #[test]
+    fn strict_block_functions_do_not_leak_to_module_scope_es2015() {
+        let result = check_text_with(
+            "if (true) {\n    function foo() { }\n    foo();\n}\nfoo();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert_eq!(checker_codes_of(&result), ["BAMTS-C002"]);
+    }
+
+    #[test]
+    fn sloppy_block_functions_still_hoist_to_module_scope() {
+        // Annex B: without strict mode the block function hoists and
+        // the module-scope use stays clean.
+        let result = check_text_with(
+            "if (true) {\n    function foo() { }\n    foo();\n}\nfoo();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es5"))
+                .with_strict(false),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn strict_unbraced_if_body_function_still_hoists() {
+        // An unbraced `if` body creates no lexical scope, so the
+        // strict function hoists to the enclosing scope and the
+        // earlier call resolves: no C002.
+        let result = check_text_with(
+            "declare var cond: boolean;\nfoo();\nif (cond) function foo() { }",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn strict_if_body_function_inside_block_stays_visible_in_block() {
+        // The `if` passes the block context through: `bar` lands in
+        // the outer block scope, so the later in-block use resolves
+        // while the module-scope use still reports C002 (no leak
+        // through the scopeless `if`).
+        let result = check_text_with(
+            "declare var cond: boolean;\nif (cond) {\n    if (cond) function bar() { }\n    bar();\n}\nbar();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert_eq!(checker_codes_of(&result), ["BAMTS-C002"]);
+    }
+
+    #[test]
+    fn strict_switch_case_function_does_not_leak_to_module_scope() {
+        // The resolve pass binds case consequents in a Block child
+        // scope, so the case function is switch-scoped: the in-switch
+        // use resolves while the module-scope use reports C002.
+        let result = check_text_with(
+            "declare var x: number;\nswitch (x) { case 1: function f() { } f(); }\nf();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert_eq!(checker_codes_of(&result), ["BAMTS-C002"]);
+    }
+
+    #[test]
+    fn strict_unbraced_while_body_function_still_hoists() {
+        // Loop bodies create no scope either: the strict function
+        // hoists to the enclosing scope and the later use resolves.
+        let result = check_text_with(
+            "declare var cond: boolean;\nwhile (cond) function w() { }\nw();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn strict_unbraced_for_body_function_stays_loop_scoped() {
+        // tsc reports TS2304 on the pre-loop use (oracle-verified):
+        // a for-body function never reaches the enclosing scope.
+        let result = check_text_with(
+            "declare var cond: boolean;\nf();\nfor (; cond;) function f() { }",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert_eq!(checker_codes_of(&result), ["BAMTS-C002"]);
+    }
+
     #[test]
     fn f4_computed_symbol_object_members_accept_without_errors() {
         // Upstream acceptSymbolAsWeakType expects zero diagnostics; symbol

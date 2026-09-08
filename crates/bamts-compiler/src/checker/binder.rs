@@ -5457,24 +5457,44 @@ fn diagnostic_suppressions(source: &SourceFile) -> DiagnosticSuppressions {
     }
 }
 
-/// Returns whether an enum initializer is a numeric literal expression.
+/// Returns whether an enum initializer is a numeric constant expression:
+/// literals, parenthesized numerics, sign/bitwise-not applications, and
+/// numeric binary operators over numeric operands. Matches the runtime
+/// reverse-mapping rule without a full constant folder.
 pub(crate) fn is_numeric_enum_initializer(expression: &Expr) -> bool {
     match expression.data() {
         Expression::Literal(Literal::Number(_)) => true,
+        Expression::Parenthesized(inner) => is_numeric_enum_initializer(inner),
         Expression::Unary(unary)
-            if matches!(unary.operator, UnaryOperator::Plus | UnaryOperator::Minus) =>
+            if matches!(
+                unary.operator,
+                UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::BitNot
+            ) =>
         {
-            matches!(
-                unary.argument.data(),
-                Expression::Literal(Literal::Number(_))
-            )
+            is_numeric_enum_initializer(&unary.argument)
+        }
+        Expression::Binary(binary)
+            if matches!(
+                binary.operator,
+                BinaryOperator::Add
+                    | BinaryOperator::Subtract
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Remainder
+                    | BinaryOperator::Exponentiate
+                    | BinaryOperator::LeftShift
+                    | BinaryOperator::SignedRightShift
+                    | BinaryOperator::UnsignedRightShift
+                    | BinaryOperator::BitAnd
+                    | BinaryOperator::BitXor
+                    | BinaryOperator::BitOr
+            ) =>
+        {
+            is_numeric_enum_initializer(&binary.left) && is_numeric_enum_initializer(&binary.right)
         }
         _ => false,
     }
 }
-
-/// One bound named interface member declaration occurrence.
-///
 /// Duplicate declarations of one member name share the canonical `symbol`
 /// while each keeps its own `declaration` and `name_range`, so consumers can
 /// render every written occurrence without minting extra symbols.
@@ -5543,6 +5563,10 @@ pub struct SemanticModel {
     /// class declarations; this map holds the `typeof C` constructor type
     /// needed for value references and `typeof` queries.
     class_constructor_types: HashMap<SymbolId, TypeId>,
+    /// Constructor (`typeof E`) types keyed by the enum symbol, mirroring
+    /// the class split: instance type in `symbol_types`, value-side
+    /// constructor here for cross-file references and queries.
+    enum_constructor_types: HashMap<SymbolId, TypeId>,
     /// Namespace declaration node to the local scope holding its member
     /// bindings, used by declaration emit to resolve unqualified names
     /// inside namespace bodies.
@@ -5617,6 +5641,32 @@ impl SemanticModel {
             .get(&id)
             .copied()
             .unwrap_or(self.symbol_types[id.0 as usize])
+    }
+
+    /// Returns the value-side constructor type for an enum symbol, or the
+    /// symbol's declared type if no constructor type was recorded.
+    #[must_use]
+    pub fn enum_constructor_type(&self, id: SymbolId) -> TypeId {
+        self.enum_constructor_types
+            .get(&id)
+            .copied()
+            .unwrap_or(self.symbol_types[id.0 as usize])
+    }
+
+    /// Returns the value-side type of a symbol: classes and enums answer
+    /// their constructor, every other kind its declared type. One site
+    /// owns the rule so member, query, and finalizer readers agree.
+    #[must_use]
+    pub(crate) fn value_side_type(&self, symbol: SymbolId) -> TypeId {
+        let constructors = match self.symbols[symbol.get() as usize].kind {
+            SymbolKind::Class => &self.class_constructor_types,
+            SymbolKind::Enum => &self.enum_constructor_types,
+            _ => return self.symbol_types[symbol.get() as usize],
+        };
+        constructors
+            .get(&symbol)
+            .copied()
+            .unwrap_or(self.symbol_types[symbol.get() as usize])
     }
 
     #[cfg(test)]
@@ -6005,12 +6055,26 @@ pub(crate) struct Binder<'src> {
     /// Variable/parameter symbol → property owner, seeded at declaration so
     /// member accesses resolve to the annotated owner.
     symbol_anchor: HashMap<SymbolId, PropertyOwner>,
+    /// Namespace-export/static collisions already reported, keyed by
+    /// constructor owner and member name. Fragments finalize
+    /// independently over one accumulated export scope, so without this
+    /// the same duplicate would fire once per fragment.
+    reported_static_collisions: HashSet<(SymbolId, String)>,
+    /// Namespace-appended static names per constructor owner, marking
+    /// properties this augmentation added. Merged symbols share one
+    /// identity, so class-owned statics carry no distinguishing mark
+    /// from our additions without this set.
+    ns_appended_statics: HashSet<(SymbolId, String)>,
     import_equals_symbols: HashMap<NodeId, SymbolId>,
     qualified_import_paths: HashMap<NodeId, Box<[SymbolId]>>,
     import_equals_targets: HashMap<SymbolId, ImportEqualsTarget>,
     imported_type_parameters: HashMap<SymbolId, Vec<SymbolId>>,
     imported_type_planes: HashMap<SymbolId, TypeId>,
     hoisted_declaration_symbols: HashMap<HoistedDeclarationIdentity, SymbolId>,
+    /// Catch scopes whose binding is not a simple identifier. The legacy
+    /// same-name `var` tolerance applies to simple bindings only; against
+    /// a destructured parameter even `var` conflicts.
+    complex_catch_scopes: HashSet<ScopeId>,
     /// Legacy JSX side tables removed: demand-side JSX lives in `super::jsx`.
     /// Class instance structural types keyed by the class symbol, built lazily
     /// during class-body resolution so `new C()` and member access on class-typed
@@ -6020,6 +6084,15 @@ pub(crate) struct Binder<'src> {
     /// declarations, `symbol_types[owner]` stores the instance type and this
     /// map holds the `typeof C` constructor type for value-position references.
     pub(crate) class_constructor_types: HashMap<SymbolId, TypeId>,
+    /// Constructor (`typeof E`) types keyed by the enum symbol. For enum
+    /// declarations, `symbol_types[owner]` stores the enum instance type
+    /// for headers while this map holds the member-bearing value-side
+    /// constructor — mirroring the class split.
+    pub(crate) enum_constructor_types: HashMap<SymbolId, TypeId>,
+    /// Enum symbols with at least one numeric-literal member seen across
+    /// all merged declarations. Scalar classification stays all-members,
+    /// but the reverse-mapping index needs only one numeric member.
+    enum_has_numeric_member: HashSet<SymbolId>,
     reg_exp_instance_type: Option<TypeId>,
     /// Shared by provisional and final class-shape passes so a generic method's
     /// type parameters keep one semantic identity.
@@ -6217,17 +6290,22 @@ impl<'src> Binder<'src> {
             member_reference_recorded: HashSet::new(),
             property_sites: Vec::new(),
             property_site_index: HashMap::new(),
+            ns_appended_statics: HashSet::new(),
             property_anchors: Vec::new(),
             property_anchor_index: HashMap::new(),
             literal_anchor: HashMap::new(),
             symbol_anchor: HashMap::new(),
+            reported_static_collisions: HashSet::new(),
             import_equals_symbols: HashMap::new(),
             qualified_import_paths: HashMap::new(),
             import_equals_targets: HashMap::new(),
+            enum_constructor_types: HashMap::new(),
+            enum_has_numeric_member: HashSet::new(),
             class_constructor_types: HashMap::new(),
             imported_type_parameters: HashMap::new(),
             imported_type_planes: HashMap::new(),
             hoisted_declaration_symbols: HashMap::new(),
+            complex_catch_scopes: HashSet::new(),
             class_instance_types: HashMap::new(),
             reg_exp_instance_type: None,
             class_method_signature_scopes: HashMap::new(),
@@ -9172,7 +9250,7 @@ impl<'src> Binder<'src> {
         self.check_cancel()?;
         self.bind_statement_names_and_class_headers(statements, scope);
         self.check_cancel()?;
-        self.bind_hoisted_statements(statements, scope);
+        self.bind_hoisted_statements(statements, scope, false, false, false);
         self.check_cancel()?;
         self.build_import_equals_targets(statements, scope);
         let mut imported_by_source = HashMap::<*const TypeTable, ImportedTypeMap>::new();
@@ -9428,6 +9506,7 @@ impl<'src> Binder<'src> {
             enum_facts: EnumFacts::unchecked(),
             namespace_facts: NamespaceFacts::unchecked(),
             ambient_modules: std::mem::take(&mut self.ambient_modules),
+            enum_constructor_types: std::mem::take(&mut self.enum_constructor_types),
             class_constructor_types: std::mem::take(&mut self.class_constructor_types),
             namespace_local_scopes: std::mem::take(&mut self.namespace_local_scopes),
         };
@@ -10029,6 +10108,32 @@ impl<'src> Binder<'src> {
             }
         }
     }
+    /// Hoist target for function declarations. A `for`/`for-in`/`for-of`
+    /// body contains its functions: tsc reports TS2304 on post-loop uses
+    /// (oracle-verified across unbraced, braced, and nested shapes), so
+    /// the climb stops at the nearest `For` scope. `var` keeps climbing
+    /// through loops via [`value_hoist_scope`].
+    fn function_hoist_scope(&self, scope: ScopeId) -> ScopeId {
+        let mut current = scope;
+        loop {
+            let node = &self.scopes[current.0 as usize];
+            if matches!(
+                node.kind,
+                ScopeKind::Class
+                    | ScopeKind::Function
+                    | ScopeKind::Module
+                    | ScopeKind::Namespace
+                    | ScopeKind::StaticBlock
+                    | ScopeKind::For
+            ) {
+                return current;
+            }
+            match node.parent {
+                Some(parent) => current = parent,
+                None => return current,
+            }
+        }
+    }
 
     pub(crate) fn emit(&mut self, code: DiagnosticCode, range: TextRange, message: &'static str) {
         if self.probing_contextual_type {
@@ -10125,13 +10230,94 @@ impl<'src> Binder<'src> {
         // `var` and function declarations are hoisted to the nearest Function or
         // Module scope, so a binding textually nested in a block, `for`, or
         // `catch` scope is owned by its enclosing function. `let`/`const` and all
-        // other kinds stay in the scope they were written in.
+        // other kinds stay in the scope they were written in. Strict-mode
+        // function declarations are block-scoped (Annex B hoisting is
+        // sloppy-only): written directly in a strict block, `for`, or
+        // `catch` scope, the binding stays there instead of rising.
+        // `var` hoists regardless of strictness.
         let hoisted = matches!(
             kind,
             SymbolKind::Variable(VariableKind::Var) | SymbolKind::Function
         );
-        let scope = if hoisted {
-            self.value_hoist_scope(scope)
+        let strict_block_function = kind == SymbolKind::Function && {
+            let declared = &self.scopes[scope.0 as usize];
+            declared.strict
+                && matches!(
+                    declared.kind,
+                    ScopeKind::Block | ScopeKind::For | ScopeKind::Catch
+                )
+        };
+        // Written scope before hoisting: `var` rises to its hoist scope,
+        // but catch-claim checks need the textual position.
+        let written_scope = scope;
+        // Catch parameters stay claimed across the child body block, but
+        // only against lexical redeclarations: tsc reports TS2492 for
+        // `let`/`const` (oracle-verified) while classes, enums, `var`,
+        // and functions shadow a simple-identifier parameter legally.
+        // Against a destructured parameter even `var` conflicts — and
+        // `var` hoists, so the walk climbs through transparent scopes
+        // to the claiming catch, stopping at hoist boundaries. Lexical
+        // declarations stay put, so only the immediate parent counts
+        // for them. Computed here because hoisted declarations return
+        // early below.
+        let catch_parent = match kind {
+            SymbolKind::Variable(
+                VariableKind::Let
+                | VariableKind::Const
+                | VariableKind::Using
+                | VariableKind::AwaitUsing,
+            ) => match self.scopes[written_scope.0 as usize].parent {
+                Some(parent)
+                    if self.scopes[written_scope.0 as usize].kind == ScopeKind::Block
+                        && self.scopes[parent.0 as usize].kind == ScopeKind::Catch =>
+                {
+                    Some(parent)
+                }
+                _ => None,
+            },
+            SymbolKind::Variable(VariableKind::Var) => {
+                let mut current = written_scope;
+                loop {
+                    if !matches!(
+                        self.scopes[current.0 as usize].kind,
+                        ScopeKind::Block | ScopeKind::For | ScopeKind::With
+                    ) {
+                        break None;
+                    }
+                    match self.scopes[current.0 as usize].parent {
+                        Some(parent) if self.scopes[parent.0 as usize].kind == ScopeKind::Catch => {
+                            break Some(parent);
+                        }
+                        Some(parent) => current = parent,
+                        None => break None,
+                    }
+                }
+            }
+            _ => None,
+        };
+        let catch_conflict = match (kind, catch_parent) {
+            (
+                SymbolKind::Variable(
+                    VariableKind::Let
+                    | VariableKind::Const
+                    | VariableKind::Using
+                    | VariableKind::AwaitUsing,
+                ),
+                Some(parent),
+            ) => self.scopes[parent.0 as usize].values.get(name).copied(),
+            (SymbolKind::Variable(VariableKind::Var), Some(parent))
+                if self.complex_catch_scopes.contains(&parent) =>
+            {
+                self.scopes[parent.0 as usize].values.get(name).copied()
+            }
+            _ => None,
+        };
+        let scope = if hoisted && !strict_block_function {
+            if kind == SymbolKind::Function {
+                self.function_hoist_scope(scope)
+            } else {
+                self.value_hoist_scope(scope)
+            }
         } else {
             scope
         };
@@ -10141,10 +10327,14 @@ impl<'src> Binder<'src> {
             range,
             kind,
         });
-        if let Some(identity) = hoisted_identity
-            && let Some(symbol) = self.hoisted_declaration_symbols.get(&identity)
-        {
-            return *symbol;
+        if let Some(identity) = hoisted_identity {
+            let hoisted = self.hoisted_declaration_symbols.get(&identity).copied();
+            if let Some(symbol) = hoisted {
+                if catch_conflict.is_some() {
+                    self.emit(DUPLICATE_DECLARATION, range, DUPLICATE_MESSAGE);
+                }
+                return symbol;
+            }
         }
         let merge = self.scopes[scope.0 as usize]
             .values
@@ -10232,7 +10422,9 @@ impl<'src> Binder<'src> {
         if let Some(identity) = hoisted_identity {
             self.hoisted_declaration_symbols.insert(identity, id);
         }
-        let conflict = value_conflict.or(type_conflict);
+        // `catch_conflict` was computed above, before hoisting, so
+        // hoisted declarations keep their claim diagnostic here too.
+        let conflict = value_conflict.or(type_conflict).or(catch_conflict);
         if let Some(existing) = conflict {
             let existing_kind = self.symbols[existing.get() as usize].kind;
             if existing_kind == SymbolKind::Import && kind != SymbolKind::Import {
@@ -10258,6 +10450,22 @@ impl<'src> Binder<'src> {
                 );
             } else {
                 self.emit(DUPLICATE_DECLARATION, range, DUPLICATE_MESSAGE);
+                // A collision involving a function declaration, or against
+                // an established `var` binding, reports at both sites (tsc
+                // TS2300/TS2393/TS2451 pairs in every order); pure lexical
+                // collisions report once at the incoming site, as do
+                // namespace-first collisions (order-sensitivity pin).
+                let peer_reports = (kind == SymbolKind::Function
+                    || existing_kind == SymbolKind::Function
+                    || existing_kind == SymbolKind::Variable(VariableKind::Var))
+                    && existing_kind != SymbolKind::Namespace
+                    && kind != SymbolKind::Namespace;
+                if peer_reports {
+                    let existing_range = self.symbols[existing.get() as usize].range;
+                    if existing_range != range {
+                        self.emit(DUPLICATE_DECLARATION, existing_range, DUPLICATE_MESSAGE);
+                    }
+                }
             }
         }
         id
@@ -10418,20 +10626,54 @@ impl<'src> Binder<'src> {
 
     /// Pre-binds `var` and function names that occur beneath lexical child
     /// scopes. The traversal never enters a function body: its own call to this
-    /// pass supplies the correct function hoist target.
-    fn bind_hoisted_statements(&mut self, statements: &'src [crate::syntax::Stmt], scope: ScopeId) {
+    /// pass supplies the correct function hoist target. `in_for_body` marks
+    /// a `for`/`for-in`/`for-of` body subtree, whose functions stay
+    /// loop-scoped (tsc TS2304 on post-loop uses) instead of hoisting.
+    fn bind_hoisted_statements(
+        &mut self,
+        statements: &'src [crate::syntax::Stmt],
+        scope: ScopeId,
+        in_block: bool,
+        in_for_body: bool,
+        local: bool,
+    ) {
         for statement in statements {
-            self.bind_hoisted_statement(statement, scope);
+            self.bind_hoisted_statement(statement, scope, in_block, in_for_body, local);
         }
     }
-
-    fn bind_hoisted_statement(&mut self, statement: &'src crate::syntax::Stmt, scope: ScopeId) {
+    fn bind_hoisted_statement(
+        &mut self,
+        statement: &'src crate::syntax::Stmt,
+        scope: ScopeId,
+        in_block: bool,
+        in_for_body: bool,
+        local: bool,
+    ) {
         match statement.data() {
             Statement::Variable(variable) if variable.kind == VariableKind::Var => {
                 self.bind_variable(variable, scope, statement.id());
             }
             Statement::Function(function) => {
-                if let Some(name) = &function.function.name {
+                // Only a real block makes a nested strict function
+                // block-scoped (Annex B hoisting is sloppy-only): the
+                // resolve pass declares it in the block scope, so the
+                // pre-pass must not leak it into the enclosing scope.
+                // Unbraced control-flow bodies create no scope, so they
+                // pass `in_block` through instead of setting it; `switch`
+                // is the exception because the resolve pass binds its
+                // cases in a Block child scope. A `for`-family body
+                // contains its functions even in sloppy mode, so the
+                // pre-pass skips those too; the resolve pass declares
+                // them in the `For` child scope. `var` and
+                // top-level/sloppy functions hoist as before.
+                let strict_block = in_block && self.scopes[scope.0 as usize].strict;
+                // A block-local prebind (`local`) declares into the block
+                // itself, so the strict-block skip does not apply: the
+                // later resolve declares the same identity.
+                if let Some(name) = &function.function.name
+                    && (!strict_block || local)
+                    && !in_for_body
+                {
                     self.declare(
                         &self.identifier_text(name),
                         SymbolKind::Function,
@@ -10441,18 +10683,40 @@ impl<'src> Binder<'src> {
                     );
                 }
             }
-            Statement::Block(block) => {
-                self.bind_hoisted_statements(&block.data().statements, scope)
-            }
+            Statement::Block(block) => self.bind_hoisted_statements(
+                &block.data().statements,
+                scope,
+                true,
+                in_for_body,
+                false,
+            ),
             Statement::If(statement) => {
-                self.bind_hoisted_statement(&statement.consequent, scope);
+                self.bind_hoisted_statement(
+                    &statement.consequent,
+                    scope,
+                    in_block,
+                    in_for_body,
+                    local,
+                );
                 if let Some(alternate) = &statement.alternate {
-                    self.bind_hoisted_statement(alternate, scope);
+                    self.bind_hoisted_statement(alternate, scope, in_block, in_for_body, local);
                 }
             }
             Statement::Switch(statement) => {
+                // The resolve pass binds case consequents in a Block
+                // child scope, so case functions are switch-scoped:
+                // suppress the enclosing pre-declaration like a block.
                 for case in &statement.cases {
-                    self.bind_hoisted_statements(&case.data().consequent, scope);
+                    // Resolve binds cases in a switch child scope, so
+                    // the enclosing `local` must not cross: nested blocks
+                    // self-cover through their own resolve prebinds.
+                    self.bind_hoisted_statements(
+                        &case.data().consequent,
+                        scope,
+                        true,
+                        in_for_body,
+                        false,
+                    );
                 }
             }
             Statement::For(for_statement) => {
@@ -10461,7 +10725,7 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope);
+                self.bind_hoisted_statement(&for_statement.body, scope, in_block, true, false);
             }
             Statement::ForIn(for_statement) => {
                 if let ForBinding::Variable(variable) = &for_statement.binding
@@ -10469,7 +10733,7 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope);
+                self.bind_hoisted_statement(&for_statement.body, scope, in_block, true, false);
             }
             Statement::ForOf(for_statement) => {
                 if let ForBinding::Variable(variable) = &for_statement.binding
@@ -10477,34 +10741,62 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope);
+                self.bind_hoisted_statement(&for_statement.body, scope, in_block, true, false);
             }
-            Statement::While(statement) => self.bind_hoisted_statement(&statement.body, scope),
-            Statement::DoWhile(statement) => self.bind_hoisted_statement(&statement.body, scope),
+            Statement::While(statement) => {
+                self.bind_hoisted_statement(&statement.body, scope, in_block, in_for_body, local)
+            }
+            Statement::DoWhile(statement) => {
+                self.bind_hoisted_statement(&statement.body, scope, in_block, in_for_body, local)
+            }
             Statement::Try(statement) => {
-                self.bind_hoisted_statements(&statement.block.data().statements, scope);
+                self.bind_hoisted_statements(
+                    &statement.block.data().statements,
+                    scope,
+                    true,
+                    in_for_body,
+                    false,
+                );
                 if let Some(handler) = &statement.handler {
-                    self.bind_hoisted_statements(&handler.data().body.data().statements, scope);
+                    self.bind_hoisted_statements(
+                        &handler.data().body.data().statements,
+                        scope,
+                        true,
+                        in_for_body,
+                        false,
+                    );
                 }
                 if let Some(finalizer) = &statement.finalizer {
-                    self.bind_hoisted_statements(&finalizer.data().statements, scope);
+                    self.bind_hoisted_statements(
+                        &finalizer.data().statements,
+                        scope,
+                        true,
+                        in_for_body,
+                        false,
+                    );
                 }
             }
-            Statement::With(with_statement) => {
-                self.bind_hoisted_statement(&with_statement.body, scope)
+            Statement::With(with_statement) => self.bind_hoisted_statement(
+                &with_statement.body,
+                scope,
+                in_block,
+                in_for_body,
+                local,
+            ),
+            Statement::Labeled(statement) => {
+                self.bind_hoisted_statement(&statement.body, scope, in_block, in_for_body, local)
             }
-            Statement::Labeled(statement) => self.bind_hoisted_statement(&statement.body, scope),
             Statement::Namespace(_) => {}
             Statement::Declare(inner) => {
                 let saved = self.ambient_binding;
                 self.ambient_binding = true;
-                self.bind_hoisted_statement(inner, scope);
+                self.bind_hoisted_statement(inner, scope, in_block, in_for_body, local);
                 self.ambient_binding = saved;
             }
             Statement::Export(export) => match export {
                 crate::syntax::ExportDeclaration::Named(
                     crate::syntax::ExportNamedDeclaration::Declaration(inner),
-                ) => self.bind_hoisted_statement(inner, scope),
+                ) => self.bind_hoisted_statement(inner, scope, in_block, in_for_body, local),
                 crate::syntax::ExportDeclaration::Default(default)
                     if let crate::syntax::ExportDefaultValue::Function(function) =
                         &default.value
@@ -10632,6 +10924,46 @@ impl<'src> Binder<'src> {
         }
     }
 
+    /// Build a `typeof S` constructor from value-member types. Numeric
+    /// enums additionally carry the reverse-mapping index signature
+    /// (`E[0]: string`); namespaces and string enums carry members only.
+    fn constructor_with_members(
+        &mut self,
+        symbol: SymbolId,
+        member_types: Vec<(String, TypeId)>,
+        numeric_index: bool,
+    ) -> TypeId {
+        let properties = member_types
+            .into_iter()
+            .map(|(name, type_id)| PropertyType::new(name, false, type_id))
+            .collect();
+        let mut object = ObjectType {
+            properties,
+            call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        };
+        if numeric_index {
+            object.index_signatures.push(IndexSignature {
+                readonly: false,
+                parameters: vec![FunctionParameter::new(
+                    "index".to_owned(),
+                    self.types.number(),
+                    false,
+                    false,
+                )],
+                value_type: self.types.string(),
+                declaring_types: Vec::new(),
+            });
+        }
+        let structural = self.types.object_type_with_members(object);
+        self.types.constructor_type(symbol, Vec::new(), structural)
+    }
+
     fn bind_enum(
         &mut self,
         declaration: &'src crate::syntax::EnumDeclaration,
@@ -10689,6 +11021,17 @@ impl<'src> Binder<'src> {
                 .as_deref()
                 .is_none_or(is_numeric_enum_initializer)
         });
+        // Reverse mappings need only one numeric member: heterogeneous
+        // enums still emit `E[1]` entries for their numeric half.
+        if declaration.members.iter().any(|member| {
+            member
+                .data()
+                .initializer
+                .as_deref()
+                .is_none_or(is_numeric_enum_initializer)
+        }) {
+            self.enum_has_numeric_member.insert(symbol);
+        }
         match self.type_defs.get_mut(&symbol) {
             Some(TypeDef::Enum { numeric: existing }) => *existing &= numeric,
             None => {
@@ -10696,6 +11039,37 @@ impl<'src> Binder<'src> {
             }
             Some(_) => unreachable!("enum symbol has an enum type definition"),
         }
+        // The declaration symbol's type is the enum type itself
+        // (`>E1 : E1` in .types baselines), mirroring how class
+        // declarations write the instance type. The accumulated
+        // numeric flag keeps merged declarations order-stable.
+        let accumulated_numeric = matches!(
+            self.type_defs.get(&symbol),
+            Some(TypeDef::Enum { numeric: true })
+        );
+        let declared = if accumulated_numeric {
+            self.types.numeric_enum(symbol)
+        } else {
+            self.types.named(symbol)
+        };
+        self.symbol_types[symbol.get() as usize] = declared;
+        self.type_state[symbol.get() as usize] = TypeState::Done(declared);
+        // The value-side constructor carries the members so aliases,
+        // assignments, and member reads through `typeof E` resolve.
+        // Member slots are written Done in the loop above, so this
+        // snapshot is final.
+        let mut member_types = Vec::new();
+        if let Some(members) = self.enum_member_symbols_by_name.get(&symbol) {
+            for (name, member) in members {
+                member_types.push((
+                    name.to_utf8_lossy(),
+                    self.symbol_types[member.get() as usize],
+                ));
+            }
+        }
+        let reverse_mapped = self.enum_has_numeric_member.contains(&symbol);
+        let constructor = self.constructor_with_members(symbol, member_types, reverse_mapped);
+        self.enum_constructor_types.insert(symbol, constructor);
         self.enum_declaration_symbols.insert(declaration_id, symbol);
         self.enum_declarations.push(EnumDeclarationBinding {
             declaration,
@@ -10824,7 +11198,20 @@ impl<'src> Binder<'src> {
             } else {
                 local_scope
             };
-            self.bind_hoisted_statement(statement, target);
+            self.bind_hoisted_statement(statement, target, false, false, false);
+        }
+        // The declaration symbol's type is the namespace constructor
+        // (`>M : typeof M` in .types baselines). Only namespace-kind
+        // symbols take this write: merged partners (enum, interface,
+        // class, alias, function) keep their own type-side or
+        // value-side owners in every declaration order.
+        let pure_namespace = self.symbols[symbol.get() as usize].kind == SymbolKind::Namespace;
+        if pure_namespace {
+            // Headers and early uses need the constructor shell here;
+            // member population belongs solely to the resolve-end
+            // finalizer, which sees body-checked types.
+            let constructor = self.constructor_with_members(symbol, Vec::new(), false);
+            self.symbol_types[symbol.get() as usize] = constructor;
         }
     }
 
@@ -12198,6 +12585,206 @@ impl<'src> Binder<'src> {
         }
     }
 
+    /// Refresh a pure namespace's constructor with body-checked member
+    /// types. Bind-time member slots are unresolved placeholders, so the
+    /// shell built in `bind_namespace` is refreshed here, after the body
+    /// has been checked. Enum-merged namespaces additionally union the
+    /// enum members into the enum's value-side constructor; every other
+    /// merged partner keeps its own owner. Unknown statements are skipped.
+    /// Value-side type of a symbol: classes and enums answer their
+    /// constructor, every other kind its declared type. Mirrors
+    /// [`SemanticModel::value_side_type`]; one rule for bind-time readers.
+    fn value_side_type(&self, symbol: SymbolId) -> TypeId {
+        let constructors = match self.symbols[symbol.get() as usize].kind {
+            SymbolKind::Class => &self.class_constructor_types,
+            SymbolKind::Enum => &self.enum_constructor_types,
+            _ => return self.symbol_types[symbol.get() as usize],
+        };
+        constructors
+            .get(&symbol)
+            .copied()
+            .unwrap_or(self.symbol_types[symbol.get() as usize])
+    }
+
+    /// Merge a merged namespace's value exports into its class partner's
+    /// constructor static shape. Own-static collisions report a
+    /// duplicate; inherited statics yield to the export. Construct
+    /// signatures and type arguments are preserved, so `typeof C`
+    /// and aliases see one constructor with both halves.
+    fn augment_class_constructor_with_namespace_exports(&mut self, symbol: SymbolId) {
+        let Some(&export_scope) = self.namespace_export_scopes.get(&symbol) else {
+            return;
+        };
+        let mut additions = Vec::new();
+        for (name, member) in &self.scopes[export_scope.0 as usize].values {
+            let kind = self.symbols[member.get() as usize].kind;
+            if matches!(
+                kind,
+                SymbolKind::Interface | SymbolKind::TypeAlias | SymbolKind::TypeParameter
+            ) {
+                continue;
+            }
+            additions.push((name.clone(), self.value_side_type(*member), *member));
+        }
+        if additions.is_empty() {
+            return;
+        }
+        self.merge_ns_additions_into_static(symbol, &additions);
+        // Derived constructors resolved before this augmentation
+        // snapshotted the base statics: refresh them with the same
+        // additions so late-merged members stay visible through
+        // subclasses. Worklist covers transitive descendants.
+        let mut stack: Vec<SymbolId> = self
+            .class_base_symbols
+            .iter()
+            .filter_map(|(derived, base)| (*base == symbol).then_some(*derived))
+            .collect();
+        // Cyclic heritage (`A extends B`, `B extends A`) must terminate:
+        // mirror `is_derived_from`'s visited guard.
+        let mut visited = HashSet::new();
+        while let Some(derived) = stack.pop() {
+            if !visited.insert(derived) {
+                continue;
+            }
+            self.merge_ns_additions_into_static(derived, &additions);
+            stack.extend(
+                self.class_base_symbols
+                    .iter()
+                    .filter_map(|(child, base)| (*base == derived).then_some(*child)),
+            );
+        }
+    }
+    /// Fold namespace exports into one class static shape. An own static
+    /// colliding with a value export is a duplicate declaration (tsc
+    /// TS2300, approximated by C001 pending a dedicated code); inherited
+    /// statics and earlier namespace appends yield to the export (a
+    /// derived merge validly narrows a base static, and fragments must
+    /// not collide with themselves). The append set tells our own
+    /// additions apart from class-owned statics, which share no
+    /// distinguishing mark on merged symbols.
+    fn merge_ns_additions_into_static(
+        &mut self,
+        owner: SymbolId,
+        additions: &[(String, TypeId, SymbolId)],
+    ) {
+        let Some(&existing) = self.class_constructor_types.get(&owner) else {
+            return;
+        };
+        let Type::ConstructorType {
+            arguments,
+            structural,
+            ..
+        } = self.types.get(existing).clone()
+        else {
+            return;
+        };
+        let Type::ObjectType(mut object) = self.types.get(structural).clone() else {
+            return;
+        };
+        let mut changed = false;
+        for (name, type_id, member) in additions {
+            match object
+                .properties
+                .iter()
+                .position(|p| p.name() == name.as_str())
+            {
+                None => {
+                    object
+                        .properties
+                        .push(PropertyType::new(name.clone(), false, *type_id));
+                    self.ns_appended_statics.insert((owner, name.clone()));
+                    changed = true;
+                }
+                Some(index) => {
+                    let ours = self.ns_appended_statics.contains(&(owner, name.clone()));
+                    let own_static =
+                        !ours && object.properties[index].declaring_class() == Some(owner);
+                    if own_static {
+                        if self
+                            .reported_static_collisions
+                            .insert((owner, name.clone()))
+                        {
+                            let range = self.symbols[member.get() as usize].range;
+                            self.emit(DUPLICATE_DECLARATION, range, DUPLICATE_MESSAGE);
+                        }
+                    } else {
+                        object.properties[index] = PropertyType::new(name.clone(), false, *type_id);
+                        self.ns_appended_statics.insert((owner, name.clone()));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            let structural = self.types.object_type_with_members(object);
+            let constructor = self.types.constructor_type(owner, arguments, structural);
+            self.class_constructor_types.insert(owner, constructor);
+        }
+    }
+
+    fn finalize_namespace_constructor(&mut self, statement_id: NodeId) {
+        let mut target = None;
+        for binding in &self.namespace_declarations {
+            if binding.declaration_id == statement_id {
+                target = Some(binding.symbol);
+                break;
+            }
+        }
+        let Some(symbol) = target else {
+            return;
+        };
+        let kind = self.symbols[symbol.get() as usize].kind;
+        let merged_enum =
+            kind == SymbolKind::Enum && self.enum_constructor_types.contains_key(&symbol);
+        // Merged classes keep their own constructor: augment its static
+        // shape with the namespace exports instead of replacing it, so
+        // `typeof C` and aliases keep construct signatures plus additions.
+        if kind == SymbolKind::Class {
+            self.augment_class_constructor_with_namespace_exports(symbol);
+            return;
+        }
+        if kind != SymbolKind::Namespace && !merged_enum {
+            return;
+        }
+        let mut member_types = Vec::new();
+        if merged_enum && let Some(members) = self.enum_member_symbols_by_name.get(&symbol) {
+            for (name, member) in members {
+                member_types.push((
+                    name.to_utf8_lossy(),
+                    self.symbol_types[member.get() as usize],
+                ));
+            }
+        }
+        if let Some(export_scope) = self.namespace_export_scopes.get(&symbol) {
+            for (name, member) in &self.scopes[export_scope.0 as usize].values {
+                let kind = self.symbols[member.get() as usize].kind;
+                if matches!(
+                    kind,
+                    SymbolKind::Interface | SymbolKind::TypeAlias | SymbolKind::TypeParameter
+                ) {
+                    continue;
+                }
+                // Classes answer their constructor and enums their
+                // value-side constructor; instance slots would mislead
+                // construction and member reads through the alias.
+                member_types.push((name.clone(), self.value_side_type(*member)));
+            }
+        }
+        // Merged rebuilds keep whatever reverse mapping any declaration
+        // earned; pure namespaces never set the flag, so members-only.
+        let numeric_index = self.enum_has_numeric_member.contains(&symbol);
+        let constructor = self.constructor_with_members(symbol, member_types, numeric_index);
+        if merged_enum {
+            self.enum_constructor_types.insert(symbol, constructor);
+        } else {
+            // Seal both the slot and the lazy state: an earlier lazy build
+            // may have sealed an empty structural, and resolve-path readers
+            // must see the same constructor as direct slot readers.
+            self.symbol_types[symbol.get() as usize] = constructor;
+            self.type_state[symbol.get() as usize] = TypeState::Done(constructor);
+        }
+    }
+
     fn resolve_statement(&mut self, statement: &'src crate::syntax::Stmt, scope: ScopeId) {
         match statement.data() {
             Statement::Variable(variable) => self.resolve_variable(variable, scope, true),
@@ -12280,6 +12867,21 @@ impl<'src> Binder<'src> {
             Statement::Block(block) => {
                 let child = self.new_scope(ScopeKind::Block, Some(scope));
                 self.bind_statements(&block.data().statements, child);
+                // Block-local prebind: nested functions must resolve for
+                // earlier sibling statements. Strict mode has no outer
+                // prebind covering them, so declare into the block
+                // itself (`local` bypasses the strict-block skip); the
+                // later resolve declares the same identity. Sloppy mode
+                // stays on the outer prebind, which already covers it.
+                if self.scopes[child.0 as usize].strict {
+                    self.bind_hoisted_statements(
+                        &block.data().statements,
+                        child,
+                        true,
+                        false,
+                        true,
+                    );
+                }
                 self.resolve_statements(&block.data().statements, child);
             }
             Statement::Expression(statement) => {
@@ -12351,6 +12953,21 @@ impl<'src> Binder<'src> {
                 self.resolve_expr(&statement.discriminant, scope);
                 self.legacy_type_of_expr(&statement.discriminant, scope);
                 let child = self.new_scope(ScopeKind::Block, Some(scope));
+                // Switch-local prebind (strict only; sloppy keeps the
+                // outer prebind): case functions must resolve for
+                // earlier cases with the switch-child identity the
+                // header bind uses, so each name yields one symbol.
+                if self.scopes[child.0 as usize].strict {
+                    for case in &statement.cases {
+                        self.bind_hoisted_statements(
+                            &case.data().consequent,
+                            child,
+                            true,
+                            false,
+                            true,
+                        );
+                    }
+                }
                 for case in &statement.cases {
                     if let Some(test) = &case.data().test {
                         self.resolve_expr(test, child);
@@ -12369,6 +12986,11 @@ impl<'src> Binder<'src> {
             }
             Statement::For(for_statement) => {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
+                // Loop-local prebind: the outer hoist pre-pass skips the
+                // for-body subtree to avoid leaking it outward, so declare
+                // its functions here into the loop scope before the
+                // initializer, test, and earlier body statements resolve.
+                self.bind_hoisted_statement(&for_statement.body, child, false, false, false);
                 let entry_super_flow = self.super_flow;
                 if let Some(initializer) = &for_statement.initializer {
                     self.resolve_for_initializer(initializer, child);
@@ -12403,6 +13025,9 @@ impl<'src> Binder<'src> {
             }
             Statement::ForIn(for_statement) => {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
+                // Loop-local prebind into the loop scope (see the `For`
+                // arm): the binding and object expressions resolve below.
+                self.bind_hoisted_statement(&for_statement.body, child, false, false, false);
                 let mut using_diagnostic = None;
                 if let ForBinding::Variable(variable) = &for_statement.binding {
                     using_diagnostic = match variable.kind {
@@ -12438,6 +13063,9 @@ impl<'src> Binder<'src> {
             }
             Statement::ForOf(for_statement) => {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
+                // Loop-local prebind into the loop scope (see the `For`
+                // arm): the iterable expression resolves below.
+                self.bind_hoisted_statement(&for_statement.body, child, false, false, false);
                 self.resolve_expr(&for_statement.iterable, child);
                 // `for-of` reads the iterator protocol off the iterable, so a
                 // nullable iterable is rejected before the element type is
@@ -12494,19 +13122,60 @@ impl<'src> Binder<'src> {
                 let entry_super_flow = self.super_flow;
                 let block = &statement.block;
                 let try_scope = self.new_scope(ScopeKind::Block, Some(scope));
+                // Try-local prebind (strict only): nested functions must
+                // resolve for earlier statements with the try-scope
+                // identity the header bind uses.
+                if self.scopes[try_scope.0 as usize].strict {
+                    self.bind_hoisted_statements(
+                        &block.data().statements,
+                        try_scope,
+                        true,
+                        false,
+                        true,
+                    );
+                }
                 self.bind_statements(&block.data().statements, try_scope);
                 self.resolve_statements(&block.data().statements, try_scope);
                 if let Some(handler) = &statement.handler {
                     let catch_scope = self.new_scope(ScopeKind::Catch, Some(scope));
                     if let Some(binding) = &handler.data().binding {
+                        // Only simple-identifier bindings tolerate a
+                        // same-name `var`; destructured parameters claim
+                        // every name they bind against `var` too.
+                        if !matches!(binding.data(), BindingPattern::Identifier(_)) {
+                            self.complex_catch_scopes.insert(catch_scope);
+                        }
                         self.bind_pattern(binding, VariableKind::Let, catch_scope, handler.id());
                     }
+                    // Body declarations live in a child block like the try
+                    // body above, so `function e` shadows the parameter
+                    // instead of conflicting with it (tsc accepts both
+                    // strict and sloppy).
                     let body = &handler.data().body;
-                    self.bind_statements(&body.data().statements, catch_scope);
-                    self.resolve_statements(&body.data().statements, catch_scope);
+                    let catch_body = self.new_scope(ScopeKind::Block, Some(catch_scope));
+                    if self.scopes[catch_body.0 as usize].strict {
+                        self.bind_hoisted_statements(
+                            &body.data().statements,
+                            catch_body,
+                            true,
+                            false,
+                            true,
+                        );
+                    }
+                    self.bind_statements(&body.data().statements, catch_body);
+                    self.resolve_statements(&body.data().statements, catch_body);
                 }
                 if let Some(finalizer) = &statement.finalizer {
                     let finally_scope = self.new_scope(ScopeKind::Block, Some(scope));
+                    if self.scopes[finally_scope.0 as usize].strict {
+                        self.bind_hoisted_statements(
+                            &finalizer.data().statements,
+                            finally_scope,
+                            true,
+                            false,
+                            true,
+                        );
+                    }
                     self.bind_statements(&finalizer.data().statements, finally_scope);
                     self.resolve_statements(&finalizer.data().statements, finally_scope);
                 }
@@ -12669,6 +13338,7 @@ impl<'src> Binder<'src> {
                 self.resolve_statements(&namespace.body.data().statements, child);
                 let popped = self.active_namespace_declarations.pop();
                 debug_assert_eq!(popped, Some(statement.id()));
+                self.finalize_namespace_constructor(statement.id());
             }
             Statement::Declare(inner) => {
                 self.ambient_stack.push(true);
@@ -13282,7 +13952,13 @@ impl<'src> Binder<'src> {
                     binder.scopes[scope.0 as usize].strict = true;
                 }
                 binder.bind_statements(&block.data().statements, scope);
-                binder.bind_hoisted_statements(&block.data().statements, scope);
+                binder.bind_hoisted_statements(
+                    &block.data().statements,
+                    scope,
+                    false,
+                    false,
+                    false,
+                );
                 binder.resolve_statements(&block.data().statements, scope);
             }
             Some(FunctionBody::Expression(expression)) => binder.resolve_expr(expression, scope),
@@ -15705,7 +16381,13 @@ impl<'src> Binder<'src> {
                             binder.scopes[child.0 as usize].strict = true;
                         }
                         binder.bind_statements(&block.data().statements, child);
-                        binder.bind_hoisted_statements(&block.data().statements, child);
+                        binder.bind_hoisted_statements(
+                            &block.data().statements,
+                            child,
+                            false,
+                            false,
+                            false,
+                        );
                         binder.resolve_statements(&block.data().statements, child);
                     }
                     FunctionBody::Expression(inner) => {
@@ -17571,13 +18253,12 @@ impl<'src> Binder<'src> {
         let name_str = Self::semantic_property_key(&name);
         if let Some(object_symbol) = self.resolved_expression_reference(object) {
             let kind = self.symbols[object_symbol.get() as usize].kind;
+            // Value bindings only: a type-only export is not a runtime
+            // property, so `M.T` falls through to missing-property paths.
             if kind == SymbolKind::Namespace
                 && let Some(member_scope) = self.container_member_scope(object_symbol)
-                && let Some(member_symbol) = self.scopes[member_scope.0 as usize]
-                    .value(name_str.as_str())
-                    .or_else(|| {
-                        self.scopes[member_scope.0 as usize].type_binding(name_str.as_str())
-                    })
+                && let Some(member_symbol) =
+                    self.scopes[member_scope.0 as usize].value(name_str.as_str())
             {
                 return self.symbol_types[member_symbol.get() as usize];
             } else if kind == SymbolKind::Enum
@@ -17588,6 +18269,52 @@ impl<'src> Binder<'src> {
                     .copied()
             {
                 return self.symbol_types[member_symbol.get() as usize];
+            } else if let Some(&member_scope) = self.namespace_export_scopes.get(&object_symbol) {
+                // Merged partners (function, class) keep their own kind,
+                // so the arms above miss them; their namespace half still
+                // answers through its export scope. Members answer
+                // value-side types, like the finalizer path.
+                if let Some(member_symbol) =
+                    self.scopes[member_scope.0 as usize].value(name_str.as_str())
+                {
+                    return self.value_side_type(member_symbol);
+                }
+                // A same-named class static is the runtime value; the
+                // namespace type binding must not mask it.
+                if let Some(&constructor) = self.class_constructor_types.get(&object_symbol)
+                    && let Type::ConstructorType { structural, .. } =
+                        self.types.get(constructor).clone()
+                    && let Type::ObjectType(object) = self.types.get(structural).clone()
+                    && let Some(property) = object
+                        .properties
+                        .iter()
+                        .find(|property| property.name() == name_str.as_str())
+                    && self.is_member_accessible(property)
+                {
+                    return property.type_id();
+                }
+                // Otherwise a type-only export is not a runtime property:
+                // report the miss instead of falling to a silent `any`.
+                // Exception: callable synthesis provides `Function.call`
+                // downstream, so a same-named type must not mask it.
+                let call_synthesized = kind == SymbolKind::Function && name_str.as_str() == "call";
+                if !call_synthesized
+                    && self.scopes[member_scope.0 as usize]
+                        .type_binding(name_str.as_str())
+                        .is_some()
+                {
+                    let property_range = match property {
+                        MemberProperty::Named(identifier) => identifier.range(),
+                        MemberProperty::Private(identifier) => identifier.range(),
+                        MemberProperty::Computed(expression) => expression.range(),
+                    };
+                    self.emit(
+                        PROPERTY_DOES_NOT_EXIST,
+                        property_range,
+                        PROPERTY_DOES_NOT_EXIST_MESSAGE,
+                    );
+                    return self.types.error_type();
+                }
             }
         }
         let object_type = self.legacy_type_of_expr(object, scope);
@@ -18738,14 +19465,7 @@ impl<'src> Binder<'src> {
                     );
                     return self.types.any();
                 };
-                match self.symbols[symbol.get() as usize].kind {
-                    SymbolKind::Class => self
-                        .class_constructor_types
-                        .get(&symbol)
-                        .copied()
-                        .unwrap_or(self.symbol_types[symbol.get() as usize]),
-                    _ => self.symbol_types[symbol.get() as usize],
-                }
+                self.value_side_type(symbol)
             }
             EntityName::Qualified { left, right } => {
                 // A qualified `typeof A.B` can be a namespace path (the prefix
@@ -18758,14 +19478,7 @@ impl<'src> Binder<'src> {
                     Ok((member_scope, _path)) => {
                         let name = self.identifier_text(right);
                         match self.scopes[member_scope.0 as usize].value(&name) {
-                            Some(symbol) => match self.symbols[symbol.get() as usize].kind {
-                                SymbolKind::Class => self
-                                    .class_constructor_types
-                                    .get(&symbol)
-                                    .copied()
-                                    .unwrap_or(self.symbol_types[symbol.get() as usize]),
-                                _ => self.symbol_types[symbol.get() as usize],
-                            },
+                            Some(symbol) => self.value_side_type(symbol),
                             None => {
                                 self.emit(
                                     CANNOT_FIND_NAME,
@@ -19817,6 +20530,15 @@ impl<'src> Binder<'src> {
             TypeState::Unresolved => {}
         }
         let Some(definition) = self.type_defs.get(&symbol).copied() else {
+            // Pure namespaces carry no type definition entry; their
+            // constructor is built on demand so lazy resolution can
+            // never clobber the bind-time write with the error type.
+            if self.symbols[symbol.get() as usize].kind == SymbolKind::Namespace {
+                let id = self.constructor_with_members(symbol, Vec::new(), false);
+                self.symbol_types[symbol.get() as usize] = id;
+                self.type_state[symbol.get() as usize] = TypeState::Done(id);
+                return id;
+            }
             let id = self.types.error_type();
             self.type_state[symbol.get() as usize] = TypeState::Done(id);
             return id;
@@ -19952,6 +20674,8 @@ impl<'src> Binder<'src> {
                     head
                 }
             }
+            // Defensive fallback: `bind_enum` seals every enum symbol Done
+            // eagerly, so this arm runs only if a future path reopens one.
             TypeDef::Enum { numeric } => {
                 if numeric {
                     self.types.numeric_enum(symbol)
@@ -21611,14 +22335,7 @@ impl<'src> Binder<'src> {
                         }
                     }
                 };
-                let declared = match self.symbols[symbol.get() as usize].kind {
-                    SymbolKind::Class => self
-                        .class_constructor_types
-                        .get(&symbol)
-                        .copied()
-                        .unwrap_or(self.symbol_types[symbol.get() as usize]),
-                    _ => self.symbol_types[symbol.get() as usize],
-                };
+                let declared = self.value_side_type(symbol);
                 self.narrowed_type(symbol, declared)
             }
             Expression::Literal(literal) => self.type_of_literal(literal),
@@ -24174,6 +24891,13 @@ impl<'src> Binder<'src> {
 
     pub(crate) fn declared_value(&mut self, symbol: SymbolId) -> DemandResult<TypeId> {
         self.check_cancel()?;
+        // Enum value positions take the member-bearing constructor, not
+        // the header instance type: `const copy = E` is `typeof E`.
+        if self.symbols.get(symbol.get() as usize).map(|s| s.kind()) == Some(SymbolKind::Enum)
+            && let Some(constructor) = self.enum_constructor_types.get(&symbol)
+        {
+            return Ok(DemandPoll::Ready(*constructor));
+        }
         if let Some(type_id) = self.symbol_types.get(symbol.get() as usize)
             && *type_id != self.types.error_type()
             && *type_id != self.types.any()
