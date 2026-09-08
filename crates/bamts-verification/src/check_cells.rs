@@ -6796,8 +6796,8 @@ interface I {
     /// sorted-first file from another area.
     #[test]
     fn baseline_file_prefers_owning_area_for_stem_twins() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/tmp/bamts-baseline-twins");
+        // System temp dir honors TMPDIR; pid-suffixed and removed after use.
+        let root = std::env::temp_dir().join(format!("bamts-twins-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for area in ["compiler", "conformance"] {
             std::fs::create_dir_all(root.join(area)).expect("fixture area");
