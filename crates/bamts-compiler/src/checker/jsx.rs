@@ -28,14 +28,20 @@
 //!   checked against the `IntrinsicElements` member or the resolved factory
 //!   signature with the existing assignability relation.
 //!
-//! Value-based factories are resolved through [`Binder::signature_group`],
-//! the canonical demand-based candidate list every callable symbol shares —
-//! there is no JSX-specific declaration cache. A generic factory's type
-//! arguments are inferred from the synthesized props object with
-//! [`InferenceContext`], trying candidates in declaration order and keeping
-//! the first whose parameter accepts the props (or that takes none). Intrinsic
-//! elements and fragments take `JSX.Element`, falling back to `any` when the
-//! namespace does not declare one.
+//! Value-based factories are resolved through [`Binder::signature_group`]
+//! first — the canonical demand-based candidate list every callable
+//! symbol shares — or through per-shape grouping views on the callee
+//! type; there is no JSX-specific declaration cache. A generic
+//! factory's type arguments are inferred from the synthesized props object
+//! with [`InferenceContext`], trying candidates in declaration order and
+//! keeping the first whose parameter accepts the props (or that takes
+//! none). A union-typed factory keeps one candidate group per member: every
+//! member must admit the props — the props object is checked against the
+//! intersection of the members' parameter types — and the element result is
+//! the union of every member's selected return, matching ordinary-call
+//! signature-group evaluation. Intrinsic elements and fragments take
+//! `JSX.Element`, falling back to `any` when the namespace does not declare
+//! one.
 //!
 //! [`Binder::infer_jsx_outcome`] computes a [`JsxElementOutcome`] once; the
 //! demand dispatch commits it atomically with the expression's
@@ -91,8 +97,10 @@ pub(crate) enum JsxElementOutcome {
         tag_range: TextRange,
     },
     /// A value-based tag resolved as a callable factory. `props_target` is
-    /// the winning candidate's first parameter type, or `None` for a
-    /// zero-parameter candidate that accepts props unconditionally.
+    /// the first-parameter type every selected candidate requires — the
+    /// single candidate's parameter type, or the intersection of one
+    /// parameter type per union member — or `None` when every selected
+    /// candidate is zero-parameter and accepts props unconditionally.
     Value {
         result: TypeId,
         props: TypeId,
@@ -256,9 +264,9 @@ impl<'src> Binder<'src> {
         }))
     }
 
-    /// Infers a value-based tag: resolves the tag value, selects the first
-    /// applicable candidate from its canonical signature group against the
-    /// synthesized props object, and returns the candidate's return type as
+    /// Infers a value-based tag: resolves the tag value, selects one
+    /// candidate per signature group against the synthesized props object,
+    /// and returns the union of every selected candidate's return type as
     /// the element's result type.
     fn infer_value_outcome(
         &mut self,
@@ -289,10 +297,9 @@ impl<'src> Binder<'src> {
                 }));
             }
         };
-        let signatures = demand_ready!(self.jsx_callable_signatures(symbol, callee));
+        let groups = demand_ready!(self.jsx_callable_signatures(symbol, callee));
         let props = demand_ready!(self.infer_jsx_props(attributes, children, None, context));
-        let Some((props_target, result)) = select_jsx_factory_signature(&signatures, props, self)
-        else {
+        let Some((props_target, result)) = select_jsx_factory_groups(&groups, props, self) else {
             let result = self.jsx_element_type(context.scope);
             // An opaque callee with no callable shape stays unchecked; a
             // resolved non-callable value reports the not-callable
@@ -429,23 +436,33 @@ impl<'src> Binder<'src> {
     /// matching an ordinary call or `new` expression: applied aliases,
     /// applied classes, function types, object types carrying call or
     /// construct signatures, constructor types (the class static side), and
-    /// named interfaces via their structural view. Unions distribute their
-    /// members in source order and stay callable only when every member
-    /// contributes a callable shape; intersections flatten every member's
-    /// candidates into one list — both matching how an ordinary call
-    /// distributes over them;
-    /// a construct signature contributes its constructor's parameters and
-    /// the class instance type as the element's result, matching the
-    /// "neither a construct nor a call signature" diagnostic contract.
+    /// named interfaces via their structural view. Candidates come back as
+    /// one group per callable shape, mirroring `call_signature_groups_for_type_raw`
+    /// for ordinary calls: a plain function, object type, construct
+    /// signature, or interface view contributes a single group; a union
+    /// contributes one group per member (so selection can require every
+    /// member to admit the props and union the per-member results); an
+    /// intersection flattens every member's candidates into one group in
+    /// member order. Unions stay callable only when every member
+    /// contributes a callable shape. An empty return value means the
+    /// callee has no callable shape.
     fn jsx_callable_signatures(
         &mut self,
         symbol: Option<SymbolId>,
         callee: TypeId,
-    ) -> DemandResult<Vec<FunctionSignature>> {
+    ) -> DemandResult<Vec<Vec<FunctionSignature>>> {
+        let resolved = self
+            .types
+            .prepare_applied_alias_view(callee)
+            .unwrap_or(callee);
+        let resolved = self
+            .types
+            .prepare_applied_class_view(resolved)
+            .unwrap_or(resolved);
         if let Some(symbol) = symbol {
             let signatures = demand_ready!(self.signature_group(symbol));
             if !signatures.is_empty() {
-                return Ok(DemandPoll::Ready(signatures));
+                return Ok(DemandPoll::Ready(vec![signatures]));
             }
             // A class value's declared type is its instance side; the
             // construct signatures live on the static side (a
@@ -457,14 +474,6 @@ impl<'src> Binder<'src> {
                 return self.jsx_callable_signatures(None, constructor_type);
             }
         }
-        let resolved = self
-            .types
-            .prepare_applied_alias_view(callee)
-            .unwrap_or(callee);
-        let resolved = self
-            .types
-            .prepare_applied_class_view(resolved)
-            .unwrap_or(resolved);
         let signatures = match self.types.get(resolved).clone() {
             Type::Function(signature) => vec![signature],
             Type::ObjectType(object) if !object.call_signatures.is_empty() => {
@@ -510,36 +519,40 @@ impl<'src> Binder<'src> {
             Type::Union(members) => {
                 // A union is callable only when every member contributes a
                 // callable shape — `number | (() => void)` is not — and
-                // member candidates concatenate in source order so selection
-                // picks the first admissible member's result, matching the
-                // canonical call grouping an ordinary call uses.
-                let mut candidates = Vec::new();
+                // each member keeps its own candidate group so selection
+                // requires every member to admit the props and unions the
+                // per-member results, matching the canonical call grouping
+                // an ordinary call uses.
+                let mut groups = Vec::with_capacity(members.len());
                 for member in members {
-                    let member_signatures =
-                        demand_ready!(self.jsx_callable_signatures(None, member));
-                    if member_signatures.is_empty() {
+                    let member_groups = demand_ready!(self.jsx_callable_signatures(None, member));
+                    if member_groups.is_empty() {
                         return Ok(DemandPoll::Ready(Vec::new()));
                     }
-                    candidates.extend(member_signatures);
+                    groups.extend(member_groups);
                 }
-                return Ok(DemandPoll::Ready(candidates));
+                return Ok(DemandPoll::Ready(groups));
             }
             Type::Intersection(members) => {
                 // An intersection flattens every member's candidates into
-                // one list in member order; a member without candidates
-                // simply contributes none, and an empty overall list means
+                // one group in member order; a member without candidates
+                // simply contributes none, and an empty overall group means
                 // the intersection is not callable.
                 let mut flattened = Vec::new();
                 for member in members {
-                    let member_signatures =
-                        demand_ready!(self.jsx_callable_signatures(None, member));
-                    flattened.extend(member_signatures);
+                    let member_groups = demand_ready!(self.jsx_callable_signatures(None, member));
+                    flattened.extend(member_groups.into_iter().flatten());
                 }
-                return Ok(DemandPoll::Ready(flattened));
+                let groups = if flattened.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![flattened]
+                };
+                return Ok(DemandPoll::Ready(groups));
             }
             _ => Vec::new(),
         };
-        Ok(DemandPoll::Ready(signatures))
+        Ok(DemandPoll::Ready(vec![signatures]))
     }
 
     // -- props/children synthesis -------------------------------------------------
@@ -1200,6 +1213,44 @@ impl<'src> Binder<'src> {
         }
     }
 }
+/// Selects one candidate per candidate group, then combines the
+/// selections the way an ordinary call evaluates signature groups: every
+/// group must yield a candidate (an empty group list means the tag is not
+/// callable, so this returns `None`), the props target checked against the
+/// element is the intersection of every selected candidate's first
+/// parameter type — each union member's props must be admissible — and
+/// the element result is the union of every selected candidate's return.
+/// A single group degrades to exactly the plain single-list selection.
+fn select_jsx_factory_groups(
+    groups: &[Vec<FunctionSignature>],
+    props: TypeId,
+    binder: &mut Binder<'_>,
+) -> Option<(Option<TypeId>, TypeId)> {
+    let (first_target, first_result) = groups
+        .first()
+        .and_then(|group| select_jsx_factory_signature(group, props, binder))?;
+    if groups.len() == 1 {
+        return Some((first_target, first_result));
+    }
+    let mut prop_targets = Vec::with_capacity(groups.len());
+    if let Some(target) = first_target {
+        prop_targets.push(target);
+    }
+    let mut results = vec![first_result];
+    for group in &groups[1..] {
+        let (target, result) = select_jsx_factory_signature(group, props, binder)?;
+        if let Some(target) = target {
+            prop_targets.push(target);
+        }
+        results.push(result);
+    }
+    let props_target = match prop_targets.as_slice() {
+        [] => None,
+        [single] => Some(*single),
+        _ => Some(binder.types.intersection(prop_targets)),
+    };
+    Some((props_target, binder.types.union(&results)))
+}
 
 /// Selects the first candidate in `signatures` whose parameters accept
 /// `props` (P1: declaration order, first applicable wins), instantiating
@@ -1836,10 +1887,10 @@ mod tests {
         assert_clean(codes(&source));
     }
 
-    /// A bare union const resolves through its symbol's canonical
-    /// signature group: members distribute in source order and selection
-    /// picks the first admissible one, so the first member's `string`
-    /// return wins over the second member's `number`.
+    /// A bare union const resolves through one candidate group per union
+    /// member: every member must admit the props and the element result is
+    /// the union of every member's selected return, so assigning it to a
+    /// single member's return type reports the other member's presence.
     #[test]
     fn union_of_factories_distributes_candidates_for_a_jsx_tag() {
         let source = format!(
@@ -1847,15 +1898,17 @@ mod tests {
              interface ReturnsString {{ (props: {{ id?: string }}): string; }} \
              interface ReturnsNumber {{ (props: {{ id?: string }}): number; }} \
              declare const Comp: ReturnsString | ReturnsNumber; \
-             const x: string = <Comp id=\"a\" />;"
+             const ok: string | number = <Comp id=\"a\" />; \
+             const narrowed: string = <Comp id=\"a\" />;"
         );
-        assert_clean(codes(&source));
+        assert_eq!(codes(&source), [TYPE_NOT_ASSIGNABLE.as_str()]);
     }
 
     /// A dotted member whose property type is a union must distribute its
     /// members through the same per-shape views an ordinary call uses;
-    /// both members accept the given props, so the first member's `string`
-    /// return must win instead of a not-callable report.
+    /// every member admits the given props and the result unions every
+    /// member's return, so the widened annotation is clean while the
+    /// first-member-only annotation reports the second member's return.
     #[test]
     fn dotted_union_member_distributes_through_the_fallthrough() {
         let source = format!(
@@ -1864,9 +1917,10 @@ mod tests {
              interface ReturnsNumber {{ (props: {{ id?: string }}): number; }} \
              declare const comp: ReturnsString | ReturnsNumber; \
              const holder = {{ Comp: comp }}; \
-             const x: string = <holder.Comp id=\"a\" />;"
+             const ok: string | number = <holder.Comp id=\"a\" />; \
+             const narrowed: string = <holder.Comp id=\"a\" />;"
         );
-        assert_clean(codes(&source));
+        assert_eq!(codes(&source), [TYPE_NOT_ASSIGNABLE.as_str()]);
     }
 
     /// One non-callable member poisons the whole union, exactly as an
@@ -1897,6 +1951,79 @@ mod tests {
              const x: string = <holder.Comp id=\"a\" />;"
         );
         assert_clean(codes(&source));
+    }
+
+    /// A union of factories with disjoint props types requires the props
+    /// object to satisfy every member: the tag is checked against the
+    /// intersection of the members' first-parameter types, so supplying
+    /// only the first branch's attribute reports the missing second-branch
+    /// attribute, while supplying both branches is clean.
+    #[test]
+    fn disjoint_union_props_missing_a_branch_attribute_reports_attributes_not_assignable() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             interface AResult {{ tag: \"a\" }} \
+             interface BResult {{ tag: \"b\" }} \
+             interface MakeA {{ (props: {{ a: string }}): AResult; }} \
+             interface MakeB {{ (props: {{ b: number }}): BResult; }} \
+             declare const C: MakeA | MakeB; \
+             const missing = <C a=\"x\" />; \
+             const both = <C a=\"s\" b={{1}} />;"
+        );
+        assert_eq!(codes(&source), [JSX_ATTRIBUTES_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    /// Same disjoint-props union, but the tag's declared type is an
+    /// annotation union of `typeof` function types - the
+    /// `declared_value` path differs from an initializer-inferred
+    /// union, so this shape must independently produce the
+    /// missing-attribute error.
+    #[test]
+    fn disjoint_union_props_via_typeof_annotation_reports_attributes_not_assignable() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             declare function MakeA(props: {{ a: string }}): {{ tag: \"a\" }}; \
+             declare function MakeB(props: {{ b: number }}): {{ tag: \"b\" }}; \
+             declare const C: typeof MakeA | typeof MakeB; \
+             const missing = <C a=\"x\" />;"
+        );
+        assert_eq!(codes(&source), [JSX_ATTRIBUTES_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    /// A union produced by a conditional initializer (rather than an
+    /// annotation) must still route through the group model: the
+    /// missing-attribute error proves every member's props were checked.
+    #[test]
+    fn conditional_initializer_union_reports_missing_branch_attribute() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             declare const MakeA: (props: {{ a: string }}) => {{ tag: \"a\" }}; \
+             declare const MakeB: (props: {{ b: number }}) => {{ tag: \"b\" }}; \
+             declare const flag: boolean; \
+             const C = flag ? MakeA : MakeB; \
+             const missing = <C a=\"x\" />;"
+        );
+        assert_eq!(codes(&source), [JSX_ATTRIBUTES_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    /// The element result of a union factory tag is the union of every
+    /// member's selected return, never a single branch's return: both
+    /// branch attributes satisfy the intersection, so the widened
+    /// annotation is clean while one branch's return type alone reports
+    /// the other branch's presence.
+    #[test]
+    fn disjoint_union_props_result_is_the_union_of_member_returns() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             interface AResult {{ tag: \"a\" }} \
+             interface BResult {{ tag: \"b\" }} \
+             interface MakeA {{ (props: {{ a: string }}): AResult; }} \
+             interface MakeB {{ (props: {{ b: number }}): BResult; }} \
+             declare const C: MakeA | MakeB; \
+             const ok: AResult | BResult = <C a=\"s\" b={{1}} />; \
+             const narrowed: AResult = <C a=\"s\" b={{1}} />;"
+        );
+        assert_eq!(codes(&source), [TYPE_NOT_ASSIGNABLE.as_str()]);
     }
 
     // -- dotted-tag member resolution degradation ---------------------------------------------------
