@@ -4535,6 +4535,27 @@ export const a2 = 3;
         );
     }
 
+    /// Function+namespace merges keep the function callable: the
+    /// namespace write must not replace a function-kind symbol's type.
+    #[test]
+    fn emit_types_function_namespace_merge_stays_callable() {
+        let logical = "tests/cases/compiler/functionNamespaceMergePin.ts";
+        let case_text =
+            "function f() {\n}\nnamespace f {\n    export const x = 1;\n}\nf();\nf.x;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            !emitted.contains("NOT_CALLABLE"),
+            "merged function not callable:\n{emitted}"
+        );
+        assert!(
+            emitted.lines().any(|line| line == ">f.x : 1"),
+            "missing `>f.x : 1`:\n{emitted}"
+        );
+    }
+
     /// A multi-file case's preamble before the first `@Filename:` marker is
     /// global options, not a unit: upstream `ParseTestFilesAndSymlinks`
     /// (`AllowImplicitFirstFile: false`) drops a comment-only preamble, so

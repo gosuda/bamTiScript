@@ -10845,13 +10845,12 @@ impl<'src> Binder<'src> {
         // (`>M : typeof M` in .types baselines), mirroring how class
         // declarations write the static type. The structural object is
         // empty: member access resolves through member symbols, never
-        // through this slot. Only pure namespaces take this write: a
-        // symbol already carrying an enum definition keeps the enum
-        // type (merged `enum E` + `namespace E` rows read `>E : E`),
-        // and interface/class/alias owners keep their lazy builds —
-        // sealing Done here would block interface structure
-        // construction in any declaration order.
-        let pure_namespace = !self.type_defs.contains_key(&symbol);
+        // through this slot. Only namespace-kind symbols take this
+        // write: merged partners (enum, interface, class, alias,
+        // function) keep their own type-side or value-side owners in
+        // every declaration order — sealing anything else here would
+        // block lazy builds or break calls.
+        let pure_namespace = self.symbols[symbol.get() as usize].kind == SymbolKind::Namespace;
         if pure_namespace {
             let structural = self.types.object_type(Vec::new());
             let constructor = self.types.constructor_type(symbol, Vec::new(), structural);
@@ -17618,6 +17617,17 @@ impl<'src> Binder<'src> {
                     .and_then(|members| members.get(&name))
                     .copied()
             {
+                return self.symbol_types[member_symbol.get() as usize];
+            } else if let Some(&member_scope) = self.namespace_export_scopes.get(&object_symbol)
+                && let Some(member_symbol) = self.scopes[member_scope.0 as usize]
+                    .value(name_str.as_str())
+                    .or_else(|| {
+                        self.scopes[member_scope.0 as usize].type_binding(name_str.as_str())
+                    })
+            {
+                // Merged partners (function, class) keep their own kind,
+                // so the arms above miss them; their namespace half still
+                // answers through its export scope.
                 return self.symbol_types[member_symbol.get() as usize];
             }
         }
