@@ -10710,6 +10710,7 @@ impl<'src> Binder<'src> {
             self.types.named(symbol)
         };
         self.symbol_types[symbol.get() as usize] = declared;
+        self.type_state[symbol.get() as usize] = TypeState::Done(declared);
         self.enum_declaration_symbols.insert(declaration_id, symbol);
         self.enum_declarations.push(EnumDeclarationBinding {
             declaration,
@@ -10844,10 +10845,18 @@ impl<'src> Binder<'src> {
         // (`>M : typeof M` in .types baselines), mirroring how class
         // declarations write the static type. The structural object is
         // empty: member access resolves through member symbols, never
-        // through this slot.
-        let structural = self.types.object_type(Vec::new());
-        let constructor = self.types.constructor_type(symbol, Vec::new(), structural);
-        self.symbol_types[symbol.get() as usize] = constructor;
+        // through this slot. A symbol already carrying an enum type
+        // keeps it: `enum E` + `namespace E` merges emit one header row
+        // per declaration (`>E : E`, then `>E : typeof E`), and one slot
+        // cannot render both — the enum row wins deterministically
+        // regardless of declaration order (augmentedTypesEnum:88-94).
+        let merged_enum = matches!(self.type_defs.get(&symbol), Some(TypeDef::Enum { .. }));
+        if !merged_enum {
+            let structural = self.types.object_type(Vec::new());
+            let constructor = self.types.constructor_type(symbol, Vec::new(), structural);
+            self.symbol_types[symbol.get() as usize] = constructor;
+            self.type_state[symbol.get() as usize] = TypeState::Done(constructor);
+        }
     }
 
     fn bind_namespace_member(

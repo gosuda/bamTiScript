@@ -4500,6 +4500,25 @@ export const a2 = 3;
         );
     }
 
+    /// Merged `enum E` + `namespace E` keeps the enum type on the shared
+    /// symbol: the enum header still reads `>E : E`
+    /// (augmentedTypesEnum:88). The namespace declaration's own
+    /// `>E : typeof E` row needs per-declaration headers, which the
+    /// per-symbol loop cannot render yet — banked follow-up.
+    #[test]
+    fn emit_types_merged_enum_namespace_keeps_enum_type() {
+        let logical = "tests/cases/compiler/mergedEnumNamespacePin.ts";
+        let case_text = "enum E {\n    A = 1,\n}\nnamespace E {\n    export var x = 1;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">E : E"),
+            "missing `>E : E` header:\n{emitted}"
+        );
+    }
+
     /// A multi-file case's preamble before the first `@Filename:` marker is
     /// global options, not a unit: upstream `ParseTestFilesAndSymlinks`
     /// (`AllowImplicitFirstFile: false`) drops a comment-only preamble, so
