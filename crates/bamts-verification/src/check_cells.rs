@@ -719,21 +719,13 @@ pub fn resolve_baseline_file(
             .iter()
             .filter(|(suffix, _, _)| baseline_suffix_matches(suffix, &compile_options))
             .collect();
-        let area_matches: Vec<_> = matches.iter().filter(|(_, _, in_area)| *in_area).collect();
-        if area_matches.len() == 1 {
-            return Some(area_matches[0].1.clone());
-        }
-        if matches.len() == 1 {
-            return Some(matches[0].1.clone());
-        }
-        // Several option-compatible variants: rank the most specific
-        // suffix first (more `key=value` parts wins), owning area before
-        // other areas, filename for determinism. Never an unmatched file.
+        // Option-compatible variants rank most-specific first; owning
+        // area breaks specificity ties, then filename, then full path
+        // for determinism. Never an unmatched file. `matches` may be
+        // empty when no variant fits; the plain fallback below covers
+        // that case.
         if !matches.is_empty() {
-            // Pool rows are (specificity, in_area, suffix, path): area
-            // first, then specificity, then filename. `matches` may be
-            // empty when no variant fits the options; the guard below
-            // preserves the plain fallback for that case.
+            // Pool rows are (specificity, in_area, suffix, path).
             let mut pool: Vec<(usize, bool, &str, &std::path::PathBuf)> = matches
                 .iter()
                 .map(|(suffix, path, in_area)| {
@@ -742,9 +734,10 @@ pub fn resolve_baseline_file(
                 })
                 .collect();
             pool.sort_by(|a, b| {
-                b.1.cmp(&a.1)
-                    .then_with(|| b.0.cmp(&a.0))
+                b.0.cmp(&a.0)
+                    .then_with(|| b.1.cmp(&a.1))
                     .then_with(|| a.2.cmp(b.2))
+                    .then_with(|| a.3.cmp(b.3))
             });
             return Some(pool[0].3.clone());
         }
@@ -6862,4 +6855,52 @@ interface I {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[test]
+    fn baseline_file_specificity_beats_owning_area() {
+        // System temp dir honors TMPDIR; pid-suffixed and removed after use.
+        let root = std::env::temp_dir().join(format!("bamts-specarea-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for area in ["compiler", "other"] {
+            std::fs::create_dir_all(root.join(area)).expect("fixture area");
+        }
+        std::fs::write(root.join("compiler/amb(target=es5).types"), "loose").expect("fixture");
+        std::fs::write(
+            root.join("other/amb(target=es5,module=commonjs).types"),
+            "exact",
+        )
+        .expect("fixture");
+        let pragmas = CasePragmas {
+            options: vec![
+                ("target".to_owned(), vec!["es5".to_owned()]),
+                ("module".to_owned(), vec!["commonjs".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        assert_eq!(
+            resolve_baseline_file(&root, "amb", "compiler", "types", &pragmas),
+            Some(root.join("other/amb(target=es5,module=commonjs).types"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn baseline_file_duplicate_suffix_breaks_tie_by_path() {
+        // System temp dir honors TMPDIR; pid-suffixed and removed after use.
+        let root = std::env::temp_dir().join(format!("bamts-duptie-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for area in ["compiler", "aaa", "bbb"] {
+            std::fs::create_dir_all(root.join(area)).expect("fixture area");
+        }
+        std::fs::write(root.join("aaa/dup(target=es5).types"), "a").expect("fixture");
+        std::fs::write(root.join("bbb/dup(target=es5).types"), "b").expect("fixture");
+        let pragmas = CasePragmas {
+            options: vec![("target".to_owned(), vec!["es5".to_owned()])],
+            no_types_and_symbols: false,
+        };
+        assert_eq!(
+            resolve_baseline_file(&root, "dup", "compiler", "types", &pragmas),
+            Some(root.join("aaa/dup(target=es5).types"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
 }
