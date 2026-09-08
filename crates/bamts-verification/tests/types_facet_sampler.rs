@@ -14,7 +14,7 @@
 //!   BAMTS_TYPES_SAMPLE=path/to/sample.txt \
 //!   cargo test -p bamts-verification --test types_facet_sampler -- --ignored --nocapture
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -155,17 +155,21 @@ fn resolve_baseline_fs(stem: &str, pragmas: &CasePragmas) -> Option<PathBuf> {
     // (`reference/<area>/*.types`); scan the top level and one down.
     let mut dirs = vec![base.clone()];
     if let Ok(entries) = fs::read_dir(&base) {
-        dirs.extend(
-            entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.is_dir()),
-        );
+        let mut nested: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        // Keep nested-directory precedence deterministic, while preserving
+        // the flat reference directory as the authoritative first choice.
+        nested.sort();
+        dirs.extend(nested);
     }
     let plain_name = format!("{stem}.types");
     let prefix = format!("{stem}(");
     let mut plain: Option<PathBuf> = None;
     let mut variants: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen_variants = HashSet::new();
     for dir in &dirs {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
@@ -173,10 +177,17 @@ fn resolve_baseline_fs(stem: &str, pragmas: &CasePragmas) -> Option<PathBuf> {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name == plain_name {
-                plain = Some(entry.path());
+                // `dirs` is ordered by authority: flat first, then nested.
+                if plain.is_none() {
+                    plain = Some(entry.path());
+                }
             } else if name.starts_with(&prefix) && name.ends_with(").types") {
                 let suffix = &name[prefix.len()..name.len() - ".types".len() - 1];
-                variants.push((suffix.to_owned(), entry.path()));
+                // A suffix identifies one configuration; retain the first
+                // occurrence so nested copies cannot make matching ambiguous.
+                if seen_variants.insert(suffix.to_owned()) {
+                    variants.push((suffix.to_owned(), entry.path()));
+                }
             }
         }
     }
