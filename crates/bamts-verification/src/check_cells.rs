@@ -692,7 +692,7 @@ pub fn resolve_baseline_file(
     let plain_name = format!("{stem}.{extension}");
     let prefix = format!("{stem}(");
     let suffix_end = format!(").{extension}");
-    let mut plain: Option<std::path::PathBuf> = None;
+    let mut plain: Option<(std::path::PathBuf, bool)> = None;
     let mut variants: Vec<(String, std::path::PathBuf, bool)> = Vec::new();
     for dir in &dirs {
         let in_area = dir == &area_dir;
@@ -702,7 +702,7 @@ pub fn resolve_baseline_file(
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name == plain_name && plain.is_none() {
-                plain = Some(entry.path());
+                plain = Some((entry.path(), in_area));
             } else if name.starts_with(&prefix) && name.ends_with(&suffix_end) {
                 let suffix = &name[prefix.len()..name.len() - suffix_end.len()];
                 variants.push((suffix.to_owned(), entry.path(), in_area));
@@ -723,15 +723,31 @@ pub fn resolve_baseline_file(
             .filter(|(suffix, _, _)| baseline_suffix_matches(suffix, &compile_options))
             .collect();
         // Baselines are per-case files: a same-stem variant in another
-        // area belongs to another case (the twin precedent), so owning
-        // matches scope the search whenever any exist. Specificity ranks
-        // within the pool, then filename, then full path.
+        // area belongs to another case (the twin precedent). When the
+        // owning area holds any stem file, the stem is owned: only
+        // owning variants may match, else the owning plain file covers
+        // generic options, else there is no compatible authority. The
+        // cross-area pool stays for unowned stems only. Specificity
+        // ranks within the pool, then filename, then full path.
         let owned: Vec<&(String, std::path::PathBuf, bool)> = matches
             .iter()
             .filter(|candidate| candidate.2)
             .map(|candidate| *candidate)
             .collect();
-        let pool_source = if owned.is_empty() { matches } else { owned };
+        let stem_owned = !owned.is_empty()
+            || variants.iter().any(|candidate| candidate.2)
+            || plain.as_ref().is_some_and(|(_, in_area)| *in_area);
+        let pool_source = if owned.is_empty() {
+            if stem_owned {
+                return plain
+                    .as_ref()
+                    .filter(|(_, in_area)| *in_area)
+                    .map(|(path, _)| path.clone());
+            }
+            matches
+        } else {
+            owned
+        };
         if !pool_source.is_empty() {
             // Pool rows are (specificity, suffix, path).
             let mut pool: Vec<(usize, &str, &std::path::PathBuf)> = pool_source
@@ -753,7 +769,7 @@ pub fn resolve_baseline_file(
             return Some(pool[0].2.clone());
         }
     }
-    if let Some(plain) = plain {
+    if let Some((plain, _)) = plain {
         return Some(plain);
     }
     variants.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
@@ -6930,6 +6946,51 @@ interface I {
         assert_eq!(
             resolve_baseline_file(&root, "dup", "compiler", "types", &pragmas),
             Some(root.join("aaa/dup.types"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn baseline_file_owned_but_incompatible_yields_none() {
+        // The owning area claims the stem but holds no compatible
+        // variant: the sibling-area match belongs to another case, so
+        // the resolver reports no authority instead of comparing
+        // against an unrelated baseline.
+        let root = std::env::temp_dir().join(format!("bamts-ownnone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for area in ["compiler", "other"] {
+            std::fs::create_dir_all(root.join(area)).expect("fixture area");
+        }
+        std::fs::write(root.join("compiler/amb(target=es5).types"), "b").expect("fixture");
+        std::fs::write(root.join("other/amb(target=es2015).types"), "b").expect("fixture");
+        let pragmas = CasePragmas {
+            options: vec![("target".to_owned(), vec!["es2015".to_owned()])],
+            no_types_and_symbols: false,
+        };
+        assert_eq!(
+            resolve_baseline_file(&root, "amb", "compiler", "types", &pragmas),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn baseline_file_owned_plain_covers_incompatible_options() {
+        // An owned stem with no compatible variant still falls back to
+        // the owning plain file rather than a sibling-area variant.
+        let root = std::env::temp_dir().join(format!("bamts-ownplain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for area in ["compiler", "other"] {
+            std::fs::create_dir_all(root.join(area)).expect("fixture area");
+        }
+        std::fs::write(root.join("compiler/amb.types"), "b").expect("fixture");
+        std::fs::write(root.join("compiler/amb(target=es5).types"), "b").expect("fixture");
+        std::fs::write(root.join("other/amb(target=es2015).types"), "b").expect("fixture");
+        let pragmas = CasePragmas {
+            options: vec![("target".to_owned(), vec!["es2015".to_owned()])],
+            no_types_and_symbols: false,
+        };
+        assert_eq!(
+            resolve_baseline_file(&root, "amb", "compiler", "types", &pragmas),
+            Some(root.join("compiler/amb.types"))
         );
         let _ = std::fs::remove_dir_all(&root);
     }
