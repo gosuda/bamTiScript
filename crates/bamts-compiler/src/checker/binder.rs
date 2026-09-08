@@ -10475,9 +10475,9 @@ impl<'src> Binder<'src> {
                 self.bind_hoisted_statements(&block.data().statements, scope, true)
             }
             Statement::If(statement) => {
-                self.bind_hoisted_statement(&statement.consequent, scope, true);
+                self.bind_hoisted_statement(&statement.consequent, scope, in_block);
                 if let Some(alternate) = &statement.alternate {
-                    self.bind_hoisted_statement(alternate, scope, true);
+                    self.bind_hoisted_statement(alternate, scope, in_block);
                 }
             }
             Statement::Switch(statement) => {
@@ -10491,7 +10491,7 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope, true);
+                self.bind_hoisted_statement(&for_statement.body, scope, in_block);
             }
             Statement::ForIn(for_statement) => {
                 if let ForBinding::Variable(variable) = &for_statement.binding
@@ -10499,7 +10499,7 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope, true);
+                self.bind_hoisted_statement(&for_statement.body, scope, in_block);
             }
             Statement::ForOf(for_statement) => {
                 if let ForBinding::Variable(variable) = &for_statement.binding
@@ -10507,13 +10507,13 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_variable(variable, scope, NodeId::default());
                 }
-                self.bind_hoisted_statement(&for_statement.body, scope, true);
+                self.bind_hoisted_statement(&for_statement.body, scope, in_block);
             }
             Statement::While(statement) => {
-                self.bind_hoisted_statement(&statement.body, scope, true)
+                self.bind_hoisted_statement(&statement.body, scope, in_block)
             }
             Statement::DoWhile(statement) => {
-                self.bind_hoisted_statement(&statement.body, scope, true)
+                self.bind_hoisted_statement(&statement.body, scope, in_block)
             }
             Statement::Try(statement) => {
                 self.bind_hoisted_statements(&statement.block.data().statements, scope, true);
@@ -10529,10 +10529,10 @@ impl<'src> Binder<'src> {
                 }
             }
             Statement::With(with_statement) => {
-                self.bind_hoisted_statement(&with_statement.body, scope, true)
+                self.bind_hoisted_statement(&with_statement.body, scope, in_block)
             }
             Statement::Labeled(statement) => {
-                self.bind_hoisted_statement(&statement.body, scope, true)
+                self.bind_hoisted_statement(&statement.body, scope, in_block)
             }
             Statement::Namespace(_) => {}
             Statement::Declare(inner) => {
