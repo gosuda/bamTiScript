@@ -26249,6 +26249,22 @@ mod tests {
     }
 
     #[test]
+    fn arguments_in_static_block_is_not_implicitly_bound() {
+        let (_, diagnostics) = bound("class C { static { arguments; } }");
+        let codes: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code().as_str())
+            .collect();
+        assert_eq!(codes, [super::CANNOT_FIND_NAME.as_str()]);
+    }
+
+    #[test]
+    fn this_in_static_block_still_resolves_to_the_constructor() {
+        let (_, diagnostics) = bound("class C { static { this; } }");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
     fn this_member_access_still_resolves() {
         let (_, diagnostics) = bound("class C { foo = 1; bar() { return this.foo; } }");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
