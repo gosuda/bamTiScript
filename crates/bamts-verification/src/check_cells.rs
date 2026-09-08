@@ -726,6 +726,28 @@ pub fn resolve_baseline_file(
         if matches.len() == 1 {
             return Some(matches[0].1.clone());
         }
+        // Several option-compatible variants: rank the most specific
+        // suffix first (more `key=value` parts wins), owning area before
+        // other areas, filename for determinism. Never an unmatched file.
+        if !matches.is_empty() {
+            // Pool rows are (specificity, in_area, suffix, path): area
+            // first, then specificity, then filename. `matches` may be
+            // empty when no variant fits the options; the guard below
+            // preserves the plain fallback for that case.
+            let mut pool: Vec<(usize, bool, &str, &std::path::PathBuf)> = matches
+                .iter()
+                .map(|(suffix, path, in_area)| {
+                    let specificity = suffix.split(',').filter(|part| part.contains('=')).count();
+                    (specificity, *in_area, suffix.as_str(), path)
+                })
+                .collect();
+            pool.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| b.0.cmp(&a.0))
+                    .then_with(|| a.2.cmp(b.2))
+            });
+            return Some(pool[0].3.clone());
+        }
     }
     if let Some(plain) = plain {
         return Some(plain);
@@ -6812,6 +6834,31 @@ interface I {
         assert_eq!(
             resolve_baseline_file(&root, "twin", "compiler", "types", &pragmas),
             Some(root.join("compiler/twin.types"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn baseline_file_prefers_most_specific_option_match() {
+        // System temp dir honors TMPDIR; pid-suffixed and removed after use.
+        let root = std::env::temp_dir().join(format!("bamts-specific-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("compiler")).expect("fixture area");
+        std::fs::write(root.join("compiler/amb(target=es5).types"), "loose").expect("fixture");
+        std::fs::write(
+            root.join("compiler/amb(target=es5,module=commonjs).types"),
+            "exact",
+        )
+        .expect("fixture");
+        let pragmas = CasePragmas {
+            options: vec![
+                ("target".to_owned(), vec!["es5".to_owned()]),
+                ("module".to_owned(), vec!["commonjs".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        assert_eq!(
+            resolve_baseline_file(&root, "amb", "compiler", "types", &pragmas),
+            Some(root.join("compiler/amb(target=es5,module=commonjs).types"))
         );
         let _ = std::fs::remove_dir_all(&root);
     }
