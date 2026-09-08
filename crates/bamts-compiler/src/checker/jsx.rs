@@ -1904,6 +1904,33 @@ mod tests {
         assert_eq!(codes(&source), [TYPE_NOT_ASSIGNABLE.as_str()]);
     }
 
+    /// A bare tag over a union of plain function types keeps per-member
+    /// groups through the same routing as interface unions: omitting
+    /// `b` is rejected by the second member even though the first
+    /// admits the props.
+    #[test]
+    fn bare_function_union_tag_requires_every_member() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             declare const Comp: ((props: {{ a: string }}) => string) | ((props: {{ b: number }}) => number); \
+             const missing = <Comp a=\"x\" />;"
+        );
+        assert_eq!(codes(&source), [JSX_ATTRIBUTES_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    /// A bare tag over a union hidden behind a type alias distributes
+    /// the same way: the alias view normalizes to a union before
+    /// candidate grouping runs.
+    #[test]
+    fn bare_alias_union_tag_requires_every_member() {
+        let source = format!(
+            "{JSX_PREAMBLE} \
+             type U = ((props: {{ a: string }}) => string) | ((props: {{ b: number }}) => number); \
+             declare const Comp: U; \
+             const missing = <Comp a=\"x\" />;"
+        );
+        assert_eq!(codes(&source), [JSX_ATTRIBUTES_NOT_ASSIGNABLE.as_str()]);
+    }
     /// A dotted member whose property type is a union must distribute its
     /// members through the same per-shape views an ordinary call uses;
     /// every member admits the given props and the result unions every
