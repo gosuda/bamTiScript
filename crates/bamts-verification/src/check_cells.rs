@@ -6924,6 +6924,42 @@ interface I {
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
 
+    /// Regression: an inner-loop function stays inner-loop-scoped (tsc
+    /// TS2304 on the outer-loop use, sloppy and strict alike); the outer
+    /// prebind must not claim it into the ancestor loop scope.
+    #[test]
+    fn nested_loop_function_stays_inner_scoped() {
+        let case_text = "for (;;) {\ng();\nfor (;;) function g() {\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/nestedLoopFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/nestedLoopFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 2)]);
+    }
+    /// Guard: a use inside the inner loop resolves (the inner loop-local
+    /// prebind declares with the inner-loop identity).
+    #[test]
+    fn nested_loop_inner_use_resolves() {
+        let case_text = "for (;;) {\nfor (;;) {\nfunction g() {\n}\ng();\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/nestedLoopInnerUse.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/nestedLoopInnerUse.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
     /// Regression: an unbraced for-body function stays loop-scoped (tsc
     /// TS2304 on the post-loop use); it must not leak outward as `any`.
     #[test]
