@@ -679,12 +679,15 @@ pub fn resolve_baseline_file(
     }
     dirs.push(base.to_path_buf());
     if let Ok(entries) = fs::read_dir(base) {
-        dirs.extend(
-            entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.is_dir() && path != &area_dir),
-        );
+        // `read_dir` order is filesystem-dependent: sort so the first
+        // plain baseline found is deterministic across machines.
+        let mut siblings: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir() && path != &area_dir)
+            .collect();
+        siblings.sort();
+        dirs.extend(siblings);
     }
     let plain_name = format!("{stem}.{extension}");
     let prefix = format!("{stem}(");
@@ -6909,6 +6912,24 @@ interface I {
         assert_eq!(
             resolve_baseline_file(&root, "dup", "compiler", "types", &pragmas),
             Some(root.join("aaa/dup(target=es5).types"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn baseline_file_sibling_order_is_sorted() {
+        // bbb is created before aaa on purpose: directory enumeration
+        // order must not decide which plain baseline wins.
+        let root = std::env::temp_dir().join(format!("bamts-sibord-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for area in ["compiler", "bbb", "aaa"] {
+            std::fs::create_dir_all(root.join(area)).expect("fixture area");
+        }
+        std::fs::write(root.join("bbb/dup.types"), "b").expect("fixture");
+        std::fs::write(root.join("aaa/dup.types"), "a").expect("fixture");
+        let pragmas = CasePragmas::default();
+        assert_eq!(
+            resolve_baseline_file(&root, "dup", "compiler", "types", &pragmas),
+            Some(root.join("aaa/dup.types"))
         );
         let _ = std::fs::remove_dir_all(&root);
     }
