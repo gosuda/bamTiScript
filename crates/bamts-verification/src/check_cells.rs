@@ -673,7 +673,10 @@ pub fn resolve_baseline_file(
     pragmas: &CasePragmas,
 ) -> Option<std::path::PathBuf> {
     let area_dir = base.join(area);
-    let mut dirs = vec![area_dir.clone()];
+    let mut dirs = Vec::new();
+    if !area.is_empty() {
+        dirs.push(area_dir.clone());
+    }
     dirs.push(base.to_path_buf());
     if let Ok(entries) = fs::read_dir(base) {
         dirs.extend(
