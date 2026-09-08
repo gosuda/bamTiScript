@@ -7087,6 +7087,152 @@ interface I {
             ]
         );
     }
+    /// Let-first twin of the func-first dual: declaration order must
+    /// not matter (tsc TS2300 at both sites, both modes).
+    #[test]
+    fn let_function_conflict_reports_both_sites() {
+        let case_text = "let f = 1;\nfunction f() {\n}\n";
+        let units = split_case_units("tests/cases/compiler/letFunctionConflict.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/letFunctionConflict.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 4),
+                ("BAMTS-C001".to_owned(), 2, 9),
+            ]
+        );
+    }
+    /// Sloppy twin of the let-first dual (tsc TS2300 at both sites
+    /// in sloppy too).
+    #[test]
+    fn sloppy_let_function_conflict_reports_both_sites() {
+        let case_text = "let f = 1;\nfunction f() {\n}\n";
+        let units = split_case_units("tests/cases/compiler/sloppyLetFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/sloppyLetFunction.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 4),
+                ("BAMTS-C001".to_owned(), 2, 9),
+            ]
+        );
+    }
+    /// A `var` established first dual-reports against a later `let`
+    /// (tsc TS2300 at both sites, both modes).
+    #[test]
+    fn var_let_conflict_reports_both_sites() {
+        let case_text = "var f = 0;\nlet f = 1;\n";
+        let units = split_case_units("tests/cases/compiler/varLetConflict.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/varLetConflict.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 4),
+                ("BAMTS-C001".to_owned(), 2, 4),
+            ]
+        );
+    }
+    /// Sloppy twin of the var-first dual (tsc TS2300 at both sites
+    /// in sloppy too).
+    #[test]
+    fn sloppy_var_let_conflict_reports_both_sites() {
+        let case_text = "var f = 0;\nlet f = 1;\n";
+        let units = split_case_units("tests/cases/compiler/sloppyVarLet.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/sloppyVarLet.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 4),
+                ("BAMTS-C001".to_owned(), 2, 4),
+            ]
+        );
+    }
+    /// Boundary: a `let` established first keeps the single diagnostic
+    /// against a later `var` (settled catch-adjacent behavior).
+    #[test]
+    fn let_var_conflict_reports_once() {
+        let case_text = "let f = 1;\nvar f = 0;\n";
+        let units = split_case_units("tests/cases/compiler/letVarConflict.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/letVarConflict.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C001".to_owned(), 2, 4)]);
+    }
+    /// A `var` established first dual-reports against a later class
+    /// (tsc TS2300 at both sites, both modes).
+    #[test]
+    fn var_class_conflict_reports_both_sites() {
+        let case_text = "var C = 0;\nclass C {\n}\n";
+        let units = split_case_units("tests/cases/compiler/varClassConflict.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/varClassConflict.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 4),
+                ("BAMTS-C001".to_owned(), 2, 6),
+            ]
+        );
+    }
     /// the same shape with `var` stays silent (tsc clean, both modes).
     #[test]
     fn loop_header_var_merges_with_body_function() {

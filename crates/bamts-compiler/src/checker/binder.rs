@@ -10376,15 +10376,17 @@ impl<'src> Binder<'src> {
                 );
             } else {
                 self.emit(DUPLICATE_DECLARATION, range, DUPLICATE_MESSAGE);
-                // A hoisted earlier declaration (loop-prebound or hoisted
-                // function) shares the fault: tsc reports the collision at
-                // both sites (TS2300/TS2451 pairs), while lexical-first
-                // collisions keep the single diagnostic.
-                if self
-                    .hoisted_declaration_symbols
-                    .values()
-                    .any(|symbol| *symbol == existing)
-                {
+                // A collision involving a function declaration, or against
+                // an established `var` binding, reports at both sites (tsc
+                // TS2300/TS2393/TS2451 pairs in every order); pure lexical
+                // collisions report once at the incoming site, as do
+                // namespace-first collisions (order-sensitivity pin).
+                let peer_reports = (kind == SymbolKind::Function
+                    || existing_kind == SymbolKind::Function
+                    || existing_kind == SymbolKind::Variable(VariableKind::Var))
+                    && existing_kind != SymbolKind::Namespace
+                    && kind != SymbolKind::Namespace;
+                if peer_reports {
                     let existing_range = self.symbols[existing.get() as usize].range;
                     if existing_range != range {
                         self.emit(DUPLICATE_DECLARATION, existing_range, DUPLICATE_MESSAGE);
