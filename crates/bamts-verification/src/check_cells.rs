@@ -7141,4 +7141,864 @@ interface I {
             "non-BMP columns must count UTF-16 units:\n{emitted_symbols}"
         );
     }
+    /// Regression: a catch-body function shadows its parameter. The body
+    /// binds in a child block like the try body, so tsc-accepted code in
+    /// strict and sloppy modes reports no duplicate (oracle: tsc rc=0).
+    #[test]
+    fn catch_body_function_shadows_parameter() {
+        let case_text = "\"use strict\";\ntry {\n} catch (e) {\n    function e() {\n    }\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchFunctionShadow.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchFunctionShadow.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: the catch parameter stays visible in the child body
+    /// block through the scope chain.
+    #[test]
+    fn catch_parameter_visible_in_body_block() {
+        let case_text = "try {\n} catch (e) {\n    const y = e;\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchParameterVisible.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchParameterVisible.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: lexical redeclarations still conflict with the catch
+    /// parameter across the child body block. Only `var` and functions
+    /// shadow it legally.
+    #[test]
+    fn catch_body_let_conflicts_with_parameter() {
+        let case_text = "try {\n} catch (e) {\n    let e;\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchLetConflict.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchLetConflict.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C001".to_owned(), 3)]);
+    }
+    /// Regression: classes shadow catch parameters legally (tsc rc=0).
+    /// Only lexical variable redeclarations conflict across the body.
+    #[test]
+    fn catch_body_class_shadows_parameter() {
+        let case_text = "try {\n} catch (e) {\n    class e {\n    }\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchClassShadow.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchClassShadow.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: enums shadow catch parameters legally (tsc rc=0).
+    #[test]
+    fn catch_body_enum_shadows_parameter() {
+        let case_text = "try {\n} catch (e) {\n    enum e {\n        A = 1,\n    }\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchEnumShadow.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchEnumShadow.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: `var` against a destructured catch param conflicts.
+    /// The legacy same-name tolerance applies to simple identifiers
+    /// only (tsc TS2492 on the `var`, alongside the pattern error).
+    #[test]
+    fn catch_destructured_param_var_conflicts() {
+        let case_text = "try {\n} catch ({ e }) {\n    var e;\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchDestructuredVar.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchDestructuredVar.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C001".to_owned(), 3)]);
+    }
+    /// Regression: nested `var` under a destructured catch conflicts.
+    /// `var` hoists through transparent scopes, so the claim walk
+    /// climbs to the complex catch instead of stopping at the block.
+    #[test]
+    fn catch_nested_var_conflicts_with_destructured_param() {
+        let case_text = "try {\n} catch ({ x }) {\n    {\n        var x;\n    }\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchNestedVar.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchNestedVar.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C001".to_owned(), 4)]);
+    }
+    /// Regression: nested `var` under a simple catch stays silent. The
+    /// legacy tolerance survives hoisting through transparent scopes.
+    #[test]
+    fn catch_nested_var_tolerated_for_simple_param() {
+        let case_text = "try {\n} catch (e) {\n    {\n        var e;\n    }\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchNestedVarSimple.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchNestedVarSimple.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: a call before a nested for-body declaration resolves
+    /// (tsc silent: the function hoists to the loop scope). The outer
+    /// pre-pass skips the for-body subtree, so the loop-local prebind
+    /// must declare it before earlier statements resolve.
+    #[test]
+    fn for_nested_function_precedes_use() {
+        let case_text =
+            "declare var cond: boolean;\nfor (;;) {\nf();\nif (cond) function f() {\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/forNestedPrecede.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/forNestedPrecede.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: a switch-case function stays switch-scoped even nested
+    /// in a strict block (tsc TS2304 on the post-block use); the
+    /// block-local prebind must not leak it into the enclosing block.
+    #[test]
+    fn strict_post_switch_function_stays_switch_scoped() {
+        let case_text =
+            "declare var x: number;\n{\nswitch (x) {\ncase 0:\nfunction f() {\n}\n}\nf();\n}\n";
+        let units = split_case_units("tests/cases/compiler/switchCaseFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/switchCaseFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 8)]);
+    }
+    /// Regression: a try-block function stays try-scoped even nested in a
+    /// strict block (tsc TS2304); the block-local prebind must not leak it.
+    #[test]
+    fn strict_post_try_function_stays_try_scoped() {
+        let case_text = "{\ntry {\nfunction f() {\n}\n} catch (e) {\n}\nf();\n}\n";
+        let units = split_case_units("tests/cases/compiler/tryBlockFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tryBlockFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 7)]);
+    }
+    /// Regression: a braced case-block function stays block-scoped (tsc
+    /// TS2304); neither the block-local nor the switch-local prebind may
+    /// leak it into an enclosing scope.
+    #[test]
+    fn strict_braced_case_function_stays_block_scoped() {
+        let case_text = "declare var x: number;\n{\nswitch (x) {\ncase 0: {\nfunction f() {\n}\n}\n}\nf();\n}\n";
+        let units = split_case_units("tests/cases/compiler/bracedCaseFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/bracedCaseFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 9)]);
+    }
+    /// Guard: a use before a nested try-body declaration resolves (tsc
+    /// silent: the function hoists to the try scope).
+    #[test]
+    fn strict_nested_try_function_precedes_use() {
+        let case_text = "declare var c: boolean;\n{\ntry {\nf();\nif (c) function f() {\n}\n} catch (e) {\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/nestedTryPrecede.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/nestedTryPrecede.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Guard: a use before a nested case declaration resolves across
+    /// cases (tsc silent: the function hoists to the switch scope).
+    #[test]
+    fn strict_nested_switch_function_precedes_use() {
+        let case_text = "declare var n: number;\ndeclare var c: boolean;\n{\nswitch (n) {\ncase 1: f();\nbreak;\ncase 2: if (c) function f() {\n}\nbreak;\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/nestedSwitchPrecede.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/nestedSwitchPrecede.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
+    /// Regression: an inner-loop function stays inner-loop-scoped in
+    /// strict mode (tsc TS2304 on the outer-loop use); the outer
+    /// prebind must not claim it into the ancestor loop scope. The
+    /// sloppy half is pinned separately below: the harness forces
+    /// strict on every unit unless pragmas switch it off.
+    #[test]
+    fn nested_loop_function_stays_inner_scoped() {
+        let case_text = "for (;;) {\ng();\nfor (;;) function g() {\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/nestedLoopFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/nestedLoopFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 2)]);
+    }
+    /// Regression: an inner-loop function stays inner-loop-scoped in
+    /// sloppy mode too (tsc TS2304 on the outer-loop use). Compiled
+    /// with strict+alwaysStrict off; the harness otherwise forces
+    /// strict on every unit.
+    #[test]
+    fn sloppy_nested_loop_function_stays_inner_scoped() {
+        let case_text = "for (;;) {\ng();\nfor (;;) function g() {\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/sloppyNestedLoop.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/sloppyNestedLoop.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 2)]);
+    }
+    /// Guard pair: the es5 block-function diagnostic gates on scope
+    /// strictness. The same shape reports under default (strict)
+    /// pragmas and stays silent with strict off, which locks the
+    /// pragma-to-sloppy path the sloppy pin above relies on.
+    #[test]
+    fn es5_block_function_reports_in_strict_scope() {
+        let case_text = "declare var c: boolean;\nif (c) {\nfunction g() {\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/es5StrictScope.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/es5StrictScope.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![("target".to_owned(), vec!["es5".to_owned()])],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C040".to_owned(), 3)]);
+    }
+    #[test]
+    fn es5_block_function_silent_in_sloppy_scope() {
+        let case_text = "declare var c: boolean;\nif (c) {\nfunction g() {\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/es5SloppyScope.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/es5SloppyScope.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("target".to_owned(), vec!["es5".to_owned()]),
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
+    /// Guard: a use inside the inner loop resolves (the inner loop-local
+    /// prebind declares with the inner-loop identity).
+    #[test]
+    fn nested_loop_inner_use_resolves() {
+        let case_text = "for (;;) {\nfor (;;) {\nfunction g() {\n}\ng();\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/nestedLoopInnerUse.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/nestedLoopInnerUse.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: a loop-header `let` sharing the unbraced body
+    /// function's name is diagnosed at both sites (tsc TS2451 at
+    /// (1,10) and (1,28), both modes). The prebind installs the
+    /// function first, so the header `let` reports; the function
+    /// resolve must report too instead of reusing its hoisted
+    /// identity silently.
+    #[test]
+    fn loop_header_let_conflicts_with_body_function() {
+        let case_text = "for (let f = 0;;) function f() {\n}\n";
+        let units = split_case_units("tests/cases/compiler/loopHeaderLetFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/loopHeaderLetFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 9),
+                ("BAMTS-C001".to_owned(), 1, 27),
+            ]
+        );
+    }
+    /// The same dual-report holds when the function comes first
+    /// (tsc TS2300 at both sites, both modes); emission order is
+    /// incoming site first.
+    #[test]
+    fn function_let_conflict_reports_both_sites() {
+        let case_text = "function f() {\n}\nlet f = 1;\n";
+        let units = split_case_units("tests/cases/compiler/functionLetConflict.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/functionLetConflict.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        // Emission order is incoming site first, but the facet
+        // collector sorts by position, so the function site leads.
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 9),
+                ("BAMTS-C001".to_owned(), 3, 4),
+            ]
+        );
+    }
+    /// Let-first twin of the func-first dual: declaration order must
+    /// not matter (tsc TS2300 at both sites, both modes).
+    #[test]
+    fn let_function_conflict_reports_both_sites() {
+        let case_text = "let f = 1;\nfunction f() {\n}\n";
+        let units = split_case_units("tests/cases/compiler/letFunctionConflict.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/letFunctionConflict.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 4),
+                ("BAMTS-C001".to_owned(), 2, 9),
+            ]
+        );
+    }
+    /// Sloppy twin of the let-first dual (tsc TS2300 at both sites
+    /// in sloppy too).
+    #[test]
+    fn sloppy_let_function_conflict_reports_both_sites() {
+        let case_text = "let f = 1;\nfunction f() {\n}\n";
+        let units = split_case_units("tests/cases/compiler/sloppyLetFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/sloppyLetFunction.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 4),
+                ("BAMTS-C001".to_owned(), 2, 9),
+            ]
+        );
+    }
+    /// A `var` established first dual-reports against a later `let`
+    /// (tsc TS2300 at both sites, both modes).
+    #[test]
+    fn var_let_conflict_reports_both_sites() {
+        let case_text = "var f = 0;\nlet f = 1;\n";
+        let units = split_case_units("tests/cases/compiler/varLetConflict.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/varLetConflict.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 4),
+                ("BAMTS-C001".to_owned(), 2, 4),
+            ]
+        );
+    }
+    /// Sloppy twin of the var-first dual (tsc TS2300 at both sites
+    /// in sloppy too).
+    #[test]
+    fn sloppy_var_let_conflict_reports_both_sites() {
+        let case_text = "var f = 0;\nlet f = 1;\n";
+        let units = split_case_units("tests/cases/compiler/sloppyVarLet.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/sloppyVarLet.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 4),
+                ("BAMTS-C001".to_owned(), 2, 4),
+            ]
+        );
+    }
+    /// Boundary: a `let` established first keeps the single diagnostic
+    /// against a later `var`. Known divergence, kept deliberately: tsc
+    /// dual-reports this pair (TS2451 at both sites), but the repo
+    /// single-reports lexical-first collisions by design (catch
+    /// settlement), and the top-level shape follows the same rule.
+    #[test]
+    fn let_var_conflict_reports_once() {
+        let case_text = "let f = 1;\nvar f = 0;\n";
+        let units = split_case_units("tests/cases/compiler/letVarConflict.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/letVarConflict.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C001".to_owned(), 2, 4)]);
+    }
+    /// A `var` established first dual-reports against a later class
+    /// (tsc TS2300 at both sites, both modes).
+    #[test]
+    fn var_class_conflict_reports_both_sites() {
+        let case_text = "var C = 0;\nclass C {\n}\n";
+        let units = split_case_units("tests/cases/compiler/varClassConflict.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/varClassConflict.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 4),
+                ("BAMTS-C001".to_owned(), 2, 6),
+            ]
+        );
+    }
+    /// Three colliding declarations flag each site exactly once (tsc
+    /// TS2300 at (1,10), (3,5) and (4,5), both modes): the shared
+    /// earlier site must not duplicate.
+    #[test]
+    fn triple_conflict_reports_each_site_once() {
+        let case_text = "function f() {\n}\nlet f = 1;\nlet f = 2;\n";
+        let units = split_case_units("tests/cases/compiler/tripleConflict.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tripleConflict.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 9),
+                ("BAMTS-C001".to_owned(), 3, 4),
+                ("BAMTS-C001".to_owned(), 4, 4),
+            ]
+        );
+    }
+    /// Sloppy twin of the triple-conflict pin (tsc TS2300 at all
+    /// three sites in sloppy too).
+    #[test]
+    fn sloppy_triple_conflict_reports_each_site_once() {
+        let case_text = "function f() {\n}\nlet f = 1;\nlet f = 2;\n";
+        let units = split_case_units("tests/cases/compiler/sloppyTriple.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/sloppyTriple.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 9),
+                ("BAMTS-C001".to_owned(), 3, 4),
+                ("BAMTS-C001".to_owned(), 4, 4),
+            ]
+        );
+    }
+    /// Mixed triple: each later conflict sees the lexical incumbent
+    /// left by the previous one, so every site still reports exactly
+    /// once (no repeated peer-report).
+    #[test]
+    fn mixed_triple_conflict_reports_each_site_once() {
+        let case_text = "function f() {\n}\nlet f;\nclass f {\n}\n";
+        let units = split_case_units("tests/cases/compiler/mixedTriple.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/mixedTriple.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 9),
+                ("BAMTS-C001".to_owned(), 3, 4),
+                ("BAMTS-C001".to_owned(), 4, 6),
+            ]
+        );
+    }
+    /// the same shape with `var` stays silent (tsc clean, both modes).
+    #[test]
+    fn loop_header_var_merges_with_body_function() {
+        let case_text = "for (var f = 0;;) function f() {\n}\n";
+        let units = split_case_units("tests/cases/compiler/loopHeaderVarFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/loopHeaderVarFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Sloppy twin of the func-first dual (tsc TS2300 at both sites
+    /// in sloppy too).
+    #[test]
+    fn sloppy_function_let_conflict_reports_both_sites() {
+        let case_text = "function f() {\n}\nlet f = 1;\n";
+        let units = split_case_units("tests/cases/compiler/sloppyFunctionLet.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/sloppyFunctionLet.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 9),
+                ("BAMTS-C001".to_owned(), 3, 4),
+            ]
+        );
+    }
+    /// Sloppy twin of the var-merge guard (tsc clean in sloppy too).
+    #[test]
+    fn sloppy_loop_header_var_merges_with_body_function() {
+        let case_text = "for (var f = 0;;) function f() {\n}\n";
+        let units = split_case_units("tests/cases/compiler/sloppyLoopHeaderVar.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/sloppyLoopHeaderVar.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Sloppy twin of the header-let conflict (tsc TS2451 at both
+    /// sites in sloppy too).
+    #[test]
+    fn sloppy_loop_header_let_conflicts_with_body_function() {
+        let case_text = "for (let f = 0;;) function f() {\n}\n";
+        let units = split_case_units("tests/cases/compiler/sloppyLoopHeaderLet.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/sloppyLoopHeaderLet.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line, d.position.character))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                ("BAMTS-C001".to_owned(), 1, 9),
+                ("BAMTS-C001".to_owned(), 1, 27),
+            ]
+        );
+    }
+
+    /// Regression: an unbraced for-body function stays loop-scoped (tsc
+    /// TS2304 on the post-loop use); it must not leak outward as `any`.
+    #[test]
+    fn for_body_function_stays_loop_scoped() {
+        let case_text =
+            "declare var cond: boolean;\nfor (; cond;) function f(x: string) {\n}\nf(1);\n";
+        let units = split_case_units("tests/cases/compiler/forBodyFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/forBodyFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 4)]);
+    }
+    /// Regression: a braced for-body function stays loop-scoped too (tsc
+    /// TS2304); only the loop subtree sees it.
+    #[test]
+    fn for_block_body_function_stays_loop_scoped() {
+        let case_text =
+            "declare var cond: boolean;\nfor (; cond;) {\nfunction b(x: string) {\n}\n}\nb(1);\n";
+        let units = split_case_units("tests/cases/compiler/forBlockBodyFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/forBlockBodyFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 6)]);
+    }
+    /// Regression: a for-of body function stays loop-scoped (tsc TS2304).
+    #[test]
+    fn for_of_body_function_stays_loop_scoped() {
+        let case_text = "declare var items: string[];\nfor (const item of items) function h(x: string) {\n}\nh(1);\n";
+        let units = split_case_units("tests/cases/compiler/forOfBodyFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/forOfBodyFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 4)]);
+    }
+    /// Guard: a while-body function still hoists (tsc checks the post-loop
+    /// call: TS2345), so the for-family containment must not leak outward.
+    #[test]
+    fn while_body_function_still_hoists() {
+        let case_text =
+            "declare var cond: boolean;\nwhile (cond) function w(x: string) {\n}\nw(1);\n";
+        let units = split_case_units("tests/cases/compiler/whileBodyFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/whileBodyFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C053".to_owned(), 4)]);
+    }
+    /// Guard: an if-body function still hoists (tsc TS2345 on a bad call).
+    #[test]
+    fn if_body_function_still_hoists() {
+        let case_text = "declare var cond: boolean;\nif (cond) function g(x: string) {\n}\ng(1);\n";
+        let units = split_case_units("tests/cases/compiler/ifBodyFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/ifBodyFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C053".to_owned(), 4)]);
+    }
+    /// Regression: a for-in body function stays loop-scoped (tsc TS2304).
+    #[test]
+    fn for_in_body_function_stays_loop_scoped() {
+        let case_text = "declare var o: any;\nfor (var k in o) function h(x: string) {\n}\nh(1);\n";
+        let units = split_case_units("tests/cases/compiler/forInBodyFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/forInBodyFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 4)]);
+    }
+    /// Regression: containment propagates through nested statements (tsc
+    /// TS2304 for an if-nested function inside a for body).
+    #[test]
+    fn for_nested_if_function_stays_loop_scoped() {
+        let case_text = "declare var cond: boolean;\nfor (; cond;) {\nif (cond) {\nfunction x(x: string) {\n}\n}\n}\nx(1);\n";
+        let units = split_case_units("tests/cases/compiler/forNestedIfFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/forNestedIfFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 8)]);
+    }
 }

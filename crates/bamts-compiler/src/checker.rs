@@ -13807,6 +13807,128 @@ class B extends A {
         let codes = checker_codes_of(&result);
         assert_eq!(codes, ["BAMTS-C039"], "{codes:?}");
     }
+
+    #[test]
+    fn strict_block_functions_do_not_leak_to_module_scope_es5() {
+        // blockScopedFunctionDeclarationES5 oracle (es5 row): the
+        // in-block declaration reports C040 and the module-scope use
+        // reports C002; the declaration must not hoist out of its block.
+        let result = check_text_with(
+            "if (true) {\n    function foo() { }\n    foo();\n}\nfoo();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es5"))
+                .with_strict(true),
+        );
+        let mut codes = checker_codes_of(&result);
+        codes.sort_unstable();
+        assert_eq!(codes, ["BAMTS-C002", "BAMTS-C040"], "{codes:?}");
+    }
+
+    #[test]
+    fn strict_block_functions_do_not_leak_to_module_scope_es2015() {
+        let result = check_text_with(
+            "if (true) {\n    function foo() { }\n    foo();\n}\nfoo();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert_eq!(checker_codes_of(&result), ["BAMTS-C002"]);
+    }
+
+    #[test]
+    fn sloppy_block_functions_still_hoist_to_module_scope() {
+        // Annex B: without strict mode the block function hoists and
+        // the module-scope use stays clean.
+        let result = check_text_with(
+            "if (true) {\n    function foo() { }\n    foo();\n}\nfoo();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es5"))
+                .with_strict(false),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn strict_unbraced_if_body_function_still_hoists() {
+        // An unbraced `if` body creates no lexical scope, so the
+        // strict function hoists to the enclosing scope and the
+        // earlier call resolves: no C002.
+        let result = check_text_with(
+            "declare var cond: boolean;\nfoo();\nif (cond) function foo() { }",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn strict_if_body_function_inside_block_stays_visible_in_block() {
+        // The `if` passes the block context through: `bar` lands in
+        // the outer block scope, so the later in-block use resolves
+        // while the module-scope use still reports C002 (no leak
+        // through the scopeless `if`).
+        let result = check_text_with(
+            "declare var cond: boolean;\nif (cond) {\n    if (cond) function bar() { }\n    bar();\n}\nbar();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert_eq!(checker_codes_of(&result), ["BAMTS-C002"]);
+    }
+
+    #[test]
+    fn strict_switch_case_function_does_not_leak_to_module_scope() {
+        // The resolve pass binds case consequents in a Block child
+        // scope, so the case function is switch-scoped: the in-switch
+        // use resolves while the module-scope use reports C002.
+        let result = check_text_with(
+            "declare var x: number;\nswitch (x) { case 1: function f() { } f(); }\nf();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert_eq!(checker_codes_of(&result), ["BAMTS-C002"]);
+    }
+
+    #[test]
+    fn strict_unbraced_while_body_function_still_hoists() {
+        // Loop bodies create no scope either: the strict function
+        // hoists to the enclosing scope and the later use resolves.
+        let result = check_text_with(
+            "declare var cond: boolean;\nwhile (cond) function w() { }\nw();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn strict_unbraced_for_body_function_stays_loop_scoped() {
+        // tsc reports TS2304 on the pre-loop use (oracle-verified):
+        // a for-body function never reaches the enclosing scope.
+        let result = check_text_with(
+            "declare var cond: boolean;\nf();\nfor (; cond;) function f() { }",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert_eq!(checker_codes_of(&result), ["BAMTS-C002"]);
+    }
+
     #[test]
     fn f4_computed_symbol_object_members_accept_without_errors() {
         // Upstream acceptSymbolAsWeakType expects zero diagnostics; symbol
