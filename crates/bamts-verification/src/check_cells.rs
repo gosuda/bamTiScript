@@ -6835,6 +6835,94 @@ interface I {
             .collect();
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
+    /// Regression: a switch-case function stays switch-scoped even nested
+    /// in a strict block (tsc TS2304 on the post-block use); the
+    /// block-local prebind must not leak it into the enclosing block.
+    #[test]
+    fn strict_post_switch_function_stays_switch_scoped() {
+        let case_text =
+            "declare var x: number;\n{\nswitch (x) {\ncase 0:\nfunction f() {\n}\n}\nf();\n}\n";
+        let units = split_case_units("tests/cases/compiler/switchCaseFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/switchCaseFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 8)]);
+    }
+    /// Regression: a try-block function stays try-scoped even nested in a
+    /// strict block (tsc TS2304); the block-local prebind must not leak it.
+    #[test]
+    fn strict_post_try_function_stays_try_scoped() {
+        let case_text = "{\ntry {\nfunction f() {\n}\n} catch (e) {\n}\nf();\n}\n";
+        let units = split_case_units("tests/cases/compiler/tryBlockFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tryBlockFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 7)]);
+    }
+    /// Regression: a braced case-block function stays block-scoped (tsc
+    /// TS2304); neither the block-local nor the switch-local prebind may
+    /// leak it into an enclosing scope.
+    #[test]
+    fn strict_braced_case_function_stays_block_scoped() {
+        let case_text = "declare var x: number;\n{\nswitch (x) {\ncase 0: {\nfunction f() {\n}\n}\n}\nf();\n}\n";
+        let units = split_case_units("tests/cases/compiler/bracedCaseFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/bracedCaseFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 9)]);
+    }
+    /// Guard: a use before a nested try-body declaration resolves (tsc
+    /// silent: the function hoists to the try scope).
+    #[test]
+    fn strict_nested_try_function_precedes_use() {
+        let case_text = "declare var c: boolean;\n{\ntry {\nf();\nif (c) function f() {\n}\n} catch (e) {\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/nestedTryPrecede.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/nestedTryPrecede.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Guard: a use before a nested case declaration resolves across
+    /// cases (tsc silent: the function hoists to the switch scope).
+    #[test]
+    fn strict_nested_switch_function_precedes_use() {
+        let case_text = "declare var n: number;\ndeclare var c: boolean;\n{\nswitch (n) {\ncase 1: f();\nbreak;\ncase 2: if (c) function f() {\n}\nbreak;\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/nestedSwitchPrecede.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/nestedSwitchPrecede.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
 
     /// Regression: an unbraced for-body function stays loop-scoped (tsc
     /// TS2304 on the post-loop use); it must not leak outward as `any`.

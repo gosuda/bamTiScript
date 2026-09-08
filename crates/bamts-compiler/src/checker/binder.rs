@@ -10617,12 +10617,15 @@ impl<'src> Binder<'src> {
                 // child scope, so case functions are switch-scoped:
                 // suppress the enclosing pre-declaration like a block.
                 for case in &statement.cases {
+                    // Resolve binds cases in a switch child scope, so
+                    // the enclosing `local` must not cross: nested blocks
+                    // self-cover through their own resolve prebinds.
                     self.bind_hoisted_statements(
                         &case.data().consequent,
                         scope,
                         true,
                         in_for_body,
-                        local,
+                        false,
                     );
                 }
             }
@@ -10662,7 +10665,7 @@ impl<'src> Binder<'src> {
                     scope,
                     true,
                     in_for_body,
-                    local,
+                    false,
                 );
                 if let Some(handler) = &statement.handler {
                     self.bind_hoisted_statements(
@@ -10670,7 +10673,7 @@ impl<'src> Binder<'src> {
                         scope,
                         true,
                         in_for_body,
-                        local,
+                        false,
                     );
                 }
                 if let Some(finalizer) = &statement.finalizer {
@@ -10679,7 +10682,7 @@ impl<'src> Binder<'src> {
                         scope,
                         true,
                         in_for_body,
-                        local,
+                        false,
                     );
                 }
             }
@@ -12565,6 +12568,21 @@ impl<'src> Binder<'src> {
                 self.resolve_expr(&statement.discriminant, scope);
                 self.legacy_type_of_expr(&statement.discriminant, scope);
                 let child = self.new_scope(ScopeKind::Block, Some(scope));
+                // Switch-local prebind (strict only; sloppy keeps the
+                // outer prebind): case functions must resolve for
+                // earlier cases with the switch-child identity the
+                // header bind uses, so each name yields one symbol.
+                if self.scopes[child.0 as usize].strict {
+                    for case in &statement.cases {
+                        self.bind_hoisted_statements(
+                            &case.data().consequent,
+                            child,
+                            true,
+                            false,
+                            true,
+                        );
+                    }
+                }
                 for case in &statement.cases {
                     if let Some(test) = &case.data().test {
                         self.resolve_expr(test, child);
@@ -12719,6 +12737,18 @@ impl<'src> Binder<'src> {
                 let entry_super_flow = self.super_flow;
                 let block = &statement.block;
                 let try_scope = self.new_scope(ScopeKind::Block, Some(scope));
+                // Try-local prebind (strict only): nested functions must
+                // resolve for earlier statements with the try-scope
+                // identity the header bind uses.
+                if self.scopes[try_scope.0 as usize].strict {
+                    self.bind_hoisted_statements(
+                        &block.data().statements,
+                        try_scope,
+                        true,
+                        false,
+                        true,
+                    );
+                }
                 self.bind_statements(&block.data().statements, try_scope);
                 self.resolve_statements(&block.data().statements, try_scope);
                 if let Some(handler) = &statement.handler {
@@ -12738,11 +12768,29 @@ impl<'src> Binder<'src> {
                     // strict and sloppy).
                     let body = &handler.data().body;
                     let catch_body = self.new_scope(ScopeKind::Block, Some(catch_scope));
+                    if self.scopes[catch_body.0 as usize].strict {
+                        self.bind_hoisted_statements(
+                            &body.data().statements,
+                            catch_body,
+                            true,
+                            false,
+                            true,
+                        );
+                    }
                     self.bind_statements(&body.data().statements, catch_body);
                     self.resolve_statements(&body.data().statements, catch_body);
                 }
                 if let Some(finalizer) = &statement.finalizer {
                     let finally_scope = self.new_scope(ScopeKind::Block, Some(scope));
+                    if self.scopes[finally_scope.0 as usize].strict {
+                        self.bind_hoisted_statements(
+                            &finalizer.data().statements,
+                            finally_scope,
+                            true,
+                            false,
+                            true,
+                        );
+                    }
                     self.bind_statements(&finalizer.data().statements, finally_scope);
                     self.resolve_statements(&finalizer.data().statements, finally_scope);
                 }
