@@ -10244,7 +10244,26 @@ impl<'src> Binder<'src> {
         if let Some(identity) = hoisted_identity {
             self.hoisted_declaration_symbols.insert(identity, id);
         }
-        let conflict = value_conflict.or(type_conflict);
+        // Catch parameters stay claimed across the child body block:
+        // lexical redeclarations conflict with the parameter while
+        // `var` and functions shadow it legally.
+        let catch_conflict = if matches!(
+            kind,
+            SymbolKind::Function | SymbolKind::Variable(VariableKind::Var)
+        ) || !kind.occupies_value()
+        {
+            None
+        } else if self.scopes[scope.0 as usize].kind == ScopeKind::Block {
+            match self.scopes[scope.0 as usize].parent {
+                Some(parent) if self.scopes[parent.0 as usize].kind == ScopeKind::Catch => {
+                    self.scopes[parent.0 as usize].values.get(name).copied()
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let conflict = value_conflict.or(type_conflict).or(catch_conflict);
         if let Some(existing) = conflict {
             let existing_kind = self.symbols[existing.get() as usize].kind;
             if existing_kind == SymbolKind::Import && kind != SymbolKind::Import {

@@ -6711,4 +6711,22 @@ interface I {
             .collect();
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
+    /// Regression: lexical redeclarations still conflict with the catch
+    /// parameter across the child body block. Only `var` and functions
+    /// shadow it legally.
+    #[test]
+    fn catch_body_let_conflicts_with_parameter() {
+        let case_text = "try {\n} catch (e) {\n    let e;\n}\n";
+        let units = split_case_units("tests/cases/compiler/catchLetConflict.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/catchLetConflict.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C001".to_owned(), 3)]);
+    }
 }
