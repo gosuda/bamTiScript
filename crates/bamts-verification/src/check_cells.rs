@@ -6956,7 +6956,7 @@ interface I {
         let pragmas = CasePragmas {
             options: vec![
                 ("strict".to_owned(), vec!["false".to_owned()]),
-                ("alwaysStrict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
             ],
             no_types_and_symbols: false,
         };
@@ -6969,6 +6969,52 @@ interface I {
             .map(|d| (d.code.clone(), d.position.line))
             .collect();
         assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 2)]);
+    }
+    /// Guard pair: the es5 block-function diagnostic gates on scope
+    /// strictness. The same shape reports under default (strict)
+    /// pragmas and stays silent with strict off, which locks the
+    /// pragma-to-sloppy path the sloppy pin above relies on.
+    #[test]
+    fn es5_block_function_reports_in_strict_scope() {
+        let case_text = "declare var c: boolean;\nif (c) {\nfunction g() {\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/es5StrictScope.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/es5StrictScope.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![("target".to_owned(), vec!["es5".to_owned()])],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C040".to_owned(), 3)]);
+    }
+    #[test]
+    fn es5_block_function_silent_in_sloppy_scope() {
+        let case_text = "declare var c: boolean;\nif (c) {\nfunction g() {\n}\n}\n";
+        let units = split_case_units("tests/cases/compiler/es5SloppyScope.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/es5SloppyScope.ts", &units);
+        let pragmas = CasePragmas {
+            options: vec![
+                ("target".to_owned(), vec!["es5".to_owned()]),
+                ("strict".to_owned(), vec!["false".to_owned()]),
+                ("alwaysstrict".to_owned(), vec!["false".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
 
     /// Guard: a use inside the inner loop resolves (the inner loop-local
