@@ -10878,24 +10878,10 @@ impl<'src> Binder<'src> {
         // type-side or value-side owners in every declaration order.
         let pure_namespace = self.symbols[symbol.get() as usize].kind == SymbolKind::Namespace;
         if pure_namespace {
-            let mut member_types = Vec::new();
-            if let Some(export_scope) = self.namespace_export_scopes.get(&symbol) {
-                for (name, member) in &self.scopes[export_scope.0 as usize].values {
-                    let kind = self.symbols[member.get() as usize].kind;
-                    if matches!(
-                        kind,
-                        SymbolKind::Interface | SymbolKind::TypeAlias | SymbolKind::TypeParameter
-                    ) {
-                        continue;
-                    }
-                    member_types.push((name.clone(), self.symbol_types[member.get() as usize]));
-                }
-            }
-            let properties = member_types
-                .into_iter()
-                .map(|(name, type_id)| PropertyType::new(name, false, type_id))
-                .collect();
-            let structural = self.types.object_type(properties);
+            // Headers and early uses need the constructor shell here;
+            // member population belongs solely to the resolve-end
+            // finalizer, which sees body-checked types.
+            let structural = self.types.object_type(Vec::new());
             let constructor = self.types.constructor_type(symbol, Vec::new(), structural);
             self.symbol_types[symbol.get() as usize] = constructor;
         }
