@@ -151,14 +151,30 @@ fn authority_case_path(logical: &str) -> PathBuf {
 /// Resolve the baseline file for a case stem and its compile options.
 fn resolve_baseline_fs(stem: &str, pragmas: &CasePragmas) -> Option<PathBuf> {
     let base = baseline_dir();
-    let plain = base.join(format!("{stem}.types"));
-    let mut variants: Vec<(String, PathBuf)> = Vec::new();
-
+    // Authority trees nest baselines one level down
+    // (`reference/<area>/*.types`); scan the top level and one down.
+    let mut dirs = vec![base.clone()];
     if let Ok(entries) = fs::read_dir(&base) {
+        dirs.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir()),
+        );
+    }
+    let plain_name = format!("{stem}.types");
+    let prefix = format!("{stem}(");
+    let mut plain: Option<PathBuf> = None;
+    let mut variants: Vec<(String, PathBuf)> = Vec::new();
+    for dir in &dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            let prefix = format!("{stem}(");
-            if name.starts_with(&prefix) && name.ends_with(").types") {
+            if name == plain_name {
+                plain = Some(entry.path());
+            } else if name.starts_with(&prefix) && name.ends_with(").types") {
                 let suffix = &name[prefix.len()..name.len() - ".types".len() - 1];
                 variants.push((suffix.to_owned(), entry.path()));
             }
@@ -181,7 +197,7 @@ fn resolve_baseline_fs(stem: &str, pragmas: &CasePragmas) -> Option<PathBuf> {
         }
     }
 
-    if plain.exists() {
+    if let Some(plain) = plain {
         return Some(plain);
     }
 
