@@ -17983,9 +17983,13 @@ impl<'src> Binder<'src> {
                 }
                 // Otherwise a type-only export is not a runtime property:
                 // report the miss instead of falling to a silent `any`.
-                if self.scopes[member_scope.0 as usize]
-                    .type_binding(name_str.as_str())
-                    .is_some()
+                // Exception: callable synthesis provides `Function.call`
+                // downstream, so a same-named type must not mask it.
+                let call_synthesized = kind == SymbolKind::Function && name_str.as_str() == "call";
+                if !call_synthesized
+                    && self.scopes[member_scope.0 as usize]
+                        .type_binding(name_str.as_str())
+                        .is_some()
                 {
                     let property_range = match property {
                         MemberProperty::Named(identifier) => identifier.range(),

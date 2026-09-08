@@ -3989,6 +3989,25 @@ mod tests {
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
 
+    /// Regression: callable synthesis survives same-named type exports.
+    /// `f.call` resolves through `Function.call` even with
+    /// `export type call` present; `apply`/`bind` are unaffected.
+    #[test]
+    fn callable_member_survives_type_name_collision() {
+        let case_text = "function f() {\n}\nnamespace f {\n    export type call = string;\n}\nf.call(undefined);\nconst g = f.apply;\nconst h = f.bind;\n";
+        let units = split_case_units("tests/cases/compiler/callableTypeCollision.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/callableTypeCollision.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
     /// Regression: nested namespaces contribute finalized constructors.
     /// The inner namespace finalizes before the outer snapshots it, so
     /// the outer structural carries the inner member types, not a shell.
