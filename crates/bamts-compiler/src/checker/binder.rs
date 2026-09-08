@@ -10458,8 +10458,10 @@ impl<'src> Binder<'src> {
                 // resolve pass declares it in the block scope, so the
                 // pre-pass must not leak it into the enclosing scope.
                 // Unbraced control-flow bodies create no scope, so they
-                // pass `in_block` through instead of setting it. `var`
-                // and top-level/sloppy functions hoist as before.
+                // pass `in_block` through instead of setting it; `switch`
+                // is the exception because the resolve pass binds its
+                // cases in a Block child scope. `var` and
+                // top-level/sloppy functions hoist as before.
                 let strict_block = in_block && self.scopes[scope.0 as usize].strict;
                 if let Some(name) = &function.function.name
                     && !strict_block
@@ -10483,8 +10485,11 @@ impl<'src> Binder<'src> {
                 }
             }
             Statement::Switch(statement) => {
+                // The resolve pass binds case consequents in a Block
+                // child scope, so case functions are switch-scoped:
+                // suppress the enclosing pre-declaration like a block.
                 for case in &statement.cases {
-                    self.bind_hoisted_statements(&case.data().consequent, scope, in_block);
+                    self.bind_hoisted_statements(&case.data().consequent, scope, true);
                 }
             }
             Statement::For(for_statement) => {

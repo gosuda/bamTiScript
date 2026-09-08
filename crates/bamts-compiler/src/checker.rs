@@ -13797,6 +13797,37 @@ class B extends A {
         );
         assert_eq!(checker_codes_of(&result), ["BAMTS-C002"]);
     }
+
+    #[test]
+    fn strict_switch_case_function_does_not_leak_to_module_scope() {
+        // The resolve pass binds case consequents in a Block child
+        // scope, so the case function is switch-scoped: the in-switch
+        // use resolves while the module-scope use reports C002.
+        let result = check_text_with(
+            "declare var x: number;\nswitch (x) { case 1: function f() { } f(); }\nf();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert_eq!(checker_codes_of(&result), ["BAMTS-C002"]);
+    }
+
+    #[test]
+    fn strict_unbraced_while_body_function_still_hoists() {
+        // Loop bodies create no scope either: the strict function
+        // hoists to the enclosing scope and the later use resolves.
+        let result = check_text_with(
+            "declare var cond: boolean;\nwhile (cond) function w() { }\nw();",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
     #[test]
     fn f4_computed_symbol_object_members_accept_without_errors() {
         // Upstream acceptSymbolAsWeakType expects zero diagnostics; symbol
