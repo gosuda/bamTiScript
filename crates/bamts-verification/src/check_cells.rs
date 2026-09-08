@@ -715,31 +715,39 @@ pub fn resolve_baseline_file(
         .filter_map(|(name, values)| values.first().map(|v| (name.clone(), v.clone())))
         .collect();
     if !compile_options.is_empty() {
-        let matches: Vec<_> = variants
+        let matches: Vec<&(String, std::path::PathBuf, bool)> = variants
             .iter()
             .filter(|(suffix, _, _)| baseline_suffix_matches(suffix, &compile_options))
             .collect();
-        // Option-compatible variants rank most-specific first; owning
-        // area breaks specificity ties, then filename, then full path
-        // for determinism. Never an unmatched file. `matches` may be
-        // empty when no variant fits; the plain fallback below covers
-        // that case.
-        if !matches.is_empty() {
-            // Pool rows are (specificity, in_area, suffix, path).
-            let mut pool: Vec<(usize, bool, &str, &std::path::PathBuf)> = matches
+        // Baselines are per-case files: a same-stem variant in another
+        // area belongs to another case (the twin precedent), so owning
+        // matches scope the search whenever any exist. Specificity ranks
+        // within the pool, then filename, then full path.
+        let owned: Vec<&(String, std::path::PathBuf, bool)> = matches
+            .iter()
+            .filter(|candidate| candidate.2)
+            .map(|candidate| *candidate)
+            .collect();
+        let pool_source = if owned.is_empty() { matches } else { owned };
+        if !pool_source.is_empty() {
+            // Pool rows are (specificity, suffix, path).
+            let mut pool: Vec<(usize, &str, &std::path::PathBuf)> = pool_source
                 .iter()
-                .map(|(suffix, path, in_area)| {
-                    let specificity = suffix.split(',').filter(|part| part.contains('=')).count();
-                    (specificity, *in_area, suffix.as_str(), path)
+                .map(|candidate| {
+                    let specificity = candidate
+                        .0
+                        .split(',')
+                        .filter(|part| part.contains('='))
+                        .count();
+                    (specificity, candidate.0.as_str(), &candidate.1)
                 })
                 .collect();
             pool.sort_by(|a, b| {
                 b.0.cmp(&a.0)
-                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| a.1.cmp(b.1))
                     .then_with(|| a.2.cmp(b.2))
-                    .then_with(|| a.3.cmp(b.3))
             });
-            return Some(pool[0].3.clone());
+            return Some(pool[0].2.clone());
         }
     }
     if let Some(plain) = plain {
@@ -6856,8 +6864,10 @@ interface I {
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
-    fn baseline_file_specificity_beats_owning_area() {
-        // System temp dir honors TMPDIR; pid-suffixed and removed after use.
+    fn baseline_file_owning_area_scopes_variant_search() {
+        // A same-stem variant in another area belongs to another case,
+        // so owning matches win even when the other variant is more
+        // specific. Specificity ranks within one area only.
         let root = std::env::temp_dir().join(format!("bamts-specarea-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for area in ["compiler", "other"] {
@@ -6878,7 +6888,7 @@ interface I {
         };
         assert_eq!(
             resolve_baseline_file(&root, "amb", "compiler", "types", &pragmas),
-            Some(root.join("other/amb(target=es5,module=commonjs).types"))
+            Some(root.join("compiler/amb(target=es5).types"))
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -6902,5 +6912,4 @@ interface I {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
-
 }
