@@ -5543,6 +5543,10 @@ pub struct SemanticModel {
     /// class declarations; this map holds the `typeof C` constructor type
     /// needed for value references and `typeof` queries.
     class_constructor_types: HashMap<SymbolId, TypeId>,
+    /// Constructor (`typeof E`) types keyed by the enum symbol, mirroring
+    /// the class split: instance type in `symbol_types`, value-side
+    /// constructor here for cross-file references and queries.
+    enum_constructor_types: HashMap<SymbolId, TypeId>,
     /// Namespace declaration node to the local scope holding its member
     /// bindings, used by declaration emit to resolve unqualified names
     /// inside namespace bodies.
@@ -5614,6 +5618,16 @@ impl SemanticModel {
     #[must_use]
     pub fn constructor_type(&self, id: SymbolId) -> TypeId {
         self.class_constructor_types
+            .get(&id)
+            .copied()
+            .unwrap_or(self.symbol_types[id.0 as usize])
+    }
+
+    /// Returns the value-side constructor type for an enum symbol, or the
+    /// symbol's declared type if no constructor type was recorded.
+    #[must_use]
+    pub fn enum_constructor_type(&self, id: SymbolId) -> TypeId {
+        self.enum_constructor_types
             .get(&id)
             .copied()
             .unwrap_or(self.symbol_types[id.0 as usize])
@@ -9434,6 +9448,7 @@ impl<'src> Binder<'src> {
             enum_facts: EnumFacts::unchecked(),
             namespace_facts: NamespaceFacts::unchecked(),
             ambient_modules: std::mem::take(&mut self.ambient_modules),
+            enum_constructor_types: std::mem::take(&mut self.enum_constructor_types),
             class_constructor_types: std::mem::take(&mut self.class_constructor_types),
             namespace_local_scopes: std::mem::take(&mut self.namespace_local_scopes),
         };
@@ -10638,6 +10653,46 @@ impl<'src> Binder<'src> {
         }
     }
 
+    /// Build a `typeof S` constructor from value-member types. Numeric
+    /// enums additionally carry the reverse-mapping index signature
+    /// (`E[0]: string`); namespaces and string enums carry members only.
+    fn constructor_with_members(
+        &mut self,
+        symbol: SymbolId,
+        member_types: Vec<(String, TypeId)>,
+        numeric_index: bool,
+    ) -> TypeId {
+        let properties = member_types
+            .into_iter()
+            .map(|(name, type_id)| PropertyType::new(name, false, type_id))
+            .collect();
+        let mut object = ObjectType {
+            properties,
+            call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        };
+        if numeric_index {
+            object.index_signatures.push(IndexSignature {
+                readonly: false,
+                parameters: vec![FunctionParameter::new(
+                    "index".to_owned(),
+                    self.types.number(),
+                    false,
+                    false,
+                )],
+                value_type: self.types.string(),
+                declaring_types: Vec::new(),
+            });
+        }
+        let structural = self.types.object_type_with_members(object);
+        self.types.constructor_type(symbol, Vec::new(), structural)
+    }
+
     fn bind_enum(
         &mut self,
         declaration: &'src crate::syntax::EnumDeclaration,
@@ -10730,12 +10785,7 @@ impl<'src> Binder<'src> {
                 ));
             }
         }
-        let properties = member_types
-            .into_iter()
-            .map(|(name, type_id)| PropertyType::new(name, false, type_id))
-            .collect();
-        let structural = self.types.object_type(properties);
-        let constructor = self.types.constructor_type(symbol, Vec::new(), structural);
+        let constructor = self.constructor_with_members(symbol, member_types, accumulated_numeric);
         self.enum_constructor_types.insert(symbol, constructor);
         self.enum_declaration_symbols.insert(declaration_id, symbol);
         self.enum_declarations.push(EnumDeclarationBinding {
@@ -10868,21 +10918,16 @@ impl<'src> Binder<'src> {
             self.bind_hoisted_statement(statement, target);
         }
         // The declaration symbol's type is the namespace constructor
-        // (`>M : typeof M` in .types baselines), mirroring how class
-        // declarations write the static type. The structural object
-        // carries the exported value members so aliases, assignments,
-        // and member reads through `typeof M` resolve; direct member
-        // access additionally shortcuts through member symbols. Only
-        // namespace-kind symbols take this write: merged partners
-        // (enum, interface, class, alias, function) keep their own
-        // type-side or value-side owners in every declaration order.
+        // (`>M : typeof M` in .types baselines). Only namespace-kind
+        // symbols take this write: merged partners (enum, interface,
+        // class, alias, function) keep their own type-side or
+        // value-side owners in every declaration order.
         let pure_namespace = self.symbols[symbol.get() as usize].kind == SymbolKind::Namespace;
         if pure_namespace {
             // Headers and early uses need the constructor shell here;
             // member population belongs solely to the resolve-end
             // finalizer, which sees body-checked types.
-            let structural = self.types.object_type(Vec::new());
-            let constructor = self.types.constructor_type(symbol, Vec::new(), structural);
+            let constructor = self.constructor_with_members(symbol, Vec::new(), false);
             self.symbol_types[symbol.get() as usize] = constructor;
         }
     }
@@ -12259,9 +12304,10 @@ impl<'src> Binder<'src> {
 
     /// Refresh a pure namespace's constructor with body-checked member
     /// types. Bind-time member slots are unresolved placeholders, so the
-    /// constructor built in `bind_namespace` is refreshed here, after the
-    /// body has been checked, with the same value-member filter. Merged
-    /// partners keep their own owners; unknown statements are skipped.
+    /// shell built in `bind_namespace` is refreshed here, after the body
+    /// has been checked. Enum-merged namespaces additionally union the
+    /// enum members into the enum's value-side constructor; every other
+    /// merged partner keeps its own owner. Unknown statements are skipped.
     fn finalize_namespace_constructor(&mut self, statement_id: NodeId) {
         let mut target = None;
         for binding in &self.namespace_declarations {
@@ -12273,10 +12319,21 @@ impl<'src> Binder<'src> {
         let Some(symbol) = target else {
             return;
         };
-        if self.symbols[symbol.get() as usize].kind != SymbolKind::Namespace {
+        let kind = self.symbols[symbol.get() as usize].kind;
+        let merged_enum =
+            kind == SymbolKind::Enum && self.enum_constructor_types.contains_key(&symbol);
+        if kind != SymbolKind::Namespace && !merged_enum {
             return;
         }
         let mut member_types = Vec::new();
+        if merged_enum && let Some(members) = self.enum_member_symbols_by_name.get(&symbol) {
+            for (name, member) in members {
+                member_types.push((
+                    name.to_utf8_lossy(),
+                    self.symbol_types[member.get() as usize],
+                ));
+            }
+        }
         if let Some(export_scope) = self.namespace_export_scopes.get(&symbol) {
             for (name, member) in &self.scopes[export_scope.0 as usize].values {
                 let kind = self.symbols[member.get() as usize].kind;
@@ -12289,17 +12346,20 @@ impl<'src> Binder<'src> {
                 member_types.push((name.clone(), self.symbol_types[member.get() as usize]));
             }
         }
-        let properties = member_types
-            .into_iter()
-            .map(|(name, type_id)| PropertyType::new(name, false, type_id))
-            .collect();
-        let structural = self.types.object_type(properties);
-        let constructor = self.types.constructor_type(symbol, Vec::new(), structural);
-        // Seal both the slot and the lazy state: an earlier lazy build
-        // may have sealed an empty structural, and resolve-path readers
-        // must see the same constructor as direct slot readers.
-        self.symbol_types[symbol.get() as usize] = constructor;
-        self.type_state[symbol.get() as usize] = TypeState::Done(constructor);
+        let numeric_index = matches!(
+            self.type_defs.get(&symbol),
+            Some(TypeDef::Enum { numeric: true })
+        );
+        let constructor = self.constructor_with_members(symbol, member_types, numeric_index);
+        if merged_enum {
+            self.enum_constructor_types.insert(symbol, constructor);
+        } else {
+            // Seal both the slot and the lazy state: an earlier lazy build
+            // may have sealed an empty structural, and resolve-path readers
+            // must see the same constructor as direct slot readers.
+            self.symbol_types[symbol.get() as usize] = constructor;
+            self.type_state[symbol.get() as usize] = TypeState::Done(constructor);
+        }
     }
 
     fn resolve_statement(&mut self, statement: &'src crate::syntax::Stmt, scope: ScopeId) {
@@ -19947,8 +20007,7 @@ impl<'src> Binder<'src> {
             // constructor is built on demand so lazy resolution can
             // never clobber the bind-time write with the error type.
             if self.symbols[symbol.get() as usize].kind == SymbolKind::Namespace {
-                let structural = self.types.object_type(Vec::new());
-                let id = self.types.constructor_type(symbol, Vec::new(), structural);
+                let id = self.constructor_with_members(symbol, Vec::new(), false);
                 self.symbol_types[symbol.get() as usize] = id;
                 self.type_state[symbol.get() as usize] = TypeState::Done(id);
                 return id;

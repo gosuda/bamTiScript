@@ -1328,6 +1328,8 @@ fn build_imported_symbol_type<'a>(
     // static side hangs off it, and the type plane is its instance type.
     let value_type_id = if symbol_kind == SymbolKind::Class {
         source_model.constructor_type(linked.symbol)
+    } else if symbol_kind == SymbolKind::Enum {
+        source_model.enum_constructor_type(linked.symbol)
     } else {
         source_model.symbol_type(linked.symbol)
     };
@@ -1351,9 +1353,10 @@ fn build_imported_symbol_type<'a>(
                 .filter(|_| signatures.all(|entry| entry.signature.return_type() == return_type))
             })
         }
-        (SymbolKind::Interface | SymbolKind::TypeAlias | SymbolKind::Enum, _) => {
-            Some(value_type_id)
-        }
+        (SymbolKind::Interface | SymbolKind::TypeAlias, _) => Some(value_type_id),
+        // Enums split planes like classes: the value plane is the
+        // constructor, the type plane stays the scalar enum type.
+        (SymbolKind::Enum, _) => Some(source_model.symbol_type(linked.symbol)),
         _ => None,
     };
     Some(ImportedSymbolType {
@@ -3566,6 +3569,37 @@ mod tests {
             result.diagnostics()
         );
     }
+
+    #[test]
+    fn enum_reverse_mapping_reads_string() {
+        let result = check_text_with(
+            "enum E {\n    A = 1,\n}\nconst v = E[0];",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn merged_enum_namespace_alias_member() {
+        let result = check_text_with(
+            "enum E {\n    A = 1,\n}\nnamespace E {\n    export const x = 1;\n}\nconst v = E;\nv.x;",
+            ProgramCheckOptions::standard()
+                .with_target(Some("es2015"))
+                .with_strict(true),
+        );
+        assert!(
+            checker_codes_of(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
     #[test]
     fn target_es5_default_lib_resolves_dom_but_not_es2015() {
         // At @target: es5 with default lib, document (dom) resolves but

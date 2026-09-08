@@ -4570,7 +4570,6 @@ export const a2 = 3;
 // @target: es2015\n\
 // @filename: class.ts\n\
 class Point { x: number; }\n\
-\n\
 // @filename: simple.ts\n\
 var a = 1;\n";
         let units = split_case_units(logical, case_text);
@@ -4584,6 +4583,26 @@ var a = 1;\n";
         assert!(
             emitted.contains("=== class.ts ==="),
             "first @Filename unit keeps its section; emitted:\n{emitted}"
+        );
+    }
+
+    /// Cross-file enum values keep their constructor through named
+    /// imports: structural assignment in the importing unit accepts.
+    #[test]
+    fn emit_types_imported_enum_value_assignable() {
+        let logical = "tests/cases/compiler/importedEnumPin.ts";
+        let case_text = "// @filename: e.ts\nenum E {\n    A = 1,\n}\nexport { E };\n// @filename: use.ts\nimport { E } from \"./e\";\nconst v: { A: E } = E;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|line| line == ">v : { A: E; }"),
+            "missing value line:\n{emitted}"
+        );
+        assert!(
+            emitted.lines().any(|line| line == ">E : typeof E"),
+            "missing imported typeof line:\n{emitted}"
         );
     }
 
