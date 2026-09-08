@@ -6029,6 +6029,16 @@ export const t = 1;
             }
             let _ = per_case;
         }
+        // Regression floor, not a parity target: when the authority tree
+        // is present the match ratio must hold; with no authority checked
+        // out the sample is empty and there is nothing to gate.
+        if member_records > 0 {
+            let ratio = matched_records as f64 / member_records as f64;
+            assert!(
+                ratio > 0.7,
+                "enum member record match ratio collapsed to {ratio:.3} ({matched_records}/{member_records})"
+            );
+        }
         let mut report =
             format!("enum_member_access_records: total={member_records} matched={matched_records}");
         for sample in &unmatched_samples {
