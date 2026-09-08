@@ -6815,4 +6815,123 @@ interface I {
             .collect();
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
+    /// Regression: an unbraced for-body function stays loop-scoped (tsc
+    /// TS2304 on the post-loop use); it must not leak outward as `any`.
+    #[test]
+    fn for_body_function_stays_loop_scoped() {
+        let case_text =
+            "declare var cond: boolean;\nfor (; cond;) function f(x: string) {\n}\nf(1);\n";
+        let units = split_case_units("tests/cases/compiler/forBodyFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/forBodyFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 4)]);
+    }
+    /// Regression: a braced for-body function stays loop-scoped too (tsc
+    /// TS2304); only the loop subtree sees it.
+    #[test]
+    fn for_block_body_function_stays_loop_scoped() {
+        let case_text =
+            "declare var cond: boolean;\nfor (; cond;) {\nfunction b(x: string) {\n}\n}\nb(1);\n";
+        let units = split_case_units("tests/cases/compiler/forBlockBodyFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/forBlockBodyFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 6)]);
+    }
+    /// Regression: a for-of body function stays loop-scoped (tsc TS2304).
+    #[test]
+    fn for_of_body_function_stays_loop_scoped() {
+        let case_text = "declare var items: string[];\nfor (const item of items) function h(x: string) {\n}\nh(1);\n";
+        let units = split_case_units("tests/cases/compiler/forOfBodyFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/forOfBodyFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 4)]);
+    }
+    /// Guard: a while-body function still hoists (tsc checks the post-loop
+    /// call: TS2345), so the for-family containment must not leak outward.
+    #[test]
+    fn while_body_function_still_hoists() {
+        let case_text =
+            "declare var cond: boolean;\nwhile (cond) function w(x: string) {\n}\nw(1);\n";
+        let units = split_case_units("tests/cases/compiler/whileBodyFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/whileBodyFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C053".to_owned(), 4)]);
+    }
+    /// Guard: an if-body function still hoists (tsc TS2345 on a bad call).
+    #[test]
+    fn if_body_function_still_hoists() {
+        let case_text = "declare var cond: boolean;\nif (cond) function g(x: string) {\n}\ng(1);\n";
+        let units = split_case_units("tests/cases/compiler/ifBodyFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/ifBodyFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C053".to_owned(), 4)]);
+    }
+    /// Regression: a for-in body function stays loop-scoped (tsc TS2304).
+    #[test]
+    fn for_in_body_function_stays_loop_scoped() {
+        let case_text = "declare var o: any;\nfor (var k in o) function h(x: string) {\n}\nh(1);\n";
+        let units = split_case_units("tests/cases/compiler/forInBodyFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/forInBodyFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 4)]);
+    }
+    /// Regression: containment propagates through nested statements (tsc
+    /// TS2304 for an if-nested function inside a for body).
+    #[test]
+    fn for_nested_if_function_stays_loop_scoped() {
+        let case_text = "declare var cond: boolean;\nfor (; cond;) {\nif (cond) {\nfunction x(x: string) {\n}\n}\n}\nx(1);\n";
+        let units = split_case_units("tests/cases/compiler/forNestedIfFunction.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/forNestedIfFunction.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 8)]);
+    }
 }
