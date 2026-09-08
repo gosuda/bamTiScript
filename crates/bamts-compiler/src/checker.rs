@@ -13700,6 +13700,26 @@ class B extends A {
         assert_eq!(unresolved.range().start().get(), 28);
         assert_eq!(unresolved.range().end().get(), 29);
     }
+
+    #[test]
+    fn static_block_keeps_es5_strict_block_function_rule() {
+        let result = check_text_with(
+            "class C { static { function f() {} } }",
+            ProgramCheckOptions::standard().with_target(Some("es5")),
+        );
+        let codes = checker_codes_of(&result);
+        assert_eq!(codes, ["BAMTS-C040"], "{codes:?}");
+    }
+
+    #[test]
+    fn static_block_keeps_overload_implementation_check() {
+        let result = check_text_with(
+            "class C { static { function f(x: string): string; } }",
+            ProgramCheckOptions::standard(),
+        );
+        let codes = checker_codes_of(&result);
+        assert_eq!(codes, ["BAMTS-C039"], "{codes:?}");
+    }
     #[test]
     fn f4_computed_symbol_object_members_accept_without_errors() {
         // Upstream acceptSymbolAsWeakType expects zero diagnostics; symbol
