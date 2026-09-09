@@ -21,8 +21,8 @@ use std::path::PathBuf;
 
 use bamts_verification::catalog::parse_case_configuration;
 use bamts_verification::check_cells::{
-    CasePragmas, case_stem, compile_case_with_pragmas, emit_types_baseline, entry_virtual_path,
-    parse_case_pragmas, split_case_units,
+    CasePragmas, baseline_area, case_stem, compile_case_with_pragmas, emit_types_baseline,
+    entry_virtual_path, parse_case_pragmas, resolve_baseline_file, split_case_units,
 };
 use bamts_verification::facets::{FacetVerdict, compare_types};
 use bamts_verification::suite::decode_case_source;
@@ -148,128 +148,10 @@ fn authority_case_path(logical: &str) -> PathBuf {
     authority_root().join("tests/cases").join(stripped)
 }
 
-/// The `tests/cases/<area>/` segment owning a harness logical path;
-/// empty when the path carries no area (flat trees).
-fn baseline_area(harness_logical: &str) -> &str {
-    harness_logical
-        .split("cases/")
-        .nth(1)
-        .and_then(|rest| rest.split('/').next())
-        .unwrap_or("")
-}
-
-/// Resolve the baseline file for a case stem and its compile options.
-///
-/// `area` is the `tests/cases/<area>/` segment owning the case; its
-/// directory wins over other areas when one stem exists in several
-/// (e.g. `compiler/` and `conformance/` twins), so a sorted-first
-/// fallback can never diff against the wrong baseline.
+/// Baseline resolution delegates to the shared area-aware implementation
+/// in check_cells so all facet samplers select the same file.
 fn resolve_baseline_fs(stem: &str, area: &str, pragmas: &CasePragmas) -> Option<PathBuf> {
-    resolve_baseline_in(stem, area, pragmas, &baseline_dir())
-}
-
-/// [`resolve_baseline_fs`] over an explicit root, so tests can prove
-/// cross-area twin discrimination against fixture trees.
-fn resolve_baseline_in(
-    stem: &str,
-    area: &str,
-    pragmas: &CasePragmas,
-    base: &std::path::Path,
-) -> Option<PathBuf> {
-    // Authority trees nest baselines one level down
-    // (`reference/<area>/*.types`); scan the top level and one down,
-    // trying the owning area first.
-    let area_dir = base.join(area);
-    let mut dirs = vec![area_dir.clone()];
-    dirs.push(base.to_path_buf());
-    if let Ok(entries) = fs::read_dir(&base) {
-        dirs.extend(
-            entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.is_dir() && path != &area_dir),
-        );
-    }
-    let plain_name = format!("{stem}.types");
-    let prefix = format!("{stem}(");
-    let mut plain: Option<PathBuf> = None;
-    // Third tuple slot marks the owning area; area matches win every
-    // tie-break so cross-area stem twins never misattribute.
-    let mut variants: Vec<(String, PathBuf, bool)> = Vec::new();
-    for dir in &dirs {
-        let in_area = dir == &area_dir;
-        let Ok(entries) = fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name == plain_name && plain.is_none() {
-                plain = Some(entry.path());
-            } else if name.starts_with(&prefix) && name.ends_with(").types") {
-                let suffix = &name[prefix.len()..name.len() - ".types".len() - 1];
-                variants.push((suffix.to_owned(), entry.path(), in_area));
-            }
-        }
-        if plain.is_some() {
-            break;
-        }
-    }
-
-    let compile_options: Vec<(String, String)> = pragmas
-        .options
-        .iter()
-        .filter_map(|(name, values)| values.first().map(|v| (name.clone(), v.clone())))
-        .collect();
-
-    if !compile_options.is_empty() {
-        let matches: Vec<_> = variants
-            .iter()
-            .filter(|(suffix, _, _)| suffix_matches_options(suffix, &compile_options))
-            .collect();
-        let area_matches: Vec<_> = matches.iter().filter(|(_, _, in_area)| *in_area).collect();
-        if area_matches.len() == 1 {
-            return Some(area_matches[0].1.clone());
-        }
-        if matches.len() == 1 {
-            return Some(matches[0].1.clone());
-        }
-    }
-
-    if let Some(plain) = plain {
-        return Some(plain);
-    }
-
-    variants.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-    variants.into_iter().next().map(|(_, p, _)| p)
-}
-
-/// Check if a variant suffix matches compile options.
-fn suffix_matches_options(suffix: &str, compile_options: &[(String, String)]) -> bool {
-    if suffix.is_empty() {
-        return true;
-    }
-    let options: std::collections::HashMap<String, String> = compile_options
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    for part in suffix.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let Some((key, value)) = part.split_once('=') else {
-            return false;
-        };
-        let key = key.trim().to_ascii_lowercase();
-        let value = value.trim().to_ascii_lowercase();
-        let Some(compile_value) = options.get(&key) else {
-            return false;
-        };
-        if compile_value.to_ascii_lowercase() != value {
-            return false;
-        }
-    }
-    true
+    resolve_baseline_file(&baseline_dir(), stem, area, "types", pragmas)
 }
 
 /// Mirror the comparator's whitespace handling: collapse every whitespace run
@@ -1003,28 +885,4 @@ fn types_facet_wrong_expr_diagnostic() {
     for l in &ambiguous {
         eprintln!("  {l}");
     }
-}
-
-/// Cross-area stem twins resolve to the owning area, never to a
-/// sorted-first file from another area.
-#[test]
-fn resolve_prefers_owning_area_for_stem_twins() {
-    // System temp dir honors TMPDIR; pid-suffixed and removed after use.
-    let root = std::env::temp_dir().join(format!("bamts-twin-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    for area in ["compiler", "conformance"] {
-        fs::create_dir_all(root.join(area)).expect("fixture area");
-    }
-    fs::write(root.join("compiler/twin.types"), "compiler").expect("fixture file");
-    fs::write(root.join("conformance/twin.types"), "conformance").expect("fixture file");
-    let pragmas = CasePragmas::default();
-    assert_eq!(
-        resolve_baseline_in("twin", "conformance", &pragmas, &root),
-        Some(root.join("conformance/twin.types"))
-    );
-    assert_eq!(
-        resolve_baseline_in("twin", "compiler", &pragmas, &root),
-        Some(root.join("compiler/twin.types"))
-    );
-    let _ = fs::remove_dir_all(&root);
 }

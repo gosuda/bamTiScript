@@ -647,6 +647,163 @@ pub fn case_stem(logical_path: &str) -> &str {
     name
 }
 
+/// The `tests/cases/<area>/` segment owning a harness logical path;
+/// empty when the path carries no area (flat trees). Shared by the
+/// facet samplers so baseline selection agrees on ownership.
+#[must_use]
+pub fn baseline_area(harness_logical: &str) -> &str {
+    harness_logical
+        .split("cases/")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+}
+
+/// Resolve a `{stem}[ (variant)].{extension}` authority baseline file
+/// under `base`, preferring the owning `area` directory when one stem
+/// exists in several areas, then the variant matching the compile
+/// options. Authority trees nest baselines one level down
+/// (`reference/<area>/*`); the top level is scanned too.
+#[must_use]
+pub fn resolve_baseline_file(
+    base: &Path,
+    stem: &str,
+    area: &str,
+    extension: &str,
+    pragmas: &CasePragmas,
+) -> Option<std::path::PathBuf> {
+    let area_dir = base.join(area);
+    let mut dirs = Vec::new();
+    if !area.is_empty() {
+        dirs.push(area_dir.clone());
+    }
+    dirs.push(base.to_path_buf());
+    if let Ok(entries) = fs::read_dir(base) {
+        // `read_dir` order is filesystem-dependent: sort so the first
+        // plain baseline found is deterministic across machines.
+        let mut siblings: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir() && path != &area_dir)
+            .collect();
+        siblings.sort();
+        dirs.extend(siblings);
+    }
+    let plain_name = format!("{stem}.{extension}");
+    let prefix = format!("{stem}(");
+    let suffix_end = format!(").{extension}");
+    let mut plain: Option<(std::path::PathBuf, bool)> = None;
+    let mut variants: Vec<(String, std::path::PathBuf, bool)> = Vec::new();
+    for dir in &dirs {
+        let in_area = dir == &area_dir;
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == plain_name && plain.is_none() {
+                plain = Some((entry.path(), in_area));
+            } else if name.starts_with(&prefix) && name.ends_with(&suffix_end) {
+                let suffix = &name[prefix.len()..name.len() - suffix_end.len()];
+                variants.push((suffix.to_owned(), entry.path(), in_area));
+            }
+        }
+        if plain.is_some() {
+            break;
+        }
+    }
+    let compile_options: Vec<(String, String)> = pragmas
+        .options
+        .iter()
+        .filter_map(|(name, values)| values.first().map(|v| (name.clone(), v.clone())))
+        .collect();
+    if !compile_options.is_empty() {
+        let matches: Vec<&(String, std::path::PathBuf, bool)> = variants
+            .iter()
+            .filter(|(suffix, _, _)| baseline_suffix_matches(suffix, &compile_options))
+            .collect();
+        // Baselines are per-case files: a same-stem variant in another
+        // area belongs to another case (the twin precedent). When the
+        // owning area holds any stem file, the stem is owned: only
+        // owning variants may match, else the owning plain file covers
+        // generic options, else there is no compatible authority. The
+        // cross-area pool stays for unowned stems only. Specificity
+        // ranks within the pool, then filename, then full path.
+        let owned: Vec<&(String, std::path::PathBuf, bool)> = matches
+            .iter()
+            .filter(|candidate| candidate.2)
+            .map(|candidate| *candidate)
+            .collect();
+        let stem_owned = !owned.is_empty()
+            || variants.iter().any(|candidate| candidate.2)
+            || plain.as_ref().is_some_and(|(_, in_area)| *in_area);
+        let pool_source = if owned.is_empty() {
+            if stem_owned {
+                return plain
+                    .as_ref()
+                    .filter(|(_, in_area)| *in_area)
+                    .map(|(path, _)| path.clone());
+            }
+            matches
+        } else {
+            owned
+        };
+        if !pool_source.is_empty() {
+            // Pool rows are (specificity, suffix, path).
+            let mut pool: Vec<(usize, &str, &std::path::PathBuf)> = pool_source
+                .iter()
+                .map(|candidate| {
+                    let specificity = candidate
+                        .0
+                        .split(',')
+                        .filter(|part| part.contains('='))
+                        .count();
+                    (specificity, candidate.0.as_str(), &candidate.1)
+                })
+                .collect();
+            pool.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| a.1.cmp(b.1))
+                    .then_with(|| a.2.cmp(b.2))
+            });
+            return Some(pool[0].2.clone());
+        }
+    }
+    if let Some((plain, _)) = plain {
+        return Some(plain);
+    }
+    variants.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    variants.into_iter().next().map(|(_, p, _)| p)
+}
+
+/// Whether a `(variant)` suffix selects the given compile options.
+fn baseline_suffix_matches(suffix: &str, compile_options: &[(String, String)]) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    let options: HashMap<String, String> = compile_options
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for part in suffix.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = part.split_once('=') else {
+            return false;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().to_ascii_lowercase();
+        let Some(compile_value) = options.get(&key) else {
+            return false;
+        };
+        if compile_value.to_ascii_lowercase() != value {
+            return false;
+        }
+    }
+    true
+}
 /// Resolve the `.errors.txt` baselines owned by one case, filtered to the
 /// variant that matches the compile options actually used.
 ///
@@ -7140,6 +7297,167 @@ interface I {
             tail_line, ">tail : Symbol(Q.tail, Decl(nonBmpMemberPin.ts, 0, 39))",
             "non-BMP columns must count UTF-16 units:\n{emitted_symbols}"
         );
+    }
+
+    /// Cross-area stem twins resolve to the owning area, never to a
+    /// sorted-first file from another area.
+    #[test]
+    fn baseline_file_prefers_owning_area_for_stem_twins() {
+        // System temp dir honors TMPDIR; pid-suffixed and removed after use.
+        let root = std::env::temp_dir().join(format!("bamts-twins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for area in ["compiler", "conformance"] {
+            std::fs::create_dir_all(root.join(area)).expect("fixture area");
+        }
+        std::fs::write(root.join("compiler/twin.types"), "compiler").expect("fixture");
+        std::fs::write(root.join("conformance/twin.types"), "conformance").expect("fixture");
+        let pragmas = CasePragmas::default();
+        assert_eq!(
+            resolve_baseline_file(&root, "twin", "conformance", "types", &pragmas),
+            Some(root.join("conformance/twin.types"))
+        );
+        assert_eq!(
+            resolve_baseline_file(&root, "twin", "compiler", "types", &pragmas),
+            Some(root.join("compiler/twin.types"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn baseline_file_prefers_most_specific_option_match() {
+        // System temp dir honors TMPDIR; pid-suffixed and removed after use.
+        let root = std::env::temp_dir().join(format!("bamts-specific-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("compiler")).expect("fixture area");
+        std::fs::write(root.join("compiler/amb(target=es5).types"), "loose").expect("fixture");
+        std::fs::write(
+            root.join("compiler/amb(target=es5,module=commonjs).types"),
+            "exact",
+        )
+        .expect("fixture");
+        let pragmas = CasePragmas {
+            options: vec![
+                ("target".to_owned(), vec!["es5".to_owned()]),
+                ("module".to_owned(), vec!["commonjs".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        assert_eq!(
+            resolve_baseline_file(&root, "amb", "compiler", "types", &pragmas),
+            Some(root.join("compiler/amb(target=es5,module=commonjs).types"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn baseline_file_owning_area_scopes_variant_search() {
+        // A same-stem variant in another area belongs to another case,
+        // so owning matches win even when the other variant is more
+        // specific. Specificity ranks within one area only.
+        let root = std::env::temp_dir().join(format!("bamts-specarea-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for area in ["compiler", "other"] {
+            std::fs::create_dir_all(root.join(area)).expect("fixture area");
+        }
+        std::fs::write(root.join("compiler/amb(target=es5).types"), "loose").expect("fixture");
+        std::fs::write(
+            root.join("other/amb(target=es5,module=commonjs).types"),
+            "exact",
+        )
+        .expect("fixture");
+        let pragmas = CasePragmas {
+            options: vec![
+                ("target".to_owned(), vec!["es5".to_owned()]),
+                ("module".to_owned(), vec!["commonjs".to_owned()]),
+            ],
+            no_types_and_symbols: false,
+        };
+        assert_eq!(
+            resolve_baseline_file(&root, "amb", "compiler", "types", &pragmas),
+            Some(root.join("compiler/amb(target=es5).types"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn baseline_file_duplicate_suffix_breaks_tie_by_path() {
+        // System temp dir honors TMPDIR; pid-suffixed and removed after use.
+        let root = std::env::temp_dir().join(format!("bamts-duptie-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for area in ["compiler", "aaa", "bbb"] {
+            std::fs::create_dir_all(root.join(area)).expect("fixture area");
+        }
+        std::fs::write(root.join("aaa/dup(target=es5).types"), "a").expect("fixture");
+        std::fs::write(root.join("bbb/dup(target=es5).types"), "b").expect("fixture");
+        let pragmas = CasePragmas {
+            options: vec![("target".to_owned(), vec!["es5".to_owned()])],
+            no_types_and_symbols: false,
+        };
+        assert_eq!(
+            resolve_baseline_file(&root, "dup", "compiler", "types", &pragmas),
+            Some(root.join("aaa/dup(target=es5).types"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn baseline_file_sibling_order_is_sorted() {
+        // bbb is created before aaa on purpose: directory enumeration
+        // order must not decide which plain baseline wins.
+        let root = std::env::temp_dir().join(format!("bamts-sibord-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for area in ["compiler", "bbb", "aaa"] {
+            std::fs::create_dir_all(root.join(area)).expect("fixture area");
+        }
+        std::fs::write(root.join("bbb/dup.types"), "b").expect("fixture");
+        std::fs::write(root.join("aaa/dup.types"), "a").expect("fixture");
+        let pragmas = CasePragmas::default();
+        assert_eq!(
+            resolve_baseline_file(&root, "dup", "compiler", "types", &pragmas),
+            Some(root.join("aaa/dup.types"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn baseline_file_owned_but_incompatible_yields_none() {
+        // The owning area claims the stem but holds no compatible
+        // variant: the sibling-area match belongs to another case, so
+        // the resolver reports no authority instead of comparing
+        // against an unrelated baseline.
+        let root = std::env::temp_dir().join(format!("bamts-ownnone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for area in ["compiler", "other"] {
+            std::fs::create_dir_all(root.join(area)).expect("fixture area");
+        }
+        std::fs::write(root.join("compiler/amb(target=es5).types"), "b").expect("fixture");
+        std::fs::write(root.join("other/amb(target=es2015).types"), "b").expect("fixture");
+        let pragmas = CasePragmas {
+            options: vec![("target".to_owned(), vec!["es2015".to_owned()])],
+            no_types_and_symbols: false,
+        };
+        assert_eq!(
+            resolve_baseline_file(&root, "amb", "compiler", "types", &pragmas),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn baseline_file_owned_plain_covers_incompatible_options() {
+        // An owned stem with no compatible variant still falls back to
+        // the owning plain file rather than a sibling-area variant.
+        let root = std::env::temp_dir().join(format!("bamts-ownplain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for area in ["compiler", "other"] {
+            std::fs::create_dir_all(root.join(area)).expect("fixture area");
+        }
+        std::fs::write(root.join("compiler/amb.types"), "b").expect("fixture");
+        std::fs::write(root.join("compiler/amb(target=es5).types"), "b").expect("fixture");
+        std::fs::write(root.join("other/amb(target=es2015).types"), "b").expect("fixture");
+        let pragmas = CasePragmas {
+            options: vec![("target".to_owned(), vec!["es2015".to_owned()])],
+            no_types_and_symbols: false,
+        };
+        assert_eq!(
+            resolve_baseline_file(&root, "amb", "compiler", "types", &pragmas),
+            Some(root.join("compiler/amb.types"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
     /// Regression: a catch-body function shadows its parameter. The body
     /// binds in a child block like the try body, so tsc-accepted code in

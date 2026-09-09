@@ -25,9 +25,9 @@ use std::path::PathBuf;
 
 use bamts_compiler::pipeline::FrontendMode;
 use bamts_verification::check_cells::{
-    CasePragmas, case_stem, compile_case_frontend, emit_declaration_baseline,
+    CasePragmas, baseline_area, case_stem, compile_case_frontend, emit_declaration_baseline,
     emit_javascript_baseline, emit_source_map_baseline, entry_virtual_path, extract_dts_sections,
-    parse_case_pragmas, split_case_units,
+    parse_case_pragmas, resolve_baseline_file, split_case_units,
 };
 use bamts_verification::facets::{FacetVerdict, compare_js_emit, compare_source_map};
 
@@ -130,76 +130,15 @@ fn authority_case_path(logical: &str) -> PathBuf {
     authority_root().join("tests/cases").join(stripped)
 }
 
-/// Resolve the baseline file for a case stem, extension, and compile options.
-/// Mirrors `resolve_stem_baseline` but works directly on the filesystem.
-fn resolve_baseline_fs(stem: &str, pragmas: &CasePragmas, extension: &str) -> Option<PathBuf> {
-    let base = baseline_dir();
-    let plain = base.join(format!("{stem}.{extension}"));
-    let suffix_end = format!(").{extension}");
-    let prefix = format!("{stem}(");
-    let mut variants: Vec<(String, PathBuf)> = Vec::new();
-
-    if let Ok(entries) = fs::read_dir(&base) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&prefix) && name.ends_with(&suffix_end) {
-                let suffix = &name[prefix.len()..name.len() - suffix_end.len()];
-                variants.push((suffix.to_owned(), entry.path()));
-            }
-        }
-    }
-
-    let compile_options: Vec<(String, String)> = pragmas
-        .options
-        .iter()
-        .filter_map(|(name, values)| values.first().map(|v| (name.clone(), v.clone())))
-        .collect();
-
-    if !compile_options.is_empty() {
-        let matches: Vec<_> = variants
-            .iter()
-            .filter(|(suffix, _)| suffix_matches_options(suffix, &compile_options))
-            .collect();
-        if matches.len() == 1 {
-            return Some(matches[0].1.clone());
-        }
-    }
-
-    if plain.exists() {
-        return Some(plain);
-    }
-
-    variants.sort_by(|a, b| a.0.cmp(&b.0));
-    variants.into_iter().next().map(|(_, p)| p)
-}
-
-/// Check if a variant suffix matches compile options (mirrors harness logic).
-fn suffix_matches_options(suffix: &str, compile_options: &[(String, String)]) -> bool {
-    if suffix.is_empty() {
-        return true;
-    }
-    let options: std::collections::HashMap<String, String> = compile_options
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    for part in suffix.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let Some((key, value)) = part.split_once('=') else {
-            return false;
-        };
-        let key = key.trim().to_ascii_lowercase();
-        let value = value.trim().to_ascii_lowercase();
-        let Some(compile_value) = options.get(&key) else {
-            return false;
-        };
-        if compile_value.to_ascii_lowercase() != value {
-            return false;
-        }
-    }
-    true
+/// Baseline resolution delegates to the shared area-aware implementation
+/// in check_cells so all facet samplers select the same file.
+fn resolve_baseline_fs(
+    stem: &str,
+    area: &str,
+    pragmas: &CasePragmas,
+    extension: &str,
+) -> Option<PathBuf> {
+    resolve_baseline_file(&baseline_dir(), stem, area, extension, pragmas)
 }
 
 /// Extract compile option pairs from pragmas (mirrors private harness helper).
@@ -700,17 +639,18 @@ fn declaration_facet_sample() {
         };
 
         let stem = case_stem(&harness_logical);
-        let baseline_path = match resolve_baseline_fs(stem, &pragmas, extension) {
-            Some(path) => path,
-            None => {
-                results.push(AnalysisResult {
-                    case: case.logical_path.clone(),
-                    cfg: case.cfg.clone(),
-                    outcome: Outcome::NoBaseline,
-                });
-                continue;
-            }
-        };
+        let baseline_path =
+            match resolve_baseline_fs(stem, baseline_area(&harness_logical), &pragmas, extension) {
+                Some(path) => path,
+                None => {
+                    results.push(AnalysisResult {
+                        case: case.logical_path.clone(),
+                        cfg: case.cfg.clone(),
+                        outcome: Outcome::NoBaseline,
+                    });
+                    continue;
+                }
+            };
 
         let raw_baseline = match fs::read_to_string(&baseline_path) {
             Ok(text) => text,
