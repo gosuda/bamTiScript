@@ -12939,13 +12939,6 @@ impl<'src> Binder<'src> {
             .chain(self.node_types.values_mut())
             .filter(|ty| **ty == existing)
             .for_each(|ty| *ty = current);
-        self.type_state
-            .iter_mut()
-            .filter_map(|state| match state {
-                TypeState::Done(id) if *id == existing => Some(state),
-                _ => None,
-            })
-            .for_each(|state| *state = TypeState::Done(current));
         self.typed_expressions
             .iter_mut()
             .filter(|entry| entry.1 == existing)

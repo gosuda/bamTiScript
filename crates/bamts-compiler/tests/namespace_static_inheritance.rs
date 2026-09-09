@@ -130,7 +130,7 @@ fn an_early_constructor_alias_assigns_to_required_structural_type() {
 }
 
 #[test]
-#[ignore = "type-state forward does not cover typeof-alias resolved before merge; tracks with representation fix"]
+#[ignore = "typeof-alias resolved before merge stays stale with and without the landed slot forward; tracks with representation fix"]
 fn a_type_alias_captured_before_merge_sees_later_exports() {
     assert_reads_clean(
         "class C {}\nclass D extends C {}\ntype A = typeof D;\nconst force: A = D;\n\
