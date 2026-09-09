@@ -12916,11 +12916,27 @@ impl<'src> Binder<'src> {
                 }
             }
         }
-        if changed {
-            let structural = self.types.object_type_with_members(object);
-            let constructor = self.types.constructor_type(owner, arguments, structural);
-            self.class_constructor_types.insert(owner, constructor);
+        if !changed {
+            return;
         }
+        let structural = self.types.object_type_with_members(object);
+        let constructor = self.types.constructor_type(owner, arguments, structural);
+        self.class_constructor_types.insert(owner, constructor);
+        self.refresh_captured_constructor_views(existing, constructor);
+    }
+
+    /// Refresh value views captured before a namespace augmentation.
+    /// `const alias = D` stores the pre-merge constructor id, so a later
+    /// export would stay invisible through the alias while `D` sees it.
+    /// Only top-level exact id matches move forward; reassigned variables
+    /// hold a different id and stay untouched. Captures nested inside
+    /// interned types need a representation fix tracked separately.
+    fn refresh_captured_constructor_views(&mut self, existing: TypeId, current: TypeId) {
+        self.symbol_types
+            .iter_mut()
+            .chain(self.node_types.values_mut())
+            .filter(|ty| **ty == existing)
+            .for_each(|ty| *ty = current);
     }
 
     fn finalize_namespace_constructor(&mut self, statement_id: NodeId) {

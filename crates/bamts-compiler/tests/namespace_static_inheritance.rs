@@ -93,11 +93,78 @@ fn a_base_export_still_refreshes_an_inherited_snapshot() {
 }
 
 #[test]
+fn an_early_constructor_alias_sees_later_namespace_exports() {
+    assert_reads_clean(
+        "class C {}\nclass D extends C {}\nconst alias = D;\n\
+         namespace C { export const x = 1; }\nconst n: 1 = alias.x;\n",
+        "an alias shares the constructor's later namespace exports",
+    );
+}
+
+#[test]
 fn an_own_static_colliding_with_its_own_namespace_is_a_duplicate() {
     // The precedence rules must not silence a genuine collision on one class.
     assert!(
         !checker_codes("class C { static x: 1 = 1; }\nnamespace C { export const x = 2; }\n")
             .is_empty(),
         "a class static colliding with its own namespace export is a duplicate"
+    );
+}
+
+#[test]
+fn an_early_constructor_alias_sees_later_namespace_exports_by_index() {
+    assert_reads_clean(
+        "class C {}\nclass D extends C {}\nconst alias = D;\n\
+         namespace C { export const x: 1 = 1; }\nconst n: 1 = alias[\"x\"];\n",
+        "an alias shares the constructor's later namespace exports by index",
+    );
+}
+
+#[test]
+fn an_early_constructor_alias_assigns_to_required_structural_type() {
+    assert_reads_clean(
+        "class C {}\nclass D extends C {}\nconst alias = D;\n\
+         namespace C { export const x: 1 = 1; }\nconst obj: { x: 1 } = alias;\n",
+        "an alias is assignable to a structural type requiring a namespace export",
+    );
+}
+
+// Pre-existing gap, not stale-alias specific: `keyof typeof D` fails even
+// without an alias, so `keyof` on constructors needs its own fix.
+#[test]
+#[ignore = "keyof on constructors is unreduced even direct; tracks separately"]
+fn an_early_constructor_alias_keyof_includes_later_namespace_exports() {
+    assert_reads_clean(
+        "class C {}\nclass D extends C {}\nconst alias = D;\n\
+         namespace C { export const x: 1 = 1; }\ntype K = keyof typeof alias;\nconst k: K = \"x\";\n",
+        "an alias's keyof includes the constructor's later namespace exports",
+    );
+}
+
+// Pre-existing gap, not stale-alias specific: `new D<number>(1)` fails even
+// without an alias, so generic construct through a namespace-augmented base
+// needs its own fix.
+#[test]
+#[ignore = "generic construct with namespace augmentation fails direct; tracks separately"]
+fn a_generic_constructor_alias_keeps_construct_signatures_and_additions() {
+    assert_reads_clean(
+        "class C<T> { constructor(public value: T) {} }\n\
+         class D<U> extends C<U> {}\nconst alias = D;\n\
+         namespace C { export const x: 1 = 1; }\n\
+         const v: 1 = alias.x;\n\
+         const n: number = new D<number>(1).value;\n",
+        "a generic constructor alias keeps construct signatures and namespace exports",
+    );
+}
+
+#[test]
+fn an_explicitly_structural_alias_does_not_gain_namespace_exports() {
+    assert!(
+        !checker_codes(
+            "class C {}\nclass D extends C {}\nconst alias: { prototype: C } = D;\n\
+             namespace C { export const x: 1 = 1; }\nconst n: 1 = alias.x;\n"
+        )
+        .is_empty(),
+        "a structural alias must not gain namespace exports"
     );
 }
