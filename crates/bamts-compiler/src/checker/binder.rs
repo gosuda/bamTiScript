@@ -23589,10 +23589,10 @@ impl<'src> Binder<'src> {
             Expression::Member(member) => {
                 let container = self.enum_owner_symbol(&member.object, scope)?;
                 let member_scope = self.container_member_scope(container)?;
-                let MemberProperty::Named(name) = &member.property else {
-                    return None;
-                };
-                self.scopes[member_scope.0 as usize].value(self.identifier_text(name).as_ref())
+                // An intermediate segment reads the same way as the final
+                // one, so `N.F` and `N["F"]` both resolve.
+                let name = enum_plan::cook_member_property_name(self.source, &member.property)?;
+                self.scopes[member_scope.0 as usize].value(name.to_utf8_lossy().as_str())
             }
             _ => None,
         }
