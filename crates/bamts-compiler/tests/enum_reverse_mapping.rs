@@ -44,8 +44,10 @@ fn string_members_reject_a_numeric_lookup() {
         "enum E { A = \"a\", B = A }\nconst v = E[0];\n",
         "enum E { A = \"a\", B = E.A }\nconst v = E[0];\n",
         "enum E { A = \"a\", B = E[\"A\"] }\nconst v = E[0];\n",
-        // A member of another enum, which resolves by symbol.
+        // A member of another enum, which resolves by symbol, whether it
+        // is named directly or through a namespace.
         "enum F { A = \"a\" }\nenum E { B = F.A }\nconst v = E[0];\n",
+        "namespace N { export enum F { A = \"a\" } }\nenum E { B = N.F.A }\nconst v = E[0];\n",
         // A second declaration continues the first one's classification.
         "enum E { A = \"a\" }\nenum E { B = A }\nconst v = E[0];\n",
         // Concatenation is a string when either side is.
@@ -71,6 +73,7 @@ fn numeric_members_keep_their_reverse_mapping() {
         // it names this enum or another one.
         "enum E { A = 1, B = A + A }\nconst v = E[0];\n",
         "enum F { A = 1 }\nenum E { B = F.A }\nconst v = E[0];\n",
+        "namespace N { export enum F { A = 1 } }\nenum E { B = N.F.A }\nconst v = E[0];\n",
         // One numeric member is enough to earn the index signature.
         "enum E { A = \"a\", B = 1 }\nconst v = E[0];\n",
     ] {

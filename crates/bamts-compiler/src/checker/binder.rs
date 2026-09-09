@@ -23576,10 +23576,33 @@ impl<'src> Binder<'src> {
         }
     }
 
+    /// Resolves the expression naming an enum in a member access to its
+    /// symbol: a bare `F`, or a qualified `N.F` at any nesting, walking
+    /// each container's member scope. Anything else, including a value
+    /// this file cannot see, resolves to `None` and leaves the member
+    /// numeric.
+    fn enum_owner_symbol(&self, expression: &Expr, scope: ScopeId) -> Option<SymbolId> {
+        match expression.data() {
+            Expression::Identifier(identifier) => {
+                self.lookup_value(scope, self.identifier_text(identifier).as_ref())
+            }
+            Expression::Member(member) => {
+                let container = self.enum_owner_symbol(&member.object, scope)?;
+                let member_scope = self.container_member_scope(container)?;
+                let MemberProperty::Named(name) = &member.property else {
+                    return None;
+                };
+                self.scopes[member_scope.0 as usize].value(self.identifier_text(name).as_ref())
+            }
+            _ => None,
+        }
+    }
+
     /// Whether an enum member initializer resolves to a string-valued
     /// enum member: a bare name in `enum E { A = "a", B = A }`, a
     /// qualified `E.A` or `E["A"]`, a member of an enum bound earlier as
-    /// in `enum F { A = "a" } enum E { B = F.A }`, or a concatenation of
+    /// in `enum F { A = "a" } enum E { B = F.A }` or reached through a
+    /// namespace as `N.F.A`, or a concatenation of
     /// any of those. Such a member is string-valued, so it earns no
     /// reverse mapping. A reference this cannot settle stays numeric,
     /// which keeps the index signature present and never reports a
@@ -23595,16 +23618,13 @@ impl<'src> Binder<'src> {
             Expression::Identifier(identifier) => {
                 string_valued.contains(self.identifier_text(identifier).as_ref())
             }
-            // `E.A`, `E["A"]`, and `F.A` are the same shape: resolve the
-            // object to its enum symbol, then ask that enum's members.
-            // The enum being bound answers from the in-progress set,
-            // since its entry lands only once the walk finishes.
+            // `E.A`, `F.A`, and `N.F.A` are the same shape: resolve the
+            // object to the enum that owns the member, then ask that
+            // enum's members. The enum being bound answers from the
+            // in-progress set, since its entry lands only once the walk
+            // finishes.
             Expression::Member(member) => {
-                let Expression::Identifier(object) = member.object.data() else {
-                    return false;
-                };
-                let Some(target) = self.lookup_value(scope, self.identifier_text(object).as_ref())
-                else {
+                let Some(target) = self.enum_owner_symbol(&member.object, scope) else {
                     return false;
                 };
                 let members = if target == owner {
