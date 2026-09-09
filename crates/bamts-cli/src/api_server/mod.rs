@@ -149,12 +149,11 @@ where
     // response to work the transport already carried. Reaping the reader
     // first is what makes that set well defined: without it the loop can
     // break while the next frame is still being parsed, and that request
-    // leaves unanswered depending only on thread scheduling. A reader
-    // that cannot be woken keeps the existing orphan path rather than
-    // stalling shutdown for the reap deadline.
-    if I::Waker::REAPABLE {
-        control.wait_reaped(REAP_DEADLINE);
-    }
+    // leaves unanswered depending only on thread scheduling. One wait
+    // serves both the drain and the join below, so a reader that never
+    // exits costs the deadline once. A reader that cannot be woken keeps
+    // the existing orphan path rather than stalling shutdown at all.
+    let reader_reaped = I::Waker::REAPABLE && control.wait_reaped(REAP_DEADLINE);
     for inbound in control.drain() {
         match inbound {
             Inbound::Work {
@@ -178,7 +177,7 @@ where
         }
     }
 
-    let reaped = if I::Waker::REAPABLE && control.wait_reaped(REAP_DEADLINE) {
+    let reaped = if reader_reaped {
         Reaped::Joined(
             reader
                 .join()
