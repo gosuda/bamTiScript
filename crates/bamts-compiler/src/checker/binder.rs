@@ -6170,6 +6170,11 @@ pub(crate) struct Binder<'src> {
     /// all merged declarations. Scalar classification stays all-members,
     /// but the reverse-mapping index needs only one numeric member.
     enum_has_numeric_member: HashSet<SymbolId>,
+    /// String-valued member names per enum symbol, accumulated across
+    /// merged declarations. A later declaration resolves a reference such
+    /// as `enum E { A = "a" } enum E { B = A }` against the members an
+    /// earlier declaration already classified.
+    enum_string_valued_members: HashMap<SymbolId, HashSet<String>>,
     /// Value-member types per enum symbol in `bind_enum` order, so
     /// `finish` can rebuild the constructor from the enum plan after
     /// `self.types` has moved into the semantic model. Merged rebuilds
@@ -6386,6 +6391,7 @@ impl<'src> Binder<'src> {
             enum_constructor_types: HashMap::new(),
             enum_constructor_members: HashMap::new(),
             enum_has_numeric_member: HashSet::new(),
+            enum_string_valued_members: HashMap::new(),
             class_constructor_types: HashMap::new(),
             imported_type_parameters: HashMap::new(),
             imported_type_planes: HashMap::new(),
@@ -11115,7 +11121,11 @@ impl<'src> Binder<'src> {
         // reverse mapping. This has to be right here rather than in
         // `finish`, because member accesses are typed before the plan runs
         // and a late correction cannot retract a diagnostic.
-        let mut string_valued: HashSet<String> = HashSet::new();
+        let enum_name = self.identifier_text(&declaration.name).into_owned();
+        let mut string_valued = self
+            .enum_string_valued_members
+            .remove(&symbol)
+            .unwrap_or_default();
         let mut has_numeric_member = false;
         for member in &declaration.members {
             let Some(name) = enum_plan::cook_member_name(self.source, &member.data().name) else {
@@ -11126,13 +11136,15 @@ impl<'src> Binder<'src> {
                 continue;
             };
             if is_syntactically_string_initializer(initializer)
-                || self.references_string_enum_member(initializer, &string_valued)
+                || self.references_string_enum_member(initializer, &enum_name, &string_valued)
             {
                 string_valued.insert(name.to_utf8_lossy());
             } else {
                 has_numeric_member = true;
             }
         }
+        self.enum_string_valued_members
+            .insert(symbol, string_valued);
         if has_numeric_member {
             self.enum_has_numeric_member.insert(symbol);
         }
@@ -23514,34 +23526,48 @@ impl<'src> Binder<'src> {
         }
     }
 
-    /// Whether an enum member initializer is a bare reference to an earlier
-    /// string-valued member of the same enum, as in `enum E { A = "a", B = A }`.
+    /// Whether an enum member initializer references an earlier
+    /// string-valued member of the same enum, as a bare name in
+    /// `enum E { A = "a", B = A }` or qualified as `E.A` or `E["A"]`.
     /// Such a member is string-valued, so it earns no reverse mapping. A
     /// reference this cannot settle stays numeric, which keeps the index
     /// signature present and never reports a spurious missing member.
     fn references_string_enum_member(
         &self,
         expression: &Expr,
+        enum_name: &str,
         string_valued: &HashSet<String>,
     ) -> bool {
         match expression.data() {
             Expression::Identifier(identifier) => {
                 string_valued.contains(self.identifier_text(identifier).as_ref())
             }
+            // `E.A` and `E["A"]` name this enum's own member; any other
+            // object is a different enum this cannot settle at bind time.
+            Expression::Member(member) => {
+                let Expression::Identifier(object) = member.object.data() else {
+                    return false;
+                };
+                if self.identifier_text(object).as_ref() != enum_name {
+                    return false;
+                }
+                enum_plan::cook_member_property_name(self.source, &member.property)
+                    .is_some_and(|name| string_valued.contains(name.to_utf8_lossy().as_str()))
+            }
             Expression::Parenthesized(inner) => {
-                self.references_string_enum_member(inner, string_valued)
+                self.references_string_enum_member(inner, enum_name, string_valued)
             }
             Expression::As(expression) => {
-                self.references_string_enum_member(&expression.expression, string_valued)
+                self.references_string_enum_member(&expression.expression, enum_name, string_valued)
             }
             Expression::Satisfies(expression) => {
-                self.references_string_enum_member(&expression.expression, string_valued)
+                self.references_string_enum_member(&expression.expression, enum_name, string_valued)
             }
             Expression::TypeAssertion(expression) => {
-                self.references_string_enum_member(&expression.expression, string_valued)
+                self.references_string_enum_member(&expression.expression, enum_name, string_valued)
             }
             Expression::NonNull(expression) => {
-                self.references_string_enum_member(&expression.expression, string_valued)
+                self.references_string_enum_member(&expression.expression, enum_name, string_valued)
             }
             _ => false,
         }
