@@ -12772,6 +12772,25 @@ impl<'src> Binder<'src> {
             );
         }
     }
+
+    /// Inheritance distance from `owner` up to `ancestor`, with `owner`
+    /// itself at zero, or `None` when `ancestor` is off that chain. The
+    /// visited set keeps a cyclic `extends` graph from looping.
+    fn inheritance_depth(&self, owner: SymbolId, ancestor: SymbolId) -> Option<u32> {
+        let mut current = owner;
+        let mut visited = HashSet::new();
+        for depth in 0.. {
+            if current == ancestor {
+                return Some(depth);
+            }
+            if !visited.insert(current) {
+                return None;
+            }
+            current = *self.class_base_symbols.get(&current)?;
+        }
+        None
+    }
+
     /// Fold namespace exports into one class static shape. An own static
     /// colliding with a value export is a duplicate declaration (tsc
     /// TS2300, approximated by C001 pending a dedicated code); inherited
@@ -12848,13 +12867,19 @@ impl<'src> Binder<'src> {
                         // a descendant-owned static legally shadows the
                         // base export, and the descendant's own namespace
                         // appends win over later base exports. A nearer
-                        // ancestor's value (smaller depth) takes precedence
-                        // over a farther one; the same ancestor at the same
-                        // depth still refreshes.
+                        // ancestor's value takes precedence over a farther
+                        // one; the same ancestor still refreshes. An
+                        // inherited own static carries no propagation
+                        // record, so rank it by where it was declared.
                         let key = (owner, name.clone());
                         let refreshes = match self.ns_propagated_statics.get(&key) {
                             Some(&(_, recorded_depth)) => depth <= recorded_depth,
-                            None => true,
+                            None => match object.properties[index].declaring_class() {
+                                Some(declaring) => self
+                                    .inheritance_depth(owner, declaring)
+                                    .is_none_or(|inherited| depth <= inherited),
+                                None => true,
+                            },
                         };
                         if refreshes {
                             object.properties[index] =
