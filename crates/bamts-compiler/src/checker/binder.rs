@@ -5461,20 +5461,6 @@ fn diagnostic_suppressions(source: &SourceFile) -> DiagnosticSuppressions {
 /// literals, parenthesized numerics, sign/bitwise-not applications, and
 /// numeric binary operators over numeric operands. Matches the runtime
 /// reverse-mapping rule without a full constant folder.
-/// Whether an enum member initializer is a string constant: tsc only
-/// accepts string-constant or numeric initializers, so anything else is
-/// a computed numeric member with a runtime reverse mapping.
-pub(crate) fn is_string_enum_initializer(expression: &Expr) -> bool {
-    match expression.data() {
-        Expression::Literal(Literal::String(_)) => true,
-        Expression::Parenthesized(inner) => is_string_enum_initializer(inner),
-        Expression::Binary(binary) if binary.operator == BinaryOperator::Add => {
-            is_string_enum_initializer(&binary.left) && is_string_enum_initializer(&binary.right)
-        }
-        _ => false,
-    }
-}
-
 pub(crate) fn is_numeric_enum_initializer(expression: &Expr) -> bool {
     match expression.data() {
         Expression::Literal(Literal::Number(_)) => true,
@@ -5509,6 +5495,48 @@ pub(crate) fn is_numeric_enum_initializer(expression: &Expr) -> bool {
         _ => false,
     }
 }
+/// Builds the `typeof E` constructor from value-member types without a
+/// binder handle: `finish` calls this after `self.types` has moved into
+/// the semantic model. Numeric enums additionally carry the
+/// reverse-mapping index signature (`E[0]: string`); string enums carry
+/// members only.
+fn constructor_with_members_in(
+    types: &mut TypeTable,
+    symbol: SymbolId,
+    member_types: Vec<(String, TypeId)>,
+    numeric_index: bool,
+) -> TypeId {
+    let properties = member_types
+        .into_iter()
+        .map(|(name, type_id)| PropertyType::new(name, false, type_id))
+        .collect();
+    let mut object = ObjectType {
+        properties,
+        call_signatures: Vec::new(),
+        call_candidate_order: Vec::new(),
+        construct_signatures: Vec::new(),
+        index_signatures: Vec::new(),
+        generator_return: None,
+        iterator_property: None,
+        async_iterator_property: None,
+    };
+    if numeric_index {
+        object.index_signatures.push(IndexSignature {
+            readonly: false,
+            parameters: vec![FunctionParameter::new(
+                "index".to_owned(),
+                types.number(),
+                false,
+                false,
+            )],
+            value_type: types.string(),
+            declaring_types: Vec::new(),
+        });
+    }
+    let structural = types.object_type_with_members(object);
+    types.constructor_type(symbol, Vec::new(), structural)
+}
+
 /// Duplicate declarations of one member name share the canonical `symbol`
 /// while each keeps its own `declaration` and `name_range`, so consumers can
 /// render every written occurrence without minting extra symbols.
@@ -6112,6 +6140,12 @@ pub(crate) struct Binder<'src> {
     /// all merged declarations. Scalar classification stays all-members,
     /// but the reverse-mapping index needs only one numeric member.
     enum_has_numeric_member: HashSet<SymbolId>,
+    /// Value-member types per enum symbol in `bind_enum` order, so
+    /// `finish` can rebuild the constructor from the enum plan after
+    /// `self.types` has moved into the semantic model. Merged rebuilds
+    /// overwrite the entry, matching how `enum_constructor_types` is
+    /// overwritten today.
+    enum_constructor_members: HashMap<SymbolId, Vec<(String, TypeId)>>,
     reg_exp_instance_type: Option<TypeId>,
     /// Shared by provisional and final class-shape passes so a generic method's
     /// type parameters keep one semantic identity.
@@ -6320,6 +6354,7 @@ impl<'src> Binder<'src> {
             qualified_import_paths: HashMap::new(),
             import_equals_targets: HashMap::new(),
             enum_constructor_types: HashMap::new(),
+            enum_constructor_members: HashMap::new(),
             enum_has_numeric_member: HashSet::new(),
             class_constructor_types: HashMap::new(),
             imported_type_parameters: HashMap::new(),
@@ -9464,6 +9499,7 @@ impl<'src> Binder<'src> {
         let enum_declarations = std::mem::take(&mut self.enum_declarations);
         let enum_member_symbols = std::mem::take(&mut self.enum_member_symbols);
         let enum_member_names = std::mem::take(&mut self.enum_member_names);
+        let enum_constructor_members = std::mem::take(&mut self.enum_constructor_members);
         let enum_member_identifier_uses = std::mem::take(&mut self.enum_member_identifier_uses);
         let imported_enum_member_uses = std::mem::take(&mut self.imported_enum_member_uses);
         let local_enum_member_targets = std::mem::take(&mut self.local_enum_member_targets);
@@ -9549,6 +9585,33 @@ impl<'src> Binder<'src> {
                 &imported_enum_member_targets,
             )
         };
+        // The enum plan is the authority on the reverse-mapping index.
+        // Reconcile the provisional constructor: rebuild only where the
+        // plan disagrees with the binder's guess, so untouched enums keep
+        // their exact TypeId.
+        let mut plan_reverse_by_symbol: HashMap<SymbolId, bool> = HashMap::new();
+        for binding in &enum_declarations {
+            let Some(plan) = enum_facts.declaration(binding.declaration_id) else {
+                continue;
+            };
+            let reverse = plan.members().iter().any(|member| member.reverse());
+            *plan_reverse_by_symbol.entry(binding.symbol).or_default() |= reverse;
+        }
+        for (symbol, reverse_mapped) in plan_reverse_by_symbol {
+            if reverse_mapped == self.enum_has_numeric_member.contains(&symbol) {
+                continue;
+            }
+            let Some(member_types) = enum_constructor_members.get(&symbol) else {
+                continue;
+            };
+            let constructor = constructor_with_members_in(
+                &mut model.types,
+                symbol,
+                member_types.clone(),
+                reverse_mapped,
+            );
+            model.enum_constructor_types.insert(symbol, constructor);
+        }
         model.enum_facts = enum_facts;
         let mut namespace_facts = namespace_plan::build(
             &model,
@@ -10953,35 +11016,7 @@ impl<'src> Binder<'src> {
         member_types: Vec<(String, TypeId)>,
         numeric_index: bool,
     ) -> TypeId {
-        let properties = member_types
-            .into_iter()
-            .map(|(name, type_id)| PropertyType::new(name, false, type_id))
-            .collect();
-        let mut object = ObjectType {
-            properties,
-            call_signatures: Vec::new(),
-            call_candidate_order: Vec::new(),
-            construct_signatures: Vec::new(),
-            index_signatures: Vec::new(),
-            generator_return: None,
-            iterator_property: None,
-            async_iterator_property: None,
-        };
-        if numeric_index {
-            object.index_signatures.push(IndexSignature {
-                readonly: false,
-                parameters: vec![FunctionParameter::new(
-                    "index".to_owned(),
-                    self.types.number(),
-                    false,
-                    false,
-                )],
-                value_type: self.types.string(),
-                declaring_types: Vec::new(),
-            });
-        }
-        let structural = self.types.object_type_with_members(object);
-        self.types.constructor_type(symbol, Vec::new(), structural)
+        constructor_with_members_in(&mut self.types, symbol, member_types, numeric_index)
     }
 
     fn bind_enum(
@@ -11041,19 +11076,17 @@ impl<'src> Binder<'src> {
                 .as_deref()
                 .is_none_or(is_numeric_enum_initializer)
         });
-        // Reverse mappings need only one numeric member: heterogeneous
-        // enums still emit `E[1]` entries for their numeric half.
-        if declaration
-            .members
-            .iter()
-            .any(|member| match member.data().initializer.as_deref() {
-                None => true,
-                Some(initializer) => {
-                    is_numeric_enum_initializer(initializer)
-                        || !is_string_enum_initializer(initializer)
-                }
-            })
-        {
+        // Provisional reverse-map guess: an auto-numbered or
+        // numeric-literal member earns the index signature. The enum plan
+        // is the authority; `finish` reconciles this against it before
+        // the model is published.
+        if declaration.members.iter().any(|member| {
+            member
+                .data()
+                .initializer
+                .as_deref()
+                .is_none_or(is_numeric_enum_initializer)
+        }) {
             self.enum_has_numeric_member.insert(symbol);
         }
         match self.type_defs.get_mut(&symbol) {
@@ -11092,6 +11125,8 @@ impl<'src> Binder<'src> {
             }
         }
         let reverse_mapped = self.enum_has_numeric_member.contains(&symbol);
+        self.enum_constructor_members
+            .insert(symbol, member_types.clone());
         let constructor = self.constructor_with_members(symbol, member_types, reverse_mapped);
         self.enum_constructor_types.insert(symbol, constructor);
         self.enum_declaration_symbols.insert(declaration_id, symbol);
@@ -12816,6 +12851,13 @@ impl<'src> Binder<'src> {
         // Merged rebuilds keep whatever reverse mapping any declaration
         // earned; pure namespaces never set the flag, so members-only.
         let numeric_index = self.enum_has_numeric_member.contains(&symbol);
+        if merged_enum {
+            // Merged rebuilds overwrite the recorded member list too, so
+            // a later plan reconciliation in `finish` sees the same
+            // members as `enum_constructor_types`.
+            self.enum_constructor_members
+                .insert(symbol, member_types.clone());
+        }
         let constructor = self.constructor_with_members(symbol, member_types, numeric_index);
         if merged_enum {
             self.enum_constructor_types.insert(symbol, constructor);
