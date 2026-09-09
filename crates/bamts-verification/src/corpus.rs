@@ -129,6 +129,11 @@ const READ_CHUNK: usize = 8192;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const NODE_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const NODE_VERSION_OUTPUT_CAP: usize = 128;
+/// Wall-clock bound for the AOT compile lane. A case timeout bounds the
+/// compiled program, which is what the Node oracle measures, so native
+/// code generation gets its own budget instead of eating the program's.
+/// This still fails closed on a compiler that hangs.
+const AOT_COMPILE_TIMEOUT: Duration = Duration::from_secs(120);
 const INTERPRETER_FUEL_PER_MILLISECOND: u64 = 10_000;
 const CORPUS_WORKER_REQUEST: &str = "BAMTS_CORPUS_WORKER_REQUEST";
 const CORPUS_WORKER_TEST: &str = "corpus_differential_worker";
@@ -1234,13 +1239,9 @@ impl BamtsRunner {
     }
 
     fn run_aot(&self, spec: &CaseSpec) -> Result<OracleOutcome> {
-        let started = Instant::now();
         let artifacts = ArtifactDirectory::create(&self.root, spec, ExecutionMode::Aot)
             .map_err(|error| corpus_stage_error(CorpusStage::Link, error))?;
         let executable = artifacts.executable(spec);
-        let Some(compile_budget) = remaining_case_budget(spec.timeout(), started.elapsed()) else {
-            return Ok(timeout_outcome(Vec::new(), self.max_output_bytes));
-        };
         let request = WorkerRequest {
             root: self.root.clone(),
             spec: spec.clone(),
@@ -1249,7 +1250,7 @@ impl BamtsRunner {
             executable: Some(executable.clone()),
         };
         let (compile_stderr, compile_stderr_truncated) =
-            match run_worker(&artifacts, &request, compile_budget)? {
+            match run_worker(&artifacts, &request, AOT_COMPILE_TIMEOUT)? {
                 WorkerRun::TimedOut(outcome) => return Ok(outcome),
                 WorkerRun::Completed(WorkerResponse::Compile {
                     stderr,
@@ -1265,22 +1266,13 @@ impl BamtsRunner {
                     ));
                 }
             };
-        let Some(execution_budget) = remaining_case_budget(spec.timeout(), started.elapsed())
-        else {
-            return Ok(with_aot_compile_evidence(
-                timeout_outcome(Vec::new(), self.max_output_bytes),
-                compile_stderr,
-                compile_stderr_truncated,
-                self.max_output_bytes,
-            ));
-        };
         let outcome = run_process(
             "BamTS AOT executable",
             &executable,
             &self.root,
             &normalized_env(),
             &[],
-            &aot_execution_limits(execution_budget, self.max_output_bytes),
+            &aot_execution_limits(spec.timeout(), self.max_output_bytes),
         )
         .map_err(|error| corpus_stage_error(CorpusStage::Spawn, error))?;
         Ok(with_aot_compile_evidence(
@@ -2924,7 +2916,7 @@ mod tests {
     }
 
     #[test]
-    fn aot_executable_uses_only_the_case_budget_remaining_after_compile() {
+    fn case_budget_shrinks_by_elapsed_time_and_closes_at_zero() {
         let total = Duration::from_millis(250);
 
         assert_eq!(
@@ -2936,17 +2928,6 @@ mod tests {
             remaining_case_budget(total, Duration::from_millis(251)),
             None
         );
-    }
-
-    #[test]
-    fn aot_executable_preserves_output_limit_with_remaining_budget() {
-        let spec = aot_case("aot-budget", 250);
-        let remaining = remaining_case_budget(spec.timeout(), Duration::from_millis(123))
-            .expect("compile has remaining budget");
-
-        let limits = aot_execution_limits(remaining, 123);
-        assert_eq!(limits.timeout, Duration::from_millis(127));
-        assert_eq!(limits.max_output_bytes, 123);
     }
 
     #[test]
