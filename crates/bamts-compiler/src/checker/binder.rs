@@ -5461,6 +5461,20 @@ fn diagnostic_suppressions(source: &SourceFile) -> DiagnosticSuppressions {
 /// literals, parenthesized numerics, sign/bitwise-not applications, and
 /// numeric binary operators over numeric operands. Matches the runtime
 /// reverse-mapping rule without a full constant folder.
+/// Whether an enum member initializer is a string constant: tsc only
+/// accepts string-constant or numeric initializers, so anything else is
+/// a computed numeric member with a runtime reverse mapping.
+pub(crate) fn is_string_enum_initializer(expression: &Expr) -> bool {
+    match expression.data() {
+        Expression::Literal(Literal::String(_)) => true,
+        Expression::Parenthesized(inner) => is_string_enum_initializer(inner),
+        Expression::Binary(binary) if binary.operator == BinaryOperator::Add => {
+            is_string_enum_initializer(&binary.left) && is_string_enum_initializer(&binary.right)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn is_numeric_enum_initializer(expression: &Expr) -> bool {
     match expression.data() {
         Expression::Literal(Literal::Number(_)) => true,
@@ -10811,13 +10825,17 @@ impl<'src> Binder<'src> {
         });
         // Reverse mappings need only one numeric member: heterogeneous
         // enums still emit `E[1]` entries for their numeric half.
-        if declaration.members.iter().any(|member| {
-            member
-                .data()
-                .initializer
-                .as_deref()
-                .is_none_or(is_numeric_enum_initializer)
-        }) {
+        if declaration
+            .members
+            .iter()
+            .any(|member| match member.data().initializer.as_deref() {
+                None => true,
+                Some(initializer) => {
+                    is_numeric_enum_initializer(initializer)
+                        || !is_string_enum_initializer(initializer)
+                }
+            })
+        {
             self.enum_has_numeric_member.insert(symbol);
         }
         match self.type_defs.get_mut(&symbol) {
