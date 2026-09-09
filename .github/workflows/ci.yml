@@ -319,6 +319,17 @@ jobs:
           merge-multiple: true
       - name: Build compiler lane worker
         run: cargo build --locked --release -p bamts-verification --bin ts_lane_worker
+      # `suite merge` recomputes the run binding, whose authority digest
+      # reads both markers under target/authority. The receipts artifact
+      # carries only JSONL, so this clean runner must materialize them too.
+      - name: Fetch pinned TypeScript compiler authority
+        run: >-
+          cargo run --locked -p bamts-verification -- source fetch
+          typescript-7-compiler --dest target/authority/typescript-7.0.2
+      - name: Fetch pinned TypeScript test authority
+        run: >-
+          cargo run --locked -p bamts-verification -- source fetch
+          typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
       - name: Merge complete compatible matrix
         env:
           BAMTS_SUITE_COMPILER_ADAPTER: target/release/ts_lane_worker
