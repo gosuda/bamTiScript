@@ -732,7 +732,7 @@ pub fn resolve_baseline_file(
         let owned: Vec<&(String, std::path::PathBuf, bool)> = matches
             .iter()
             .filter(|candidate| candidate.2)
-            .map(|candidate| *candidate)
+            .copied()
             .collect();
         let stem_owned = !owned.is_empty()
             || variants.iter().any(|candidate| candidate.2)
