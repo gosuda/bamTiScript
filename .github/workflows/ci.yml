@@ -49,6 +49,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The workspace guard shells out to `cargo metadata --offline`,
+      # which resolves the graph for every target and so needs crates
+      # this host build never downloads. `cargo fetch` without `--target`
+      # gets all of them, matching the Formal job's G0 ledger step.
+      - name: Fetch dependencies for all targets
+        run: cargo fetch --locked
+
       - name: Fetch pinned TypeScript test fixtures
         run: >-
           cargo run --locked -p bamts-verification -- source fetch
