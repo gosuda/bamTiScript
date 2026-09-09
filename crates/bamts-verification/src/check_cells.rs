@@ -6127,16 +6127,25 @@ export const t = 1;
         );
     }
 
+    /// The pinned authority test tree, resolved from this crate's location so
+    /// the tests do not depend on one developer's checkout. Overridable with
+    /// `BAMTS_AUTHORITY_ROOT` for a tree materialized elsewhere.
+    fn authority_tests_root() -> std::path::PathBuf {
+        match std::env::var("BAMTS_AUTHORITY_ROOT") {
+            Ok(root) => std::path::PathBuf::from(root),
+            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/authority/typescript-7.0.2-tests"),
+        }
+    }
+
     /// Run the 10 build-info evidence-sweep cells through the observer's core
     /// path: compile each case, emit build-info, extract `.tsbuildinfo`
     /// sections from the authority `.js` baseline, and compare. Reports
     /// per-cell PASS or BLOCKING_FAIL with the first differing line.
     #[test]
     fn build_info_ten_evidence_cells_per_cell_verdict() {
-        let authority = Path::new(
-            "/home/alpha/compiler/bamTiScript/target/authority/\
-             typescript-7.0.2-tests",
-        );
+        let authority = authority_tests_root();
+        let authority = authority.as_path();
         let cases: &[(&str, &str)] = &[
             (
                 "incrementalConfig",
@@ -6259,9 +6268,7 @@ export const t = 1;
     /// node can report before/after numbers.
     #[test]
     fn enum_types_facet_sample_60_cells() {
-        let authority_root = std::env::var("BAMTS_AUTHORITY_ROOT").unwrap_or_else(|_| {
-            "/home/alpha/compiler/bamTiScript/target/authority/typescript-7.0.2-tests".to_owned()
-        });
+        let authority_root = authority_tests_root().to_string_lossy().into_owned();
         let cases_dir = format!("{authority_root}/tests/cases/compiler");
         let conformance_dir = format!("{authority_root}/tests/cases/conformance/enums");
         let baseline_dir = format!("{authority_root}/tests/baselines/reference");
@@ -6354,12 +6361,7 @@ export const t = 1;
     /// report lands under the session scratch root.
     #[test]
     fn javascript_facet_first_delta_sample() {
-        let authority =
-            std::path::PathBuf::from(std::env::var("BAMTS_AUTHORITY_ROOT").unwrap_or_else(|_| {
-                "/home/alpha/compiler/bamTiScript/target/authority/\
-                 typescript-7.0.2-tests"
-                    .to_owned()
-            }));
+        let authority = authority_tests_root();
         let sample_cap: usize = std::env::var("BAMTS_JS_SAMPLE")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -6635,9 +6637,7 @@ export const t = 1;
     /// records, counting verbatim line matches.
     #[test]
     fn enum_member_access_records_parity() {
-        let authority_root = std::env::var("BAMTS_AUTHORITY_ROOT").unwrap_or_else(|_| {
-            "/home/alpha/compiler/bamTiScript/target/authority/typescript-7.0.2-tests".to_owned()
-        });
+        let authority_root = authority_tests_root().to_string_lossy().into_owned();
         let baseline_dir = format!("{authority_root}/tests/baselines/reference");
         let mut case_paths: Vec<(String, String)> = Vec::new();
         for (rel_dir, dir) in [
