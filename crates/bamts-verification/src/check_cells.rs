@@ -3988,6 +3988,78 @@ mod tests {
             .collect();
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
+    /// Regression: a derived own static survives a later base
+    /// namespace export with the same name (tsc silent: the override
+    /// is legal). Propagation must not report it as a collision.
+    #[test]
+    fn derived_own_static_survives_late_base_export() {
+        let case_text = "class C {\n}\nclass B extends C {\nstatic x: number = 2;\n}\nnamespace C {\nexport const x: number = 1;\n}\nconst n: number = B.x;\n";
+        let units = split_case_units("tests/cases/compiler/tmAa.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmAa.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: an alias of a derived class exposes the derived
+    /// namespace export type, not a later-propagated base type (tsc
+    /// accepts `const n: 2 = alias.x`).
+    #[test]
+    fn derived_alias_exposes_derived_export_type() {
+        let case_text = "class C {\n}\nclass B extends C {\n}\nnamespace B {\nexport const x = 2;\n}\nnamespace C {\nexport const x: number = 1;\n}\nconst alias = B;\nconst n: 2 = alias.x;\n";
+        let units = split_case_units("tests/cases/compiler/tmAb3.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmAb3.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
+    /// Guard: direct access through a derived class keeps the
+    /// derived namespace export type (tsc accepts).
+    #[test]
+    fn derived_direct_access_keeps_derived_type() {
+        let case_text = "class C {\n}\nclass B extends C {\n}\nnamespace B {\nexport const x = 2;\n}\nnamespace C {\nexport const x: number = 1;\n}\nconst n: 2 = B.x;\n";
+        let units = split_case_units("tests/cases/compiler/tmAb2.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmAb2.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: a computed numeric enum member earns the reverse
+    /// mapping (tsc silent: `E[0]` is `string`, as for constant
+    /// numeric members).
+    #[test]
+    fn computed_numeric_enum_reverse_mapping() {
+        let case_text = "enum E {\nA = Math.random()\n}\nconst s: string = E[0];\n";
+        let units = split_case_units("tests/cases/compiler/tmAc.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmAc.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
 
     /// Regression: callable synthesis survives same-named type exports.
     /// `f.call` resolves through `Function.call` even with

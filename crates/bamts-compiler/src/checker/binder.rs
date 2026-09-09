@@ -6065,6 +6065,11 @@ pub(crate) struct Binder<'src> {
     /// identity, so class-owned statics carry no distinguishing mark
     /// from our additions without this set.
     ns_appended_statics: HashSet<(SymbolId, String)>,
+    /// Properties a base-namespace propagation refreshed on a
+    /// descendant, distinct from that descendant's own namespace
+    /// appends: propagation must leave own statics and own appends
+    /// alone while still refreshing inherited snapshots.
+    ns_propagated_statics: HashSet<(SymbolId, String)>,
     import_equals_symbols: HashMap<NodeId, SymbolId>,
     qualified_import_paths: HashMap<NodeId, Box<[SymbolId]>>,
     import_equals_targets: HashMap<SymbolId, ImportEqualsTarget>,
@@ -6287,6 +6292,7 @@ impl<'src> Binder<'src> {
             property_sites: Vec::new(),
             property_site_index: HashMap::new(),
             ns_appended_statics: HashSet::new(),
+            ns_propagated_statics: HashSet::new(),
             property_anchors: Vec::new(),
             property_anchor_index: HashMap::new(),
             literal_anchor: HashMap::new(),
@@ -12411,7 +12417,7 @@ impl<'src> Binder<'src> {
         if additions.is_empty() {
             return;
         }
-        self.merge_ns_additions_into_static(symbol, &additions);
+        self.merge_ns_additions_into_static(symbol, &additions, true);
         // Derived constructors resolved before this augmentation
         // snapshotted the base statics: refresh them with the same
         // additions so late-merged members stay visible through
@@ -12428,7 +12434,7 @@ impl<'src> Binder<'src> {
             if !visited.insert(derived) {
                 continue;
             }
-            self.merge_ns_additions_into_static(derived, &additions);
+            self.merge_ns_additions_into_static(derived, &additions, false);
             stack.extend(
                 self.class_base_symbols
                     .iter()
@@ -12443,11 +12449,15 @@ impl<'src> Binder<'src> {
     /// derived merge validly narrows a base static, and fragments must
     /// not collide with themselves). The append set tells our own
     /// additions apart from class-owned statics, which share no
-    /// distinguishing mark on merged symbols.
+    /// distinguishing mark on merged symbols. Propagated calls
+    /// (`direct == false`) refresh inherited snapshots only: descendant
+    /// overrides and own-namespace appends win silently, tracked by
+    /// the propagated set so later base exports still refresh them.
     fn merge_ns_additions_into_static(
         &mut self,
         owner: SymbolId,
         additions: &[(String, TypeId, SymbolId)],
+        direct: bool,
     ) {
         let Some(&existing) = self.class_constructor_types.get(&owner) else {
             return;
@@ -12474,24 +12484,39 @@ impl<'src> Binder<'src> {
                     object
                         .properties
                         .push(PropertyType::new(name.clone(), false, *type_id));
-                    self.ns_appended_statics.insert((owner, name.clone()));
+                    if direct {
+                        self.ns_appended_statics.insert((owner, name.clone()));
+                    } else {
+                        self.ns_propagated_statics.insert((owner, name.clone()));
+                    }
                     changed = true;
                 }
                 Some(index) => {
                     let ours = self.ns_appended_statics.contains(&(owner, name.clone()));
                     let own_static =
                         !ours && object.properties[index].declaring_class() == Some(owner);
-                    if own_static {
-                        if self
-                            .reported_static_collisions
-                            .insert((owner, name.clone()))
-                        {
-                            let range = self.symbols[member.get() as usize].range;
-                            self.emit(DUPLICATE_DECLARATION, range, DUPLICATE_MESSAGE);
+                    if direct {
+                        if own_static {
+                            if self
+                                .reported_static_collisions
+                                .insert((owner, name.clone()))
+                            {
+                                let range = self.symbols[member.get() as usize].range;
+                                self.emit(DUPLICATE_DECLARATION, range, DUPLICATE_MESSAGE);
+                            }
+                        } else {
+                            object.properties[index] =
+                                PropertyType::new(name.clone(), false, *type_id);
+                            self.ns_appended_statics.insert((owner, name.clone()));
+                            changed = true;
                         }
-                    } else {
+                    } else if !(ours || own_static) {
+                        // Propagation refreshes inherited snapshots only:
+                        // a descendant-owned static legally shadows the
+                        // base export, and the descendant's own namespace
+                        // appends win over later base exports.
                         object.properties[index] = PropertyType::new(name.clone(), false, *type_id);
-                        self.ns_appended_statics.insert((owner, name.clone()));
+                        self.ns_propagated_statics.insert((owner, name.clone()));
                         changed = true;
                     }
                 }
