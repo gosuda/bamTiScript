@@ -6110,8 +6110,11 @@ pub(crate) struct Binder<'src> {
     /// Properties a base-namespace propagation refreshed on a
     /// descendant, distinct from that descendant's own namespace
     /// appends: propagation must leave own statics and own appends
-    /// alone while still refreshing inherited snapshots.
-    ns_propagated_statics: HashSet<(SymbolId, String)>,
+    /// alone while still refreshing inherited snapshots. The value
+    /// records the originating ancestor and the inheritance depth from
+    /// the leaf owner, so a nearer ancestor's value is not replaced by
+    /// a farther one.
+    ns_propagated_statics: HashMap<(SymbolId, String), (SymbolId, u32)>,
     import_equals_symbols: HashMap<NodeId, SymbolId>,
     qualified_import_paths: HashMap<NodeId, Box<[SymbolId]>>,
     import_equals_targets: HashMap<SymbolId, ImportEqualsTarget>,
@@ -6343,13 +6346,13 @@ impl<'src> Binder<'src> {
             member_reference_recorded: HashSet::new(),
             property_sites: Vec::new(),
             property_site_index: HashMap::new(),
-            ns_appended_statics: HashSet::new(),
-            ns_propagated_statics: HashSet::new(),
             property_anchors: Vec::new(),
             property_anchor_index: HashMap::new(),
             literal_anchor: HashMap::new(),
             symbol_anchor: HashMap::new(),
             reported_static_collisions: HashSet::new(),
+            ns_appended_statics: HashSet::new(),
+            ns_propagated_statics: HashMap::new(),
             import_equals_symbols: HashMap::new(),
             qualified_import_paths: HashMap::new(),
             import_equals_targets: HashMap::new(),
@@ -12688,28 +12691,28 @@ impl<'src> Binder<'src> {
         if additions.is_empty() {
             return;
         }
-        self.merge_ns_additions_into_static(symbol, &additions, true);
+        self.merge_ns_additions_into_static(symbol, &additions, true, symbol, 0);
         // Derived constructors resolved before this augmentation
         // snapshotted the base statics: refresh them with the same
         // additions so late-merged members stay visible through
         // subclasses. Worklist covers transitive descendants.
-        let mut stack: Vec<SymbolId> = self
+        let mut stack: Vec<(SymbolId, u32)> = self
             .class_base_symbols
             .iter()
-            .filter_map(|(derived, base)| (*base == symbol).then_some(*derived))
+            .filter_map(|(derived, base)| (*base == symbol).then_some((*derived, 1)))
             .collect();
         // Cyclic heritage (`A extends B`, `B extends A`) must terminate:
         // mirror `is_derived_from`'s visited guard.
         let mut visited = HashSet::new();
-        while let Some(derived) = stack.pop() {
+        while let Some((derived, depth)) = stack.pop() {
             if !visited.insert(derived) {
                 continue;
             }
-            self.merge_ns_additions_into_static(derived, &additions, false);
+            self.merge_ns_additions_into_static(derived, &additions, false, symbol, depth);
             stack.extend(
                 self.class_base_symbols
                     .iter()
-                    .filter_map(|(child, base)| (*base == derived).then_some(*child)),
+                    .filter_map(|(child, base)| (*base == derived).then_some((*child, depth + 1))),
             );
         }
     }
@@ -12729,6 +12732,8 @@ impl<'src> Binder<'src> {
         owner: SymbolId,
         additions: &[(String, TypeId, SymbolId)],
         direct: bool,
+        source: SymbolId,
+        depth: u32,
     ) {
         let Some(&existing) = self.class_constructor_types.get(&owner) else {
             return;
@@ -12758,7 +12763,8 @@ impl<'src> Binder<'src> {
                     if direct {
                         self.ns_appended_statics.insert((owner, name.clone()));
                     } else {
-                        self.ns_propagated_statics.insert((owner, name.clone()));
+                        self.ns_propagated_statics
+                            .insert((owner, name.clone()), (source, depth));
                     }
                     changed = true;
                 }
@@ -12785,10 +12791,21 @@ impl<'src> Binder<'src> {
                         // Propagation refreshes inherited snapshots only:
                         // a descendant-owned static legally shadows the
                         // base export, and the descendant's own namespace
-                        // appends win over later base exports.
-                        object.properties[index] = PropertyType::new(name.clone(), false, *type_id);
-                        self.ns_propagated_statics.insert((owner, name.clone()));
-                        changed = true;
+                        // appends win over later base exports. A nearer
+                        // ancestor's value (smaller depth) takes precedence
+                        // over a farther one; the same ancestor at the same
+                        // depth still refreshes.
+                        let key = (owner, name.clone());
+                        let refreshes = match self.ns_propagated_statics.get(&key) {
+                            Some(&(_, recorded_depth)) => depth <= recorded_depth,
+                            None => true,
+                        };
+                        if refreshes {
+                            object.properties[index] =
+                                PropertyType::new(name.clone(), false, *type_id);
+                            self.ns_propagated_statics.insert(key, (source, depth));
+                            changed = true;
+                        }
                     }
                 }
             }
