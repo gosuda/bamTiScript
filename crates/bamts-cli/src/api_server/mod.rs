@@ -145,6 +145,16 @@ where
 
     control.stop();
     let _ = waker.wake();
+    // `shutdown` ends the loop by design, and the drain owes a terminal
+    // response to work the transport already carried. Reaping the reader
+    // first is what makes that set well defined: without it the loop can
+    // break while the next frame is still being parsed, and that request
+    // leaves unanswered depending only on thread scheduling. A reader
+    // that cannot be woken keeps the existing orphan path rather than
+    // stalling shutdown for the reap deadline.
+    if I::Waker::REAPABLE {
+        control.wait_reaped(REAP_DEADLINE);
+    }
     for inbound in control.drain() {
         match inbound {
             Inbound::Work {
