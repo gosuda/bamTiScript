@@ -2879,27 +2879,30 @@ printf started > link-started
         let cancel = CancellationToken::new();
         let trigger = cancel.clone();
         let marker = directory.join("link-started");
+        // Wait for the linker to actually start rather than for a fixed
+        // slice of wall clock: a loaded runner can take longer to spawn
+        // the process than a short deadline allows. The cap only breaks a
+        // genuine hang, and the returned instant dates the cancel so the
+        // bound below measures cancellation, not process startup.
         let canceller = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + Duration::from_secs(60);
             while !marker.is_file() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(5));
             }
             let started = marker.is_file();
             trigger.cancel();
-            started
+            started.then(Instant::now)
         });
 
-        let started = Instant::now();
         let error = link_executable(&[], &directory.join("output"), &context, &cancel)
             .expect_err("cancelled linker must fail as cancellation");
         assert!(matches!(error, DriverError::Cancelled));
+        let cancelled_at = canceller
+            .join()
+            .expect("link cancellation thread completes")
+            .expect("the linker must start before it is cancelled");
         assert!(
-            canceller
-                .join()
-                .expect("link cancellation thread completes")
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
+            cancelled_at.elapsed() < Duration::from_secs(3),
             "managed link cancellation must be bounded"
         );
         fs::remove_dir_all(directory)?;

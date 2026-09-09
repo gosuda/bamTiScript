@@ -1209,8 +1209,8 @@ pub(crate) fn cook_member_property_name(
 ) -> Option<EcmaString> {
     match property {
         MemberProperty::Named(identifier) => source
-            .token_text(identifier.data().token())
-            .map(EcmaString::encode),
+            .identifier_text(identifier.data().token())
+            .map(|name| EcmaString::encode(name.as_ref())),
         MemberProperty::Computed(expression) => match expression.data() {
             Expression::Literal(Literal::String(string)) => source
                 .token_text(string.data().token())

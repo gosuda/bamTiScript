@@ -732,7 +732,7 @@ pub fn resolve_baseline_file(
         let owned: Vec<&(String, std::path::PathBuf, bool)> = matches
             .iter()
             .filter(|candidate| candidate.2)
-            .map(|candidate| *candidate)
+            .copied()
             .collect();
         let stem_owned = !owned.is_empty()
             || variants.iter().any(|candidate| candidate.2)
@@ -4145,6 +4145,78 @@ mod tests {
             .collect();
         assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
     }
+    /// Regression: a derived own static survives a later base
+    /// namespace export with the same name (tsc silent: the override
+    /// is legal). Propagation must not report it as a collision.
+    #[test]
+    fn derived_own_static_survives_late_base_export() {
+        let case_text = "class C {\n}\nclass B extends C {\nstatic x: number = 2;\n}\nnamespace C {\nexport const x: number = 1;\n}\nconst n: number = B.x;\n";
+        let units = split_case_units("tests/cases/compiler/tmAa.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmAa.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: an alias of a derived class exposes the derived
+    /// namespace export type, not a later-propagated base type (tsc
+    /// accepts `const n: 2 = alias.x`).
+    #[test]
+    fn derived_alias_exposes_derived_export_type() {
+        let case_text = "class C {\n}\nclass B extends C {\n}\nnamespace B {\nexport const x = 2;\n}\nnamespace C {\nexport const x: number = 1;\n}\nconst alias = B;\nconst n: 2 = alias.x;\n";
+        let units = split_case_units("tests/cases/compiler/tmAb3.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmAb3.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+
+    /// Guard: direct access through a derived class keeps the
+    /// derived namespace export type (tsc accepts).
+    #[test]
+    fn derived_direct_access_keeps_derived_type() {
+        let case_text = "class C {\n}\nclass B extends C {\n}\nnamespace B {\nexport const x = 2;\n}\nnamespace C {\nexport const x: number = 1;\n}\nconst n: 2 = B.x;\n";
+        let units = split_case_units("tests/cases/compiler/tmAb2.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmAb2.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
+    /// Regression: a computed numeric enum member earns the reverse
+    /// mapping (tsc silent: `E[0]` is `string`, as for constant
+    /// numeric members).
+    #[test]
+    fn computed_numeric_enum_reverse_mapping() {
+        let case_text = "enum E {\nA = Math.random()\n}\nconst s: string = E[0];\n";
+        let units = split_case_units("tests/cases/compiler/tmAc.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/tmAc.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let code_map = repo_code_map();
+        let mut actual = collect_facet_diagnostics(&case);
+        actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
+        let codes: Vec<_> = actual
+            .iter()
+            .map(|d| (d.code.clone(), d.position.line))
+            .collect();
+        assert!(actual.is_empty(), "unexpected diagnostics: {codes:?}");
+    }
 
     /// Regression: callable synthesis survives same-named type exports.
     /// `f.call` resolves through `Function.call` even with
@@ -6055,16 +6127,25 @@ export const t = 1;
         );
     }
 
+    /// The pinned authority test tree, resolved from this crate's location so
+    /// the tests do not depend on one developer's checkout. Overridable with
+    /// `BAMTS_AUTHORITY_ROOT` for a tree materialized elsewhere.
+    fn authority_tests_root() -> std::path::PathBuf {
+        match std::env::var("BAMTS_AUTHORITY_ROOT") {
+            Ok(root) => std::path::PathBuf::from(root),
+            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/authority/typescript-7.0.2-tests"),
+        }
+    }
+
     /// Run the 10 build-info evidence-sweep cells through the observer's core
     /// path: compile each case, emit build-info, extract `.tsbuildinfo`
     /// sections from the authority `.js` baseline, and compare. Reports
     /// per-cell PASS or BLOCKING_FAIL with the first differing line.
     #[test]
     fn build_info_ten_evidence_cells_per_cell_verdict() {
-        let authority = Path::new(
-            "/home/alpha/compiler/bamTiScript/target/authority/\
-             typescript-7.0.2-tests",
-        );
+        let authority = authority_tests_root();
+        let authority = authority.as_path();
         let cases: &[(&str, &str)] = &[
             (
                 "incrementalConfig",
@@ -6187,9 +6268,7 @@ export const t = 1;
     /// node can report before/after numbers.
     #[test]
     fn enum_types_facet_sample_60_cells() {
-        let authority_root = std::env::var("BAMTS_AUTHORITY_ROOT").unwrap_or_else(|_| {
-            "/home/alpha/compiler/bamTiScript/target/authority/typescript-7.0.2-tests".to_owned()
-        });
+        let authority_root = authority_tests_root().to_string_lossy().into_owned();
         let cases_dir = format!("{authority_root}/tests/cases/compiler");
         let conformance_dir = format!("{authority_root}/tests/cases/conformance/enums");
         let baseline_dir = format!("{authority_root}/tests/baselines/reference");
@@ -6282,12 +6361,7 @@ export const t = 1;
     /// report lands under the session scratch root.
     #[test]
     fn javascript_facet_first_delta_sample() {
-        let authority =
-            std::path::PathBuf::from(std::env::var("BAMTS_AUTHORITY_ROOT").unwrap_or_else(|_| {
-                "/home/alpha/compiler/bamTiScript/target/authority/\
-                 typescript-7.0.2-tests"
-                    .to_owned()
-            }));
+        let authority = authority_tests_root();
         let sample_cap: usize = std::env::var("BAMTS_JS_SAMPLE")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -6563,9 +6637,7 @@ export const t = 1;
     /// records, counting verbatim line matches.
     #[test]
     fn enum_member_access_records_parity() {
-        let authority_root = std::env::var("BAMTS_AUTHORITY_ROOT").unwrap_or_else(|_| {
-            "/home/alpha/compiler/bamTiScript/target/authority/typescript-7.0.2-tests".to_owned()
-        });
+        let authority_root = authority_tests_root().to_string_lossy().into_owned();
         let baseline_dir = format!("{authority_root}/tests/baselines/reference");
         let mut case_paths: Vec<(String, String)> = Vec::new();
         for (rel_dir, dir) in [
