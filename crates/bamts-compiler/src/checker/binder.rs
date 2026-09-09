@@ -12925,7 +12925,7 @@ impl<'src> Binder<'src> {
         self.refresh_captured_constructor_views(existing, constructor);
     }
 
-    /// Refresh value views captured before a namespace augmentation.
+    /// Refresh views captured before a namespace augmentation.
     /// `const alias = D` stores the pre-merge constructor id, so a later
     /// export would stay invisible through the alias while `D` sees it.
     /// Only top-level exact id matches move forward; reassigned variables
@@ -12937,6 +12937,13 @@ impl<'src> Binder<'src> {
             .chain(self.node_types.values_mut())
             .filter(|ty| **ty == existing)
             .for_each(|ty| *ty = current);
+        self.type_state
+            .iter_mut()
+            .filter_map(|state| match state {
+                TypeState::Done(id) if *id == existing => Some(state),
+                _ => None,
+            })
+            .for_each(|state| *state = TypeState::Done(current));
     }
 
     fn finalize_namespace_constructor(&mut self, statement_id: NodeId) {

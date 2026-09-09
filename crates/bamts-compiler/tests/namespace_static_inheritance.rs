@@ -129,6 +129,16 @@ fn an_early_constructor_alias_assigns_to_required_structural_type() {
     );
 }
 
+#[test]
+#[ignore = "type-state forward does not cover typeof-alias resolved before merge; tracks with representation fix"]
+fn a_type_alias_captured_before_merge_sees_later_exports() {
+    assert_reads_clean(
+        "class C {}\nclass D extends C {}\ntype A = typeof D;\nconst force: A = D;\n\
+         namespace C { export const x: 1 = 1; }\nconst probe: A = D;\nconst v: 1 = probe.x;\n",
+        "a type alias resolved before the merge shares later namespace exports",
+    );
+}
+
 // Pre-existing gap, not stale-alias specific: `keyof typeof D` fails even
 // without an alias, so `keyof` on constructors needs its own fix.
 #[test]
