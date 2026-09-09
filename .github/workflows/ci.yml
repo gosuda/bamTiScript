@@ -189,6 +189,12 @@ jobs:
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
           rustup default "$TOOLCHAIN"
 
+      # `ledger verify` shells out to `cargo metadata --offline`, which
+      # resolves the graph for every target and so needs crates the host
+      # build never downloads. `cargo fetch` without `--target` gets all.
+      - name: Fetch dependencies for all targets
+        run: cargo fetch --locked
+
       - name: G0 ledger
         run: cargo run --locked -p bamts-verification --bin bamts-verification -- ledger verify --gate G0
 
