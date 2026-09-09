@@ -78,6 +78,11 @@ pub(crate) struct Planned {
 
 pub struct Session {
     compiler: Option<Compiler>,
+    /// Set by `shutdown`: the session refuses further requests but the
+    /// loop keeps serving, so work already in the transport still gets
+    /// its terminal response.
+    shutting_down: bool,
+    /// Set by `exit` alone: the loop terminates.
     stopped: bool,
 }
 
@@ -94,11 +99,13 @@ impl Session {
     pub fn new() -> Self {
         Self {
             compiler: None,
+            shutting_down: false,
             stopped: false,
         }
     }
 
-    /// Whether the loop should stop after the current dispatch batch.
+    /// Whether `exit` has been seen and the loop should terminate.
+    /// `shutdown` does not end the loop; only `exit` and end of input do.
     #[must_use]
     pub const fn stopped(&self) -> bool {
         self.stopped
@@ -156,10 +163,16 @@ impl Session {
         params: Option<&Value>,
         cancellation: &CancellationToken,
     ) -> Result<Value, ApiError> {
+        // After `shutdown` the session serves nothing further, but it
+        // still answers: a refusal is a terminal response, and the loop
+        // runs until `exit` or end of input.
+        if self.shutting_down {
+            return Err(ApiError::Cancelled);
+        }
         match method {
             "initialize" => self.initialize(params),
             "shutdown" => {
-                self.stopped = true;
+                self.shutting_down = true;
                 Ok(Value::Null)
             }
             "service/open" => self.open(params, cancellation),
