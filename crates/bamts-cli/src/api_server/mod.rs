@@ -11,6 +11,7 @@ use std::io::{self, Write};
 use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use control::{Control, ControlKind, Inbound, Next, REAP_DEADLINE, ReaderExit};
 use reader::reader_main;
@@ -176,6 +177,13 @@ where
             Inbound::Control(_) => {}
         }
     }
+
+    // A reader that exits while the drain is writing its responses still
+    // owes its terminal error, so re-read the state once the drain is
+    // done. A zero deadline reads without waiting again, which keeps the
+    // single bounded wait above.
+    let reader_reaped =
+        reader_reaped || (I::Waker::REAPABLE && control.wait_reaped(Duration::ZERO));
 
     let reaped = if reader_reaped {
         Reaped::Joined(
