@@ -11121,7 +11121,8 @@ impl<'src> Binder<'src> {
         // reverse mapping. This has to be right here rather than in
         // `finish`, because member accesses are typed before the plan runs
         // and a late correction cannot retract a diagnostic.
-        let enum_name = self.identifier_text(&declaration.name).into_owned();
+        // The enum's own entry is taken out while the walk runs, so a
+        // self-reference reads the in-progress set rather than a stale one.
         let mut string_valued = self
             .enum_string_valued_members
             .remove(&symbol)
@@ -11136,7 +11137,7 @@ impl<'src> Binder<'src> {
                 continue;
             };
             if is_syntactically_string_initializer(initializer)
-                || self.references_string_enum_member(initializer, &enum_name, &string_valued)
+                || self.references_string_enum_member(initializer, scope, symbol, &string_valued)
             {
                 string_valued.insert(name.to_utf8_lossy());
             } else {
@@ -23551,49 +23552,85 @@ impl<'src> Binder<'src> {
         }
     }
 
-    /// Whether an enum member initializer references an earlier
-    /// string-valued member of the same enum, as a bare name in
-    /// `enum E { A = "a", B = A }` or qualified as `E.A` or `E["A"]`.
-    /// Such a member is string-valued, so it earns no reverse mapping. A
-    /// reference this cannot settle stays numeric, which keeps the index
-    /// signature present and never reports a spurious missing member.
+    /// Whether an enum member initializer resolves to a string-valued
+    /// enum member: a bare name in `enum E { A = "a", B = A }`, a
+    /// qualified `E.A` or `E["A"]`, a member of an enum bound earlier as
+    /// in `enum F { A = "a" } enum E { B = F.A }`, or a concatenation of
+    /// any of those. Such a member is string-valued, so it earns no
+    /// reverse mapping. A reference this cannot settle stays numeric,
+    /// which keeps the index signature present and never reports a
+    /// spurious missing member.
     fn references_string_enum_member(
         &self,
         expression: &Expr,
-        enum_name: &str,
+        scope: ScopeId,
+        owner: SymbolId,
         string_valued: &HashSet<String>,
     ) -> bool {
         match expression.data() {
             Expression::Identifier(identifier) => {
                 string_valued.contains(self.identifier_text(identifier).as_ref())
             }
-            // `E.A` and `E["A"]` name this enum's own member; any other
-            // object is a different enum this cannot settle at bind time.
+            // `E.A`, `E["A"]`, and `F.A` are the same shape: resolve the
+            // object to its enum symbol, then ask that enum's members.
+            // The enum being bound answers from the in-progress set,
+            // since its entry lands only once the walk finishes.
             Expression::Member(member) => {
                 let Expression::Identifier(object) = member.object.data() else {
                     return false;
                 };
-                if self.identifier_text(object).as_ref() != enum_name {
+                let Some(target) = self.lookup_value(scope, self.identifier_text(object).as_ref())
+                else {
                     return false;
-                }
-                enum_plan::cook_member_property_name(self.source, &member.property)
-                    .is_some_and(|name| string_valued.contains(name.to_utf8_lossy().as_str()))
+                };
+                let members = if target == owner {
+                    Some(string_valued)
+                } else {
+                    self.enum_string_valued_members.get(&target)
+                };
+                members.is_some_and(|members| {
+                    enum_plan::cook_member_property_name(self.source, &member.property)
+                        .is_some_and(|name| members.contains(name.to_utf8_lossy().as_str()))
+                })
+            }
+            // `+` yields a string when either side does, matching the
+            // syntactic classifier's rule for literal operands.
+            Expression::Binary(binary) if binary.operator == BinaryOperator::Add => {
+                self.references_string_enum_member(&binary.left, scope, owner, string_valued)
+                    || self.references_string_enum_member(
+                        &binary.right,
+                        scope,
+                        owner,
+                        string_valued,
+                    )
             }
             Expression::Parenthesized(inner) => {
-                self.references_string_enum_member(inner, enum_name, string_valued)
+                self.references_string_enum_member(inner, scope, owner, string_valued)
             }
-            Expression::As(expression) => {
-                self.references_string_enum_member(&expression.expression, enum_name, string_valued)
-            }
-            Expression::Satisfies(expression) => {
-                self.references_string_enum_member(&expression.expression, enum_name, string_valued)
-            }
-            Expression::TypeAssertion(expression) => {
-                self.references_string_enum_member(&expression.expression, enum_name, string_valued)
-            }
-            Expression::NonNull(expression) => {
-                self.references_string_enum_member(&expression.expression, enum_name, string_valued)
-            }
+            Expression::As(expression) => self.references_string_enum_member(
+                &expression.expression,
+                scope,
+                owner,
+                string_valued,
+            ),
+            Expression::Satisfies(expression) => self.references_string_enum_member(
+                &expression.expression,
+                scope,
+                owner,
+                string_valued,
+            ),
+            Expression::TypeAssertion(expression) => self.references_string_enum_member(
+                &expression.expression,
+                scope,
+                owner,
+                string_valued,
+            ),
+            Expression::NonNull(expression) => self.references_string_enum_member(
+                &expression.expression,
+                scope,
+                owner,
+                string_valued,
+            ),
             _ => false,
         }
     }
