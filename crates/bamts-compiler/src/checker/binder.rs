@@ -5495,6 +5495,75 @@ pub(crate) fn is_numeric_enum_initializer(expression: &Expr) -> bool {
         _ => false,
     }
 }
+/// Returns whether an enum initializer is syntactically a string value,
+/// matching the enum plan's reverse-mapping rule: string literals, template
+/// literals, transparent type wrappers around strings, and binary `+` where
+/// EITHER operand is a string.
+fn is_syntactically_string_initializer(expression: &Expr) -> bool {
+    match expression.data() {
+        Expression::Literal(Literal::String(_)) => true,
+        Expression::Template(_) => true,
+        // Transparent wrappers: unwrap recursively
+        Expression::Parenthesized(inner) => is_syntactically_string_initializer(inner),
+        Expression::As(as_expr) => is_syntactically_string_initializer(&as_expr.expression),
+        Expression::Satisfies(satisfies_expr) => {
+            is_syntactically_string_initializer(&satisfies_expr.expression)
+        }
+        Expression::TypeAssertion(assertion) => {
+            is_syntactically_string_initializer(&assertion.expression)
+        }
+        Expression::NonNull(non_null) => is_syntactically_string_initializer(&non_null.expression),
+        // Binary `+`: string if EITHER side is string (|| not &&)
+        Expression::Binary(binary) if binary.operator == BinaryOperator::Add => {
+            is_syntactically_string_initializer(&binary.left)
+                || is_syntactically_string_initializer(&binary.right)
+        }
+        _ => false,
+    }
+}
+
+/// Builds the `typeof E` constructor from value-member types without a
+/// binder handle: `finish` calls this after `self.types` has moved into
+/// the semantic model. Numeric enums additionally carry the
+/// reverse-mapping index signature (`E[0]: string`); string enums carry
+/// members only.
+fn constructor_with_members_in(
+    types: &mut TypeTable,
+    symbol: SymbolId,
+    member_types: Vec<(String, TypeId)>,
+    numeric_index: bool,
+) -> TypeId {
+    let properties = member_types
+        .into_iter()
+        .map(|(name, type_id)| PropertyType::new(name, false, type_id))
+        .collect();
+    let mut object = ObjectType {
+        properties,
+        call_signatures: Vec::new(),
+        call_candidate_order: Vec::new(),
+        construct_signatures: Vec::new(),
+        index_signatures: Vec::new(),
+        generator_return: None,
+        iterator_property: None,
+        async_iterator_property: None,
+    };
+    if numeric_index {
+        object.index_signatures.push(IndexSignature {
+            readonly: false,
+            parameters: vec![FunctionParameter::new(
+                "index".to_owned(),
+                types.number(),
+                false,
+                false,
+            )],
+            value_type: types.string(),
+            declaring_types: Vec::new(),
+        });
+    }
+    let structural = types.object_type_with_members(object);
+    types.constructor_type(symbol, Vec::new(), structural)
+}
+
 /// Duplicate declarations of one member name share the canonical `symbol`
 /// while each keeps its own `declaration` and `name_range`, so consumers can
 /// render every written occurrence without minting extra symbols.
@@ -6065,6 +6134,14 @@ pub(crate) struct Binder<'src> {
     /// identity, so class-owned statics carry no distinguishing mark
     /// from our additions without this set.
     ns_appended_statics: HashSet<(SymbolId, String)>,
+    /// Properties a base-namespace propagation refreshed on a
+    /// descendant, distinct from that descendant's own namespace
+    /// appends: propagation must leave own statics and own appends
+    /// alone while still refreshing inherited snapshots. The value
+    /// records the originating ancestor and the inheritance depth from
+    /// the leaf owner, so a nearer ancestor's value is not replaced by
+    /// a farther one.
+    ns_propagated_statics: HashMap<(SymbolId, String), (SymbolId, u32)>,
     import_equals_symbols: HashMap<NodeId, SymbolId>,
     qualified_import_paths: HashMap<NodeId, Box<[SymbolId]>>,
     import_equals_targets: HashMap<SymbolId, ImportEqualsTarget>,
@@ -6093,6 +6170,17 @@ pub(crate) struct Binder<'src> {
     /// all merged declarations. Scalar classification stays all-members,
     /// but the reverse-mapping index needs only one numeric member.
     enum_has_numeric_member: HashSet<SymbolId>,
+    /// String-valued member names per enum symbol, accumulated across
+    /// merged declarations. A later declaration resolves a reference such
+    /// as `enum E { A = "a" } enum E { B = A }` against the members an
+    /// earlier declaration already classified.
+    enum_string_valued_members: HashMap<SymbolId, HashSet<String>>,
+    /// Value-member types per enum symbol in `bind_enum` order, so
+    /// `finish` can rebuild the constructor from the enum plan after
+    /// `self.types` has moved into the semantic model. Merged rebuilds
+    /// overwrite the entry, matching how `enum_constructor_types` is
+    /// overwritten today.
+    enum_constructor_members: HashMap<SymbolId, Vec<(String, TypeId)>>,
     reg_exp_instance_type: Option<TypeId>,
     /// Shared by provisional and final class-shape passes so a generic method's
     /// type parameters keep one semantic identity.
@@ -6290,17 +6378,20 @@ impl<'src> Binder<'src> {
             member_reference_recorded: HashSet::new(),
             property_sites: Vec::new(),
             property_site_index: HashMap::new(),
-            ns_appended_statics: HashSet::new(),
             property_anchors: Vec::new(),
             property_anchor_index: HashMap::new(),
             literal_anchor: HashMap::new(),
             symbol_anchor: HashMap::new(),
             reported_static_collisions: HashSet::new(),
+            ns_appended_statics: HashSet::new(),
+            ns_propagated_statics: HashMap::new(),
             import_equals_symbols: HashMap::new(),
             qualified_import_paths: HashMap::new(),
             import_equals_targets: HashMap::new(),
             enum_constructor_types: HashMap::new(),
+            enum_constructor_members: HashMap::new(),
             enum_has_numeric_member: HashSet::new(),
+            enum_string_valued_members: HashMap::new(),
             class_constructor_types: HashMap::new(),
             imported_type_parameters: HashMap::new(),
             imported_type_planes: HashMap::new(),
@@ -9444,6 +9535,7 @@ impl<'src> Binder<'src> {
         let enum_declarations = std::mem::take(&mut self.enum_declarations);
         let enum_member_symbols = std::mem::take(&mut self.enum_member_symbols);
         let enum_member_names = std::mem::take(&mut self.enum_member_names);
+        let enum_constructor_members = std::mem::take(&mut self.enum_constructor_members);
         let enum_member_identifier_uses = std::mem::take(&mut self.enum_member_identifier_uses);
         let imported_enum_member_uses = std::mem::take(&mut self.imported_enum_member_uses);
         let local_enum_member_targets = std::mem::take(&mut self.local_enum_member_targets);
@@ -9529,6 +9621,33 @@ impl<'src> Binder<'src> {
                 &imported_enum_member_targets,
             )
         };
+        // The enum plan is the authority on the reverse-mapping index.
+        // Reconcile the provisional constructor: rebuild only where the
+        // plan disagrees with the binder's guess, so untouched enums keep
+        // their exact TypeId.
+        let mut plan_reverse_by_symbol: HashMap<SymbolId, bool> = HashMap::new();
+        for binding in &enum_declarations {
+            let Some(plan) = enum_facts.declaration(binding.declaration_id) else {
+                continue;
+            };
+            let reverse = plan.members().iter().any(|member| member.reverse());
+            *plan_reverse_by_symbol.entry(binding.symbol).or_default() |= reverse;
+        }
+        for (symbol, reverse_mapped) in plan_reverse_by_symbol {
+            if reverse_mapped == self.enum_has_numeric_member.contains(&symbol) {
+                continue;
+            }
+            let Some(member_types) = enum_constructor_members.get(&symbol) else {
+                continue;
+            };
+            let constructor = constructor_with_members_in(
+                &mut model.types,
+                symbol,
+                member_types.clone(),
+                reverse_mapped,
+            );
+            model.enum_constructor_types.insert(symbol, constructor);
+        }
         model.enum_facts = enum_facts;
         let mut namespace_facts = namespace_plan::build(
             &model,
@@ -10933,35 +11052,7 @@ impl<'src> Binder<'src> {
         member_types: Vec<(String, TypeId)>,
         numeric_index: bool,
     ) -> TypeId {
-        let properties = member_types
-            .into_iter()
-            .map(|(name, type_id)| PropertyType::new(name, false, type_id))
-            .collect();
-        let mut object = ObjectType {
-            properties,
-            call_signatures: Vec::new(),
-            call_candidate_order: Vec::new(),
-            construct_signatures: Vec::new(),
-            index_signatures: Vec::new(),
-            generator_return: None,
-            iterator_property: None,
-            async_iterator_property: None,
-        };
-        if numeric_index {
-            object.index_signatures.push(IndexSignature {
-                readonly: false,
-                parameters: vec![FunctionParameter::new(
-                    "index".to_owned(),
-                    self.types.number(),
-                    false,
-                    false,
-                )],
-                value_type: self.types.string(),
-                declaring_types: Vec::new(),
-            });
-        }
-        let structural = self.types.object_type_with_members(object);
-        self.types.constructor_type(symbol, Vec::new(), structural)
+        constructor_with_members_in(&mut self.types, symbol, member_types, numeric_index)
     }
 
     fn bind_enum(
@@ -11021,15 +11112,41 @@ impl<'src> Binder<'src> {
                 .as_deref()
                 .is_none_or(is_numeric_enum_initializer)
         });
-        // Reverse mappings need only one numeric member: heterogeneous
-        // enums still emit `E[1]` entries for their numeric half.
-        if declaration.members.iter().any(|member| {
-            member
-                .data()
-                .initializer
-                .as_deref()
-                .is_none_or(is_numeric_enum_initializer)
-        }) {
+        // Reverse mapping follows the enum plan's rule: a member earns it
+        // unless its initializer is string-valued. Syntax settles literals,
+        // templates, transparent wrappers, and concatenation; a bare
+        // reference to an earlier member of this enum is resolved against
+        // the members already walked above. Anything else, a call or
+        // arithmetic, stays numeric, so a computed member keeps its runtime
+        // reverse mapping. This has to be right here rather than in
+        // `finish`, because member accesses are typed before the plan runs
+        // and a late correction cannot retract a diagnostic.
+        // The enum's own entry is taken out while the walk runs, so a
+        // self-reference reads the in-progress set rather than a stale one.
+        let mut string_valued = self
+            .enum_string_valued_members
+            .remove(&symbol)
+            .unwrap_or_default();
+        let mut has_numeric_member = false;
+        for member in &declaration.members {
+            let Some(name) = enum_plan::cook_member_name(self.source, &member.data().name) else {
+                continue;
+            };
+            let Some(initializer) = member.data().initializer.as_deref() else {
+                has_numeric_member = true;
+                continue;
+            };
+            if is_syntactically_string_initializer(initializer)
+                || self.references_string_enum_member(initializer, scope, symbol, &string_valued)
+            {
+                string_valued.insert(name.to_utf8_lossy());
+            } else {
+                has_numeric_member = true;
+            }
+        }
+        self.enum_string_valued_members
+            .insert(symbol, string_valued);
+        if has_numeric_member {
             self.enum_has_numeric_member.insert(symbol);
         }
         match self.type_defs.get_mut(&symbol) {
@@ -11068,6 +11185,8 @@ impl<'src> Binder<'src> {
             }
         }
         let reverse_mapped = self.enum_has_numeric_member.contains(&symbol);
+        self.enum_constructor_members
+            .insert(symbol, member_types.clone());
         let constructor = self.constructor_with_members(symbol, member_types, reverse_mapped);
         self.enum_constructor_types.insert(symbol, constructor);
         self.enum_declaration_symbols.insert(declaration_id, symbol);
@@ -12629,31 +12748,71 @@ impl<'src> Binder<'src> {
         if additions.is_empty() {
             return;
         }
-        self.merge_ns_additions_into_static(symbol, &additions);
+        self.merge_ns_additions_into_static(symbol, &additions, true, symbol, 0);
         // Derived constructors resolved before this augmentation
         // snapshotted the base statics: refresh them with the same
         // additions so late-merged members stay visible through
         // subclasses. Worklist covers transitive descendants.
-        let mut stack: Vec<SymbolId> = self
+        let mut stack: Vec<(SymbolId, u32)> = self
             .class_base_symbols
             .iter()
-            .filter_map(|(derived, base)| (*base == symbol).then_some(*derived))
+            .filter_map(|(derived, base)| (*base == symbol).then_some((*derived, 1)))
             .collect();
         // Cyclic heritage (`A extends B`, `B extends A`) must terminate:
         // mirror `is_derived_from`'s visited guard.
         let mut visited = HashSet::new();
-        while let Some(derived) = stack.pop() {
+        while let Some((derived, depth)) = stack.pop() {
             if !visited.insert(derived) {
                 continue;
             }
-            self.merge_ns_additions_into_static(derived, &additions);
+            self.merge_ns_additions_into_static(derived, &additions, false, symbol, depth);
             stack.extend(
                 self.class_base_symbols
                     .iter()
-                    .filter_map(|(child, base)| (*base == derived).then_some(*child)),
+                    .filter_map(|(child, base)| (*base == derived).then_some((*child, depth + 1))),
             );
         }
     }
+
+    /// Inheritance distance from `owner` up to `ancestor`, with `owner`
+    /// itself at zero, or `None` when `ancestor` is off that chain. The
+    /// visited set keeps a cyclic `extends` graph from looping.
+    fn inheritance_depth(&self, owner: SymbolId, ancestor: SymbolId) -> Option<u32> {
+        let mut current = owner;
+        let mut visited = HashSet::new();
+        for depth in 0.. {
+            if current == ancestor {
+                return Some(depth);
+            }
+            if !visited.insert(current) {
+                return None;
+            }
+            current = *self.class_base_symbols.get(&current)?;
+        }
+        None
+    }
+
+    /// Distance from `owner` to the nearest strict ancestor whose own
+    /// namespace appended `name`. A value inherited from a namespace
+    /// carries no declaring class, so the chain is the only record of
+    /// where it came from. `None` means no ancestor appended it.
+    fn nearest_ns_append_depth(&self, owner: SymbolId, name: &str) -> Option<u32> {
+        let mut key = (owner, name.to_owned());
+        let mut visited = HashSet::new();
+        let mut current = owner;
+        for depth in 0.. {
+            key.0 = current;
+            if depth > 0 && self.ns_appended_statics.contains(&key) {
+                return Some(depth);
+            }
+            if !visited.insert(current) {
+                return None;
+            }
+            current = *self.class_base_symbols.get(&current)?;
+        }
+        None
+    }
+
     /// Fold namespace exports into one class static shape. An own static
     /// colliding with a value export is a duplicate declaration (tsc
     /// TS2300, approximated by C001 pending a dedicated code); inherited
@@ -12661,11 +12820,17 @@ impl<'src> Binder<'src> {
     /// derived merge validly narrows a base static, and fragments must
     /// not collide with themselves). The append set tells our own
     /// additions apart from class-owned statics, which share no
-    /// distinguishing mark on merged symbols.
+    /// distinguishing mark on merged symbols. Propagated calls
+    /// (`direct == false`) refresh inherited snapshots only: descendant
+    /// overrides and own-namespace appends win silently, tracked by
+    /// the propagated set so later base exports still refresh them.
     fn merge_ns_additions_into_static(
         &mut self,
         owner: SymbolId,
         additions: &[(String, TypeId, SymbolId)],
+        direct: bool,
+        source: SymbolId,
+        depth: u32,
     ) {
         let Some(&existing) = self.class_constructor_types.get(&owner) else {
             return;
@@ -12692,34 +12857,92 @@ impl<'src> Binder<'src> {
                     object
                         .properties
                         .push(PropertyType::new(name.clone(), false, *type_id));
-                    self.ns_appended_statics.insert((owner, name.clone()));
+                    if direct {
+                        self.ns_appended_statics.insert((owner, name.clone()));
+                    } else {
+                        self.ns_propagated_statics
+                            .insert((owner, name.clone()), (source, depth));
+                    }
                     changed = true;
                 }
                 Some(index) => {
                     let ours = self.ns_appended_statics.contains(&(owner, name.clone()));
                     let own_static =
                         !ours && object.properties[index].declaring_class() == Some(owner);
-                    if own_static {
-                        if self
-                            .reported_static_collisions
-                            .insert((owner, name.clone()))
-                        {
-                            let range = self.symbols[member.get() as usize].range;
-                            self.emit(DUPLICATE_DECLARATION, range, DUPLICATE_MESSAGE);
+                    if direct {
+                        if own_static {
+                            if self
+                                .reported_static_collisions
+                                .insert((owner, name.clone()))
+                            {
+                                let range = self.symbols[member.get() as usize].range;
+                                self.emit(DUPLICATE_DECLARATION, range, DUPLICATE_MESSAGE);
+                            }
+                        } else {
+                            object.properties[index] =
+                                PropertyType::new(name.clone(), false, *type_id);
+                            self.ns_appended_statics.insert((owner, name.clone()));
+                            changed = true;
                         }
-                    } else {
-                        object.properties[index] = PropertyType::new(name.clone(), false, *type_id);
-                        self.ns_appended_statics.insert((owner, name.clone()));
-                        changed = true;
+                    } else if !(ours || own_static) {
+                        // Propagation refreshes inherited snapshots only:
+                        // a descendant-owned static legally shadows the
+                        // base export, and the descendant's own namespace
+                        // appends win over later base exports. A nearer
+                        // ancestor's value takes precedence over a farther
+                        // one; the same ancestor still refreshes. An
+                        // inherited own static carries no propagation
+                        // record, so rank it by where it was declared,
+                        // and one inherited from a namespace by the
+                        // nearest ancestor that appended it.
+                        let key = (owner, name.clone());
+                        let refreshes = match self.ns_propagated_statics.get(&key) {
+                            Some(&(_, recorded_depth)) => depth <= recorded_depth,
+                            None => {
+                                let incumbent = object.properties[index]
+                                    .declaring_class()
+                                    .and_then(|declaring| self.inheritance_depth(owner, declaring))
+                                    .or_else(|| self.nearest_ns_append_depth(owner, name));
+                                incumbent.is_none_or(|inherited| depth <= inherited)
+                            }
+                        };
+                        if refreshes {
+                            object.properties[index] =
+                                PropertyType::new(name.clone(), false, *type_id);
+                            self.ns_propagated_statics.insert(key, (source, depth));
+                            changed = true;
+                        }
                     }
                 }
             }
         }
-        if changed {
-            let structural = self.types.object_type_with_members(object);
-            let constructor = self.types.constructor_type(owner, arguments, structural);
-            self.class_constructor_types.insert(owner, constructor);
+        if !changed {
+            return;
         }
+        let structural = self.types.object_type_with_members(object);
+        let constructor = self.types.constructor_type(owner, arguments, structural);
+        self.class_constructor_types.insert(owner, constructor);
+        self.refresh_captured_constructor_views(existing, constructor);
+    }
+
+    /// Refresh views captured before a namespace augmentation.
+    /// `const alias = D` stores the pre-merge constructor id, so a later
+    /// export would stay invisible through the alias while `D` sees it.
+    /// Only top-level exact id matches move forward; reassigned variables
+    /// hold a different id and stay untouched. The baseline record advances
+    /// with the semantic slots so `.types` renders the same constructor.
+    /// Captures nested inside interned types need a representation fix
+    /// tracked separately.
+    fn refresh_captured_constructor_views(&mut self, existing: TypeId, current: TypeId) {
+        self.symbol_types
+            .iter_mut()
+            .chain(self.node_types.values_mut())
+            .filter(|ty| **ty == existing)
+            .for_each(|ty| *ty = current);
+        self.typed_expressions
+            .iter_mut()
+            .filter(|entry| entry.1 == existing)
+            .for_each(|entry| entry.1 = current);
     }
 
     fn finalize_namespace_constructor(&mut self, statement_id: NodeId) {
@@ -12773,6 +12996,13 @@ impl<'src> Binder<'src> {
         // Merged rebuilds keep whatever reverse mapping any declaration
         // earned; pure namespaces never set the flag, so members-only.
         let numeric_index = self.enum_has_numeric_member.contains(&symbol);
+        if merged_enum {
+            // Merged rebuilds overwrite the recorded member list too, so
+            // a later plan reconciliation in `finish` sees the same
+            // members as `enum_constructor_types`.
+            self.enum_constructor_members
+                .insert(symbol, member_types.clone());
+        }
         let constructor = self.constructor_with_members(symbol, member_types, numeric_index);
         if merged_enum {
             self.enum_constructor_types.insert(symbol, constructor);
@@ -23365,6 +23595,109 @@ impl<'src> Binder<'src> {
                 crate::literal::string_value(lexeme)
             }
             _ => None,
+        }
+    }
+
+    /// Resolves the expression naming an enum in a member access to its
+    /// symbol: a bare `F`, or a qualified `N.F` at any nesting, walking
+    /// each container's member scope. Anything else, including a value
+    /// this file cannot see, resolves to `None` and leaves the member
+    /// numeric.
+    fn enum_owner_symbol(&self, expression: &Expr, scope: ScopeId) -> Option<SymbolId> {
+        match expression.data() {
+            Expression::Identifier(identifier) => {
+                self.lookup_value(scope, self.identifier_text(identifier).as_ref())
+            }
+            Expression::Member(member) => {
+                let container = self.enum_owner_symbol(&member.object, scope)?;
+                let member_scope = self.container_member_scope(container)?;
+                // An intermediate segment reads the same way as the final
+                // one, so `N.F` and `N["F"]` both resolve.
+                let name = enum_plan::cook_member_property_name(self.source, &member.property)?;
+                self.scopes[member_scope.0 as usize].value(name.to_utf8_lossy().as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether an enum member initializer resolves to a string-valued
+    /// enum member: a bare name in `enum E { A = "a", B = A }`, a
+    /// qualified `E.A` or `E["A"]`, a member of an enum bound earlier as
+    /// in `enum F { A = "a" } enum E { B = F.A }` or reached through a
+    /// namespace as `N.F.A`, or a concatenation of
+    /// any of those. Such a member is string-valued, so it earns no
+    /// reverse mapping. A reference this cannot settle stays numeric,
+    /// which keeps the index signature present and never reports a
+    /// spurious missing member.
+    fn references_string_enum_member(
+        &self,
+        expression: &Expr,
+        scope: ScopeId,
+        owner: SymbolId,
+        string_valued: &HashSet<String>,
+    ) -> bool {
+        match expression.data() {
+            Expression::Identifier(identifier) => {
+                string_valued.contains(self.identifier_text(identifier).as_ref())
+            }
+            // `E.A`, `F.A`, and `N.F.A` are the same shape: resolve the
+            // object to the enum that owns the member, then ask that
+            // enum's members. The enum being bound answers from the
+            // in-progress set, since its entry lands only once the walk
+            // finishes.
+            Expression::Member(member) => {
+                let Some(target) = self.enum_owner_symbol(&member.object, scope) else {
+                    return false;
+                };
+                let members = if target == owner {
+                    Some(string_valued)
+                } else {
+                    self.enum_string_valued_members.get(&target)
+                };
+                members.is_some_and(|members| {
+                    enum_plan::cook_member_property_name(self.source, &member.property)
+                        .is_some_and(|name| members.contains(name.to_utf8_lossy().as_str()))
+                })
+            }
+            // `+` yields a string when either side does, matching the
+            // syntactic classifier's rule for literal operands.
+            Expression::Binary(binary) if binary.operator == BinaryOperator::Add => {
+                self.references_string_enum_member(&binary.left, scope, owner, string_valued)
+                    || self.references_string_enum_member(
+                        &binary.right,
+                        scope,
+                        owner,
+                        string_valued,
+                    )
+            }
+            Expression::Parenthesized(inner) => {
+                self.references_string_enum_member(inner, scope, owner, string_valued)
+            }
+            Expression::As(expression) => self.references_string_enum_member(
+                &expression.expression,
+                scope,
+                owner,
+                string_valued,
+            ),
+            Expression::Satisfies(expression) => self.references_string_enum_member(
+                &expression.expression,
+                scope,
+                owner,
+                string_valued,
+            ),
+            Expression::TypeAssertion(expression) => self.references_string_enum_member(
+                &expression.expression,
+                scope,
+                owner,
+                string_valued,
+            ),
+            Expression::NonNull(expression) => self.references_string_enum_member(
+                &expression.expression,
+                scope,
+                owner,
+                string_valued,
+            ),
+            _ => false,
         }
     }
 }
