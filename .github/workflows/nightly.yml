@@ -95,6 +95,18 @@ jobs:
         run: cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
       - name: Build compiler lane worker
         run: cargo build --locked --release -p bamts-verification --bin ts_lane_worker
+      # `suite run` hashes the locked authority markers under
+      # target/authority. The typescript-7.0.2 catalog reads both the
+      # compiler tree and the test tree, so both must be materialized
+      # or the receipt step fails with E_TOOL_MISSING.
+      - name: Fetch pinned TypeScript compiler authority
+        run: >-
+          cargo run --locked -p bamts-verification -- source fetch
+          typescript-7-compiler --dest target/authority/typescript-7.0.2
+      - name: Fetch pinned TypeScript test authority
+        run: >-
+          cargo run --locked -p bamts-verification -- source fetch
+          typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
       - name: Write strict nightly receipt
         env:
           BAMTS_SUITE_COMPILER_ADAPTER: target/release/ts_lane_worker
