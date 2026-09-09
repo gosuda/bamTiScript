@@ -12929,8 +12929,10 @@ impl<'src> Binder<'src> {
     /// `const alias = D` stores the pre-merge constructor id, so a later
     /// export would stay invisible through the alias while `D` sees it.
     /// Only top-level exact id matches move forward; reassigned variables
-    /// hold a different id and stay untouched. Captures nested inside
-    /// interned types need a representation fix tracked separately.
+    /// hold a different id and stay untouched. The baseline record advances
+    /// with the semantic slots so `.types` renders the same constructor.
+    /// Captures nested inside interned types need a representation fix
+    /// tracked separately.
     fn refresh_captured_constructor_views(&mut self, existing: TypeId, current: TypeId) {
         self.symbol_types
             .iter_mut()
@@ -12944,6 +12946,10 @@ impl<'src> Binder<'src> {
                 _ => None,
             })
             .for_each(|state| *state = TypeState::Done(current));
+        self.typed_expressions
+            .iter_mut()
+            .filter(|entry| entry.1 == existing)
+            .for_each(|entry| entry.1 = current);
     }
 
     fn finalize_namespace_constructor(&mut self, statement_id: NodeId) {
