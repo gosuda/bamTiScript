@@ -54,6 +54,22 @@ jobs:
           cargo run --locked -p bamts-verification -- source fetch
           typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
 
+      # `cargo test --workspace` covers authority, oracle-pin, and formal
+      # bridge tests that read `node_modules/typescript/package.json` and
+      # drive a local Quint. Without these the step fails on a missing
+      # toolchain rather than on a real defect.
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Install Quint
+        run: npm ci --prefix formal/quint
+
       - name: Test workspace
         run: cargo test --workspace --locked
 
