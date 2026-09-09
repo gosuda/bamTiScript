@@ -5495,6 +5495,33 @@ pub(crate) fn is_numeric_enum_initializer(expression: &Expr) -> bool {
         _ => false,
     }
 }
+/// Returns whether an enum initializer is syntactically a string value,
+/// matching the enum plan's reverse-mapping rule: string literals, template
+/// literals, transparent type wrappers around strings, and binary `+` where
+/// EITHER operand is a string.
+fn is_syntactically_string_initializer(expression: &Expr) -> bool {
+    match expression.data() {
+        Expression::Literal(Literal::String(_)) => true,
+        Expression::Template(_) => true,
+        // Transparent wrappers: unwrap recursively
+        Expression::Parenthesized(inner) => is_syntactically_string_initializer(inner),
+        Expression::As(as_expr) => is_syntactically_string_initializer(&as_expr.expression),
+        Expression::Satisfies(satisfies_expr) => {
+            is_syntactically_string_initializer(&satisfies_expr.expression)
+        }
+        Expression::TypeAssertion(assertion) => {
+            is_syntactically_string_initializer(&assertion.expression)
+        }
+        Expression::NonNull(non_null) => is_syntactically_string_initializer(&non_null.expression),
+        // Binary `+`: string if EITHER side is string (|| not &&)
+        Expression::Binary(binary) if binary.operator == BinaryOperator::Add => {
+            is_syntactically_string_initializer(&binary.left)
+                || is_syntactically_string_initializer(&binary.right)
+        }
+        _ => false,
+    }
+}
+
 /// Builds the `typeof E` constructor from value-member types without a
 /// binder handle: `finish` calls this after `self.types` has moved into
 /// the semantic model. Numeric enums additionally carry the
@@ -11079,17 +11106,34 @@ impl<'src> Binder<'src> {
                 .as_deref()
                 .is_none_or(is_numeric_enum_initializer)
         });
-        // Provisional reverse-map guess: an auto-numbered or
-        // numeric-literal member earns the index signature. The enum plan
-        // is the authority; `finish` reconciles this against it before
-        // the model is published.
-        if declaration.members.iter().any(|member| {
-            member
-                .data()
-                .initializer
-                .as_deref()
-                .is_none_or(is_numeric_enum_initializer)
-        }) {
+        // Reverse mapping follows the enum plan's rule: a member earns it
+        // unless its initializer is string-valued. Syntax settles literals,
+        // templates, transparent wrappers, and concatenation; a bare
+        // reference to an earlier member of this enum is resolved against
+        // the members already walked above. Anything else, a call or
+        // arithmetic, stays numeric, so a computed member keeps its runtime
+        // reverse mapping. This has to be right here rather than in
+        // `finish`, because member accesses are typed before the plan runs
+        // and a late correction cannot retract a diagnostic.
+        let mut string_valued: HashSet<String> = HashSet::new();
+        let mut has_numeric_member = false;
+        for member in &declaration.members {
+            let Some(name) = enum_plan::cook_member_name(self.source, &member.data().name) else {
+                continue;
+            };
+            let Some(initializer) = member.data().initializer.as_deref() else {
+                has_numeric_member = true;
+                continue;
+            };
+            if is_syntactically_string_initializer(initializer)
+                || self.references_string_enum_member(initializer, &string_valued)
+            {
+                string_valued.insert(name.to_utf8_lossy());
+            } else {
+                has_numeric_member = true;
+            }
+        }
+        if has_numeric_member {
             self.enum_has_numeric_member.insert(symbol);
         }
         match self.type_defs.get_mut(&symbol) {
@@ -23467,6 +23511,39 @@ impl<'src> Binder<'src> {
                 crate::literal::string_value(lexeme)
             }
             _ => None,
+        }
+    }
+
+    /// Whether an enum member initializer is a bare reference to an earlier
+    /// string-valued member of the same enum, as in `enum E { A = "a", B = A }`.
+    /// Such a member is string-valued, so it earns no reverse mapping. A
+    /// reference this cannot settle stays numeric, which keeps the index
+    /// signature present and never reports a spurious missing member.
+    fn references_string_enum_member(
+        &self,
+        expression: &Expr,
+        string_valued: &HashSet<String>,
+    ) -> bool {
+        match expression.data() {
+            Expression::Identifier(identifier) => {
+                string_valued.contains(self.identifier_text(identifier).as_ref())
+            }
+            Expression::Parenthesized(inner) => {
+                self.references_string_enum_member(inner, string_valued)
+            }
+            Expression::As(expression) => {
+                self.references_string_enum_member(&expression.expression, string_valued)
+            }
+            Expression::Satisfies(expression) => {
+                self.references_string_enum_member(&expression.expression, string_valued)
+            }
+            Expression::TypeAssertion(expression) => {
+                self.references_string_enum_member(&expression.expression, string_valued)
+            }
+            Expression::NonNull(expression) => {
+                self.references_string_enum_member(&expression.expression, string_valued)
+            }
+            _ => false,
         }
     }
 }
