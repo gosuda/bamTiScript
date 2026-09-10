@@ -216,6 +216,7 @@ fn program_emit_options(program: &ResolvedProgram, mode: FrontendMode) -> Option
         always_strict,
         module,
         program.use_define_for_class_fields(),
+        program.import_helpers(),
     );
     options.no_emit_helpers = check.no_emit_helpers();
 

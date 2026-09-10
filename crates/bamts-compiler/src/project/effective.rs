@@ -723,6 +723,7 @@ fn emit_options(options: &CompilerOptions, source_id: SourceId) -> (EmitOptions,
         always_strict,
         module,
         options.use_define_for_class_fields(),
+        options.import_helpers(),
     );
 
     (emit_options, diagnostics)

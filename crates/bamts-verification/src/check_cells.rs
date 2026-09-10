@@ -997,7 +997,8 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             | "emitdeclarationonly"
             | "sourcemap"
             | "declarationmap"
-            | "usedefineforclassfields" => value.eq_ignore_ascii_case("true").to_string(),
+            | "usedefineforclassfields"
+            | "importhelpers" => value.eq_ignore_ascii_case("true").to_string(),
             "lib" => {
                 let items: Vec<String> = values
                     .iter()
@@ -1021,6 +1022,7 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             "noemit" => "noEmit",
             "alwaysstrict" => "alwaysStrict",
             "usedefineforclassfields" => "useDefineForClassFields",
+            "importhelpers" => "importHelpers",
             "exactoptionalpropertytypes" => "exactOptionalPropertyTypes",
             "nouncheckedindexedaccess" => "noUncheckedIndexedAccess",
             "strictpropertyinitialization" => "strictPropertyInitialization",
@@ -2492,6 +2494,7 @@ pub fn emit_source_map_baseline(
             check.always_strict(),
             prog.is_commonjs().then_some(ModuleKind::CommonJs),
             prog.use_define_for_class_fields(),
+            prog.import_helpers(),
         );
         options.no_emit_helpers = check.no_emit_helpers();
         match prog.jsx_routing_decision(ProgramOutputKind::JavaScript) {

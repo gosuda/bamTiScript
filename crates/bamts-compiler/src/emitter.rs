@@ -210,6 +210,7 @@ impl EmitOptions {
         always_strict: bool,
         module: Option<ModuleKind>,
         use_define_for_class_fields: Option<bool>,
+        import_helpers: Option<bool>,
     ) {
         self.target = target;
         self.always_strict = always_strict;
@@ -218,6 +219,9 @@ impl EmitOptions {
         }
         if let Some(use_define) = use_define_for_class_fields {
             self.use_define_for_class_fields = Some(use_define);
+        }
+        if let Some(import_helpers) = import_helpers {
+            self.import_helpers = import_helpers;
         }
     }
 
