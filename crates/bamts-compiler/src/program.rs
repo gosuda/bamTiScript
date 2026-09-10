@@ -222,6 +222,7 @@ pub struct ResolvedProgram {
     always_strict: bool,
     no_emit_helpers: bool,
     use_define_for_class_fields: Option<bool>,
+    import_helpers: Option<bool>,
     target: crate::emitter::ScriptTarget,
     libs: crate::checker::intrinsic_environment::LibSet,
     check_js: bool,
@@ -240,6 +241,11 @@ impl ResolvedProgram {
     #[must_use]
     pub const fn use_define_for_class_fields(&self) -> Option<bool> {
         self.use_define_for_class_fields
+    }
+
+    #[must_use]
+    pub const fn import_helpers(&self) -> Option<bool> {
+        self.import_helpers
     }
 
     #[must_use]
@@ -716,6 +722,7 @@ impl ProgramLoader {
             always_strict: self.options.always_strict(),
             no_emit_helpers: self.options.no_emit_helpers(),
             use_define_for_class_fields: self.options.use_define_for_class_fields(),
+            import_helpers: self.options.import_helpers(),
             target,
             libs,
             check_js: self.options.check_js(),
