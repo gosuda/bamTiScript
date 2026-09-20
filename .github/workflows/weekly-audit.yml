@@ -58,6 +58,21 @@ jobs:
           set -euo pipefail
           cargo run --locked -p bamts-verification --bin ts_conformance -- audit-ledger --require-complete
 
+      - name: Build canonical compiler receipt tools
+        shell: bash
+        run: |
+          cargo build --locked --release -p bamts-verification --bin bamts-verification --bin ts_lane_worker
+          install -D -m 755 target/release/bamts-verification target/receipt-tools/bamts-verification
+          install -D -m 755 target/release/ts_lane_worker target/receipt-tools/ts_lane_worker
+
+      - name: Upload canonical compiler receipt tools
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: compiler-receipt-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/receipt-tools
+          if-no-files-found: error
+          retention-days: 30
+
   audit:
     name: Audit shard ${{ matrix.shard }}/32
     needs: preflight
@@ -128,29 +143,34 @@ jobs:
         run: |
           set -euo pipefail
           cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
-      - name: Build compiler lane worker
+      - name: Download canonical compiler receipt tools
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: compiler-receipt-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/receipt-tools
+      - name: Restore receipt tool permissions
         shell: bash
-        run: cargo build --locked --release -p bamts-verification --bin ts_lane_worker
+        run: chmod +x target/receipt-tools/bamts-verification target/receipt-tools/ts_lane_worker
       - name: Fetch pinned TypeScript compiler authority
         shell: bash
         run: >-
-          cargo run --locked -p bamts-verification -- source fetch
+          target/receipt-tools/bamts-verification source fetch
           typescript-7-compiler --dest target/authority/typescript-7.0.2
       - name: Fetch pinned TypeScript test authority
         shell: bash
         run: >-
-          cargo run --locked -p bamts-verification -- source fetch
+          target/receipt-tools/bamts-verification source fetch
           typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
       - name: Run weekly-audit receipt shard
         shell: bash
         env:
-          BAMTS_SUITE_COMPILER_ADAPTER: target/release/ts_lane_worker
+          BAMTS_SUITE_COMPILER_ADAPTER: target/receipt-tools/ts_lane_worker
         run: |
           set -euo pipefail
           # ts_conformance --shards is one-based; low-level suite --shard is zero-based.
           zero=$(( ${{ matrix.shard }} - 1 ))
           receipt="verification/evidence/weekly/typescript-7.0.2/compiler/x86_64-unknown-linux-gnu/${{ github.run_id }}/${{ github.run_attempt }}/${zero}.jsonl"
-          cargo run --locked -p bamts-verification --bin bamts-verification -- suite run \
+          target/receipt-tools/bamts-verification suite run \
             --catalog typescript-7.0.2 --shard "${zero}/32" \
             --receipt "$receipt" --runner compiler --platform x86_64-unknown-linux-gnu \
             --workflow .github/workflows/weekly-audit.yml --run-id "${{ github.run_id }}" \
@@ -198,34 +218,39 @@ jobs:
           pattern: weekly-typescript-compiler-x64-${{ github.run_id }}-${{ github.run_attempt }}-shard-*
           path: target/receipts
           merge-multiple: true
-      - name: Build compiler lane worker
+      - name: Download canonical compiler receipt tools
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: compiler-receipt-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/receipt-tools
+      - name: Restore receipt tool permissions
         shell: bash
-        run: cargo build --locked --release -p bamts-verification --bin ts_lane_worker
+        run: chmod +x target/receipt-tools/bamts-verification target/receipt-tools/ts_lane_worker
       - name: Fetch pinned TypeScript compiler authority
         shell: bash
         run: >-
-          cargo run --locked -p bamts-verification -- source fetch
+          target/receipt-tools/bamts-verification source fetch
           typescript-7-compiler --dest target/authority/typescript-7.0.2
       - name: Fetch pinned TypeScript test authority
         shell: bash
         run: >-
-          cargo run --locked -p bamts-verification -- source fetch
+          target/receipt-tools/bamts-verification source fetch
           typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
       - name: Merge complete compatible matrix
         shell: bash
         env:
-          BAMTS_SUITE_COMPILER_ADAPTER: target/release/ts_lane_worker
+          BAMTS_SUITE_COMPILER_ADAPTER: target/receipt-tools/ts_lane_worker
         run: |
           set -euo pipefail
-          cargo run --locked -p bamts-verification --bin bamts-verification -- suite merge \
+          target/receipt-tools/bamts-verification suite merge \
             --catalog typescript-7.0.2 --receipts target/receipts \
             --out verification/evidence/weekly-merged/typescript-7.0.2-compiler-x86_64-unknown-linux-gnu.jsonl
       - name: Check canonical merged receipt
         shell: bash
         env:
-          BAMTS_SUITE_COMPILER_ADAPTER: target/release/ts_lane_worker
+          BAMTS_SUITE_COMPILER_ADAPTER: target/receipt-tools/ts_lane_worker
         run: |
-          cargo run --locked -p bamts-verification --bin bamts-verification -- suite merge \
+          target/receipt-tools/bamts-verification suite merge \
             --catalog typescript-7.0.2 --receipts target/receipts \
             --out verification/evidence/weekly-merged/typescript-7.0.2-compiler-x86_64-unknown-linux-gnu.jsonl --check
       - name: Upload weekly merged receipt

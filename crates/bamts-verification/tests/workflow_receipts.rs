@@ -14,7 +14,9 @@ fn workflow(name: &str) -> String {
 }
 
 #[test]
-fn compiler_receipt_jobs_provision_authority_before_execution() {
+fn compiler_receipt_jobs_use_pinned_authority_and_shared_tools() {
+    const TOOLS_ARTIFACT: &str =
+        "compiler-receipt-tools-${{ github.run_id }}-${{ github.run_attempt }}";
     #[derive(serde::Deserialize)]
     struct Workflow {
         jobs: BTreeMap<String, Job>,
@@ -30,11 +32,39 @@ fn compiler_receipt_jobs_provision_authority_before_execution() {
     struct Step {
         #[serde(default)]
         run: String,
+        #[serde(default)]
+        uses: String,
+        #[serde(default)]
+        with: ArtifactInputs,
+    }
+
+    #[derive(Default, serde::Deserialize)]
+    struct ArtifactInputs {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        path: String,
     }
 
     for name in ["ci.yml", "nightly.yml", "weekly-audit.yml"] {
         let parsed: Workflow = serde_saphyr::from_str(&workflow(name))
             .unwrap_or_else(|error| panic!("cannot parse {name}: {error}"));
+        let producer = parsed.jobs.get("preflight").expect("preflight job");
+        let upload = producer
+            .steps
+            .iter()
+            .position(|step| {
+                step.uses.starts_with("actions/upload-artifact@")
+                    && step.with.name == TOOLS_ARTIFACT
+                    && step.with.path == "target/receipt-tools"
+            })
+            .unwrap_or_else(|| panic!("{name} must publish one canonical receipt tool artifact"));
+        assert!(producer.steps[..upload].iter().any(|step| {
+            step.run.contains("cargo build --locked --release")
+                && step
+                    .run
+                    .contains("--bin bamts-verification --bin ts_lane_worker")
+        }));
         let mut checked_jobs = 0;
         for (job_name, job) in parsed.jobs {
             let Some(execution) = job.steps.iter().position(|step| {
@@ -44,6 +74,29 @@ fn compiler_receipt_jobs_provision_authority_before_execution() {
                 continue;
             };
             checked_jobs += 1;
+            let download = job.steps[..execution]
+                .iter()
+                .position(|step| {
+                    step.uses.starts_with("actions/download-artifact@")
+                        && step.with.name == TOOLS_ARTIFACT
+                        && step.with.path == "target/receipt-tools"
+                })
+                .unwrap_or_else(|| panic!("{name}:{job_name} must download the canonical tools"));
+            assert!(job.steps[download + 1..execution].iter().any(|step| {
+                step.run.contains(
+                    "chmod +x target/receipt-tools/bamts-verification target/receipt-tools/ts_lane_worker",
+                )
+            }));
+            for step in &job.steps[execution..] {
+                if step.run.contains("--catalog typescript-7.0.2") {
+                    assert!(
+                        step.run
+                            .contains("target/receipt-tools/bamts-verification suite ")
+                            && !step.run.contains("cargo run"),
+                        "{name}:{job_name} must execute the downloaded harness, not rebuild it"
+                    );
+                }
+            }
             for required in [
                 "source fetch typescript-7-compiler --dest target/authority/typescript-7.0.2",
                 "source fetch typescript-primary-tests --dest target/authority/typescript-7.0.2-tests",
@@ -115,7 +168,7 @@ fn receipt_workflows_bind_attempt_and_merge_complete_matrices() {
 fn workers_cannot_mint_pass_or_upload_logs_as_receipts() {
     for name in ["ci.yml", "nightly.yml", "weekly-audit.yml"] {
         let text = workflow(name);
-        assert!(text.contains("bamts-verification -- suite run"));
+        assert!(text.contains("target/receipt-tools/bamts-verification suite run"));
         assert!(
             !text.contains("--state PASS"),
             "{name} exposes worker PASS minting"
