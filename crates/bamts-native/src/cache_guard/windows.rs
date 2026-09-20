@@ -553,6 +553,9 @@ fn write_archive_atomic(
         let mut file = match OpenOptions::new()
             .write(true)
             .access_mode(FILE_GENERIC_WRITE.0 | DELETE.0)
+            // The same-parent rename requires the staging identity and parent
+            // to stay fixed until publication, even against another owner process.
+            .share_mode(0)
             .create_new(true)
             .open(&temporary)
         {
