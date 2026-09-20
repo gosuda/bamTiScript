@@ -30,9 +30,9 @@ use windows::{
             CreateDirectoryW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_DELETE_CHILD,
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-            FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_WRITE_ATTRIBUTES,
-            FILE_WRITE_DATA, FILE_WRITE_EA, FileAttributeTagInfo, GetFileInformationByHandleEx,
-            READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+            FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, FileAttributeTagInfo,
+            GetFileInformationByHandleEx, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
         },
         System::{
             SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE},
@@ -323,11 +323,15 @@ fn validate_single_component(name: &OsStr, parent: &Path) -> Result<(), CacheGua
 }
 
 fn open_pinned_path(path: &Path, directory: bool) -> Result<File, CacheGuardError> {
+    // Publishing a child opens its parent for directory writes. Permit those
+    // opens, but never share DELETE: the guarded directory must not move.
+    // Archive handles still deny both writes and replacement while held.
+    let sharing = FILE_SHARE_READ.0 | if directory { FILE_SHARE_WRITE.0 } else { 0 };
     let mut options = OpenOptions::new();
     options
         .read(true)
         .access_mode(FILE_GENERIC_READ.0 | READ_CONTROL.0)
-        .share_mode(FILE_SHARE_READ.0)
+        .share_mode(sharing)
         .custom_flags(
             FILE_FLAG_OPEN_REPARSE_POINT.0
                 | if directory {
@@ -811,6 +815,44 @@ mod tests {
             assert_eq!(fs::read(archive.path()).expect("read archive"), b"expected");
         }
         drop(runtime);
+        drop(root);
+        fs::remove_dir_all(root_path).expect("remove fixture");
+    }
+
+    #[test]
+    fn guarded_archive_publication_preserves_directory_and_file_pins() {
+        let root_path = fresh_root();
+        let root = PrivateCacheRoot::acquire(&root_path).expect("private root");
+        let runtime = root
+            .guard_child_dir(std::ffi::OsStr::new("runtime"))
+            .expect("runtime dir");
+        let staged = runtime.path().join("staged.lib");
+        let published = runtime.path().join("runtime.lib");
+        fs::write(&staged, b"expected").expect("stage under guarded parent");
+        fs::rename(&staged, &published).expect("publish under guarded parent");
+        assert!(
+            fs::rename(runtime.path(), root.root_path().join("moved")).is_err(),
+            "a held directory must not be renamed"
+        );
+
+        let archive = root
+            .materialize_archive(&runtime, "runtime.lib", b"expected")
+            .expect("hold published archive");
+        assert!(fs::write(archive.path(), b"poison").is_err());
+        assert!(fs::remove_file(archive.path()).is_err());
+        assert!(fs::rename(archive.path(), &staged).is_err());
+        assert_eq!(
+            fs::read(archive.path()).expect("read held archive"),
+            b"expected"
+        );
+        drop(archive);
+        fs::rename(&published, &staged).expect("release permits archive rename");
+        drop(runtime);
+        fs::rename(
+            root.root_path().join("runtime"),
+            root.root_path().join("moved"),
+        )
+        .expect("release permits directory rename");
         drop(root);
         fs::remove_dir_all(root_path).expect("remove fixture");
     }
