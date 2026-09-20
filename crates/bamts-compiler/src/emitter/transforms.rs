@@ -275,11 +275,12 @@ pub fn emit_transformed(
         eof,
         file.diagnostics().to_vec(),
     );
-    let helper_emit = helpers::emit_helpers(&used_helpers, &options.helpers, Some(&rewritten));
     // Under `moduleDetection: auto` a file whose JSX draws the automatic
     // runtime import is a module (commentsOnJSXExpressionsArePreserved),
     // so the synthesized import counts like a source-level one.
     let is_module = !runtime_prelude.is_empty() || crate::checker::source_is_module(file);
+    let helper_emit =
+        helpers::emit_helpers_for_source(&used_helpers, &options.helpers, &rewritten, is_module);
     let cjs_marker = rewriter.cjs_marker_prelude(!runtime_prelude.is_empty());
     let cjs_requires = rewriter.cjs_require_prelude();
     let prelude = join_preludes(

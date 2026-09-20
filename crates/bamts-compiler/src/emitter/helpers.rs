@@ -51,10 +51,9 @@ pub struct HelperOptions {
     /// When true, bind helpers from [`HelperOptions::module_specifier`] instead
     /// of inlining their bodies.
     pub import_helpers: bool,
-    /// Assume helpers exist globally; emit no prelude (`noEmitHelpers`). Takes
-    /// precedence over `import_helpers` when both are set: the more specific
-    /// "assume global" instruction wins, and the combination is contradictory
-    /// configuration no baseline exercises.
+    /// Assume inline helpers exist globally; emit no inline helper definitions
+    /// (`noEmitHelpers`). External imports still emit when `import_helpers`
+    /// is enabled.
     pub no_emit_helpers: bool,
     pub style: HelperStyle,
     /// The module specifier used for imported helpers. Defaults to `tslib`.
@@ -309,7 +308,36 @@ pub fn emit_helpers(
     options: &HelperOptions,
     file: Option<&SourceFile>,
 ) -> HelperEmit {
-    emit_closed(close_helpers(requested), options, file, Vec::new())
+    let source_is_module = file.is_some_and(crate::checker::source_is_module);
+    emit_closed(
+        close_helpers(requested),
+        options,
+        file,
+        Vec::new(),
+        options.import_helpers,
+        source_is_module,
+    )
+}
+
+/// Emits helpers using the caller's effective module classification.
+///
+/// Project emission uses this when synthesized imports make a source a module
+/// even though its original syntax has no import or export.
+#[must_use]
+pub(super) fn emit_helpers_for_source(
+    requested: &[HelperKind],
+    options: &HelperOptions,
+    file: &SourceFile,
+    source_is_module: bool,
+) -> HelperEmit {
+    emit_closed(
+        close_helpers(requested),
+        options,
+        Some(file),
+        Vec::new(),
+        options.import_helpers && source_is_module,
+        source_is_module,
+    )
 }
 
 /// Resolves helper identifiers, recording [`codes::UNKNOWN_HELPER`] for names
@@ -335,7 +363,15 @@ pub fn emit_helpers_named(
             )),
         }
     }
-    emit_closed(close_helpers(&requested), options, file, diagnostics)
+    let source_is_module = file.is_some_and(crate::checker::source_is_module);
+    emit_closed(
+        close_helpers(&requested),
+        options,
+        file,
+        diagnostics,
+        options.import_helpers,
+        source_is_module,
+    )
 }
 
 fn close_helpers(requested: &[HelperKind]) -> Vec<HelperKind> {
@@ -354,6 +390,8 @@ fn emit_closed(
     options: &HelperOptions,
     file: Option<&SourceFile>,
     mut diagnostics: Vec<Diagnostic>,
+    import_helpers: bool,
+    source_is_module: bool,
 ) -> HelperEmit {
     if helpers.is_empty() {
         diagnostics.sort();
@@ -363,19 +401,7 @@ fn emit_closed(
             diagnostics,
         };
     }
-    if options.no_emit_helpers {
-        // `noEmitHelpers`: callers provide the helpers; the closed set is
-        // still recorded (and name-resolution diagnostics kept) but no
-        // definition text is emitted. One gate serves both entry points.
-        diagnostics.sort();
-        return HelperEmit {
-            prelude: String::new(),
-            helpers,
-            diagnostics,
-        };
-    }
-
-    let external_imports = options.import_helpers && options.style != HelperStyle::Inline;
+    let external_imports = import_helpers && options.style != HelperStyle::Inline;
     let (imported, inline_only): (Vec<_>, Vec<_>) = if external_imports {
         helpers
             .iter()
@@ -384,10 +410,7 @@ fn emit_closed(
     } else {
         (Vec::new(), helpers.clone())
     };
-    if !imported.is_empty()
-        && options.style == HelperStyle::EsModule
-        && !file.is_some_and(crate::checker::source_is_module)
-    {
+    if !imported.is_empty() && options.style == HelperStyle::EsModule && !source_is_module {
         let (source_id, range) = file.map_or((SourceId::new(0), empty_range()), |file| {
             (file.source_id(), file.range())
         });
@@ -405,23 +428,28 @@ fn emit_closed(
         };
     }
 
+    let inline_prelude = if options.no_emit_helpers {
+        String::new()
+    } else {
+        inline_prelude(&inline_only)
+    };
     let prelude = match options.style {
-        HelperStyle::Inline => inline_prelude(&inline_only),
+        HelperStyle::Inline => inline_prelude,
         HelperStyle::EsModule if external_imports => {
             let mut prelude = if imported.is_empty() {
                 String::new()
             } else {
                 es_import_prelude(&imported, &options.module_specifier)
             };
-            prelude.push_str(&inline_prelude(&inline_only));
+            prelude.push_str(&inline_prelude);
             prelude
         }
         HelperStyle::CommonJs if external_imports => {
             let mut prelude = cjs_prelude(&imported, &options.module_specifier);
-            prelude.push_str(&inline_prelude(&inline_only));
+            prelude.push_str(&inline_prelude);
             prelude
         }
-        HelperStyle::EsModule | HelperStyle::CommonJs => inline_prelude(&inline_only),
+        HelperStyle::EsModule | HelperStyle::CommonJs => inline_prelude,
     };
 
     diagnostics.sort();
@@ -626,6 +654,33 @@ mod tests {
         assert_eq!(
             emitted.diagnostics[0].code(),
             codes::IMPORT_HELPERS_REQUIRES_MODULE
+        );
+    }
+
+    #[test]
+    fn imported_helpers_still_emit_with_no_emit_helpers() {
+        let file = parse("export const x = 1;\n");
+        let mut esm = HelperOptions::es_module();
+        esm.no_emit_helpers = true;
+        let esm = emit_helpers(
+            &[HelperKind::Awaiter, HelperKind::PropKey],
+            &esm,
+            Some(&file),
+        );
+        assert!(!esm.has_errors());
+        assert_eq!(esm.prelude, "import { __awaiter } from \"tslib\";\n");
+
+        let mut common_js = HelperOptions::common_js();
+        common_js.no_emit_helpers = true;
+        let common_js = emit_helpers(
+            &[HelperKind::Awaiter, HelperKind::PropKey],
+            &common_js,
+            None,
+        );
+        assert!(!common_js.has_errors());
+        assert_eq!(
+            common_js.prelude,
+            "var __awaiter = require(\"tslib\").__awaiter;\n"
         );
     }
 
