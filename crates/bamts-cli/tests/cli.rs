@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::io::OwnedFd;
 #[cfg(unix)]
@@ -72,6 +72,39 @@ const CLASSIC_DYNAMIC_IMPORT_PROGRAM: &str = r#"import vm from 'node:vm';
 vm.runInThisContext("import('node:util').then(function(ns) { process.stdout.write(String(typeof ns.parseArgs) + '\\n'); })");
 "#;
 static NEXT_DIRECTORY: AtomicU32 = AtomicU32::new(0);
+
+#[path = "cli/chaos.rs"]
+mod chaos;
+
+#[test]
+fn process_capture_drains_stdout_and_stderr_before_waiting() {
+    let child = Command::new("node")
+        .args([
+            "-e",
+            "process.stdout.write('x'.repeat(262144)); process.stderr.write('y'.repeat(262144));",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Node is required for CLI E2E oracle tests");
+    let output =
+        wait_for_output_with_timeout(child, "large two-pipe output", Duration::from_secs(5));
+    assert_success(&output, "large two-pipe output");
+    assert_eq!(output.stdout, vec![b'x'; 262144]);
+    assert_eq!(output.stderr, vec![b'y'; 262144]);
+}
+
+#[test]
+#[should_panic(expected = "watchdog probe exceeded")]
+fn process_capture_still_terminates_and_reaps_a_hung_child() {
+    let child = Command::new("node")
+        .args(["-e", "setInterval(() => {}, 1000);"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Node watchdog probe starts");
+    wait_for_output_with_timeout(child, "watchdog probe", Duration::from_millis(200));
+}
 
 #[test]
 fn optional_chain_continuations_skip_side_effects_and_preserve_receivers() {
@@ -1669,24 +1702,57 @@ fn assert_execution_success(output: &ExecutionOutput, command: &str) {
     );
 }
 
-fn wait_for_output(mut child: Child, command: &str) -> Output {
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().expect("finished child output"),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                child.kill().expect("timed-out child is killed");
-                let output = child.wait_with_output().expect("timed-out child output");
-                panic!(
-                    "{command} exceeded 120 seconds\nstdout:\n{}\nstderr:\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
+fn wait_for_output(child: Child, command: &str) -> Output {
+    wait_for_output_with_timeout(child, command, Duration::from_secs(120))
+}
+
+fn wait_for_output_with_timeout(mut child: Child, command: &str, timeout: Duration) -> Output {
+    let deadline = Instant::now() + timeout;
+    drop(child.stdin.take());
+    thread::scope(|scope| {
+        let stdout = child
+            .stdout
+            .take()
+            .map(|pipe| scope.spawn(move || read_output(pipe)));
+        let stderr = child
+            .stderr
+            .take()
+            .map(|pipe| scope.spawn(move || read_output(pipe)));
+        let (status, timed_out) = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break (status, false),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => {
+                    child.kill().expect("timed-out child is killed");
+                    break (child.wait().expect("timed-out child is reaped"), true);
+                }
+                Err(error) => {
+                    child.kill().expect("failed child wait is terminated");
+                    child.wait().expect("failed child wait is reaped");
+                    panic!("could not wait for {command}: {error}");
+                }
             }
-            Err(error) => panic!("could not wait for {command}: {error}"),
-        }
-    }
+        };
+        let output = Output {
+            status,
+            stdout: stdout.map_or_else(Vec::new, |reader| reader.join().expect("stdout reader")),
+            stderr: stderr.map_or_else(Vec::new, |reader| reader.join().expect("stderr reader")),
+        };
+        assert!(
+            !timed_out,
+            "{command} exceeded {timeout:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    })
+}
+
+fn read_output(mut pipe: impl Read) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes)
+        .expect("child pipe is readable");
+    bytes
 }
 
 fn framed(payload: &[u8]) -> Vec<u8> {
