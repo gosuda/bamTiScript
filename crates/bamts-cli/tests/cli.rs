@@ -188,6 +188,40 @@ fn api_transport_serves_socket_backed_stdin() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn api_rejects_unterminated_oversized_header_without_waiting_for_eof() {
+    let directory = ScratchDirectory::new();
+    let (mut peer, child_stdin) = UnixStream::pair().expect("socket pair for child stdin");
+    let child = directory
+        .command()
+        .arg("--api")
+        .current_dir(&directory.path)
+        .stdin(Stdio::from(OwnedFd::from(child_stdin)))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("bamts API child starts");
+    peer.write_all(&[b'x'; 8 * 1024 + 1])
+        .expect("oversized unterminated header is written");
+
+    // Keep the socket open: rejection must depend on the byte budget, not EOF
+    // or a delimiter supplied by the peer.
+    let output = wait_for_output(child, "bamts --api oversized header");
+    drop(peer);
+    assert_success(&output, "bamts --api oversized header");
+    let responses = decode_frames(&output.stdout);
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["id"], serde_json::Value::Null);
+    assert_eq!(responses[0]["error"]["code"], -32700);
+    assert!(
+        responses[0]["error"]["message"]
+            .as_str()
+            .expect("parse error message")
+            .contains("header block exceeds 8192 bytes")
+    );
+}
+
 #[test]
 fn aot_and_jit_share_process_argv_entrypoint_parity() {
     let project = ScratchDirectory::new();

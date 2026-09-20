@@ -1,6 +1,6 @@
 //! JSON-RPC wire framing and bounded protocol values.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -217,7 +217,10 @@ pub(crate) fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<Frame> {
 
     loop {
         let mut line = String::new();
-        let read = match reader.read_line(&mut line) {
+        // Read at most one byte beyond the remaining budget. Checking after an
+        // unbounded read_line lets an unterminated header allocate indefinitely.
+        let remaining = (MAX_HEADER_BYTES - header_bytes + 1) as u64;
+        let read = match reader.take(remaining).read_line(&mut line) {
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                 return Ok(Frame::Malformed(
