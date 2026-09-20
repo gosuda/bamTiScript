@@ -213,20 +213,58 @@ mod tests {
     }
 
     #[test]
-    fn import_helpers_require_module_for_esm() {
-        let options = EmitOptions {
+    fn import_helpers_fall_back_to_inline_helpers_for_scripts() {
+        let esm_options = EmitOptions {
             target: ScriptTarget::Es5,
             import_helpers: true,
             module: Some(ModuleKind::Es2015),
             ..EmitOptions::default()
         };
-        let out = one("async function f() { return 1; }", &options);
+        let esm = one("async function f() { return 1; }", &esm_options);
         assert!(
-            out.diagnostics.iter().any(|diagnostic| diagnostic.code()
-                == super::super::helpers::codes::IMPORT_HELPERS_REQUIRES_MODULE),
-            "non-module ESM helpers should be rejected: {:?}",
+            !esm.has_errors(),
+            "unexpected diagnostics: {:?}",
+            esm.diagnostics
+        );
+        let esm_js = esm.javascript.expect("javascript output").code;
+        assert!(esm_js.contains("var __awaiter ="));
+        assert!(!esm_js.contains("from \"tslib\""));
+
+        let common_js_options = EmitOptions {
+            module: Some(ModuleKind::CommonJs),
+            ..esm_options
+        };
+        let common_js = one("async function f() { return 1; }", &common_js_options);
+        assert!(
+            !common_js.has_errors(),
+            "unexpected diagnostics: {:?}",
+            common_js.diagnostics
+        );
+        let common_js = common_js.javascript.expect("javascript output").code;
+        assert!(common_js.contains("var __awaiter ="));
+        assert!(!common_js.contains("require(\"tslib\")"));
+    }
+
+    #[test]
+    fn import_helpers_take_precedence_over_no_emit_helpers_for_modules() {
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            import_helpers: true,
+            no_emit_helpers: true,
+            module: Some(ModuleKind::Es2015),
+            ..EmitOptions::default()
+        };
+        let out = one("export async function f() { return 1; }", &options);
+        assert!(
+            !out.has_errors(),
+            "unexpected diagnostics: {:?}",
             out.diagnostics
         );
+        let js = out.javascript.expect("javascript output").code;
+        assert!(js.contains("from \"tslib\";"), "got:\n{js}");
+        assert!(js.contains("__awaiter"), "got:\n{js}");
+        assert!(js.contains("__generator"), "got:\n{js}");
+        assert!(!js.contains("var __awaiter ="));
     }
 
     #[test]
@@ -316,6 +354,32 @@ mod tests {
             "{code}"
         );
         assert!(code.contains("_jsx_1(\"div\""), "{code}");
+    }
+
+    #[test]
+    fn automatic_jsx_module_can_import_helpers() {
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            import_helpers: true,
+            jsx: Some(JsxEmit::ReactJsx),
+            ..EmitOptions::default()
+        };
+        let output = one_jsx(
+            "const view = <div />; async function f() { return 1; }",
+            &options,
+        );
+        assert!(
+            !output.has_errors(),
+            "unexpected diagnostics: {:?}",
+            output.diagnostics
+        );
+        let code = output.javascript.expect("JavaScript output").code;
+        assert!(code.contains("from \"tslib\";"), "{code}");
+        assert!(code.contains("from \"react/jsx-runtime\";"), "{code}");
+        assert!(
+            !code.contains("var __awaiter = (this && this.__awaiter)"),
+            "{code}"
+        );
     }
 
     #[test]

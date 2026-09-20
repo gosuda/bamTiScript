@@ -957,6 +957,7 @@ pub struct CompilerOptions {
     strict_property_initialization: bool,
     always_strict: bool,
     use_define_for_class_fields: Option<bool>,
+    import_helpers: Option<bool>,
     allow_js: bool,
     check_js: bool,
     resolve_json_module: bool,
@@ -1056,6 +1057,11 @@ impl CompilerOptions {
     #[must_use]
     pub const fn use_define_for_class_fields(&self) -> Option<bool> {
         self.use_define_for_class_fields
+    }
+
+    #[must_use]
+    pub const fn import_helpers(&self) -> Option<bool> {
+        self.import_helpers
     }
 
     #[must_use]
@@ -1249,6 +1255,7 @@ impl ProjectConfig {
             .unwrap_or(strict),
             always_strict: optional_bool(compiler, "alwaysStrict")?.unwrap_or(strict),
             use_define_for_class_fields: optional_bool(compiler, "useDefineForClassFields")?,
+            import_helpers: optional_bool(compiler, "importHelpers")?,
             allow_js: optional_bool(compiler, "allowJs")?.unwrap_or(false),
             check_js: optional_bool(compiler, "checkJs")?.unwrap_or(false),
             resolve_json_module: optional_bool(compiler, "resolveJsonModule")?.unwrap_or(false),
@@ -2588,6 +2595,31 @@ mod tests {
         )
         .expect("silent key");
         assert_eq!(silent.options().use_define_for_class_fields(), None);
+    }
+
+    #[test]
+    fn project_config_parses_import_helpers_as_tri_state() {
+        let pinned_true = ProjectConfig::parse(
+            &root(),
+            "/workspace/corpus/tsconfig.json",
+            r#"{"compilerOptions":{"importHelpers":true}}"#,
+        )
+        .expect("pinned true");
+        assert_eq!(pinned_true.options().import_helpers(), Some(true));
+        let pinned_false = ProjectConfig::parse(
+            &root(),
+            "/workspace/corpus/tsconfig.json",
+            r#"{"compilerOptions":{"importHelpers":false}}"#,
+        )
+        .expect("pinned false");
+        assert_eq!(pinned_false.options().import_helpers(), Some(false));
+        let silent = ProjectConfig::parse(
+            &root(),
+            "/workspace/corpus/tsconfig.json",
+            r#"{"compilerOptions":{"strict":true}}"#,
+        )
+        .expect("silent key");
+        assert_eq!(silent.options().import_helpers(), None);
     }
 
     #[test]
