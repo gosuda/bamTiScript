@@ -17,7 +17,7 @@ use windows::{
             ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-                GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+                ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
             },
             CONTAINER_INHERIT_ACE, CopySid, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
             EqualSid, GENERIC_MAPPING, GetAce, GetLengthSid, GetSecurityDescriptorControl,
@@ -47,6 +47,10 @@ use super::{CacheGuardError, HeldArchive};
 const MAX_CHAIN_DEPTH: usize = 32;
 const MAX_NAME_ATTEMPTS: usize = 128;
 const COMPARE_BUFFER_BYTES: usize = 64 * 1024;
+// Windows Modules Installer owns protected system directories, including the
+// system-drive root on current Windows images. It is not a private-cache owner.
+const TRUSTED_INSTALLER_SID: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 static NEXT_INVOCATION_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
@@ -113,6 +117,7 @@ struct TrustedSids {
     system: OwnedSid,
     administrators: OwnedSid,
     creator_owner: OwnedSid,
+    trusted_installer: OwnedSid,
 }
 
 #[derive(Debug)]
@@ -281,10 +286,11 @@ impl TrustedSids {
             system: well_known_sid(WinLocalSystemSid)?,
             administrators: well_known_sid(WinBuiltinAdministratorsSid)?,
             creator_owner: well_known_sid(WinCreatorOwnerSid)?,
+            trusted_installer: parse_sid(TRUSTED_INSTALLER_SID)?,
         })
     }
 
-    fn owner_is_trusted(&self, candidate: PSID) -> bool {
+    fn owner_is_trusted(&self, candidate: PSID, policy: DirectoryPolicy) -> bool {
         [
             self.user.as_sid(),
             self.system.as_sid(),
@@ -292,10 +298,13 @@ impl TrustedSids {
         ]
         .into_iter()
         .any(|trusted| equal_sid(candidate, trusted))
+            || (matches!(policy, DirectoryPolicy::Ancestor)
+                && equal_sid(candidate, self.trusted_installer.as_sid()))
     }
 
-    fn mutation_is_trusted(&self, candidate: PSID) -> bool {
-        self.owner_is_trusted(candidate) || equal_sid(candidate, self.creator_owner.as_sid())
+    fn mutation_is_trusted(&self, candidate: PSID, policy: DirectoryPolicy) -> bool {
+        self.owner_is_trusted(candidate, policy)
+            || equal_sid(candidate, self.creator_owner.as_sid())
     }
 }
 
@@ -409,7 +418,7 @@ fn inspect_security_descriptor(
     policy: DirectoryPolicy,
     trusted: &TrustedSids,
 ) -> Result<(), CacheGuardError> {
-    if owner.is_invalid() || !trusted.owner_is_trusted(owner) {
+    if owner.is_invalid() || !trusted.owner_is_trusted(owner, policy) {
         return Err(CacheGuardError::UntrustedOwner {
             path: path.to_owned(),
             owner: sid_to_string(owner, path).unwrap_or_else(|_| "<invalid-sid>".to_owned()),
@@ -461,7 +470,7 @@ fn inspect_security_descriptor(
             continue;
         }
         let trustee = PSID(ptr::from_ref(&ace.SidStart).cast_mut().cast());
-        if !trusted.mutation_is_trusted(trustee) {
+        if !trusted.mutation_is_trusted(trustee, policy) {
             return Err(CacheGuardError::UntrustedWriteAce {
                 path: path.to_owned(),
                 trustee: sid_to_string(trustee, path)
@@ -637,8 +646,23 @@ fn well_known_sid(
     Ok(buffer)
 }
 
+fn parse_sid(value: &str) -> Result<OwnedSid, CacheGuardError> {
+    let path = Path::new("<sid>");
+    let value = wide(OsStr::new(value));
+    let mut sid = PSID(ptr::null_mut());
+    // SAFETY: value is NUL terminated and sid is a valid output pointer.
+    unsafe { ConvertStringSidToSidW(PCWSTR(value.as_ptr()), &mut sid) }
+        .map_err(|error| CacheGuardError::io(path, io::Error::from_raw_os_error(error.code().0)))?;
+    let result = copy_sid(sid, path);
+    // SAFETY: ConvertStringSidToSidW allocated sid with LocalAlloc on success.
+    unsafe {
+        LocalFree(Some(HLOCAL(sid.0)));
+    }
+    result
+}
+
 fn copy_sid(source: PSID, path: &Path) -> Result<OwnedSid, CacheGuardError> {
-    // SAFETY: source comes from a successful token/security query.
+    // SAFETY: source comes from a successful Windows SID query or conversion.
     let size = unsafe { GetLengthSid(source) };
     let mut output = OwnedSid::with_byte_capacity(size as usize);
     // SAFETY: the pointer-aligned output has at least the size reported for source.
@@ -682,7 +706,8 @@ fn wide(value: &OsStr) -> Vec<u16> {
 mod tests {
     use super::{
         CONTAINER_INHERIT_ACE, DELETE, DirectoryPolicy, FILE_DELETE_CHILD, FILE_WRITE_DATA,
-        INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE, PrivateCacheRoot, WRITE_DAC, ace_grants_mutation,
+        INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE, PrivateCacheRoot, TrustedSids, WRITE_DAC,
+        ace_grants_mutation, parse_sid, well_known_sid,
     };
     use std::{
         fs,
@@ -698,6 +723,37 @@ mod tests {
             "bamts-cache-guard-test-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn trusted_installer_is_trusted_only_for_ancestors() {
+        let trusted = TrustedSids::current().expect("trusted SIDs");
+        let installer = trusted.trusted_installer.as_sid();
+        assert!(trusted.owner_is_trusted(installer, DirectoryPolicy::Ancestor));
+        assert!(trusted.mutation_is_trusted(installer, DirectoryPolicy::Ancestor));
+        assert!(!trusted.owner_is_trusted(installer, DirectoryPolicy::Cache));
+        assert!(!trusted.mutation_is_trusted(installer, DirectoryPolicy::Cache));
+    }
+
+    #[test]
+    fn system_ancestor_exception_preserves_the_exact_trust_boundary() {
+        let trusted = TrustedSids::current().expect("trusted SIDs");
+        let other_service =
+            parse_sid("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478465")
+                .expect("distinct service SID");
+        let everyone = well_known_sid(windows::Win32::Security::WinWorldSid).expect("Everyone SID");
+        for policy in [DirectoryPolicy::Ancestor, DirectoryPolicy::Cache] {
+            for owner in [&trusted.user, &trusted.system, &trusted.administrators] {
+                assert!(trusted.owner_is_trusted(owner.as_sid(), policy));
+                assert!(trusted.mutation_is_trusted(owner.as_sid(), policy));
+            }
+            for untrusted in [&other_service, &everyone] {
+                assert!(!trusted.owner_is_trusted(untrusted.as_sid(), policy));
+                assert!(!trusted.mutation_is_trusted(untrusted.as_sid(), policy));
+            }
+            assert!(!trusted.owner_is_trusted(trusted.creator_owner.as_sid(), policy));
+            assert!(trusted.mutation_is_trusted(trusted.creator_owner.as_sid(), policy));
+        }
     }
 
     #[test]
