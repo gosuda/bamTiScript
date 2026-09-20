@@ -1276,6 +1276,10 @@ function $ERROR(message) {\n\
         sources: &[HarnessSource],
         variant: &ExecutionVariant,
     ) -> Result<(), OracleError> {
+        // These real-engine fixtures check completion/error classification,
+        // not host scheduling latency. Deadline policy is tested below with
+        // explicit timestamps; retain a finite budget under parallel CI load.
+        const SEMANTIC_FIXTURE_DEADLINE: Duration = Duration::from_secs(10);
         let script = compose_script(parsed, plan, variant, sources)?;
         let request = RunRequest {
             mode: ExecutionMode::Interpreter,
@@ -1283,7 +1287,7 @@ function $ERROR(message) {\n\
             script,
             negative: plan.negative.clone(),
             async_done: plan.async_done,
-            deadline: DEFAULT_ASYNC_DEADLINE,
+            deadline: SEMANTIC_FIXTURE_DEADLINE,
         };
         let outcome = runner.run(&request);
         judge_run(&request, &outcome)
@@ -1637,6 +1641,28 @@ function $ERROR(message) {\n\
             deadline,
         };
         assert_eq!(judge_done(&early), Err(DoneFailure::EarlyExit));
+    }
+
+    #[test]
+    fn production_done_deadline_boundary_remains_exact() {
+        assert_eq!(DEFAULT_ASYNC_DEADLINE, Duration::from_millis(500));
+        for (kind, at_boundary) in [
+            (DoneEventKind::Success, Ok(())),
+            (DoneEventKind::Error, Err(DoneFailure::Error)),
+        ] {
+            let mut trace = AsyncTrace {
+                events: vec![DoneEvent {
+                    kind,
+                    at: DEFAULT_ASYNC_DEADLINE,
+                }],
+                failure_value: None,
+                exited_at: None,
+                deadline: DEFAULT_ASYNC_DEADLINE,
+            };
+            assert_eq!(judge_done(&trace), at_boundary);
+            trace.events[0].at += Duration::from_nanos(1);
+            assert_eq!(judge_done(&trace), Err(DoneFailure::Late));
+        }
     }
 
     #[test]
