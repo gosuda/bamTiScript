@@ -335,6 +335,45 @@ fn duplicate_content_length_is_rejected_as_unrecoverable() {
 }
 
 #[test]
+fn header_read_stops_at_the_budget_before_a_newline() {
+    for prefix in ["", "Content-Length: 2\r\n", "X: y\r\n"].map(str::as_bytes) {
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(b"X-Padding: ");
+        bytes.extend(std::iter::repeat_n(b'x', MAX_HEADER_BYTES * 2));
+        let mut input = Cursor::new(bytes);
+
+        assert!(matches!(
+            read_frame(&mut input).expect("bounded header read"),
+            Frame::Malformed(_)
+        ));
+        assert_eq!(
+            input.position(),
+            (MAX_HEADER_BYTES + 1) as u64,
+            "the reader must detect overflow without consuming the rest of the line"
+        );
+    }
+}
+
+#[test]
+fn exact_header_budget_preserves_the_body_and_following_frame() {
+    let mut bytes = b"Content-Length: 2\r\nX-Padding: ".to_vec();
+    bytes.resize(MAX_HEADER_BYTES - 4, b'x');
+    bytes.extend_from_slice(b"\r\n\r\n{}");
+    bytes.extend(frame(r#"{"id":1,"method":"compiler/version"}"#));
+    let mut input = Cursor::new(bytes);
+
+    assert_eq!(
+        read_frame(&mut input).expect("exact budget"),
+        Frame::Payload(b"{}".to_vec())
+    );
+    assert!(matches!(
+        read_frame(&mut input).expect("next frame"),
+        Frame::Payload(_)
+    ));
+    assert_eq!(read_frame(&mut input).expect("frame boundary"), Frame::Eof);
+}
+
+#[test]
 fn malformed_json_body_is_answered_and_the_stream_continues() {
     let mut input = frame("{ this is not json ");
     input.extend(frame(r#"{"id":5,"method":"compiler/version"}"#));
