@@ -382,14 +382,24 @@ jobs:
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
           rustup default "$TOOLCHAIN"
 
-      # `ledger verify` shells out to `cargo metadata --offline`, which
-      # resolves the graph for every target and so needs crates the host
-      # build never downloads. `cargo fetch` without `--target` gets all.
+      # The workspace/formal guards resolve the graph for every target and so
+      # need crates the host build never downloads. `cargo fetch` without
+      # `--target` gets all of them.
       - name: Fetch dependencies for all targets
         run: cargo fetch --locked
 
-      - name: G0 ledger
-        run: cargo run --locked -p bamts-verification --bin bamts-verification -- ledger verify --gate G0
+      # Nightly source commits also invalidate candidate-bound completion
+      # receipts. Validate the source-derived authority lock here; strict
+      # ledger closure remains a completion/release gate.
+      - name: Fetch catalog authority
+        run: |
+          cargo run --locked -p bamts-verification -- source fetch typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
+          cargo run --locked -p bamts-verification -- source fetch typescript-6.0-tests --dest target/authority/typescript-6.0.2-tests
+          cargo run --locked -p bamts-verification -- source fetch typescript-compat-tests --dest target/authority/typescript-5.9.3-tests
+          cargo run --locked -p bamts-verification -- source fetch test262 --dest target/authority/test262
+
+      - name: Verify catalog lock
+        run: cargo run --locked -p bamts-verification --bin bamts-verification -- catalog regenerate --release typescript-7.0.2 --check
 
       - name: Formal gates G1,G2,G5,G3,G4
         run: cargo run --locked -p bamts-verification --bin bamts-verification -- formal audit --gates G1,G2,G5,G3,G4
