@@ -250,6 +250,110 @@ process.stdout.write(process.env.BAMTS_AOT_ENTRYPOINT === undefined ? "hidden\n"
     assert_eq!(aot.stdout, jit.stdout);
 }
 
+#[cfg(unix)]
+#[test]
+fn lsp_rejects_malformed_headers_without_dispatching_the_next_frame() {
+    for mut input in [
+        vec![b'x'; 8 * 1024 + 1],
+        b"Content-Length: 2\r\ncontent-length: 2\r\n\r\n{}".to_vec(),
+        b"Not a header\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+    ] {
+        let directory = ScratchDirectory::new();
+        input.extend(framed(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#,
+        ));
+        let (mut peer, child_stdin) = UnixStream::pair().expect("socket pair for child stdin");
+        let child = directory
+            .command()
+            .arg("--lsp")
+            .current_dir(&directory.path)
+            .stdin(Stdio::from(OwnedFd::from(child_stdin)))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("LSP child starts");
+        peer.write_all(&input).expect("malformed input is written");
+        let output = wait_for_output(child, "bamts --lsp malformed header");
+        drop(peer);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            output.stdout.is_empty(),
+            "ambiguous framing must not dispatch JSON"
+        );
+        assert!(!stderr(&output).contains("panicked"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn lsp_fragmented_typescript_edits_publish_errors_then_recover() {
+    for chunk_size in [1, 3, 17, 4096] {
+        let directory = ScratchDirectory::new();
+        directory.write("main.ts", "const value: number = 7;\n");
+        let uri = format!("file://{}", directory.path.join("main.ts").display());
+        let requests = [
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{
+                "uri":uri,"languageId":"typescript","version":1,"text":"const value: number = \"bad\";\n"
+            }}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{
+                "textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":"const value: number = 7;\n"}]
+            }}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}),
+            serde_json::json!({"jsonrpc":"2.0","method":"exit"}),
+        ];
+        let input: Vec<u8> = requests
+            .iter()
+            .flat_map(|request| framed(&serde_json::to_vec(request).expect("request serializes")))
+            .collect();
+        let mut child = directory
+            .command()
+            .arg("--lsp")
+            .current_dir(&directory.path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("LSP child starts");
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        for chunk in input.chunks(chunk_size) {
+            stdin.write_all(chunk).expect("fragment is written");
+        }
+        drop(stdin);
+        let output = wait_for_output(child, "bamts --lsp fragmented edits");
+        assert_success(&output, "bamts --lsp fragmented edits");
+        let responses = decode_frames(&output.stdout);
+        let diagnostics: Vec<_> = responses
+            .iter()
+            .filter(|response| response["method"] == "textDocument/publishDiagnostics")
+            .map(|response| {
+                response["params"]["diagnostics"]
+                    .as_array()
+                    .expect("diagnostics")
+            })
+            .collect();
+        assert_eq!(diagnostics.len(), 2, "{responses:?}");
+        assert!(
+            diagnostics[0]
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "BAMTS-C004"),
+            "the invalid TypeScript must be checked: {responses:?}"
+        );
+        assert!(
+            diagnostics[1]
+                .iter()
+                .all(|diagnostic| diagnostic["severity"] != 1),
+            "the valid edit must clear stale errors: {responses:?}"
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response["id"] == 2 && response.get("result").is_some())
+        );
+    }
+}
+
 #[test]
 fn aot_and_jit_execute_non_decimal_bigint_literals() {
     let project = ScratchDirectory::new();
