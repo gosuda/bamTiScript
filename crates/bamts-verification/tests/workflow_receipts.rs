@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -11,6 +11,53 @@ fn repository_root() -> PathBuf {
 fn workflow(name: &str) -> String {
     fs::read_to_string(repository_root().join(".github/workflows").join(name))
         .unwrap_or_else(|error| panic!("cannot read {name}: {error}"))
+}
+
+#[test]
+fn compiler_receipt_jobs_provision_authority_before_execution() {
+    #[derive(serde::Deserialize)]
+    struct Workflow {
+        jobs: BTreeMap<String, Job>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Job {
+        #[serde(default)]
+        steps: Vec<Step>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Step {
+        #[serde(default)]
+        run: String,
+    }
+
+    for name in ["ci.yml", "nightly.yml", "weekly-audit.yml"] {
+        let parsed: Workflow = serde_saphyr::from_str(&workflow(name))
+            .unwrap_or_else(|error| panic!("cannot parse {name}: {error}"));
+        let mut checked_jobs = 0;
+        for (job_name, job) in parsed.jobs {
+            let Some(execution) = job.steps.iter().position(|step| {
+                step.run.contains("--catalog typescript-7.0.2")
+                    && (step.run.contains("suite run") || step.run.contains("suite merge"))
+            }) else {
+                continue;
+            };
+            checked_jobs += 1;
+            for required in [
+                "source fetch typescript-7-compiler --dest target/authority/typescript-7.0.2",
+                "source fetch typescript-primary-tests --dest target/authority/typescript-7.0.2-tests",
+            ] {
+                assert!(
+                    job.steps[..execution]
+                        .iter()
+                        .any(|step| step.run.contains(required)),
+                    "{name}:{job_name} must provision `{required}` before receipt execution"
+                );
+            }
+        }
+        assert!(checked_jobs > 0, "{name} contains no compiler receipt jobs");
+    }
 }
 
 #[test]
