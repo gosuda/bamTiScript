@@ -74,6 +74,23 @@ vm.runInThisContext("import('node:util').then(function(ns) { process.stdout.writ
 static NEXT_DIRECTORY: AtomicU32 = AtomicU32::new(0);
 
 #[test]
+fn optional_chain_continuations_skip_side_effects_and_preserve_receivers() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        include_str!("fixtures/optional-chain-continuations.ts"),
+    );
+    for mode in ["jit", "aot"] {
+        let output = project.execute(mode, "main.ts", &[]);
+        assert_execution_success(&output, mode);
+        assert_eq!(
+            output.stdout, b"[-1,-1,-1,-1,-1,true,0]\n[7,40,7,7,40,true,6]\n",
+            "{mode}"
+        );
+    }
+}
+
+#[test]
 fn api_execution_preserves_stdout_and_exit_code() {
     let directory = ScratchDirectory::new();
     directory.write("hello.ts", include_str!("fixtures/hello.ts"));
