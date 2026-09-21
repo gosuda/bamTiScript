@@ -11,8 +11,11 @@ use std::{
 };
 
 use windows::{
+    Wdk::Storage::FileSystem::{
+        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+    },
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
+        Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree, RtlNtStatusToDosError},
         Security::{
             ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
             Authorization::{
@@ -35,6 +38,7 @@ use windows::{
             READ_CONTROL, WRITE_DAC, WRITE_OWNER,
         },
         System::{
+            IO::IO_STATUS_BLOCK,
             SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE},
             Threading::{GetCurrentProcess, OpenProcessToken},
         },
@@ -327,6 +331,8 @@ fn open_pinned_path(path: &Path, directory: bool) -> Result<File, CacheGuardErro
     options
         .read(true)
         .access_mode(FILE_GENERIC_READ.0 | READ_CONTROL.0)
+        // Deny directory writes as well as deletion: a writable directory
+        // handle could install a junction after its no-reparse validation.
         .share_mode(FILE_SHARE_READ.0)
         .custom_flags(
             FILE_FLAG_OPEN_REPARSE_POINT.0
@@ -546,6 +552,10 @@ fn write_archive_atomic(
         ));
         let mut file = match OpenOptions::new()
             .write(true)
+            .access_mode(FILE_GENERIC_WRITE.0 | DELETE.0)
+            // The same-parent rename requires the staging identity and parent
+            // to stay fixed until publication, even against another owner process.
+            .share_mode(0)
             .create_new(true)
             .open(&temporary)
         {
@@ -558,8 +568,9 @@ fn write_archive_atomic(
             let _ = fs::remove_file(&temporary);
             return Err(CacheGuardError::io(&temporary, source));
         }
+        let renamed = rename_archive_in_place(&file, destination);
         drop(file);
-        match fs::rename(&temporary, destination) {
+        match renamed {
             Ok(()) => return Ok(()),
             Err(_error) if destination.exists() => {
                 let _ = fs::remove_file(&temporary);
@@ -574,6 +585,60 @@ fn write_archive_atomic(
     Err(CacheGuardError::NameAttemptsExhausted {
         parent: parent.to_owned(),
     })
+}
+
+// The synchronous file was created in destination's guarded parent, and the
+// destination has a validated single-component name. A native leaf-only rename
+// changes that entry without reopening its write-denying parent. Win32 path
+// renames resolve a target directory instead and conflict with the parent pin.
+fn rename_archive_in_place(file: &File, destination: &Path) -> io::Result<()> {
+    let name: Vec<u16> = destination
+        .file_name()
+        .expect("validated archive component")
+        .encode_wide()
+        .collect();
+    let name_bytes = u32::try_from(std::mem::size_of_val(name.as_slice())).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "archive name exceeds NT length",
+        )
+    })?;
+    let length = size_of::<FILE_RENAME_INFORMATION>() + name_bytes as usize;
+    let length_u32 = u32::try_from(length).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "archive rename exceeds NT length",
+        )
+    })?;
+    let mut storage = vec![0_usize; length.div_ceil(size_of::<usize>())];
+    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: pointer-aligned zeroed storage holds the header and UTF-16 tail.
+    // Its null RootDirectory and false ReplaceIfExists select a same-parent,
+    // non-replacing rename. The live synchronous file has DELETE access; both
+    // buffers remain valid until the synchronous syscall returns.
+    let result = unsafe {
+        (*information).FileNameLength = name_bytes;
+        ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+            name.len(),
+        );
+        NtSetInformationFile(
+            HANDLE(file.as_raw_handle()),
+            &mut status,
+            information.cast(),
+            length_u32,
+            FileRenameInformation,
+        )
+    };
+    if result.is_ok() {
+        Ok(())
+    } else {
+        // SAFETY: this maps a returned NT status to its Win32 error code.
+        let code = unsafe { RtlNtStatusToDosError(result) };
+        Err(io::Error::from_raw_os_error(code as i32))
+    }
 }
 
 fn bytes_equal(file: &mut File, expected: &[u8]) -> io::Result<bool> {
@@ -812,6 +877,56 @@ mod tests {
         }
         drop(runtime);
         drop(root);
+        fs::remove_dir_all(root_path).expect("remove fixture");
+    }
+
+    #[test]
+    fn guarded_archive_publication_preserves_directory_and_file_pins() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root_path = fresh_root();
+        let root = PrivateCacheRoot::acquire(&root_path).expect("private root");
+        let runtime = root
+            .guard_child_dir(std::ffi::OsStr::new("runtime"))
+            .expect("runtime dir");
+        let runtime_path = runtime.path().to_owned();
+        let staged = runtime_path.join("staged.lib");
+        let published = runtime_path.join("runtime-\u{1f680}.lib");
+        let open_directory_writer = |path: &std::path::Path| {
+            fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(super::FILE_FLAG_BACKUP_SEMANTICS.0)
+                .open(path)
+        };
+        assert_eq!(
+            open_directory_writer(runtime.path())
+                .expect_err("a junction writer must be denied on the still-empty directory")
+                .raw_os_error(),
+            Some(32)
+        );
+        assert!(
+            fs::rename(runtime.path(), root.root_path().join("moved")).is_err(),
+            "a held directory must not be renamed"
+        );
+
+        let archive = root
+            .materialize_archive(&runtime, "runtime-\u{1f680}.lib", b"expected")
+            .expect("hold published archive");
+        assert!(fs::write(archive.path(), b"poison").is_err());
+        assert!(fs::remove_file(archive.path()).is_err());
+        assert!(fs::rename(archive.path(), &staged).is_err());
+        assert_eq!(
+            fs::read(archive.path()).expect("read held archive"),
+            b"expected"
+        );
+        drop(archive);
+        fs::write(&published, b"released").expect("release permits archive write");
+        drop(runtime);
+        drop(open_directory_writer(&runtime_path).expect("release permits directory write open"));
+        drop(root);
+        fs::rename(&published, &staged).expect("release permits archive rename");
+        fs::rename(&runtime_path, root_path.join("moved"))
+            .expect("release permits directory rename");
         fs::remove_dir_all(root_path).expect("remove fixture");
     }
 
