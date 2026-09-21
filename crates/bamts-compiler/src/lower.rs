@@ -3629,6 +3629,11 @@ impl<'a> FunctionContext<'a> {
             }
             return self.lower_enum_scalar(builder, &scalar, range);
         }
+        if Self::has_optional_chain(expression) {
+            return self
+                .lower_optional_chain(builder, expression)
+                .map(|(value, _)| value);
+        }
         match expression.data() {
             Expression::JsxElement(_)
             | Expression::JsxFragment(_)
@@ -3879,7 +3884,7 @@ impl<'a> FunctionContext<'a> {
         }
         match argument.data() {
             Expression::Member(member) => {
-                if member.optional {
+                if Self::has_optional_chain(argument) {
                     return self.lower_optional_delete(builder, range, member);
                 }
                 let object = self.lower_expression(builder, &member.object)?;
@@ -3933,15 +3938,11 @@ impl<'a> FunctionContext<'a> {
         let result = self.alloc_register(range)?;
         let truthy = self.load_constant(builder, Constant::Boolean(true), range)?;
         self.move_to(range, result, truthy)?;
-        let object = self.lower_expression(builder, &member.object)?;
-        let is_nullish = self.compute_nullish(builder, range, object)?;
-        let skip = self.emit(
-            range,
-            Instruction::JumpIfTrue {
-                condition: is_nullish,
-                target: Pc::new(0),
-            },
-        )?;
+        let mut skips = Vec::new();
+        let (object, _) = self.lower_chain_reference(builder, &member.object, &mut skips)?;
+        if member.optional {
+            self.skip_nullish_chain(builder, range, object, &mut skips)?;
+        }
         let key = self.member_key(builder, &member.property)?;
         let deleted = self.alloc_register(range)?;
         self.emit(
@@ -3954,7 +3955,9 @@ impl<'a> FunctionContext<'a> {
         )?;
         self.move_to(range, result, deleted)?;
         let end = self.next_pc();
-        self.patch_jump(skip, end);
+        for skip in skips {
+            self.patch_jump(skip, end);
+        }
         Ok(result)
     }
     fn lower_binary(
@@ -4785,49 +4788,126 @@ impl<'a> FunctionContext<'a> {
             };
             return Err(self.const_enum_operation(range, operation));
         }
-        if member.optional {
-            let value = self.lower_optional_chain(builder, range, member)?;
-            let object = self.undefined(builder, range)?;
-            return Ok((object, value));
-        }
         let object = self.lower_expression(builder, &member.object)?;
         let key = self.member_key(builder, &member.property)?;
         let dst = self.alloc_register(range)?;
         self.emit(range, Instruction::GetProperty { dst, object, key })?;
         Ok((object, dst))
     }
+    fn has_optional_chain(mut expression: &Expr) -> bool {
+        loop {
+            expression = match expression.data() {
+                Expression::Member(member) => {
+                    if member.optional {
+                        return true;
+                    }
+                    &member.object
+                }
+                Expression::Call(call) => {
+                    if call.optional {
+                        return true;
+                    }
+                    &call.callee
+                }
+                Expression::NonNull(non_null) => &non_null.expression,
+                // Parentheses end a chain; a TS non-null assertion does not.
+                _ => return false,
+            };
+        }
+    }
+
+    /// Every optional link jumps past the whole chain, including computed keys
+    /// and call arguments. The pair retains a property reference's receiver.
     fn lower_optional_chain(
         &mut self,
         builder: &mut ModuleBuilder,
-        range: TextRange,
-        member: &MemberExpression,
-    ) -> Result<Register, LowerError> {
-        let result = self.alloc_register(range)?;
-        let undefined = self.undefined(builder, range)?;
-        self.move_to(range, result, undefined)?;
-        let object = self.lower_expression(builder, &member.object)?;
-        let is_nullish = self.compute_nullish(builder, range, object)?;
-        let skip = self.emit(
-            range,
-            Instruction::JumpIfTrue {
-                condition: is_nullish,
-                target: Pc::new(0),
-            },
-        )?;
-        let key = self.member_key(builder, &member.property)?;
-        let value = self.alloc_register(range)?;
-        self.emit(
-            range,
-            Instruction::GetProperty {
-                dst: value,
-                object,
-                key,
-            },
-        )?;
+        expression: &Expr,
+    ) -> Result<(Register, Register), LowerError> {
+        let range = expression.range();
+        let result = self.undefined(builder, range)?;
+        let receiver = self.undefined(builder, range)?;
+        let mut skips = Vec::new();
+        let (value, this_value) = self.lower_chain_reference(builder, expression, &mut skips)?;
+        self.move_to(range, receiver, this_value)?;
         self.move_to(range, result, value)?;
         let end = self.next_pc();
-        self.patch_jump(skip, end);
-        Ok(result)
+        for skip in skips {
+            self.patch_jump(skip, end);
+        }
+        Ok((result, receiver))
+    }
+
+    fn skip_nullish_chain(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        value: Register,
+        skips: &mut Vec<Pc>,
+    ) -> Result<(), LowerError> {
+        let condition = self.compute_nullish(builder, range, value)?;
+        skips.push(self.emit(
+            range,
+            Instruction::JumpIfTrue {
+                condition,
+                target: Pc::new(0),
+            },
+        )?);
+        Ok(())
+    }
+
+    fn lower_chain_reference(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        expression: &Expr,
+        skips: &mut Vec<Pc>,
+    ) -> Result<(Register, Register), LowerError> {
+        let range = expression.range();
+        if !Self::has_optional_chain(expression) {
+            return self.lower_callee(builder, range, expression);
+        }
+        if self.is_direct_const_enum_member(expression)? {
+            return Err(self.const_enum_operation(range, ConstEnumOperation::OptionalAccess));
+        }
+        match expression.data() {
+            Expression::Member(member) => {
+                let (object, _) = self.lower_chain_reference(builder, &member.object, skips)?;
+                if member.optional {
+                    self.skip_nullish_chain(builder, range, object, skips)?;
+                }
+                let key = self.member_key(builder, &member.property)?;
+                let dst = self.alloc_register(range)?;
+                self.emit(range, Instruction::GetProperty { dst, object, key })?;
+                Ok((dst, object))
+            }
+            Expression::Call(call) => {
+                if self.is_direct_const_enum_member(&call.callee)? {
+                    return Err(
+                        self.const_enum_operation(range, ConstEnumOperation::OptionalAccess)
+                    );
+                }
+                let (callee, this_value) =
+                    self.lower_chain_reference(builder, &call.callee, skips)?;
+                if call.optional {
+                    self.skip_nullish_chain(builder, range, callee, skips)?;
+                }
+                let arguments = self.build_arguments(builder, range, &call.arguments)?;
+                let dst = self.alloc_register(range)?;
+                self.emit(
+                    range,
+                    Instruction::Call {
+                        dst,
+                        callee,
+                        this_value,
+                        arguments,
+                    },
+                )?;
+                Ok((dst, self.undefined(builder, range)?))
+            }
+            Expression::NonNull(non_null) => {
+                self.lower_chain_reference(builder, &non_null.expression, skips)
+            }
+            _ => unreachable!("optional chains contain only member, call, and non-null links"),
+        }
     }
     fn lower_call(
         &mut self,
@@ -4837,14 +4917,6 @@ impl<'a> FunctionContext<'a> {
     ) -> Result<Register, LowerError> {
         if matches!(call.callee.data(), Expression::Super) {
             return self.lower_derived_super(builder, range, call);
-        }
-        if let Expression::Member(member) = call.callee.data()
-            && member.optional
-        {
-            return self.lower_optional_member_call(builder, range, call, member);
-        }
-        if call.optional {
-            return self.lower_optional_call(builder, range, call);
         }
         if self.is_direct_const_enum_member(&call.callee)? {
             return Err(self.const_enum_operation(range, ConstEnumOperation::Read));
@@ -4863,75 +4935,19 @@ impl<'a> FunctionContext<'a> {
         )?;
         Ok(dst)
     }
-    fn lower_optional_member_call(
-        &mut self,
-        builder: &mut ModuleBuilder,
-        range: TextRange,
-        call: &CallExpression,
-        member: &MemberExpression,
-    ) -> Result<Register, LowerError> {
-        if self.is_direct_const_enum_member(&call.callee)? {
-            return Err(self.const_enum_operation(range, ConstEnumOperation::OptionalAccess));
-        }
-        let result = self.alloc_register(range)?;
-        let undefined = self.undefined(builder, range)?;
-        self.move_to(range, result, undefined)?;
-        let object = self.lower_expression(builder, &member.object)?;
-        let object_is_nullish = self.compute_nullish(builder, range, object)?;
-        let object_skip = self.emit(
-            range,
-            Instruction::JumpIfTrue {
-                condition: object_is_nullish,
-                target: Pc::new(0),
-            },
-        )?;
-        let key = self.member_key(builder, &member.property)?;
-        let callee = self.alloc_register(range)?;
-        self.emit(
-            range,
-            Instruction::GetProperty {
-                dst: callee,
-                object,
-                key,
-            },
-        )?;
-        let callee_skip = if call.optional {
-            let callee_is_nullish = self.compute_nullish(builder, range, callee)?;
-            Some(self.emit(
-                range,
-                Instruction::JumpIfTrue {
-                    condition: callee_is_nullish,
-                    target: Pc::new(0),
-                },
-            )?)
-        } else {
-            None
-        };
-        let arguments = self.build_arguments(builder, range, &call.arguments)?;
-        let value = self.alloc_register(range)?;
-        self.emit(
-            range,
-            Instruction::Call {
-                dst: value,
-                callee,
-                this_value: object,
-                arguments,
-            },
-        )?;
-        self.move_to(range, result, value)?;
-        let end = self.next_pc();
-        self.patch_jump(object_skip, end);
-        if let Some(callee_skip) = callee_skip {
-            self.patch_jump(callee_skip, end);
-        }
-        Ok(result)
-    }
     fn lower_callee(
         &mut self,
         builder: &mut ModuleBuilder,
         range: TextRange,
         callee: &Expr,
     ) -> Result<(Register, Register), LowerError> {
+        let mut callee = callee;
+        while let Expression::Parenthesized(inner) = callee.data() {
+            callee = inner;
+        }
+        if Self::has_optional_chain(callee) {
+            return self.lower_optional_chain(builder, callee);
+        }
         match callee.data() {
             Expression::Member(member) if !member.optional => {
                 if matches!(member.object.data(), Expression::Super) {
@@ -5001,43 +5017,6 @@ impl<'a> FunctionContext<'a> {
                 Ok((callee, this_value))
             }
         }
-    }
-    fn lower_optional_call(
-        &mut self,
-        builder: &mut ModuleBuilder,
-        range: TextRange,
-        call: &CallExpression,
-    ) -> Result<Register, LowerError> {
-        if self.is_direct_const_enum_member(&call.callee)? {
-            return Err(self.const_enum_operation(range, ConstEnumOperation::OptionalAccess));
-        }
-        let result = self.alloc_register(range)?;
-        let undefined = self.undefined(builder, range)?;
-        self.move_to(range, result, undefined)?;
-        let (callee, this_value) = self.lower_callee(builder, range, &call.callee)?;
-        let is_nullish = self.compute_nullish(builder, range, callee)?;
-        let skip = self.emit(
-            range,
-            Instruction::JumpIfTrue {
-                condition: is_nullish,
-                target: Pc::new(0),
-            },
-        )?;
-        let arguments = self.build_arguments(builder, range, &call.arguments)?;
-        let value = self.alloc_register(range)?;
-        self.emit(
-            range,
-            Instruction::Call {
-                dst: value,
-                callee,
-                this_value,
-                arguments,
-            },
-        )?;
-        self.move_to(range, result, value)?;
-        let end = self.next_pc();
-        self.patch_jump(skip, end);
-        Ok(result)
     }
     fn lower_new(
         &mut self,
