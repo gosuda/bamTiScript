@@ -5,7 +5,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{self, BufRead, Write},
+    io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -20,6 +20,7 @@ use bamts_compiler::source::{SourceText, TextRange, Utf16Pos};
 use serde_json::{Value, json};
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 8 * 1024;
 const REQUEST_CANCELLED: i32 = -32800;
 
 /// How the stdio loop finished.
@@ -778,19 +779,46 @@ fn percent_decode(input: &str) -> Result<String, String> {
 
 fn read_message(input: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
     let mut content_length = None;
+    let mut header_bytes = 0;
     loop {
         let mut header = String::new();
-        if input.read_line(&mut header)? == 0 {
-            return Ok(None);
+        // Bound the read itself so a peer cannot grow an unterminated line.
+        let remaining = (MAX_HEADER_BYTES - header_bytes + 1) as u64;
+        let read = input.take(remaining).read_line(&mut header)?;
+        if read == 0 {
+            return if header_bytes == 0 {
+                Ok(None)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "stream ended inside an LSP header",
+                ))
+            };
+        }
+        header_bytes += read;
+        if header_bytes > MAX_HEADER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LSP header exceeds 8 KiB",
+            ));
         }
         let header = header.trim_end_matches(['\r', '\n']);
         if header.is_empty() {
             break;
         }
         let Some((name, value)) = header.split_once(':') else {
-            continue;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LSP header line has no separator",
+            ));
         };
         if name.eq_ignore_ascii_case("Content-Length") {
+            if content_length.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate Content-Length",
+                ));
+            }
             content_length = Some(
                 value
                     .trim()
@@ -2431,6 +2459,61 @@ mod tests {
         let mut cursor = Cursor::new(b"Content-Type: application/vscode-jsonrpc\r\n\r\n".to_vec());
         let error = read_message(&mut cursor).expect_err("missing length");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn framing_bounds_header_reads_before_a_newline() {
+        for prefix in ["", "Content-Length: 2\r\n", "X: y\r\n"] {
+            let bytes = format!("{prefix}X-Padding: {}", "x".repeat(16 * 1024));
+            let mut input = Cursor::new(bytes);
+            let error = read_message(&mut input).expect_err("header budget");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(input.position(), 8193, "reject at the first excess byte");
+        }
+    }
+
+    #[test]
+    fn framing_rejects_duplicate_lengths_and_malformed_headers() {
+        for bytes in [
+            "Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}",
+            "Content-Length: 9\r\ncontent-length: 2\r\n\r\n{}",
+            "Not a header\r\nContent-Length: 2\r\n\r\n{}",
+        ] {
+            let error = read_message(&mut Cursor::new(bytes)).expect_err(bytes);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn framing_distinguishes_eof_from_a_truncated_header() {
+        assert_eq!(
+            read_message(&mut Cursor::new(b"")).expect("clean EOF"),
+            None
+        );
+        for bytes in ["Content-Length: 2", "Content-Length: 2\r\n"] {
+            let error = read_message(&mut Cursor::new(bytes)).expect_err("truncated header");
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    #[test]
+    fn framing_preserves_exact_budget_and_fragmented_frame_boundaries() {
+        let mut bytes = b"Content-Length: 2\r\nX-Padding: ".to_vec();
+        bytes.resize(8192 - 4, b'x');
+        bytes.extend_from_slice(b"\r\n\r\n{}");
+        bytes.extend_from_slice(b"Content-Length: 2\r\n\r\n[]");
+        for capacity in [1, 2, 3, 7, 13, 512, 8192] {
+            let mut input = io::BufReader::with_capacity(capacity, Cursor::new(&bytes));
+            assert_eq!(
+                read_message(&mut input).expect("first frame"),
+                Some(b"{}".to_vec())
+            );
+            assert_eq!(
+                read_message(&mut input).expect("second frame"),
+                Some(b"[]".to_vec())
+            );
+            assert_eq!(read_message(&mut input).expect("clean EOF"), None);
+        }
     }
 
     /// A `BufRead` that serves framed messages in segments, running each
