@@ -1,12 +1,12 @@
 //! Linux backend: `/proc`, `/sys`, and `get_mempolicy(2)`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_os = "linux")]
 use std::fs;
 
-use crate::PlatformError;
 #[cfg(target_os = "linux")]
 use crate::{MachineFacts, ThreadPlacement};
+use crate::{PlatformError, UNAVAILABLE};
 
 type Result<T> = std::result::Result<T, PlatformError>;
 
@@ -71,6 +71,101 @@ fn parse_proc_cpuinfo(content: &str) -> Result<(String, u32, u32, String)> {
         .map_err(|_| malformed("/proc/cpuinfo", "socket count overflow"))?
         .max(1);
     Ok((model, socket_count, cores_per_socket, microcode))
+}
+
+/// Builds the CPU identity from cpuinfo. A `model name` line selects the
+/// original parser, so x86 hosts read exactly what they always have. A host
+/// without it but with ARM identification fields takes its model from those
+/// fields and its socket and core counts from the sysfs topology.
+fn cpu_identity(
+    content: &str,
+    topology: impl FnOnce() -> Result<Vec<(i64, i64)>>,
+) -> Result<(String, u32, u32, String)> {
+    let has_model_name = content
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .any(|(key, _)| key.trim() == "model name");
+    if !has_model_name && let Some(model) = parse_arm_cpu_model(content) {
+        let (sockets, cores_per_socket) = sockets_and_cores(&topology()?)?;
+        return Ok((model, sockets, cores_per_socket, UNAVAILABLE.to_owned()));
+    }
+    parse_proc_cpuinfo(content)
+}
+
+/// Names an ARM CPU from the identification fields cpuinfo does print.
+fn parse_arm_cpu_model(content: &str) -> Option<String> {
+    let mut implementer = None;
+    let mut part = None;
+    for (key, value) in content.lines().filter_map(|line| line.split_once(':')) {
+        let (key, value) = (key.trim(), value.trim());
+        match key {
+            "CPU implementer" if implementer.is_none() => implementer = Some(value),
+            "CPU part" if part.is_none() => part = Some(value),
+            _ => {}
+        }
+    }
+    Some(format!("arm64 implementer={} part={}", implementer?, part?))
+}
+
+/// Counts sockets and cores per socket from one `(package id, core id)` pair
+/// per online CPU.
+fn sockets_and_cores(cpus: &[(i64, i64)]) -> Result<(u32, u32)> {
+    const SOURCE: &str = "/sys/devices/system/cpu topology";
+    let mut packages: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+    for &(package, core) in cpus {
+        if package < 0 {
+            return Err(malformed(SOURCE, format!("negative package id {package}")));
+        }
+        packages.entry(package).or_default().insert(core);
+    }
+    let mut counts = packages.values().map(BTreeSet::len);
+    let first = counts.next().ok_or_else(|| malformed(SOURCE, "no CPUs"))?;
+    if counts.any(|count| count != first) {
+        return Err(malformed(SOURCE, "packages have different core counts"));
+    }
+    let sockets =
+        u32::try_from(packages.len()).map_err(|_| malformed(SOURCE, "socket count overflow"))?;
+    let cores = u32::try_from(first).map_err(|_| malformed(SOURCE, "core count overflow"))?;
+    Ok((sockets, cores))
+}
+
+#[cfg(target_os = "linux")]
+fn read_topology() -> Result<Vec<(i64, i64)>> {
+    const ROOT: &str = "/sys/devices/system/cpu";
+    let read_error = |error: std::io::Error| PlatformError::Read {
+        source: ROOT.to_owned(),
+        detail: error.to_string(),
+    };
+    let mut cpus = Vec::new();
+    for entry in fs::read_dir(ROOT).map_err(read_error)? {
+        let entry = entry.map_err(read_error)?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(number) = name.strip_prefix("cpu") else {
+            continue;
+        };
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let topology = entry.path().join("topology");
+        // An offline CPU has no topology directory.
+        let (Ok(package), Ok(core)) = (
+            fs::read_to_string(topology.join("physical_package_id")),
+            fs::read_to_string(topology.join("core_id")),
+        ) else {
+            continue;
+        };
+        let parse = |text: &str, field: &str| {
+            text.trim()
+                .parse::<i64>()
+                .map_err(|_| malformed(ROOT, format!("{field} is not a number")))
+        };
+        cpus.push((
+            parse(&package, "physical_package_id")?,
+            parse(&core, "core_id")?,
+        ));
+    }
+    Ok(cpus)
 }
 
 /// Parses `SwapTotal` (KiB) from `/proc/meminfo`.
@@ -198,7 +293,7 @@ pub(crate) fn machine_facts() -> Result<MachineFacts> {
         .unwrap_or_else(|_| "unknown".to_owned());
 
     let (kernel_release, kernel_version) = parse_proc_version(&version)?;
-    let (cpu_model, sockets, cores_per_socket, microcode) = parse_proc_cpuinfo(&cpuinfo)?;
+    let (cpu_model, sockets, cores_per_socket, microcode) = cpu_identity(&cpuinfo, read_topology)?;
     let swap_total_kib = parse_proc_meminfo_swap(&meminfo)?;
 
     Ok(MachineFacts {
@@ -245,6 +340,80 @@ mod tests {
         assert_eq!(sockets, 2);
         assert_eq!(cores, 20);
         assert_eq!(micro, "0x2007006");
+    }
+
+    const ARM_CPUINFO: &str = "processor\t: 0\nBogoMIPS\t: 48.00\nFeatures\t: fp asimd\nCPU implementer\t: 0x61\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0x000\nCPU revision\t: 0\n";
+    const X86_CPUINFO: &str = "model name\t: Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz\nmicrocode\t: 0x2007006\ncpu cores\t: 20\nphysical id\t: 0\n\nphysical id\t: 1\ncpu cores\t: 20\n";
+
+    #[test]
+    fn arm_cpu_model_comes_from_identification_fields() {
+        assert_eq!(
+            parse_arm_cpu_model(ARM_CPUINFO).as_deref(),
+            Some("arm64 implementer=0x61 part=0x000")
+        );
+        assert_eq!(parse_arm_cpu_model("CPU implementer\t: 0x61\n"), None);
+        assert_eq!(parse_arm_cpu_model(X86_CPUINFO), None);
+    }
+
+    #[test]
+    fn cpu_identity_keeps_the_x86_path_and_its_errors() {
+        let unreached = || unreachable!("an x86 host never reads the topology");
+        assert_eq!(
+            cpu_identity(X86_CPUINFO, unreached).unwrap(),
+            parse_proc_cpuinfo(X86_CPUINFO).unwrap()
+        );
+        let no_microcode = "model name\t: Intel(R) Xeon(R)\ncpu cores\t: 4\n";
+        assert!(
+            cpu_identity(no_microcode, unreached)
+                .unwrap_err()
+                .to_string()
+                .contains("missing microcode")
+        );
+        assert!(
+            cpu_identity("", unreached)
+                .unwrap_err()
+                .to_string()
+                .contains("missing model name")
+        );
+    }
+
+    #[test]
+    fn cpu_identity_reads_the_topology_for_arm() {
+        let cpus = (0..8).map(|core| (0, core)).collect::<Vec<_>>();
+        assert_eq!(
+            cpu_identity(ARM_CPUINFO, || Ok(cpus)).unwrap(),
+            (
+                "arm64 implementer=0x61 part=0x000".to_owned(),
+                1,
+                8,
+                UNAVAILABLE.to_owned()
+            )
+        );
+        assert!(cpu_identity(ARM_CPUINFO, || Ok(Vec::new())).is_err());
+    }
+
+    #[test]
+    fn counts_sockets_and_cores_per_socket() {
+        assert_eq!(
+            sockets_and_cores(&[(0, 0), (0, 1), (0, 2), (0, 3)]).unwrap(),
+            (1, 4)
+        );
+        assert_eq!(
+            sockets_and_cores(&[(0, 0), (0, 1), (1, 0), (1, 1)]).unwrap(),
+            (2, 2)
+        );
+        // SMT siblings share a core id and must not be counted twice.
+        assert_eq!(
+            sockets_and_cores(&[(0, 0), (0, 0), (0, 1), (0, 1)]).unwrap(),
+            (1, 2)
+        );
+        for bad in [
+            &[][..],
+            &[(0, 0), (0, 1), (1, 0)][..],
+            &[(-1, 0), (-1, 1)][..],
+        ] {
+            assert!(sockets_and_cores(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
