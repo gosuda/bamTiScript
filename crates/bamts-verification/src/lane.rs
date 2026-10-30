@@ -1078,8 +1078,8 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&scratch).expect("scratch");
-        let mut executor =
-            ProcessExecutor::new("/bin/true", Vec::new(), "/", &scratch).with_max_output_bytes(64);
+        let mut executor = ProcessExecutor::new("/usr/bin/true", Vec::new(), "/", &scratch)
+            .with_max_output_bytes(64);
         let request = request(
             1,
             key(
@@ -1109,8 +1109,8 @@ mod tests {
         fs::create_dir_all(&scratch).expect("scratch");
         let retained = scratch.join(format!("lane-{TEST_RUN_ID}-1.response.json"));
         fs::write(&retained, b"stale").expect("retained response");
-        let mut executor =
-            ProcessExecutor::new("/bin/true", Vec::new(), "/", &scratch).with_max_output_bytes(64);
+        let mut executor = ProcessExecutor::new("/usr/bin/true", Vec::new(), "/", &scratch)
+            .with_max_output_bytes(64);
         let item = key(
             ExecutionMode::Interpreter,
             "x86_64-unknown-linux-gnu",
