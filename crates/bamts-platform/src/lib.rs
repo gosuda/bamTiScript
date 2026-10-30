@@ -5,6 +5,9 @@
 
 use std::fmt;
 
+#[cfg(any(target_os = "linux", test))]
+mod linux;
+
 /// Recorded for a fact this host does not have, such as a CPU governor on macOS.
 pub const UNAVAILABLE: &str = "unavailable";
 
@@ -34,6 +37,70 @@ impl fmt::Display for PlatformError {
 }
 
 impl std::error::Error for PlatformError {}
+
+/// Facts that identify the machine, for matching a measurement host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineFacts {
+    /// Kernel release, such as `7.0.0-30-generic`.
+    pub kernel_release: String,
+    /// Kernel build version tail.
+    pub kernel_version: String,
+    /// CPU model name.
+    pub cpu_model: String,
+    /// Distinct physical sockets.
+    pub sockets: u32,
+    /// Physical cores per socket.
+    pub cores_per_socket: u32,
+    /// CPU microcode revision, or [`UNAVAILABLE`].
+    pub microcode: String,
+    /// CPU frequency governor, or the host's marker for none.
+    pub governor: String,
+    /// Total swap in KiB.
+    pub swap_total_kib: u64,
+}
+
+/// How the calling thread is placed on the machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadPlacement {
+    /// CPUs the thread may run on, such as `0-19`, or [`UNAVAILABLE`].
+    pub cpu_affinity: String,
+    /// NUMA memory policy, or [`UNAVAILABLE`].
+    pub memory_policy: String,
+    /// NUMA memory nodes, or [`UNAVAILABLE`].
+    pub memory_nodes: String,
+}
+
+/// Reads the facts that identify this machine.
+///
+/// # Errors
+/// Returns [`PlatformError`] when this host has no implementation or the host
+/// answers in a shape the reader does not accept.
+pub fn machine_facts() -> Result<MachineFacts, PlatformError> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::machine_facts()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(PlatformError::Unsupported("machine facts"))
+    }
+}
+
+/// Reads how the calling thread is placed on this machine.
+///
+/// # Errors
+/// Returns [`PlatformError`] when this host has no implementation or the host
+/// answers in a shape the reader does not accept.
+pub fn thread_placement() -> Result<ThreadPlacement, PlatformError> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::thread_placement()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(PlatformError::Unsupported("thread placement"))
+    }
+}
 
 /// The Rust target triple of this host, in the form receipts record.
 #[must_use]

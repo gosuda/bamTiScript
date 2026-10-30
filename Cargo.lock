@@ -166,6 +166,9 @@ dependencies = [
 [[package]]
 name = "bamts-platform"
 version = "0.2.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "bamts-runtime"
