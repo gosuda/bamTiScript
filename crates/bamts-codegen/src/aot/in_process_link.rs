@@ -633,20 +633,13 @@ fn apply_relocation(
                 place.cast::<u32>().write_unaligned(value);
             }
         }
-        (RelocationKind::Relative, 26) => {
-            // AArch64 call: (S + A - P) >> 2, 26-bit, masked into place[31:0]
-            // The lower 2 bits of the place are 00 (ARM alignment), so we
-            // encode the 26-bit immediate directly.
-            let displacement = (symbol_addr as i64)
-                .wrapping_add(addend)
-                .wrapping_sub(place_addr as i64);
-            let imm26 = (displacement >> 2) as u32 & 0x03FF_FFFF;
-            unsafe {
-                let existing = place.cast::<u32>().read_unaligned();
-                place
-                    .cast::<u32>()
-                    .write_unaligned((existing & 0xFC00_0000) | imm26);
-            }
+        // AArch64 `B`/`BL`. `object` reports an ELF `R_AARCH64_CALL26` as
+        // `PltRelative`; COFF and Mach-O readers report `Relative`.
+        (RelocationKind::Relative | RelocationKind::PltRelative, 26) => {
+            let target = (symbol_addr as i64).wrapping_add(addend) as u64;
+            return patch_instruction(place, |word| {
+                patch_branch26(word, place_addr as u64, target)
+            });
         }
         _ => {
             return Err(InProcessLinkError::UnsupportedRelocation {
@@ -719,6 +712,25 @@ fn patch_ldr_got_lo12(instruction: u32, got_entry: u64) -> Result<u32, InProcess
     }
     let scaled_offset = ((got_entry & 0xFFF) >> 3) as u32;
     Ok((instruction & !(0xFFF << 10)) | (scaled_offset << 10))
+}
+
+/// `R_AARCH64_CALL26`: gives a `B` or `BL` the word distance to `target`. The
+/// field is 26 bits of signed 4-byte words, so the reach is +-128 MiB.
+fn patch_branch26(instruction: u32, place: u64, target: u64) -> Result<u32, InProcessLinkError> {
+    let displacement = (target as i64).wrapping_sub(place as i64);
+    if displacement & 0x3 != 0 {
+        return Err(InProcessLinkError::RelocationMisaligned {
+            relocation: "R_AARCH64_CALL26",
+            address: target,
+        });
+    }
+    if !(-(1 << 27)..(1 << 27)).contains(&displacement) {
+        return Err(InProcessLinkError::RelocationOutOfRange {
+            relocation: "R_AARCH64_CALL26",
+            displacement,
+        });
+    }
+    Ok((instruction & 0xFC00_0000) | ((displacement >> 2) as u32 & 0x03FF_FFFF))
 }
 
 /// Builds a map of helper symbol names to their live function addresses.
@@ -945,6 +957,90 @@ mod tests {
             patch_ldr_got_lo12(LDR_X17_FROM_X16, 4),
             Err(InProcessLinkError::RelocationMisaligned { .. })
         ));
+    }
+
+    /// `bl #0`. The expected words below come from assembling `bl #N` with clang.
+    const BL: u32 = 0x9400_0000;
+
+    #[test]
+    fn branch_patch_matches_assembler_output() {
+        assert_eq!(patch_branch26(BL, 0, 8).unwrap(), 0x9400_0002);
+        assert_eq!(patch_branch26(BL, 4, 0).unwrap(), 0x97FF_FFFF);
+    }
+
+    #[test]
+    fn branch_patch_keeps_the_opcode_of_b_and_bl() {
+        assert_eq!(patch_branch26(0x1400_0000, 0, 8).unwrap(), 0x1400_0002);
+    }
+
+    #[test]
+    fn branch_patch_accepts_exactly_plus_or_minus_128_mib() {
+        let reach = 1u64 << 27;
+        assert_eq!(patch_branch26(BL, 0, reach - 4).unwrap(), 0x95FF_FFFF);
+        assert_eq!(patch_branch26(BL, reach, 0).unwrap(), 0x9600_0000);
+        assert!(matches!(
+            patch_branch26(BL, 0, reach),
+            Err(InProcessLinkError::RelocationOutOfRange { .. })
+        ));
+        assert!(matches!(
+            patch_branch26(BL, reach + 4, 0),
+            Err(InProcessLinkError::RelocationOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn branch_patch_rejects_a_target_that_is_not_word_aligned() {
+        assert!(matches!(
+            patch_branch26(BL, 0, 6),
+            Err(InProcessLinkError::RelocationMisaligned { .. })
+        ));
+    }
+
+    #[test]
+    fn apply_relocation_patches_the_call26_that_elf_readers_call_plt_relative() {
+        use cranelift_object::object::write;
+        use cranelift_object::object::{
+            Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope,
+        };
+
+        let mut object =
+            write::Object::new(BinaryFormat::Elf, Architecture::Aarch64, Endianness::Little);
+        let text = object.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+        object.append_section_data(text, &BL.to_le_bytes(), 4);
+        let callee = object.add_symbol(write::Symbol {
+            name: b"callee".to_vec(),
+            value: 0,
+            size: 0,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: write::SymbolSection::Undefined,
+            flags: SymbolFlags::None,
+        });
+        object
+            .add_relocation(
+                text,
+                write::Relocation {
+                    offset: 0,
+                    symbol: callee,
+                    addend: 0,
+                    flags: RelocationFlags::Elf {
+                        r_type: elf::R_AARCH64_CALL26,
+                    },
+                },
+            )
+            .expect("relocation records");
+        let bytes = object.write().expect("object writes");
+
+        let file = File::parse(&*bytes).expect("object parses");
+        let section = file.section_by_name(".text").expect("text section");
+        let (_, relocation) = section.relocations().next().expect("one relocation");
+        assert_eq!(relocation.kind(), RelocationKind::PltRelative);
+
+        let mut word = [BL];
+        let place = word.as_mut_ptr().cast::<u8>();
+        apply_relocation(place, place as usize + 8, &relocation).expect("call26 applies");
+        assert_eq!(word[0], 0x9400_0002);
     }
 
     #[test]
