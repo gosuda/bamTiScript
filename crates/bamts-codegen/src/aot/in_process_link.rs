@@ -177,6 +177,8 @@ pub enum InProcessLinkError {
     Map(String),
     /// A memory protection operation failed.
     Protect(String),
+    /// Making the patched code visible to instruction fetch failed.
+    InstructionCache(String),
 }
 
 impl fmt::Display for InProcessLinkError {
@@ -218,6 +220,9 @@ impl fmt::Display for InProcessLinkError {
             }
             Self::Map(msg) => write!(f, "memory mapping failed: {msg}"),
             Self::Protect(msg) => write!(f, "memory protection failed: {msg}"),
+            Self::InstructionCache(msg) => {
+                write!(f, "instruction cache maintenance failed: {msg}")
+            }
         }
     }
 }
@@ -425,7 +430,16 @@ pub fn link_aot_in_process(
     // -- 7. Protect text as executable --------------------------------------
 
     if text_region_size > 0 {
+        // AArch64 fetches instructions through a cache that stores into the
+        // mapping do not update, so the patched code must be made visible.
+        // The order matches `jit_memory`: clear the cache before the RW -> RX
+        // transition, flush the pipeline after it.
+        //
+        // SAFETY: `text_base..text_base+text_region_size` is the text part of
+        // `mapping`, which this function owns and keeps alive.
         unsafe {
+            wasmtime_internal_jit_icache_coherence::clear_cache(text_base.cast(), text_region_size)
+                .map_err(|e| InProcessLinkError::InstructionCache(e.to_string()))?;
             region::protect(
                 text_base as *const (),
                 text_region_size,
@@ -433,6 +447,8 @@ pub fn link_aot_in_process(
             )
             .map_err(|e| InProcessLinkError::Protect(e.to_string()))?;
         }
+        wasmtime_internal_jit_icache_coherence::pipeline_flush_mt()
+            .map_err(|e| InProcessLinkError::InstructionCache(e.to_string()))?;
     }
 
     // -- 8. Build ProgramDescriptor from mapped data ------------------------
