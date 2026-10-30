@@ -29,8 +29,8 @@ use bamts_native::{
 };
 
 use cranelift_object::object::{
-    File, Object, ObjectSection, ObjectSymbol, Relocation, RelocationEncoding, RelocationKind,
-    RelocationTarget, SectionIndex, SectionKind, SymbolIndex,
+    File, Object, ObjectSection, ObjectSymbol, Relocation, RelocationEncoding, RelocationFlags,
+    RelocationKind, RelocationTarget, SectionIndex, SectionKind, SymbolIndex, elf,
 };
 
 use crate::AotObject;
@@ -161,6 +161,16 @@ pub enum InProcessLinkError {
         size: u8,
         encoding: RelocationEncoding,
     },
+    /// A relocation value does not fit the field of the instruction it patches.
+    RelocationOutOfRange {
+        relocation: &'static str,
+        displacement: i64,
+    },
+    /// A relocation needs an address with alignment the address does not have.
+    RelocationMisaligned {
+        relocation: &'static str,
+        address: u64,
+    },
     /// The mapped ProgramDescriptor failed validation.
     DescriptorValidation(AbiError),
     /// A memory mapping operation failed.
@@ -187,6 +197,21 @@ impl fmt::Display for InProcessLinkError {
                     f,
                     "unsupported relocation: kind={kind:?} size={size} encoding={encoding:?}"
                 )
+            }
+            Self::RelocationOutOfRange {
+                relocation,
+                displacement,
+            } => {
+                write!(
+                    f,
+                    "{relocation} displacement {displacement} is out of range"
+                )
+            }
+            Self::RelocationMisaligned {
+                relocation,
+                address,
+            } => {
+                write!(f, "{relocation} address {address:#x} is misaligned")
             }
             Self::DescriptorValidation(error) => {
                 write!(f, "program descriptor validation failed: {error:?}")
@@ -250,7 +275,7 @@ pub fn link_aot_in_process(
             .section_by_index(section.original_index)
             .map_err(|e| InProcessLinkError::Parse(e.to_string()))?;
         for (_offset, reloc) in original_section.relocations() {
-            if reloc.kind() == RelocationKind::GotRelative
+            if needs_got_entry(&reloc)
                 && let RelocationTarget::Symbol(idx) = reloc.target()
                 && got_seen.insert(idx)
             {
@@ -378,7 +403,7 @@ pub fn link_aot_in_process(
 
         for (reloc_offset, relocation) in original_section.relocations() {
             // For GotRelative, the "symbol address" is the GOT entry address.
-            let symbol_addr = if relocation.kind() == RelocationKind::GotRelative {
+            let symbol_addr = if needs_got_entry(&relocation) {
                 let RelocationTarget::Symbol(sym_idx) = relocation.target() else {
                     return Err(InProcessLinkError::UnknownRelocationTarget(format!(
                         "{:?}",
@@ -568,6 +593,20 @@ fn apply_relocation(
     let size = relocation.size();
     let encoding = relocation.encoding();
 
+    // `object` leaves the AArch64 GOT forms as `Unknown`, so they are told
+    // apart by the raw ELF relocation type.
+    match elf_relocation_type(relocation) {
+        Some(elf::R_AARCH64_ADR_GOT_PAGE) => {
+            return patch_instruction(place, |word| {
+                patch_adrp_page(word, place_addr as u64, symbol_addr as u64)
+            });
+        }
+        Some(elf::R_AARCH64_LD64_GOT_LO12_NC) => {
+            return patch_instruction(place, |word| patch_ldr_got_lo12(word, symbol_addr as u64));
+        }
+        _ => {}
+    }
+
     match (kind, size) {
         (RelocationKind::Absolute, 64) => {
             // S + A
@@ -618,6 +657,68 @@ fn apply_relocation(
         }
     }
     Ok(())
+}
+
+fn elf_relocation_type(relocation: &Relocation) -> Option<u32> {
+    match relocation.flags() {
+        RelocationFlags::Elf { r_type } => Some(r_type),
+        _ => None,
+    }
+}
+
+/// Whether the relocation reads its symbol through a GOT entry instead of
+/// addressing the symbol directly.
+fn needs_got_entry(relocation: &Relocation) -> bool {
+    relocation.kind() == RelocationKind::GotRelative
+        || matches!(
+            elf_relocation_type(relocation),
+            Some(elf::R_AARCH64_ADR_GOT_PAGE | elf::R_AARCH64_LD64_GOT_LO12_NC)
+        )
+}
+
+/// Rewrites the 32-bit instruction at `place` through `patch`.
+fn patch_instruction(
+    place: *mut u8,
+    patch: impl FnOnce(u32) -> Result<u32, InProcessLinkError>,
+) -> Result<(), InProcessLinkError> {
+    unsafe {
+        let patched = patch(place.cast::<u32>().read_unaligned())?;
+        place.cast::<u32>().write_unaligned(patched);
+    }
+    Ok(())
+}
+
+/// `R_AARCH64_ADR_GOT_PAGE`: points an `ADRP` at the 4 KiB page holding the
+/// GOT entry. `ADRP` counts 4 KiB pages whatever the OS page size is.
+fn patch_adrp_page(
+    instruction: u32,
+    place: u64,
+    got_entry: u64,
+) -> Result<u32, InProcessLinkError> {
+    let pages = (got_entry >> 12) as i64 - (place >> 12) as i64;
+    if !(-(1 << 20)..(1 << 20)).contains(&pages) {
+        return Err(InProcessLinkError::RelocationOutOfRange {
+            relocation: "R_AARCH64_ADR_GOT_PAGE",
+            displacement: pages,
+        });
+    }
+    let immediate = pages as u32 & 0x1F_FFFF;
+    let immlo = immediate & 0x3;
+    let immhi = immediate >> 2;
+    Ok((instruction & !((0x3 << 29) | (0x7_FFFF << 5))) | (immlo << 29) | (immhi << 5))
+}
+
+/// `R_AARCH64_LD64_GOT_LO12_NC`: gives an 8-byte `LDR` the offset of the GOT
+/// entry inside its page.
+fn patch_ldr_got_lo12(instruction: u32, got_entry: u64) -> Result<u32, InProcessLinkError> {
+    if got_entry & 0x7 != 0 {
+        return Err(InProcessLinkError::RelocationMisaligned {
+            relocation: "R_AARCH64_LD64_GOT_LO12_NC",
+            address: got_entry,
+        });
+    }
+    let scaled_offset = ((got_entry & 0xFFF) >> 3) as u32;
+    Ok((instruction & !(0xFFF << 10)) | (scaled_offset << 10))
 }
 
 /// Builds a map of helper symbol names to their live function addresses.
@@ -774,6 +875,76 @@ mod tests {
             ModuleId::new(1),
         )
         .expect("test program verifies")
+    }
+
+    /// `adrp x16, #0` and `ldr x17, [x16]`. The expected words below come from
+    /// assembling `adrp x16, #N` and `ldr x17, [x16, #N]` with clang.
+    const ADRP_X16: u32 = 0x9000_0010;
+    const LDR_X17_FROM_X16: u32 = 0xF940_0211;
+
+    #[test]
+    fn adrp_patch_matches_assembler_output() {
+        assert_eq!(patch_adrp_page(ADRP_X16, 0, 0x1000).unwrap(), 0xB000_0010);
+        assert_eq!(patch_adrp_page(ADRP_X16, 0x2000, 0).unwrap(), 0xD0FF_FFF0);
+    }
+
+    #[test]
+    fn adrp_patch_counts_4k_pages_and_ignores_the_offset_in_the_page() {
+        assert_eq!(
+            patch_adrp_page(ADRP_X16, 0xFFC, 0x1008).unwrap(),
+            patch_adrp_page(ADRP_X16, 0, 0x1000).unwrap()
+        );
+    }
+
+    #[test]
+    fn adrp_patch_replaces_an_earlier_immediate() {
+        let stale = ADRP_X16 | (0x3 << 29) | (0x7_FFFF << 5);
+        assert_eq!(patch_adrp_page(stale, 0, 0x1000).unwrap(), 0xB000_0010);
+    }
+
+    #[test]
+    fn adrp_patch_accepts_exactly_the_21_bit_page_range() {
+        let span = 1u64 << 32;
+        assert!(patch_adrp_page(ADRP_X16, 0, span - 0x1000).is_ok());
+        assert!(patch_adrp_page(ADRP_X16, span, 0).is_ok());
+        assert!(matches!(
+            patch_adrp_page(ADRP_X16, 0, span),
+            Err(InProcessLinkError::RelocationOutOfRange { .. })
+        ));
+        assert!(matches!(
+            patch_adrp_page(ADRP_X16, span + 0x1000, 0),
+            Err(InProcessLinkError::RelocationOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn ldr_patch_matches_assembler_output() {
+        assert_eq!(
+            patch_ldr_got_lo12(LDR_X17_FROM_X16, 8).unwrap(),
+            0xF940_0611
+        );
+        assert_eq!(
+            patch_ldr_got_lo12(LDR_X17_FROM_X16, 0x7008).unwrap(),
+            0xF940_0611
+        );
+    }
+
+    #[test]
+    fn ldr_patch_replaces_an_earlier_offset_and_covers_the_whole_page() {
+        let stale = LDR_X17_FROM_X16 | (0xFFF << 10);
+        assert_eq!(patch_ldr_got_lo12(stale, 0).unwrap(), LDR_X17_FROM_X16);
+        assert_eq!(
+            patch_ldr_got_lo12(LDR_X17_FROM_X16, 0xFF8).unwrap(),
+            LDR_X17_FROM_X16 | (0x1FF << 10)
+        );
+    }
+
+    #[test]
+    fn ldr_patch_rejects_an_entry_that_is_not_8_aligned() {
+        assert!(matches!(
+            patch_ldr_got_lo12(LDR_X17_FROM_X16, 4),
+            Err(InProcessLinkError::RelocationMisaligned { .. })
+        ));
     }
 
     #[test]
