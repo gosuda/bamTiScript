@@ -139,6 +139,75 @@ pub(crate) fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>> {
     }
 }
 
+/// Parses the peak resident set (`VmHWM`) in bytes from a
+/// `/proc/<pid>/status` document.
+fn parse_peak_memory_bytes(status: &str) -> Result<u64> {
+    const SOURCE: &str = "/proc/<pid>/status";
+    let rest = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .ok_or_else(|| malformed(SOURCE, "VmHWM field not found"))?;
+    let kib: u64 = rest
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| malformed(SOURCE, "VmHWM has no value"))?
+        .parse()
+        .map_err(|error| malformed(SOURCE, format!("VmHWM is not a number: {error}")))?;
+    kib.checked_mul(1024)
+        .ok_or_else(|| malformed(SOURCE, "VmHWM overflows"))
+}
+
+/// A zombie has exited and no longer has an address space, so it has no
+/// `VmHWM` line.
+fn is_zombie(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("State:"))
+        .is_some_and(|state| state.trim_start().starts_with('Z'))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn peak_memory_bytes(pid: u32) -> Result<u64> {
+    let path = format!("/proc/{pid}/status");
+    let status = match fs::read_to_string(&path) {
+        Ok(status) => status,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PlatformError::ProcessGone(pid));
+        }
+        Err(error) => {
+            return Err(PlatformError::Read {
+                source: path,
+                detail: error.to_string(),
+            });
+        }
+    };
+    if is_zombie(&status) {
+        return Err(PlatformError::ProcessGone(pid));
+    }
+    parse_peak_memory_bytes(&status)
+}
+
+/// Resets the kernel's high-water mark when it starts, so the final read is
+/// the peak since then.
+#[cfg(target_os = "linux")]
+pub(crate) struct Window;
+
+#[cfg(target_os = "linux")]
+impl Window {
+    pub(crate) fn start() -> Result<Self> {
+        const SOURCE: &str = "/proc/self/clear_refs";
+        fs::write(SOURCE, "5").map_err(|error| PlatformError::Read {
+            source: SOURCE.to_owned(),
+            detail: error.to_string(),
+        })?;
+        Ok(Self)
+    }
+
+    pub(crate) fn finish(self) -> Result<u64> {
+        peak_memory_bytes(std::process::id())
+    }
+}
+
 /// Builds the CPU identity from cpuinfo. A `model name` line selects the
 /// original parser, so x86 hosts read exactly what they always have. A host
 /// without it but with ARM identification fields takes its model from those
@@ -538,6 +607,27 @@ mod tests {
                 .iter()
                 .all(|region| !region.permissions.contains("rwx"))
         );
+    }
+
+    #[test]
+    fn peak_memory_is_the_high_water_mark_not_the_current_set() {
+        let status = "VmPeak:\t  900000 kB\nVmHWM:\t   32000 kB\nVmRSS:\t   20000 kB\n";
+        assert_eq!(parse_peak_memory_bytes(status).unwrap(), 32_768_000);
+        for bad in [
+            "VmRSS:\t 20000 kB\n",
+            "VmHWM:\n",
+            "VmHWM:\t abc kB\n",
+            "VmHWM:\t 18446744073709551615 kB\n",
+        ] {
+            assert!(parse_peak_memory_bytes(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn recognises_a_zombie() {
+        assert!(is_zombie("Name:\tcat\nState:\tZ (zombie)\n"));
+        assert!(!is_zombie("Name:\tcat\nState:\tS (sleeping)\n"));
+        assert!(!is_zombie("Name:\tcat\n"));
     }
 
     #[test]

@@ -160,6 +160,79 @@ pub fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>, PlatformError> {
     }
 }
 
+#[cfg(target_os = "linux")]
+use linux::Window as WindowImpl;
+#[cfg(target_os = "macos")]
+use macos::Window as WindowImpl;
+
+/// A host with no peak-memory window cannot construct one.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+enum WindowImpl {}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl WindowImpl {
+    fn start() -> Result<Self, PlatformError> {
+        Err(PlatformError::Unsupported("peak memory window"))
+    }
+
+    fn finish(self) -> Result<u64, PlatformError> {
+        match self {}
+    }
+}
+
+/// Peak memory of a process since it started, in bytes.
+///
+/// This is the resident-set peak on Linux and the physical-footprint peak on
+/// macOS.
+///
+/// # Errors
+/// Returns [`PlatformError::ProcessGone`] when the process no longer exists,
+/// and another [`PlatformError`] when this host has no implementation or the
+/// host fails the read.
+pub fn peak_memory_bytes(pid: u32) -> Result<u64, PlatformError> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::peak_memory_bytes(pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::peak_memory_bytes(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        Err(PlatformError::Unsupported("peak memory"))
+    }
+}
+
+/// Measures the peak memory of the current process across a span of work.
+///
+/// On Linux the host resets its high-water mark when the window starts, so
+/// the result is exact. macOS has no public way to reset the peak, so the
+/// window samples the process footprint every millisecond and a spike shorter
+/// than that can be missed. Treat the macOS value as functional evidence, not
+/// as a benchmark measurement.
+pub struct PeakWindow(WindowImpl);
+
+impl PeakWindow {
+    /// Starts measuring.
+    ///
+    /// # Errors
+    /// Returns [`PlatformError`] when this host has no implementation or the
+    /// host refuses to start the window.
+    pub fn start() -> Result<Self, PlatformError> {
+        WindowImpl::start().map(Self)
+    }
+
+    /// Stops measuring and returns the peak in bytes since [`PeakWindow::start`].
+    ///
+    /// # Errors
+    /// Returns [`PlatformError`] when the host fails the final read.
+    pub fn finish(self) -> Result<u64, PlatformError> {
+        self.0.finish()
+    }
+}
+
 /// The Rust target triple of this host, in the form receipts record.
 #[must_use]
 pub fn host_triple() -> String {
@@ -181,6 +254,35 @@ pub fn host_triple() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_touched_allocation_raises_the_peak_window() {
+        const BYTES: usize = 64 * 1024 * 1024;
+        let idle = PeakWindow::start().unwrap();
+        let baseline = idle.finish().unwrap();
+
+        let window = PeakWindow::start().unwrap();
+        let block = vec![1_u8; BYTES];
+        // Hold the allocation live long enough for the 1 ms macOS sampler to
+        // be scheduled and see it, even on a busy machine.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(block.iter().filter(|byte| **byte == 1).count(), BYTES);
+        drop(block);
+        let peak = window.finish().unwrap();
+
+        let margin = 16 * 1024 * 1024;
+        assert!(
+            peak >= baseline + (BYTES - margin) as u64,
+            "peak {peak} did not rise from the idle {baseline} by the allocation"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_process_peak_covers_its_current_footprint() {
+        assert!(peak_memory_bytes(std::process::id()).unwrap() > 0);
+    }
 
     #[test]
     fn host_triple_matches_the_running_host() {

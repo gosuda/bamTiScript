@@ -4,6 +4,14 @@
 use std::mem::{MaybeUninit, size_of};
 #[cfg(target_os = "macos")]
 use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "macos")]
+use std::thread;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 
 use crate::PlatformError;
 #[cfg(target_os = "macos")]
@@ -299,6 +307,119 @@ pub(crate) fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>> {
     walk_regions(pid, |address| region_at(raw_pid, pid, address))
 }
 
+#[cfg(target_os = "macos")]
+const RUSAGE_SOURCE: &str = "proc_pid_rusage(RUSAGE_INFO_V4)";
+
+/// Reads the resource usage record of a process.
+#[cfg(target_os = "macos")]
+fn rusage_v4(pid: u32) -> Result<libc::rusage_info_v4> {
+    let raw_pid = libc::c_int::try_from(pid).map_err(|_| {
+        malformed(
+            RUSAGE_SOURCE,
+            format!("pid {pid} does not fit the host pid type"),
+        )
+    })?;
+    let mut info = MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: `info` is a live, writable `rusage_info_v4`, the record that
+    // `RUSAGE_INFO_V4` asks the kernel to fill. The pointer is used only for
+    // the duration of the call.
+    #[allow(unsafe_code)]
+    let status = unsafe {
+        libc::proc_pid_rusage(
+            raw_pid,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        )
+    };
+    if status != 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(if error.raw_os_error() == Some(libc::ESRCH) {
+            PlatformError::ProcessGone(pid)
+        } else {
+            PlatformError::Read {
+                source: RUSAGE_SOURCE.to_owned(),
+                detail: error.to_string(),
+            }
+        });
+    }
+    // SAFETY: a zero status means the kernel filled the whole record, and the
+    // buffer was zero-initialised first, so every byte is initialised and a
+    // zero pattern is valid for every integer field.
+    #[allow(unsafe_code)]
+    Ok(unsafe { info.assume_init() })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn peak_memory_bytes(pid: u32) -> Result<u64> {
+    Ok(rusage_v4(pid)?.ri_lifetime_max_phys_footprint)
+}
+
+/// Samples the physical footprint of this process while the window is open.
+/// The public SDK has no way to reset the footprint peak, so a spike shorter
+/// than the sampling interval can be missed.
+#[cfg(target_os = "macos")]
+pub(crate) struct Window {
+    stop: Arc<AtomicBool>,
+    sampler: Option<thread::JoinHandle<u64>>,
+}
+
+#[cfg(target_os = "macos")]
+impl Window {
+    const INTERVAL: Duration = Duration::from_millis(1);
+
+    pub(crate) fn start() -> Result<Self> {
+        let pid = std::process::id();
+        let first = rusage_v4(pid)?.ri_phys_footprint;
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let sampler = thread::Builder::new()
+            .name("bamts-peak-window".to_owned())
+            .spawn(move || {
+                let mut peak = first;
+                while !flag.load(Ordering::Acquire) {
+                    if let Ok(info) = rusage_v4(pid) {
+                        peak = peak.max(info.ri_phys_footprint);
+                    }
+                    thread::sleep(Self::INTERVAL);
+                }
+                peak
+            })
+            .map_err(|error| PlatformError::Read {
+                source: "peak memory sampler thread".to_owned(),
+                detail: error.to_string(),
+            })?;
+        Ok(Self {
+            stop,
+            sampler: Some(sampler),
+        })
+    }
+
+    pub(crate) fn finish(mut self) -> Result<u64> {
+        self.stop.store(true, Ordering::Release);
+        let sampled = self
+            .sampler
+            .take()
+            .expect("the sampler is present until the window finishes")
+            .join()
+            .map_err(|_| PlatformError::Read {
+                source: "peak memory sampler thread".to_owned(),
+                detail: "the sampler panicked".to_owned(),
+            })?;
+        let last = rusage_v4(std::process::id())?.ri_phys_footprint;
+        Ok(sampled.max(last))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Window {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(sampler) = self.sampler.take() {
+            let _ = sampler.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,6 +632,55 @@ mod tests {
         child.stdin.take().unwrap().flush().unwrap();
         child.wait().unwrap();
         assert_eq!(process_regions(pid), Err(PlatformError::ProcessGone(pid)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reads_the_lifetime_peak_of_a_child_then_reports_it_gone() {
+        use std::io::{BufRead, BufReader};
+        use std::process::Stdio;
+        // The child allocates and touches about 120 MiB, announces it, then
+        // waits for its standard input to close.
+        let mut child = Command::new("/usr/bin/perl")
+            .args([
+                "-e",
+                r#"$| = 1; my $x = "a" x 125000000; print "ready\n"; <STDIN>;"#,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
+        let peak = peak_memory_bytes(pid).unwrap();
+        assert!(peak >= 100 * 1024 * 1024, "peak was {peak}");
+        assert!(peak < 4 * 1024 * 1024 * 1024, "peak was {peak}");
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert_eq!(peak_memory_bytes(pid), Err(PlatformError::ProcessGone(pid)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rejects_a_peak_memory_pid_that_does_not_fit() {
+        assert!(matches!(
+            peak_memory_bytes(u32::MAX),
+            Err(PlatformError::Malformed { .. })
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_dropped_window_stops_its_sampler() {
+        let window = crate::PeakWindow::start().unwrap();
+        drop(window);
+        // A second window starts cleanly, so the first left nothing running
+        // that would fail or leak.
+        crate::PeakWindow::start().unwrap().finish().unwrap();
     }
 
     #[cfg(target_os = "macos")]
