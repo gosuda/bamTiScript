@@ -54,6 +54,16 @@ Example:
 }
 ```
 
+### Single-worker procedure
+
+When one worker runs alone, no hub exists. Replace the hub messages with `.outline/change-window.log`:
+
+1. Before the first edit, append `ACQUIRE_AST_WINDOW: owner=<worker> files=<paths> pre_hashes=<path:sha256,...> reason=<summary>`. Compute hashes with `shasum -a 256 <file>`.
+2. Do not acquire if the log's last entry for an overlapping file is an unreleased `ACQUIRE_AST_WINDOW`. Stop and escalate instead.
+3. After the last verified edit, append `RELEASE_AST_WINDOW: owner=<worker> files=<paths> post_hashes=<path:sha256,...>`.
+
+Fresh reads, append-only discriminants, UTF-16 rules, and diagnostic bands apply unchanged.
+
 ## Content Hashes and Fresh Reads
 
 Hash every announced file before the first edit and after the last verified edit. Do not reuse a hash from a previous wave.
