@@ -232,19 +232,6 @@ fn runner_for_mode(catalog: &str, mode: crate::shard::ExecutionMode) -> Option<S
     allowed.contains(&runner).then_some(runner)
 }
 
-/// Platform token used when `BAMTS_PLATFORM` is unset: the host triple in
-/// the form the receipts already record.
-#[must_use]
-pub fn default_platform() -> String {
-    let arch = std::env::consts::ARCH;
-    match std::env::consts::OS {
-        "linux" => format!("{arch}-unknown-linux-gnu"),
-        "macos" => format!("{arch}-apple-darwin"),
-        "windows" => format!("{arch}-pc-windows-msvc"),
-        os => format!("{arch}-unknown-{os}"),
-    }
-}
-
 /// Selected catalog plus the digests that name the current manifest image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogManifest {
@@ -752,7 +739,7 @@ fn classified_outcome(state: NonPassState, key: &ObligationKey) -> LaneOutcome {
 pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> {
     let runner = resolve_runner(&request.catalog, &request.runner)?;
     let platform = if request.platform.is_empty() {
-        default_platform()
+        bamts_platform::host_triple()
     } else {
         request.platform.clone()
     };

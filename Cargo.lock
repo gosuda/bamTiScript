@@ -190,6 +190,7 @@ dependencies = [
  "bamts-compiler",
  "bamts-native",
  "bamts-node",
+ "bamts-platform",
  "bamts-runtime",
  "getrandom 0.3.4",
  "libc",

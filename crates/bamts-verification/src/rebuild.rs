@@ -339,7 +339,7 @@ impl ObligationIndex {
                     identifier: identifier.to_owned(),
                     configuration: declared_configuration(identifier),
                     mode: ExecutionMode::Interpreter,
-                    platform: native_platform(),
+                    platform: bamts_platform::host_triple(),
                     declared_observable: declared_observable(identifier),
                     classification: None,
                 },
@@ -420,21 +420,6 @@ fn declared_configuration(identifier: &str) -> String {
             || "default".to_owned(),
             |(_, configuration)| configuration.to_owned(),
         )
-}
-fn native_platform() -> String {
-    let environment = if cfg!(target_env = "musl") {
-        "musl"
-    } else if cfg!(target_env = "msvc") {
-        "msvc"
-    } else {
-        "gnu"
-    };
-    match std::env::consts::OS {
-        "linux" => format!("{}-unknown-linux-{environment}", std::env::consts::ARCH),
-        "macos" => format!("{}-apple-darwin", std::env::consts::ARCH),
-        "windows" => format!("{}-pc-windows-{environment}", std::env::consts::ARCH),
-        os => format!("{}-unknown-{os}", std::env::consts::ARCH),
-    }
 }
 
 /// Rebuilds the ledger from the manifest and the supplied receipts.
@@ -1198,7 +1183,7 @@ mod tests {
     const OTHER: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
     const CATALOG: &str = "typescript-7.0.2";
     fn platform() -> String {
-        native_platform()
+        bamts_platform::host_triple()
     }
     fn scratch(name: &str) -> PathBuf {
         let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
@@ -1631,7 +1616,7 @@ mod tests {
                 &declared,
                 "default",
                 ExecutionMode::Interpreter,
-                "aarch64-unknown-linux-gnu",
+                format!("{}-foreign", platform()),
             )
             .expect("platform"),
         ] {
