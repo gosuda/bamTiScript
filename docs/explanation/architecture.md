@@ -80,6 +80,7 @@ flowchart TD
   - If the matching native package is missing or fails verification, artifact loading fails closed with an explicit error (`NativeArtifactNotFoundError` or `NativeArtifactLoadError`). It never falls back to downloading binaries or spawning the CLI.
 - Cancellation and environment teardown ownership:
   - `bamts-cancel` owns atomic cancellation handles and execution interrupt triggers.
+  - `bamts-platform` owns host facts and process observation: host triple, machine facts, process memory regions, and peak memory. OS-specific reads stay in this crate.
   - `bamts-napi` (private crate) owns N-API native bindings, isolate memory management, and environment teardown.
 
 ### 6. Validation

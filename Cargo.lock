@@ -164,6 +164,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bamts-platform"
+version = "0.2.0"
+
+[[package]]
 name = "bamts-runtime"
 version = "0.2.0"
 dependencies = [
