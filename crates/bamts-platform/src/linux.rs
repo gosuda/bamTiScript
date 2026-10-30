@@ -6,7 +6,7 @@ use std::fs;
 
 #[cfg(target_os = "linux")]
 use crate::{MachineFacts, ThreadPlacement};
-use crate::{PlatformError, UNAVAILABLE};
+use crate::{MemoryRegion, PlatformError, UNAVAILABLE};
 
 type Result<T> = std::result::Result<T, PlatformError>;
 
@@ -71,6 +71,56 @@ fn parse_proc_cpuinfo(content: &str) -> Result<(String, u32, u32, String)> {
         .map_err(|_| malformed("/proc/cpuinfo", "socket count overflow"))?
         .max(1);
     Ok((model, socket_count, cores_per_socket, microcode))
+}
+
+/// Parses `/proc/<pid>/maps` into regions.
+fn parse_process_maps(text: &str) -> Result<Vec<MemoryRegion>> {
+    const SOURCE: &str = "/proc/<pid>/maps";
+    text.lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let range = fields
+                .next()
+                .ok_or_else(|| malformed(SOURCE, "mapping lacks range"))?;
+            let permissions = fields
+                .next()
+                .ok_or_else(|| malformed(SOURCE, "mapping lacks permissions"))?
+                .to_owned();
+            let offset = fields
+                .next()
+                .ok_or_else(|| malformed(SOURCE, "mapping lacks offset"))?;
+            let device = fields
+                .next()
+                .ok_or_else(|| malformed(SOURCE, "mapping lacks device"))?;
+            let inode = fields
+                .next()
+                .ok_or_else(|| malformed(SOURCE, "mapping lacks inode"))?;
+            let pathname = fields.next().map(str::to_owned);
+            Ok(MemoryRegion {
+                identity: format!(
+                    "{range} {offset} {device} {inode} {}",
+                    pathname.as_deref().unwrap_or("")
+                ),
+                permissions,
+                pathname,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>> {
+    let path = format!("/proc/{pid}/maps");
+    match fs::read_to_string(&path) {
+        Ok(text) => parse_process_maps(&text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(PlatformError::ProcessGone(pid))
+        }
+        Err(error) => Err(PlatformError::Read {
+            source: path,
+            detail: error.to_string(),
+        }),
+    }
 }
 
 /// Builds the CPU identity from cpuinfo. A `model name` line selects the
@@ -414,6 +464,40 @@ mod tests {
         ] {
             assert!(sockets_and_cores(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn parses_process_maps_into_regions() {
+        let text = "55d0c8a00000-55d0c8a21000 r-xp 00000000 fd:01 1048 /usr/bin/cat\n7f1c2a000000-7f1c2a021000 rwxp 00000000 00:00 0\n";
+        let regions = parse_process_maps(text).unwrap();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(
+            regions[0],
+            MemoryRegion {
+                identity: "55d0c8a00000-55d0c8a21000 00000000 fd:01 1048 /usr/bin/cat".to_owned(),
+                permissions: "r-xp".to_owned(),
+                pathname: Some("/usr/bin/cat".to_owned()),
+            }
+        );
+        assert_eq!(regions[1].permissions, "rwxp");
+        assert_eq!(regions[1].pathname, None);
+        assert!(parse_process_maps("55d0c8a00000-55d0c8a21000\n").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_this_process_regions() {
+        let regions = process_regions(std::process::id()).unwrap();
+        assert!(
+            regions
+                .iter()
+                .any(|region| region.permissions.contains('x') && region.pathname.is_some())
+        );
+        assert!(
+            regions
+                .iter()
+                .all(|region| !region.permissions.contains("rwx"))
+        );
     }
 
     #[test]

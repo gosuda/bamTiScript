@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use bamts_cli::args::{ExecutionTarget, Mode};
 use bamts_cli::driver;
+use bamts_platform::MemoryRegion;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -253,13 +254,6 @@ impl RealEvidenceProvider<'_> {
             "anonymous_executable_mappings": anonymous.len(),
         }))
     }
-}
-
-#[derive(Debug, Clone)]
-struct ProcessMapping {
-    identity: String,
-    permissions: String,
-    pathname: Option<String>,
 }
 
 pub fn run() -> Value {
@@ -669,7 +663,7 @@ fn validate_event_stream(stdout: &[u8]) -> Result<Vec<String>> {
 
 #[derive(Debug)]
 struct ChildMapSample {
-    mappings: Vec<ProcessMapping>,
+    mappings: Vec<MemoryRegion>,
     executable_mappings: usize,
     samples: usize,
 }
@@ -718,7 +712,7 @@ fn sample_child_maps_with_observer(
     mut child: Child,
     executable: &Path,
     timeout: Duration,
-    mut observed: impl FnMut(&mut Child, &[ProcessMapping]) -> Result<()>,
+    mut observed: impl FnMut(&mut Child, &[MemoryRegion]) -> Result<()>,
 ) -> Result<ChildMapSample> {
     let stdout = child
         .stdout
@@ -833,42 +827,16 @@ fn join_pipe_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Resu
         .map_err(|_| io::Error::other("controlled child pipe reader panicked"))?
 }
 
-fn process_maps_for(pid: u32) -> Result<Vec<ProcessMapping>> {
-    let text = fs::read_to_string(format!("/proc/{pid}/maps"))
-        .with_context(|| format!("reading /proc/{pid}/maps"))?;
-    parse_process_maps(&text)
+fn process_maps_for(pid: u32) -> Result<Vec<MemoryRegion>> {
+    bamts_platform::process_regions(pid)
+        .with_context(|| format!("reading the memory regions of process {pid}"))
 }
 
-fn process_maps() -> Result<Vec<ProcessMapping>> {
+fn process_maps() -> Result<Vec<MemoryRegion>> {
     process_maps_for(std::process::id())
 }
 
-fn parse_process_maps(text: &str) -> Result<Vec<ProcessMapping>> {
-    text.lines()
-        .map(|line| {
-            let mut fields = line.split_whitespace();
-            let range = fields.next().context("mapping lacks range")?;
-            let permissions = fields
-                .next()
-                .context("mapping lacks permissions")?
-                .to_owned();
-            let offset = fields.next().context("mapping lacks offset")?;
-            let device = fields.next().context("mapping lacks device")?;
-            let inode = fields.next().context("mapping lacks inode")?;
-            let pathname = fields.next().map(str::to_owned);
-            Ok(ProcessMapping {
-                identity: format!(
-                    "{range} {offset} {device} {inode} {}",
-                    pathname.as_deref().unwrap_or("")
-                ),
-                permissions,
-                pathname,
-            })
-        })
-        .collect()
-}
-
-fn anonymous_executable_mappings(maps: &[ProcessMapping]) -> BTreeSet<String> {
+fn anonymous_executable_mappings(maps: &[MemoryRegion]) -> BTreeSet<String> {
     maps.iter()
         .filter(|mapping| mapping.permissions.contains('x') && mapping.pathname.is_none())
         .map(|mapping| mapping.identity.clone())

@@ -112,6 +112,36 @@ pub fn thread_placement() -> Result<ThreadPlacement, PlatformError> {
     }
 }
 
+/// One contiguous memory region of a process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRegion {
+    /// Names this region. Stable across samples of one address space.
+    pub identity: String,
+    /// Four characters: `r`, `w`, and `x`, each `-` when absent, then `p`.
+    /// For example `r-xp`.
+    pub permissions: String,
+    /// The backing file, or `None` for anonymous memory.
+    pub pathname: Option<String>,
+}
+
+/// Lists the memory regions of a process.
+///
+/// # Errors
+/// Returns [`PlatformError::ProcessGone`] when the process no longer exists,
+/// and another [`PlatformError`] when this host has no implementation or the
+/// host fails the read.
+pub fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>, PlatformError> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::process_regions(pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        Err(PlatformError::Unsupported("process regions"))
+    }
+}
+
 /// The Rust target triple of this host, in the form receipts record.
 #[must_use]
 pub fn host_triple() -> String {
