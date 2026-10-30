@@ -7,6 +7,8 @@ use std::fmt;
 
 #[cfg(any(target_os = "linux", test))]
 mod linux;
+#[cfg(any(target_os = "macos", test))]
+mod macos;
 
 /// Recorded for a fact this host does not have, such as a CPU governor on macOS.
 pub const UNAVAILABLE: &str = "unavailable";
@@ -80,7 +82,11 @@ pub fn machine_facts() -> Result<MachineFacts, PlatformError> {
     {
         linux::machine_facts()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::machine_facts()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(PlatformError::Unsupported("machine facts"))
     }
@@ -96,7 +102,11 @@ pub fn thread_placement() -> Result<ThreadPlacement, PlatformError> {
     {
         linux::thread_placement()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::thread_placement()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(PlatformError::Unsupported("thread placement"))
     }
