@@ -125,13 +125,20 @@ impl NativeEntryTable for LinkedAotProgram {
 
 /// Returns the Cranelift target triple for the host, or an error if the host
 /// architecture is not supported for in-process AOT.
+///
+/// The triple selects the calling convention generated code uses to call the
+/// `bamts_*` helpers, which are compiled for the real host. The container stays
+/// ELF on every host: the `-elf` suffix makes Cranelift write ELF while the
+/// rest of the triple still picks the host ABI. Do not pass these triples to
+/// `linking::TargetFormat::for_triple`, which would read `darwin` as Mach-O.
 pub fn host_target() -> Result<&'static str, HostTargetError> {
-    if cfg!(target_arch = "x86_64") {
-        Ok("x86_64-unknown-linux-gnu")
-    } else if cfg!(target_arch = "aarch64") {
-        Ok("aarch64-unknown-linux-gnu")
-    } else {
-        Err(HostTargetError::UnsupportedArch(std::env::consts::ARCH))
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin-elf"),
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin-elf"),
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc-elf"),
+        (_, "x86_64") => Ok("x86_64-unknown-linux-gnu"),
+        (_, "aarch64") => Ok("aarch64-unknown-linux-gnu"),
+        _ => Err(HostTargetError::UnsupportedArch(std::env::consts::ARCH)),
     }
 }
 
@@ -767,6 +774,32 @@ mod tests {
             ModuleId::new(1),
         )
         .expect("test program verifies")
+    }
+
+    #[test]
+    fn host_target_selects_the_host_abi_and_keeps_elf() {
+        use cranelift_codegen::isa::{self, CallConv};
+        use cranelift_codegen::settings::{self, Flags};
+        use cranelift_object::object::BinaryFormat;
+
+        let target = host_target().expect("host target supported");
+        let isa = isa::lookup_by_name(target)
+            .expect("target exists")
+            .finish(Flags::new(settings::builder()))
+            .expect("target builds");
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => CallConv::AppleAarch64,
+            ("windows", "x86_64") => CallConv::WindowsFastcall,
+            _ => CallConv::SystemV,
+        };
+        assert_eq!(isa.frontend_config().default_call_conv, expected);
+        if cfg!(target_os = "macos") {
+            assert!(target.contains("apple-darwin"), "target was {target}");
+        }
+
+        let object = crate::compile_aot(&test_program(), target).expect("AOT object emits");
+        let file = File::parse(&*object.bytes).expect("object parses");
+        assert_eq!(file.format(), BinaryFormat::Elf);
     }
 
     #[test]
