@@ -135,7 +135,11 @@ pub fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>, PlatformError> {
     {
         linux::process_regions(pid)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::process_regions(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pid;
         Err(PlatformError::Unsupported("process regions"))
