@@ -108,18 +108,25 @@ fn parse_process_maps(text: &str) -> Result<Vec<MemoryRegion>> {
         .collect()
 }
 
+/// Classifies a failed read of a `/proc/<pid>` file. A process reaped before
+/// `open` is `ENOENT`, and one reaped between `open` and `read` is `ESRCH`.
+fn process_read_error(pid: u32, source: String, error: &std::io::Error) -> PlatformError {
+    if error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) {
+        PlatformError::ProcessGone(pid)
+    } else {
+        PlatformError::Read {
+            source,
+            detail: error.to_string(),
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>> {
     let path = format!("/proc/{pid}/maps");
     match fs::read_to_string(&path) {
         Ok(text) => parse_process_maps(&text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Err(PlatformError::ProcessGone(pid))
-        }
-        Err(error) => Err(PlatformError::Read {
-            source: path,
-            detail: error.to_string(),
-        }),
+        Err(error) => Err(process_read_error(pid, path, &error)),
     }
 }
 
@@ -482,6 +489,22 @@ mod tests {
         assert_eq!(regions[1].permissions, "rwxp");
         assert_eq!(regions[1].pathname, None);
         assert!(parse_process_maps("55d0c8a00000-55d0c8a21000\n").is_err());
+    }
+
+    #[test]
+    fn a_process_reaped_around_a_read_is_gone() {
+        for errno in [libc::ENOENT, libc::ESRCH] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            assert_eq!(
+                process_read_error(7, "/proc/7/maps".to_owned(), &error),
+                PlatformError::ProcessGone(7)
+            );
+        }
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert!(matches!(
+            process_read_error(7, "/proc/7/maps".to_owned(), &denied),
+            PlatformError::Read { .. }
+        ));
     }
 
     #[cfg(target_os = "linux")]
