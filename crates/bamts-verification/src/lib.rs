@@ -10,6 +10,7 @@ pub mod facets;
 pub mod fixtures;
 pub mod formal_bridge;
 pub mod formal_gates;
+#[cfg(unix)]
 pub mod jit_runner;
 pub mod lane;
 pub mod leaf_evidence;
