@@ -18,7 +18,7 @@ pub const UNAVAILABLE: &str = "unavailable";
 pub enum PlatformError {
     /// This host has no implementation of the named capability.
     Unsupported(&'static str),
-    /// The process no longer exists.
+    /// The process has exited or is exiting.
     ProcessGone(u32),
     /// The host failed the read.
     Read { source: String, detail: String },
@@ -127,9 +127,10 @@ pub struct MemoryRegion {
 /// Lists the memory regions of a process.
 ///
 /// # Errors
-/// Returns [`PlatformError::ProcessGone`] when the process no longer exists,
-/// and another [`PlatformError`] when this host has no implementation or the
-/// host fails the read.
+/// Returns [`PlatformError::ProcessGone`] when the process has exited or is
+/// exiting. An exiting process may not be reapable yet, so wait for it rather
+/// than polling once. Returns another [`PlatformError`] when this host has no
+/// implementation or the host fails the read.
 pub fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>, PlatformError> {
     #[cfg(target_os = "linux")]
     {

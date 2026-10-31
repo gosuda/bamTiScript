@@ -201,60 +201,66 @@ fn region_from(info: &ProcRegionWithPathInfo) -> Result<MemoryRegion> {
     })
 }
 
+/// Reads the first region at or after `address`, or `None` when the kernel has
+/// no region there.
 #[cfg(target_os = "macos")]
-pub(crate) fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>> {
+fn region_at(
+    raw_pid: libc::c_int,
+    pid: u32,
+    address: u64,
+) -> Result<Option<ProcRegionWithPathInfo>> {
     const BUFFER_SIZE: libc::c_int = 1272;
-    let raw_pid = libc::c_int::try_from(pid).map_err(|_| {
-        malformed(
-            REGION_SOURCE,
-            format!("pid {pid} does not fit the host pid type"),
+    let mut info = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
+    // SAFETY: `info` is a live, writable buffer of exactly `BUFFER_SIZE` bytes,
+    // the size the kernel is told. `proc_pidinfo` writes at most that many
+    // bytes and keeps no pointer to it after returning.
+    #[allow(unsafe_code)]
+    let written = unsafe {
+        libc::proc_pidinfo(
+            raw_pid,
+            PROC_PIDREGIONPATHINFO,
+            address,
+            info.as_mut_ptr().cast::<libc::c_void>(),
+            BUFFER_SIZE,
         )
-    })?;
+    };
+    if written != BUFFER_SIZE {
+        let error = std::io::Error::last_os_error();
+        return match (written, error.raw_os_error()) {
+            (0, Some(libc::EINVAL)) => Ok(None),
+            // A reaped, exited but unreaped, or never-existing process.
+            (0, Some(libc::ESRCH)) => Err(PlatformError::ProcessGone(pid)),
+            (0, _) => Err(PlatformError::Read {
+                source: REGION_SOURCE.to_owned(),
+                detail: error.to_string(),
+            }),
+            _ => Err(malformed(
+                REGION_SOURCE,
+                format!("short read of {written} bytes, expected {BUFFER_SIZE}"),
+            )),
+        };
+    }
+    // SAFETY: the buffer was zeroed and the kernel then wrote it. Every field
+    // is an integer or an array of integers, so any bytes are a valid value.
+    #[allow(unsafe_code)]
+    Ok(Some(unsafe { info.assume_init() }))
+}
+
+/// Walks regions through `read_at` until it runs out.
+///
+/// Running out is ambiguous. It ends every walk, but an exiting process also
+/// reads this way for a moment: its address space goes first, and only then
+/// does the kernel answer `ESRCH`. A live process always has a region at or
+/// after address 0, so reading there again tells the two apart, and a list cut
+/// short by an exit is never returned as complete.
+#[cfg(target_os = "macos")]
+fn walk_regions(
+    pid: u32,
+    mut read_at: impl FnMut(u64) -> Result<Option<ProcRegionWithPathInfo>>,
+) -> Result<Vec<MemoryRegion>> {
     let mut regions = Vec::new();
     let mut address = 0_u64;
-    loop {
-        let mut info = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
-        // SAFETY: `info` is a live, writable buffer of exactly `BUFFER_SIZE`
-        // bytes, the size the kernel is told. `proc_pidinfo` writes at most
-        // that many bytes and keeps no pointer to it after returning.
-        #[allow(unsafe_code)]
-        let written = unsafe {
-            libc::proc_pidinfo(
-                raw_pid,
-                PROC_PIDREGIONPATHINFO,
-                address,
-                info.as_mut_ptr().cast::<libc::c_void>(),
-                BUFFER_SIZE,
-            )
-        };
-        if written != BUFFER_SIZE {
-            let error = std::io::Error::last_os_error();
-            return match (written, error.raw_os_error()) {
-                // The kernel reports the end of the address space as EINVAL.
-                (0, Some(libc::EINVAL)) if !regions.is_empty() => Ok(regions),
-                // A reaped, unreaped, or never-existing process is ESRCH. A
-                // process that exits mid-walk is also ESRCH, so a partial list
-                // is never returned as a complete one.
-                (0, Some(libc::ESRCH)) => Err(PlatformError::ProcessGone(pid)),
-                (0, Some(libc::EINVAL)) => Err(malformed(
-                    REGION_SOURCE,
-                    "process reports no memory regions",
-                )),
-                (0, _) => Err(PlatformError::Read {
-                    source: REGION_SOURCE.to_owned(),
-                    detail: error.to_string(),
-                }),
-                _ => Err(malformed(
-                    REGION_SOURCE,
-                    format!("short read of {written} bytes, expected {BUFFER_SIZE}"),
-                )),
-            };
-        }
-        // SAFETY: the kernel returned the full `BUFFER_SIZE` bytes, and the
-        // buffer was zero-initialised before the call, so every byte is
-        // initialised and a zero pattern is valid for every field.
-        #[allow(unsafe_code)]
-        let info = unsafe { info.assume_init() };
+    while let Some(info) = read_at(address)? {
         let next = info
             .prp_prinfo
             .pri_address
@@ -264,6 +270,21 @@ pub(crate) fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>> {
         regions.push(region_from(&info)?);
         address = next;
     }
+    if regions.is_empty() || read_at(0)?.is_none() {
+        return Err(PlatformError::ProcessGone(pid));
+    }
+    Ok(regions)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>> {
+    let raw_pid = libc::c_int::try_from(pid).map_err(|_| {
+        malformed(
+            REGION_SOURCE,
+            format!("pid {pid} does not fit the host pid type"),
+        )
+    })?;
+    walk_regions(pid, |address| region_at(raw_pid, pid, address))
 }
 
 #[cfg(test)]
@@ -327,6 +348,84 @@ mod tests {
         assert_eq!(permissions_string(3), "rw-p");
         assert_eq!(permissions_string(5), "r-xp");
         assert_eq!(permissions_string(7), "rwxp");
+    }
+
+    /// A zeroed region record, valid because every field is an integer.
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    fn blank_region() -> ProcRegionWithPathInfo {
+        // SAFETY: every field is an integer or an array of integers.
+        unsafe { MaybeUninit::<ProcRegionWithPathInfo>::zeroed().assume_init() }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn region(start: u64, size: u64) -> Option<ProcRegionWithPathInfo> {
+        let mut info = blank_region();
+        info.prp_prinfo.pri_address = start;
+        info.prp_prinfo.pri_size = size;
+        Some(info)
+    }
+
+    /// Runs a walk against scripted kernel answers, and returns its result with
+    /// the addresses it asked for.
+    #[cfg(target_os = "macos")]
+    fn scripted_walk(
+        script: Vec<Result<Option<ProcRegionWithPathInfo>>>,
+    ) -> (Result<Vec<MemoryRegion>>, Vec<u64>) {
+        let mut asked = Vec::new();
+        let mut answers = script.into_iter();
+        let result = walk_regions(7, |address| {
+            asked.push(address);
+            answers.next().expect("the walk read past its script")
+        });
+        (result, asked)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_finished_walk_confirms_the_process_still_has_regions() {
+        let (result, asked) = scripted_walk(vec![
+            Ok(region(0, 16)),
+            Ok(region(16, 16)),
+            Ok(None),
+            Ok(region(0, 16)),
+        ]);
+        assert_eq!(result.unwrap().len(), 2);
+        assert_eq!(asked, [0, 16, 32, 0]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_walk_cut_short_by_an_exit_is_not_a_complete_list() {
+        // The address space went away after the first region. Measured on
+        // macOS 27: a walk ended this way after 6 regions of a larger map.
+        let (result, _) = scripted_walk(vec![Ok(region(0, 16)), Ok(None), Ok(None)]);
+        assert_eq!(result, Err(PlatformError::ProcessGone(7)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_with_no_regions_is_exiting_not_malformed() {
+        let (result, _) = scripted_walk(vec![Ok(None)]);
+        assert_eq!(result, Err(PlatformError::ProcessGone(7)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_exit_during_the_confirming_read_is_process_gone() {
+        let (result, _) = scripted_walk(vec![
+            Ok(region(0, 16)),
+            Ok(None),
+            Err(PlatformError::ProcessGone(7)),
+        ]);
+        assert_eq!(result, Err(PlatformError::ProcessGone(7)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_walk_that_stops_advancing_is_malformed() {
+        let (result, _) = scripted_walk(vec![Ok(region(16, 0)), Ok(region(16, 0))]);
+        assert!(matches!(result, Err(PlatformError::Malformed { .. })));
     }
 
     /// The page tests map and unmap at the kernel's choice of address. Running
