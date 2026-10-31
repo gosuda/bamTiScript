@@ -451,6 +451,73 @@ pub(crate) fn thread_placement() -> Result<ThreadPlacement> {
     })
 }
 
+/// Parses a kernel CPU list such as `0-3,5,7-9`.
+fn parse_cpu_list(text: &str) -> Result<BTreeSet<u32>> {
+    const SOURCE: &str = "CPU list";
+    let number = |token: &str| -> Result<u32> {
+        token
+            .trim()
+            .parse()
+            .map_err(|_| malformed(SOURCE, format!("`{token}` is not a CPU number")))
+    };
+    let mut cpus = BTreeSet::new();
+    for part in text
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        if let Some((first, last)) = part.split_once('-') {
+            cpus.extend(number(first)?..=number(last)?);
+        } else {
+            cpus.insert(number(part)?);
+        }
+    }
+    Ok(cpus)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn online_cpu_list() -> Result<String> {
+    read_evidence("/sys/devices/system/cpu/online").map(|text| text.trim().to_owned())
+}
+
+/// The scaling governor of each online CPU, sorted. A CPU without cpufreq
+/// reports an empty string.
+#[cfg(target_os = "linux")]
+pub(crate) fn cpu_governors() -> Result<Vec<String>> {
+    const ROOT: &str = "/sys/devices/system/cpu";
+    let read_error = |error: std::io::Error| PlatformError::Read {
+        source: ROOT.to_owned(),
+        detail: error.to_string(),
+    };
+    let online = parse_cpu_list(&online_cpu_list()?)?;
+    let mut governors = Vec::new();
+    for entry in fs::read_dir(ROOT).map_err(read_error)? {
+        let entry = entry.map_err(read_error)?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(digits) = name.strip_prefix("cpu") else {
+            continue;
+        };
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let number: u32 = digits
+            .parse()
+            .map_err(|_| malformed(ROOT, format!("`{name}` is not a CPU directory")))?;
+        if online.contains(&number) {
+            let path = entry.path().join("cpufreq/scaling_governor");
+            governors.push(
+                fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned(),
+            );
+        }
+    }
+    governors.sort();
+    Ok(governors)
+}
+
 /// Runs `numactl --show` and returns its output, or `None` when the tool is
 /// missing, fails, or prints something that is not UTF-8.
 #[cfg(target_os = "linux")]
@@ -783,5 +850,29 @@ mod tests {
         assert_eq!(parse_whitespace_list("0").unwrap(), [0]);
         assert_eq!(parse_whitespace_list("").unwrap(), Vec::<u32>::new());
         assert!(parse_whitespace_list("0 x").is_err());
+    }
+
+    #[test]
+    fn cpu_lists_parse_ranges_and_singletons() {
+        let expected: BTreeSet<u32> = [0, 1, 2, 3, 5, 7, 8, 9].into();
+        assert_eq!(parse_cpu_list("0-3,5,7-9").unwrap(), expected);
+        assert_eq!(parse_cpu_list("0-79").unwrap().len(), 80);
+        assert_eq!(parse_cpu_list(" 4 ,").unwrap(), BTreeSet::from([4]));
+        assert!(parse_cpu_list("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_cpu_lists_are_rejected() {
+        for text in ["a", "0-b", "-1", "1,x"] {
+            assert!(parse_cpu_list(text).is_err(), "{text:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn there_is_one_governor_per_online_cpu() {
+        let online = parse_cpu_list(&online_cpu_list().unwrap()).unwrap();
+        assert!(!online.is_empty());
+        assert_eq!(cpu_governors().unwrap().len(), online.len());
     }
 }

@@ -102,11 +102,13 @@ pub struct ConditionsRecord {
 
 impl Conditions {
     pub fn capture() -> Result<Self> {
+        let facts = bamts_platform::machine_facts()?;
+        let placement = bamts_platform::thread_placement()?;
         Ok(Self {
-            governors: read_governors()?,
-            swap_total_kb: read_swap_total_kb()?,
-            cpus_allowed_list: read_cpus_allowed_list()?,
-            cpus_online: read_cpus_online()?,
+            governors: bamts_platform::cpu_governors()?,
+            swap_total_kb: facts.swap_total_kib,
+            cpus_allowed_list: placement.cpu_affinity,
+            cpus_online: bamts_platform::online_cpu_list()?,
         })
     }
 
@@ -154,52 +156,6 @@ impl Conditions {
             cpus_online: self.cpus_online.clone(),
         }
     }
-}
-
-fn read_governors() -> Result<Vec<String>> {
-    let online = parse_cpu_list(&read_cpus_online()?)?;
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir("/sys/devices/system/cpu")? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(n) = name.strip_prefix("cpu")
-            && n.chars().all(|c| c.is_ascii_digit())
-        {
-            let number: u32 = n.parse()?;
-            if online.contains(&number) {
-                let path = entry.path().join("cpufreq/scaling_governor");
-                out.push(read_to_string(&path).unwrap_or_default().trim().to_owned());
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-fn read_swap_total_kb() -> Result<u64> {
-    let text = read_to_string("/proc/meminfo")?;
-    text.lines()
-        .find_map(|line| {
-            line.split_once("SwapTotal:")
-                .and_then(|(_, rest)| rest.split_whitespace().next())
-        })
-        .ok_or_else(|| anyhow!("SwapTotal not found in /proc/meminfo"))?
-        .parse()
-        .map_err(|e| anyhow!("SwapTotal: {e}"))
-}
-
-fn read_cpus_allowed_list() -> Result<String> {
-    let text = read_to_string("/proc/self/status")?;
-    text.lines()
-        .find_map(|line| line.split_once("Cpus_allowed_list:"))
-        .map(|(_, v)| v.trim().to_owned())
-        .ok_or_else(|| anyhow!("Cpus_allowed_list not found in /proc/self/status"))
-}
-
-fn read_cpus_online() -> Result<String> {
-    Ok(read_to_string("/sys/devices/system/cpu/online")?
-        .trim()
-        .to_owned())
 }
 
 fn parse_cpu_list(s: &str) -> Result<BTreeSet<u32>> {
@@ -594,6 +550,25 @@ mod tests {
     #[test]
     fn catalog_contains_jit_rule_identifiers() {
         verify_catalog().unwrap();
+    }
+
+    /// The conditions come from the platform crate on every host, so macOS can
+    /// read them too. The old readers opened `/sys` and `/proc` directly.
+    #[test]
+    fn conditions_come_from_the_platform_crate() {
+        let conditions = Conditions::capture().unwrap();
+        let facts = bamts_platform::machine_facts().unwrap();
+        let placement = bamts_platform::thread_placement().unwrap();
+        assert_eq!(
+            conditions.governors,
+            bamts_platform::cpu_governors().unwrap()
+        );
+        assert_eq!(conditions.swap_total_kb, facts.swap_total_kib);
+        assert_eq!(conditions.cpus_allowed_list, placement.cpu_affinity);
+        assert_eq!(
+            conditions.cpus_online,
+            bamts_platform::online_cpu_list().unwrap()
+        );
     }
 
     #[test]

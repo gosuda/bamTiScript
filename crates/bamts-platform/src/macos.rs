@@ -115,6 +115,20 @@ pub(crate) fn thread_placement() -> Result<ThreadPlacement> {
     })
 }
 
+/// Formats the CPUs `0` to `count - 1` as a kernel CPU list, such as `0-13`.
+fn cpu_list_for(count: u32) -> Result<String> {
+    match count {
+        0 => Err(malformed("sysctl hw.logicalcpu", "no logical CPUs")),
+        1 => Ok("0".to_owned()),
+        _ => Ok(format!("0-{}", count - 1)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn online_cpu_list() -> Result<String> {
+    cpu_list_for(sysctl_u32("hw.logicalcpu")?)
+}
+
 /// Formats Mach VM protection bits in the `rwxp` style of `/proc/<pid>/maps`.
 fn permissions_string(protection: u32) -> String {
     const READ: u32 = 0x01;
@@ -762,5 +776,20 @@ mod tests {
         assert_eq!(placement.cpu_affinity, UNAVAILABLE);
         assert_eq!(placement.memory_policy, UNAVAILABLE);
         assert_eq!(placement.memory_nodes, UNAVAILABLE);
+    }
+
+    #[test]
+    fn formats_the_logical_cpus_as_a_kernel_list() {
+        assert_eq!(cpu_list_for(14).unwrap(), "0-13");
+        assert_eq!(cpu_list_for(2).unwrap(), "0-1");
+        assert_eq!(cpu_list_for(1).unwrap(), "0");
+        assert!(cpu_list_for(0).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_online_list_covers_the_logical_cpus() {
+        let count = sysctl_u32("hw.logicalcpu").unwrap();
+        assert_eq!(online_cpu_list().unwrap(), cpu_list_for(count).unwrap());
     }
 }

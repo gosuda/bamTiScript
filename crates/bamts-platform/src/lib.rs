@@ -119,6 +119,47 @@ pub fn thread_placement() -> Result<ThreadPlacement, PlatformError> {
     }
 }
 
+/// The CPUs that are online, as a kernel CPU list such as `0-19`.
+///
+/// # Errors
+/// Returns [`PlatformError`] when this host has no implementation or the host
+/// fails the read.
+pub fn online_cpu_list() -> Result<String, PlatformError> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::online_cpu_list()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::online_cpu_list()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(PlatformError::Unsupported("online CPU list"))
+    }
+}
+
+/// The frequency governor of each online CPU, sorted. A host that has none,
+/// such as macOS, reports a single [`UNAVAILABLE`].
+///
+/// # Errors
+/// Returns [`PlatformError`] when this host has no implementation or the host
+/// fails the read.
+pub fn cpu_governors() -> Result<Vec<String>, PlatformError> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::cpu_governors()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(vec![UNAVAILABLE.to_owned()])
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(PlatformError::Unsupported("CPU governors"))
+    }
+}
+
 /// The memory policy of this process as `numactl --show` reports it, or
 /// [`UNAVAILABLE`] when the host or the tool does not say.
 #[must_use]
