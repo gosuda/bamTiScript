@@ -341,10 +341,35 @@ pub fn host_triple() -> String {
 mod tests {
     use super::*;
 
+    /// On Linux a window resets a mark shared by the whole process, so tests that
+    /// open one run one at a time.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    static WINDOW_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_window_does_not_count_an_earlier_peak() {
+        const BYTES: usize = 64 * 1024 * 1024;
+        let _serial = WINDOW_TESTS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let block = vec![1_u8; BYTES];
+        assert_eq!(block.iter().filter(|byte| **byte == 1).count(), BYTES);
+        drop(block);
+        let peak = PeakWindow::start().unwrap().finish().unwrap();
+        assert!(
+            peak < BYTES as u64,
+            "peak {peak} still includes the allocation made before the window"
+        );
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_touched_allocation_raises_the_peak_window() {
         const BYTES: usize = 64 * 1024 * 1024;
+        let _serial = WINDOW_TESTS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let idle = PeakWindow::start().unwrap();
         let baseline = idle.finish().unwrap();
 

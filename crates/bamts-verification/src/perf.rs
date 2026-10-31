@@ -843,30 +843,33 @@ pub fn measure(options: &MeasureOptions) -> Result<MeasureResult> {
     let mut check_samples = Vec::with_capacity(repeats as usize);
     let mut emit_samples = Vec::with_capacity(repeats as usize);
     let mut rss_samples = Vec::with_capacity(repeats as usize);
-    // Reset the peak RSS high-water mark before every repeat so each sample
-    // measures only that run's allocation peak, not the cumulative peak of
-    // every prior repeat and the harness.
+    // Open a peak-memory window around every repeat so each sample measures only
+    // that run's allocation peak, not the cumulative peak of every prior repeat
+    // and the harness. The wall time is taken inside the window, so it spans the
+    // same work it always did.
     for _ in 0..repeats {
-        reset_peak_rss()?;
-        let started = Instant::now();
-        let (_report, telemetry) = run_suite_with_telemetry(
-            &options.workspace_root,
-            &options.snapshot_root,
-            &RunFilterOptions {
-                status: StatusFilter::All,
-                slice: Some(options.slice.clone()),
-                backends: BackendFilter::All,
-                shards: None,
-            },
-        )
-        .map_err(|error| PerfError::harness(format!("run_suite seam failed: {error}")))?;
-        wall_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+        let ((telemetry, wall_ms), peak) = measure_peak(|| {
+            let started = Instant::now();
+            let (_report, telemetry) = run_suite_with_telemetry(
+                &options.workspace_root,
+                &options.snapshot_root,
+                &RunFilterOptions {
+                    status: StatusFilter::All,
+                    slice: Some(options.slice.clone()),
+                    backends: BackendFilter::All,
+                    shards: None,
+                },
+            )
+            .map_err(|error| PerfError::harness(format!("run_suite seam failed: {error}")))?;
+            Ok((telemetry, started.elapsed().as_secs_f64() * 1_000.0))
+        })?;
+        wall_samples.push(wall_ms);
         scan_samples.push(telemetry.millis(Phase::Scan));
         parse_samples.push(telemetry.millis(Phase::Parse));
         bind_samples.push(telemetry.millis(Phase::Bind));
         check_samples.push(telemetry.millis(Phase::Check));
         emit_samples.push(telemetry.millis(Phase::Emit));
-        rss_samples.push(read_peak_rss_bytes()? as f64);
+        rss_samples.push(peak as f64);
     }
 
     // `total` is the whole measured seam wall; the phase split is the compiler's
@@ -978,64 +981,17 @@ fn load_baseline(path: Option<&Path>, host: &HostManifest) -> Result<Option<Base
     }))
 }
 
-/// Resets the process peak RSS high-water mark (`VmHWM`) so each benchmark
-/// repeat measures its own allocation peak.
+/// Runs `work` and returns its output with the peak memory of this process
+/// across it, in bytes.
 ///
-/// On Linux this writes `5` to `/proc/self/clear_refs`, which the kernel
-/// documents as resetting the high-water mark to the current resident set
-/// size. On other platforms this returns a contextual error instead of
-/// silently producing fake data.
-fn reset_peak_rss() -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        fs::write("/proc/self/clear_refs", "5")
-            .map_err(|error| PerfError::harness(format!("/proc/self/clear_refs: {error}")))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        Err(PerfError::harness(
-            "peak RSS reset requires /proc/self/clear_refs and is only available on Linux",
-        ))
-    }
-}
-
-/// Reads the current process peak RSS high-water mark (`VmHWM`) in bytes.
-///
-/// After a [`reset_peak_rss`] call this is the peak since that reset, so the
-/// benchmark can attribute peak memory to each measured repeat. On non-Linux
-/// hosts this returns a contextual error instead of a fake zero.
-fn read_peak_rss_bytes() -> Result<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let content = fs::read_to_string("/proc/self/status")
-            .map_err(|error| PerfError::harness(format!("/proc/self/status: {error}")))?;
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("VmHWM:") {
-                let kib: u64 = rest
-                    .split_whitespace()
-                    .next()
-                    .ok_or_else(|| PerfError::harness("/proc/self/status: VmHWM has no value"))?
-                    .parse()
-                    .map_err(|error| {
-                        PerfError::harness(format!(
-                            "/proc/self/status: VmHWM is not a number: {error}"
-                        ))
-                    })?;
-                return Ok(kib * 1024);
-            }
-        }
-        Err(PerfError::harness(
-            "/proc/self/status: VmHWM field not found",
-        ))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        Err(PerfError::harness(
-            "peak RSS read requires /proc/self/status and is only available on Linux",
-        ))
-    }
+/// The peak is the resident-set peak on Linux, reset when the window opens, and
+/// the sampled physical-footprint peak on macOS, which can miss a spike shorter
+/// than a millisecond. A window cannot overlap another on Linux.
+fn measure_peak<T>(work: impl FnOnce() -> Result<T>) -> Result<(T, u64)> {
+    let window = bamts_platform::PeakWindow::start().map_err(platform_error)?;
+    let output = work()?;
+    let peak = window.finish().map_err(platform_error)?;
+    Ok((output, peak))
 }
 
 fn write_result(path: &Path, result: &MeasureResult) -> Result<()> {
@@ -1500,24 +1456,26 @@ fn invalid_conditions(observed: &ObservedConditions, expected: &HostConditions) 
     )
 }
 
+/// Polls the peak memory of a child until it is gone, and returns the highest
+/// value seen. Run it beside the `wait` that reaps the child: `ProcessGone`
+/// comes only after the reap.
 fn poll_child_peak_rss(pid: u32) -> u64 {
-    let status_path = format!("/proc/{pid}/status");
+    poll_peak(|| bamts_platform::peak_memory_bytes(pid))
+}
+
+fn poll_peak(
+    mut read: impl FnMut() -> std::result::Result<u64, bamts_platform::PlatformError>,
+) -> u64 {
     let mut peak = 0_u64;
     loop {
-        let Ok(status) = fs::read_to_string(&status_path) else {
-            return peak;
-        };
-        for line in status.lines() {
-            if let Some(value) = line.strip_prefix("VmHWM:") {
-                if let Some(kib) = value
-                    .split_whitespace()
-                    .next()
-                    .and_then(|v| v.parse::<u64>().ok())
-                {
-                    peak = peak.max(kib.saturating_mul(1024));
-                }
-                break;
-            }
+        match read() {
+            Ok(bytes) => peak = peak.max(bytes),
+            // Not the end: Linux reads this for most of a child's exit, and
+            // macOS while a live child execs.
+            Err(bamts_platform::PlatformError::NoAddressSpace(_)) => {}
+            // Gone after the reap, or unreadable. Stop on every other error, so a
+            // persistent one cannot hang the thread that joins this poller.
+            Err(_) => return peak,
         }
         thread::sleep(Duration::from_millis(2));
     }
@@ -2579,104 +2537,76 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(target_os = "linux")]
-    fn parse_proc_status_value(rest: &str, field: &str) -> Result<u64> {
-        let kib: u64 = rest
-            .split_whitespace()
-            .next()
-            .ok_or_else(|| PerfError::harness(format!("/proc/self/status: {field} has no value")))?
-            .parse()
-            .map_err(|error| {
-                PerfError::harness(format!(
-                    "/proc/self/status: {field} is not a number: {error}"
-                ))
-            })?;
-        Ok(kib * 1024)
-    }
-
-    #[cfg(target_os = "linux")]
-    /// Reads the current `(VmHWM, VmRSS)` pair from a single `/proc/self/status`
-    /// snapshot so the test compares the two fields atomically.
-    fn read_hwm_and_rss() -> Result<(u64, u64)> {
-        let content = std::fs::read_to_string("/proc/self/status")
-            .map_err(|error| PerfError::harness(format!("/proc/self/status: {error}")))?;
-        let mut hwm = None;
-        let mut rss = None;
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("VmHWM:") {
-                hwm = Some(parse_proc_status_value(rest, "VmHWM")?);
-            } else if let Some(rest) = line.strip_prefix("VmRSS:") {
-                rss = Some(parse_proc_status_value(rest, "VmRSS")?);
-            }
-        }
-        match (hwm, rss) {
-            (Some(h), Some(r)) => Ok((h, r)),
-            (None, _) => Err(PerfError::harness("/proc/self/status: VmHWM not found")),
-            (_, None) => Err(PerfError::harness("/proc/self/status: VmRSS not found")),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires Node 24.18.0 or /proc/self/clear_refs permission; external_blocked in this environment"]
-    fn reset_peak_rss_resets_hwm_to_current_rss() {
-        // Raise the high-water mark by faulting in a large allocation.
-        let (hwm_before, _rss_before) =
-            read_hwm_and_rss().expect("read /proc/self/status before allocation");
-        let big = {
-            let mut v = vec![0u8; 64 * 1024 * 1024];
-            for i in (0..v.len()).step_by(4096) {
-                v[i] = 1;
-            }
-            std::hint::black_box(v)
+    fn the_peak_window_reports_a_touched_allocation() {
+        const BYTES: usize = 64 * 1024 * 1024;
+        let (marker, peak) = measure_peak(|| {
+            let block = vec![1_u8; BYTES];
+            // Hold it long enough for the 1 ms macOS sampler to see it.
+            thread::sleep(Duration::from_millis(150));
+            assert_eq!(block.iter().filter(|byte| **byte == 1).count(), BYTES);
+            Ok("done")
+        })
+        .unwrap();
+        assert_eq!(marker, "done");
+        assert!(peak >= BYTES as u64, "peak {peak} is below the allocation");
+    }
+
+    #[test]
+    fn a_failed_measurement_returns_the_work_error() {
+        let error =
+            measure_peak(|| -> Result<()> { Err(PerfError::harness("work failed")) }).unwrap_err();
+        assert!(error.detail.contains("work failed"));
+    }
+
+    fn scripted(script: Vec<std::result::Result<u64, bamts_platform::PlatformError>>) -> u64 {
+        let mut reads = script.into_iter();
+        poll_peak(|| reads.next().expect("the poller read past its script"))
+    }
+
+    #[test]
+    fn the_poller_keeps_the_highest_peak_until_the_child_is_gone() {
+        use bamts_platform::PlatformError::ProcessGone;
+        assert_eq!(scripted(vec![Ok(5), Ok(9), Ok(7), Err(ProcessGone(1))]), 9);
+    }
+
+    /// Nearly every Linux child reads this way for most of its exit, and macOS
+    /// reads it while a child execs. Neither is the end.
+    #[test]
+    fn the_poller_keeps_polling_through_a_missing_address_space() {
+        use bamts_platform::PlatformError::{NoAddressSpace, ProcessGone};
+        let script = vec![
+            Ok(5),
+            Err(NoAddressSpace(1)),
+            Err(NoAddressSpace(1)),
+            Ok(9),
+            Err(ProcessGone(1)),
+        ];
+        assert_eq!(scripted(script), 9);
+    }
+
+    /// A persistent read error must end the poll, or `sampler.join()` would hang.
+    #[test]
+    fn the_poller_stops_on_any_other_error() {
+        use bamts_platform::PlatformError::Read;
+        let broken = Read {
+            source: "peak".to_owned(),
+            detail: "denied".to_owned(),
         };
-        let (hwm_during, _rss_during) =
-            read_hwm_and_rss().expect("read /proc/self/status during allocation");
-        assert!(hwm_during >= hwm_before, "allocation must not lower VmHWM");
-
-        // Dropping the allocation returns the mapped pages to the OS on glibc,
-        // lowering current RSS while leaving the lifetime HWM high.
-        drop(big);
-
-        reset_peak_rss().expect("reset VmHWM");
-
-        let (hwm_after, rss_after) =
-            read_hwm_and_rss().expect("read /proc/self/status after reset");
-        assert!(
-            hwm_after > 0,
-            "VmHWM after reset must be positive, not fake"
-        );
-        assert!(
-            hwm_after >= rss_after,
-            "VmHWM cannot be below current VmRSS (hwm={hwm_after}, rss={rss_after})"
-        );
-        assert!(
-            hwm_after <= rss_after + 8 * 1024 * 1024,
-            "VmHWM after reset must be near current VmRSS (within test overhead); \
-             got hwm={hwm_after}, rss={rss_after}"
-        );
+        assert_eq!(scripted(vec![Ok(5), Err(broken.clone())]), 5);
+        assert_eq!(scripted(vec![Err(broken)]), 0);
     }
 
-    #[cfg(not(target_os = "linux"))]
     #[test]
-    fn peak_rss_sampling_is_unsupported_outside_linux() {
-        // Resetting and reading VmHWM are platform-specific; on non-Linux they
-        // must fail with a typed, contextual error rather than return fake data.
-        let reset =
-            reset_peak_rss().expect_err("reset should fail on non-Linux with a contextual error");
-        assert_eq!(reset.code, PerfErrorCode::HarnessError);
-        assert!(
-            reset.detail.contains("Linux"),
-            "reset error must name the platform"
-        );
-
-        let read = read_peak_rss_bytes()
-            .expect_err("read should fail on non-Linux with a contextual error");
-        assert_eq!(read.code, PerfErrorCode::HarnessError);
-        assert!(
-            read.detail.contains("Linux"),
-            "read error must name the platform"
-        );
+    fn polling_beside_a_real_child_ends_when_it_is_reaped() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 0.3"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let poller = thread::spawn(move || poll_child_peak_rss(pid));
+        child.wait().unwrap();
+        assert!(poller.join().unwrap() > 0);
     }
 
     #[test]
