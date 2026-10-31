@@ -121,11 +121,20 @@ fn process_read_error(pid: u32, source: String, error: &std::io::Error) -> Platf
     }
 }
 
+/// A process with an empty map has released its address space.
+fn regions_from_maps(pid: u32, text: &str) -> Result<Vec<MemoryRegion>> {
+    let regions = parse_process_maps(text)?;
+    if regions.is_empty() {
+        return Err(PlatformError::NoAddressSpace(pid));
+    }
+    Ok(regions)
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>> {
     let path = format!("/proc/{pid}/maps");
     match fs::read_to_string(&path) {
-        Ok(text) => parse_process_maps(&text),
+        Ok(text) => regions_from_maps(pid, &text),
         Err(error) => Err(process_read_error(pid, path, &error)),
     }
 }
@@ -489,6 +498,14 @@ mod tests {
         assert_eq!(regions[1].permissions, "rwxp");
         assert_eq!(regions[1].pathname, None);
         assert!(parse_process_maps("55d0c8a00000-55d0c8a21000\n").is_err());
+    }
+
+    #[test]
+    fn an_empty_map_is_no_address_space() {
+        assert_eq!(
+            regions_from_maps(7, ""),
+            Err(PlatformError::NoAddressSpace(7))
+        );
     }
 
     #[test]

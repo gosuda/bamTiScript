@@ -18,8 +18,11 @@ pub const UNAVAILABLE: &str = "unavailable";
 pub enum PlatformError {
     /// This host has no implementation of the named capability.
     Unsupported(&'static str),
-    /// The process has exited or is exiting.
+    /// The host cannot find the process, which has exited or is exiting.
     ProcessGone(u32),
+    /// The process has no address space at this moment. It is exiting or, on
+    /// macOS, replacing its image with `exec`. Only a later read can tell which.
+    NoAddressSpace(u32),
     /// The host failed the read.
     Read { source: String, detail: String },
     /// The host answered in a shape the parser does not accept.
@@ -31,6 +34,9 @@ impl fmt::Display for PlatformError {
         match self {
             Self::Unsupported(what) => write!(formatter, "{what} is not available on this host"),
             Self::ProcessGone(pid) => write!(formatter, "process {pid} no longer exists"),
+            Self::NoAddressSpace(pid) => {
+                write!(formatter, "process {pid} has no address space right now")
+            }
             Self::Read { source, detail } | Self::Malformed { source, detail } => {
                 write!(formatter, "{source}: {detail}")
             }
@@ -126,10 +132,15 @@ pub struct MemoryRegion {
 
 /// Lists the memory regions of a process.
 ///
+/// A list read while a process execs can mix its old and new images. Read again
+/// for a clean one.
+///
 /// # Errors
-/// Returns [`PlatformError::ProcessGone`] when the process has exited or is
-/// exiting. An exiting process may not be reapable yet, so wait for it rather
-/// than polling once. Returns another [`PlatformError`] when this host has no
+/// Returns [`PlatformError::ProcessGone`] when the host cannot find the process
+/// and [`PlatformError::NoAddressSpace`] when it has no regions at this moment.
+/// Neither means a child can be reaped yet, so poll it rather than concluding
+/// from one read, and do not block on it: after `NoAddressSpace` it may still be
+/// running. Returns another [`PlatformError`] when this host has no
 /// implementation or the host fails the read.
 pub fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>, PlatformError> {
     #[cfg(target_os = "linux")]

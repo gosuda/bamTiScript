@@ -222,7 +222,8 @@ fn region_at(
         let error = std::io::Error::last_os_error();
         return match (written, error.raw_os_error()) {
             (0, Some(libc::EINVAL)) => Ok(None),
-            // A reaped, exited but unreaped, or never-existing process.
+            // Measured on macOS 27: never seen on a live process, in 363
+            // verdicts taken while one execed.
             (0, Some(libc::ESRCH)) => Err(PlatformError::ProcessGone(pid)),
             (0, _) => Err(PlatformError::Read {
                 source: REGION_SOURCE.to_owned(),
@@ -242,11 +243,14 @@ fn region_at(
 
 /// Walks regions through `read_at` until it runs out.
 ///
-/// Running out is ambiguous. It ends every walk, but an exiting process also
-/// reads this way for a moment: its address space goes first, and only then
-/// does the kernel answer `ESRCH`. A live process always has a region at or
-/// after address 0, so reading there again tells the two apart, and a list cut
-/// short by an exit is never returned as complete.
+/// Running out is ambiguous. It ends every walk, but a process also reads this
+/// way for a moment when it exits or execs: the kernel takes the address space
+/// away, and has no region to report until the process is gone or has its new
+/// image. A process with an address space always has a region at or after
+/// address 0, so reading there again tells a finished walk from a lost one.
+///
+/// A walk that crosses an exec between reads, without seeing that moment, lists
+/// regions from both images.
 #[cfg(target_os = "macos")]
 fn walk_regions(
     pid: u32,
@@ -265,7 +269,7 @@ fn walk_regions(
         address = next;
     }
     if regions.is_empty() || read_at(0)?.is_none() {
-        return Err(PlatformError::ProcessGone(pid));
+        return Err(PlatformError::NoAddressSpace(pid));
     }
     Ok(regions)
 }
@@ -433,14 +437,14 @@ mod tests {
         // The address space went away after the first region. Measured on
         // macOS 27: a walk ended this way after 6 regions of a larger map.
         let (result, _) = scripted_walk(vec![Ok(region(0, 16)), Ok(None), Ok(None)]);
-        assert_eq!(result, Err(PlatformError::ProcessGone(7)));
+        assert_eq!(result, Err(PlatformError::NoAddressSpace(7)));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_process_with_no_regions_is_exiting_not_malformed() {
+    fn a_process_with_no_regions_has_no_address_space() {
         let (result, _) = scripted_walk(vec![Ok(None)]);
-        assert_eq!(result, Err(PlatformError::ProcessGone(7)));
+        assert_eq!(result, Err(PlatformError::NoAddressSpace(7)));
     }
 
     #[cfg(target_os = "macos")]
