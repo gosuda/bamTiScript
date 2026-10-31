@@ -108,6 +108,7 @@ dependencies = [
  "bamts-bytecode",
  "bamts-cancel",
  "bamts-native",
+ "bamts-platform",
  "bamts-runtime",
  "cranelift-codegen",
  "cranelift-frontend",

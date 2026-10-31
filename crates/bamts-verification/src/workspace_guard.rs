@@ -1042,6 +1042,7 @@ fn expected_internal_graph() -> InternalGraph {
         BTreeMap::from([
             ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
             ("bamts-cancel".to_owned(), internal_dependency(false, &[])),
+            ("bamts-platform".to_owned(), internal_dependency(false, &[])),
             ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
             ("bamts-native".to_owned(), internal_dependency(true, &[])),
         ]),
