@@ -20,8 +20,9 @@ pub enum PlatformError {
     Unsupported(&'static str),
     /// The host cannot find the process, which has exited or is exiting.
     ProcessGone(u32),
-    /// The process has no address space at this moment. It is exiting or, on
-    /// macOS, replacing its image with `exec`. Only a later read can tell which.
+    /// The process shows no address space at this moment. It may be exiting,
+    /// replacing its image with `exec` on macOS, or running on after its main
+    /// thread exited on Linux. Only a later read can tell which.
     NoAddressSpace(u32),
     /// The host failed the read.
     Read { source: String, detail: String },
@@ -132,8 +133,9 @@ pub struct MemoryRegion {
 
 /// Lists the memory regions of a process.
 ///
-/// A list read while a process execs can mix its old and new images. Read again
-/// for a clean one.
+/// The read is not atomic. While a process execs or exits, a list can be partial
+/// or mix its old and new images, so sample a changing process repeatedly. A
+/// mapping that comes and goes between samples is not seen at all.
 ///
 /// # Errors
 /// Returns [`PlatformError::ProcessGone`] when the host cannot find the process

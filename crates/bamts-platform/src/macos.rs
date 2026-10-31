@@ -259,13 +259,13 @@ fn region_at(raw_pid: libc::c_int, pid: u32, address: u64) -> Result<Option<Walk
 /// Walks regions through `read_at` until it runs out.
 ///
 /// Running out is ambiguous. It ends every walk, but a process also reads this
-/// way for a moment when it exits or execs: the kernel takes the address space
-/// away, and has no region to report until the process is gone or has its new
-/// image. A process with an address space always has a region at or after
-/// address 0, so reading there again tells a finished walk from a lost one.
+/// way for a moment when it exits or execs: the kernel has no region to report
+/// until the process is gone or has its new image. A process with an address
+/// space always has a region at or after address 0, so reading there again
+/// catches an address space that is already gone.
 ///
-/// A walk that crosses an exec between reads, without seeing that moment, lists
-/// regions from both images.
+/// It cannot catch one still being torn down, or an exec that lands between two
+/// reads, so a list taken during either can be partial or span both images.
 #[cfg(target_os = "macos")]
 fn walk_regions(
     pid: u32,

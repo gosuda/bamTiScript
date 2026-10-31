@@ -757,9 +757,10 @@ fn sample_child_maps_from(
         }
         let mappings = match read_maps(&mut child) {
             Ok(mappings) => mappings,
-            // Neither answer is final. macOS gives them before an exiting child
-            // can be reaped, and while a live child execs, so keep sampling:
-            // `try_wait` decides an exit, and a new image still gets checked.
+            // Neither answer is final. An exiting child gives them before it
+            // can be reaped, and a live child gives `NoAddressSpace` during an
+            // exec. Keep sampling: `try_wait` decides an exit, and a new image
+            // that outlives a poll still gets checked.
             Err(error) if child_is_between_states(&error) => {
                 thread::sleep(Duration::from_millis(1));
                 continue;
