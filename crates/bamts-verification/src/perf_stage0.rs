@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use bamts_cli::args::{ExecutionTarget, Mode};
 use bamts_cli::driver;
-use bamts_platform::MemoryRegion;
+use bamts_platform::{MemoryRegion, PlatformError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -709,9 +709,25 @@ fn sample_child_maps(child: Child, executable: &Path, timeout: Duration) -> Resu
 }
 
 fn sample_child_maps_with_observer(
+    child: Child,
+    executable: &Path,
+    timeout: Duration,
+    observed: impl FnMut(&mut Child, &[MemoryRegion]) -> Result<()>,
+) -> Result<ChildMapSample> {
+    sample_child_maps_from(
+        child,
+        executable,
+        timeout,
+        |child| process_maps_for(child.id()),
+        observed,
+    )
+}
+
+fn sample_child_maps_from(
     mut child: Child,
     executable: &Path,
     timeout: Duration,
+    mut read_maps: impl FnMut(&mut Child) -> Result<Vec<MemoryRegion>>,
     mut observed: impl FnMut(&mut Child, &[MemoryRegion]) -> Result<()>,
 ) -> Result<ChildMapSample> {
     let stdout = child
@@ -734,8 +750,13 @@ fn sample_child_maps_with_observer(
             Ok(None) => {}
             Err(error) => break Err(error),
         }
-        let mappings = match process_maps_for(child.id()) {
+        let mappings = match read_maps(&mut child) {
             Ok(mappings) => mappings,
+            // macOS reports an exiting process as gone before it can be reaped,
+            // so `try_wait` could still call this child live.
+            Err(error) if process_is_gone(&error) => {
+                break child.wait().context("waiting for an exiting child");
+            }
             Err(error) => match child
                 .try_wait()
                 .context("checking child after map-read failure")
@@ -834,6 +855,13 @@ fn process_maps_for(pid: u32) -> Result<Vec<MemoryRegion>> {
 
 fn process_maps() -> Result<Vec<MemoryRegion>> {
     process_maps_for(std::process::id())
+}
+
+fn process_is_gone(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<PlatformError>(),
+        Some(PlatformError::ProcessGone(_))
+    )
 }
 
 fn anonymous_executable_mappings(maps: &[MemoryRegion]) -> BTreeSet<String> {
@@ -1158,6 +1186,49 @@ requires="live map captured"
         assert!(sample.samples > 1);
         assert!(sample.executable_mappings > 0);
         assert!(anonymous_executable_mappings(&sample.mappings).is_empty());
+    }
+
+    /// macOS reports an exiting process as gone before it can be reaped. How
+    /// often a real read lands there depends on load, so this one is scripted.
+    #[test]
+    fn continuous_sampler_waits_for_a_child_gone_before_it_can_be_reaped() {
+        let executable = fs::canonicalize("/bin/cat").unwrap();
+        let child = Command::new(&executable)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut reads = 0;
+        let sample = sample_child_maps_from(
+            child,
+            &executable,
+            Duration::from_secs(2),
+            |child| {
+                reads += 1;
+                if reads == 1 {
+                    return process_maps_for(child.id());
+                }
+                // EOF starts the exit, so `try_wait` still reports a live child.
+                drop(child.stdin.take());
+                Err(anyhow::Error::new(PlatformError::ProcessGone(child.id())))
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(sample.samples, 1);
+        assert!(sample.executable_mappings > 0);
+    }
+
+    #[test]
+    fn a_reaped_child_is_recognised_as_gone_through_the_error_context() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(process_is_gone(&process_maps_for(pid).unwrap_err()));
     }
 
     #[test]
