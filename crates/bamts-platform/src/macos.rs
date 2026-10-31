@@ -1,9 +1,7 @@
-//! macOS backend: `sysctl`.
+//! macOS backend: `sysctl` and `libproc`.
 
 #[cfg(target_os = "macos")]
-use std::ffi::CStr;
-#[cfg(target_os = "macos")]
-use std::mem::{MaybeUninit, size_of, size_of_val};
+use std::mem::{MaybeUninit, size_of};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
@@ -175,17 +173,13 @@ const REGION_SOURCE: &str = "proc_pidinfo(PROC_PIDREGIONPATHINFO)";
 
 #[cfg(target_os = "macos")]
 fn region_from(info: &ProcRegionWithPathInfo) -> Result<MemoryRegion> {
-    let field = &info.prp_vip.vip_path;
-    // SAFETY: `vip_path` is a fixed array of `c_char`. Each is one byte with no
-    // padding, and every bit pattern is a valid `u8`. The slice spans exactly
-    // that array and borrows from `info`, so it cannot outlive the data.
-    #[allow(unsafe_code)]
-    let bytes =
-        unsafe { std::slice::from_raw_parts(field.as_ptr().cast::<u8>(), size_of_val(field)) };
-    let path = CStr::from_bytes_until_nul(bytes)
-        .map_err(|_| malformed(REGION_SOURCE, "region path is not NUL-terminated"))?
-        .to_string_lossy()
-        .into_owned();
+    let field = info.prp_vip.vip_path.as_flattened();
+    let length = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| malformed(REGION_SOURCE, "region path is not NUL-terminated"))?;
+    let bytes: Vec<u8> = field[..length].iter().map(|byte| *byte as u8).collect();
+    let path = String::from_utf8_lossy(&bytes).into_owned();
     let region = &info.prp_prinfo;
     let end = region
         .pri_address
@@ -364,6 +358,45 @@ mod tests {
         info.prp_prinfo.pri_address = start;
         info.prp_prinfo.pri_size = size;
         Some(info)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reads_a_region_path_across_the_inner_arrays() {
+        let path = format!("/{}", "a".repeat(63));
+        let mut info = blank_region();
+        let field = info.prp_vip.vip_path.as_flattened_mut();
+        for (slot, byte) in field.iter_mut().zip(path.bytes()) {
+            *slot = byte as libc::c_char;
+        }
+        assert_eq!(region_from(&info).unwrap().pathname, Some(path));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_region_path_without_a_terminator_is_malformed() {
+        let mut info = blank_region();
+        info.prp_vip
+            .vip_path
+            .as_flattened_mut()
+            .fill(b'a' as libc::c_char);
+        assert!(matches!(
+            region_from(&info),
+            Err(PlatformError::Malformed { .. })
+        ));
+    }
+
+    /// The anonymous-executable check tests only `is_none`, so a path that is
+    /// not UTF-8 must stay a path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_region_path_that_is_not_utf8_is_still_a_path() {
+        let mut info = blank_region();
+        info.prp_vip.vip_path[0][0] = 0xFF_u8 as libc::c_char;
+        assert_eq!(
+            region_from(&info).unwrap().pathname.as_deref(),
+            Some("\u{FFFD}")
+        );
     }
 
     /// Runs a walk against scripted kernel answers, and returns its result with
