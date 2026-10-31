@@ -2281,7 +2281,7 @@ mod tests {
         assert_eq!(host.conditions.swap_total_kib, 403_979_000);
         assert_eq!(
             host.source.get("governor").map(String::as_str),
-            Some("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+            Some(bamts_platform::LINUX_GOVERNOR_SOURCE)
         );
         assert_eq!(host.conditions.cpu_affinity, "0-19");
         assert_eq!(host.conditions.memory_policy, "bind");

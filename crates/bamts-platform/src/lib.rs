@@ -13,6 +13,11 @@ mod macos;
 /// Recorded for a fact this host does not have, such as a CPU governor on macOS.
 pub const UNAVAILABLE: &str = "unavailable";
 
+/// The file the Linux backend reads for the CPU governor. A host manifest
+/// records it as the evidence source of its `governor` condition, so a test can
+/// hold the manifest to the code that does the reading.
+pub const LINUX_GOVERNOR_SOURCE: &str = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor";
+
 /// Why a host fact could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlatformError {

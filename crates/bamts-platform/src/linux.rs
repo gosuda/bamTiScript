@@ -419,7 +419,7 @@ pub(crate) fn machine_facts() -> Result<MachineFacts> {
     let version = read_evidence("/proc/version")?;
     let cpuinfo = read_evidence("/proc/cpuinfo")?;
     let meminfo = read_evidence("/proc/meminfo")?;
-    let governor = read_evidence("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+    let governor = read_evidence(crate::LINUX_GOVERNOR_SOURCE)
         .map(|text| text.trim().to_owned())
         .unwrap_or_else(|_| "unknown".to_owned());
 
