@@ -196,14 +196,7 @@ mod tests {
     use super::{FileSystem, OsFileSystem};
 
     fn temporary_root() -> std::path::PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("bamts-service-fs-{}-{nonce}", std::process::id()));
-        fs::create_dir(&root).expect("create temporary root");
-        root
+        crate::service::test_support::fresh_dir("bamts-service-fs")
     }
 
     fn collect_names(entries: Vec<std::path::PathBuf>) -> Vec<String> {
