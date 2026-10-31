@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn a_process_without_an_address_space_is_gone() {
-        // Measured on Linux 6: an exiting process reads `R (running)` with no
+        // Measured on Linux 6.8: an exiting process reads `R (running)` with no
         // `VmHWM` line for most of its exit, before it becomes a zombie.
         for state in ["R (running)", "D (disk sleep)", "Z (zombie)"] {
             let status = format!("Name:\tcat\nState:\t{state}\nPid:\t7\n");

@@ -342,9 +342,8 @@ fn rusage_v4(pid: u32) -> Result<libc::rusage_info_v4> {
             }
         });
     }
-    // SAFETY: a zero status means the kernel filled the whole record, and the
-    // buffer was zero-initialised first, so every byte is initialised and a
-    // zero pattern is valid for every integer field.
+    // SAFETY: the buffer was zeroed and the kernel then wrote it. Every field
+    // is an integer or an array of integers, so any bytes are a valid value.
     #[allow(unsafe_code)]
     Ok(unsafe { info.assume_init() })
 }
@@ -676,11 +675,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_dropped_window_stops_its_sampler() {
-        let window = crate::PeakWindow::start().unwrap();
+        let window = Window::start().unwrap();
+        let stop = Arc::clone(&window.stop);
         drop(window);
-        // A second window starts cleanly, so the first left nothing running
-        // that would fail or leak.
-        crate::PeakWindow::start().unwrap().finish().unwrap();
+        // The sampler holds the only other clone until it returns.
+        assert_eq!(Arc::strong_count(&stop), 1);
     }
 
     #[cfg(target_os = "macos")]

@@ -186,9 +186,13 @@ impl WindowImpl {
 /// macOS.
 ///
 /// # Errors
-/// Returns [`PlatformError::ProcessGone`] when the process no longer exists,
-/// and another [`PlatformError`] when this host has no implementation or the
-/// host fails the read.
+/// Returns [`PlatformError::ProcessGone`] when the process has exited or is
+/// exiting, and another [`PlatformError`] when this host has no implementation
+/// or the host fails the read.
+///
+/// Linux reports `ProcessGone` from the start of the exit. macOS keeps
+/// answering with the final peak until the process is reaped, so a loop that
+/// polls until `ProcessGone` must run beside a `wait`, never before it.
 pub fn peak_memory_bytes(pid: u32) -> Result<u64, PlatformError> {
     #[cfg(target_os = "linux")]
     {
@@ -212,6 +216,9 @@ pub fn peak_memory_bytes(pid: u32) -> Result<u64, PlatformError> {
 /// window samples the process footprint every millisecond and a spike shorter
 /// than that can be missed. Treat the macOS value as functional evidence, not
 /// as a benchmark measurement.
+///
+/// Windows cannot overlap on Linux. Starting one resets a mark shared by the
+/// whole process, which would lower the result of a window already open.
 pub struct PeakWindow(WindowImpl);
 
 impl PeakWindow {
@@ -276,6 +283,7 @@ mod tests {
             peak >= baseline + (BYTES - margin) as u64,
             "peak {peak} did not rise from the idle {baseline} by the allocation"
         );
+        assert!(peak >= BYTES as u64, "peak {peak} is below the allocation");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
