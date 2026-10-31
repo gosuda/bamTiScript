@@ -35,3 +35,43 @@ leaf-gate leaf:
 conformance-shard index count="4" catalog="typescript-7.0.2":
     cargo build --locked --release -p bamts-verification --bin ts_lane_worker
     receipt="target/evidence-local/{{catalog}}/{{index}}.jsonl" && mkdir -p "$(dirname "$receipt")" && BAMTS_SUITE_COMPILER_ADAPTER=target/release/ts_lane_worker cargo run --locked --release -p bamts-verification --bin bamts-verification -- suite run --catalog {{catalog}} --shard "{{index}}/{{count}}" --receipt "$receipt" --runner compiler --platform x86_64-unknown-linux-gnu --workflow local --run-id local --run-attempt 1 --source-sha "$(git rev-parse HEAD)" --job conformance-shard --host "$(uname -sm | tr ' ' '-')" --runtime "node-v24.18.0;rust-$(rustc --version)" && printf 'SHARD %s/%s RECEIPT %s\n' "{{index}}" "{{count}}" "$receipt"
+
+# Check that the whole workspace, tests included, still builds for every host
+# the product targets. This proves only that it compiles.
+xcheck:
+    cargo check --workspace --all-targets --locked --target x86_64-apple-darwin
+    cargo check --workspace --all-targets --locked --target x86_64-unknown-linux-gnu
+    cargo check --workspace --all-targets --locked --target aarch64-unknown-linux-gnu
+    cargo check --workspace --all-targets --locked --target x86_64-pc-windows-msvc
+    printf '%s\n' 'XCHECK PASS'
+
+# Fail when code outside bamts-platform reads /proc or /sys, or runs numactl or
+# sysctl, so OS facts stay behind the platform crate. It is a tripwire for
+# literals, not a proof: it misses a path built from parts or a command named by
+# a variable. It uses grep because it exists on every host; an rg missing from
+# PATH would make a ripgrep search print nothing and pass.
+#
+# A search that cannot see must not pass. BSD grep on macOS exits 1 for a missing
+# directory, the same as "no match", so exit codes cannot tell. bamts-platform
+# reads /proc and /sys by design, so a search that finds nothing there is blind.
+portability-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pattern='"/(proc|sys)/|Command::new\("(numactl|sysctl)"'
+    status=0
+    found="$(grep -rnE --include='*.rs' "$pattern" crates)" || status=$?
+    if [[ $status -gt 1 ]]; then
+        printf '%s\n' 'PORTABILITY ERROR: the search itself failed'
+        exit 1
+    fi
+    if ! grep -q '^crates/bamts-platform/src/' <<<"$found"; then
+        printf '%s\n' 'PORTABILITY ERROR: the search found nothing in bamts-platform, so it cannot be trusted'
+        exit 1
+    fi
+    hits="$(grep -v '^crates/bamts-platform/src/' <<<"$found" || true)"
+    if [[ -n "$hits" ]]; then
+        printf '%s\n' "$hits"
+        printf '%s\n' 'PORTABILITY FAIL'
+        exit 1
+    fi
+    printf '%s\n' 'PORTABILITY PASS'
