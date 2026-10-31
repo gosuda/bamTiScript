@@ -2491,7 +2491,7 @@ fn effective_uid_in_context(context: &ExecutionContext) -> Result<u32, DriverErr
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn effective_uid() -> Result<u32, DriverError> {
     let context = ExecutionContext::ambient()?;
     effective_uid_in_context(&context)

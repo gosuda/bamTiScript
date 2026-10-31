@@ -2306,6 +2306,7 @@ mod tests {
         assert!(results_with_id(&messages, &json!(1))[0]["result"].is_object());
     }
 
+    #[cfg(unix)]
     #[test]
     fn document_uris_must_stay_inside_the_workspace_root() {
         let root = tempfile::tempdir().expect("temp");

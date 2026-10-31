@@ -476,6 +476,7 @@ fn cancelled_execute_reports_request_cancelled() {
     assert_eq!(error_code(&response), CODE_REQUEST_CANCELLED);
 }
 
+#[cfg(unix)]
 #[test]
 fn late_cancel_after_response_does_not_poison_reused_id() {
     let root = temp_root("late-cancel");
@@ -521,6 +522,7 @@ fn late_cancel_after_response_does_not_poison_reused_id() {
     fs::remove_dir_all(root).expect("remove root");
 }
 
+#[cfg(unix)]
 #[test]
 fn queue_saturation_pipe_cancel() {
     let root = temp_root("queue-saturation");
@@ -585,6 +587,7 @@ fn queue_saturation_pipe_cancel() {
     fs::remove_dir_all(root).expect("remove root");
 }
 
+#[cfg(unix)]
 fn exit_join_elapsed() -> Duration {
     let (reader, mut writer) = io::pipe().expect("pipe");
     let producer = std::thread::spawn(move || {
@@ -600,6 +603,7 @@ fn exit_join_elapsed() -> Duration {
     elapsed
 }
 
+#[cfg(unix)]
 #[test]
 fn repeated_exit_sessions_reap_readers() {
     for _ in 0..4 {
@@ -607,6 +611,7 @@ fn repeated_exit_sessions_reap_readers() {
     }
 }
 
+#[cfg(unix)]
 fn shutdown_join_elapsed() -> Duration {
     let (reader, mut writer) = io::pipe().expect("pipe");
     let producer = std::thread::spawn(move || {
@@ -626,11 +631,13 @@ fn shutdown_join_elapsed() -> Duration {
     elapsed
 }
 
+#[cfg(unix)]
 #[test]
 fn shutdown_joins_the_reader() {
     assert!(shutdown_join_elapsed() < Duration::from_millis(500));
 }
 
+#[cfg(unix)]
 #[test]
 fn repeated_shutdown_sessions_reap_readers() {
     for _ in 0..4 {
@@ -638,6 +645,7 @@ fn repeated_shutdown_sessions_reap_readers() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn in_flight_cancel_over_pipe_preserves_session() {
     let root = temp_root("pipe-cancel");
