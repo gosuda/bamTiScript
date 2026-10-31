@@ -1354,18 +1354,22 @@ fn replace_atomically(path: &Path, bytes: &[u8]) -> Result<(), CompletionError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
     struct Scratch(PathBuf);
     impl Scratch {
         fn new(name: &str) -> Self {
+            // The clock cannot keep these apart: macOS reads it in microseconds,
+            // and `fixture` gives every test the same label. A collision does not
+            // fail, because `create_dir_all` accepts an existing directory, so
+            // two tests would share one and one would delete it under the other.
+            static NEXT: AtomicU64 = AtomicU64::new(0);
             let p = std::env::temp_dir().join(format!(
                 "bamts-completion-{name}-{}-{}",
                 process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
+                NEXT.fetch_add(1, Ordering::Relaxed)
             ));
+            // A directory left by an earlier process with the same id is stale.
+            let _ = fs::remove_dir_all(&p);
             fs::create_dir_all(p.join("verification")).unwrap();
             fs::create_dir_all(p.join(".outline/gates")).unwrap();
             fs::create_dir_all(p.join("proof")).unwrap();
@@ -1376,6 +1380,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn scratch_directories_made_together_never_share_a_path() {
+        const THREADS: usize = 32;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    Scratch::new("state")
+                })
+            })
+            .collect();
+        let scratches: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        let distinct: std::collections::BTreeSet<_> = scratches.iter().map(|s| &s.0).collect();
+        assert_eq!(distinct.len(), THREADS);
     }
     fn fixture(state: &str, public: Option<&str>, mutation: bool) -> Scratch {
         let scratch = Scratch::new("state");
