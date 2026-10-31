@@ -157,34 +157,28 @@ fn parse_peak_memory_bytes(status: &str) -> Result<u64> {
         .ok_or_else(|| malformed(SOURCE, "VmHWM overflows"))
 }
 
-/// A zombie has exited and no longer has an address space, so it has no
-/// `VmHWM` line.
-fn is_zombie(status: &str) -> bool {
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("State:"))
-        .is_some_and(|state| state.trim_start().starts_with('Z'))
+/// The kernel prints `VmHWM` only for a task that holds an address space. A
+/// process drops it early in exit, long before it becomes a zombie, and its
+/// state can still read as running. So a status with a `State:` line and no
+/// `VmHWM` line is a process that is exiting.
+fn has_left_its_address_space(status: &str) -> bool {
+    let has_field = |name| status.lines().any(|line| line.starts_with(name));
+    has_field("State:") && !has_field("VmHWM:")
+}
+
+fn peak_from_status(pid: u32, status: &str) -> Result<u64> {
+    if has_left_its_address_space(status) {
+        return Err(PlatformError::ProcessGone(pid));
+    }
+    parse_peak_memory_bytes(status)
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn peak_memory_bytes(pid: u32) -> Result<u64> {
     let path = format!("/proc/{pid}/status");
-    let status = match fs::read_to_string(&path) {
-        Ok(status) => status,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(PlatformError::ProcessGone(pid));
-        }
-        Err(error) => {
-            return Err(PlatformError::Read {
-                source: path,
-                detail: error.to_string(),
-            });
-        }
-    };
-    if is_zombie(&status) {
-        return Err(PlatformError::ProcessGone(pid));
-    }
-    parse_peak_memory_bytes(&status)
+    let status =
+        fs::read_to_string(&path).map_err(|error| process_read_error(pid, path, &error))?;
+    peak_from_status(pid, &status)
 }
 
 /// Resets the kernel's high-water mark when it starts, so the final read is
@@ -624,10 +618,31 @@ mod tests {
     }
 
     #[test]
-    fn recognises_a_zombie() {
-        assert!(is_zombie("Name:\tcat\nState:\tZ (zombie)\n"));
-        assert!(!is_zombie("Name:\tcat\nState:\tS (sleeping)\n"));
-        assert!(!is_zombie("Name:\tcat\n"));
+    fn a_process_without_an_address_space_is_gone() {
+        // Measured on Linux 6: an exiting process reads `R (running)` with no
+        // `VmHWM` line for most of its exit, before it becomes a zombie.
+        for state in ["R (running)", "D (disk sleep)", "Z (zombie)"] {
+            let status = format!("Name:\tcat\nState:\t{state}\nPid:\t7\n");
+            assert_eq!(
+                peak_from_status(7, &status),
+                Err(PlatformError::ProcessGone(7)),
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_process_reports_its_peak() {
+        let status = "State:\tS (sleeping)\nVmHWM:\t   32000 kB\n";
+        assert_eq!(peak_from_status(7, status), Ok(32_768_000));
+    }
+
+    #[test]
+    fn a_status_without_a_state_is_malformed_not_gone() {
+        assert!(matches!(
+            peak_from_status(7, "Name:\tcat\n"),
+            Err(PlatformError::Malformed { .. })
+        ));
     }
 
     #[test]
