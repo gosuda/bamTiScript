@@ -157,18 +157,18 @@ fn parse_peak_memory_bytes(status: &str) -> Result<u64> {
         .ok_or_else(|| malformed(SOURCE, "VmHWM overflows"))
 }
 
-/// The kernel prints `VmHWM` only for a task that holds an address space. A
-/// process drops it early in exit, long before it becomes a zombie, and its
-/// state can still read as running. So a status with a `State:` line and no
-/// `VmHWM` line is a process that is exiting.
-fn has_left_its_address_space(status: &str) -> bool {
+/// The kernel prints `VmHWM` only for a task that holds an address space. An
+/// exiting process drops it long before it becomes a zombie, and its state can
+/// still read as running. A process whose main thread has exited reads the same
+/// way while its other threads run, so this does not prove an exit.
+fn has_no_address_space(status: &str) -> bool {
     let has_field = |name| status.lines().any(|line| line.starts_with(name));
     has_field("State:") && !has_field("VmHWM:")
 }
 
 fn peak_from_status(pid: u32, status: &str) -> Result<u64> {
-    if has_left_its_address_space(status) {
-        return Err(PlatformError::ProcessGone(pid));
+    if has_no_address_space(status) {
+        return Err(PlatformError::NoAddressSpace(pid));
     }
     parse_peak_memory_bytes(status)
 }
@@ -618,14 +618,14 @@ mod tests {
     }
 
     #[test]
-    fn a_process_without_an_address_space_is_gone() {
+    fn a_status_without_vmhwm_has_no_address_space() {
         // Measured on Linux 6.8: an exiting process reads `R (running)` with no
         // `VmHWM` line for most of its exit, before it becomes a zombie.
         for state in ["R (running)", "D (disk sleep)", "Z (zombie)"] {
             let status = format!("Name:\tcat\nState:\t{state}\nPid:\t7\n");
             assert_eq!(
                 peak_from_status(7, &status),
-                Err(PlatformError::ProcessGone(7)),
+                Err(PlatformError::NoAddressSpace(7)),
                 "{state}"
             );
         }

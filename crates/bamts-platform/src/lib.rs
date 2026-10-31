@@ -186,13 +186,16 @@ impl WindowImpl {
 /// macOS.
 ///
 /// # Errors
-/// Returns [`PlatformError::ProcessGone`] when the process has exited or is
-/// exiting, and another [`PlatformError`] when this host has no implementation
-/// or the host fails the read.
+/// Returns [`PlatformError::ProcessGone`] when the host cannot find the process
+/// and [`PlatformError::NoAddressSpace`] when it has no address space at this
+/// moment. Returns another [`PlatformError`] when this host has no
+/// implementation or the host fails the read.
 ///
-/// Linux reports `ProcessGone` from the start of the exit. macOS keeps
-/// answering with the final peak until the process is reaped, so a loop that
-/// polls until `ProcessGone` must run beside a `wait`, never before it.
+/// To follow a child to its end, poll beside a `wait` until `ProcessGone`, which
+/// comes only after the reap, and keep polling through `NoAddressSpace`. Linux
+/// reports it once the process drops its address space, which also happens to
+/// a process that runs on after its main thread exits. macOS keeps answering
+/// with the final peak until the reap.
 pub fn peak_memory_bytes(pid: u32) -> Result<u64, PlatformError> {
     #[cfg(target_os = "linux")]
     {
