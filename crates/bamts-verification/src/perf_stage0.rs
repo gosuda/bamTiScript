@@ -750,12 +750,19 @@ fn sample_child_maps_from(
             Ok(None) => {}
             Err(error) => break Err(error),
         }
+        if std::time::Instant::now() >= deadline {
+            break Err(anyhow::anyhow!(
+                "controlled child did not exit before timeout"
+            ));
+        }
         let mappings = match read_maps(&mut child) {
             Ok(mappings) => mappings,
-            // macOS reports an exiting process as gone before it can be reaped,
-            // so `try_wait` could still call this child live.
-            Err(error) if process_is_gone(&error) => {
-                break child.wait().context("waiting for an exiting child");
+            // Neither answer is final. macOS gives them before an exiting child
+            // can be reaped, and while a live child execs, so keep sampling:
+            // `try_wait` decides an exit, and a new image still gets checked.
+            Err(error) if child_is_between_states(&error) => {
+                thread::sleep(Duration::from_millis(1));
+                continue;
             }
             Err(error) => match child
                 .try_wait()
@@ -789,11 +796,6 @@ fn sample_child_maps_from(
         }
         for mapping in mappings {
             union.entry(mapping.identity.clone()).or_insert(mapping);
-        }
-        if std::time::Instant::now() >= deadline {
-            break Err(anyhow::anyhow!(
-                "controlled child did not exit before timeout"
-            ));
         }
         thread::sleep(Duration::from_millis(1));
     };
@@ -857,10 +859,10 @@ fn process_maps() -> Result<Vec<MemoryRegion>> {
     process_maps_for(std::process::id())
 }
 
-fn process_is_gone(error: &anyhow::Error) -> bool {
+fn child_is_between_states(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<PlatformError>(),
-        Some(PlatformError::ProcessGone(_))
+        Some(PlatformError::ProcessGone(_) | PlatformError::NoAddressSpace(_))
     )
 }
 
@@ -1188,10 +1190,7 @@ requires="live map captured"
         assert!(anonymous_executable_mappings(&sample.mappings).is_empty());
     }
 
-    /// macOS reports an exiting process as gone before it can be reaped. How
-    /// often a real read lands there depends on load, so this one is scripted.
-    #[test]
-    fn continuous_sampler_waits_for_a_child_gone_before_it_can_be_reaped() {
+    fn spawn_idle_cat() -> (PathBuf, Child) {
         let executable = fs::canonicalize("/bin/cat").unwrap();
         let child = Command::new(&executable)
             .stdin(Stdio::piped())
@@ -1199,36 +1198,111 @@ requires="live map captured"
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut reads = 0;
-        let sample = sample_child_maps_from(
+        (executable, child)
+    }
+
+    /// `spawn` can return before the executable is mapped, so a fixture that
+    /// needs it observed reads real maps until it appears.
+    fn shows_executable(mappings: &[MemoryRegion], executable: &Path) -> bool {
+        mappings
+            .iter()
+            .any(|mapping| mapping.pathname.as_deref().map(Path::new) == Some(executable))
+    }
+
+    /// macOS gives both errors before an exiting child can be reaped. How often
+    /// a real read lands there depends on load, so these reads are scripted.
+    #[test]
+    fn continuous_sampler_polls_a_child_that_reads_as_gone_until_it_exits() {
+        for error in [
+            PlatformError::ProcessGone(1),
+            PlatformError::NoAddressSpace(1),
+        ] {
+            let (executable, child) = spawn_idle_cat();
+            let mut mapped = false;
+            let sample = sample_child_maps_from(
+                child,
+                &executable,
+                Duration::from_secs(2),
+                |child| {
+                    if mapped {
+                        // EOF starts the exit, so `try_wait` still sees a live child.
+                        drop(child.stdin.take());
+                        return Err(anyhow::Error::new(error.clone()));
+                    }
+                    let mappings = process_maps_for(child.id())?;
+                    mapped = shows_executable(&mappings, &executable);
+                    Ok(mappings)
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+            assert!(sample.executable_mappings > 0);
+        }
+    }
+
+    /// macOS also reports no address space while a live child execs, so that
+    /// answer must never end sampling: the new image still has to be checked.
+    #[test]
+    fn continuous_sampler_checks_the_image_a_child_execs_into() {
+        let (executable, child) = spawn_idle_cat();
+        let mut mapped = false;
+        let mut execed = false;
+        let error = sample_child_maps_from(
             child,
             &executable,
             Duration::from_secs(2),
             |child| {
-                reads += 1;
-                if reads == 1 {
-                    return process_maps_for(child.id());
+                if execed {
+                    return Ok(vec![MemoryRegion {
+                        identity: "new image".to_owned(),
+                        permissions: "rwxp".to_owned(),
+                        pathname: None,
+                    }]);
                 }
-                // EOF starts the exit, so `try_wait` still reports a live child.
-                drop(child.stdin.take());
-                Err(anyhow::Error::new(PlatformError::ProcessGone(child.id())))
+                if mapped {
+                    execed = true;
+                    let error = PlatformError::NoAddressSpace(child.id());
+                    return Err(anyhow::Error::new(error));
+                }
+                let mappings = process_maps_for(child.id())?;
+                mapped = shows_executable(&mappings, &executable);
+                Ok(mappings)
             },
             |_, _| Ok(()),
         )
-        .unwrap();
-        assert_eq!(sample.samples, 1);
-        assert!(sample.executable_mappings > 0);
+        .unwrap_err();
+        assert!(error.to_string().contains("RWX"), "{error:#}");
     }
 
     #[test]
-    fn a_reaped_child_is_recognised_as_gone_through_the_error_context() {
+    fn continuous_sampler_times_out_on_a_child_that_stays_unreadable() {
+        let (executable, child) = spawn_idle_cat();
+        let error = sample_child_maps_from(
+            child,
+            &executable,
+            Duration::from_millis(50),
+            |child| {
+                let error = PlatformError::NoAddressSpace(child.id());
+                Err(anyhow::Error::new(error))
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("did not exit before timeout"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_reaped_child_is_recognised_through_the_error_context() {
         let mut child = Command::new("/bin/cat")
             .stdin(Stdio::null())
             .spawn()
             .unwrap();
         let pid = child.id();
         child.wait().unwrap();
-        assert!(process_is_gone(&process_maps_for(pid).unwrap_err()));
+        assert!(child_is_between_states(&process_maps_for(pid).unwrap_err()));
     }
 
     #[test]
