@@ -171,15 +171,21 @@ const _: () = assert!(size_of::<ProcRegionWithPathInfo>() == 1272);
 #[cfg(target_os = "macos")]
 const REGION_SOURCE: &str = "proc_pidinfo(PROC_PIDREGIONPATHINFO)";
 
+/// Decodes `vip_path`, which `libc` declares as an array of arrays.
 #[cfg(target_os = "macos")]
-fn region_from(info: &ProcRegionWithPathInfo) -> Result<MemoryRegion> {
-    let field = info.prp_vip.vip_path.as_flattened();
+fn region_path(field: &[[libc::c_char; 32]; 32]) -> Result<String> {
+    let field = field.as_flattened();
     let length = field
         .iter()
         .position(|byte| *byte == 0)
         .ok_or_else(|| malformed(REGION_SOURCE, "region path is not NUL-terminated"))?;
     let bytes: Vec<u8> = field[..length].iter().map(|byte| *byte as u8).collect();
-    let path = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn region_from(info: &ProcRegionWithPathInfo) -> Result<MemoryRegion> {
+    let path = region_path(&info.prp_vip.vip_path)?;
     let region = &info.prp_prinfo;
     let end = region
         .pri_address
@@ -195,14 +201,18 @@ fn region_from(info: &ProcRegionWithPathInfo) -> Result<MemoryRegion> {
     })
 }
 
+/// One answer from the kernel, as a walk needs it.
+#[cfg(target_os = "macos")]
+struct WalkedRegion {
+    start: u64,
+    size: u64,
+    region: MemoryRegion,
+}
+
 /// Reads the first region at or after `address`, or `None` when the kernel has
 /// no region there.
 #[cfg(target_os = "macos")]
-fn region_at(
-    raw_pid: libc::c_int,
-    pid: u32,
-    address: u64,
-) -> Result<Option<ProcRegionWithPathInfo>> {
+fn region_at(raw_pid: libc::c_int, pid: u32, address: u64) -> Result<Option<WalkedRegion>> {
     const BUFFER_SIZE: libc::c_int = 1272;
     let mut info = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
     // SAFETY: `info` is a live, writable buffer of exactly `BUFFER_SIZE` bytes,
@@ -238,7 +248,12 @@ fn region_at(
     // SAFETY: the buffer was zeroed and the kernel then wrote it. Every field
     // is an integer or an array of integers, so any bytes are a valid value.
     #[allow(unsafe_code)]
-    Ok(Some(unsafe { info.assume_init() }))
+    let info = unsafe { info.assume_init() };
+    Ok(Some(WalkedRegion {
+        start: info.prp_prinfo.pri_address,
+        size: info.prp_prinfo.pri_size,
+        region: region_from(&info)?,
+    }))
 }
 
 /// Walks regions through `read_at` until it runs out.
@@ -254,18 +269,17 @@ fn region_at(
 #[cfg(target_os = "macos")]
 fn walk_regions(
     pid: u32,
-    mut read_at: impl FnMut(u64) -> Result<Option<ProcRegionWithPathInfo>>,
+    mut read_at: impl FnMut(u64) -> Result<Option<WalkedRegion>>,
 ) -> Result<Vec<MemoryRegion>> {
     let mut regions = Vec::new();
     let mut address = 0_u64;
-    while let Some(info) = read_at(address)? {
-        let next = info
-            .prp_prinfo
-            .pri_address
-            .checked_add(info.prp_prinfo.pri_size)
+    while let Some(found) = read_at(address)? {
+        let next = found
+            .start
+            .checked_add(found.size)
             .filter(|next| *next > address)
             .ok_or_else(|| malformed(REGION_SOURCE, "region walk does not advance"))?;
-        regions.push(region_from(&info)?);
+        regions.push(found.region);
         address = next;
     }
     if regions.is_empty() || read_at(0)?.is_none() {
@@ -348,44 +362,36 @@ mod tests {
         assert_eq!(permissions_string(7), "rwxp");
     }
 
-    /// A zeroed region record, valid because every field is an integer.
     #[cfg(target_os = "macos")]
-    #[allow(unsafe_code)]
-    fn blank_region() -> ProcRegionWithPathInfo {
-        // SAFETY: every field is an integer or an array of integers.
-        unsafe { MaybeUninit::<ProcRegionWithPathInfo>::zeroed().assume_init() }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn region(start: u64, size: u64) -> Option<ProcRegionWithPathInfo> {
-        let mut info = blank_region();
-        info.prp_prinfo.pri_address = start;
-        info.prp_prinfo.pri_size = size;
-        Some(info)
+    fn region(start: u64, size: u64) -> Option<WalkedRegion> {
+        Some(WalkedRegion {
+            start,
+            size,
+            region: MemoryRegion {
+                identity: String::new(),
+                permissions: permissions_string(0),
+                pathname: None,
+            },
+        })
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn reads_a_region_path_across_the_inner_arrays() {
         let path = format!("/{}", "a".repeat(63));
-        let mut info = blank_region();
-        let field = info.prp_vip.vip_path.as_flattened_mut();
-        for (slot, byte) in field.iter_mut().zip(path.bytes()) {
+        let mut field = [[0; 32]; 32];
+        for (slot, byte) in field.as_flattened_mut().iter_mut().zip(path.bytes()) {
             *slot = byte as libc::c_char;
         }
-        assert_eq!(region_from(&info).unwrap().pathname, Some(path));
+        assert_eq!(region_path(&field).unwrap(), path);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn a_region_path_without_a_terminator_is_malformed() {
-        let mut info = blank_region();
-        info.prp_vip
-            .vip_path
-            .as_flattened_mut()
-            .fill(b'a' as libc::c_char);
+        let field = [[b'a' as libc::c_char; 32]; 32];
         assert!(matches!(
-            region_from(&info),
+            region_path(&field),
             Err(PlatformError::Malformed { .. })
         ));
     }
@@ -395,19 +401,16 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_region_path_that_is_not_utf8_is_still_a_path() {
-        let mut info = blank_region();
-        info.prp_vip.vip_path[0][0] = 0xFF_u8 as libc::c_char;
-        assert_eq!(
-            region_from(&info).unwrap().pathname.as_deref(),
-            Some("\u{FFFD}")
-        );
+        let mut field = [[0; 32]; 32];
+        field[0][0] = 0xFF_u8 as libc::c_char;
+        assert_eq!(region_path(&field).unwrap(), "\u{FFFD}");
     }
 
     /// Runs a walk against scripted kernel answers, and returns its result with
     /// the addresses it asked for.
     #[cfg(target_os = "macos")]
     fn scripted_walk(
-        script: Vec<Result<Option<ProcRegionWithPathInfo>>>,
+        script: Vec<Result<Option<WalkedRegion>>>,
     ) -> (Result<Vec<MemoryRegion>>, Vec<u64>) {
         let mut asked = Vec::new();
         let mut answers = script.into_iter();
