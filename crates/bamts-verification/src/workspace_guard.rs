@@ -1023,6 +1023,7 @@ fn expected_internal_graph() -> InternalGraph {
                 "bamts-native".to_owned(),
                 internal_dependency(false, &["gc"]),
             ),
+            ("bamts-platform".to_owned(), internal_dependency(false, &[])),
         ]),
     );
     graph.insert(

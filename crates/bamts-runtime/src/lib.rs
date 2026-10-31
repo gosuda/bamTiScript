@@ -2060,26 +2060,13 @@ pub fn run_with_telemetry<H: Host>(
     (outcome, telemetry)
 }
 
-/// Best-effort process peak resident set size, in KiB, from
-/// `/proc/self/status` `VmHWM`. Returns `None` when the file or field is
-/// unavailable (non-Linux hosts, sandboxes).
+/// Best-effort peak memory of this process, in KiB: the resident-set peak on
+/// Linux and the physical-footprint peak on macOS. Returns `None` when the host
+/// cannot say, such as a sandbox without `/proc`.
 fn peak_rss_kb() -> Option<u64> {
-    let content = std::fs::read_to_string("/proc/self/status").ok()?;
-    parse_peak_rss_kb(&content)
-}
-
-/// Parses the process peak resident set size, in KiB, from a
-/// `/proc/self/status`-shaped document. Selects the `VmHWM:` field (the peak
-/// resident set) rather than `VmRSS:` (the current resident set), returning
-/// `None` when the field or its numeric value is missing.
-fn parse_peak_rss_kb(status: &str) -> Option<u64> {
-    status.lines().find_map(|line| {
-        line.strip_prefix("VmHWM:")?
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()
-    })
+    bamts_platform::peak_memory_bytes(std::process::id())
+        .ok()
+        .map(|bytes| bytes / 1024)
 }
 
 impl<'a, H: Host> Machine<'a, H> {
@@ -13667,9 +13654,8 @@ mod tests {
         assert_eq!(plain, outcome);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn run_with_telemetry_reports_peak_rss_on_linux() {
+    fn run_with_telemetry_reports_peak_rss() {
         let program = verified(
             vec![],
             vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
@@ -13678,25 +13664,8 @@ mod tests {
         let (_, telemetry) = super::run_with_telemetry(&program, &mut host, &Limits::default());
         assert!(
             telemetry.rss_kb > 0,
-            "peak RSS should be read from /proc on Linux"
+            "peak RSS should be read from the host"
         );
-    }
-
-    #[test]
-    fn parse_peak_rss_kb_selects_vmhwm_not_vmrss() {
-        let status = "Name:	bamts-runtime
-VmRSS:	   64000 kB
-VmHWM:	   32000 kB
-VmPeak:	64000 kB";
-        assert_eq!(super::parse_peak_rss_kb(status), Some(32_000));
-    }
-
-    #[test]
-    fn parse_peak_rss_kb_returns_none_when_only_vmrss_present() {
-        let status = "Name:	bamts-runtime
-VmRSS:	64000 kB
-VmPeak:	64000 kB";
-        assert_eq!(super::parse_peak_rss_kb(status), None);
     }
 
     fn namespace_descriptor_entry() -> Function {
