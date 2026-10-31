@@ -119,6 +119,41 @@ pub fn thread_placement() -> Result<ThreadPlacement, PlatformError> {
     }
 }
 
+/// The memory policy of this process as `numactl --show` reports it, or
+/// [`UNAVAILABLE`] when the host or the tool does not say.
+#[must_use]
+pub fn numa_policy_mode() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        linux::numa_policy_mode()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        UNAVAILABLE.to_owned()
+    }
+}
+
+/// The memory nodes this process is bound to. A host without NUMA nodes, such as
+/// macOS, has none and returns an empty list.
+///
+/// # Errors
+/// Returns [`PlatformError`] when this host has no implementation or the host
+/// fails the read.
+pub fn numa_memory_nodes() -> Result<Vec<u32>, PlatformError> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::numa_memory_nodes()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Vec::new())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(PlatformError::Unsupported("memory nodes"))
+    }
+}
+
 /// One contiguous memory region of a process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryRegion {

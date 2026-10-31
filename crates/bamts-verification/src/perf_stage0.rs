@@ -42,12 +42,14 @@ pub struct HostConditions {
 
 impl HostConditions {
     fn new() -> Result<Self> {
+        let facts = bamts_platform::machine_facts()?;
+        let placement = bamts_platform::thread_placement()?;
         Ok(Self {
-            governor: capture_governor()?,
-            swap_total_kib: capture_swap_total_kib()?,
-            cpu_affinity: capture_cpu_affinity()?,
-            mempolicy_mode: capture_mempolicy_mode(),
-            memory_nodes: capture_memory_nodes()?,
+            governor: facts.governor,
+            swap_total_kib: facts.swap_total_kib,
+            cpu_affinity: placement.cpu_affinity,
+            mempolicy_mode: bamts_platform::numa_policy_mode(),
+            memory_nodes: bamts_platform::numa_memory_nodes()?,
         })
     }
 }
@@ -874,61 +876,6 @@ fn anonymous_executable_mappings(maps: &[MemoryRegion]) -> BTreeSet<String> {
         .collect()
 }
 
-fn capture_governor() -> Result<String> {
-    Ok(
-        fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")?
-            .trim()
-            .to_owned(),
-    )
-}
-fn capture_swap_total_kib() -> Result<u64> {
-    let text = fs::read_to_string("/proc/meminfo")?;
-    text.lines()
-        .find_map(|line| line.strip_prefix("SwapTotal:"))
-        .and_then(|rest| rest.split_whitespace().next())
-        .context("SwapTotal not found")?
-        .parse()
-        .context("parsing SwapTotal")
-}
-fn capture_cpu_affinity() -> Result<String> {
-    let text = fs::read_to_string("/proc/self/status")?;
-    text.lines()
-        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
-        .map(str::trim)
-        .map(str::to_owned)
-        .context("Cpus_allowed_list not found")
-}
-fn capture_mempolicy_mode() -> String {
-    Command::new("numactl")
-        .arg("--show")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|text| {
-            text.lines().find_map(|line| {
-                line.strip_prefix("policy:")
-                    .map(str::trim)
-                    .map(str::to_owned)
-            })
-        })
-        .unwrap_or_else(|| "unavailable".into())
-}
-fn capture_memory_nodes() -> Result<Vec<u32>> {
-    if let Ok(output) = Command::new("numactl").arg("--show").output()
-        && output.status.success()
-        && let Ok(text) = String::from_utf8(output.stdout)
-        && let Some(nodes) = text.lines().find_map(|line| line.strip_prefix("nodebind:"))
-    {
-        return parse_whitespace_list(nodes.trim());
-    }
-    let text = fs::read_to_string("/proc/self/status")?;
-    text.lines()
-        .find_map(|line| line.strip_prefix("Mems_allowed_list:"))
-        .map(str::trim)
-        .context("Mems_allowed_list not found")
-        .and_then(parse_range_list)
-}
 fn parse_range_list(text: &str) -> Result<Vec<u32>> {
     anyhow::ensure!(!text.trim().is_empty(), "memory-node list is empty");
     let mut nodes = Vec::new();
@@ -948,11 +895,6 @@ fn parse_range_list(text: &str) -> Result<Vec<u32>> {
     }
     Ok(nodes)
 }
-fn parse_whitespace_list(text: &str) -> Result<Vec<u32>> {
-    text.split_whitespace()
-        .map(|token| token.parse().map_err(Into::into))
-        .collect()
-}
 
 #[cfg(test)]
 mod tests {
@@ -969,6 +911,22 @@ mod tests {
             anyhow::ensure!(self.fail != Some(name), "mutated evidence rejected");
             Ok(json!({"provider": rule.decided_by, "checked": true}))
         }
+    }
+
+    /// The conditions come from the platform crate on every host, so macOS can
+    /// read them too. The old readers opened `/sys` and `/proc` directly.
+    #[test]
+    fn host_conditions_come_from_the_platform_crate() {
+        let conditions = HostConditions::new().unwrap();
+        let facts = bamts_platform::machine_facts().unwrap();
+        let placement = bamts_platform::thread_placement().unwrap();
+        assert_eq!(conditions.governor, facts.governor);
+        assert_eq!(conditions.swap_total_kib, facts.swap_total_kib);
+        assert_eq!(conditions.cpu_affinity, placement.cpu_affinity);
+        assert_eq!(
+            conditions.mempolicy_mode,
+            bamts_platform::numa_policy_mode()
+        );
     }
 
     fn conditions() -> HostConditions {

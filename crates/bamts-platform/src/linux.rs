@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::process::Command;
 
 #[cfg(target_os = "linux")]
 use crate::{MachineFacts, ThreadPlacement};
@@ -449,6 +451,95 @@ pub(crate) fn thread_placement() -> Result<ThreadPlacement> {
     })
 }
 
+/// Runs `numactl --show` and returns its output, or `None` when the tool is
+/// missing, fails, or prints something that is not UTF-8.
+#[cfg(target_os = "linux")]
+fn numactl_show() -> Option<String> {
+    Command::new("numactl")
+        .arg("--show")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+}
+
+/// The memory policy `numactl --show` reports, or [`UNAVAILABLE`] when it does
+/// not say.
+#[cfg(target_os = "linux")]
+pub(crate) fn numa_policy_mode() -> String {
+    numactl_show()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                line.strip_prefix("policy:")
+                    .map(str::trim)
+                    .map(str::to_owned)
+            })
+        })
+        .unwrap_or_else(|| UNAVAILABLE.to_owned())
+}
+
+/// The memory nodes this process is bound to: the `nodebind` line of
+/// `numactl --show`, else `Mems_allowed_list` from `/proc/self/status`.
+#[cfg(target_os = "linux")]
+pub(crate) fn numa_memory_nodes() -> Result<Vec<u32>> {
+    if let Some(text) = numactl_show()
+        && let Some(nodes) = text.lines().find_map(|line| line.strip_prefix("nodebind:"))
+    {
+        return parse_whitespace_list(nodes.trim());
+    }
+    let status = read_evidence("/proc/self/status")?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Mems_allowed_list:"))
+        .map(str::trim)
+        .ok_or_else(|| malformed("/proc/self/status", "missing Mems_allowed_list"))
+        .and_then(parse_node_range_list)
+}
+
+fn node_number(token: &str) -> Result<u32> {
+    token.parse().map_err(|_| {
+        malformed(
+            "memory-node list",
+            format!("`{token}` is not a node number"),
+        )
+    })
+}
+
+/// Parses a kernel node list such as `0`, `0-3`, or `0,2-3`.
+fn parse_node_range_list(text: &str) -> Result<Vec<u32>> {
+    const SOURCE: &str = "memory-node list";
+    if text.trim().is_empty() {
+        return Err(malformed(SOURCE, "memory-node list is empty"));
+    }
+    let mut nodes = Vec::new();
+    for token in text.split(',').map(str::trim) {
+        if token.is_empty() {
+            return Err(malformed(
+                SOURCE,
+                "memory-node list contains an empty token",
+            ));
+        }
+        if let Some((start, end)) = token.split_once('-') {
+            let (start, end) = (node_number(start)?, node_number(end)?);
+            if start > end {
+                return Err(malformed(
+                    SOURCE,
+                    format!("reversed memory-node range: {token}"),
+                ));
+            }
+            nodes.extend(start..=end);
+        } else {
+            nodes.push(node_number(token)?);
+        }
+    }
+    Ok(nodes)
+}
+
+/// Parses the node numbers on a `numactl --show` `nodebind:` line.
+fn parse_whitespace_list(text: &str) -> Result<Vec<u32>> {
+    text.split_whitespace().map(node_number).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,5 +760,28 @@ mod tests {
             ("bind".to_owned(), "0-4".to_owned())
         );
         assert!(decode_memory_policy(-1, &mask).is_err());
+    }
+
+    #[test]
+    fn node_lists_parse_singletons_ranges_and_mixes() {
+        assert_eq!(parse_node_range_list("0").unwrap(), [0]);
+        assert_eq!(parse_node_range_list("0-3").unwrap(), [0, 1, 2, 3]);
+        assert_eq!(parse_node_range_list("0,2-3").unwrap(), [0, 2, 3]);
+        assert_eq!(parse_node_range_list(" 1 , 3 ").unwrap(), [1, 3]);
+    }
+
+    #[test]
+    fn malformed_node_lists_are_rejected() {
+        for text in ["", "  ", "0,", ",0", "3-1", "a", "0-b", "-1", "0--1"] {
+            assert!(parse_node_range_list(text).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn nodebind_lines_parse_as_whitespace_lists() {
+        assert_eq!(parse_whitespace_list("0 1").unwrap(), [0, 1]);
+        assert_eq!(parse_whitespace_list("0").unwrap(), [0]);
+        assert_eq!(parse_whitespace_list("").unwrap(), Vec::<u32>::new());
+        assert!(parse_whitespace_list("0 x").is_err());
     }
 }
