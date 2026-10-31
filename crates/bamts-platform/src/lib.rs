@@ -180,7 +180,7 @@ impl WindowImpl {
     }
 }
 
-/// Peak memory of a process since it started, in bytes.
+/// Peak memory of a process since it started or last execed, in bytes.
 ///
 /// This is the resident-set peak on Linux and the physical-footprint peak on
 /// macOS.
@@ -193,9 +193,9 @@ impl WindowImpl {
 ///
 /// To follow a child to its end, poll beside a `wait` until `ProcessGone`, which
 /// comes only after the reap, and keep polling through `NoAddressSpace`. Linux
-/// reports it once the process drops its address space, which also happens to
-/// a process that runs on after its main thread exits. macOS keeps answering
-/// with the final peak until the reap.
+/// reads the main thread, so it reports that during an exit and for a process
+/// running on after its main thread exited. macOS keeps answering with the
+/// final peak until the reap.
 pub fn peak_memory_bytes(pid: u32) -> Result<u64, PlatformError> {
     #[cfg(target_os = "linux")]
     {
