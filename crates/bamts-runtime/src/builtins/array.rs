@@ -33,6 +33,7 @@ pub(super) fn install<H: Host>(
     }
     for (name, length, handler) in [
         ("toString", 0, to_string::<H> as BuiltinHandler<H>),
+        ("toLocaleString", 0, to_locale_string::<H>),
         ("push", 1, push::<H> as BuiltinHandler<H>),
         ("pop", 0, pop::<H>),
         ("shift", 0, shift::<H>),
@@ -540,6 +541,44 @@ fn to_string<H: Host>(
         object,
         &[],
     )?))
+}
+/// `Array.prototype.toLocaleString`: each element's own `toLocaleString`,
+/// joined with a comma. `object` stays rooted because every element can run
+/// user code.
+fn to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let object = array_es2023::to_object(machine, this)?;
+    let depth = machine.native_roots.len();
+    machine.push_native_roots(depth, &[object]);
+    let joined = locale_join(machine, object);
+    machine.pop_native_roots(depth);
+    Ok(BuiltinOutcome::Value(allocate_string(machine, joined?)?))
+}
+fn locale_join<H: Host>(
+    machine: &mut Machine<'_, H>,
+    object: Value,
+) -> Result<EcmaString, EvalFailure> {
+    let length = array_es2023::length_of_array_like(machine, object)?;
+    let mut output = bamts_bytecode::EcmaStringBuilder::new();
+    for index in 0..length {
+        if index != 0 {
+            output.push_unit(u16::from(b','));
+        }
+        let element = machine.get_property_key(object, &array_es2023::index_key(index))?;
+        if matches!(element.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            continue;
+        }
+        let method = machine.get_named_property(element, "toLocaleString")?;
+        let text = machine.call_value(method, element, &[])?;
+        for &unit in machine.coerce_string_observable(text)?.as_units() {
+            output.push_unit(unit);
+        }
+    }
+    Ok(output.finish())
 }
 fn from_index<H: Host>(
     machine: &Machine<'_, H>,

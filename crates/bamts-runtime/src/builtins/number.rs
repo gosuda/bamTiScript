@@ -44,6 +44,7 @@ pub(super) fn install<H: Host>(
     }
     for (name, length, handler) in [
         ("toString", 1, to_string::<H> as BuiltinHandler<H>),
+        ("toLocaleString", 0, to_locale_string::<H>),
         ("toFixed", 1, to_fixed::<H>),
         ("toExponential", 1, to_exponential::<H>),
         ("toPrecision", 1, to_precision::<H>),
@@ -206,6 +207,25 @@ pub(super) fn global_is_finite<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let n = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
     Ok(BuiltinOutcome::Value(Value::boolean(n.is_finite())))
+}
+/// `Number.prototype.toLocaleString` without a locale: the ECMAScript form.
+fn to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let n = primitive_number(
+        machine,
+        this,
+        "Number.prototype.toLocaleString requires that 'this' be a Number",
+    )?;
+    let text =
+        number_format::to_string_radix(n, 10.0).map_err(|error| range_error(error.message()))?;
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        EcmaString::encode(&text),
+    )?))
 }
 fn to_string<H: Host>(
     machine: &mut Machine<'_, H>,

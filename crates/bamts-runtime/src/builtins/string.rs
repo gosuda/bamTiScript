@@ -48,6 +48,8 @@ pub(super) fn install<H: Host>(
         ("trimEnd", 0, trim_end::<H>),
         ("toUpperCase", 0, to_upper::<H>),
         ("toLowerCase", 0, to_lower::<H>),
+        ("toLocaleUpperCase", 0, to_upper::<H>),
+        ("toLocaleLowerCase", 0, to_lower::<H>),
         ("padStart", 1, pad_start::<H>),
         ("padEnd", 1, pad_end::<H>),
         ("repeat", 1, repeat::<H>),

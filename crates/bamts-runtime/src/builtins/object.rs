@@ -63,6 +63,7 @@ pub(super) fn install<H: Host>(
 
     for (name, length, handler) in [
         ("toString", 0, prototype_to_string::<H> as BuiltinHandler<H>),
+        ("toLocaleString", 0, prototype_to_locale_string::<H>),
         ("hasOwnProperty", 1, has_own_property::<H>),
         ("isPrototypeOf", 1, is_prototype_of::<H>),
         ("valueOf", 0, value_of::<H>),
@@ -172,6 +173,27 @@ fn function_to_string<H: Host>(
         .unwrap_or_default();
     let source = EcmaString::encode(&format!("function {name}() {{ [native code] }}"));
     Ok(BuiltinOutcome::Value(allocate_string(machine, source)?))
+}
+
+/// `Object.prototype.toLocaleString`: `Invoke(this, "toString")`, with the
+/// receiver passed through unboxed so a primitive `this` stays primitive.
+fn prototype_to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if matches!(this.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+        return Err(type_error(
+            "Object.prototype.toLocaleString called on null or undefined",
+        ));
+    }
+    let method = machine.get_named_property(this, "toString")?;
+    Ok(BuiltinOutcome::Value(machine.call_value(
+        method,
+        this,
+        &[],
+    )?))
 }
 
 fn function_has_instance<H: Host>(
