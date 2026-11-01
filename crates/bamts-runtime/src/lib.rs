@@ -13368,11 +13368,15 @@ fn numeric_f64(value: Value) -> Option<f64> {
     }
 }
 
+/// The compact encoding for a whole Number. `-0` stays a double: Int32 has no
+/// negative zero, and `1 / -0` and `Object.is` can both tell the difference.
 fn number_value(number: f64) -> Value {
+    let negative_zero = number == 0.0 && number.is_sign_negative();
     if number.is_finite()
         && number.fract() == 0.0
         && number >= f64::from(i32::MIN)
         && number <= f64::from(i32::MAX)
+        && !negative_zero
     {
         Value::int32(number as i32 as u32)
     } else {
@@ -21620,6 +21624,16 @@ mod tests {
             })
         ));
         assert!(machine.frames.is_empty());
+    }
+
+    #[test]
+    fn number_value_keeps_the_sign_of_zero() {
+        assert_eq!(number_value(0.0), Value::int32(0));
+        assert!(matches!(
+            number_value(-0.0).decode(),
+            Some(Decoded::Number(zero)) if zero == 0.0 && zero.is_sign_negative()
+        ));
+        assert_eq!(number_value(-1.0), Value::int32(-1i32 as u32));
     }
 
     #[test]

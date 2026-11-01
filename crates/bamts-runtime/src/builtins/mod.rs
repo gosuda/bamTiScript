@@ -442,13 +442,22 @@ fn math_round<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let x = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
-    let rounded = if (-0.5..0.0).contains(&x) {
-        -0.0
-    } else {
-        (x + 0.5).floor()
-    };
-    Ok(BuiltinOutcome::Value(crate::number_value(rounded)))
+    let x = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let x = value_number(machine.coerce_number_observable(x)?);
+    Ok(BuiltinOutcome::Value(crate::number_value(round_half_up(x))))
+}
+/// `Math.round`: the nearest integer, with ties toward `+Infinity`. Adding 0.5
+/// and flooring is wrong just below a tie, where the sum rounds up, and a value
+/// past 2^52 is already an integer.
+fn round_half_up(x: f64) -> f64 {
+    if !x.is_finite() || x == 0.0 || x.abs() >= 4_503_599_627_370_496.0 {
+        return x;
+    }
+    if (-0.5..0.0).contains(&x) {
+        return -0.0;
+    }
+    let floor = x.floor();
+    if x - floor >= 0.5 { floor + 1.0 } else { floor }
 }
 fn math_sign<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -2083,6 +2092,19 @@ mod tests {
             }
             Property::Accessor { .. } => panic!("NaN must be a data property"),
         }
+    }
+    #[test]
+    fn round_half_up_keeps_zero_signs_and_the_value_just_below_a_tie() {
+        assert!(round_half_up(-0.0).is_sign_negative());
+        assert!(round_half_up(-0.5).is_sign_negative());
+        assert_eq!(round_half_up(-0.5), 0.0);
+        assert!(round_half_up(0.2).is_sign_positive());
+        assert_eq!(round_half_up(0.49999999999999994), 0.0);
+        assert_eq!(round_half_up(2.5), 3.0);
+        assert_eq!(round_half_up(-2.5), -2.0);
+        assert_eq!(round_half_up(9007199254740991.0), 9007199254740991.0);
+        assert!(round_half_up(f64::NAN).is_nan());
+        assert_eq!(round_half_up(f64::NEG_INFINITY), f64::NEG_INFINITY);
     }
     #[test]
     fn global_undefined_descriptor_is_frozen() {
