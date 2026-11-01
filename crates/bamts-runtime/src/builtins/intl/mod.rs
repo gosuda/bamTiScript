@@ -6,6 +6,7 @@
 
 mod collator;
 mod locale;
+mod number_format;
 mod options;
 
 use std::collections::BTreeMap;
@@ -13,6 +14,7 @@ use std::collections::BTreeMap;
 use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
+use super::super::push;
 use super::{
     allocate_array, allocate_string, define_data, install_constructor_function, install_function,
 };
@@ -93,6 +95,13 @@ pub(super) fn install<H: Host>(
     let namespace = super::super::ordinary_prototype(heap, builtins.object_prototype());
     let tag_symbol = builtins.symbol_to_string_tag();
     super::define_to_string_tag(heap, namespace, tag_symbol, "Intl");
+    let fallback_symbol = push(
+        heap,
+        HeapEntry::Symbol {
+            description: EcmaString::encode("IntlLegacyConstructedSymbol"),
+        },
+    );
+    builtins.set_intl_fallback_symbol(fallback_symbol);
     // Classes refer to each other's instances, so every prototype exists before
     // any class is populated.
     for kind in IntlKind::ALL {
@@ -109,6 +118,7 @@ pub(super) fn install<H: Host>(
     }
     locale::install(heap, builtins, namespace);
     collator::install(heap, builtins, namespace);
+    number_format::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Intl"), namespace);
 }
 
@@ -210,6 +220,71 @@ pub(super) fn instance_prototype<H: Host>(
         }
     }
     Ok(machine.intrinsics.builtins.intl_prototype(kind))
+}
+
+/// OrdinaryHasInstance against an Intl constructor, whose `prototype` property
+/// is fixed.
+fn inherits_from<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+    kind: IntlKind,
+) -> Result<bool, EvalFailure> {
+    if !is_object(machine, value)? {
+        return Ok(false);
+    }
+    let prototype = machine.intrinsics.builtins.intl_prototype(kind);
+    let mut object = value;
+    while let Some(next) = machine.internal_get_prototype_of(object)? {
+        if next == prototype {
+            return Ok(true);
+        }
+        object = next;
+    }
+    Ok(false)
+}
+
+/// ChainNumberFormat and ChainDateTimeFormat: a plain call on an object that
+/// inherits from the constructor initializes that object, for the sake of
+/// `Intl.Constructor.call(instance)`, by hiding the real instance on it.
+pub(super) fn chain_legacy_instance<H: Host>(
+    machine: &mut Machine<'_, H>,
+    instance: Value,
+    kind: IntlKind,
+    constructing: bool,
+    this: Value,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if constructing || !inherits_from(machine, this, kind)? {
+        return Ok(BuiltinOutcome::Value(instance));
+    }
+    let symbol = machine.intrinsics.builtins.intl_fallback_symbol();
+    let key = machine.to_property_key(symbol)?;
+    machine.define_descriptor(
+        this,
+        key,
+        Property::Data {
+            value: instance,
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        },
+    )?;
+    Ok(BuiltinOutcome::Value(this))
+}
+
+/// UnwrapNumberFormat and UnwrapDateTimeFormat: the instance a legacy-chained
+/// object hides, or the value itself.
+pub(super) fn unwrap_legacy_instance<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+    kind: IntlKind,
+) -> Result<Value, EvalFailure> {
+    let is_instance = intl_record(machine, value)?.is_some_and(|record| record.kind() == kind);
+    if is_instance || !inherits_from(machine, value, kind)? {
+        return Ok(value);
+    }
+    let symbol = machine.intrinsics.builtins.intl_fallback_symbol();
+    let key = machine.to_property_key(symbol)?;
+    machine.get_property_key(value, &key)
 }
 
 /// The cached function of a `format` or `compare` getter. The bound receiver
@@ -394,6 +469,26 @@ pub(super) fn define_field<H: Host>(
     machine.create_data_property_key(object, PropertyKey::Named(EcmaString::encode(name)), value)
 }
 
+/// One element of a `formatToParts` result. `source` and `unit` are the
+/// properties some services add.
+pub(super) fn part_object<H: Host>(
+    machine: &mut Machine<'_, H>,
+    part_type: &str,
+    value: &str,
+    extra: Option<(&str, &str)>,
+) -> Result<Value, EvalFailure> {
+    let part = new_object(machine)?;
+    let type_value = string_value(machine, part_type)?;
+    define_field(machine, part, "type", type_value)?;
+    let text = string_value(machine, value)?;
+    define_field(machine, part, "value", text)?;
+    if let Some((name, text)) = extra {
+        let text = string_value(machine, text)?;
+        define_field(machine, part, name, text)?;
+    }
+    Ok(part)
+}
+
 /// An Array of strings, as `CreateArrayFromList` makes it.
 pub(super) fn string_array<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -411,6 +506,21 @@ pub(super) fn string_array_outcome<H: Host>(
     values: &[String],
 ) -> Result<BuiltinOutcome, EvalFailure> {
     string_array(machine, values).map(BuiltinOutcome::Value)
+}
+
+/// StrWhiteSpaceChar.
+pub(super) fn is_string_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\u{9}' | '\u{a}' | '\u{b}' | '\u{c}' | '\u{d}' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+    )
 }
 
 pub(super) fn boolean_outcome(value: bool) -> BuiltinOutcome {

@@ -829,6 +829,7 @@ pub struct IntlData {
     collation_keywords: Vec<String>,
     case_first_keywords: Vec<String>,
     numeric_keywords: Vec<String>,
+    numbering_keywords: Vec<String>,
 }
 
 /// The one instance services hold a reference to.
@@ -840,6 +841,13 @@ pub static DATA: LazyLock<IntlData> = LazyLock::new(|| {
         .collect();
     numbering_systems.push(String::from("hanidec"));
     numbering_systems.sort();
+    let mut numbering_keywords = vec![String::from("latn")];
+    numbering_keywords.extend(
+        numbering_systems
+            .iter()
+            .filter(|name| *name != "latn")
+            .cloned(),
+    );
     IntlData {
         available: owned(&["en", "en-US"]),
         calendars: owned(&["gregory", "iso8601"]),
@@ -856,6 +864,7 @@ pub static DATA: LazyLock<IntlData> = LazyLock::new(|| {
             .collect(),
         case_first_keywords: owned(&["false", "lower", "upper"]),
         numeric_keywords: owned(&["false", "true"]),
+        numbering_keywords,
     }
 });
 
@@ -951,6 +960,7 @@ impl LocaleDataProvider for IntlData {
             "co" => &self.collation_keywords,
             "kf" => &self.case_first_keywords,
             "kn" => &self.numeric_keywords,
+            "nu" => &self.numbering_keywords,
             _ => &[],
         }
     }

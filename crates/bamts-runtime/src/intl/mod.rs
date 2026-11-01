@@ -9,6 +9,7 @@ pub mod date_time_format;
 mod locale_aliases;
 pub mod locale_data;
 pub mod locale_negotiation;
+pub mod number_data;
 pub mod number_format;
 pub mod plural_rules;
 

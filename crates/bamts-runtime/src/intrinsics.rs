@@ -93,6 +93,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     date_prototype: Option<Value>,
     temporal_prototypes: [Option<Value>; crate::temporal::TemporalKind::COUNT],
     intl_prototypes: [Option<Value>; crate::intl::IntlKind::COUNT],
+    intl_fallback_symbol: Option<Value>,
     weak_ref_prototype: Option<Value>,
     finalization_registry_prototype: Option<Value>,
     map_prototype: Option<Value>,
@@ -165,6 +166,7 @@ impl<H: Host> BuiltinTable<H> {
             date_prototype: None,
             temporal_prototypes: [None; crate::temporal::TemporalKind::COUNT],
             intl_prototypes: [None; crate::intl::IntlKind::COUNT],
+            intl_fallback_symbol: None,
             weak_ref_prototype: None,
             finalization_registry_prototype: None,
             map_prototype: None,
@@ -481,6 +483,14 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn temporal_prototype(&self, kind: crate::temporal::TemporalKind) -> Value {
         self.temporal_prototypes[kind.index()].expect("Temporal builtins install their prototypes")
     }
+    /// `%Intl%.[[FallbackSymbol]]`.
+    pub(crate) fn set_intl_fallback_symbol(&mut self, symbol: Value) {
+        self.intl_fallback_symbol = Some(symbol);
+    }
+    pub(crate) fn intl_fallback_symbol(&self) -> Value {
+        self.intl_fallback_symbol
+            .expect("Intl builtins install the fallback symbol")
+    }
     pub(crate) fn set_intl_prototype(&mut self, kind: crate::intl::IntlKind, prototype: Value) {
         self.intl_prototypes[kind.index()] = Some(prototype);
     }
@@ -730,6 +740,7 @@ impl<H: Host> BuiltinTable<H> {
             date_prototype,
             temporal_prototypes,
             intl_prototypes,
+            intl_fallback_symbol,
             weak_ref_prototype,
             finalization_registry_prototype,
             map_prototype,
@@ -816,6 +827,7 @@ impl<H: Host> BuiltinTable<H> {
             .chain(typedarray_prototypes.iter())
             .chain(temporal_prototypes.iter())
             .chain(intl_prototypes.iter())
+            .chain(std::iter::once(intl_fallback_symbol))
             .flatten()
         {
             visit(*value);

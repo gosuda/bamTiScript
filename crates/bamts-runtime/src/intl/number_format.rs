@@ -1463,8 +1463,10 @@ impl<'a> NumberFormat<'a> {
             .collect())
     }
 
-    /// ECMA-402 `PartitionNumberRangePattern` with the conforming trivial
-    /// `CollapseNumberRange` implementation explicitly permitted by the spec.
+    /// ECMA-402 `PartitionNumberRangePattern`. `CollapseNumberRange` removes an
+    /// affix the two ends share when it is longer than one code point, so
+    /// `+$2.90–3.10` shares its `+$` and `$3 – $5` repeats its `$`. Any affix
+    /// left on an inner side spaces out the separator.
     pub fn format_range_to_parts(
         &self,
         start: &IntlMathematicalValue,
@@ -1480,22 +1482,50 @@ impl<'a> NumberFormat<'a> {
         if concatenate_parts(&start_parts) == concatenate_parts(&end_parts) {
             return self.approximate_range(start_parts);
         }
+        let (start_prefix, start_number, start_suffix) = split_number(&start_parts);
+        let (end_prefix, end_number, end_suffix) = split_number(&end_parts);
+        let shared_prefix = collapsible(start_prefix, end_prefix);
+        let shared_suffix = collapsible(start_suffix, end_suffix);
+        let spaced = (!shared_prefix && !(start_prefix.is_empty() && end_prefix.is_empty()))
+            || (!shared_suffix && !(start_suffix.is_empty() && end_suffix.is_empty()));
+        let separator = if spaced {
+            format!(" {} ", self.range_patterns.separator)
+        } else {
+            self.range_patterns.separator.clone()
+        };
         let mut result = Vec::with_capacity(start_parts.len() + end_parts.len() + 1);
-        result.extend(start_parts.into_iter().map(|part| NumberRangePart {
-            part_type: part.part_type,
-            value: part.value,
-            source: RangeSource::StartRange,
-        }));
-        result.push(NumberRangePart {
-            part_type: NumberPartType::Literal,
-            value: self.range_patterns.separator.clone(),
-            source: RangeSource::Shared,
-        });
-        result.extend(end_parts.into_iter().map(|part| NumberRangePart {
-            part_type: part.part_type,
-            value: part.value,
-            source: RangeSource::EndRange,
-        }));
+        let mut push = |parts: &[NumberPart], source| {
+            result.extend(parts.iter().map(|part| NumberRangePart {
+                part_type: part.part_type,
+                value: part.value.clone(),
+                source,
+            }));
+        };
+        if shared_prefix {
+            push(start_prefix, RangeSource::Shared);
+        } else {
+            push(start_prefix, RangeSource::StartRange);
+        }
+        push(start_number, RangeSource::StartRange);
+        if !shared_suffix {
+            push(start_suffix, RangeSource::StartRange);
+        }
+        push(
+            &[NumberPart {
+                part_type: NumberPartType::Literal,
+                value: separator,
+            }],
+            RangeSource::Shared,
+        );
+        if !shared_prefix {
+            push(end_prefix, RangeSource::EndRange);
+        }
+        push(end_number, RangeSource::EndRange);
+        if shared_suffix {
+            push(start_suffix, RangeSource::Shared);
+        } else {
+            push(end_suffix, RangeSource::EndRange);
+        }
         Ok(result)
     }
 
@@ -2017,6 +2047,39 @@ fn push_part(parts: &mut Vec<NumberPart>, part_type: NumberPartType, value: Stri
     }
 }
 
+/// Splits parts into what precedes the number, the number, and what follows.
+fn split_number(parts: &[NumberPart]) -> (&[NumberPart], &[NumberPart], &[NumberPart]) {
+    let is_number = |part: &NumberPart| {
+        matches!(
+            part.part_type,
+            NumberPartType::Integer
+                | NumberPartType::Group
+                | NumberPartType::Decimal
+                | NumberPartType::Fraction
+                | NumberPartType::Nan
+                | NumberPartType::Infinity
+                | NumberPartType::Compact
+                | NumberPartType::ExponentInteger
+                | NumberPartType::ExponentMinusSign
+                | NumberPartType::ExponentSeparator
+        )
+    };
+    let Some(first) = parts.iter().position(is_number) else {
+        return (parts, &[], &[]);
+    };
+    let last = parts.iter().rposition(is_number).unwrap_or(first) + 1;
+    (&parts[..first], &parts[first..last], &parts[last..])
+}
+
+fn collapsible(start: &[NumberPart], end: &[NumberPart]) -> bool {
+    start == end
+        && start
+            .iter()
+            .map(|part| part.value.chars().count())
+            .sum::<usize>()
+            > 1
+}
+
 fn concatenate_parts(parts: &[NumberPart]) -> String {
     parts.iter().map(|part| part.value.as_str()).collect()
 }
@@ -2501,14 +2564,19 @@ pub const SANCTIONED_UNITS: [&str; 45] = [
     "year",
 ];
 
-fn validate_unit(value: &str) -> Result<String, NumberFormatError> {
-    let valid = SANCTIONED_UNITS.contains(&value)
+/// IsWellFormedUnitIdentifier.
+#[must_use]
+pub fn is_well_formed_unit(value: &str) -> bool {
+    SANCTIONED_UNITS.contains(&value)
         || value
             .split_once("-per-")
             .is_some_and(|(numerator, denominator)| {
                 SANCTIONED_UNITS.contains(&numerator) && SANCTIONED_UNITS.contains(&denominator)
-            });
-    if !valid {
+            })
+}
+
+fn validate_unit(value: &str) -> Result<String, NumberFormatError> {
+    if !is_well_formed_unit(value) {
         return Err(NumberFormatError::range(format!(
             "invalid unit identifier: {value}"
         )));
