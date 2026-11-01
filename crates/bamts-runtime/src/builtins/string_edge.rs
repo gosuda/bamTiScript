@@ -349,7 +349,10 @@ fn symbol_key<H: Host>(
     Ok(PropertyKey::Symbol(index as u32))
 }
 
-fn is_regexp<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<bool, EvalFailure> {
+pub(super) fn is_regexp<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<bool, EvalFailure> {
     if !machine.is_object(value) {
         return Ok(false);
     }

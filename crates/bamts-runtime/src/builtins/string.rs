@@ -5,7 +5,7 @@ use bamts_native::{Decoded, Value};
 
 use super::{
     allocate_array, allocate_string, define_data, install_constructor_function, install_function,
-    range_error, to_integer_or_infinity, type_error, uri_error, value_number,
+    range_error, type_error, uri_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, IterationKind, Machine, PropertyKey, PropertyMap};
@@ -100,11 +100,11 @@ fn constructor<H: Host>(
         Ok(BuiltinOutcome::Value(value))
     }
 }
-fn text<H: Host>(machine: &Machine<'_, H>, this: Value) -> Result<EcmaString, EvalFailure> {
+fn text<H: Host>(machine: &mut Machine<'_, H>, this: Value) -> Result<EcmaString, EvalFailure> {
     if matches!(this.decode(), Some(Decoded::Undefined | Decoded::Null)) {
         return Err(type_error("String method called on null or undefined"));
     }
-    machine.to_string(machine.unbox_primitive_or_self(this)?)
+    machine.coerce_string_observable(this)
 }
 fn locale_compare<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -130,8 +130,19 @@ fn append(out: &mut EcmaStringBuilder, text: &EcmaString) {
         out.push_unit(unit);
     }
 }
-fn integer<H: Host>(machine: &Machine<'_, H>, value: Value) -> Result<isize, EvalFailure> {
-    Ok(to_integer_or_infinity(machine, value)? as isize)
+fn integer<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<isize, EvalFailure> {
+    Ok(super::array_es2023::integer_or_infinity(machine, value)? as isize)
+}
+/// Rejects a search string that is a RegExp, for the methods that take text only.
+fn require_not_regexp<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+    operation: &'static str,
+) -> Result<(), EvalFailure> {
+    if super::string_edge::is_regexp(machine, value)? {
+        return Err(type_error(operation));
+    }
+    Ok(())
 }
 /// `String.prototype.toString` and `valueOf`: the receiver's own string. Neither
 /// coerces, so a receiver that is not a String throws.
@@ -159,7 +170,9 @@ fn from_char_code<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let mut out = EcmaStringBuilder::with_capacity(args.len());
     for arg in args {
-        out.push_unit(value_number(machine.to_number(*arg)?) as u16);
+        out.push_unit(
+            crate::to_uint32(value_number(machine.coerce_number_observable(*arg)?)) as u16,
+        );
     }
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
@@ -179,11 +192,13 @@ fn raw<H: Host>(
         .ok_or_else(|| type_error("String.raw requires template.raw"))?;
     let mut out = EcmaStringBuilder::new();
     for (i, value) in values.iter().enumerate() {
-        append(&mut out, &machine.to_string(*value)?);
+        append(&mut out, &machine.coerce_string_observable(*value)?);
         if i + 1 < values.len() {
             append(
                 &mut out,
-                &machine.to_string(args.get(i + 1).copied().unwrap_or(Value::UNDEFINED))?,
+                &machine.coerce_string_observable(
+                    args.get(i + 1).copied().unwrap_or(Value::UNDEFINED),
+                )?,
             );
         }
     }
@@ -351,7 +366,8 @@ fn index_of<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let haystack = text(machine, this)?;
-    let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let needle =
+        machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let start = integer(machine, args.get(1).copied().unwrap_or(Value::int32(0)))?.max(0) as usize;
     Ok(BuiltinOutcome::Value(crate::number_value(
         search_units(haystack.as_units(), needle.as_units(), start).map_or(-1.0, |i| i as f64),
@@ -364,13 +380,16 @@ fn last_index_of<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let haystack = text(machine, this)?;
-    let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    let end = if args.len() < 2 || args[1] == Value::UNDEFINED {
+    let needle =
+        machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let position = value_number(
+        machine.coerce_number_observable(args.get(1).copied().unwrap_or(Value::UNDEFINED))?,
+    );
+    let end = if position.is_nan() {
         haystack.len_units()
     } else {
-        integer(machine, args[1])?.max(0) as usize
-    }
-    .min(haystack.len_units());
+        (position.max(0.0) as usize).min(haystack.len_units())
+    };
     let found = (0..=end).rev().find(|index| {
         haystack
             .as_units()
@@ -387,11 +406,17 @@ fn includes<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let BuiltinOutcome::Value(v) = index_of(machine, this, args, false)? else {
-        unreachable!()
-    };
+    let haystack = text(machine, this)?;
+    let search = args.first().copied().unwrap_or(Value::UNDEFINED);
+    require_not_regexp(
+        machine,
+        search,
+        "String.prototype.includes cannot search for a RegExp",
+    )?;
+    let needle = machine.coerce_string_observable(search)?;
+    let start = integer(machine, args.get(1).copied().unwrap_or(Value::int32(0)))?.max(0) as usize;
     Ok(BuiltinOutcome::Value(Value::boolean(
-        value_number(v) >= 0.0,
+        search_units(haystack.as_units(), needle.as_units(), start).is_some(),
     )))
 }
 fn starts_with<H: Host>(
@@ -401,7 +426,13 @@ fn starts_with<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let haystack = text(machine, this)?;
-    let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let search = args.first().copied().unwrap_or(Value::UNDEFINED);
+    require_not_regexp(
+        machine,
+        search,
+        "String.prototype.startsWith cannot search for a RegExp",
+    )?;
+    let needle = machine.coerce_string_observable(search)?;
     let position =
         integer(machine, args.get(1).copied().unwrap_or(Value::int32(0)))?.max(0) as usize;
     Ok(BuiltinOutcome::Value(Value::boolean(
@@ -418,7 +449,13 @@ fn ends_with<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let haystack = text(machine, this)?;
-    let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let search = args.first().copied().unwrap_or(Value::UNDEFINED);
+    require_not_regexp(
+        machine,
+        search,
+        "String.prototype.endsWith cannot search for a RegExp",
+    )?;
+    let needle = machine.coerce_string_observable(search)?;
     let end = if args.len() < 2 || args[1] == Value::UNDEFINED {
         haystack.len_units()
     } else {
@@ -444,7 +481,7 @@ fn split<H: Host>(
     }
     let string = text(machine, this)?;
     let limit = value_number(
-        machine.to_number(
+        machine.coerce_number_observable(
             args.get(1)
                 .copied()
                 .unwrap_or(crate::number_value(u32::MAX as f64)),
@@ -456,7 +493,7 @@ fn split<H: Host>(
     let parts = if args.is_empty() || args[0] == Value::UNDEFINED {
         vec![string]
     } else {
-        let separator = machine.to_string(args[0])?;
+        let separator = machine.coerce_string_observable(args[0])?;
         if separator.is_empty() {
             string
                 .as_units()
@@ -508,9 +545,9 @@ fn replacement<H: Host>(
                     whole_value,
                 ],
             )
-            .and_then(|value| machine.to_string(value));
+            .and_then(|value| machine.coerce_string_observable(value));
     }
-    let template = machine.to_string(replacer)?;
+    let template = machine.coerce_string_observable(replacer)?;
     let mut output = EcmaStringBuilder::new();
     let units = template.as_units();
     let mut offset = 0;
@@ -561,7 +598,8 @@ fn replace_impl<H: Host>(
         return replace_regexp(machine, this, args, all);
     }
     let string = text(machine, this)?;
-    let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let needle =
+        machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let replacer = args.get(1).copied().unwrap_or(Value::UNDEFINED);
     let mut output = EcmaStringBuilder::new();
     let mut cursor = 0;
@@ -730,16 +768,18 @@ fn pad<H: Host>(
     start: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let string = text(machine, this)?;
-    let target =
-        to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?
-            .max(0.0);
+    let target = super::array_es2023::integer_or_infinity(
+        machine,
+        args.first().copied().unwrap_or(Value::UNDEFINED),
+    )?
+    .max(0.0);
     if target <= string.len_units() as f64 {
         return Ok(BuiltinOutcome::Value(allocate_string(machine, string)?));
     }
     let filler = if args.len() < 2 || args[1] == Value::UNDEFINED {
         EcmaString::encode(" ")
     } else {
-        machine.to_string(args[1])?
+        machine.coerce_string_observable(args[1])?
     };
     if filler.is_empty() {
         return Ok(BuiltinOutcome::Value(allocate_string(machine, string)?));
@@ -809,7 +849,10 @@ fn repeat<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let string = text(machine, this)?;
-    let count = to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let count = super::array_es2023::integer_or_infinity(
+        machine,
+        args.first().copied().unwrap_or(Value::UNDEFINED),
+    )?;
     if count < 0.0 || count.is_infinite() {
         return Err(range_error("Invalid count value"));
     }
@@ -851,7 +894,7 @@ fn concat<H: Host>(
     let mut output = EcmaStringBuilder::new();
     append(&mut output, &text(machine, this)?);
     for argument in args {
-        append(&mut output, &machine.to_string(*argument)?);
+        append(&mut output, &machine.coerce_string_observable(*argument)?);
     }
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
@@ -865,7 +908,7 @@ fn normalize<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     if let Some(form) = args.first().filter(|value| **value != Value::UNDEFINED) {
-        let form = machine.to_string(*form)?;
+        let form = machine.coerce_string_observable(*form)?;
         if !form.eq_ascii("NFC")
             && !form.eq_ascii("NFD")
             && !form.eq_ascii("NFKC")
@@ -876,10 +919,8 @@ fn normalize<H: Host>(
             ));
         }
     }
-    Ok(BuiltinOutcome::Value(allocate_string(
-        machine,
-        text(machine, this)?,
-    )?))
+    let string = text(machine, this)?;
+    Ok(BuiltinOutcome::Value(allocate_string(machine, string)?))
 }
 fn uri_unescaped(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte)
@@ -982,7 +1023,8 @@ pub(super) fn decode_uri_component<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let source = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let source =
+        machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let units = source.as_units();
     let mut output = EcmaStringBuilder::with_capacity(units.len());
     let mut offset = 0;
@@ -1066,7 +1108,7 @@ fn regexp_for_argument<H: Host>(
             Some(value),
         ))
     } else {
-        let pattern = machine.to_string(value)?;
+        let pattern = machine.coerce_string_observable(value)?;
         Ok((
             super::regexp::compile(machine, &pattern, &EcmaString::default())?,
             None,
@@ -1228,7 +1270,7 @@ fn split_regexp<H: Host>(
     );
     let regex = super::regexp::compile(machine, &pattern, &stickyless_flags)?;
     let limit = value_number(
-        machine.to_number(
+        machine.coerce_number_observable(
             args.get(1)
                 .copied()
                 .unwrap_or(crate::number_value(u32::MAX as f64)),
@@ -1386,9 +1428,9 @@ fn regexp_replacement<H: Host>(
         }
         return machine
             .call_value(replacer, Value::UNDEFINED, &arguments)
-            .and_then(|value| machine.to_string(value));
+            .and_then(|value| machine.coerce_string_observable(value));
     }
-    let replacement = machine.to_string(replacer)?;
+    let replacement = machine.coerce_string_observable(replacer)?;
     let before = super::regexp::slice_units(input, 0..matched.range.start);
     let after = super::regexp::slice_units(input, matched.range.end..input.len_units());
     let mut output = EcmaStringBuilder::new();
