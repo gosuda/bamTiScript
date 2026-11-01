@@ -78,7 +78,7 @@ pub fn compile_classic_script(
     let module_name = normalized_module_name(resource_name).unwrap_or(DEFAULT_MODULE_NAME);
     let options = LowerOptions {
         javascript_compatibility: true,
-        ..LowerOptions::default()
+        script_entry: true,
     };
     let enum_facts = EnumFacts::unchecked();
     let namespace_facts = NamespaceFacts::unchecked();

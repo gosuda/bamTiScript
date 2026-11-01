@@ -15,13 +15,16 @@ use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
 use super::{define_data, define_frozen_data, install_constructor_function};
-use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
+use crate::intrinsics::{
+    BuiltinDef, BuiltinHandler, BuiltinOutcome, BuiltinTable, native_function,
+};
 use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyMap, ScriptSource, ThrowOrigin};
 
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
+    script_compiler: bool,
 ) {
     let prototype = builtins.function_prototype();
     let constructor = install_constructor_function(
@@ -34,6 +37,80 @@ pub(crate) fn install<H: Host>(
     define_frozen_data(heap, constructor, "prototype", prototype);
     define_data(heap, prototype, "constructor", constructor);
     globals.insert(EcmaString::encode("Function"), constructor);
+    if script_compiler {
+        let id = builtins.register(BuiltinDef {
+            name: "eval",
+            length: 1,
+            handler: eval::<H>,
+        });
+        let function = native_function(heap, id, "eval", 1);
+        globals.insert(EcmaString::encode("eval"), function);
+    }
+}
+
+/// `eval(x)` as an indirect call: the source runs in the global scope, as a
+/// classic script, and yields its completion value. Anything but a string comes
+/// back unchanged. A host without a script compiler has no `eval` at all, so
+/// the name reads as undeclared there rather than failing when called.
+fn eval<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if constructing {
+        return Err(type_error("eval is not a constructor"));
+    }
+    let source = args.first().copied().unwrap_or(Value::UNDEFINED);
+    match machine.string_value(source) {
+        Some(text) => run_script(
+            machine,
+            &text,
+            "eval",
+            "eval: this host provides no script compiler",
+        ),
+        None => Ok(BuiltinOutcome::Value(source)),
+    }
+}
+
+/// Compiles `source` as a classic script, runs it against the global object,
+/// and returns its completion value.
+fn run_script<H: Host>(
+    machine: &mut Machine<'_, H>,
+    source: &EcmaString,
+    name: &str,
+    no_compiler: &'static str,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let name = EcmaString::encode(name);
+    let compiled = {
+        let provider = machine
+            .host
+            .script_compiler()
+            .ok_or_else(|| type_error(no_compiler))?;
+        provider.compile_script(ScriptSource {
+            source: source.as_units(),
+            name: name.as_units(),
+        })
+    }
+    .map_err(|error| crate::vm::compile_error(machine, error))?;
+    let module = machine
+        .install_script_reserving(compiled, 1, 1)
+        .map_err(EvalFailure::Runtime)?;
+    let entry = machine
+        .allocate(HeapEntry::Function {
+            module,
+            function: machine.module_code(module).entry(),
+            captures: Vec::new(),
+            context: None,
+            properties: PropertyMap::default(),
+            prototype: Some(machine.intrinsics.function_prototype),
+            extensible: true,
+        })
+        .map_err(EvalFailure::Runtime)?;
+    let previous = machine.context_global.take();
+    let result = machine.call_value(entry, machine.global_object, &[]);
+    machine.context_global = previous;
+    result.map(BuiltinOutcome::Value)
 }
 
 /// `Function(p1, ..., pn, body)` / `new Function(p1, ..., pn, body)`.
@@ -69,37 +146,12 @@ fn function_constructor<H: Host>(
     source.push_str("\n)\n{\n");
     source.push_str(&body_source);
     source.push_str("\n})");
-    let script = EcmaString::encode(&source);
-    let script_name = EcmaString::encode("Function constructor");
-    let compiled = {
-        let provider = machine
-            .host
-            .script_compiler()
-            .ok_or_else(|| type_error("Function: this host provides no script compiler"))?;
-        provider.compile_script(ScriptSource {
-            source: script.as_units(),
-            name: script_name.as_units(),
-        })
-    }
-    .map_err(|error| crate::vm::compile_error(machine, error))?;
-    let module = machine
-        .install_script_reserving(compiled, 1, 1)
-        .map_err(EvalFailure::Runtime)?;
-    let entry = machine
-        .allocate(HeapEntry::Function {
-            module,
-            function: machine.module_code(module).entry(),
-            captures: Vec::new(),
-            context: None,
-            properties: PropertyMap::default(),
-            prototype: Some(machine.intrinsics.function_prototype),
-            extensible: true,
-        })
-        .map_err(EvalFailure::Runtime)?;
-    let previous = machine.context_global.take();
-    let result = machine.call_value(entry, machine.global_object, &[]);
-    machine.context_global = previous;
-    result.map(BuiltinOutcome::Value)
+    run_script(
+        machine,
+        &EcmaString::encode(&source),
+        "Function constructor",
+        "Function: this host provides no script compiler",
+    )
 }
 
 fn type_error(operation: &'static str) -> EvalFailure {

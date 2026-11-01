@@ -772,7 +772,11 @@ pub(crate) struct Intrinsics<H: Host> {
     pub(crate) builtins: BuiltinTable<H>,
 }
 impl<H: Host> Intrinsics<H> {
-    pub(crate) fn initialize(heap: &mut Vec<HeapEntry>, timers_available: bool) -> Self {
+    pub(crate) fn initialize(
+        heap: &mut Vec<HeapEntry>,
+        timers_available: bool,
+        script_compiler: bool,
+    ) -> Self {
         let object_prototype = push(
             heap,
             HeapEntry::Object {
@@ -805,7 +809,13 @@ impl<H: Host> Intrinsics<H> {
             number_prototype,
             boolean_prototype,
         );
-        builtins::install(heap, &mut globals, &mut builtins, timers_available);
+        builtins::install(
+            heap,
+            &mut globals,
+            &mut builtins,
+            timers_available,
+            script_compiler,
+        );
         crate::host_objects::install(heap, &mut globals, &mut builtins);
         Self {
             globals,

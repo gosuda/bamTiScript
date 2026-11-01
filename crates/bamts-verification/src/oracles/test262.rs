@@ -2116,6 +2116,39 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn indirect_eval_runs_in_the_global_scope() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [&str; 10] = [
+            "assert.sameValue((0, eval)('1 + 1'), 2);",
+            "assert.sameValue((0, eval)(1), 1);",
+            "assert.sameValue((0, eval)(), undefined);",
+            "var x = 1; assert.sameValue((0, eval)('x'), 1);",
+            "(0, eval)('var y = 2'); assert.sameValue(globalThis.y, 2);",
+            "(0, eval)('function g() { return 3; }'); assert.sameValue(globalThis.g(), 3);",
+            "assert.sameValue((0, eval)('this'), globalThis);",
+            "assert.sameValue((0, eval)('if (true) { 4; } else { 5; }'), 4);",
+            "assert.sameValue(throws(SyntaxError, function () { (0, eval)('('); }), true);",
+            "assert.sameValue(throws(TypeError, function () { new eval('1'); }), true);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: indirect eval", &format!("{THROWS}{body}"));
+                let label = format!("indirect-eval-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_script_declares_on_the_global_object() {
         const CASES: [(&str, &str); 11] = [
             (

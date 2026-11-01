@@ -48,6 +48,7 @@ pub(crate) fn install<H: Host>(
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
     timers_available: bool,
+    script_compiler: bool,
 ) {
     symbol::install(heap, globals, builtins);
     let bigint_prototype = bigint::install(heap, globals, builtins);
@@ -61,7 +62,7 @@ pub(crate) fn install<H: Host>(
     collections::install_generator_prototype(heap, builtins);
     collections::install_async_generator_prototype(heap, builtins);
     collections::install(heap, globals, builtins);
-    function_constructor::install(heap, globals, builtins);
+    function_constructor::install(heap, globals, builtins, script_compiler);
     map_set_edge::install(heap, globals, builtins);
     date_full::install(heap, globals, builtins);
     object::install(heap, globals, builtins);

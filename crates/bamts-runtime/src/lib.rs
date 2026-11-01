@@ -2136,11 +2136,12 @@ impl<'a, H: Host> Machine<'a, H> {
         let live_registers = frame.registers.len();
         let mut heap = Vec::new();
         let timers_available = host.timers().is_some();
-        let mut intrinsics = intrinsics::Intrinsics::<H>::initialize(&mut heap, timers_available);
+        let script_compiler = host.script_compiler().is_some();
+        let mut intrinsics =
+            intrinsics::Intrinsics::<H>::initialize(&mut heap, timers_available, script_compiler);
         let global_object = intrinsics
             .global("globalThis")
             .expect("host objects install globalThis");
-        let script_compiler = host.script_compiler().is_some();
         let installed_external = external_modules::install(
             &mut heap,
             &mut intrinsics.builtins,
