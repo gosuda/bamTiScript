@@ -1,0 +1,63 @@
+{
+  "cell_class": "cross_qemu",
+  "obligations": {
+    "execmem-guard": {
+      "evidence": "command=bamts-verification toolchain measure --target riscv64gc-unknown-linux-gnu; executable_sha256=b538691cb0fbe25a3ecb6ba03c3eac587dbb5c42ad665dd834fec6f657a7a460; inspector_sha256=89bd80244c0abd65f7b91b3cb0bee38bba682c23a12646610dfafe4b361ed9e3; writable_executable_regions=0; relro=true; now=true; noexecstack=true; gnu_stack=RW; dynamic_section=absent",
+      "missing_artifact": "",
+      "reason": "Stored execmem-guard observation for this triple.",
+      "status": "PASS",
+      "unblock_condition": ""
+    },
+    "hardened-link": {
+      "evidence": "command=ld.lld -m elf64lriscv -static -e _start -z relro -z now -z noexecstack -z defs --build-id=none -o probe ../support.o probe.o; executable_sha256=b538691cb0fbe25a3ecb6ba03c3eac587dbb5c42ad665dd834fec6f657a7a460; object_format=elf; object_type=executable; machine=riscv64; relro=true; now=true; noexecstack=true; gnu_stack=RW; dynamic_section=absent; linker_version=Ubuntu LLD 18.1.3 (compatible with GNU linkers); linker_sha256=f8835e48488195c65fb3dcb946053284ddf6b1369922893785209a9073c4e57b",
+      "missing_artifact": "",
+      "reason": "Stored hardened link artifact for this triple.",
+      "status": "PASS",
+      "unblock_condition": ""
+    },
+    "native-runtime": {
+      "evidence": "command=/usr/bin/qemu-riscv64-static ./probe; executable_sha256=b538691cb0fbe25a3ecb6ba03c3eac587dbb5c42ad665dd834fec6f657a7a460; execution=qemu-riscv64; exit=0; result=int32:42; fuel=positive; emulator_version=qemu-riscv64 version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18); emulator_sha256=dfa4aa3c7aa272934264a318505c8b7002b78003d78595423a077397e0959849",
+      "missing_artifact": "",
+      "reason": "An emulator executed the target runtime image for this triple.",
+      "status": "PASS",
+      "unblock_condition": ""
+    },
+    "reproducible-build": {
+      "evidence": "command=bamts-verification toolchain measure --target riscv64gc-unknown-linux-gnu; first_object_sha256=889175cbf5e8a76ab4dd7a785263f66e13268266bb5059ad054638110321da41; second_object_sha256=889175cbf5e8a76ab4dd7a785263f66e13268266bb5059ad054638110321da41; first_executable_sha256=b538691cb0fbe25a3ecb6ba03c3eac587dbb5c42ad665dd834fec6f657a7a460; second_executable_sha256=b538691cb0fbe25a3ecb6ba03c3eac587dbb5c42ad665dd834fec6f657a7a460; byte_identical=true",
+      "missing_artifact": "",
+      "reason": "Stored reproducible-build identity for this triple.",
+      "status": "PASS",
+      "unblock_condition": ""
+    },
+    "target-functional": {
+      "evidence": "command=/usr/bin/qemu-riscv64-static ./probe; executable_sha256=b538691cb0fbe25a3ecb6ba03c3eac587dbb5c42ad665dd834fec6f657a7a460; execution=qemu-riscv64; exit=0; result=int32:42; fuel=positive; emulator_version=qemu-riscv64 version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18); emulator_sha256=dfa4aa3c7aa272934264a318505c8b7002b78003d78595423a077397e0959849",
+      "missing_artifact": "",
+      "reason": "An emulator executed a linked image for this triple.",
+      "status": "PASS",
+      "unblock_condition": ""
+    },
+    "target-object": {
+      "evidence": "command=bamts-verification toolchain object --target riscv64gc-unknown-linux-gnu --out probe.o; object_sha256=889175cbf5e8a76ab4dd7a785263f66e13268266bb5059ad054638110321da41; object_format=elf; object_type=relocatable; machine=riscv64; bytes=4160; entry=bamts_m0_fn_0; helpers=bamts_load_constant,bamts_consume_fuel",
+      "missing_artifact": "",
+      "reason": "Stored relocatable AOT object for this triple.",
+      "status": "PASS",
+      "unblock_condition": ""
+    },
+    "toolchain-manifest": {
+      "evidence": "command=rustc -vV; rustc_version=1.97.1; rustc_host=aarch64-unknown-linux-gnu; rustc_sha256=a3d4dfcd867ddc1e7dca25f13f7236c72229a56f68aa511437c5bb72eb2dfe78",
+      "missing_artifact": "",
+      "reason": "Recorded from rustc -vV on this host.",
+      "status": "PASS",
+      "unblock_condition": ""
+    }
+  },
+  "rustc": {
+    "commit": "8bab26f4f68e0e26f0bb7960be334d5b520ea452",
+    "commit_date": "2026-07-14",
+    "host": "aarch64-unknown-linux-gnu",
+    "llvm_version": "22.1.6",
+    "version": "1.97.1"
+  },
+  "schema": "bamti.target-cell/v2",
+  "triple": "riscv64gc-unknown-linux-gnu"
+}
