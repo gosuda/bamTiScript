@@ -661,6 +661,7 @@ fn install_globals<H: Host>(
     );
     globals.insert(EcmaString::encode("NaN"), crate::number_value(f64::NAN));
     globals.insert(EcmaString::encode("undefined"), Value::UNDEFINED);
+    number::share_global_parsers(heap, globals);
 }
 fn install_errors<H: Host>(
     heap: &mut Vec<HeapEntry>,

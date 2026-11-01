@@ -67,6 +67,13 @@ pub(super) fn install<H: Host>(
         define_data(heap, prototype, name, f)
     }
 }
+/// `Number.parseFloat` and `Number.parseInt` are the global functions themselves.
+pub(super) fn share_global_parsers(heap: &mut [HeapEntry], globals: &BTreeMap<EcmaString, Value>) {
+    let constructor = globals[&EcmaString::encode("Number")];
+    for name in ["parseFloat", "parseInt"] {
+        define_static(heap, constructor, name, globals[&EcmaString::encode(name)]);
+    }
+}
 fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[super::heap_index(constructor)]
     else {
@@ -353,6 +360,20 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program};
     use super::*;
     use crate::Limits;
+
+    #[test]
+    fn number_parsers_are_the_global_functions() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Number").unwrap();
+        for name in ["parseFloat", "parseInt"] {
+            assert_eq!(
+                machine.get_named_property(constructor, name).unwrap(),
+                machine.intrinsics.global(name).unwrap()
+            );
+        }
+    }
 
     #[test]
     fn number_constants_are_read_only() {
