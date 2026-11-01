@@ -454,7 +454,8 @@ impl Regex {
     /// A state already expanded cannot do better the second time, since everything
     /// it reaches was reached earlier at a higher priority. Skipping it keeps
     /// equivalent alternatives such as (a|a)* linear; the step budget is the backstop
-    /// for states that differ only in their captures, as in ((a)|(a))*.
+    /// for states that differ only in their captures, as in ((a)|(a))*. It grows with
+    /// the input, since a plain repeat over a long string takes a step per character.
     fn match_repeat(
         &self,
         flags: Flags,
@@ -497,7 +498,7 @@ impl Regex {
                 continue;
             }
             steps += 1;
-            if steps > STEP_BUDGET {
+            if steps > STEP_BUDGET.max(input.len().saturating_mul(2)) {
                 return Err(RegexError::budget_exhausted());
             }
             let mut iterations = Vec::new();
