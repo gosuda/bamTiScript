@@ -1889,6 +1889,8 @@ pub struct Machine<'a, H: Host> {
     registry: ModuleRegistry,
     /// First machine-wide module ID reserved for host-compiled script modules.
     dynamic_base: usize,
+    /// The last global a read found no binding for, which names it in a report.
+    missing_global: Option<EcmaString>,
     /// Host-compiled programs retained for the machine lifetime so their
     /// closures remain executable after the originating Script object dies.
     dynamic: Vec<DynamicModule>,
@@ -2260,6 +2262,7 @@ impl<'a, H: Host> Machine<'a, H> {
             },
             dynamic_base: program.map_or(1, |program| program.modules().len()),
             dynamic: Vec::new(),
+            missing_global: None,
             template_objects,
             template_sites: BTreeMap::new(),
             current_builtin_id: None,
@@ -4413,7 +4416,14 @@ impl<'a, H: Host> Machine<'a, H> {
             return;
         };
         if message.is_none() {
-            *message = self.resolve_thrown_message(*value);
+            *message = match origin {
+                ThrowOrigin::ReferenceError {
+                    operation: "global is not defined",
+                } => self.missing_global.as_ref().map(|name| {
+                    EcmaString::encode(&format!("{} is not defined", name.to_utf8_lossy()))
+                }),
+                _ => self.resolve_thrown_message(*value),
+            };
         }
         if *origin != ThrowOrigin::Bytecode {
             return;
@@ -6695,11 +6705,12 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(Some(value));
         }
         let name = self.constant_text(module, name).to_owned();
-        let key = PropertyKey::Named(name);
+        let key = PropertyKey::Named(name.clone());
         let global = self.context_global.unwrap_or(self.global_object);
         if self.internal_has_property(global, &key)? {
             return self.get_property_key(global, &key).map(Some);
         }
+        self.missing_global = Some(name);
         Ok(None)
     }
 
@@ -19500,7 +19511,7 @@ mod tests {
                     operation: "global is not defined",
                 },
                 constructor_name: None,
-                message: None,
+                message: Some(EcmaString::encode("missing is not defined")),
             }
         );
     }

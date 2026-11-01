@@ -9893,7 +9893,7 @@ mod tests {
                         operation: "global is not defined",
                     },
                     constructor_name: None,
-                    message: None,
+                    message: Some(EcmaString::encode("missing_global is not defined")),
                 }
             );
         };
