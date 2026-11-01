@@ -37,7 +37,7 @@ use super::{
 
 mod namespaces;
 
-use namespaces::{ContainerBinding, NamespaceFrame};
+use namespaces::{ContainerBinding, NamespaceFrame, is_qualified_alias};
 
 /// Stable diagnostic identifiers produced by target transforms.
 pub mod codes {
@@ -610,6 +610,8 @@ struct Rewriter<'a> {
     occupied_names: Option<BTreeSet<String>>,
     /// Where each value name is declared, once a namespace needs to know.
     value_symbol_ranges: Option<std::collections::HashMap<String, Vec<TextRange>>>,
+    /// Where each alias read as a value is declared, once one needs to know.
+    read_aliases: Option<BTreeSet<Utf16Pos>>,
 }
 
 /// Per-file CommonJS lowering plan built before the rewrite walk.
@@ -711,6 +713,7 @@ impl<'a> Rewriter<'a> {
             declared_names: Vec::new(),
             occupied_names: None,
             value_symbol_ranges: None,
+            read_aliases: None,
         }
     }
     /// Scans top-level module syntax into a CommonJS lowering plan.
@@ -822,6 +825,9 @@ impl<'a> Rewriter<'a> {
                             Statement::Function(_)
                             | Statement::Interface(_)
                             | Statement::TypeAlias(_) => {}
+                            Statement::ImportEquals(import) if is_qualified_alias(import) => {
+                                plan.void_0.push(identifier_text(file, &import.local));
+                            }
                             Statement::Namespace(namespace) => {
                                 if let NamespaceName::Identifier { name, .. } = &namespace.name
                                     && model
@@ -1048,6 +1054,9 @@ impl<'a> Rewriter<'a> {
             Statement::Enum(declaration) if declaration.is_const => return Vec::new(),
             Statement::Enum(declaration) => {
                 return self.lower_enum(inner, declaration, binding, statement.range());
+            }
+            Statement::ImportEquals(import) if is_qualified_alias(import) => {
+                return self.lower_exported_alias(inner, import, binding, statement.range());
             }
             _ => {}
         }
@@ -1701,8 +1710,8 @@ impl<'a> Rewriter<'a> {
                 ContainerBinding::Local,
                 statement.range(),
             ),
-            Statement::ImportEquals(_)
-            | Statement::Export(_)
+            Statement::ImportEquals(import) => self.lower_alias(statement, import),
+            Statement::Export(_)
             | Statement::Interface(_)
             | Statement::TypeAlias(_)
             | Statement::Empty
@@ -10733,6 +10742,46 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
              (function (E) {\n\
              \x20   E[E[\"A\"] = 0] = \"A\";\n\
              })(E || (exports.E = E = {}));\n"
+        );
+    }
+
+    #[test]
+    fn an_alias_is_declared_only_where_it_holds_a_value() {
+        // Upstream aliasBug, unusedImports10 and
+        // usingModuleWithExportImportInValuePosition.
+        let output = emit_at(
+            "namespace A { export var x = 1; export interface I {} }\n\
+             import top = A;\n\
+             namespace B { import unused = A; export var y = 1; }\n\
+             namespace C { import read = A; export var z = read.x; }\n\
+             namespace D { export import published = A; }\n\
+             namespace E { export import shape = A.I; export var w = 1; }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var A;\n\
+             (function (A) {\n\
+             \x20   A.x = 1;\n\
+             })(A || (A = {}));\n\
+             var top = A;\n\
+             var B;\n\
+             (function (B) {\n\
+             \x20   B.y = 1;\n\
+             })(B || (B = {}));\n\
+             var C;\n\
+             (function (C) {\n\
+             \x20   var read = A;\n\
+             \x20   C.z = read.x;\n\
+             })(C || (C = {}));\n\
+             var D;\n\
+             (function (D) {\n\
+             \x20   D.published = A;\n\
+             })(D || (D = {}));\n\
+             var E;\n\
+             (function (E) {\n\
+             \x20   E.w = 1;\n\
+             })(E || (E = {}));\n"
         );
     }
 

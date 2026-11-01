@@ -37,6 +37,11 @@ pub(super) enum ContainerBinding {
     Export,
 }
 
+/// Whether an `import a = ...` aliases a name rather than requiring a module.
+pub(super) fn is_qualified_alias(import: &ImportEqualsDeclaration) -> bool {
+    matches!(import.reference, ExternalModuleReference::Qualified(_))
+}
+
 impl Rewriter<'_> {
     pub(super) fn lower_namespace(
         &mut self,
@@ -95,6 +100,151 @@ impl Rewriter<'_> {
         let argument = self.container_argument(&local, &binding, range);
         out.push(self.container_call(&local, body, argument, range));
         out
+    }
+
+    /// `var a = A.B;` for an alias something reads, or one a script declares at
+    /// its top level for a value. Any other alias only names a type.
+    pub(super) fn lower_alias(
+        &mut self,
+        statement: &Stmt,
+        import: &ImportEqualsDeclaration,
+    ) -> Vec<Stmt> {
+        let ExternalModuleReference::Qualified(name) = &import.reference else {
+            return vec![statement.clone()];
+        };
+        if import.is_type_only {
+            return vec![statement.clone()];
+        }
+        let script_top_level =
+            self.declared_names.len() == 1 && !crate::checker::source_is_module(self.file);
+        if !self.alias_is_read(statement)
+            && !(script_top_level && self.alias_target_is_value(statement))
+        {
+            return Vec::new();
+        }
+        let range = statement.range();
+        let Some(value) = self.entity_expression(name, range) else {
+            return vec![statement.clone()];
+        };
+        vec![self.alias_declaration(import, value, range)]
+    }
+
+    /// An exported alias publishes its target, unless that only names a type.
+    pub(super) fn lower_exported_alias(
+        &mut self,
+        statement: &Stmt,
+        import: &ImportEqualsDeclaration,
+        binding: ContainerBinding,
+        range: TextRange,
+    ) -> Vec<Stmt> {
+        let ExternalModuleReference::Qualified(name) = &import.reference else {
+            return vec![statement.clone()];
+        };
+        if import.is_type_only
+            || !(self.alias_is_read(statement) || self.alias_target_is_value(statement))
+        {
+            return Vec::new();
+        }
+        let Some(local) = self.identifier_name(&import.local) else {
+            return vec![statement.clone()];
+        };
+        let Some(value) = self.entity_expression(name, range) else {
+            return vec![statement.clone()];
+        };
+        let expression = match binding {
+            ContainerBinding::Member(parent) => {
+                self.member_assignment(&parent, &local, value, range)
+            }
+            ContainerBinding::CommonJs => {
+                let left = self.cjs_export_target(&local, range);
+                self.assignment(left, value, range)
+            }
+            ContainerBinding::Local | ContainerBinding::Export => {
+                let declaration = self.alias_declaration(import, value, range);
+                return vec![self.syn_node(
+                    range,
+                    Statement::Export(ExportDeclaration::Named(
+                        ExportNamedDeclaration::Declaration(Box::new(declaration)),
+                    )),
+                )];
+            }
+        };
+        vec![self.expression_statement(expression, range)]
+    }
+
+    fn alias_declaration(
+        &mut self,
+        import: &ImportEqualsDeclaration,
+        value: Expr,
+        range: TextRange,
+    ) -> Stmt {
+        let declarator = self.make_declarator(import.local.clone(), Some(value), range);
+        self.syn_node(
+            range,
+            Statement::Variable(VariableDeclaration {
+                range,
+                kind: VariableKind::Var,
+                declarations: vec![declarator],
+            }),
+        )
+    }
+
+    fn entity_expression(&mut self, name: &EntityName, range: TextRange) -> Option<Expr> {
+        match name {
+            EntityName::Identifier(ident) => {
+                Some(self.node(ident.range(), Expression::Identifier(ident.clone())))
+            }
+            EntityName::Qualified { left, right } => {
+                let object = self.entity_expression(left, range)?;
+                let property = MemberProperty::Named(right.clone());
+                Some(self.member_expr(&object, property, range))
+            }
+            EntityName::Missing(_) => None,
+        }
+    }
+
+    fn alias_is_read(&mut self, statement: &Stmt) -> bool {
+        let Some(model) = self.model else {
+            return true;
+        };
+        let read = self.read_aliases.get_or_insert_with(|| {
+            let read: BTreeSet<SymbolId> = model.references().map(|(_, symbol)| symbol).collect();
+            model
+                .symbols()
+                .iter()
+                .enumerate()
+                .filter(|(index, symbol)| {
+                    symbol.kind() == SymbolKind::Import
+                        && read.contains(&SymbolId::new(*index as u32))
+                })
+                .map(|(_, symbol)| symbol.range().start())
+                .collect()
+        });
+        read.contains(&statement.range().start())
+    }
+
+    /// Whether an alias resolves to something with a runtime value. One that
+    /// resolves to nothing counts, so the error it reports is not also erased.
+    fn alias_target_is_value(&self, statement: &Stmt) -> bool {
+        let Some(model) = self.model else {
+            return true;
+        };
+        let facts = model.namespace_facts();
+        let target = facts
+            .qualified_import_path(statement.id())
+            .and_then(<[SymbolId]>::last);
+        let Some(&target) = target else {
+            return true;
+        };
+        match model.symbol(target).kind() {
+            SymbolKind::Interface | SymbolKind::TypeAlias => false,
+            SymbolKind::Namespace => facts.merged_declarations(target).iter().any(|declaration| {
+                facts
+                    .declaration(*declaration)
+                    .is_some_and(|plan| plan.is_value_bearing())
+            }),
+            _ => true,
+        }
     }
 
     /// `E[E["A"] = 0] = "A";`, or `E["A"] = "a";` for a member with no reverse
@@ -200,6 +350,10 @@ impl Rewriter<'_> {
             Statement::Enum(declaration) if !declaration.is_const => {
                 let binding = ContainerBinding::Member(parameter.to_owned());
                 return self.lower_enum(inner, declaration, binding, range);
+            }
+            Statement::ImportEquals(import) if is_qualified_alias(import) => {
+                let binding = ContainerBinding::Member(parameter.to_owned());
+                return self.lower_exported_alias(inner, import, binding, range);
             }
             Statement::Function(function) if function.function.body.is_some() => {
                 function.function.name.as_ref()
