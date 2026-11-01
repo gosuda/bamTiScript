@@ -36,6 +36,27 @@ pub(super) fn install<H: Host>(
         weak_set_constructor::<H>,
     );
 
+    for constructor in [map.constructor, set.constructor] {
+        let species = install_function(
+            heap,
+            builtins,
+            "get [Symbol.species]",
+            0,
+            super::regexp_protocol::species_getter::<H>,
+        );
+        super::define_symbol_property(
+            heap,
+            constructor,
+            builtins.symbol_species(),
+            crate::Property::Accessor {
+                getter: Some(species),
+                setter: None,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+
     let group_by = install_function(heap, builtins, "groupBy", 2, map_group_by::<H>);
     define_constructor_data(heap, map.constructor, "groupBy", group_by);
     let map_set = install_function(heap, builtins, "set", 2, strong_map_set::<H>);
