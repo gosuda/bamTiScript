@@ -83,12 +83,14 @@ fn constructor<H: Host>(
     args: &[Value],
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let value = if args.is_empty() {
-        Value::int32(0)
-    } else if let Some(number) = super::bigint::bigint_to_number(machine, args[0])? {
-        number
+    let value = if let Some(value) = args.first() {
+        let primitive = machine.coerce_primitive_observable(*value, false)?;
+        match super::bigint::bigint_to_number(machine, primitive)? {
+            Some(number) => number,
+            None => machine.coerce_number_observable(primitive)?,
+        }
     } else {
-        machine.to_number(args[0])?
+        Value::int32(0)
     };
     if constructing {
         Ok(BuiltinOutcome::Value(machine.box_primitive(value)?))
@@ -194,10 +196,10 @@ pub(super) fn parse_int<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let text = machine
-        .to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?
+        .coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?
         .to_utf8_lossy();
     let requested = to_int32_radix(value_number(
-        machine.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))?,
+        machine.coerce_number_observable(args.get(1).copied().unwrap_or(Value::UNDEFINED))?,
     ));
     Ok(BuiltinOutcome::Value(crate::number_value(
         number_format::parse_int(&text, requested),
@@ -209,7 +211,9 @@ pub(super) fn global_is_nan<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let n = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
+    let n = value_number(
+        machine.coerce_number_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+    );
     Ok(BuiltinOutcome::Value(Value::boolean(n.is_nan())))
 }
 pub(super) fn global_is_finite<H: Host>(
@@ -218,7 +222,9 @@ pub(super) fn global_is_finite<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let n = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
+    let n = value_number(
+        machine.coerce_number_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+    );
     Ok(BuiltinOutcome::Value(Value::boolean(n.is_finite())))
 }
 /// `Number.prototype.toLocaleString` without a locale: the ECMAScript form.

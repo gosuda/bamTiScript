@@ -1776,14 +1776,11 @@ fn as_uint_n<H: Host>(
 
 /// `ToIndex`: integer truncating, must be in `[0, 2^53 - 1]`.
 fn to_index<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<usize, EvalFailure> {
-    if value == Value::UNDEFINED {
-        return Ok(0);
-    }
-    let number = numeric_f64(machine.to_number(value)?).expect("ToNumber returns numeric");
-    if !number.is_finite() || !(0.0..=9_007_199_254_740_991.0).contains(&number) {
+    let integer = super::to_integer_or_infinity(machine, value)?;
+    if !(0.0..=9_007_199_254_740_991.0).contains(&integer) {
         return Err(range_error("Invalid index range"));
     }
-    usize::try_from(number.trunc() as u64).map_err(|_| range_error("Invalid index range"))
+    usize::try_from(integer as u64).map_err(|_| range_error("Invalid index range"))
 }
 
 /// §21.2.3.1: `BigInt.prototype.toString([radix])`.

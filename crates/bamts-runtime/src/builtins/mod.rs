@@ -305,10 +305,10 @@ fn to_uint8_from_f64(number: f64) -> u8 {
 }
 
 fn to_integer_or_infinity<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<f64, EvalFailure> {
-    let number = value_number(machine.to_number(value)?);
+    let number = value_number(machine.coerce_number_observable(value)?);
     Ok(if number.is_nan() || number == 0.0 {
         0.0
     } else {
