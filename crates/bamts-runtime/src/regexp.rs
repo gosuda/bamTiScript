@@ -152,6 +152,11 @@ impl Regex {
         if parser.peek().is_some() {
             return Err(parser.error("unexpected token"));
         }
+        for name in &parser.referenced_names {
+            if !parser.names.iter().any(|(known, _)| known == name) {
+                return Err(parser.error("invalid named reference"));
+            }
+        }
         Ok(Self {
             expression,
             flags,
@@ -1032,10 +1037,15 @@ struct Parser<'a> {
     reachable_names: Vec<String>,
     unicode: bool,
     flags: Flags,
+    /// The pattern's capturing groups, including those not parsed yet.
+    total_captures: usize,
+    has_named_groups: bool,
+    referenced_names: Vec<String>,
 }
 
 impl<'a> Parser<'a> {
     fn new(units: &'a [u16], flags: Flags) -> Self {
+        let (total_captures, has_named_groups) = scan_groups(units);
         Self {
             units,
             position: 0,
@@ -1044,6 +1054,9 @@ impl<'a> Parser<'a> {
             reachable_names: Vec::new(),
             unicode: flags.unicode,
             flags,
+            total_captures,
+            has_named_groups,
+            referenced_names: Vec::new(),
         }
     }
 
@@ -1075,7 +1088,20 @@ impl<'a> Parser<'a> {
             }
             let first_capture = self.capture_count + 1;
             let atom = self.parse_atom()?;
-            nodes.push(self.parse_quantifier(atom, first_capture)?);
+            let assertion = match &atom {
+                Node::Start | Node::End | Node::WordBoundary(_) => true,
+                Node::Look { behind, .. } => *behind || self.unicode,
+                _ => false,
+            };
+            if assertion && self.at_quantifier()? {
+                return Err(self.error("nothing to repeat"));
+            }
+            let quantified = self.parse_quantifier(atom, first_capture)?;
+            let repeated = matches!(quantified, Node::Repeat { .. });
+            nodes.push(quantified);
+            if repeated && self.at_quantifier()? {
+                return Err(self.error("nothing to repeat"));
+            }
         }
         Ok(nodes)
     }
@@ -1084,6 +1110,14 @@ impl<'a> Parser<'a> {
         let token = self
             .next()
             .ok_or_else(|| self.error("expected regular expression atom"))?;
+        if token == 0x7b && !self.unicode {
+            self.position -= 1;
+            let quantifier = self.at_quantifier()?;
+            self.position += 1;
+            if quantifier {
+                return Err(self.error("nothing to repeat"));
+            }
+        }
         match token {
             0x2e => Ok(Node::Dot),
             0x5e => Ok(Node::Start),
@@ -1093,6 +1127,7 @@ impl<'a> Parser<'a> {
             0x5c => self.parse_escape(false),
             0x29 => Err(self.error("unmatched ')'")),
             0x2a | 0x2b | 0x3f => Err(self.error("nothing to repeat")),
+            0x7b | 0x7d | 0x5d if self.unicode => Err(self.error("lone bracket in Unicode mode")),
             _ => {
                 let start = self.position - 1;
                 let (value, width) = next_code_point(self.units, start, self.unicode);
@@ -1123,8 +1158,8 @@ impl<'a> Parser<'a> {
                         look = Some((true, false));
                     }
                     _ => {
-                        let name = self.take_until(0x3e)?;
-                        if name.is_empty() || self.reachable_names.contains(&name) {
+                        let name = self.parse_group_name()?;
+                        if self.reachable_names.contains(&name) {
                             return Err(self.error("invalid duplicate capture group name"));
                         }
                         self.capture_count += 1;
@@ -1202,13 +1237,11 @@ impl<'a> Parser<'a> {
             false
         };
         let mut items = Vec::new();
-        let mut first = true;
         while let Some(token) = self.peek() {
-            if token == 0x5d && !first {
+            if token == 0x5d {
                 self.position += 1;
                 return Ok(CharacterClass { negated, items });
             }
-            first = false;
             let left = self.parse_class_item()?;
             if self.peek() == Some(0x2d) && self.units.get(self.position + 1) != Some(&0x5d) {
                 self.position += 1;
@@ -1262,10 +1295,16 @@ impl<'a> Parser<'a> {
             0x53 => Ok(class_node(ClassItem::NotSpace)),
             0x62 => Ok(Node::WordBoundary(true)),
             0x42 => Ok(Node::WordBoundary(false)),
-            0x6b if self.next() == Some(0x3c) => {
-                Ok(Node::NamedBackReference(self.take_until(0x3e)?))
+            0x6b if self.unicode || self.has_named_groups => {
+                if self.next() != Some(0x3c) {
+                    return Err(self.error("invalid named reference"));
+                }
+                let name = self.parse_group_name()?;
+                self.referenced_names.push(name.clone());
+                Ok(Node::NamedBackReference(name))
             }
             value if value <= 0x7f && (value as u8).is_ascii_digit() && value != 0x30 => {
+                let checkpoint = self.position;
                 let mut number = (value - 0x30) as usize;
                 while let Some(digit) = self.peek().and_then(decimal_digit) {
                     self.position += 1;
@@ -1274,7 +1313,14 @@ impl<'a> Parser<'a> {
                         .and_then(|number| number.checked_add(digit))
                         .ok_or_else(|| self.error("backreference number is too large"))?;
                 }
-                Ok(Node::BackReference(number))
+                if number <= self.total_captures {
+                    return Ok(Node::BackReference(number));
+                }
+                if self.unicode {
+                    return Err(self.error("invalid back reference"));
+                }
+                self.position = checkpoint;
+                self.escape_character(value, false).map(Node::Literal)
             }
             value => self.escape_character(value, false).map(Node::Literal),
         }
@@ -1287,8 +1333,16 @@ impl<'a> Parser<'a> {
             0x74 => Ok(0x09),
             0x66 => Ok(0x0c),
             0x76 => Ok(0x0b),
-            0x30 => Ok(0),
-            0x78 => self.hex_escape(2),
+            0x30 if self.unicode && self.peek().and_then(decimal_digit).is_some() => {
+                Err(self.error("invalid decimal escape"))
+            }
+            0x30 if self.unicode || !self.peek().is_some_and(is_octal_digit) => Ok(0),
+            0x30..=0x37 if !self.unicode => Ok(self.legacy_octal_escape(escaped)),
+            0x63 => self.control_escape(in_class),
+            0x78 => match self.hex_escape(2) {
+                Err(_) if !self.unicode => Ok(0x78),
+                result => result,
+            },
             0x75 if self.unicode && self.peek() == Some(0x7b) => {
                 self.position += 1;
                 let digits = self.take_until(0x7d)?;
@@ -1327,6 +1381,43 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `\c`. Without a letter, Annex B reads the backslash as itself and leaves the
+    /// `c` to be read next, and a class also takes a digit or `_`.
+    fn control_escape(&mut self, in_class: bool) -> Result<u32, RegexError> {
+        let letter = self.peek().filter(|unit| {
+            u8::try_from(*unit).is_ok_and(|byte| {
+                byte.is_ascii_alphabetic()
+                    || (in_class && !self.unicode && (byte.is_ascii_digit() || byte == b'_'))
+            })
+        });
+        match letter {
+            Some(letter) => {
+                self.position += 1;
+                Ok(u32::from(letter) % 32)
+            }
+            None if !self.unicode => {
+                self.position -= 1;
+                Ok(0x5c)
+            }
+            None => Err(self.error("invalid control escape")),
+        }
+    }
+
+    /// Annex B `LegacyOctalEscapeSequence`: at most three digits, up to `\377`.
+    fn legacy_octal_escape(&mut self, first: u16) -> u32 {
+        let mut value = u32::from(first) - 0x30;
+        for _ in 0..2 {
+            match self.peek().filter(|unit| is_octal_digit(*unit)) {
+                Some(unit) if value * 8 + u32::from(unit) - 0x30 <= 0o377 => {
+                    value = value * 8 + u32::from(unit) - 0x30;
+                    self.position += 1;
+                }
+                _ => break,
+            }
+        }
+        value
+    }
+
     fn hex_escape(&mut self, count: usize) -> Result<u32, RegexError> {
         if self.position + count > self.units.len() {
             return Err(self.error("invalid hexadecimal escape"));
@@ -1360,26 +1451,10 @@ impl<'a> Parser<'a> {
                 (0, Some(1))
             }
             0x7b => {
-                let checkpoint = self.position;
-                self.position += 1;
-                let Some(minimum) = self.parse_decimal() else {
-                    self.position = checkpoint;
+                let Some(bounds) = self.parse_braced_bounds()? else {
                     return Ok(atom);
                 };
-                match self.next() {
-                    Some(0x7d) => (minimum, Some(minimum)),
-                    Some(0x2c) => {
-                        let maximum = self.parse_decimal();
-                        if self.next() != Some(0x7d) {
-                            return Err(self.error("invalid quantifier"));
-                        }
-                        if maximum.is_some_and(|value| value < minimum) {
-                            return Err(self.error("quantifier range out of order"));
-                        }
-                        (minimum, maximum)
-                    }
-                    _ => return Err(self.error("invalid quantifier")),
-                }
+                bounds
             }
             _ => return Ok(atom),
         };
@@ -1398,6 +1473,47 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `{n}`, `{n,}` or `{n,m}` at the cursor. Anything else leaves the cursor
+    /// there: it is a literal `{` under Annex B and an error in Unicode mode.
+    fn parse_braced_bounds(&mut self) -> Result<Option<(usize, Option<usize>)>, RegexError> {
+        let checkpoint = self.position;
+        self.position += 1;
+        let bounds = self.parse_decimal().and_then(|minimum| match self.next() {
+            Some(0x7d) => Some((minimum, Some(minimum))),
+            Some(0x2c) => {
+                let maximum = self.parse_decimal();
+                (self.next() == Some(0x7d)).then_some((minimum, maximum))
+            }
+            _ => None,
+        });
+        let Some((minimum, maximum)) = bounds else {
+            self.position = checkpoint;
+            return if self.unicode {
+                Err(self.error("invalid quantifier"))
+            } else {
+                Ok(None)
+            };
+        };
+        if maximum.is_some_and(|maximum| maximum < minimum) {
+            return Err(self.error("quantifier range out of order"));
+        }
+        Ok(Some((minimum, maximum)))
+    }
+
+    /// Whether a quantifier starts here, without consuming it.
+    fn at_quantifier(&mut self) -> Result<bool, RegexError> {
+        match self.peek() {
+            Some(0x2a | 0x2b | 0x3f) => Ok(true),
+            Some(0x7b) => {
+                let checkpoint = self.position;
+                let bounds = self.parse_braced_bounds()?;
+                self.position = checkpoint;
+                Ok(bounds.is_some())
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn parse_decimal(&mut self) -> Option<usize> {
         let begin = self.position;
         let mut value = 0usize;
@@ -1406,6 +1522,70 @@ impl<'a> Parser<'a> {
             value = value.checked_mul(10)?.checked_add(digit)?;
         }
         (self.position > begin).then_some(value)
+    }
+
+    /// `GroupName` up to and including `>`. Escapes name a code point, and each
+    /// code point must fit an identifier.
+    fn parse_group_name(&mut self) -> Result<String, RegexError> {
+        let mut name = String::new();
+        loop {
+            let invalid = |parser: &Self| parser.error("invalid capture group name");
+            let unit = self.next().ok_or_else(|| invalid(self))?;
+            if unit == 0x3e {
+                break;
+            }
+            let value = if unit == 0x5c {
+                if self.next() != Some(0x75) {
+                    return Err(invalid(self));
+                }
+                self.group_name_escape()?
+            } else {
+                let start = self.position - 1;
+                let (value, width) = next_code_point(self.units, start, true);
+                self.position = start + width;
+                value
+            };
+            let character = char::from_u32(value).ok_or_else(|| invalid(self))?;
+            let allowed = matches!(character, '$' | '_')
+                || character.is_alphabetic()
+                || (!name.is_empty()
+                    && (character.is_alphanumeric()
+                        || matches!(character, '\u{200c}' | '\u{200d}')));
+            if !allowed {
+                return Err(invalid(self));
+            }
+            name.push(character);
+        }
+        if name.is_empty() {
+            return Err(self.error("invalid capture group name"));
+        }
+        Ok(name)
+    }
+
+    /// The code point after `\u` in a group name, which reads as in Unicode mode
+    /// whatever the pattern's flags are.
+    fn group_name_escape(&mut self) -> Result<u32, RegexError> {
+        if self.peek() == Some(0x7b) {
+            self.position += 1;
+            let digits = self.take_until(0x7d)?;
+            return u32::from_str_radix(&digits, 16)
+                .ok()
+                .filter(|value| *value <= 0x10ffff)
+                .ok_or_else(|| self.error("invalid Unicode escape"));
+        }
+        let first = self.hex_escape(4)?;
+        if (0xd800..=0xdbff).contains(&first) && self.units.get(self.position) == Some(&0x5c) {
+            let checkpoint = self.position;
+            self.position += 1;
+            if self.next() == Some(0x75)
+                && let Ok(second) = self.hex_escape(4)
+                && (0xdc00..=0xdfff).contains(&second)
+            {
+                return Ok(combine_surrogates(first as u16, second as u16));
+            }
+            self.position = checkpoint;
+        }
+        Ok(first)
     }
 
     fn take_until(&mut self, terminator: u16) -> Result<String, RegexError> {
@@ -1441,6 +1621,34 @@ fn class_node(item: ClassItem) -> Node {
         negated: false,
         items: vec![item],
     })
+}
+
+fn is_octal_digit(unit: u16) -> bool {
+    (0x30..=0x37).contains(&unit)
+}
+
+/// Counts the capturing groups in a pattern, and says whether any is named.
+fn scan_groups(units: &[u16]) -> (usize, bool) {
+    let (mut count, mut named, mut in_class, mut position) = (0, false, false, 0);
+    while let Some(unit) = units.get(position).copied() {
+        match unit {
+            0x5c => position += 1,
+            0x5b => in_class = true,
+            0x5d => in_class = false,
+            0x28 if !in_class => match units.get(position + 1) {
+                Some(0x3f) => {
+                    let name = units.get(position + 2) == Some(&0x3c)
+                        && !matches!(units.get(position + 3), Some(0x3d | 0x21));
+                    count += usize::from(name);
+                    named |= name;
+                }
+                _ => count += 1,
+            },
+            _ => {}
+        }
+        position += 1;
+    }
+    (count, named)
 }
 
 fn decimal_digit(unit: u16) -> Option<usize> {
@@ -1649,6 +1857,57 @@ mod tests {
             .map(|(name, _)| name.as_str())
             .collect();
         assert_eq!(names, ["z", "b"]);
+    }
+
+    #[test]
+    fn annex_b_escapes_read_literally_outside_unicode_mode() {
+        assert_eq!(ranges("\\x", "", "x"), [Some(0..1)]);
+        assert_eq!(ranges("\\c", "", "\\c"), [Some(0..2)]);
+        assert_eq!(ranges("\\ca", "", "\u{1}"), [Some(0..1)]);
+        assert_eq!(ranges("[\\c1]", "", "\u{11}"), [Some(0..1)]);
+        assert_eq!(ranges("[\\12-\\14]", "", "\n"), [Some(0..1)]);
+        assert_eq!(ranges("\\1", "", "\u{1}"), [Some(0..1)]);
+        assert_eq!(ranges("a{1,b}", "", "a{1,b}"), [Some(0..6)]);
+        assert_eq!(ranges("\\k<a", "", "k<a"), [Some(0..3)]);
+        for pattern in ["\\1", "\\c", "a{1,b}", "}", "]"] {
+            assert!(
+                Regex::compile(&text(pattern), &text("u")).is_err(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_can_repeat_a_quantifier_or_an_assertion() {
+        for pattern in ["a**", "a{1}{2}", "a+?+", "^*", "\\b+", "(?<=a)*", "{1}"] {
+            assert!(
+                Regex::compile(&text(pattern), &text("")).is_err(),
+                "{pattern}"
+            );
+        }
+        assert!(Regex::compile(&text("(?=a)*"), &text("")).is_ok());
+        assert!(Regex::compile(&text("(?=a)*"), &text("u")).is_err());
+    }
+
+    #[test]
+    fn an_empty_class_matches_nothing_and_its_negation_anything() {
+        assert!(regex("[]", "").exec(&text("a"), 0).unwrap().is_none());
+        assert_eq!(ranges("[^]", "", "a"), [Some(0..1)]);
+    }
+
+    #[test]
+    fn group_names_take_escapes_and_references_must_resolve() {
+        let matched = regex("(?<\\u{41}b>x)", "")
+            .exec(&text("x"), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(matched.named[0].0, "Ab");
+        for pattern in ["\\k<x>(?<y>a)", "(?<1a>x)", "(?<>x)"] {
+            assert!(
+                Regex::compile(&text(pattern), &text("")).is_err(),
+                "{pattern}"
+            );
+        }
     }
 
     #[test]
