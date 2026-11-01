@@ -521,6 +521,12 @@ impl EvidenceRow {
     pub fn artifacts(&self) -> &BTreeMap<String, String> {
         &self.artifacts
     }
+
+    /// The diagnostic text recorded with the state; empty on a clean `PASS`.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
 }
 
 /// Footer that closes a stream.

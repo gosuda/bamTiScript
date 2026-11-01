@@ -30,6 +30,7 @@ use bamts_verification::{
     shard::ShardSpec,
     source_fetch::{CommandBackend, materialize_named},
     suite::completion::{SuiteMergeRequest, SuiteRunRequest, merge_suite, run_suite},
+    sweep_report::{DiffRequest, FamiliesRequest, diff as diff_receipts, families},
     toolchain_schema::{
         blocking_obligations, catalog_identifiers, emit_probe_object, load_target_cells,
     },
@@ -107,6 +108,8 @@ enum Command {
     },
     SuiteRun(SuiteRunRequest),
     SuiteMerge(SuiteMergeRequest),
+    SuiteFamilies(FamiliesRequest),
+    SuiteDiff(DiffRequest),
 }
 
 fn main() {
@@ -169,7 +172,25 @@ fn dispatch(root: &Path, command: Command) -> Result<()> {
         Command::ReplayCanary { faulty } => run_replay_canary_child(root, faulty),
         Command::SuiteRun(request) => run_suite(root, &request).map(|_| ()),
         Command::SuiteMerge(request) => merge_suite(root, &request).map(|_| ()),
+        Command::SuiteFamilies(request) => print_report(&families(&request)?),
+        Command::SuiteDiff(request) => {
+            let (report, regressions) = diff_receipts(&request)?;
+            print_report(&report)?;
+            if request.fail_on_regression && regressions > 0 {
+                return Err(VerificationError::new(
+                    ErrorCode::Transition,
+                    format!("{regressions} row(s) regressed from PASS"),
+                ));
+            }
+            Ok(())
+        }
     }
+}
+
+fn print_report(report: &str) -> Result<()> {
+    write!(io::stdout().lock(), "{report}").map_err(|error| {
+        VerificationError::new(ErrorCode::Io, format!("cannot write report: {error}"))
+    })
 }
 
 fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Command> {
@@ -277,9 +298,52 @@ fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result
                 },
             }))
         }
+        "families" => {
+            let receipt = path_argument(arguments, "suite families receipt")?;
+            let flags = parse_flags(arguments, &["--top", "--family", "--root"], &[])?;
+            Ok(Command::SuiteFamilies(FamiliesRequest {
+                receipt,
+                top: count_flag(&flags.values, "--top", 20)?,
+                family: flags.values.get("--family").cloned(),
+                root: flags.values.get("--root").map(PathBuf::from),
+            }))
+        }
+        "diff" => {
+            let a = path_argument(arguments, "first receipt of suite diff")?;
+            let b = path_argument(arguments, "second receipt of suite diff")?;
+            let flags = parse_flags(arguments, &["--limit"], &["--fail-on-regression"])?;
+            Ok(Command::SuiteDiff(DiffRequest {
+                a,
+                b,
+                limit: count_flag(&flags.values, "--limit", 20)?,
+                fail_on_regression: flags.switches.contains("--fail-on-regression"),
+            }))
+        }
         _ if subcommand.starts_with("--") => Err(usage(format!("unknown flag `{subcommand}`"))),
         _ => Err(usage(format!("unknown suite subcommand `{subcommand}`"))),
     }
+}
+
+/// A positional path. A word that looks like a flag is a missing path.
+fn path_argument(
+    arguments: &mut impl Iterator<Item = OsString>,
+    description: &str,
+) -> Result<PathBuf> {
+    let value = required_argument(arguments, description)?;
+    if value.starts_with("--") {
+        return Err(usage(format!(
+            "missing {description}, found flag `{value}`"
+        )));
+    }
+    Ok(PathBuf::from(value))
+}
+
+fn count_flag(values: &BTreeMap<String, String>, flag: &str, default: usize) -> Result<usize> {
+    values.get(flag).map_or(Ok(default), |value| {
+        value
+            .parse::<usize>()
+            .map_err(|_| usage(format!("`{flag}` must be an unsigned integer")))
+    })
 }
 
 /// Parses low-level suite coordinates as zero-based `<index>/<count>`.
@@ -1355,6 +1419,120 @@ mod tests {
         assert_eq!(request.receipts, PathBuf::from("receipts"));
         assert_eq!(request.out, PathBuf::from("merged.jsonl"));
         assert_eq!(request.publish, PublishMode::Check);
+    }
+
+    #[test]
+    fn parses_suite_families_with_its_optional_flags() {
+        let Command::SuiteFamilies(plain) =
+            parse(&["bamts-verification", "suite", "families", "merged.jsonl"]).expect("plain")
+        else {
+            panic!("suite families variant")
+        };
+        assert_eq!(plain.receipt, PathBuf::from("merged.jsonl"));
+        assert_eq!(plain.top, 20);
+        assert_eq!(plain.family, None);
+        assert_eq!(plain.root, None);
+
+        let Command::SuiteFamilies(one) = parse(&[
+            "bamts-verification",
+            "suite",
+            "families",
+            "merged.jsonl",
+            "--top",
+            "5",
+            "--family",
+            "types/mismatch",
+            "--root",
+            "target/authority/test262",
+        ])
+        .expect("flags") else {
+            panic!("suite families variant")
+        };
+        assert_eq!(one.top, 5);
+        assert_eq!(one.family.as_deref(), Some("types/mismatch"));
+        assert_eq!(one.root, Some(PathBuf::from("target/authority/test262")));
+    }
+
+    #[test]
+    fn parses_suite_diff_with_two_receipts_and_a_regression_switch() {
+        let Command::SuiteDiff(request) = parse(&[
+            "bamts-verification",
+            "suite",
+            "diff",
+            "before.jsonl",
+            "after.jsonl",
+            "--limit",
+            "3",
+            "--fail-on-regression",
+        ])
+        .expect("diff") else {
+            panic!("suite diff variant")
+        };
+        assert_eq!(request.a, PathBuf::from("before.jsonl"));
+        assert_eq!(request.b, PathBuf::from("after.jsonl"));
+        assert_eq!(request.limit, 3);
+        assert!(request.fail_on_regression);
+
+        let Command::SuiteDiff(defaults) =
+            parse(&["bamts-verification", "suite", "diff", "a.jsonl", "b.jsonl"])
+                .expect("defaults")
+        else {
+            panic!("suite diff variant")
+        };
+        assert_eq!(defaults.limit, 20);
+        assert!(!defaults.fail_on_regression);
+    }
+
+    #[test]
+    fn rejects_malformed_suite_report_arguments() {
+        for arguments in [
+            vec!["bamts-verification", "suite", "families"],
+            vec!["bamts-verification", "suite", "families", "--top", "5"],
+            vec![
+                "bamts-verification",
+                "suite",
+                "families",
+                "r.jsonl",
+                "--top",
+                "many",
+            ],
+            vec![
+                "bamts-verification",
+                "suite",
+                "families",
+                "r.jsonl",
+                "--top",
+            ],
+            vec!["bamts-verification", "suite", "diff", "only-one.jsonl"],
+            vec![
+                "bamts-verification",
+                "suite",
+                "diff",
+                "a.jsonl",
+                "--limit",
+                "2",
+            ],
+            vec![
+                "bamts-verification",
+                "suite",
+                "diff",
+                "a.jsonl",
+                "b.jsonl",
+                "--limit",
+                "x",
+            ],
+            vec![
+                "bamts-verification",
+                "suite",
+                "diff",
+                "a.jsonl",
+                "b.jsonl",
+                "c.jsonl",
+            ],
+        ] {
+            let error = parse(&arguments).expect_err(&format!("{arguments:?}"));
+            assert_eq!(error.code(), ErrorCode::Usage, "{arguments:?}");
+        }
     }
 
     #[test]
