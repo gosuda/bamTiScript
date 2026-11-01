@@ -49,6 +49,10 @@ fn zero_range() -> TextRange {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LowerOptions {
     pub javascript_compatibility: bool,
+    /// The host runs the entry file as an ECMAScript Script, so its top-level
+    /// `var` and function names live on the global object. Nothing in a file
+    /// can say this: Node runs the same bytes as a CommonJS module.
+    pub script_entry: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LoweringGoal {
@@ -356,6 +360,9 @@ fn assemble_with_linkage_strings(
     } else {
         None
     };
+    if options.script_entry {
+        context.instantiate_script(&mut builder, file.statements())?;
+    }
     context.lower_top_level(&mut builder, file.statements())?;
     match completion {
         Some(value) => context.emit(file.range(), Instruction::Return { value })?,
@@ -1603,6 +1610,65 @@ impl<'a> FunctionContext<'a> {
             ArgumentsSource::Captured(register) => Ok(Some(register)),
             ArgumentsSource::None => Ok(None),
         }
+    }
+    /// The part of `GlobalDeclarationInstantiation` lowering must spell out:
+    /// each `var` name exists before the Script runs, and declaring one never
+    /// disturbs a global that already has it.
+    fn instantiate_script(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        statements: &[Stmt],
+    ) -> Result<(), LowerError> {
+        let range = self.file.range();
+        if self.strict {
+            // `this` is the global object at the top of a Script, even a strict
+            // one. No code has run yet that could have replaced `globalThis`.
+            let name = builder.intern(Constant::String(EcmaString::encode("globalThis")), range)?;
+            let dst = self.alloc_register(range)?;
+            self.emit(range, Instruction::LoadGlobal { dst, name })?;
+            self.this_capture = Some(dst);
+        }
+        let mut names = Vec::new();
+        collect_var_names(self.file, statements, &mut names);
+        names.sort_unstable();
+        names.dedup();
+        names.retain(|name| name != "undefined");
+        if names.is_empty() {
+            return Ok(());
+        }
+        let undefined_type = self.string_reg(builder, EcmaString::encode("undefined"), range)?;
+        let value = self.undefined(builder, range)?;
+        for name in names {
+            let id = builder.intern(Constant::String(EcmaString::encode(&name)), range)?;
+            let declared = self.alloc_register(range)?;
+            self.emit(
+                range,
+                Instruction::TypeOfGlobal {
+                    dst: declared,
+                    name: id,
+                },
+            )?;
+            let absent = self.alloc_register(range)?;
+            self.emit(
+                range,
+                Instruction::Binary {
+                    dst: absent,
+                    op: BinaryOp::StrictEqual,
+                    left: declared,
+                    right: undefined_type,
+                },
+            )?;
+            let skip = self.emit(
+                range,
+                Instruction::JumpIfFalse {
+                    condition: absent,
+                    target: Pc::new(0),
+                },
+            )?;
+            self.emit(range, Instruction::StoreGlobal { name: id, value })?;
+            self.patch_jump(skip, self.next_pc());
+        }
+        Ok(())
     }
     fn lower_top_level(
         &mut self,
@@ -10817,6 +10883,7 @@ mod tests {
                 parsed.product(),
                 LowerOptions {
                     javascript_compatibility: true,
+                    ..LowerOptions::default()
                 },
             ) {
                 Ok(module) => {
@@ -10850,6 +10917,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
         )
     }
@@ -12727,6 +12795,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
         )
         .expect_err("a trailing BigInt separator is invalid");
@@ -12793,6 +12862,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             checked.product().enum_facts(),
             checked.product().namespace_facts(),
@@ -12825,6 +12895,7 @@ mod tests {
                 parsed.product(),
                 LowerOptions {
                     javascript_compatibility: true,
+                    ..LowerOptions::default()
                 },
                 checked.product().enum_facts(),
                 checked.product().namespace_facts(),
@@ -12852,6 +12923,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             checked.product().enum_facts(),
             checked.product().namespace_facts(),
@@ -12884,6 +12956,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             checked.product().enum_facts(),
             checked.product().namespace_facts(),
@@ -12937,6 +13010,7 @@ mod tests {
                 parsed.product(),
                 LowerOptions {
                     javascript_compatibility: true,
+                    ..LowerOptions::default()
                 },
                 checked.product().enum_facts(),
                 checked.product().namespace_facts(),
@@ -12971,6 +13045,7 @@ mod tests {
                 parsed.product(),
                 LowerOptions {
                     javascript_compatibility: true,
+                    ..LowerOptions::default()
                 },
                 checked.product().enum_facts(),
                 checked.product().namespace_facts(),
@@ -12993,6 +13068,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             checked.product().enum_facts(),
             checked.product().namespace_facts(),
@@ -13052,6 +13128,7 @@ mod tests {
             files[1].product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             facts.enum_facts(),
             facts.namespace_facts(),
@@ -13149,6 +13226,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             checked.product().enum_facts(),
             checked.product().namespace_facts(),
@@ -13234,6 +13312,7 @@ mod tests {
             files[1].product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             facts.enum_facts(),
             facts.namespace_facts(),
@@ -15991,6 +16070,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             checked.product().enum_facts(),
             checked.product().namespace_facts(),

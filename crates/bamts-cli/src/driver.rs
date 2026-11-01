@@ -1722,6 +1722,7 @@ fn forbidden_lint_override(error: bamts_compiler::lint::ForbidOverrideError) -> 
 fn lower_options(args: &CliArgs) -> LowerOptions {
     LowerOptions {
         javascript_compatibility: args.js_compat.enabled,
+        ..LowerOptions::default()
     }
 }
 

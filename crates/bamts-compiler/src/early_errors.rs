@@ -44,11 +44,50 @@ const STRICT_RESERVED: [&str; 9] = [
 #[must_use]
 pub fn check(file: &SourceFile) -> Vec<Diagnostic> {
     let module = is_module(file);
-    let context = Context {
-        strict: module || has_use_strict(file, file.statements()),
-        module,
-        ..Context::default()
-    };
+    walk(
+        file,
+        Context {
+            strict: module || has_use_strict(file, file.statements()),
+            module,
+            ..Context::default()
+        },
+    )
+}
+
+/// Reports every early error in `file`, which the host runs as a Script, so
+/// module syntax is one more of them.
+#[must_use]
+pub fn check_script(file: &SourceFile) -> Vec<Diagnostic> {
+    let mut errors = walk(
+        file,
+        Context {
+            strict: has_use_strict(file, file.statements()),
+            script: true,
+            ..Context::default()
+        },
+    );
+    errors.extend(
+        file.statements()
+            .iter()
+            .filter(|statement| {
+                matches!(
+                    statement.data(),
+                    Statement::Import(_) | Statement::Export(_)
+                )
+            })
+            .map(|statement| {
+                Diagnostic::error(
+                    EARLY_ERROR,
+                    file.source_id(),
+                    statement.range(),
+                    "module syntax is not allowed in a script",
+                )
+            }),
+    );
+    errors
+}
+
+fn walk(file: &SourceFile, context: Context) -> Vec<Diagnostic> {
     let mut walker = Walker {
         file,
         errors: Vec::new(),
@@ -64,6 +103,8 @@ pub fn check(file: &SourceFile) -> Vec<Diagnostic> {
 struct Context {
     strict: bool,
     module: bool,
+    /// The host named the goal, so `import.meta` is decidable.
+    script: bool,
     generator: bool,
     is_async: bool,
     in_parameters: bool,
@@ -839,6 +880,7 @@ impl Walker<'_> {
         Context {
             strict: context.strict,
             module: context.module,
+            script: context.script,
             new_target: true,
             ..Context::default()
         }
@@ -1417,6 +1459,9 @@ impl Walker<'_> {
             }
             Expression::Meta(MetaProperty::NewTarget) if !context.new_target => {
                 self.error(expression.range(), "`new.target` needs a function");
+            }
+            Expression::Meta(MetaProperty::ImportMeta) if context.script => {
+                self.error(expression.range(), "`import.meta` needs a module");
             }
             _ => {}
         }

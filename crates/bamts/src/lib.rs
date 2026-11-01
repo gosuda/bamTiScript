@@ -198,7 +198,28 @@ pub fn compile_source_file_with_lints(
     lints: &LintTable,
     cancel: &CancellationToken,
 ) -> Result<bamts_compiler::program::ExecutableProgram> {
-    let path = canonical_entrypoint_with_cancel(path.as_ref(), cancel)?;
+    compile_entry(path.as_ref(), lints, false, cancel)
+}
+
+/// Compiles an entrypoint the host runs as an ECMAScript Script. Its top-level
+/// `var` and function names live on the global object, and module syntax in it
+/// is an error. A file cannot say this of itself, which is why it is a separate
+/// entry: Node runs the same bytes as a CommonJS module.
+pub fn compile_script_file(
+    path: impl AsRef<Path>,
+    lints: &LintTable,
+    cancel: &CancellationToken,
+) -> Result<bamts_compiler::program::ExecutableProgram> {
+    compile_entry(path.as_ref(), lints, true, cancel)
+}
+
+fn compile_entry(
+    path: &Path,
+    lints: &LintTable,
+    script_entry: bool,
+    cancel: &CancellationToken,
+) -> Result<bamts_compiler::program::ExecutableProgram> {
+    let path = canonical_entrypoint_with_cancel(path, cancel)?;
     let fallback_root = path.parent().map(Path::to_path_buf).ok_or_else(|| {
         Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -222,7 +243,7 @@ pub fn compile_source_file_with_lints(
     if !diagnostics.is_empty() {
         return Err(Error::Diagnostics { diagnostics });
     }
-    let diagnostics = early_errors(&resolved.program);
+    let diagnostics = early_errors(&resolved.program, script_entry);
     if !diagnostics.is_empty() {
         return Err(Error::Diagnostics { diagnostics });
     }
@@ -231,6 +252,7 @@ pub fn compile_source_file_with_lints(
         &frontend,
         LowerOptions {
             javascript_compatibility: true,
+            script_entry,
         },
         cancel,
     )
@@ -239,7 +261,8 @@ pub fn compile_source_file_with_lints(
 
 /// The early errors of every JavaScript module about to run. TypeScript sources
 /// answer to the checker instead.
-fn early_errors(program: &ResolvedProgram) -> Vec<Diagnostic> {
+fn early_errors(program: &ResolvedProgram, script_entry: bool) -> Vec<Diagnostic> {
+    let entrypoint = program.entrypoint().source_id();
     program
         .modules()
         .iter()
@@ -255,7 +278,12 @@ fn early_errors(program: &ResolvedProgram) -> Vec<Diagnostic> {
                 module.script_kind(),
                 module.source().clone(),
             );
-            bamts_compiler::early_errors::check(parse(scanned).product())
+            let parsed = parse(scanned);
+            if script_entry && module.source_id() == entrypoint {
+                bamts_compiler::early_errors::check_script(parsed.product())
+            } else {
+                bamts_compiler::early_errors::check(parsed.product())
+            }
         })
         .collect()
 }

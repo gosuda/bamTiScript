@@ -2485,14 +2485,21 @@ pub fn lower_program_with_cancel(
                 ProgramLowerErrorKind::InvalidModuleName,
             )
         })?;
-        raw_modules.push(collect_raw_module(
+        let mut raw = collect_raw_module(
             module,
             output.source_file(),
             output.semantic_model().enum_facts(),
             output.semantic_model().namespace_facts(),
             name,
             &module_ids,
-        )?);
+        )?;
+        if runs_as_script(resolved, module, output.source_file(), options) {
+            // Its `var` and function names belong to the global object, so a
+            // module cell must not capture them.
+            raw.bindings
+                .retain(|binding| !matches!(binding.kind, RawBindingKind::Hoisted));
+        }
+        raw_modules.push(raw);
         check_lower_cancel(cancel, module.path(), ProgramLowerPhase::Metadata)?;
     }
     check_lower_cancel(
@@ -2529,7 +2536,10 @@ pub fn lower_program_with_cancel(
         let strings = linkage_strings(raw);
         let code = lower::assemble_program_module(
             file,
-            options,
+            LowerOptions {
+                script_entry: runs_as_script(resolved, resolved_module, file, options),
+                ..options
+            },
             &strings,
             raw.jsx_plan.as_ref(),
             output.semantic_model().enum_facts(),
@@ -3383,6 +3393,19 @@ fn materialize_program_module(
     }
 }
 
+/// Whether `module` is the Script the host asked for. A file with module syntax
+/// is a module either way, and the host decides whether that is an error.
+fn runs_as_script(
+    resolved: &ResolvedProgram,
+    module: &ResolvedModule,
+    file: &SourceFile,
+    options: LowerOptions,
+) -> bool {
+    options.script_entry
+        && module.source_id() == resolved.entrypoint().source_id()
+        && !crate::early_errors::is_module(file)
+}
+
 fn normalized_module_name(root: &ProjectRoot, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root.path()).ok()?;
     let mut name = String::new();
@@ -3648,6 +3671,7 @@ mod tests {
             &frontend,
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
         )
         .unwrap()
@@ -3746,6 +3770,7 @@ mod tests {
             &frontend,
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
         )
         .expect_err("ill-formed metadata must not reach host String conversion");
@@ -5531,6 +5556,7 @@ mod tests {
                 &frontend,
                 LowerOptions {
                     javascript_compatibility: true,
+                    ..LowerOptions::default()
                 },
             )
             .unwrap_or_else(|error| panic!("{entrypoint}: {error}"));
@@ -5697,6 +5723,7 @@ mod tests {
             &frontend,
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
         )
         .unwrap();

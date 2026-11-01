@@ -983,11 +983,13 @@ impl Test262Runner for InterpreterRunner {
             }
         };
 
-        let compiled = bamts::compile_source_file_with_lints(
-            &script,
-            &conformance_lints(),
-            &CancellationToken::new(),
-        );
+        let lints = conformance_lints();
+        let cancel = CancellationToken::new();
+        let compiled = if request.script.kind == SourceKind::Module {
+            bamts::compile_source_file_with_lints(&script, &lints, &cancel)
+        } else {
+            bamts::compile_script_file(&script, &lints, &cancel)
+        };
         let executable = match compiled {
             Ok(executable) => executable,
             Err(bamts::Error::Diagnostics { diagnostics }) => {
@@ -2009,6 +2011,67 @@ function $ERROR(message) {\n\
             ExecutionMode::Aot,
         ] {
             run_fixture_in(mode, &format!("object-rest-{mode:?}"), &source).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_script_declares_on_the_global_object() {
+        const CASES: [(&str, &str); 11] = [
+            (
+                "",
+                "function f() { var x = 1; var x; return x; } assert.sameValue(f(), 1);",
+            ),
+            ("", "var x = 1; assert.sameValue(globalThis.x, 1);"),
+            ("", "function f() {} assert.sameValue(globalThis.f, f);"),
+            ("", "assert.sameValue(hoisted, undefined); var hoisted = 1;"),
+            (
+                "",
+                "assert.sameValue(early(), 1); function early() { return 1; }",
+            ),
+            ("", "assert.sameValue(this, globalThis);"),
+            ("", "var undefined; assert.sameValue(undefined, void 0);"),
+            ("", "var Array; assert.sameValue(typeof Array, 'function');"),
+            (
+                "",
+                "let y = 1; assert.sameValue(y, 1); assert.sameValue('y' in globalThis, false);",
+            ),
+            (
+                "",
+                "var v = 1; (function () { v = 2; })(); assert.sameValue(globalThis.v, 2);",
+            ),
+            (
+                "flags: [module]",
+                "var x = 1; assert.sameValue('x' in globalThis, false); assert.sameValue(this, undefined);",
+            ),
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, (flags, body)) in CASES.iter().enumerate() {
+                let source = wrap(&format!("description: script goal\n{flags}"), body);
+                let label = format!("script-goal-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn module_syntax_is_an_early_error_in_a_script() {
+        for (index, body) in ["export var x;", "import './composed.js';", "import.meta;"]
+            .iter()
+            .enumerate()
+        {
+            let source = wrap(
+                "description: module syntax in a script\n\
+                 negative:\n  phase: parse\n  type: SyntaxError",
+                body,
+            );
+            run_fixture(&format!("script-goal-early-{index}"), &source)
+                .unwrap_or_else(|error| panic!("{body}: {error:?}"));
         }
     }
 
