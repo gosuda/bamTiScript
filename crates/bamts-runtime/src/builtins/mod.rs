@@ -1238,7 +1238,10 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::WeakRef { properties, .. }
             | HeapEntry::FinalizationRegistry { properties, .. }
             | HeapEntry::DisposableStack { properties, .. }
-            | HeapEntry::Timeout { properties, .. } => properties,
+            | HeapEntry::Timeout { properties, .. }
+            | HeapEntry::ArrayBuffer { properties, .. }
+            | HeapEntry::SharedArrayBuffer { properties, .. }
+            | HeapEntry::DataView { properties, .. } => properties,
             _ => return Ok(None),
         };
         Ok(properties.get(key).cloned())

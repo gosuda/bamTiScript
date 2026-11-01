@@ -655,8 +655,8 @@ fn notify<H: Host>(
 }
 
 /// A pending `Atomics.waitAsync`. The block's waiter list holds only its id,
-/// because a block can outlive any one heap and a `Value` in it would be
-/// invisible to the collector; the machine owns this record and traces `promise`.
+/// because the collector cannot see a `Value` inside a block; the machine owns
+/// this record and traces `promise`.
 #[derive(Debug)]
 pub(crate) struct AsyncWaiter {
     pub(crate) promise: Value,
@@ -1439,6 +1439,26 @@ mod tests {
                 Value::int32(0),
                 "a wait that failed to arm leaves no waiter"
             );
+        });
+    }
+
+    #[test]
+    fn buffers_and_data_views_report_their_own_properties() {
+        with_machine(|machine| {
+            let shared = shared_buffer(machine, 8, None);
+            let data_view = view_of(machine, "DataView", shared);
+            let unshared = machine.intrinsics.global("ArrayBuffer").unwrap();
+            let unshared = machine
+                .construct_value(unshared, &[Value::int32(8)])
+                .unwrap();
+            for object in [shared, data_view, unshared] {
+                machine
+                    .set_data_property(object, "marker", Value::int32(1))
+                    .unwrap();
+                let key = PropertyKey::Named(EcmaString::encode("marker"));
+                assert!(machine.own_descriptor(object, &key).unwrap().is_some());
+                assert_eq!(machine.enumerable_keys(object).unwrap().len(), 1);
+            }
         });
     }
 
