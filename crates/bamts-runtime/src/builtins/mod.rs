@@ -1058,8 +1058,10 @@ impl<'a, H: Host> Machine<'a, H> {
         {
             return Ok(false);
         }
+        // The cycle walk stops at a proxy, whose [[GetPrototypeOf]] is not ordinary.
         let mut node = proposed;
-        while !matches!(node.decode(), Some(Decoded::Null)) {
+        while !matches!(node.decode(), Some(Decoded::Null)) && !self.heap_entry_is_proxy_value(node)
+        {
             if node == object {
                 return Ok(false);
             }
