@@ -12,6 +12,7 @@ mod number_format;
 mod options;
 mod plural_rules;
 mod relative_time_format;
+mod segmenter;
 
 use std::collections::BTreeMap;
 
@@ -126,6 +127,7 @@ pub(super) fn install<H: Host>(
     plural_rules::install(heap, builtins, namespace);
     list_format::install(heap, builtins, namespace);
     relative_time_format::install(heap, builtins, namespace);
+    segmenter::install(heap, builtins, namespace);
     display_names::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Intl"), namespace);
 }
@@ -535,6 +537,34 @@ pub(super) fn is_type_sequence(value: &str) -> bool {
         && value.split('-').all(|part| {
             (3..=8).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
         })
+}
+
+/// Sets a symbol-keyed method, as a data property like any other.
+fn define_symbol_method(heap: &mut [HeapEntry], object: Value, symbol: Value, function: Value) {
+    let symbol = super::heap_index(symbol);
+    let HeapEntry::Object { properties, .. } = &mut heap[super::heap_index(object)] else {
+        panic!("method target is an ordinary object");
+    };
+    properties.insert(
+        PropertyKey::Symbol(symbol as u32),
+        Property::Data {
+            value: function,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        },
+    );
+}
+
+fn set_prototype(heap: &mut [HeapEntry], object: Value, parent: Value) {
+    let HeapEntry::Object { prototype, .. } = &mut heap[super::heap_index(object)] else {
+        panic!("prototype target is an ordinary object");
+    };
+    *prototype = Some(parent);
+}
+
+fn define_tag(heap: &mut Vec<HeapEntry>, object: Value, symbol: Value, tag: &str) {
+    super::define_to_string_tag(heap, object, symbol, tag);
 }
 
 /// StringListFromIterable.
