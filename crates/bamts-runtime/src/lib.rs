@@ -7734,6 +7734,49 @@ impl<'a, H: Host> Machine<'a, H> {
         self.box_primitive(value)
     }
 
+    /// The string inside a String exotic object.
+    fn boxed_string(&self, index: usize) -> Option<&EcmaString> {
+        let HeapEntry::Object {
+            boxed_primitive: Some(primitive),
+            ..
+        } = &self.heap[index]
+        else {
+            return None;
+        };
+        let slot = self.runtime_slot(*primitive).ok().flatten()?;
+        match &self.heap[slot] {
+            HeapEntry::String(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// `StringGetOwnProperty`, plus the `length` every String exotic object owns.
+    pub(crate) fn string_exotic_property(
+        &mut self,
+        index: usize,
+        key: &PropertyKey,
+    ) -> Result<Option<Property>, EvalFailure> {
+        let found = self
+            .boxed_string(index)
+            .and_then(|text| string_own_get(text, key));
+        let (value, enumerable) = match found {
+            Some(Found::Value(length)) => (length, false),
+            Some(Found::Text(unit)) => {
+                let unit = self
+                    .allocate(HeapEntry::String(unit))
+                    .map_err(EvalFailure::Runtime)?;
+                (unit, true)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Property::Data {
+            value,
+            writable: false,
+            enumerable,
+            configurable: false,
+        }))
+    }
+
     pub(crate) fn unbox_primitive_or_self(&self, value: Value) -> Result<Value, EvalFailure> {
         let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
             return Ok(value);
@@ -9866,6 +9909,12 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
+                if self
+                    .boxed_string(index)
+                    .is_some_and(|text| string_own_get(text, key).is_some())
+                {
+                    return Ok(false);
+                }
                 if let PropertyKey::Named(name) = key
                     && let Some(typed_index) = typedarray_all::typed_array_index(name)
                     && matches!(self.heap[index], HeapEntry::TypedArray { .. })
@@ -11991,6 +12040,12 @@ impl<'a, H: Host> Machine<'a, H> {
                 .internal_get_own_property(src, key)?
                 .is_some_and(|descriptor| descriptor.enumerable == Some(true)));
         }
+        if self
+            .boxed_string(index)
+            .is_some_and(|text| string_has_index(text, key))
+        {
+            return Ok(true);
+        }
         Ok(match &self.heap[index] {
             HeapEntry::Array {
                 elements,
@@ -12008,9 +12063,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 },
                 Property::enumerable,
             ),
-            HeapEntry::String(text) => key.as_string().is_some_and(|name| {
-                array_index(name).is_some_and(|offset| (offset as usize) < text.len_units())
-            }),
+            HeapEntry::String(text) => string_has_index(text, key),
             HeapEntry::TypedArray { properties, .. } => properties.get(key).map_or_else(
                 || {
                     key.as_string()
@@ -13537,6 +13590,12 @@ fn array_index(key: &EcmaString) -> Option<u32> {
             .checked_add(u32::from(unit - u16::from(b'0')))?;
     }
     (index != u32::MAX).then_some(index)
+}
+
+fn string_has_index(text: &EcmaString, key: &PropertyKey) -> bool {
+    key.as_string().is_some_and(|name| {
+        array_index(name).is_some_and(|offset| (offset as usize) < text.len_units())
+    })
 }
 
 fn string_own_get(text: &EcmaString, key: &PropertyKey) -> Option<Found> {

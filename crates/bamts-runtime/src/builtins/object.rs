@@ -721,6 +721,56 @@ mod tests {
     }
 
     #[test]
+    fn string_wrappers_own_read_only_length_and_code_units() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let text = allocate_string(&mut machine, EcmaString::encode("ab")).unwrap();
+        let wrapper = machine.value_to_object(text).unwrap();
+        for (name, expected_enumerable) in [("0", true), ("1", true), ("length", false)] {
+            assert!(matches!(
+                machine.own_descriptor(wrapper, &named(name)).unwrap(),
+                Some(Property::Data {
+                    writable: false,
+                    enumerable,
+                    configurable: false,
+                    ..
+                }) if enumerable == expected_enumerable
+            ));
+            assert!(!machine.internal_delete(wrapper, &named(name)).unwrap());
+            assert!(
+                !machine
+                    .internal_set(wrapper, named(name), Value::int32(0), wrapper)
+                    .unwrap()
+            );
+        }
+        assert!(
+            machine
+                .own_descriptor(wrapper, &named("2"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            machine
+                .internal_set(wrapper, named("2"), Value::int32(0), wrapper)
+                .unwrap()
+        );
+        assert_eq!(machine.enumerable_keys(wrapper).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn freezing_a_string_wrapper_keeps_its_exotic_properties() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let text = allocate_string(&mut machine, EcmaString::encode("ab")).unwrap();
+        let wrapper = machine.value_to_object(text).unwrap();
+        call_object(&mut machine, "freeze", &[wrapper]).unwrap();
+        let frozen = call_object(&mut machine, "isFrozen", &[wrapper]).unwrap();
+        assert_eq!(frozen, Value::TRUE);
+    }
+
+    #[test]
     fn function_prototype_is_a_function_without_construct() {
         let module = blank_program("<test>");
         let mut host = TestHost;

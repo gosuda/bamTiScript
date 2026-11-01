@@ -1220,6 +1220,9 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Ok(None);
         };
+        if let Some(property) = self.string_exotic_property(index, key)? {
+            return Ok(Some(property));
+        }
         let properties = match &self.heap[index] {
             HeapEntry::ModuleNamespace { module } => {
                 let PropertyKey::Named(name) = key else {
@@ -1426,6 +1429,22 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Err(type_error("Object.defineProperty called on non-object"));
         };
+        if let Some(Property::Data {
+            value: stored,
+            enumerable,
+            ..
+        }) = self.string_exotic_property(index, &key)?
+        {
+            return match descriptor {
+                Property::Data {
+                    value,
+                    writable: false,
+                    enumerable: requested,
+                    configurable: false,
+                } if requested == enumerable && self.same_value(value, stored) => Ok(()),
+                _ => Err(type_error("Cannot redefine property")),
+            };
+        }
         if let PropertyKey::Named(name) = &key
             && let Some(typed_index) = typedarray_all::typed_array_index(name)
             && matches!(self.heap[index], HeapEntry::TypedArray { .. })
