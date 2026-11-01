@@ -683,6 +683,28 @@ mod tests {
     }
 
     #[test]
+    fn writing_an_element_with_a_descriptor_keeps_its_attributes() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = allocate_array(&mut machine, vec![Value::int32(1)]).unwrap();
+        machine
+            .define_descriptor(array, named("0"), pinned_element(Value::int32(1)))
+            .unwrap();
+        machine
+            .set_data_property(array, "0", Value::int32(9))
+            .unwrap();
+        assert!(matches!(
+            machine.own_descriptor(array, &named("0")).unwrap(),
+            Some(Property::Data {
+                value,
+                configurable: false,
+                ..
+            }) if value == Value::int32(9)
+        ));
+    }
+
+    #[test]
     fn function_prototype_is_a_function_without_construct() {
         let module = blank_program("<test>");
         let mut host = TestHost;

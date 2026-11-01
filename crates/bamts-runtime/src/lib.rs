@@ -9586,7 +9586,14 @@ impl<'a, H: Host> Machine<'a, H> {
                                     "set array index",
                                 )?;
                             }
-                            elements[offset] = value;
+                            let key = PropertyKey::Named(name);
+                            if let Some(Property::Data { value: stored, .. }) =
+                                properties.get_mut(&key)
+                            {
+                                *stored = value;
+                            } else {
+                                elements[offset] = value;
+                            }
                         } else {
                             let key = PropertyKey::Named(name);
                             let descriptor = match properties.get(&key) {
