@@ -3,21 +3,23 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::arraybuffer::{
-    SharedBlock, grow_shared_array_buffer, species_constructor, to_clamped_index, to_index,
+    SharedBlock, Suspension, Waiter, grow_shared_array_buffer, species_constructor,
+    to_clamped_index, to_index,
 };
 use super::bigint;
 use super::typedarray_all::{
-    ElementKind, TypedArraySnapshot, integer_or_infinity, storage_from_value, typed_array_snapshot,
-    value_from_storage,
+    ElementKind, TypedArraySnapshot, ViewBuffer, integer_or_infinity, storage_from_value,
+    typed_array_snapshot, value_from_storage,
 };
 use super::{
-    define_data, define_to_string_tag, heap_index, install_constructor_function, install_function,
-    range_error, type_error,
+    allocate_string, define_data, define_to_string_tag, heap_index, install_constructor_function,
+    install_function, range_error, type_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
@@ -108,10 +110,12 @@ fn install_atomics<H: Host>(
         ("exchange", 3, exchange::<H>),
         ("isLockFree", 1, is_lock_free::<H>),
         ("load", 2, load::<H>),
+        ("notify", 3, notify::<H>),
         ("or", 3, or::<H>),
         ("pause", 0, pause::<H>),
         ("store", 3, store::<H>),
         ("sub", 3, sub::<H>),
+        ("wait", 4, wait::<H>),
         ("xor", 3, xor::<H>),
     ] {
         let function = install_function(heap, builtins, name, length, handler);
@@ -549,11 +553,115 @@ fn pause<H: Host>(
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 
+/// The validated, coerced arguments of DoWait, up to the critical section.
+struct WaitRequest {
+    block: Arc<SharedBlock>,
+    position: usize,
+    size: usize,
+    expected: [u8; 8],
+    /// `None` is a wait with no timeout.
+    timeout_ms: Option<f64>,
+}
+
+impl WaitRequest {
+    fn parse<H: Host>(machine: &mut Machine<'_, H>, args: &[Value]) -> Result<Self, EvalFailure> {
+        let snapshot = validate_integer_typed_array(machine, argument(args, 0), true)?;
+        let ViewBuffer::Shared(block) = &snapshot.buffer else {
+            return Err(type_error("Atomics wait operations require shared memory"));
+        };
+        let position = validate_atomic_access(machine, &snapshot, argument(args, 1))?;
+        let expected = storage_from_value(machine, snapshot.kind, argument(args, 2))?;
+        let timeout = value_number(machine.coerce_number_observable(argument(args, 3))?);
+        Ok(Self {
+            block: Arc::clone(block),
+            position,
+            size: snapshot.kind.element_size(),
+            expected,
+            timeout_ms: (!timeout.is_nan() && timeout != f64::INFINITY).then(|| timeout.max(0.0)),
+        })
+    }
+
+    /// Must be asked inside the waiter critical section: a writer changes the
+    /// value before it notifies, so it either is seen here or finds the waiter.
+    fn value_is_expected(&self) -> bool {
+        self.block.with_bytes(|bytes| {
+            bytes[self.position..self.position + self.size] == self.expected[..self.size]
+        })
+    }
+}
+
+fn wait<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let request = WaitRequest::parse(machine, args)?;
+    if !machine.limits.agent_can_suspend {
+        return Err(type_error("Atomics.wait cannot suspend this agent"));
+    }
+    let suspension = Arc::new(Suspension::default());
+    let waiter = Waiter::Blocking(Arc::clone(&suspension));
+    {
+        let mut waiters = request.block.waiters();
+        if !request.value_is_expected() {
+            drop(waiters);
+            return string_outcome(machine, "not-equal");
+        }
+        waiters.add(request.position, waiter.clone());
+    }
+    let deadline = request
+        .timeout_ms
+        .and_then(|milliseconds| Duration::try_from_secs_f64(milliseconds / 1000.0).ok())
+        .and_then(|timeout| Instant::now().checked_add(timeout));
+    let woken = suspension.wait(deadline, &machine.cancel)
+        || !request.block.waiters().remove(request.position, &waiter);
+    if woken {
+        return string_outcome(machine, "ok");
+    }
+    machine.check_cancel().map_err(EvalFailure::Runtime)?;
+    string_outcome(machine, "timed-out")
+}
+
+fn notify<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let snapshot = validate_integer_typed_array(machine, argument(args, 0), true)?;
+    let position = validate_atomic_access(machine, &snapshot, argument(args, 1))?;
+    let count = match argument(args, 2) {
+        Value::UNDEFINED => usize::MAX,
+        // A float-to-integer cast saturates, which is what infinity asks for.
+        value => integer_or_infinity(machine, value)?.max(0.0) as usize,
+    };
+    let ViewBuffer::Shared(block) = &snapshot.buffer else {
+        return Ok(BuiltinOutcome::Value(Value::int32(0)));
+    };
+    let woken = block.waiters().take(position, count);
+    for waiter in &woken {
+        match waiter {
+            Waiter::Blocking(suspension) => suspension.wake(),
+        }
+    }
+    Ok(BuiltinOutcome::Value(crate::number_value(
+        woken.len() as f64
+    )))
+}
+
+fn string_outcome<H: Host>(
+    machine: &mut Machine<'_, H>,
+    text: &str,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    allocate_string(machine, EcmaString::encode(text)).map(BuiltinOutcome::Value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{TestHost, blank_program};
     use super::*;
-    use crate::{Limits, ThrowOrigin};
+    use crate::{CancellationToken, Limits, RuntimeErrorKind, ThrowOrigin};
 
     fn atomics(machine: &Machine<'_, TestHost>) -> Value {
         machine
@@ -756,6 +864,192 @@ mod tests {
                 ));
             }
         });
+    }
+
+    fn result_is(machine: &Machine<'_, TestHost>, value: Value, expected: &str) -> bool {
+        machine
+            .string_value(value)
+            .is_some_and(|text| text.eq_ascii(expected))
+    }
+
+    #[test]
+    fn wait_compares_the_value_before_it_suspends() {
+        with_machine(|machine| {
+            let buffer = shared_buffer(machine, 8, None);
+            let view = view_of(machine, "Int32Array", buffer);
+            let namespace = atomics(machine);
+            let result = call(
+                machine,
+                namespace,
+                "wait",
+                &[view, Value::int32(0), Value::int32(1)],
+            )
+            .unwrap();
+            assert!(result_is(machine, result, "not-equal"));
+        });
+    }
+
+    #[test]
+    fn wait_blocks_for_its_timeout_and_leaves_no_waiter_behind() {
+        with_machine(|machine| {
+            let buffer = shared_buffer(machine, 8, None);
+            let view = view_of(machine, "Int32Array", buffer);
+            let namespace = atomics(machine);
+            let started = Instant::now();
+            let result = call(
+                machine,
+                namespace,
+                "wait",
+                &[view, Value::int32(0), Value::int32(0), Value::int32(30)],
+            )
+            .unwrap();
+            assert!(result_is(machine, result, "timed-out"));
+            assert!(started.elapsed() >= Duration::from_millis(30));
+            let woken = call(machine, namespace, "notify", &[view, Value::int32(0)]).unwrap();
+            assert_eq!(woken, Value::int32(0));
+        });
+    }
+
+    #[test]
+    fn a_notifier_on_another_thread_wakes_a_suspended_wait() {
+        with_machine(|machine| {
+            let buffer = shared_buffer(machine, 8, None);
+            let view = view_of(machine, "Int32Array", buffer);
+            let block = shared_block(machine, buffer).unwrap();
+            let namespace = atomics(machine);
+            let notifier = std::thread::spawn(move || {
+                loop {
+                    let woken = block.waiters().take(0, 1);
+                    if let [Waiter::Blocking(suspension)] = woken.as_slice() {
+                        suspension.wake();
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+            });
+            let result = call(
+                machine,
+                namespace,
+                "wait",
+                &[view, Value::int32(0), Value::int32(0)],
+            )
+            .unwrap();
+            notifier.join().unwrap();
+            assert!(result_is(machine, result, "ok"));
+        });
+    }
+
+    #[test]
+    fn cancellation_ends_an_unbounded_wait_and_withdraws_its_waiter() {
+        let program = blank_program("<atomics-test>");
+        let mut host = TestHost;
+        let cancel = CancellationToken::new();
+        let mut machine =
+            Machine::new_with_cancel(&program, &mut host, Limits::default(), cancel.clone());
+        let buffer = shared_buffer(&mut machine, 8, None);
+        let view = view_of(&mut machine, "Int32Array", buffer);
+        let block = shared_block(&machine, buffer).unwrap();
+        let namespace = atomics(&machine);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            cancel.cancel();
+        });
+        let result = call(
+            &mut machine,
+            namespace,
+            "wait",
+            &[view, Value::int32(0), Value::int32(0)],
+        );
+        canceller.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(EvalFailure::Runtime(RuntimeErrorKind::Cancelled))
+        ));
+        assert!(block.waiters().take(0, usize::MAX).is_empty());
+    }
+
+    #[test]
+    fn waiters_queue_per_position_and_wake_oldest_first() {
+        let block = SharedBlock::new(vec![0; 16], None);
+        let (first, second, elsewhere) = (
+            Waiter::Blocking(Arc::default()),
+            Waiter::Blocking(Arc::default()),
+            Waiter::Blocking(Arc::default()),
+        );
+        let mut list = block.waiters();
+        list.add(0, first.clone());
+        list.add(8, elsewhere.clone());
+        list.add(0, second.clone());
+        let [Waiter::Blocking(taken)] = list.take(0, 1).try_into().unwrap();
+        let Waiter::Blocking(oldest) = &first;
+        assert!(Arc::ptr_eq(&taken, oldest));
+        assert!(!list.remove(0, &first), "a taken waiter is gone");
+        assert!(list.remove(0, &second));
+        assert!(list.take(0, usize::MAX).is_empty());
+        assert_eq!(list.take(8, usize::MAX).len(), 1);
+    }
+
+    #[test]
+    fn wait_is_refused_on_unshared_memory_and_views_that_cannot_wait() {
+        with_machine(|machine| {
+            let namespace = atomics(machine);
+            let unshared = machine.intrinsics.global("ArrayBuffer").unwrap();
+            let unshared = machine
+                .construct_value(unshared, &[Value::int32(8)])
+                .unwrap();
+            let unshared = view_of(machine, "Int32Array", unshared);
+            let shared = shared_buffer(machine, 8, None);
+            let bytes = view_of(machine, "Uint8Array", shared);
+            for view in [unshared, bytes] {
+                assert!(matches!(
+                    call(
+                        machine,
+                        namespace,
+                        "wait",
+                        &[view, Value::int32(0), Value::int32(0), Value::int32(0)]
+                    ),
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+                ));
+            }
+            let woken = call(machine, namespace, "notify", &[unshared, Value::int32(0)]).unwrap();
+            assert_eq!(
+                woken,
+                Value::int32(0),
+                "notify on unshared memory is a no-op"
+            );
+        });
+    }
+
+    #[test]
+    fn an_agent_that_cannot_suspend_rejects_wait_after_validating_its_arguments() {
+        let program = blank_program("<atomics-test>");
+        let mut host = TestHost;
+        let limits = Limits {
+            agent_can_suspend: false,
+            ..Limits::default()
+        };
+        let mut machine = Machine::new(&program, &mut host, limits);
+        let buffer = shared_buffer(&mut machine, 8, None);
+        let view = view_of(&mut machine, "Int32Array", buffer);
+        let namespace = atomics(&machine);
+        assert!(matches!(
+            call(
+                &mut machine,
+                namespace,
+                "wait",
+                &[view, Value::int32(0), Value::int32(0), Value::int32(0)]
+            ),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        assert!(matches!(
+            call(
+                &mut machine,
+                namespace,
+                "wait",
+                &[view, Value::int32(99), Value::int32(0), Value::int32(0)]
+            ),
+            Err(EvalFailure::Throw(ThrowOrigin::RangeError { .. }))
+        ));
     }
 
     #[test]

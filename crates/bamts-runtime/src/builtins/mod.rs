@@ -2198,10 +2198,12 @@ mod tests {
                 "exchange",
                 "isLockFree",
                 "load",
+                "notify",
                 "or",
                 "pause",
                 "store",
                 "sub",
+                "wait",
                 "xor",
             ]
         );

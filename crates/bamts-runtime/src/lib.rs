@@ -96,6 +96,8 @@ pub struct Limits {
     pub max_microtasks: usize,
     /// Ceiling on live timers armed at once.
     pub max_timers: usize,
+    /// This agent's `[[CanBlock]]`: whether `Atomics.wait` may suspend it.
+    pub agent_can_suspend: bool,
 }
 
 impl Default for Limits {
@@ -111,6 +113,7 @@ impl Default for Limits {
             max_dynamic_modules: 1 << 10,
             max_microtasks: 1 << 20,
             max_timers: 1 << 20,
+            agent_can_suspend: true,
         }
     }
 }
