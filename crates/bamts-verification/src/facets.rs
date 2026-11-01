@@ -672,9 +672,85 @@ fn compare_structural(
         FacetVerdict::Pass
     } else {
         FacetVerdict::Fail {
-            reason: format!("{facet} structural mismatch after formatting/order normalization"),
+            reason: format!(
+                "{facet} structural mismatch {}",
+                describe_difference(&expected_norm, &actual_norm)
+            ),
         }
     }
+}
+
+/// Longest excerpt of a differing line kept in a reason.
+const EXCERPT_CHARS: usize = 100;
+
+/// `[category]: where`, naming the first difference between two normalized
+/// outputs. The category is a plain word, so rows that differ the same way group
+/// together. The lines themselves sit in backticks, so a family ignores them.
+fn describe_difference(expected: &[String], actual: &[String]) -> String {
+    let common = expected
+        .iter()
+        .zip(actual)
+        .take_while(|(left, right)| left == right)
+        .count();
+    match (expected.get(common), actual.get(common)) {
+        (None, Some(extra)) => format!(
+            "[extra-lines]: actual has {} extra line(s) from line {}: `{}`",
+            actual.len() - common,
+            common + 1,
+            excerpt(extra)
+        ),
+        (Some(missing), None) => format!(
+            "[missing-lines]: actual ends at line {common}; expected continues with `{}`",
+            excerpt(missing)
+        ),
+        (Some(left), Some(right)) => {
+            let mut sorted_expected = expected.to_vec();
+            let mut sorted_actual = actual.to_vec();
+            sorted_expected.sort();
+            sorted_actual.sort();
+            let category = if sorted_expected == sorted_actual {
+                "order"
+            } else {
+                line_difference(left, right)
+            };
+            format!(
+                "[{category}]: line {} expected `{}` actual `{}`",
+                common + 1,
+                excerpt(left),
+                excerpt(right)
+            )
+        }
+        // The slices differ, so one of them has a line at `common`.
+        (None, None) => "[text]: outputs differ".to_owned(),
+    }
+}
+
+/// How two lines at the same position differ, from the most to the least specific.
+fn line_difference(expected: &str, actual: &str) -> &'static str {
+    let unquoted = |text: &str| text.replace('\'', "\"");
+    let unpunctuated = |text: &str| text.trim_end_matches([';', ',']).to_owned();
+    if expected.split_whitespace().eq(actual.split_whitespace()) {
+        "spacing"
+    } else if expected.eq_ignore_ascii_case(actual) {
+        "case"
+    } else if unquoted(expected) == unquoted(actual) {
+        "quote-style"
+    } else if unpunctuated(expected) == unpunctuated(actual) {
+        "punctuation"
+    } else {
+        "text"
+    }
+}
+
+/// A line cut to a readable length, with backticks replaced so it can sit in one.
+fn excerpt(line: &str) -> String {
+    let line = line.trim().replace('`', "'");
+    if line.chars().count() <= EXCERPT_CHARS {
+        return line;
+    }
+    let mut cut: String = line.chars().take(EXCERPT_CHARS).collect();
+    cut.push('…');
+    cut
 }
 
 /// Declared identity of one element in a declaration-set container.
@@ -1987,6 +2063,97 @@ fn schema_error(detail: impl Into<String>) -> VerificationError {
 mod tests {
     use super::*;
     use crate::corpus::{OracleOutcome, Provenance};
+
+    fn js_reason(expected: &str, actual: &str) -> String {
+        match compare_js_emit(expected, actual) {
+            FacetVerdict::Fail { reason } => reason,
+            other => panic!("a difference must fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_mismatch_names_its_category_and_the_first_differing_line() {
+        let cases: [(&str, &str, &str, &[&str]); 8] = [
+            (
+                "a\nb",
+                "a\nb\nc\nd",
+                "extra-lines",
+                &["2 extra line(s) from line 3", "`c`"],
+            ),
+            (
+                "a\nb\nc",
+                "a\nb",
+                "missing-lines",
+                &["ends at line 2", "`c`"],
+            ),
+            (
+                "a\nb\nc",
+                "a\nc\nb",
+                "order",
+                &["line 2", "expected `b`", "actual `c`"],
+            ),
+            (
+                "var x = 1;",
+                "var  x =  1;",
+                "spacing",
+                &["line 1", "expected `var x = 1;`"],
+            ),
+            ("let s = 'a';", "let s = \"a\";", "quote-style", &["line 1"]),
+            (
+                "f()",
+                "f();",
+                "punctuation",
+                &["expected `f()`", "actual `f();`"],
+            ),
+            ("Foo();", "foo();", "case", &["line 1"]),
+            (
+                "ok\na = 1;",
+                "ok\na = 2;",
+                "text",
+                &["line 2", "expected `a = 1;`", "actual `a = 2;`"],
+            ),
+        ];
+        for (expected, actual, category, mentions) in cases {
+            let reason = js_reason(expected, actual);
+            assert!(
+                reason.starts_with(&format!("javascript structural mismatch [{category}]: ")),
+                "{category}: {reason}"
+            );
+            for mention in mentions {
+                assert!(reason.contains(mention), "{category}: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_mismatch_stays_a_failure_and_equal_output_still_passes() {
+        assert!(compare_js_emit("a = 1;", "a = 2;").is_fail());
+        assert!(compare_js_emit("a = 1;\r\n", "a = 1;  \n").is_pass());
+    }
+
+    #[test]
+    fn a_reason_excerpts_long_lines_and_never_nests_backticks() {
+        let long = "x".repeat(400);
+        let reason = js_reason("ok", &format!("ok\n{long}"));
+        assert!(reason.len() < 200, "{} bytes: {reason}", reason.len());
+        let tick = js_reason("a `b` c", "a `d` c");
+        assert_eq!(tick.matches('`').count() % 2, 0, "{tick}");
+        assert!(!tick.contains("`b`"), "{tick}");
+    }
+
+    #[test]
+    fn rows_that_differ_in_category_not_in_content_share_a_family() {
+        use crate::sweep_report::family_name;
+        let family =
+            |expected: &str, actual: &str| family_name("javascript", &js_reason(expected, actual));
+        assert_eq!(
+            family("a = 1;", "a = 2;"),
+            family("return f(x);", "return g(y);")
+        );
+        assert_eq!(family("f()", "f();"), family("g(1, 2)", "g(1, 2);"));
+        assert_ne!(family("a = 1;", "a = 2;"), family("f()", "f();"));
+        assert_ne!(family("a\nb", "a\nb\nc"), family("a\nb\nc", "a\nb"));
+    }
 
     fn empty_map_json(entries: &[(&str, DiagnosticMappingStatus, Option<u32>)]) -> String {
         let evidence = "fixture evidence";
