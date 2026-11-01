@@ -284,6 +284,7 @@ pub fn judge_stage_outcome(
     let thrown = failure.map(|(stage, error_type)| ThrownError {
         phase: stage.phase(),
         error_type,
+        message: String::new(),
     });
     judge_run(request, &RunOutcome::Completed { thrown }).map_err(HarnessError::Oracle)
 }

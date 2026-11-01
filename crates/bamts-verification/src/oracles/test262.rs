@@ -50,6 +50,8 @@ pub enum OracleError {
     ExpectationMismatch {
         expected: String,
         actual: String,
+        /// What the throw said, when it said anything.
+        message: String,
     },
     /// The runner could not observe the script at all. Always blocking.
     BlockedRun {
@@ -287,6 +289,8 @@ pub struct RunRequest {
 pub struct ThrownError {
     pub phase: NegativePhase,
     pub error_type: NegativeType,
+    /// What the throw said. Never part of a verdict.
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -629,6 +633,32 @@ pub fn judge_done(trace: &AsyncTrace) -> Result<(), DoneFailure> {
     }
 }
 
+/// What a failed run reports. A mismatch reads as its cause, so runs that failed
+/// the same way group together in a sweep report.
+fn failure_detail(error: &OracleError) -> String {
+    match error {
+        OracleError::ExpectationMismatch {
+            expected,
+            actual,
+            message,
+        } if message.is_empty() => format!("expected {expected}, got {actual}"),
+        OracleError::ExpectationMismatch {
+            expected,
+            actual,
+            message,
+        } => format!("expected {expected}, got {actual}: {message}"),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The first diagnostic of a rejected parse, which is what the parser objected to.
+fn parse_message(diagnostics: &[Diagnostic]) -> String {
+    diagnostics
+        .first()
+        .map(|diagnostic| format!("{} {}", diagnostic.code().as_str(), diagnostic.message()))
+        .unwrap_or_default()
+}
+
 pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), OracleError> {
     match outcome {
         RunOutcome::Async(trace) => {
@@ -636,6 +666,7 @@ pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), Oracl
                 return Err(OracleError::ExpectationMismatch {
                     expected: "non-async".to_owned(),
                     actual: "async".to_owned(),
+                    message: String::new(),
                 });
             }
             match judge_done(trace) {
@@ -644,6 +675,7 @@ pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), Oracl
                     Some(expected) => Err(OracleError::ExpectationMismatch {
                         expected: format!("{:?}/{}", expected.phase, expected.error_type.as_str()),
                         actual: "async completion".to_owned(),
+                        message: String::new(),
                     }),
                 },
                 Err(DoneFailure::Error) => match &request.negative {
@@ -676,6 +708,7 @@ pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), Oracl
                                         trace.failure_value.as_deref().unwrap_or_default()
                                     ),
                                 },
+                                message: trace.failure_value.clone().unwrap_or_default(),
                             })
                         }
                     }
@@ -698,16 +731,19 @@ pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), Oracl
                     Err(OracleError::ExpectationMismatch {
                         expected: format!("{:?}/{}", expected.phase, expected.error_type.as_str()),
                         actual: format!("{:?}/{}", actual.phase, actual.error_type.as_str()),
+                        message: actual.message.clone(),
                     })
                 }
             }
             (Some(expected), None) => Err(OracleError::ExpectationMismatch {
                 expected: format!("{:?}/{}", expected.phase, expected.error_type.as_str()),
                 actual: "completed".to_owned(),
+                message: String::new(),
             }),
             (None, Some(actual)) => Err(OracleError::ExpectationMismatch {
                 expected: "success".to_owned(),
                 actual: format!("{:?}/{}", actual.phase, actual.error_type.as_str()),
+                message: actual.message.clone(),
             }),
         },
         RunOutcome::Blocked { detail } => Err(OracleError::BlockedRun {
@@ -750,7 +786,7 @@ pub fn evaluate_in_all_modes<R: Test262Runner>(
             if let Err(error) = judge_run(&request, &outcome) {
                 return Err(OracleError::ModeFailure(ModeFailure {
                     mode,
-                    detail: format!("{error:?}"),
+                    detail: failure_detail(&error),
                 }));
             }
         }
@@ -799,7 +835,7 @@ pub fn evaluate_in_mode<R: Test262Runner>(
         if let Err(error) = judge_run(&request, &outcome) {
             return Err(OracleError::ModeFailure(ModeFailure {
                 mode,
-                detail: format!("{error:?}"),
+                detail: failure_detail(&error),
             }));
         }
     }
@@ -1018,6 +1054,7 @@ fn parse_phase_outcome(diagnostics: &[Diagnostic]) -> RunOutcome {
             thrown: Some(ThrownError {
                 phase: NegativePhase::Parse,
                 error_type: NegativeType::SyntaxError,
+                message: parse_message(diagnostics),
             }),
         };
     }
@@ -1067,12 +1104,16 @@ fn observed_failure(error: &bamts_runtime::RuntimeError, deadline: Duration) -> 
         RuntimeErrorKind::UncaughtThrow {
             origin,
             constructor_name,
+            message,
             ..
         } => match classify_thrown(*origin, constructor_name.as_ref()) {
             Some(error_type) => RunOutcome::Completed {
                 thrown: Some(ThrownError {
                     phase: NegativePhase::Runtime,
                     error_type,
+                    message: message
+                        .as_ref()
+                        .map_or_else(|| format!("{origin:?}"), EcmaString::to_utf8_lossy),
                 }),
             },
             None => {
@@ -1341,6 +1382,7 @@ function $ERROR(message) {\n\
                     thrown: Some(ThrownError {
                         phase: negative.phase,
                         error_type: negative.error_type,
+                        message: String::new(),
                     }),
                 }
             } else {
@@ -1358,6 +1400,7 @@ function $ERROR(message) {\n\
                     thrown: Some(ThrownError {
                         phase: NegativePhase::Runtime,
                         error_type: NegativeType::TypeError,
+                        message: String::new(),
                     }),
                 }
             } else {
@@ -2051,7 +2094,9 @@ function $ERROR(message) {\n\
             async_done_outcome(DoneEventKind::Error, Some("CustomError: not a known type"));
 
         match judge_run(&request, &outcome) {
-            Err(OracleError::ExpectationMismatch { expected, actual }) => {
+            Err(OracleError::ExpectationMismatch {
+                expected, actual, ..
+            }) => {
                 assert_eq!(expected, "Runtime/Test262Error");
                 assert_eq!(actual, "Runtime/CustomError: not a known type");
             }
@@ -2171,11 +2216,50 @@ function $ERROR(message) {\n\
             // this is an ExpectationMismatch, not a BlockedRun.
             assert!(
                 matches!(&result,
-                    Err(OracleError::ExpectationMismatch { expected, actual })
+                    Err(OracleError::ExpectationMismatch { expected, actual, .. })
                         if expected == "success" && actual == "Runtime/Test262Error"
                 ),
                 "a guest throw with a known constructor must be classified, not blocked: {result:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_failed_run_reads_as_what_it_expected_and_what_the_throw_said() {
+        let mismatch = |message: &str| OracleError::ExpectationMismatch {
+            expected: "success".to_owned(),
+            actual: "Runtime/Test262Error".to_owned(),
+            message: message.to_owned(),
+        };
+        assert_eq!(
+            failure_detail(&mismatch("Expected SameValue(«1», «2»)")),
+            "expected success, got Runtime/Test262Error: Expected SameValue(«1», «2»)"
+        );
+        assert_eq!(
+            failure_detail(&mismatch("")),
+            "expected success, got Runtime/Test262Error"
+        );
+        let blocked = OracleError::BlockedRun {
+            detail: "no verdict".to_owned(),
+        };
+        assert!(failure_detail(&blocked).contains("no verdict"));
+    }
+
+    #[test]
+    fn a_thrown_message_never_changes_a_verdict() {
+        let request = negative_async_request(Some(Negative {
+            phase: NegativePhase::Runtime,
+            error_type: NegativeType::TypeError,
+        }));
+        for message in ["", "anything at all"] {
+            let outcome = RunOutcome::Completed {
+                thrown: Some(ThrownError {
+                    phase: NegativePhase::Runtime,
+                    error_type: NegativeType::TypeError,
+                    message: message.to_owned(),
+                }),
+            };
+            assert!(judge_run(&request, &outcome).is_ok());
         }
     }
 

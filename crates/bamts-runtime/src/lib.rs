@@ -330,6 +330,9 @@ pub enum RuntimeErrorKind {
         /// names the constructor, or when the value is not an object with a
         /// resolvable constructor.
         constructor_name: Option<EcmaString>,
+        /// The thrown object's own `message` data property, read at the same
+        /// boundary, so a failure can say more than which constructor threw.
+        message: Option<EcmaString>,
     },
     FuelExhausted {
         limit: u64,
@@ -422,6 +425,7 @@ impl fmt::Display for RuntimeError {
                 value,
                 origin,
                 constructor_name,
+                ..
             } => match constructor_name {
                 Some(name) => write!(
                     formatter,
@@ -2381,6 +2385,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     value: exception.value,
                     origin: exception.origin,
                     constructor_name: None,
+                    message: None,
                 }));
             }
         }
@@ -2692,6 +2697,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         value: exception.value,
                         origin: exception.origin,
                         constructor_name: None,
+                        message: None,
                     }));
                 }
                 continue;
@@ -2910,6 +2916,7 @@ impl<'a, H: Host> Machine<'a, H> {
             value: exception.value,
             origin: exception.origin,
             constructor_name: None,
+            message: None,
         }))
     }
 
@@ -3295,6 +3302,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 value,
                 origin,
                 constructor_name: None,
+                message: None,
             },
         );
         self.store_async_module_completion(pending.record, Some(Err(error.clone())))
@@ -4384,9 +4392,9 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    /// Populates the `constructor_name` field of a
-    /// [`RuntimeErrorKind::UncaughtThrow`] when the throw originated from
-    /// guest bytecode ([`ThrowOrigin::Bytecode`]). Engine-originated throws
+    /// Populates the `message` field of a [`RuntimeErrorKind::UncaughtThrow`],
+    /// and its `constructor_name` field when the throw originated from guest
+    /// bytecode ([`ThrowOrigin::Bytecode`]). Engine-originated throws
     /// (`TypeError`, `RangeError`, etc.) already name their constructor in
     /// the [`ThrowOrigin`] variant and are left as `None`.
     ///
@@ -4399,10 +4407,14 @@ impl<'a, H: Host> Machine<'a, H> {
             value,
             origin,
             constructor_name,
+            message,
         } = &mut error.kind
         else {
             return;
         };
+        if message.is_none() {
+            *message = self.resolve_thrown_message(*value);
+        }
         if *origin != ThrowOrigin::Bytecode {
             return;
         }
@@ -5066,6 +5078,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     value,
                     origin,
                     constructor_name: None,
+                    message: None,
                 },
             ),
             Err(EvalFailure::Runtime(kind)) => self.program_error(module, kind),
@@ -8076,6 +8089,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         value,
                         origin,
                         constructor_name: None,
+                        message: None,
                     },
                     site_module,
                     site_function,
@@ -8113,6 +8127,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             value,
                             origin,
                             constructor_name: None,
+                            message: None,
                         },
                         site_module,
                         site_function,
@@ -19485,6 +19500,7 @@ mod tests {
                     operation: "global is not defined",
                 },
                 constructor_name: None,
+                message: None,
             }
         );
     }
@@ -19523,6 +19539,7 @@ mod tests {
                 value: Value::UNDEFINED,
                 origin: ThrowOrigin::TypeError { operation: "call" },
                 constructor_name: None,
+                message: None,
             }
         );
     }
@@ -19630,6 +19647,79 @@ mod tests {
             }
             other => panic!("expected UncaughtThrow, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_thrown_error_reports_its_message_and_a_plain_value_reports_none() {
+        // `throw new Error("boom")`.
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::encode("Error")),
+                Constant::String(EcmaString::encode("boom")),
+            ],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::CreateArray { dst: reg(2) },
+                    Instruction::ArrayPush {
+                        array: reg(2),
+                        value: reg(1),
+                    },
+                    Instruction::Construct {
+                        dst: reg(3),
+                        callee: reg(0),
+                        arguments: reg(2),
+                    },
+                    Instruction::Throw { value: reg(3) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        let RuntimeErrorKind::UncaughtThrow { message, .. } = error.kind else {
+            panic!("expected an uncaught throw");
+        };
+        assert_eq!(
+            message.map(|text| text.to_utf8_lossy()).as_deref(),
+            Some("boom")
+        );
+
+        // `throw "boom"`: a thrown string has no `message` property.
+        let module = verified(
+            vec![Constant::String(EcmaString::encode("boom"))],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::Throw { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        let RuntimeErrorKind::UncaughtThrow { message, .. } = error.kind else {
+            panic!("expected an uncaught throw");
+        };
+        assert_eq!(message, None);
     }
 
     #[test]
@@ -21356,6 +21446,7 @@ mod tests {
                 value: Value::int32(7),
                 origin: ThrowOrigin::Bytecode,
                 constructor_name: None,
+                message: None,
             }
         );
         assert!(machine.callback_boundaries.is_empty());
@@ -26566,6 +26657,7 @@ mod tests {
                 value: Value::int32(7),
                 origin: ThrowOrigin::Bytecode,
                 constructor_name: None,
+                message: None,
             }
         );
         // The later job stays queued and unrun.
@@ -26613,6 +26705,7 @@ mod tests {
                 value: Value::int32(7),
                 origin: ThrowOrigin::Bytecode,
                 constructor_name: None,
+                message: None,
             }
         );
         // The exception converts before any drain, so the queued microtask and

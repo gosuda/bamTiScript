@@ -1003,6 +1003,17 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(false)
     }
 
+    /// The own `message` data property of a thrown object. Like constructor
+    /// resolution, this runs no user code, so an accessor yields nothing.
+    pub(crate) fn resolve_thrown_message(&self, value: Value) -> Option<EcmaString> {
+        let index = self.runtime_slot(value).ok().flatten()?;
+        match self.own_get_ascii(index, "message")? {
+            Found::Value(message) => self.string_value(message),
+            Found::Text(message) => Some(message),
+            _ => None,
+        }
+    }
+
     /// Resolves the constructor name of a thrown value by walking its
     /// prototype chain to a builtin error constructor
     /// (`TypeError`, `RangeError`, `SyntaxError`, `ReferenceError`,

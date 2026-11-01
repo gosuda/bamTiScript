@@ -565,6 +565,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     value,
                     origin,
                     constructor_name: None,
+                    message: None,
                 },
                 site.function.get() as usize,
                 fault_pc,
@@ -576,6 +577,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 value,
                 origin,
                 constructor_name: None,
+                message: None,
             },
             function,
             pc,
@@ -3155,6 +3157,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         value,
                         origin,
                         constructor_name: None,
+                        message: None,
                     },
                     function.get() as usize,
                     0,
@@ -9605,6 +9608,7 @@ mod tests {
                         value: Value::UNDEFINED,
                         origin: ThrowOrigin::TypeError { operation },
                         constructor_name: None,
+                        message: None,
                     }
                 );
             };
@@ -9889,6 +9893,7 @@ mod tests {
                         operation: "global is not defined",
                     },
                     constructor_name: None,
+                    message: None,
                 }
             );
         };
