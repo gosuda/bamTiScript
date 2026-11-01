@@ -568,6 +568,7 @@ fn install_globals<H: Host>(
         crate::number_value(f64::INFINITY),
     );
     globals.insert(EcmaString::encode("NaN"), crate::number_value(f64::NAN));
+    globals.insert(EcmaString::encode("undefined"), Value::UNDEFINED);
 }
 fn install_errors<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -2060,6 +2061,30 @@ mod tests {
             }
             Property::Accessor { .. } => panic!("NaN must be a data property"),
         }
+    }
+    #[test]
+    fn global_undefined_descriptor_is_frozen() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let global_this = machine
+            .intrinsics
+            .global("globalThis")
+            .expect("globalThis is installed");
+        let key = PropertyKey::Named(EcmaString::encode("undefined"));
+        let descriptor = machine
+            .own_descriptor(global_this, &key)
+            .expect("descriptor lookup succeeds")
+            .expect("undefined is defined on globalThis");
+        assert!(matches!(
+            descriptor,
+            Property::Data {
+                value: Value::UNDEFINED,
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            }
+        ));
     }
     #[test]
     fn global_infinity_and_nan_are_stable_across_reads() {
