@@ -790,6 +790,17 @@ impl<'a> VParser<'a> {
                         names.push(public);
                     }
                 },
+                Some(unit @ (0x69 | 0x6d | 0x73 | 0x2d)) => {
+                    self.out.push_str("(?");
+                    self.out.push(char::from(unit as u8));
+                    while self.out.as_bytes().last() != Some(&b':') {
+                        let modifier = self
+                            .next()
+                            .and_then(|unit| u8::try_from(unit).ok())
+                            .ok_or_else(|| self.error("invalid group"))?;
+                        self.out.push(char::from(modifier));
+                    }
+                }
                 _ => return Err(self.error("invalid group")),
             }
         } else {

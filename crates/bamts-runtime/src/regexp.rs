@@ -146,7 +146,7 @@ pub(crate) struct Regex {
 impl Regex {
     pub(crate) fn compile(pattern: &EcmaString, flags: &EcmaString) -> Result<Self, RegexError> {
         let flags = Flags::parse(flags)?;
-        let mut parser = Parser::new(pattern.as_units(), flags.unicode);
+        let mut parser = Parser::new(pattern.as_units(), flags);
         let expression = parser.parse_disjunction(None)?;
         if parser.peek().is_some() {
             return Err(parser.error("unexpected token"));
@@ -179,7 +179,7 @@ impl Regex {
                 captures: vec![None; self.capture_count + 1],
             };
             if let Some(mut matched) = self
-                .match_node(&self.expression, input, state)?
+                .match_node(self.flags, &self.expression, input, state)?
                 .into_iter()
                 .next()
             {
@@ -204,16 +204,17 @@ impl Regex {
 
     fn match_node(
         &self,
+        flags: Flags,
         node: &Node,
         input: &[u16],
         state: State,
     ) -> Result<Vec<State>, RegexError> {
         match node {
-            Node::Sequence(nodes) => self.match_sequence(nodes, input, state),
+            Node::Sequence(nodes) => self.match_sequence(flags, nodes, input, state),
             Node::Alternation(branches) => {
                 let mut out = Vec::new();
                 for branch in branches {
-                    out.extend(self.match_node(branch, input, state.clone())?);
+                    out.extend(self.match_node(flags, branch, input, state.clone())?);
                 }
                 Ok(out)
             }
@@ -221,9 +222,9 @@ impl Regex {
                 if state.position == input.len() {
                     return Ok(Vec::new());
                 }
-                let (actual, width) = next_code_point(input, state.position, self.flags.unicode);
+                let (actual, width) = next_code_point(input, state.position, flags.unicode);
                 Ok(self
-                    .code_point_eq(actual, *expected)
+                    .code_point_eq(flags, actual, *expected)
                     .then(|| state.advanced(width))
                     .into_iter()
                     .collect())
@@ -232,8 +233,8 @@ impl Regex {
                 if state.position == input.len() {
                     return Ok(Vec::new());
                 }
-                let (actual, width) = next_code_point(input, state.position, self.flags.unicode);
-                Ok((self.flags.dot_all || !is_line_terminator(actual))
+                let (actual, width) = next_code_point(input, state.position, flags.unicode);
+                Ok((flags.dot_all || !is_line_terminator(actual))
                     .then(|| state.advanced(width))
                     .into_iter()
                     .collect())
@@ -242,22 +243,22 @@ impl Regex {
                 if state.position == input.len() {
                     return Ok(Vec::new());
                 }
-                let (actual, width) = next_code_point(input, state.position, self.flags.unicode);
+                let (actual, width) = next_code_point(input, state.position, flags.unicode);
                 Ok(class
-                    .matches(actual, self.flags.ignore_case, self.flags.unicode)
+                    .matches(actual, flags.ignore_case, flags.unicode)
                     .then(|| state.advanced(width))
                     .into_iter()
                     .collect())
             }
             Node::Start => Ok((state.position == 0
-                || (self.flags.multiline
+                || (flags.multiline
                     && state.position > 0
                     && is_line_terminator(u32::from(input[state.position - 1]))))
             .then_some(state)
             .into_iter()
             .collect()),
             Node::End => Ok((state.position == input.len()
-                || (self.flags.multiline
+                || (flags.multiline
                     && input
                         .get(state.position)
                         .is_some_and(|value| is_line_terminator(u32::from(*value)))))
@@ -269,7 +270,7 @@ impl Regex {
                     false
                 } else {
                     let low = input[state.position - 1];
-                    let value = if self.flags.unicode
+                    let value = if flags.unicode
                         && (0xdc00..=0xdfff).contains(&low)
                         && state.position >= 2
                         && (0xd800..=0xdbff).contains(&input[state.position - 2])
@@ -278,13 +279,11 @@ impl Regex {
                     } else {
                         u32::from(low)
                     };
-                    is_word(value, self.flags.ignore_case, self.flags.unicode)
+                    is_word(value, flags.ignore_case, flags.unicode)
                 };
                 let right = (state.position < input.len())
-                    .then(|| next_code_point(input, state.position, self.flags.unicode).0)
-                    .is_some_and(|value| {
-                        is_word(value, self.flags.ignore_case, self.flags.unicode)
-                    });
+                    .then(|| next_code_point(input, state.position, flags.unicode).0)
+                    .is_some_and(|value| is_word(value, flags.ignore_case, flags.unicode));
                 Ok(((left != right) == *positive)
                     .then_some(state)
                     .into_iter()
@@ -293,7 +292,7 @@ impl Regex {
             Node::Group { index, body } => {
                 let begin = state.position;
                 Ok(self
-                    .match_node(body, input, state)?
+                    .match_node(flags, body, input, state)?
                     .into_iter()
                     .map(|mut matched| {
                         if let Some(index) = index {
@@ -303,14 +302,17 @@ impl Regex {
                     })
                     .collect())
             }
+            Node::Modified { flags, body } => self.match_node(*flags, body, input, state),
             Node::BackReference(index) => {
                 let Some(range) = state.captures.get(*index).and_then(Clone::clone) else {
                     return Ok(vec![state]);
                 };
-                Ok(self.match_backreference(input, range, state))
+                Ok(self.match_backreference(flags, input, range, state))
             }
             Node::NamedBackReference(name) => match self.names.get(name) {
-                Some(index) => Ok(self.match_node(&Node::BackReference(*index), input, state)?),
+                Some(index) => {
+                    Ok(self.match_node(flags, &Node::BackReference(*index), input, state)?)
+                }
                 None => Ok(Vec::new()),
             },
             Node::Look {
@@ -325,21 +327,21 @@ impl Regex {
                         let mut initial = state.clone();
                         initial.position = begin;
                         candidates.extend(
-                            self.match_node(body, input, initial)?
+                            self.match_node(flags, body, input, initial)?
                                 .into_iter()
                                 .filter(|matched| matched.position == state.position),
                         );
                         if begin == state.position {
                             break;
                         }
-                        begin += next_code_point(input, begin, self.flags.unicode).1;
+                        begin += next_code_point(input, begin, flags.unicode).1;
                         if begin > state.position {
                             break;
                         }
                     }
                     candidates
                 } else {
-                    self.match_node(body, input, state.clone())?
+                    self.match_node(flags, body, input, state.clone())?
                 };
                 Ok(if *positive {
                     candidates
@@ -359,16 +361,22 @@ impl Regex {
         }
     }
 
-    fn match_backreference(&self, input: &[u16], range: Range<usize>, state: State) -> Vec<State> {
+    fn match_backreference(
+        &self,
+        flags: Flags,
+        input: &[u16],
+        range: Range<usize>,
+        state: State,
+    ) -> Vec<State> {
         let mut captured = range.start;
         let mut candidate = state.position;
         while captured < range.end {
             if candidate >= input.len() {
                 return Vec::new();
             }
-            let (left, left_width) = next_code_point(input, captured, self.flags.unicode);
-            let (right, right_width) = next_code_point(input, candidate, self.flags.unicode);
-            if captured + left_width > range.end || !self.code_point_eq(left, right) {
+            let (left, left_width) = next_code_point(input, captured, flags.unicode);
+            let (right, right_width) = next_code_point(input, candidate, flags.unicode);
+            if captured + left_width > range.end || !self.code_point_eq(flags, left, right) {
                 return Vec::new();
             }
             captured += left_width;
@@ -380,6 +388,7 @@ impl Regex {
 
     fn match_sequence(
         &self,
+        flags: Flags,
         nodes: &[Node],
         input: &[u16],
         state: State,
@@ -424,7 +433,7 @@ impl Regex {
                 for prior in &levels[count] {
                     let mut attempt = prior.clone();
                     attempt.captures[captures.clone()].fill(None);
-                    for matched in self.match_node(body, input, attempt)? {
+                    for matched in self.match_node(flags, body, input, attempt)? {
                         if matched.position == prior.position && count + 1 >= *min {
                             continue;
                         }
@@ -461,24 +470,23 @@ impl Regex {
                 // exactly once, so the deep copy of every captures allocation
                 // on each iteration was pure waste.
                 for candidate in std::mem::take(&mut levels[count]) {
-                    result.extend(self.match_sequence(rest, input, candidate)?);
+                    result.extend(self.match_sequence(flags, rest, input, candidate)?);
                 }
             }
             Ok(result)
         } else {
             let mut result = Vec::new();
-            for matched in self.match_node(first, input, state)? {
-                result.extend(self.match_sequence(rest, input, matched)?);
+            for matched in self.match_node(flags, first, input, state)? {
+                result.extend(self.match_sequence(flags, rest, input, matched)?);
             }
             Ok(result)
         }
     }
 
-    fn code_point_eq(&self, left: u32, right: u32) -> bool {
+    fn code_point_eq(&self, flags: Flags, left: u32, right: u32) -> bool {
         left == right
-            || (self.flags.ignore_case
-                && canonicalize(left, self.flags.unicode)
-                    == canonicalize(right, self.flags.unicode))
+            || (flags.ignore_case
+                && canonicalize(left, flags.unicode) == canonicalize(right, flags.unicode))
     }
 }
 
@@ -521,6 +529,11 @@ enum Node {
     WordBoundary(bool),
     Group {
         index: Option<usize>,
+        body: Box<Node>,
+    },
+    /// `(?ims-ims:...)`: its body runs under these flags instead.
+    Modified {
+        flags: Flags,
         body: Box<Node>,
     },
     BackReference(usize),
@@ -1003,16 +1016,18 @@ struct Parser<'a> {
     capture_count: usize,
     names: BTreeMap<String, usize>,
     unicode: bool,
+    flags: Flags,
 }
 
 impl<'a> Parser<'a> {
-    fn new(units: &'a [u16], unicode: bool) -> Self {
+    fn new(units: &'a [u16], flags: Flags) -> Self {
         Self {
             units,
             position: 0,
             capture_count: 0,
             names: BTreeMap::new(),
-            unicode,
+            unicode: flags.unicode,
+            flags,
         }
     }
 
@@ -1070,6 +1085,8 @@ impl<'a> Parser<'a> {
     fn parse_group(&mut self) -> Result<Node, RegexError> {
         let mut index = None;
         let mut look = None;
+        let outer_flags = self.flags;
+        let mut modified = false;
         if self.peek() == Some(u16::from(b'?')) {
             self.position += 1;
             match self.next() {
@@ -1095,6 +1112,11 @@ impl<'a> Parser<'a> {
                         self.names.insert(name, self.capture_count);
                     }
                 },
+                Some(0x69 | 0x6d | 0x73 | 0x2d) => {
+                    self.position -= 1;
+                    self.flags = self.parse_modifiers()?;
+                    modified = true;
+                }
                 _ => return Err(self.error("invalid group")),
             }
         } else {
@@ -1105,7 +1127,13 @@ impl<'a> Parser<'a> {
         if self.next() != Some(0x29) {
             return Err(self.error("unterminated group"));
         }
-        Ok(if let Some((behind, positive)) = look {
+        let body_flags = std::mem::replace(&mut self.flags, outer_flags);
+        Ok(if modified {
+            Node::Modified {
+                flags: body_flags,
+                body: Box::new(body),
+            }
+        } else if let Some((behind, positive)) = look {
             Node::Look {
                 body: Box::new(body),
                 behind,
@@ -1117,6 +1145,29 @@ impl<'a> Parser<'a> {
                 body: Box::new(body),
             }
         })
+    }
+
+    /// The flags inside `(?ims-ims:`. Each letter may appear once, in either
+    /// list, and at least one must appear.
+    fn parse_modifiers(&mut self) -> Result<Flags, RegexError> {
+        let mut flags = self.flags;
+        let mut seen = Vec::new();
+        let mut enable = true;
+        loop {
+            match self.next() {
+                Some(0x3a) if !seen.is_empty() => return Ok(flags),
+                Some(0x2d) if enable => enable = false,
+                Some(unit @ (0x69 | 0x6d | 0x73)) if !seen.contains(&unit) => {
+                    seen.push(unit);
+                    match unit {
+                        0x69 => flags.ignore_case = enable,
+                        0x6d => flags.multiline = enable,
+                        _ => flags.dot_all = enable,
+                    }
+                }
+                _ => return Err(self.error("invalid group")),
+            }
+        }
     }
 
     fn parse_class(&mut self) -> Result<CharacterClass, RegexError> {
@@ -1518,6 +1569,35 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn modifiers_change_flags_only_inside_their_group() {
+        assert_eq!(ranges("(?i:a)b", "", "Ab"), [Some(0..2)]);
+        assert!(regex("(?i:a)b", "").exec(&text("AB"), 0).unwrap().is_none());
+        assert!(
+            regex("(?-i:a)b", "i")
+                .exec(&text("Ab"), 0)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(ranges("(?-i:a)b", "i", "aB"), [Some(0..2)]);
+        assert_eq!(ranges("(?s:.).", "", "\na"), [Some(0..2)]);
+        assert_eq!(ranges("(?m:^b)", "", "a\nb"), [Some(2..3)]);
+        assert_eq!(ranges("(?i:(?-i:a)b)", "", "aB"), [Some(0..2)]);
+        for pattern in [
+            "(?-:a)",
+            "(?ii:a)",
+            "(?i-i:a)",
+            "(?g:a)",
+            "(?i--s:a)",
+            "(?I:a)",
+        ] {
+            assert!(
+                Regex::compile(&text(pattern), &text("")).is_err(),
+                "{pattern}"
+            );
+        }
     }
 
     #[test]
