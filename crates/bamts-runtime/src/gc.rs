@@ -793,6 +793,17 @@ fn trace_entry(
             prototype,
             ..
         } => trace_properties_and_prototype(properties, *prototype, heap, marks, work),
+        HeapEntry::Intl {
+            bound,
+            properties,
+            prototype,
+            ..
+        } => {
+            if let Some(bound) = bound {
+                mark_value(heap, marks, work, *bound);
+            }
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+        }
         HeapEntry::TypedArray {
             buffer,
             properties,

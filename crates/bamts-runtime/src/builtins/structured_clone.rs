@@ -440,6 +440,7 @@ fn build_plan<H: Host>(
             | HeapEntry::DisposableStack { .. }
             | HeapEntry::ProcessEnv { .. }
             | HeapEntry::Temporal { .. }
+            | HeapEntry::Intl { .. }
             | HeapEntry::Promise { .. }
             | HeapEntry::Timeout { .. }
             | HeapEntry::PromiseResolver { .. }

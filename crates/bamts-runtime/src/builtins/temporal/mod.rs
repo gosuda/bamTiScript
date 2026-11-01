@@ -172,7 +172,12 @@ fn install_class<H: Host>(
     define_data(heap, namespace, class.name, constructor);
 }
 
-fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
+pub(in crate::intrinsics::builtins) fn define_getter(
+    heap: &mut [HeapEntry],
+    object: Value,
+    name: &str,
+    getter: Value,
+) {
     let Some(bamts_native::Decoded::HeapRef(id)) = object.decode() else {
         panic!("accessor target is a heap object");
     };

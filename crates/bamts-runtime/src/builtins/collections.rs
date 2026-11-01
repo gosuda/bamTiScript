@@ -1280,6 +1280,7 @@ fn require_weak_key<H: Host>(machine: &Machine<'_, H>, key: Value) -> Result<(),
         | HeapEntry::RegExp { .. }
         | HeapEntry::Date { .. }
         | HeapEntry::Temporal { .. }
+        | HeapEntry::Intl { .. }
         | HeapEntry::Collection { .. }
         | HeapEntry::TypedArray { .. }
         | HeapEntry::ArrayBuffer { .. }

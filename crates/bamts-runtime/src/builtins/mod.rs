@@ -11,6 +11,7 @@ pub(crate) mod bigint;
 mod collections;
 mod date_full;
 mod function_constructor;
+mod intl;
 mod json_edge;
 mod number;
 mod object;
@@ -93,6 +94,7 @@ pub(crate) fn install<H: Host>(
     uri::install(heap, globals, builtins);
     disposable_stack::install(heap, globals, builtins);
     temporal::install(heap, globals, builtins);
+    intl::install(heap, globals, builtins);
 }
 fn install_function<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -138,7 +140,8 @@ pub(crate) fn define_data(heap: &mut [HeapEntry], object: Value, name: &str, val
         | HeapEntry::NativeFunction { properties, .. }
         | HeapEntry::RegExp { properties, .. }
         | HeapEntry::Date { properties, .. }
-        | HeapEntry::Temporal { properties, .. } => {
+        | HeapEntry::Temporal { properties, .. }
+        | HeapEntry::Intl { properties, .. } => {
             properties.insert(
                 PropertyKey::Named(EcmaString::encode(name)),
                 builtin_property(value),
@@ -1004,6 +1007,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::RegExp { extensible, .. }
             | HeapEntry::Date { extensible, .. }
             | HeapEntry::Temporal { extensible, .. }
+            | HeapEntry::Intl { extensible, .. }
             | HeapEntry::BuiltinIterator { extensible, .. }
             | HeapEntry::Collection { extensible, .. }
             | HeapEntry::TypedArray { extensible, .. }
@@ -1090,6 +1094,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             }
             | HeapEntry::Temporal {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Intl {
                 properties,
                 extensible,
                 ..
@@ -1254,6 +1263,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::WeakRef { properties, .. }
@@ -1513,6 +1523,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     extensible,
                     ..
                 }
+                | HeapEntry::Intl {
+                    properties,
+                    extensible,
+                    ..
+                }
                 | HeapEntry::BuiltinIterator {
                     properties,
                     extensible,
@@ -1660,6 +1675,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::TypedArray { properties, .. }
@@ -1693,6 +1709,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::RegExp { extensible, .. }
             | HeapEntry::Date { extensible, .. }
             | HeapEntry::Temporal { extensible, .. }
+            | HeapEntry::Intl { extensible, .. }
             | HeapEntry::BuiltinIterator { extensible, .. }
             | HeapEntry::Collection { extensible, .. }
             | HeapEntry::TypedArray { extensible, .. }
@@ -1742,6 +1759,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::RegExp { properties, .. }
                 | HeapEntry::Date { properties, .. }
                 | HeapEntry::Temporal { properties, .. }
+                | HeapEntry::Intl { properties, .. }
                 | HeapEntry::BuiltinIterator { properties, .. }
                 | HeapEntry::Collection { properties, .. }
                 | HeapEntry::TypedArray { properties, .. }
@@ -1768,6 +1786,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::TypedArray { properties, .. }

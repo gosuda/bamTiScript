@@ -92,6 +92,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     async_disposable_stack_prototype: Option<Value>,
     date_prototype: Option<Value>,
     temporal_prototypes: [Option<Value>; crate::temporal::TemporalKind::COUNT],
+    intl_prototypes: [Option<Value>; crate::intl::IntlKind::COUNT],
     weak_ref_prototype: Option<Value>,
     finalization_registry_prototype: Option<Value>,
     map_prototype: Option<Value>,
@@ -163,6 +164,7 @@ impl<H: Host> BuiltinTable<H> {
             async_disposable_stack_prototype: None,
             date_prototype: None,
             temporal_prototypes: [None; crate::temporal::TemporalKind::COUNT],
+            intl_prototypes: [None; crate::intl::IntlKind::COUNT],
             weak_ref_prototype: None,
             finalization_registry_prototype: None,
             map_prototype: None,
@@ -479,6 +481,12 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn temporal_prototype(&self, kind: crate::temporal::TemporalKind) -> Value {
         self.temporal_prototypes[kind.index()].expect("Temporal builtins install their prototypes")
     }
+    pub(crate) fn set_intl_prototype(&mut self, kind: crate::intl::IntlKind, prototype: Value) {
+        self.intl_prototypes[kind.index()] = Some(prototype);
+    }
+    pub(crate) fn intl_prototype(&self, kind: crate::intl::IntlKind) -> Value {
+        self.intl_prototypes[kind.index()].expect("Intl builtins install their prototypes")
+    }
     pub(crate) fn set_date_prototype(&mut self, prototype: Value) {
         self.date_prototype = Some(prototype);
     }
@@ -621,7 +629,8 @@ impl<H: Host> BuiltinTable<H> {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Array { properties, .. }
             | HeapEntry::Date { properties, .. }
-            | HeapEntry::Temporal { properties, .. } => {
+            | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. } => {
                 properties.insert(
                     crate::PropertyKey::Named(EcmaString::encode("constructor")),
                     constructor_property,
@@ -720,6 +729,7 @@ impl<H: Host> BuiltinTable<H> {
             async_disposable_stack_prototype,
             date_prototype,
             temporal_prototypes,
+            intl_prototypes,
             weak_ref_prototype,
             finalization_registry_prototype,
             map_prototype,
@@ -805,6 +815,7 @@ impl<H: Host> BuiltinTable<H> {
             .iter()
             .chain(typedarray_prototypes.iter())
             .chain(temporal_prototypes.iter())
+            .chain(intl_prototypes.iter())
             .flatten()
         {
             visit(*value);
@@ -1821,7 +1832,6 @@ mod tests {
         let machine = Machine::new(&module, &mut host, Limits::default());
         let names = [
             "eval",
-            "Intl",
             "Iterator",
             "AsyncIterator",
             "URL",
