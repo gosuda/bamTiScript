@@ -7795,7 +7795,10 @@ impl<'a, H: Host> Machine<'a, H> {
                     Ok(None) => self.last_completion.take().ok_or(EvalFailure::Runtime(
                         RuntimeErrorKind::InvalidValue { value: object },
                     )),
-                    Ok(Some(execution)) => Ok(execution.value),
+                    // With no activation to return to, `complete_frame` hands back
+                    // the raw completion, so the receiver rule applies here.
+                    Ok(Some(execution)) if self.is_object(execution.value) => Ok(execution.value),
+                    Ok(Some(_)) => Ok(object),
                     Err(error) => {
                         self.unwind_frames_to(stop_depth);
                         match error.kind {
@@ -21611,6 +21614,73 @@ mod tests {
                 origin: ThrowOrigin::TypeError { operation: "call" },
             })
         ));
+        assert!(machine.frames.is_empty());
+    }
+
+    #[test]
+    fn construct_with_no_calling_activation_applies_the_receiver_rule() {
+        // The native tiers keep no interpreter frame, so a constructor entered
+        // from a builtin has nothing to return to. A primitive completion must
+        // still yield the receiver, and an object completion must replace it.
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let mut constructor = |index: u32| {
+            machine
+                .allocate(HeapEntry::Function {
+                    module: ModuleId::new(0),
+                    function: FunctionId::new(index),
+                    captures: Vec::new(),
+                    context: None,
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.function_prototype),
+                    extensible: true,
+                })
+                .unwrap()
+        };
+        let returns_primitive = constructor(1);
+        let returns_object = constructor(2);
+
+        let receiver = machine.construct_value(returns_primitive, &[]).unwrap();
+        let index = machine.runtime_slot(receiver).unwrap().unwrap();
+        assert!(
+            matches!(machine.heap[index], HeapEntry::Object { .. }),
+            "a primitive completion yields the constructed receiver"
+        );
+        let replaced = machine.construct_value(returns_object, &[]).unwrap();
+        let index = machine.runtime_slot(replaced).unwrap().unwrap();
+        assert!(
+            matches!(machine.heap[index], HeapEntry::Array { .. }),
+            "an object completion replaces the receiver"
+        );
         assert!(machine.frames.is_empty());
     }
 
