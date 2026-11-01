@@ -20,7 +20,16 @@ ci-quality:
     cargo clippy --workspace --all-targets --locked -- -D warnings
     cargo test --workspace --locked
 
+# Every npm test except the two groups that need the assembled five-host release
+# set: the staged leaf archives and the clean-consumer install. One machine cannot
+# build all five leaves, so those run in ci-npm-release instead of being dropped.
 ci-npm:
+    npm ci
+    node --test --test-skip-pattern='staged cli-|clean consumer' npm/test/*.test.mjs
+
+# The whole npm suite. It needs every host's leaf archive in npm/dist, so it is the
+# gate for the five-host install, not for a single machine.
+ci-npm-release:
     npm ci
     node --test npm/test/*.test.mjs
 
