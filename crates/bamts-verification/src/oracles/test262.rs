@@ -2228,7 +2228,10 @@ function $ERROR(message) {\n\
 
     #[test]
     fn super_reads_above_the_home_object() {
-        const CASES: [&str; 9] = [
+        const CASES: [&str; 10] = [
+            "var o = { m() { return super.x; } }; Object.setPrototypeOf(o, null); \
+             var caught; try { o.m(); } catch (error) { caught = error; } \
+             assert.sameValue(caught instanceof TypeError, true);",
             "class A { m() { return 1; } } \
              class B extends A { m() { return super.m() + 1; } } \
              assert.sameValue(new B().m(), 2);",

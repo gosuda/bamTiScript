@@ -9348,6 +9348,11 @@ impl<'a, H: Host> Machine<'a, H> {
         key: &PropertyKey,
     ) -> Result<Value, EvalFailure> {
         let base = self.super_base(home)?;
+        if base == Value::NULL {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "get super property through null prototype",
+            }));
+        }
         self.internal_get(base, key, receiver)
     }
 
