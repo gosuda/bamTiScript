@@ -40,7 +40,7 @@ pub(super) fn install<H: Host>(
     define_getter(heap, prototype, "source", source_get);
     let flags_get = install_function(heap, builtins, "get flags", 0, flags_getter::<H>);
     define_getter(heap, prototype, "flags", flags_get);
-    super::regexp_protocol::install(heap, builtins, prototype);
+    super::regexp_protocol::install(heap, builtins, prototype, constructor);
     builtins.set_regexp_prototype(prototype);
     globals.insert(EcmaString::encode("RegExp"), constructor);
 }

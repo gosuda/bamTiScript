@@ -13,7 +13,7 @@ use super::array_es2023::{index_key, integer_or_infinity, length_of_array_like};
 use super::regexp::{builtin_exec, regexp_parts};
 use super::{allocate_array, allocate_string, keep_root, type_error, with_roots};
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine};
+use crate::{EvalFailure, HeapEntry, Host, Machine, Property};
 
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
@@ -805,11 +805,101 @@ pub(super) fn flags_getter<H: Host>(
     )?))
 }
 
-/// Installs the flag accessors and the `Symbol`-keyed methods.
+fn species_getter<H: Host>(
+    _machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    Ok(BuiltinOutcome::Value(this))
+}
+
+fn is_escaped_punctuator(unit: u32) -> bool {
+    char::from_u32(unit).is_some_and(|c| ",-=<>#&!%:;@~'`\"".contains(c))
+}
+
+fn is_whitespace_or_line_terminator(unit: u32) -> bool {
+    matches!(
+        unit,
+        0x09..=0x0d
+            | 0x20
+            | 0xa0
+            | 0x1680
+            | 0x2000..=0x200a
+            | 0x2028
+            | 0x2029
+            | 0x202f
+            | 0x205f
+            | 0x3000
+            | 0xfeff
+    )
+}
+
+/// `EncodeForRegExpEscape`.
+fn encode_for_escape(output: &mut EcmaStringBuilder, code_point: u32) {
+    let control = match code_point {
+        0x09 => Some("\\t"),
+        0x0a => Some("\\n"),
+        0x0b => Some("\\v"),
+        0x0c => Some("\\f"),
+        0x0d => Some("\\r"),
+        _ => None,
+    };
+    if let Some(control) = control {
+        output.push_utf8(control);
+    } else if char::from_u32(code_point).is_some_and(|c| "^$\\.*+?()[]{}|/".contains(c)) {
+        output.push_unit(u16::from(b'\\'));
+        output.push_unit(code_point as u16);
+    } else if is_escaped_punctuator(code_point)
+        || is_whitespace_or_line_terminator(code_point)
+        || (0xd800..=0xdfff).contains(&code_point)
+    {
+        if code_point <= 0xff {
+            output.push_utf8(&format!("\\x{code_point:02x}"));
+        } else {
+            output.push_utf8(&format!("\\u{code_point:04x}"));
+        }
+    } else {
+        output
+            .push_code_point(code_point)
+            .expect("a code point read from a string is valid");
+    }
+}
+
+/// `RegExp.escape(S)`. The first character is hex-escaped when it could join a
+/// preceding `\0`-style escape or a `\c` control, so the result is safe anywhere
+/// in a pattern.
+fn escape<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let Some(text) = machine.string_value(argument(args, 0)) else {
+        return Err(type_error("RegExp.escape requires a string"));
+    };
+    let mut output = EcmaStringBuilder::with_capacity(text.len_units());
+    for (offset, code_point) in text.code_points() {
+        let initial_alphanumeric =
+            offset == 0 && u8::try_from(code_point).is_ok_and(|byte| byte.is_ascii_alphanumeric());
+        if initial_alphanumeric {
+            output.push_utf8(&format!("\\x{code_point:02x}"));
+        } else {
+            encode_for_escape(&mut output, code_point);
+        }
+    }
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        output.finish(),
+    )?))
+}
+
+/// Installs the flag accessors, the `Symbol`-keyed methods and `RegExp.escape`.
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     builtins: &mut BuiltinTable<H>,
     prototype: Value,
+    constructor: Value,
 ) {
     use super::{define_symbol_property, install_function};
     use crate::intrinsics::BuiltinHandler;
@@ -863,6 +953,26 @@ pub(super) fn install<H: Host>(
         let function = install_function(heap, builtins, name, length, handler);
         define_symbol_property(heap, prototype, symbol, super::builtin_property(function));
     }
+    let escape_function = install_function(heap, builtins, "escape", 1, escape::<H>);
+    super::define_data(heap, constructor, "escape", escape_function);
+    let species = install_function(
+        heap,
+        builtins,
+        "get [Symbol.species]",
+        0,
+        species_getter::<H>,
+    );
+    define_symbol_property(
+        heap,
+        constructor,
+        builtins.symbol_species(),
+        Property::Accessor {
+            getter: Some(species),
+            setter: None,
+            enumerable: false,
+            configurable: true,
+        },
+    );
     let iterator_prototype = crate::intrinsics::push(
         heap,
         HeapEntry::Object {
@@ -1088,6 +1198,40 @@ mod tests {
         assert_eq!(step(&mut machine), Value::TRUE);
         assert!(matches!(
             regexp_string_iterator_next(&mut machine, string, &[], false),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+    }
+
+    fn escaped(machine: &mut Machine<'_, TestHost>, units: &[u16]) -> Vec<u16> {
+        let input = allocate_string(machine, EcmaString::from_units(units)).unwrap();
+        let result = outcome_value(escape(machine, Value::UNDEFINED, &[input], false).unwrap());
+        machine.string_value(result).unwrap().as_units().to_vec()
+    }
+
+    #[test]
+    fn escape_is_safe_at_the_start_of_a_pattern_and_after_any_syntax() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        for (input, expected) in [
+            ("abc", "\\x61bc"),
+            ("1", "\\x31"),
+            ("_a", "_a"),
+            (".*", "\\.\\*"),
+            ("a/b", "\\x61\\/b"),
+            ("\n", "\\n"),
+            ("-", "\\x2d"),
+            (" ", "\\x20"),
+            ("\u{2028}", "\\u2028"),
+        ] {
+            let units: Vec<u16> = input.encode_utf16().collect();
+            let expected: Vec<u16> = expected.encode_utf16().collect();
+            assert_eq!(escaped(&mut machine, &units), expected, "{input:?}");
+        }
+        let lone: Vec<u16> = "\\ud800".encode_utf16().collect();
+        assert_eq!(escaped(&mut machine, &[0xd800]), lone);
+        assert!(matches!(
+            escape(&mut machine, Value::UNDEFINED, &[Value::int32(1)], false),
             Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
         ));
     }
