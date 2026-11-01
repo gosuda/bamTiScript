@@ -35,6 +35,10 @@ use super::{
     print_with_jsx_plan,
 };
 
+mod namespaces;
+
+use namespaces::{ContainerBinding, NamespaceFrame};
+
 /// Stable diagnostic identifiers produced by target transforms.
 pub mod codes {
     use crate::diagnostic::DiagnosticCode;
@@ -597,6 +601,15 @@ struct Rewriter<'a> {
     parameter_initializer_depths: Vec<usize>,
     cjs: Option<CjsPlan>,
     synthesized_ids: BTreeSet<NodeId>,
+    file: &'a SourceFile,
+    /// Namespace bodies being lowered, innermost last.
+    namespace_frames: Vec<NamespaceFrame>,
+    /// Names each enclosing statement list has declared so far.
+    declared_names: Vec<BTreeSet<String>>,
+    /// Identifiers a generated name must avoid, once one is needed.
+    occupied_names: Option<BTreeSet<String>>,
+    /// Where each value name is declared, once a namespace needs to know.
+    value_symbol_ranges: Option<std::collections::HashMap<String, Vec<TextRange>>>,
 }
 
 /// Per-file CommonJS lowering plan built before the rewrite walk.
@@ -693,6 +706,11 @@ impl<'a> Rewriter<'a> {
             parameter_initializer_depths: Vec::new(),
             cjs,
             synthesized_ids: BTreeSet::new(),
+            file,
+            namespace_frames: Vec::new(),
+            declared_names: Vec::new(),
+            occupied_names: None,
+            value_symbol_ranges: None,
         }
     }
     /// Scans top-level module syntax into a CommonJS lowering plan.
@@ -701,23 +719,7 @@ impl<'a> Rewriter<'a> {
         options: &TransformOptions,
         model: &SemanticModel,
     ) -> Option<CjsPlan> {
-        let occupied: BTreeSet<String> = file
-            .tokens()
-            .iter()
-            .filter(|token| token.kind() == TokenKind::Identifier)
-            .filter_map(|token| {
-                let start = file
-                    .source_text()
-                    .utf16_to_byte(token.range().start())
-                    .ok()?;
-                let end = file.source_text().utf16_to_byte(token.range().end()).ok()?;
-                file.source_text()
-                    .as_str()
-                    .get(start..end)
-                    .map(str::to_owned)
-            })
-            .collect();
-        let mut names = RequireNames::new(occupied);
+        let mut names = RequireNames::new(identifier_names(file));
         let mut plan = CjsPlan::default();
         let module_scope = model.module_scope();
         let symbol_of = |name: &str| model.scope(module_scope).value(name);
@@ -820,6 +822,16 @@ impl<'a> Rewriter<'a> {
                             Statement::Function(_)
                             | Statement::Interface(_)
                             | Statement::TypeAlias(_) => {}
+                            Statement::Namespace(namespace) => {
+                                if let NamespaceName::Identifier { name, .. } = &namespace.name
+                                    && model
+                                        .namespace_facts()
+                                        .declaration(inner.id())
+                                        .is_some_and(|plan| plan.is_value_bearing())
+                                {
+                                    plan.void_0.push(identifier_text(file, name));
+                                }
+                            }
                             _ => {
                                 for name in declared_binding_names(file, inner) {
                                     plan.void_0.push(name);
@@ -1024,6 +1036,14 @@ impl<'a> Rewriter<'a> {
     }
 
     fn rewrite_export_named_declaration(&mut self, statement: &Stmt, inner: &Stmt) -> Vec<Stmt> {
+        if let Statement::Namespace(namespace) = inner.data() {
+            let binding = if self.cjs.is_some() {
+                ContainerBinding::CommonJs
+            } else {
+                ContainerBinding::Export
+            };
+            return self.lower_namespace(inner, namespace, binding, statement.range());
+        }
         if self.cjs.is_some() {
             return self.cjs_export_declaration(statement.range(), inner);
         }
@@ -1328,10 +1348,13 @@ impl<'a> Rewriter<'a> {
     }
 
     fn rewrite_statements(&mut self, statements: &[Stmt]) -> Vec<Stmt> {
+        self.declared_names.push(BTreeSet::new());
         let mut out = Vec::new();
         for statement in statements {
+            self.record_declaration(statement);
             out.extend(self.rewrite_statement(statement));
         }
+        self.declared_names.pop();
         out
     }
 
@@ -1659,12 +1682,17 @@ impl<'a> Rewriter<'a> {
                     vec![statement.clone()]
                 }
             }
+            Statement::Namespace(namespace) => self.lower_namespace(
+                statement,
+                namespace,
+                ContainerBinding::Local,
+                statement.range(),
+            ),
             Statement::ImportEquals(_)
             | Statement::Export(_)
             | Statement::Interface(_)
             | Statement::TypeAlias(_)
             | Statement::Enum(_)
-            | Statement::Namespace(_)
             | Statement::Empty
             | Statement::Break(_)
             | Statement::Continue(_)
@@ -6974,7 +7002,12 @@ impl<'a> Rewriter<'a> {
                     }),
                 )
             }
-            Expression::Identifier(_) => {
+            Expression::Identifier(ident) => {
+                if let Some(parameter) = self.namespace_member_parameter(expression.id())
+                    && let Some(name) = self.identifier_name(ident)
+                {
+                    return self.namespace_member(&parameter, &name, expression.range());
+                }
                 if let Some(replacement) = self.cjs_identifier_replacement(expression) {
                     replacement
                 } else {
@@ -7116,6 +7149,20 @@ impl<'a> Rewriter<'a> {
     /// refusal instead of a live `await` in ES5 output.
     fn rewrite_assignment_target(&mut self, target: &AssignmentTargetNode) -> AssignmentTargetNode {
         let rewritten = match target.data() {
+            AssignmentTarget::Identifier(ident) => {
+                let parameter = self
+                    .namespace_member_parameter(target.id())
+                    .or_else(|| self.namespace_member_parameter(ident.id()));
+                let (Some(parameter), Some(name)) = (parameter, self.identifier_name(ident)) else {
+                    return target.clone();
+                };
+                let object = self.ident_expr(&parameter);
+                let property = MemberProperty::Named(self.ident(&name));
+                AssignmentTarget::Member(AssignmentMemberTarget {
+                    object: Box::new(object),
+                    property,
+                })
+            }
             AssignmentTarget::Member(member) => {
                 return self.rewrite_member_target(member, target.range());
             }
@@ -8959,6 +9006,25 @@ fn contains_yield(expression: &Expr) -> bool {
     }
 }
 
+/// Every identifier the file spells, which a generated name has to avoid.
+fn identifier_names(file: &SourceFile) -> BTreeSet<String> {
+    file.tokens()
+        .iter()
+        .filter(|token| token.kind() == TokenKind::Identifier)
+        .filter_map(|token| {
+            let start = file
+                .source_text()
+                .utf16_to_byte(token.range().start())
+                .ok()?;
+            let end = file.source_text().utf16_to_byte(token.range().end()).ok()?;
+            file.source_text()
+                .as_str()
+                .get(start..end)
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 fn identifier_text(file: &SourceFile, ident: &IdentifierNode) -> String {
     raw_token_text(file, ident.data().token())
 }
@@ -10536,6 +10602,140 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         assert!(code.contains("exports.a = a;"), "{code}");
         assert!(code.contains("exports.c = b;"), "{code}");
         assert!(!code.contains("export {"), "{code}");
+    }
+
+    #[test]
+    fn a_namespace_fills_its_container_through_a_call() {
+        let output = emit_at(
+            "namespace A {\n\
+             \x20   // a comment\n\
+             \x20   export var x = 1, y;\n\
+             \x20   var hidden = x;\n\
+             \x20   export function f() { return x; }\n\
+             \x20   export class C {}\n\
+             \x20   export namespace B {\n\
+             \x20       export var z = x + 1;\n\
+             \x20   }\n\
+             }\n\
+             namespace A {\n\
+             \x20   x = 2;\n\
+             \x20   x++;\n\
+             \x20   const box = { x };\n\
+             \x20   f();\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var A;\n\
+             (function (A) {\n\
+             \x20   // a comment\n\
+             \x20   A.x = 1;\n\
+             \x20   var hidden = A.x;\n\
+             \x20   function f() { return A.x; }\n\
+             \x20   A.f = f;\n\
+             \x20   class C {\n\
+             \x20   }\n\
+             \x20   A.C = C;\n\
+             \x20   let B;\n\
+             \x20   (function (B) {\n\
+             \x20       B.z = A.x + 1;\n\
+             \x20   })(B = A.B || (A.B = {}));\n\
+             })(A || (A = {}));\n\
+             (function (A) {\n\
+             \x20   A.x = 2;\n\
+             \x20   A.x++;\n\
+             \x20   const box = { x: A.x };\n\
+             \x20   A.f();\n\
+             })(A || (A = {}));\n"
+        );
+    }
+
+    #[test]
+    fn a_namespace_without_a_value_emits_nothing() {
+        let output = emit_at(
+            "namespace T { export interface I {} }\n\
+             namespace U { import a = T; }\n\
+             namespace V { export const enum E { A } }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(javascript(&output), "");
+    }
+
+    #[test]
+    fn a_namespace_merged_into_a_class_uses_its_binding() {
+        let output = emit_at(
+            "class C {}\nnamespace C { export var x = 1; }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "class C {\n}\n(function (C) {\n    C.x = 1;\n})(C || (C = {}));\n"
+        );
+    }
+
+    #[test]
+    fn a_namespace_whose_body_shadows_its_name_renames_the_parameter() {
+        let output = emit_at(
+            "namespace M { export var M = 1; export var y = M; }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var M;\n(function (M_1) {\n    M_1.M = 1;\n    M_1.y = M_1.M;\n})(M || (M = {}));\n"
+        );
+    }
+
+    #[test]
+    fn an_exported_pattern_assigns_each_name_onto_the_container() {
+        // Upstream declarationEmitDestructuringArrayPattern3 and
+        // downlevelLetConst13: one read needs no temporary.
+        let output = emit_at(
+            "namespace M {\n\
+             \x20   export var [a, b] = [1, 2];\n\
+             \x20   export let [c] = [1];\n\
+             \x20   export const { d: e } = { d: 1 };\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var M;\n\
+             (function (M) {\n\
+             \x20   var _a;\n\
+             \x20   _a = [1, 2], M.a = _a[0], M.b = _a[1];\n\
+             \x20   M.c = [1][0];\n\
+             \x20   M.e = { d: 1 }.d;\n\
+             })(M || (M = {}));\n"
+        );
+    }
+
+    #[test]
+    fn an_exported_namespace_publishes_its_container() {
+        let source = "export namespace M { export var x = 1; }\n";
+        let esm = emit_at(source, ScriptTarget::Es2015);
+        assert_eq!(
+            javascript(&esm),
+            "export var M;\n(function (M) {\n    M.x = 1;\n})(M || (M = {}));\n"
+        );
+        let cjs = emit_with_options(
+            source,
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        assert_eq!(
+            javascript(&cjs),
+            "\"use strict\";\n\
+             Object.defineProperty(exports, \"__esModule\", { value: true });\n\
+             exports.M = void 0;\n\
+             var M;\n\
+             (function (M) {\n\
+             \x20   M.x = 1;\n\
+             })(M || (exports.M = M = {}));\n"
+        );
     }
 
     #[test]

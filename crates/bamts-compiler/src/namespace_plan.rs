@@ -532,8 +532,11 @@ fn statement_is_value_bearing(
             .get(&statement.id())
             .is_some_and(|binding| namespace_is_value_bearing(binding, by_declaration)),
         Statement::Declare(_) => false,
+        // An alias holds a value only once it is published on the container.
+        Statement::ImportEquals(_) => false,
         Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner))) => {
-            statement_is_value_bearing(inner, by_declaration)
+            matches!(inner.data(), Statement::ImportEquals(_))
+                || statement_is_value_bearing(inner, by_declaration)
         }
         Statement::Empty => false,
         _ => true,
