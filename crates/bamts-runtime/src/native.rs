@@ -3344,6 +3344,22 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         }
         let kind = self.machine.borrow().callee_kind(callee);
         match kind {
+            Ok(CalleeKind::Builtin { id })
+                if !self
+                    .machine
+                    .borrow()
+                    .intrinsics
+                    .builtins
+                    .is_constructable(id) =>
+            {
+                self.pending_throw.set(Some(PendingThrow {
+                    value: Value::UNDEFINED,
+                    origin: ThrowOrigin::TypeError {
+                        operation: "construct",
+                    },
+                }));
+                HelperResult::throw(Value::UNDEFINED)
+            }
             Ok(CalleeKind::Builtin { id }) => {
                 let result = self.machine.borrow_mut().call_builtin_with_new_target(
                     id,

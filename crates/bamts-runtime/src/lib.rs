@@ -7378,6 +7378,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 Err(failure) => self.resolve_failure(failure, call_pc),
             };
         }
+        match self.is_constructor(callee) {
+            Ok(true) => {}
+            Ok(false) => return self.throw_type("construct", call_pc),
+            Err(failure) => return self.resolve_failure(failure, call_pc),
+        }
         let index = match self.runtime_slot(callee) {
             Ok(Some(index)) => index,
             Ok(None) => return self.throw_type("construct", call_pc),
@@ -19710,6 +19715,57 @@ mod tests {
             }
             other => panic!("expected UncaughtThrow, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_builtin_with_no_construct_cannot_be_called_with_new() {
+        // `new Math.abs()`.
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::encode("Math")),
+                Constant::String(EcmaString::encode("abs")),
+            ],
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(2),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::CreateArray { dst: reg(3) },
+                    Instruction::Construct {
+                        dst: reg(4),
+                        callee: reg(2),
+                        arguments: reg(3),
+                    },
+                    Instruction::Return { value: reg(4) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError {
+                    operation: "construct"
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
