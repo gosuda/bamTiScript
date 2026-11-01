@@ -692,6 +692,14 @@ enum IterationKind {
     Key,
     Value,
     Entry,
+    /// A `%StringIteratorPrototype%` instance; `source` is its code points.
+    StringCodePoint,
+    /// A `%RegExpStringIteratorPrototype%` instance; `source` is its hidden state.
+    RegExpString,
+    /// An `Iterator` helper; `source` is its hidden state.
+    IteratorHelper(intrinsics::builtins::iterator_helpers::Operation),
+    /// A `%WrapForValidIteratorPrototype%` instance; `source` is its record.
+    WrapForValid,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1476,10 +1484,14 @@ impl HeapEntry {
                 )
                 .saturating_add(properties.charge_bytes())
                 .saturating_add(1),
-            Self::NativeFunction { callable, .. } => match callable {
+            Self::NativeFunction {
+                callable,
+                properties,
+                ..
+            } => properties.charge_bytes().saturating_add(match callable {
                 NativeCallable::Builtin(_) => 1,
                 NativeCallable::Bound(bound) => bound.arguments.len().saturating_add(1),
-            },
+            }),
             Self::Proxy { .. } => 1,
             Self::ProxyRevoker { properties, .. } => properties.charge_bytes().saturating_add(1),
             Self::Generator { state, .. } => match state {
@@ -1820,6 +1832,16 @@ pub struct Machine<'a, H: Host> {
     limits: Limits,
     gc: gc::GcState,
     native_roots: Vec<Vec<Value>>,
+    /// Recently compiled patterns. `exec` runs once per match of a global search,
+    /// so recompiling on every call would make it cost a parse per match.
+    /// Objects being joined, innermost last. A cycle passes through native code
+    /// on every level, so no activation limit would stop it.
+    array_join_stack: Vec<Value>,
+    regexp_cache: Vec<(
+        EcmaString,
+        EcmaString,
+        std::rc::Rc<intrinsics::builtins::regexp_v::CompiledV>,
+    )>,
     /// Values kept strongly reachable for the current ECMAScript job by
     /// WeakRef construction/deref. Cleared exactly once at the outer job seam.
     kept_alive: Vec<Value>,
@@ -2193,6 +2215,8 @@ impl<'a, H: Host> Machine<'a, H> {
             gc: gc::GcState::new(&limits),
             limits,
             native_roots: Vec::new(),
+            regexp_cache: Vec::new(),
+            array_join_stack: Vec::new(),
             kept_alive: Vec::new(),
             fuel,
             frames: vec![frame],
@@ -3431,13 +3455,16 @@ impl<'a, H: Host> Machine<'a, H> {
         target: Value,
         record: Value,
     ) -> Result<Value, EvalFailure> {
+        let name = self
+            .allocate(HeapEntry::String(EcmaString::encode("")))
+            .map_err(EvalFailure::Runtime)?;
         self.allocate(HeapEntry::native_function(
             NativeCallable::Bound(Box::new(BoundCallable {
                 target,
                 this_value: Value::UNDEFINED,
                 arguments: vec![record],
             })),
-            PropertyMap::default(),
+            intrinsics::function_properties(1, name),
             None,
         ))
         .map_err(EvalFailure::Runtime)
@@ -3873,6 +3900,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 },
             );
         }
+        properties.insert(self.intrinsics.builtins.error_brand_key(), error_brand());
         self.allocate(HeapEntry::Object {
             properties,
             prototype: Some(self.intrinsics.error_prototype(id)),
@@ -5693,14 +5721,17 @@ impl<'a, H: Host> Machine<'a, H> {
                     captures,
                 } => match self.read_captures(frame_index, captures.get(), function) {
                     Ok(captures) => {
+                        let properties = self
+                            .closure_properties(module_id, function)
+                            .map_err(|kind| self.error_at(kind, function_index, pc))?;
                         let value = self
                             .allocate(HeapEntry::Function {
                                 module: module_id,
                                 function,
                                 captures,
                                 context: self.frames[frame_index].context,
-                                properties: PropertyMap::default(),
-                                prototype: Some(self.intrinsics.function_prototype),
+                                properties,
+                                prototype: Some(self.closure_prototype(module_id, function)),
                                 extensible: true,
                             })
                             .map_err(|kind| self.error_at(kind, function_index, pc))?;
@@ -5712,7 +5743,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Instruction::GetProperty { dst, object, key } => {
                     let object = self.read_register(frame_index, object.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.computed_property_key(object, key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5731,7 +5762,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let object = self.read_register(frame_index, object.get());
                     let value = self.read_register(frame_index, value.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.computed_property_key(object, key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5757,7 +5788,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Instruction::DeleteProperty { dst, object, key } => {
                     let object = self.read_register(frame_index, object.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.computed_property_key(object, key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5784,7 +5815,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let object = self.read_register(frame_index, object.get());
                     let accessor = self.read_register(frame_index, accessor.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5800,7 +5831,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let object = self.read_register(frame_index, object.get());
                     let value = self.read_register(frame_index, value.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5921,7 +5952,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 },
                 Instruction::StoreGlobal { name, value } => {
                     let value = self.read_register(frame_index, value.get());
-                    match self.store_global(module_id, name, value) {
+                    let sloppy = self.is_sloppy(module_id, function_index);
+                    match self.store_global(module_id, name, value, sloppy) {
                         Ok(()) => self.frames[frame_index].pc = pc + 1,
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
@@ -6295,7 +6327,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let home = self.read_register(frame_index, home.get());
                     let receiver = self.read_register(frame_index, receiver.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -6319,7 +6351,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let home = self.read_register(frame_index, home.get());
                     let receiver = self.read_register(frame_index, receiver.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -6673,6 +6705,137 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(None)
     }
 
+    /// `ToPropertyKey` for a property reference. A null or undefined base throws
+    /// here, before the key converts, so that conversion runs no user code.
+    pub(crate) fn computed_property_key(
+        &mut self,
+        object: Value,
+        key: Value,
+    ) -> Result<PropertyKey, EvalFailure> {
+        if matches!(object.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "access a property of null or undefined",
+            }));
+        }
+        self.observable_property_key(key)
+    }
+
+    /// The `[[Prototype]]` a new closure starts with, which depends on its kind.
+    pub(crate) fn closure_prototype(&self, module: ModuleId, function: FunctionId) -> Value {
+        let flags = self.module_code(module).functions()[function.get() as usize].flags();
+        let builtins = &self.intrinsics.builtins;
+        match (flags.is_async, flags.is_generator) {
+            (false, false) => self.intrinsics.function_prototype,
+            (false, true) => builtins.generator_function_prototype(),
+            (true, false) => builtins.async_function_prototype(),
+            (true, true) => builtins.async_generator_function_prototype(),
+        }
+    }
+
+    /// The own properties a new closure starts with. A generator function owns
+    /// the `prototype` object its kind requires, which the compiler emits only
+    /// for constructors; every other property of a closure is materialized on
+    /// demand.
+    pub(crate) fn closure_properties(
+        &mut self,
+        module: ModuleId,
+        function: FunctionId,
+    ) -> Result<PropertyMap, RuntimeErrorKind> {
+        let flags = self.module_code(module).functions()[function.get() as usize].flags();
+        let mut properties = PropertyMap::default();
+        if flags.is_generator {
+            let builtins = &self.intrinsics.builtins;
+            let parent = if flags.is_async {
+                builtins.async_generator_prototype()
+            } else {
+                builtins.generator_prototype()
+            };
+            let value = self.allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(parent),
+                extensible: true,
+                boxed_primitive: None,
+            })?;
+            properties.insert(
+                PropertyKey::Named(EcmaString::encode("prototype")),
+                Property::Data {
+                    value,
+                    writable: true,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+        Ok(properties)
+    }
+
+    /// A function's `length` and `name` come from its code until something could
+    /// tell that from stored properties: a descriptor read, a key list, a delete or
+    /// a redefinition stores them first, ahead of whatever is already stored.
+    pub(crate) fn reify_function_properties(&mut self, index: usize) -> Result<(), EvalFailure> {
+        let reified = self.intrinsics.builtins.function_reified_key();
+        let name_key = PropertyKey::Named(EcmaString::encode("name"));
+        let length_key = PropertyKey::Named(EcmaString::encode("length"));
+        let HeapEntry::Function {
+            module,
+            function,
+            properties,
+            ..
+        } = &self.heap[index]
+        else {
+            return Ok(());
+        };
+        if properties.contains_key(&reified) {
+            return Ok(());
+        }
+        let metadata = &self.module_code(*module).functions()[function.get() as usize];
+        let length = (!properties.contains_key(&length_key))
+            .then(|| number_value(metadata.parameter_count() as f64));
+        let name = (!properties.contains_key(&name_key)).then(|| {
+            metadata
+                .name()
+                .map(|id| self.constant_text(*module, id).clone())
+                .unwrap_or_default()
+        });
+        let name = name
+            .map(|text| self.allocate(HeapEntry::String(text)))
+            .transpose()
+            .map_err(EvalFailure::Runtime)?;
+        let mut stored = PropertyMap::default();
+        for (key, value) in [(length_key, length), (name_key, name)] {
+            if let Some(value) = value {
+                stored.insert(
+                    key,
+                    Property::Data {
+                        value,
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                );
+            }
+        }
+        stored.insert(
+            reified,
+            Property::Data {
+                value: Value::TRUE,
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        self.charge_slot(index, stored.charge_bytes())
+            .map_err(EvalFailure::Runtime)?;
+        let HeapEntry::Function { properties, .. } = &mut self.heap[index] else {
+            unreachable!("function checked above");
+        };
+        for (key, property) in std::mem::take(properties).0 {
+            stored.insert(key, property);
+        }
+        *properties = stored;
+        Ok(())
+    }
+
     /// Whether a function is non-strict ECMAScript code.
     pub(crate) fn is_sloppy(&self, module: ModuleId, function: usize) -> bool {
         self.module_code(module).functions()[function]
@@ -6720,6 +6883,7 @@ impl<'a, H: Host> Machine<'a, H> {
         module: ModuleId,
         name: ConstantId,
         value: Value,
+        sloppy: bool,
     ) -> Result<(), EvalFailure> {
         let cell = self
             .registry
@@ -6746,7 +6910,17 @@ impl<'a, H: Host> Machine<'a, H> {
         } else {
             let name = self.constant_text(module, name).to_owned();
             let global = self.context_global.unwrap_or(self.global_object);
-            self.set_data_property_key(global, PropertyKey::Named(name), value)?;
+            let key = PropertyKey::Named(name);
+            let stored = self.internal_set(global, key.clone(), value, global)?;
+            // This instruction also carries global declarations, whose failure
+            // always throws. Only an assignment can fail on an existing
+            // property, and sloppy code ignores that; a missing property on a
+            // non-extensible global is taken to be a declaration.
+            if !stored && !(sloppy && self.has_own_property_key(global, &key)?) {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "assign to read only property",
+                }));
+            }
         }
         Ok(())
     }
@@ -6851,22 +7025,6 @@ impl<'a, H: Host> Machine<'a, H> {
             arguments: flattened,
             new_target,
         })
-    }
-
-    fn bound_target(&self, mut value: Value) -> Result<Value, RuntimeErrorKind> {
-        loop {
-            let Some(index) = self.runtime_slot(value)? else {
-                return Ok(value);
-            };
-            let HeapEntry::NativeFunction {
-                callable: NativeCallable::Bound(bound),
-                ..
-            } = &self.heap[index]
-            else {
-                return Ok(value);
-            };
-            value = bound.target;
-        }
     }
 
     /// Materializes a constant into an ABI value, interning strings and bigints
@@ -6978,6 +7136,25 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// A strict arguments object poisons `callee`; a sloppy one would name the
+    /// function, which a frame does not hold.
+    pub(crate) fn arguments_properties(&self, sloppy: bool) -> PropertyMap {
+        let mut properties = PropertyMap::default();
+        if !sloppy {
+            let thrower = self.intrinsics.builtins.throw_type_error();
+            properties.insert(
+                PropertyKey::Named(EcmaString::encode("callee")),
+                Property::Accessor {
+                    getter: Some(thrower),
+                    setter: Some(thrower),
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+        properties
+    }
+
     pub(crate) fn materialize_arguments(
         &mut self,
         frame: usize,
@@ -6988,10 +7165,12 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(existing);
         }
         let args = self.frames[frame].args.clone();
+        let properties =
+            self.arguments_properties(self.is_sloppy(self.frames[frame].module, function));
         let value = self
             .allocate(HeapEntry::Array {
                 elements: args,
-                properties: PropertyMap::default(),
+                properties,
                 prototype: Some(self.intrinsics.array_prototype),
                 extensible: true,
                 length_writable: true,
@@ -7146,6 +7325,22 @@ impl<'a, H: Host> Machine<'a, H> {
     /// callees recurse into their target, runtime closures consult the
     /// compiler-emitted `FunctionFlags::is_constructable` bit, and proxies
     /// answer from the snapshot `ProxyCreate` took of their target.
+    /// Whether `value` is a non-strict `function`, the one kind of function that
+    /// the specification lets an implementation give `caller` and `arguments`.
+    pub(crate) fn is_sloppy_ordinary_function(&self, value: Value) -> Result<bool, EvalFailure> {
+        let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
+            return Ok(false);
+        };
+        let HeapEntry::Function {
+            module, function, ..
+        } = &self.heap[index]
+        else {
+            return Ok(false);
+        };
+        let flags = self.module_code(*module).functions()[function.get() as usize].flags();
+        Ok(flags.is_sloppy && flags.is_constructable && !flags.is_async && !flags.is_generator)
+    }
+
     pub(crate) fn is_constructor(&self, value: Value) -> Result<bool, EvalFailure> {
         let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
             return Ok(false);
@@ -7678,6 +7873,49 @@ impl<'a, H: Host> Machine<'a, H> {
         self.box_primitive(value)
     }
 
+    /// The string inside a String exotic object.
+    fn boxed_string(&self, index: usize) -> Option<&EcmaString> {
+        let HeapEntry::Object {
+            boxed_primitive: Some(primitive),
+            ..
+        } = &self.heap[index]
+        else {
+            return None;
+        };
+        let slot = self.runtime_slot(*primitive).ok().flatten()?;
+        match &self.heap[slot] {
+            HeapEntry::String(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// `StringGetOwnProperty`, plus the `length` every String exotic object owns.
+    pub(crate) fn string_exotic_property(
+        &mut self,
+        index: usize,
+        key: &PropertyKey,
+    ) -> Result<Option<Property>, EvalFailure> {
+        let found = self
+            .boxed_string(index)
+            .and_then(|text| string_own_get(text, key));
+        let (value, enumerable) = match found {
+            Some(Found::Value(length)) => (length, false),
+            Some(Found::Text(unit)) => {
+                let unit = self
+                    .allocate(HeapEntry::String(unit))
+                    .map_err(EvalFailure::Runtime)?;
+                (unit, true)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Property::Data {
+            value,
+            writable: false,
+            enumerable,
+            configurable: false,
+        }))
+    }
+
     pub(crate) fn unbox_primitive_or_self(&self, value: Value) -> Result<Value, EvalFailure> {
         let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
             return Ok(value);
@@ -7744,6 +7982,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 configurable: true,
             },
         );
+        properties.insert(self.intrinsics.builtins.error_brand_key(), error_brand());
         match self.allocate(HeapEntry::Object {
             properties,
             prototype: Some(self.intrinsics.error_prototype(id)),
@@ -7828,7 +8067,10 @@ impl<'a, H: Host> Machine<'a, H> {
                     Ok(None) => self.last_completion.take().ok_or(EvalFailure::Runtime(
                         RuntimeErrorKind::InvalidValue { value: object },
                     )),
-                    Ok(Some(execution)) => Ok(execution.value),
+                    // With no activation to return to, `complete_frame` hands back
+                    // the raw completion, so the receiver rule applies here.
+                    Ok(Some(execution)) if self.is_object(execution.value) => Ok(execution.value),
+                    Ok(Some(_)) => Ok(object),
                     Err(error) => {
                         self.unwind_frames_to(stop_depth);
                         match error.kind {
@@ -8418,10 +8660,6 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn own_get_ascii(&self, index: usize, name: &str) -> Option<Found> {
         debug_assert!(name.is_ascii());
-        let slot = |value| self.runtime_slot(value).ok().flatten();
-        if slot(self.intrinsics.object_prototype) == Some(index) && name == "toString" {
-            return Some(Found::Value(self.intrinsics.object_to_string()));
-        }
         match &self.heap[index] {
             HeapEntry::Object {
                 properties,
@@ -8494,6 +8732,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 if let Some(found) = property_lookup_ascii(properties, name) {
                     return Some(found);
                 }
+                if properties.contains_key(&self.intrinsics.builtins.function_reified_key()) {
+                    return None;
+                }
                 let metadata = &self.module_code(*module).functions()[function.get() as usize];
                 if name == "length" {
                     return Some(Found::Value(
@@ -8533,33 +8774,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.registry.cells[cell.0].value
                 })))
             }
-            HeapEntry::RegExp {
-                pattern,
-                flags,
-                properties,
-                ..
-            } => {
-                if let Some(found) = property_lookup_ascii(properties, name) {
-                    return Some(found);
-                }
-                let flag = |unit| {
-                    Found::Value(Value::boolean(flags.as_units().contains(&u16::from(unit))))
-                };
-                match name {
-                    "source" => Some(Found::Text(crate::intrinsics::builtins::canonical_source(
-                        pattern,
-                    ))),
-                    "flags" => Some(Found::Text(flags.clone())),
-                    "global" => Some(flag(b'g')),
-                    "ignoreCase" => Some(flag(b'i')),
-                    "multiline" => Some(flag(b'm')),
-                    "sticky" => Some(flag(b'y')),
-                    "unicode" => Some(flag(b'u')),
-                    "dotAll" => Some(flag(b's')),
-                    "lastIndex" => Some(Found::Value(Value::int32(0))),
-                    _ => None,
-                }
-            }
+            HeapEntry::RegExp { properties, .. } => property_lookup_ascii(properties, name),
             HeapEntry::HashState { update, digest, .. } => match name {
                 "update" => Some(Found::Value(*update)),
                 "digest" => Some(Found::Value(*digest)),
@@ -8583,12 +8798,6 @@ impl<'a, H: Host> Machine<'a, H> {
     /// Looks up an own property of the heap entry at `index`, returning `None`
     /// when the key is absent so the caller may continue up the prototype chain.
     fn own_get(&self, index: usize, key: &PropertyKey) -> Option<Found> {
-        if let PropertyKey::Named(name) = key {
-            let slot = |value| self.runtime_slot(value).ok().flatten();
-            if slot(self.intrinsics.object_prototype) == Some(index) && name.eq_ascii("toString") {
-                return Some(Found::Value(self.intrinsics.object_to_string()));
-            }
-        }
         match &self.heap[index] {
             HeapEntry::Object {
                 properties,
@@ -8662,7 +8871,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 if let Some(found) = property_lookup(properties, key) {
                     return Some(found);
                 }
-                if let PropertyKey::Named(name) = key {
+                if let PropertyKey::Named(name) = key
+                    && !properties.contains_key(&self.intrinsics.builtins.function_reified_key())
+                {
                     let metadata = &self.module_code(*module).functions()[function.get() as usize];
                     if name.eq_ascii("length") {
                         return Some(Found::Value(
@@ -8700,53 +8911,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 })))
             }
             HeapEntry::NativeFunction { properties, .. } => property_lookup(properties, key),
-            HeapEntry::RegExp {
-                pattern,
-                flags,
-                properties,
-                ..
-            } => {
-                if let Some(found) = property_lookup(properties, key) {
-                    return Some(found);
-                }
-                if let PropertyKey::Named(name) = key {
-                    let flag = |ascii: &str| {
-                        Found::Value(Value::boolean(
-                            flags.as_units().contains(&u16::from(ascii.as_bytes()[0])),
-                        ))
-                    };
-                    if name.eq_ascii("source") {
-                        return Some(Found::Text(crate::intrinsics::builtins::canonical_source(
-                            pattern,
-                        )));
-                    }
-                    if name.eq_ascii("flags") {
-                        return Some(Found::Text(flags.clone()));
-                    }
-                    if name.eq_ascii("global") {
-                        return Some(flag("g"));
-                    }
-                    if name.eq_ascii("ignoreCase") {
-                        return Some(flag("i"));
-                    }
-                    if name.eq_ascii("multiline") {
-                        return Some(flag("m"));
-                    }
-                    if name.eq_ascii("sticky") {
-                        return Some(flag("y"));
-                    }
-                    if name.eq_ascii("unicode") {
-                        return Some(flag("u"));
-                    }
-                    if name.eq_ascii("dotAll") {
-                        return Some(flag("s"));
-                    }
-                    if name.eq_ascii("lastIndex") {
-                        return Some(Found::Value(Value::int32(0)));
-                    }
-                }
-                None
-            }
+            HeapEntry::RegExp { properties, .. } => property_lookup(properties, key),
             HeapEntry::HashState { update, digest, .. } => {
                 let PropertyKey::Named(name) = key else {
                     return None;
@@ -9082,6 +9247,13 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.object_slot(receiver)? else {
             return Ok(false);
         };
+        if self.is_array_length_key(index, &key) {
+            let descriptor = crate::builtins::property_descriptor::PropertyDescriptor {
+                value: Some(value),
+                ..Default::default()
+            };
+            return self.array_define_length(index, descriptor);
+        }
         self.set_own_data(index, key, value)?;
         Ok(true)
     }
@@ -9179,6 +9351,102 @@ impl<'a, H: Host> Machine<'a, H> {
         self.internal_get(base, key, receiver)
     }
 
+    pub(crate) fn is_array_length_key(&self, index: usize, key: &PropertyKey) -> bool {
+        matches!(key, PropertyKey::Named(name) if name.eq_ascii("length"))
+            && matches!(self.heap[index], HeapEntry::Array { .. })
+    }
+
+    /// `ToUint32` and then `ToNumber`, which both run user code and must agree.
+    fn array_length_value(&mut self, value: Value) -> Result<usize, EvalFailure> {
+        let first = self.coerce_number_observable(value)?;
+        let second = self.coerce_number_observable(value)?;
+        let length = numeric_f64(first).map_or(0, to_uint32);
+        if numeric_f64(second) == Some(f64::from(length)) {
+            Ok(length as usize)
+        } else {
+            Err(EvalFailure::Throw(ThrowOrigin::RangeError {
+                operation: "set array length",
+            }))
+        }
+    }
+
+    /// `ArraySetLength`. A non-configurable element stops a truncation there,
+    /// which is reported as `false` after the elements above it have gone.
+    pub(crate) fn array_define_length(
+        &mut self,
+        index: usize,
+        descriptor: crate::builtins::property_descriptor::PropertyDescriptor,
+    ) -> Result<bool, EvalFailure> {
+        let length = descriptor
+            .value
+            .map(|value| self.array_length_value(value))
+            .transpose()?;
+        let HeapEntry::Array {
+            elements,
+            length_writable,
+            ..
+        } = &self.heap[index]
+        else {
+            unreachable!("array_define_length requires an array");
+        };
+        let (old_length, writable) = (elements.len(), *length_writable);
+        if descriptor.is_accessor()
+            || descriptor.enumerable == Some(true)
+            || descriptor.configurable == Some(true)
+            || (!writable
+                && (descriptor.writable == Some(true)
+                    || length.is_some_and(|length| length != old_length)))
+        {
+            return Ok(false);
+        }
+        let reached = match length {
+            Some(length) if length != old_length => self.resize_array(index, length)?,
+            _ => true,
+        };
+        if descriptor.writable == Some(false)
+            && let HeapEntry::Array {
+                length_writable, ..
+            } = &mut self.heap[index]
+        {
+            *length_writable = false;
+        }
+        Ok(reached)
+    }
+
+    /// Resizes with the heap accounting, and says whether `length` was reached.
+    fn resize_array(&mut self, index: usize, length: usize) -> Result<bool, EvalFailure> {
+        let old_length_and_bytes = |entry: &HeapEntry| match entry {
+            HeapEntry::Array {
+                elements,
+                properties,
+                ..
+            } => (elements.len(), properties.charge_bytes()),
+            _ => unreachable!("resize_array requires an array"),
+        };
+        let (old_length, old_property_bytes) = old_length_and_bytes(&self.heap[index]);
+        let growth = length
+            .saturating_sub(old_length)
+            .saturating_mul(std::mem::size_of::<Value>());
+        self.charge_slot(index, growth)
+            .map_err(EvalFailure::Runtime)?;
+        let HeapEntry::Array {
+            elements,
+            properties,
+            ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("resize_array requires an array");
+        };
+        let reached = apply_array_length(elements, properties, length);
+        let (new_length, new_property_bytes) = old_length_and_bytes(&self.heap[index]);
+        let released = old_length
+            .saturating_sub(new_length)
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(old_property_bytes.saturating_sub(new_property_bytes));
+        self.refund_slot(index, released);
+        Ok(reached)
+    }
+
     fn set_own_data(
         &mut self,
         index: usize,
@@ -9196,57 +9464,18 @@ impl<'a, H: Host> Machine<'a, H> {
             typedarray_all::write_element(self, view, offset, value)?;
             return Ok(());
         }
-        if matches!(&key, PropertyKey::Named(name) if name.eq_ascii("length"))
-            && matches!(self.heap[index], HeapEntry::Array { .. })
-        {
-            let length =
-                exact_array_length(value).ok_or(EvalFailure::Throw(ThrowOrigin::RangeError {
+        if self.is_array_length_key(index, &key) {
+            let descriptor = crate::builtins::property_descriptor::PropertyDescriptor {
+                value: Some(value),
+                ..Default::default()
+            };
+            return if self.array_define_length(index, descriptor)? {
+                Ok(())
+            } else {
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "set array length",
-                }))?;
-            let (old_length, old_property_bytes, length_writable) = match &self.heap[index] {
-                HeapEntry::Array {
-                    elements,
-                    properties,
-                    length_writable,
-                    ..
-                } => (elements.len(), properties.charge_bytes(), *length_writable),
-                _ => unreachable!("array checked above"),
+                }))
             };
-            if !length_writable {
-                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "set array length",
-                }));
-            }
-            let growth = length
-                .saturating_sub(old_length)
-                .saturating_mul(std::mem::size_of::<Value>());
-            self.charge_slot(index, growth)
-                .map_err(EvalFailure::Runtime)?;
-            let result = {
-                let HeapEntry::Array {
-                    elements,
-                    properties,
-                    ..
-                } = &mut self.heap[index]
-                else {
-                    unreachable!("array checked above");
-                };
-                apply_array_length(elements, properties, length, "set array length")
-            };
-            let (new_length, new_property_bytes) = match &self.heap[index] {
-                HeapEntry::Array {
-                    elements,
-                    properties,
-                    ..
-                } => (elements.len(), properties.charge_bytes()),
-                _ => unreachable!("array checked above"),
-            };
-            let released = old_length
-                .saturating_sub(new_length)
-                .saturating_mul(std::mem::size_of::<Value>())
-                .saturating_add(old_property_bytes.saturating_sub(new_property_bytes));
-            self.refund_slot(index, released);
-            return result;
         }
         if let HeapEntry::Array {
             elements,
@@ -9558,7 +9787,14 @@ impl<'a, H: Host> Machine<'a, H> {
                                     "set array index",
                                 )?;
                             }
-                            elements[offset] = value;
+                            let key = PropertyKey::Named(name);
+                            if let Some(Property::Data { value: stored, .. }) =
+                                properties.get_mut(&key)
+                            {
+                                *stored = value;
+                            } else {
+                                elements[offset] = value;
+                            }
                         } else {
                             let key = PropertyKey::Named(name);
                             let descriptor = match properties.get(&key) {
@@ -9843,6 +10079,13 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
+                if self
+                    .boxed_string(index)
+                    .is_some_and(|text| string_own_get(text, key).is_some())
+                {
+                    return Ok(false);
+                }
+                self.reify_function_properties(index)?;
                 if let PropertyKey::Named(name) = key
                     && let Some(typed_index) = typedarray_all::typed_array_index(name)
                     && matches!(self.heap[index], HeapEntry::TypedArray { .. })
@@ -11919,9 +12162,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         indices.push((offset, key));
                     }
                     indices.sort_unstable_by_key(|(offset, _)| *offset);
+                    let length = PropertyKey::Named(EcmaString::encode("length"));
                     Ok(indices
                         .into_iter()
                         .map(|(_, key)| key)
+                        .chain(std::iter::once(length))
                         .chain(suffix)
                         .collect())
                 }
@@ -11976,6 +12221,12 @@ impl<'a, H: Host> Machine<'a, H> {
                 .internal_get_own_property(src, key)?
                 .is_some_and(|descriptor| descriptor.enumerable == Some(true)));
         }
+        if self
+            .boxed_string(index)
+            .is_some_and(|text| string_has_index(text, key))
+        {
+            return Ok(true);
+        }
         Ok(match &self.heap[index] {
             HeapEntry::Array {
                 elements,
@@ -11993,9 +12244,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 },
                 Property::enumerable,
             ),
-            HeapEntry::String(text) => key.as_string().is_some_and(|name| {
-                array_index(name).is_some_and(|offset| (offset as usize) < text.len_units())
-            }),
+            HeapEntry::String(text) => string_has_index(text, key),
             HeapEntry::TypedArray { properties, .. } => properties.get(key).map_or_else(
                 || {
                     key.as_string()
@@ -12575,6 +12824,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             UnaryOp::Plus => self.coerce_number_observable(operand),
             UnaryOp::Negate => {
+                let operand = self.coerce_primitive_observable(operand, false)?;
                 if let Some(value) = intrinsics::builtins::bigint::unary_minus(self, operand)? {
                     return Ok(value);
                 }
@@ -12583,6 +12833,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Ok(number_value(-number))
             }
             UnaryOp::BitwiseNot => {
+                let operand = self.coerce_primitive_observable(operand, false)?;
                 if let Some(value) = intrinsics::builtins::bigint::bitwise_not(self, operand)? {
                     return Ok(value);
                 }
@@ -12636,7 +12887,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             BinaryOp::InstanceOf => self.instance_of(left, right).map(Value::boolean),
             BinaryOp::In => {
-                let key = self.to_property_key(left)?;
+                let key = self.observable_property_key(left)?;
                 self.internal_has_property(right, &key).map(Value::boolean)
             }
             BinaryOp::Add => self.add(left, right),
@@ -12700,6 +12951,10 @@ impl<'a, H: Host> Machine<'a, H> {
         left: Value,
         right: Value,
     ) -> Result<Value, EvalFailure> {
+        // ToNumeric, left first: an object operand runs its `valueOf` here, and
+        // the operator only ever sees primitives after this.
+        let left = self.coerce_primitive_observable(left, false)?;
+        let right = self.coerce_primitive_observable(right, false)?;
         if let Some(result) =
             intrinsics::builtins::bigint::binary_op(self, bigint_binary_op(op), left, right)?
         {
@@ -12712,7 +12967,7 @@ impl<'a, H: Host> Machine<'a, H> {
             BinaryOp::Multiply => number_value(left * right),
             BinaryOp::Divide => Value::number(left / right),
             BinaryOp::Remainder => Value::number(left % right),
-            BinaryOp::Exponent => Value::number(left.powf(right)),
+            BinaryOp::Exponent => Value::number(number_exponentiate(left, right)),
             BinaryOp::BitAnd => Value::int32((to_int32(left) & to_int32(right)) as u32),
             BinaryOp::BitOr => Value::int32((to_int32(left) | to_int32(right)) as u32),
             BinaryOp::BitXor => Value::int32((to_int32(left) ^ to_int32(right)) as u32),
@@ -12744,11 +12999,7 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn coerce_primitive_default(&mut self, value: Value) -> Result<Value, EvalFailure> {
-        let prefer_string = self
-            .runtime_slot(value)
-            .map_err(EvalFailure::Runtime)?
-            .is_some_and(|index| matches!(self.heap[index], HeapEntry::Date { .. }));
-        self.coerce_primitive_with_hint(value, "default", prefer_string)
+        self.coerce_primitive_with_hint(value, "default", false)
     }
 
     pub(crate) fn coerce_primitive_observable(
@@ -12790,6 +13041,15 @@ impl<'a, H: Host> Machine<'a, H> {
                 operation: "Symbol.toPrimitive returned an object",
             }));
         }
+        self.ordinary_to_primitive(value, prefer_string)
+    }
+
+    /// `OrdinaryToPrimitive`: the two ordinary methods, in hint order.
+    pub(crate) fn ordinary_to_primitive(
+        &mut self,
+        value: Value,
+        prefer_string: bool,
+    ) -> Result<Value, EvalFailure> {
         let methods = if prefer_string {
             ["toString", "valueOf"]
         } else {
@@ -13096,14 +13356,19 @@ impl<'a, H: Host> Machine<'a, H> {
     /// prototype-chain check. A present-but-non-callable handler is a
     /// TypeError, matching `GetMethod`.
     fn instance_of(&mut self, value: Value, constructor: Value) -> Result<bool, EvalFailure> {
-        let constructor = self
-            .bound_target(constructor)
-            .map_err(EvalFailure::Runtime)?;
+        if !self.is_object(constructor) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "instanceof",
+            }));
+        }
         let key = self.has_instance_key()?;
         let handler = self.get_property_key(constructor, &key)?;
         if matches!(handler.decode(), Some(Decoded::Undefined | Decoded::Null)) {
-            // No `@@hasInstance`: ordinary prototype-chain check, byte-for-byte
-            // the pre-symbol `instanceof` behavior.
+            if !self.is_callable(constructor)? {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "instanceof",
+                }));
+            }
             return self.ordinary_has_instance(value, constructor);
         }
         // GetMethod: a present, non-nullish handler must be callable.
@@ -13118,18 +13383,29 @@ impl<'a, H: Host> Machine<'a, H> {
 
     /// `OrdinaryHasInstance` (ECMA-262 §7.3.20): walks `value`'s prototype
     /// chain for the constructor's own `prototype` object, matching by heap
-    /// identity. This is the fallback for a right-hand side that defines no
-    /// callable `Symbol.hasInstance` and is unchanged from the original
-    /// `instanceof` implementation.
+    /// identity. A bound function defers to `instanceof` on its target, and a
+    /// non-callable receiver is simply not a constructor of anything.
     fn ordinary_has_instance(
         &mut self,
         value: Value,
         constructor: Value,
     ) -> Result<bool, EvalFailure> {
         if !self.is_callable(constructor)? {
-            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "instanceof",
-            }));
+            return Ok(false);
+        }
+        if let Some(index) = self
+            .runtime_slot(constructor)
+            .map_err(EvalFailure::Runtime)?
+            && let HeapEntry::NativeFunction {
+                callable: NativeCallable::Bound(bound),
+                ..
+            } = &self.heap[index]
+        {
+            let target = bound.target;
+            return self.instance_of(value, target);
+        }
+        if !self.is_object(value) {
+            return Ok(false);
         }
         let prototype_key = PropertyKey::Named(EcmaString::encode("prototype"));
         let prototype = self.internal_get(constructor, &prototype_key, constructor)?;
@@ -13431,6 +13707,18 @@ fn numeric_f64(value: Value) -> Option<f64> {
     }
 }
 
+/// What an error object stores under the `[[ErrorData]]` brand key.
+fn error_brand() -> Property {
+    Property::Data {
+        value: Value::TRUE,
+        writable: false,
+        enumerable: false,
+        configurable: false,
+    }
+}
+
+/// The compact encoding for a whole Number. `-0` stays a double: Int32 has no
+/// negative zero, and `1 / -0` and `Object.is` can both tell the difference.
 fn number_value(number: f64) -> Value {
     // An int32 has no negative zero, so that one integral value stays a double.
     if number.is_finite()
@@ -13445,20 +13733,21 @@ fn number_value(number: f64) -> Value {
     }
 }
 
+/// `Number::exponentiate`, which differs from `powf` for a base of 1 or -1 and a
+/// NaN or infinite exponent.
+pub(crate) fn number_exponentiate(base: f64, exponent: f64) -> f64 {
+    if exponent.is_nan() || (base.abs() == 1.0 && exponent.is_infinite()) {
+        f64::NAN
+    } else {
+        base.powf(exponent)
+    }
+}
+
 fn parse_number(text: &EcmaString) -> f64 {
     let Ok(text) = text.to_utf8_strict() else {
         return f64::NAN;
     };
-    parse_number_utf8(&text)
-}
-
-fn parse_number_utf8(text: &str) -> f64 {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        0.0
-    } else {
-        trimmed.parse::<f64>().unwrap_or(f64::NAN)
-    }
+    intrinsics::builtins::string_to_number(&text)
 }
 
 fn to_uint32(number: f64) -> u32 {
@@ -13504,6 +13793,12 @@ fn array_index(key: &EcmaString) -> Option<u32> {
     (index != u32::MAX).then_some(index)
 }
 
+fn string_has_index(text: &EcmaString, key: &PropertyKey) -> bool {
+    key.as_string().is_some_and(|name| {
+        array_index(name).is_some_and(|offset| (offset as usize) < text.len_units())
+    })
+}
+
 fn string_own_get(text: &EcmaString, key: &PropertyKey) -> Option<Found> {
     let PropertyKey::Named(name) = key else {
         return None;
@@ -13532,15 +13827,16 @@ fn exact_array_length(value: Value) -> Option<usize> {
     }
 }
 
+/// Resizes to `length`, stopping above the highest non-configurable element, and
+/// says whether the whole of `length` was reached.
 pub(crate) fn apply_array_length(
     elements: &mut Vec<Value>,
     properties: &mut PropertyMap,
     length: usize,
-    operation: &'static str,
-) -> Result<(), EvalFailure> {
+) -> bool {
     if length >= elements.len() {
         elements.resize(length, Value::HOLE);
-        return Ok(());
+        return true;
     }
     let blocked = properties
         .iter()
@@ -13559,10 +13855,7 @@ pub(crate) fn apply_array_length(
             .is_none_or(|offset| (offset as usize) < effective_length)
     });
     elements.resize(effective_length, Value::HOLE);
-    if blocked.is_some() {
-        return Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }));
-    }
-    Ok(())
+    blocked.is_none()
 }
 
 pub(crate) fn array_set_length(
@@ -13577,7 +13870,11 @@ pub(crate) fn array_set_length(
     if !length_writable {
         return Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }));
     }
-    apply_array_length(elements, properties, length, operation)
+    if apply_array_length(elements, properties, length) {
+        Ok(())
+    } else {
+        Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }))
+    }
 }
 
 fn bigint_binary_op(op: BinaryOp) -> intrinsics::builtins::bigint::BigIntBinaryOp {
@@ -19416,6 +19713,55 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_global_store_is_silent_only_in_sloppy_code() {
+        fn store_to_read_only_global(is_sloppy: bool) -> Result<Value, RuntimeErrorKind> {
+            let entry = Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags {
+                    is_sloppy,
+                    ..FunctionFlags::default()
+                },
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(0),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                vec![],
+            );
+            let program = verified(
+                vec![
+                    Constant::String(EcmaString::encode("undefined")),
+                    Constant::Int32(1),
+                ],
+                vec![entry],
+            );
+            let mut host = TestHost;
+            Machine::new(&program, &mut host, Limits::default())
+                .run()
+                .map(|execution| execution.value)
+                .map_err(|error| error.kind)
+        }
+
+        assert_eq!(store_to_read_only_global(true), Ok(Value::int32(1)));
+        assert!(matches!(
+            store_to_read_only_global(false),
+            Err(RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn globals_store_load_and_typeof_undeclared() {
         // StoreGlobal x=5; TypeOfGlobal y (undeclared) -> "undefined";
         // TypeOfGlobal x -> "number"; return LoadGlobal x.
@@ -21635,6 +21981,322 @@ mod tests {
                 origin: ThrowOrigin::TypeError { operation: "call" },
             })
         ));
+        assert!(machine.frames.is_empty());
+    }
+
+    #[test]
+    fn computed_property_keys_run_user_conversion() {
+        fn key_text<H: Host>(
+            machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            let text = machine
+                .allocate(HeapEntry::String(EcmaString::encode("converted")))
+                .map_err(EvalFailure::Runtime)?;
+            Ok(intrinsics::BuiltinOutcome::Value(text))
+        }
+        let program = verified(
+            vec![
+                Constant::String(EcmaString::encode("converted")),
+                Constant::String(EcmaString::encode("toString")),
+                Constant::Int32(7),
+            ],
+            vec![function(
+                0,
+                6,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::SetProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(3),
+                        name: cid(1),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(4),
+                        object: reg(0),
+                        key: reg(3),
+                    },
+                    Instruction::Return { value: reg(4) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let id = machine
+            .intrinsics
+            .builtins
+            .register(intrinsics::BuiltinDef {
+                name: "key text",
+                length: 0,
+                handler: key_text::<TestHost>,
+            });
+        let to_string = intrinsics::native_function(&mut machine.heap, id, "key text", 0);
+        let key = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(key, "toString", to_string)
+            .unwrap();
+        machine.test_set_global("toString", key);
+        assert_eq!(machine.run().unwrap().value, Value::int32(7));
+    }
+
+    #[test]
+    fn closure_prototypes_follow_the_function_kind() {
+        let plain = function(0, 1, vec![Instruction::Halt], Vec::new());
+        let kinded = |is_async, is_generator| {
+            Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags {
+                    is_async,
+                    is_generator,
+                    ..FunctionFlags::default()
+                },
+                vec![Instruction::Halt],
+                Vec::new(),
+            )
+        };
+        let program = verified(
+            Vec::new(),
+            vec![
+                plain,
+                kinded(false, true),
+                kinded(true, false),
+                kinded(true, true),
+            ],
+        );
+        let mut host = TestHost;
+        let machine = Machine::new(&program, &mut host, Limits::default());
+        let kind = |index| machine.closure_prototype(ModuleId::new(0), FunctionId::new(index));
+        let builtins = &machine.intrinsics.builtins;
+        assert_eq!(kind(0), machine.intrinsics.function_prototype);
+        assert_eq!(kind(1), builtins.generator_function_prototype());
+        assert_eq!(kind(2), builtins.async_function_prototype());
+        assert_eq!(kind(3), builtins.async_generator_function_prototype());
+        assert!(
+            !machine.is_callable(kind(1)).unwrap(),
+            "only %Function.prototype% is itself callable"
+        );
+    }
+
+    #[test]
+    fn a_generator_closure_owns_a_prototype_inheriting_from_its_kind() {
+        let generator = Function::new(
+            None,
+            0,
+            0,
+            1,
+            FunctionFlags {
+                is_generator: true,
+                ..FunctionFlags::default()
+            },
+            vec![Instruction::Halt],
+            Vec::new(),
+        );
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator,
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let module = ModuleId::new(0);
+        assert!(
+            machine
+                .closure_properties(module, FunctionId::new(0))
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        let properties = machine
+            .closure_properties(module, FunctionId::new(1))
+            .unwrap();
+        let Some(Property::Data {
+            value,
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        }) = properties.get(&PropertyKey::Named(EcmaString::encode("prototype")))
+        else {
+            panic!("a generator function's prototype is a writable data property");
+        };
+        assert_eq!(
+            machine.internal_get_prototype_of(*value).unwrap(),
+            Some(machine.intrinsics.builtins.generator_prototype())
+        );
+    }
+
+    #[test]
+    fn arithmetic_converts_object_operands_left_first() {
+        fn seven<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            Ok(intrinsics::BuiltinOutcome::Value(Value::int32(7)))
+        }
+        fn fail<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            Err(EvalFailure::ThrowValue(Value::int32(1)))
+        }
+        let program = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let mut object_with = |name, handler| {
+            let id = machine
+                .intrinsics
+                .builtins
+                .register(intrinsics::BuiltinDef {
+                    name,
+                    length: 0,
+                    handler,
+                });
+            let value_of = intrinsics::native_function(&mut machine.heap, id, name, 0);
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            machine
+                .set_data_property(object, "valueOf", value_of)
+                .unwrap();
+            object
+        };
+        let number = object_with("seven", seven::<TestHost>);
+        let thrower = object_with("fail", fail::<TestHost>);
+        assert_eq!(
+            machine
+                .numeric_binary(BinaryOp::Multiply, number, Value::int32(2))
+                .unwrap(),
+            Value::int32(14)
+        );
+        assert_eq!(
+            machine.eval_unary(UnaryOp::Negate, number).unwrap(),
+            Value::int32(-7i32 as u32)
+        );
+        assert_eq!(
+            machine.eval_unary(UnaryOp::BitwiseNot, number).unwrap(),
+            Value::int32(-8i32 as u32)
+        );
+        assert!(
+            matches!(
+                machine.numeric_binary(BinaryOp::Subtract, thrower, Value::int32(1)),
+                Err(EvalFailure::ThrowValue(_))
+            ),
+            "a conversion failure propagates"
+        );
+    }
+
+    #[test]
+    fn number_value_keeps_the_sign_of_zero() {
+        assert_eq!(number_value(0.0), Value::int32(0));
+        assert!(matches!(
+            number_value(-0.0).decode(),
+            Some(Decoded::Number(zero)) if zero == 0.0 && zero.is_sign_negative()
+        ));
+        assert_eq!(number_value(-1.0), Value::int32(-1i32 as u32));
+    }
+
+    #[test]
+    fn construct_with_no_calling_activation_applies_the_receiver_rule() {
+        // The native tiers keep no interpreter frame, so a constructor entered
+        // from a builtin has nothing to return to. A primitive completion must
+        // still yield the receiver, and an object completion must replace it.
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let mut constructor = |index: u32| {
+            machine
+                .allocate(HeapEntry::Function {
+                    module: ModuleId::new(0),
+                    function: FunctionId::new(index),
+                    captures: Vec::new(),
+                    context: None,
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.function_prototype),
+                    extensible: true,
+                })
+                .unwrap()
+        };
+        let returns_primitive = constructor(1);
+        let returns_object = constructor(2);
+
+        let receiver = machine.construct_value(returns_primitive, &[]).unwrap();
+        let index = machine.runtime_slot(receiver).unwrap().unwrap();
+        assert!(
+            matches!(machine.heap[index], HeapEntry::Object { .. }),
+            "a primitive completion yields the constructed receiver"
+        );
+        let replaced = machine.construct_value(returns_object, &[]).unwrap();
+        let index = machine.runtime_slot(replaced).unwrap().unwrap();
+        assert!(
+            matches!(machine.heap[index], HeapEntry::Array { .. }),
+            "an object completion replaces the receiver"
+        );
         assert!(machine.frames.is_empty());
     }
 

@@ -1,17 +1,24 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::rc::Rc;
 
 use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
 use super::annex_b::record_legacy_match;
+use super::regexp_protocol::{flags_getter, test, to_length};
+use super::regexp_v::{CompiledV, create_result_property, execution_failure};
+use super::string_edge::is_regexp;
 use super::{
-    allocate_array, allocate_string, builtin_property, define_data, heap_index,
-    install_constructor_function, install_function, type_error,
+    allocate_array, allocate_string, define_data, install_constructor_function, install_function,
+    type_error, with_roots,
 };
-use crate::intrinsics::regexp::{Match, Regex, RegexErrorKind, STEP_BUDGET, canonical_flags};
+use crate::intrinsics::regexp::{Match, canonical_flags};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
+
+/// How many compiled patterns the machine keeps. A program's hot loop uses few.
+const COMPILE_CACHE_ENTRIES: usize = 8;
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -33,20 +40,7 @@ pub(super) fn install<H: Host>(
     define_getter(heap, prototype, "source", source_get);
     let flags_get = install_function(heap, builtins, "get flags", 0, flags_getter::<H>);
     define_getter(heap, prototype, "flags", flags_get);
-    let symbol_replace_fn = install_function(
-        heap,
-        builtins,
-        "[Symbol.replace]",
-        2,
-        symbol_replace::<H> as BuiltinHandler<H>,
-    );
-    let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
-        panic!("RegExp prototype must be an ordinary object");
-    };
-    properties.insert(
-        PropertyKey::Symbol(heap_index(builtins.symbol_replace()) as u32),
-        builtin_property(symbol_replace_fn),
-    );
+    super::regexp_protocol::install(heap, builtins, prototype, constructor);
     builtins.set_regexp_prototype(prototype);
     globals.insert(EcmaString::encode("RegExp"), constructor);
 }
@@ -57,49 +51,96 @@ fn constructor<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let (pattern, inherited_flags) = args.first().copied().map_or_else(
-        || Ok((EcmaString::default(), EcmaString::default())),
-        |value| {
-            if let Some(parts) = regexp_parts(machine, value) {
-                Ok(parts)
-            } else {
-                Ok((machine.to_string(value)?, EcmaString::default()))
+    let pattern = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let flags = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    with_roots(machine, &[pattern, flags], |machine, depth| {
+        let pattern_is_regexp = is_regexp(machine, pattern)?;
+        let new_target = machine.current_new_target();
+        let active = machine
+            .intrinsics
+            .global("RegExp")
+            .expect("RegExp is installed");
+        if new_target == Value::UNDEFINED && pattern_is_regexp && flags == Value::UNDEFINED {
+            let pattern_constructor = machine.get_named_property(pattern, "constructor")?;
+            if pattern_constructor == active {
+                return Ok(pattern);
             }
-        },
-    )?;
-    let flags = if let Some(value) = args
-        .get(1)
-        .copied()
-        .filter(|value| *value != Value::UNDEFINED)
-    {
-        machine.to_string(value)?
+        }
+        let (source, flags) = if let Some((source, original)) = regexp_parts(machine, pattern) {
+            let flags = if flags == Value::UNDEFINED {
+                allocate_string(machine, original)?
+            } else {
+                flags
+            };
+            (allocate_string(machine, source)?, flags)
+        } else if pattern_is_regexp {
+            let source = machine.get_named_property(pattern, "source")?;
+            let flags = if flags == Value::UNDEFINED {
+                machine.get_named_property(pattern, "flags")?
+            } else {
+                flags
+            };
+            (source, flags)
+        } else {
+            (pattern, flags)
+        };
+        super::keep_root(machine, depth, source);
+        super::keep_root(machine, depth, flags);
+        let default_prototype = machine.intrinsics.regexp_prototype();
+        let prototype = if new_target == Value::UNDEFINED {
+            default_prototype
+        } else {
+            let candidate = machine.get_named_property(new_target, "prototype")?;
+            if machine.is_object(candidate) {
+                candidate
+            } else {
+                default_prototype
+            }
+        };
+        super::keep_root(machine, depth, prototype);
+        regexp_initialize(machine, prototype, source, flags)
+    })
+    .map(BuiltinOutcome::Value)
+}
+
+/// `RegExpAlloc` and `RegExpInitialize` together. The two conversions run after
+/// the prototype is read, and a bad pattern or flag is a `SyntaxError`.
+fn regexp_initialize<H: Host>(
+    machine: &mut Machine<'_, H>,
+    prototype: Value,
+    source: Value,
+    flags: Value,
+) -> Result<Value, EvalFailure> {
+    let pattern = if source == Value::UNDEFINED {
+        EcmaString::default()
     } else {
-        inherited_flags
+        machine.coerce_string_observable(source)?
+    };
+    let flags = if flags == Value::UNDEFINED {
+        EcmaString::default()
+    } else {
+        machine.coerce_string_observable(flags)?
     };
     compile(machine, &pattern, &flags)?;
-    let properties = initial_regexp_properties();
-    let default_prototype = machine.intrinsics.regexp_prototype();
-    let new_target = machine.current_new_target();
-    let prototype = if new_target != Value::UNDEFINED {
-        let candidate = machine.get_named_property(new_target, "prototype")?;
-        if machine.is_object(candidate) {
-            candidate
-        } else {
-            default_prototype
-        }
-    } else {
-        default_prototype
-    };
-    let value = machine
+    machine
         .allocate(HeapEntry::RegExp {
             pattern,
             flags,
-            properties,
+            properties: initial_regexp_properties(),
             prototype: Some(prototype),
             extensible: true,
         })
-        .map_err(EvalFailure::Runtime)?;
-    Ok(BuiltinOutcome::Value(value))
+        .map_err(EvalFailure::Runtime)
+}
+
+/// `RegExpCreate`, for the String methods that take a pattern.
+pub(super) fn regexp_create<H: Host>(
+    machine: &mut Machine<'_, H>,
+    source: Value,
+    flags: Value,
+) -> Result<Value, EvalFailure> {
+    let prototype = machine.intrinsics.regexp_prototype();
+    regexp_initialize(machine, prototype, source, flags)
 }
 
 fn uses_extended_flags(flags: &EcmaString) -> bool {
@@ -123,20 +164,23 @@ pub(super) fn compile<H: Host>(
     machine: &mut Machine<'_, H>,
     pattern: &EcmaString,
     flags: &EcmaString,
-) -> Result<Regex, EvalFailure> {
-    if uses_extended_flags(flags) {
-        return Ok(super::regexp_v::compile(machine, pattern, flags)?
-            .engine_regex()
-            .clone());
+) -> Result<Rc<CompiledV>, EvalFailure> {
+    let cached = machine
+        .regexp_cache
+        .iter()
+        .position(|(source, options, _)| source == pattern && options == flags);
+    if let Some(position) = cached {
+        let entry = machine.regexp_cache.remove(position);
+        let compiled = Rc::clone(&entry.2);
+        machine.regexp_cache.insert(0, entry);
+        return Ok(compiled);
     }
-    Regex::compile(pattern, flags).map_err(|error| {
-        let id = machine
-            .intrinsics
-            .builtins
-            .id_named("SyntaxError")
-            .expect("SyntaxError installed");
-        machine.throw_error(id, error.message().to_owned())
-    })
+    let compiled = Rc::new(super::regexp_v::compile(machine, pattern, flags)?);
+    machine.regexp_cache.truncate(COMPILE_CACHE_ENTRIES - 1);
+    machine
+        .regexp_cache
+        .insert(0, (pattern.clone(), flags.clone(), Rc::clone(&compiled)));
+    Ok(compiled)
 }
 
 /// Build the initial own-property map for a newly constructed RegExp.
@@ -168,43 +212,24 @@ pub(super) fn regexp_parts<H: Host>(
     }
 }
 
+/// `RegExpBuiltinExec` up to the point of building a result. `lastIndex` is read
+/// first even when it will not be used, and a coercion it triggers can recompile
+/// the receiver, so the pattern and flags are read after it.
 pub(super) fn execute<H: Host>(
     machine: &mut Machine<'_, H>,
     regexp: Value,
     input: &EcmaString,
 ) -> Result<Option<Match>, EvalFailure> {
-    let (pattern, flags) = regexp_parts(machine, regexp)
-        .ok_or_else(|| type_error("RegExp method called on incompatible receiver"))?;
-    if uses_extended_flags(&flags) {
-        let (_compiled, matched) =
-            super::regexp_v::execute(machine, regexp, &pattern, &flags, input)?;
-        if let Some(ref matched) = matched {
-            record_legacy_match(machine, input, matched)?;
-        }
-        return Ok(matched);
-    }
-    let regex = compile(machine, &pattern, &flags)?;
-    let uses_last_index = regex.flags().global || regex.flags().sticky;
-    let start = if uses_last_index {
-        index_value(machine.get_named_property(regexp, "lastIndex")?)
-    } else {
-        0
-    };
-    let matched = regex.exec(input, start).map_err(|error| {
-        // Budget exhaustion must surface as a runtime error, not a silent
-        // non-match — a caller that validates input with .test() must see a
-        // failure it can handle instead of a false `false`. Compile errors
-        // are impossible here (the regex was already compiled successfully
-        // above), so only BudgetExhausted can reach this point.
-        match error.kind() {
-            RegexErrorKind::BudgetExhausted => {
-                EvalFailure::Runtime(crate::RuntimeErrorKind::RegexpStepBudgetExceeded {
-                    limit: STEP_BUDGET,
-                })
-            }
-            RegexErrorKind::Compile => unreachable!("regex already compiled successfully"),
-        }
-    })?;
+    let incompatible = || type_error("RegExp method called on incompatible receiver");
+    regexp_parts(machine, regexp).ok_or_else(incompatible)?;
+    let last_index = machine.get_named_property(regexp, "lastIndex")?;
+    let last_index = to_length(machine, last_index)?;
+    let (pattern, flags) = regexp_parts(machine, regexp).ok_or_else(incompatible)?;
+    let compiled = compile(machine, &pattern, &flags)?;
+    let engine_flags = compiled.engine_regex().flags();
+    let uses_last_index = engine_flags.global || engine_flags.sticky;
+    let start = if uses_last_index { last_index } else { 0 };
+    let matched = compiled.exec(input, start).map_err(execution_failure)?;
     if let Some(ref matched) = matched {
         record_legacy_match(machine, input, matched)?;
     }
@@ -215,41 +240,16 @@ pub(super) fn execute<H: Host>(
     Ok(matched)
 }
 
-/// RegExpExec for consumers (`test`, String methods). The builtin `exec` method
-/// calls `execute` directly and must not dispatch through this path.
-pub(super) fn regexp_exec<H: Host>(
+/// `RegExpBuiltinExec`.
+pub(super) fn builtin_exec<H: Host>(
     machine: &mut Machine<'_, H>,
     regexp: Value,
     input: &EcmaString,
 ) -> Result<Value, EvalFailure> {
-    let input_value = allocate_string(machine, input.clone())?;
-    if let Some(result) = super::regexp_v::call_exec_override(machine, regexp, input_value)? {
-        return Ok(result);
-    }
     let Some(matched) = execute(machine, regexp, input)? else {
         return Ok(Value::NULL);
     };
-    match_array_for(machine, Some(regexp), input, matched)
-}
-
-fn symbol_replace<H: Host>(
-    machine: &mut Machine<'_, H>,
-    this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    regexp_parts(machine, this).ok_or_else(|| {
-        type_error("RegExp.prototype[Symbol.replace] called on incompatible receiver")
-    })?;
-    let string = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let replacer = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-    let replace =
-        machine.get_named_property(machine.intrinsics.builtins.string_prototype(), "replace")?;
-    Ok(BuiltinOutcome::Value(machine.call_value(
-        replace,
-        string,
-        &[this, replacer],
-    )?))
+    match_array_for(machine, regexp, input, matched)
 }
 
 fn exec<H: Host>(
@@ -260,30 +260,9 @@ fn exec<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     regexp_parts(machine, this)
         .ok_or_else(|| type_error("RegExp method called on incompatible receiver"))?;
-    let input = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    let Some(matched) = execute(machine, this, &input)? else {
-        return Ok(BuiltinOutcome::Value(Value::NULL));
-    };
-    Ok(BuiltinOutcome::Value(match_array_for(
-        machine,
-        Some(this),
-        &input,
-        matched,
-    )?))
-}
-
-fn test<H: Host>(
-    machine: &mut Machine<'_, H>,
-    this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    regexp_parts(machine, this)
-        .ok_or_else(|| type_error("RegExp method called on incompatible receiver"))?;
-    let input = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    Ok(BuiltinOutcome::Value(Value::boolean(
-        regexp_exec(machine, this, &input)? != Value::NULL,
-    )))
+    let input =
+        machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    Ok(BuiltinOutcome::Value(builtin_exec(machine, this, &input)?))
 }
 
 fn to_string<H: Host>(
@@ -292,13 +271,19 @@ fn to_string<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let (pattern, flags) = regexp_parts(machine, this)
-        .ok_or_else(|| type_error("RegExp method called on incompatible receiver"))?;
+    if !machine.is_object(this) {
+        return Err(type_error("RegExp.prototype.toString requires an object"));
+    }
+    let source = machine.get_named_property(this, "source")?;
+    let source = machine.coerce_string_observable(source)?;
+    let flags = machine.get_named_property(this, "flags")?;
+    let flags = machine.coerce_string_observable(flags)?;
     let mut output = bamts_bytecode::EcmaStringBuilder::new();
     output.push_unit(u16::from(b'/'));
-    append_canonical_source(&pattern, &mut output);
+    for &unit in source.as_units() {
+        output.push_unit(unit);
+    }
     output.push_unit(u16::from(b'/'));
-    let flags = canonical_regexp_flags(&flags);
     for &unit in flags.as_units() {
         output.push_unit(unit);
     }
@@ -314,31 +299,29 @@ fn source_getter<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let (pattern, _) = regexp_parts(machine, this).ok_or_else(|| {
-        type_error("RegExp.prototype.source getter called on incompatible receiver")
-    })?;
-    Ok(BuiltinOutcome::Value(allocate_string(
-        machine,
-        canonical_source(&pattern),
-    )?))
+    if !machine.is_object(this) {
+        return Err(type_error(
+            "RegExp.prototype.source getter requires an object",
+        ));
+    }
+    if let Some((pattern, _)) = regexp_parts(machine, this) {
+        return Ok(BuiltinOutcome::Value(allocate_string(
+            machine,
+            canonical_source(&pattern),
+        )?));
+    }
+    if this == machine.intrinsics.regexp_prototype() {
+        return Ok(BuiltinOutcome::Value(allocate_string(
+            machine,
+            EcmaString::encode("(?:)"),
+        )?));
+    }
+    Err(type_error(
+        "RegExp.prototype.source getter called on incompatible receiver",
+    ))
 }
 
-fn flags_getter<H: Host>(
-    machine: &mut Machine<'_, H>,
-    this: Value,
-    _args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let (_pattern, flags) = regexp_parts(machine, this).ok_or_else(|| {
-        type_error("RegExp.prototype.flags getter called on incompatible receiver")
-    })?;
-    Ok(BuiltinOutcome::Value(allocate_string(
-        machine,
-        canonical_regexp_flags(&flags),
-    )?))
-}
-
-fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
+pub(super) fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
     let HeapEntry::Object { properties, .. } = &mut heap[super::heap_index(object)] else {
         panic!("accessor target must be an ordinary object");
     };
@@ -355,15 +338,14 @@ fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Valu
 
 pub(super) fn match_array_for<H: Host>(
     machine: &mut Machine<'_, H>,
-    regexp: Option<Value>,
+    regexp: Value,
     input: &EcmaString,
     matched: Match,
 ) -> Result<Value, EvalFailure> {
-    if let Some(regexp) = regexp
-        && let Some((pattern, flags)) = regexp_parts(machine, regexp)
+    if let Some((pattern, flags)) = regexp_parts(machine, regexp)
         && uses_extended_flags(&flags)
     {
-        let compiled = super::regexp_v::compile(machine, &pattern, &flags)?;
+        let compiled = compile(machine, &pattern, &flags)?;
         return super::regexp_v::match_array(machine, input, &compiled, &matched);
     }
     match_array(machine, input, matched)
@@ -382,15 +364,16 @@ pub(super) fn match_array<H: Host>(
         });
     }
     let array = allocate_array(machine, values)?;
-    machine.set_data_property(
+    create_result_property(
+        machine,
         array,
         "index",
         crate::number_value(matched.range.start as f64),
     )?;
     let input_value = allocate_string(machine, input.clone())?;
-    machine.set_data_property(array, "input", input_value)?;
+    create_result_property(machine, array, "input", input_value)?;
     if matched.named.is_empty() {
-        machine.set_data_property(array, "groups", Value::UNDEFINED)?;
+        create_result_property(machine, array, "groups", Value::UNDEFINED)?;
     } else {
         let groups = machine
             .allocate(HeapEntry::Object {
@@ -405,9 +388,9 @@ pub(super) fn match_array<H: Host>(
                 Some(range) => allocate_string(machine, slice_units(input, range))?,
                 None => Value::UNDEFINED,
             };
-            machine.set_data_property(groups, &name, value)?;
+            create_result_property(machine, groups, &name, value)?;
         }
-        machine.set_data_property(array, "groups", groups)?;
+        create_result_property(machine, array, "groups", groups)?;
     }
     Ok(array)
 }
@@ -415,16 +398,6 @@ pub(super) fn match_array<H: Host>(
 pub(super) fn slice_units(input: &EcmaString, range: Range<usize>) -> EcmaString {
     input.slice_units(range).unwrap_or_default()
 }
-fn index_value(value: Value) -> usize {
-    match value.decode() {
-        Some(bamts_native::Decoded::Int32(value)) => value as usize,
-        Some(bamts_native::Decoded::Number(value)) if value.is_finite() && value > 0.0 => {
-            value as usize
-        }
-        _ => 0,
-    }
-}
-
 pub(crate) fn canonical_source(pattern: &EcmaString) -> EcmaString {
     let mut escaped = bamts_bytecode::EcmaStringBuilder::new();
     append_canonical_source(pattern, &mut escaped);

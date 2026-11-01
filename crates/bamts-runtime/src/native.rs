@@ -3342,9 +3342,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             return HelperResult::normal(existing);
         }
         let prototype = self.machine.borrow().intrinsics.array_prototype;
+        let properties = self
+            .machine
+            .borrow()
+            .arguments_properties(self.running_is_sloppy());
         let allocated = self.machine.borrow_mut().allocate(HeapEntry::Array {
             elements: args,
-            properties: PropertyMap::default(),
+            properties,
             prototype: Some(prototype),
             extensible: true,
             length_writable: true,
@@ -3983,13 +3987,22 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     let context = self.machine.borrow().context_global;
                     match materialized {
                         Ok(captures) => {
-                            let prototype = self.machine.borrow().intrinsics.function_prototype;
+                            let prototype =
+                                self.machine.borrow().closure_prototype(module, function);
+                            let properties = self
+                                .machine
+                                .borrow_mut()
+                                .closure_properties(module, function);
+                            let properties = match properties {
+                                Ok(properties) => properties,
+                                Err(kind) => break 'result self.fatal(kind),
+                            };
                             self.allocated(HeapEntry::Function {
                                 module,
                                 function,
                                 captures,
                                 context,
-                                properties: PropertyMap::default(),
+                                properties,
                                 prototype: Some(prototype),
                                 extensible: true,
                             })
@@ -3999,7 +4012,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::GetProperty { object, key } => {
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().computed_property_key(object, key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
@@ -4013,7 +4026,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::SetProperty { object, key, value } => {
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().computed_property_key(object, key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
@@ -4042,7 +4055,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::DeleteProperty { object, key } => {
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().computed_property_key(object, key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
@@ -4077,7 +4090,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         }
                     };
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().observable_property_key(key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
@@ -4094,7 +4107,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::DefineDataProperty { object, key, value } => {
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().observable_property_key(key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
@@ -4171,7 +4184,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     receiver,
                     key,
                 } => {
-                    let key = match self.machine.borrow().to_property_key(key) {
+                    let key = match self.machine.borrow_mut().observable_property_key(key) {
                         Ok(key) => key,
                         Err(failure) => break 'result self.fail(failure),
                     };
@@ -4184,7 +4197,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     key,
                     value,
                 } => {
-                    let key = match self.machine.borrow().to_property_key(key) {
+                    let key = match self.machine.borrow_mut().observable_property_key(key) {
                         Ok(key) => key,
                         Err(failure) => break 'result self.fail(failure),
                     };
@@ -4367,10 +4380,12 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     }
                 }
                 HelperCall::StoreGlobal { name, value } => {
+                    let sloppy = self.running_is_sloppy();
                     let stored = self.machine.borrow_mut().store_global(
                         module,
                         ConstantId::new(name),
                         value,
+                        sloppy,
                     );
                     match stored {
                         Ok(()) => HelperResult::normal(Value::UNDEFINED),

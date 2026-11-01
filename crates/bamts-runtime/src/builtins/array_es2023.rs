@@ -83,7 +83,7 @@ fn number<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<f64, Ev
     machine.coerce_number_observable(value).map(value_number)
 }
 
-fn integer_or_infinity<H: Host>(
+pub(super) fn integer_or_infinity<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<f64, EvalFailure> {
@@ -117,7 +117,7 @@ pub(super) fn index_key(index: usize) -> PropertyKey {
 /// `ArrayCreate(length)` with a preflight before Rust allocates the backing
 /// vector. Copy-by-change methods always create the intrinsic Array, never a
 /// species-derived result.
-fn array_create<H: Host>(
+pub(super) fn array_create<H: Host>(
     machine: &mut Machine<'_, H>,
     length: usize,
 ) -> Result<Value, EvalFailure> {
@@ -148,7 +148,7 @@ fn array_create<H: Host>(
     allocate_array(machine, elements)
 }
 
-fn create_data_property<H: Host>(
+pub(super) fn create_data_property<H: Host>(
     machine: &mut Machine<'_, H>,
     array: Value,
     index: usize,

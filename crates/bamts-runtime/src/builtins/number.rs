@@ -25,8 +25,6 @@ pub(super) fn install<H: Host>(
         ("isSafeInteger", 1, is_safe_integer::<H>),
         ("isFinite", 1, is_finite::<H>),
         ("isNaN", 1, is_nan::<H>),
-        ("parseFloat", 1, parse_float::<H>),
-        ("parseInt", 2, parse_int::<H>),
     ] {
         let f = install_function(heap, builtins, name, length, handler);
         define_static(heap, constructor, name, f)
@@ -41,7 +39,20 @@ pub(super) fn install<H: Host>(
         ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
         ("NaN", f64::NAN),
     ] {
-        define_static(heap, constructor, name, crate::number_value(value))
+        let HeapEntry::NativeFunction { properties, .. } =
+            &mut heap[super::heap_index(constructor)]
+        else {
+            panic!("Number constructor must be native")
+        };
+        properties.insert(
+            PropertyKey::Named(EcmaString::encode(name)),
+            crate::Property::Data {
+                value: crate::number_value(value),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
     }
     for (name, length, handler) in [
         ("toString", 1, to_string::<H> as BuiltinHandler<H>),
@@ -53,6 +64,13 @@ pub(super) fn install<H: Host>(
     ] {
         let f = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, f)
+    }
+}
+/// `Number.parseFloat` and `Number.parseInt` are the global functions themselves.
+pub(super) fn share_global_parsers(heap: &mut [HeapEntry], globals: &BTreeMap<EcmaString, Value>) {
+    let constructor = globals[&EcmaString::encode("Number")];
+    for name in ["parseFloat", "parseInt"] {
+        define_static(heap, constructor, name, globals[&EcmaString::encode(name)]);
     }
 }
 fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
@@ -71,15 +89,18 @@ fn constructor<H: Host>(
     args: &[Value],
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let value = if args.is_empty() {
-        Value::int32(0)
-    } else if let Some(number) = super::bigint::bigint_to_number(machine, args[0])? {
-        number
+    let value = if let Some(value) = args.first() {
+        let primitive = machine.coerce_primitive_observable(*value, false)?;
+        match super::bigint::bigint_to_number(machine, primitive)? {
+            Some(number) => number,
+            None => machine.coerce_number_observable(primitive)?,
+        }
     } else {
-        machine.to_number(args[0])?
+        Value::int32(0)
     };
     if constructing {
-        Ok(BuiltinOutcome::Value(machine.box_primitive(value)?))
+        let prototype = machine.intrinsics.number_prototype;
+        super::wrap_for_new_target(machine, value, prototype)
     } else {
         Ok(BuiltinOutcome::Value(value))
     }
@@ -158,7 +179,7 @@ pub(super) fn parse_float<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let text = machine
-        .to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?
+        .coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?
         .to_utf8_lossy();
     Ok(BuiltinOutcome::Value(crate::number_value(
         number_format::parse_float(&text),
@@ -182,10 +203,10 @@ pub(super) fn parse_int<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let text = machine
-        .to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?
+        .coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?
         .to_utf8_lossy();
     let requested = to_int32_radix(value_number(
-        machine.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))?,
+        machine.coerce_number_observable(args.get(1).copied().unwrap_or(Value::UNDEFINED))?,
     ));
     Ok(BuiltinOutcome::Value(crate::number_value(
         number_format::parse_int(&text, requested),
@@ -197,7 +218,9 @@ pub(super) fn global_is_nan<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let n = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
+    let n = value_number(
+        machine.coerce_number_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+    );
     Ok(BuiltinOutcome::Value(Value::boolean(n.is_nan())))
 }
 pub(super) fn global_is_finite<H: Host>(
@@ -206,7 +229,9 @@ pub(super) fn global_is_finite<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let n = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
+    let n = value_number(
+        machine.coerce_number_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+    );
     Ok(BuiltinOutcome::Value(Value::boolean(n.is_finite())))
 }
 fn to_string<H: Host>(
@@ -330,6 +355,58 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program};
     use super::*;
     use crate::Limits;
+
+    #[test]
+    fn exponentiation_differs_from_powf_for_a_unit_base() {
+        assert!(crate::number_exponentiate(1.0, f64::INFINITY).is_nan());
+        assert!(crate::number_exponentiate(-1.0, f64::NEG_INFINITY).is_nan());
+        assert!(crate::number_exponentiate(1.0, f64::NAN).is_nan());
+        assert_eq!(crate::number_exponentiate(f64::NAN, 0.0), 1.0);
+        assert_eq!(crate::number_exponentiate(2.0, 10.0), 1024.0);
+    }
+
+    #[test]
+    fn number_parsers_are_the_global_functions() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Number").unwrap();
+        for name in ["parseFloat", "parseInt"] {
+            assert_eq!(
+                machine.get_named_property(constructor, name).unwrap(),
+                machine.intrinsics.global(name).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn number_constants_are_read_only() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Number").unwrap();
+        for name in [
+            "MAX_SAFE_INTEGER",
+            "MIN_SAFE_INTEGER",
+            "EPSILON",
+            "MAX_VALUE",
+            "MIN_VALUE",
+            "POSITIVE_INFINITY",
+            "NEGATIVE_INFINITY",
+            "NaN",
+        ] {
+            let key = PropertyKey::Named(EcmaString::encode(name));
+            assert!(matches!(
+                machine.own_descriptor(constructor, &key).unwrap(),
+                Some(crate::Property::Data {
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                    ..
+                })
+            ));
+        }
+    }
 
     #[test]
     fn numeric_prefixes_stop_at_lone_surrogates() {

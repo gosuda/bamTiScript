@@ -7,11 +7,14 @@ use bamts_bytecode::{DescriptorSlot, EcmaString};
 use bamts_native::{Decoded, Value};
 use std::collections::BTreeMap;
 mod array;
+mod array_generic;
+pub(crate) use array_generic::is_array;
 pub(crate) mod bigint;
 mod collections;
 mod date_full;
 mod function_constructor;
 mod intl;
+pub(crate) mod iterator_helpers;
 mod json_edge;
 mod number;
 mod object;
@@ -21,7 +24,7 @@ pub(crate) mod property_descriptor;
 pub(crate) mod proxy;
 pub(crate) mod reflect;
 mod regexp;
-pub(crate) use regexp::{canonical_source, initial_regexp_properties};
+pub(crate) use regexp::initial_regexp_properties;
 mod annex_b;
 mod array_es2023;
 pub(crate) mod arraybuffer;
@@ -32,7 +35,9 @@ mod error_edge;
 mod map_set_edge;
 mod math_edge;
 mod number_format;
-mod regexp_v;
+pub(crate) use number_format::string_to_number;
+mod regexp_protocol;
+pub(crate) mod regexp_v;
 mod set_methods;
 mod string;
 mod string_edge;
@@ -53,6 +58,7 @@ pub(crate) fn install<H: Host>(
     timers_available: bool,
     script_compiler: bool,
 ) {
+    object::install_function_prototype(heap, builtins);
     symbol::install(heap, globals, builtins);
     let bigint_prototype = bigint::install(heap, globals, builtins);
     builtins.set_bigint_prototype(bigint_prototype);
@@ -61,6 +67,7 @@ pub(crate) fn install<H: Host>(
         timers::install(heap, globals, builtins);
     }
     collections::install_iterator_prototype(heap, builtins);
+    iterator_helpers::install(heap, globals, builtins);
     collections::install_async_iterator_prototype(heap, builtins);
     collections::install_generator_prototype(heap, builtins);
     collections::install_async_generator_prototype(heap, builtins);
@@ -95,6 +102,22 @@ pub(crate) fn install<H: Host>(
     disposable_stack::install(heap, globals, builtins);
     temporal::install(heap, globals, builtins);
     intl::install(heap, globals, builtins);
+}
+/// Runs `body` with `roots` kept alive across any user code it reaches. The
+/// frame's depth is passed in, so `keep_root` can add values found along the way.
+fn with_roots<H: Host, T>(
+    machine: &mut Machine<'_, H>,
+    roots: &[Value],
+    body: impl FnOnce(&mut Machine<'_, H>, usize) -> Result<T, EvalFailure>,
+) -> Result<T, EvalFailure> {
+    let depth = machine.native_roots.len();
+    machine.push_native_roots(depth, roots);
+    let result = body(machine, depth);
+    machine.pop_native_roots(depth);
+    result
+}
+fn keep_root<H: Host>(machine: &mut Machine<'_, H>, depth: usize, value: Value) {
+    machine.native_roots[depth].push(value);
 }
 fn install_function<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -146,6 +169,27 @@ pub(crate) fn define_data(heap: &mut [HeapEntry], object: Value, name: &str, val
                 PropertyKey::Named(EcmaString::encode(name)),
                 builtin_property(value),
             );
+        }
+        _ => panic!("intrinsic property target must be an ordinary object"),
+    }
+}
+/// Installs a symbol-keyed property on an intrinsic object of any shape.
+pub(crate) fn define_symbol_property(
+    heap: &mut [HeapEntry],
+    object: Value,
+    symbol: Value,
+    property: Property,
+) {
+    let key = PropertyKey::Symbol(heap_index(symbol) as u32);
+    let index = heap_index(object);
+    match &mut heap[index] {
+        HeapEntry::Object { properties, .. }
+        | HeapEntry::Array { properties, .. }
+        | HeapEntry::Function { properties, .. }
+        | HeapEntry::NativeFunction { properties, .. }
+        | HeapEntry::RegExp { properties, .. }
+        | HeapEntry::Date { properties, .. } => {
+            properties.insert(key, property);
         }
         _ => panic!("intrinsic property target must be an ordinary object"),
     }
@@ -266,11 +310,45 @@ fn to_uint8_from_f64(number: f64) -> u8 {
     }
 }
 
+/// `GetPrototypeFromConstructor` for the running built-in constructor.
+fn prototype_from_new_target<H: Host>(
+    machine: &mut Machine<'_, H>,
+    default_prototype: Value,
+) -> Result<Value, EvalFailure> {
+    let new_target = machine.current_new_target();
+    if new_target == Value::UNDEFINED {
+        return Ok(default_prototype);
+    }
+    let prototype = machine.get_named_property(new_target, "prototype")?;
+    Ok(if machine.is_object(prototype) {
+        prototype
+    } else {
+        default_prototype
+    })
+}
+/// The wrapper object a primitive-wrapping constructor returns.
+fn wrap_for_new_target<H: Host>(
+    machine: &mut Machine<'_, H>,
+    primitive: Value,
+    default_prototype: Value,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let prototype = with_roots(machine, &[primitive], |machine, _| {
+        prototype_from_new_target(machine, default_prototype)
+    })?;
+    let wrapper = machine.box_primitive(primitive)?;
+    if let HeapEntry::Object {
+        prototype: slot, ..
+    } = &mut machine.heap[heap_index(wrapper)]
+    {
+        *slot = Some(prototype);
+    }
+    Ok(BuiltinOutcome::Value(wrapper))
+}
 fn to_integer_or_infinity<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<f64, EvalFailure> {
-    let number = value_number(machine.to_number(value)?);
+    let number = value_number(machine.coerce_number_observable(value)?);
     Ok(if number.is_nan() || number == 0.0 {
         0.0
     } else {
@@ -295,7 +373,11 @@ fn define_array_length(
     if !length_writable && length != elements.len() {
         return Err(type_error("Cannot redefine non-writable array length"));
     }
-    crate::apply_array_length(elements, properties, length, "define array length")
+    if crate::apply_array_length(elements, properties, length) {
+        Ok(())
+    } else {
+        Err(type_error("define array length"))
+    }
 }
 fn install_boolean<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -321,7 +403,8 @@ fn boolean_constructor<H: Host>(
     let value =
         Value::boolean(machine.to_boolean(args.first().copied().unwrap_or(Value::UNDEFINED)));
     if constructing {
-        return machine.box_primitive(value).map(BuiltinOutcome::Value);
+        let prototype = machine.intrinsics.boolean_prototype;
+        return wrap_for_new_target(machine, value, prototype);
     }
     Ok(BuiltinOutcome::Value(value))
 }
@@ -442,7 +525,8 @@ fn math_round<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let x = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
+    let x = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let x = value_number(machine.coerce_number_observable(x)?);
     Ok(BuiltinOutcome::Value(crate::number_value(round_half_up(x))))
 }
 fn math_sign<H: Host>(
@@ -511,7 +595,9 @@ fn math_pow<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let x = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
     let y = value_number(machine.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))?);
-    Ok(BuiltinOutcome::Value(crate::number_value(x.powf(y))))
+    Ok(BuiltinOutcome::Value(crate::number_value(
+        crate::number_exponentiate(x, y),
+    )))
 }
 fn math_random<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -585,6 +671,8 @@ fn install_globals<H: Host>(
         crate::number_value(f64::INFINITY),
     );
     globals.insert(EcmaString::encode("NaN"), crate::number_value(f64::NAN));
+    globals.insert(EcmaString::encode("undefined"), Value::UNDEFINED);
+    number::share_global_parsers(heap, globals);
 }
 fn install_errors<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -795,10 +883,19 @@ fn error_to_string<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_object(this) {
+        return Err(type_error("Error.prototype.toString requires an object"));
+    }
     let name_value = machine.get_named_property(this, "name")?;
-    let name = machine.to_string(name_value)?;
+    let name = match name_value {
+        Value::UNDEFINED => EcmaString::encode("Error"),
+        value => machine.coerce_string_observable(value)?,
+    };
     let message_value = machine.get_named_property(this, "message")?;
-    let message = machine.to_string(message_value)?;
+    let message = match message_value {
+        Value::UNDEFINED => EcmaString::encode(""),
+        value => machine.coerce_string_observable(value)?,
+    };
     let text = if name.is_empty() {
         message
     } else if message.is_empty() {
@@ -905,6 +1002,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 proxy::define_own_property(machine, object, key, descriptor)
             });
         }
+        if let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)?
+            && self.is_array_length_key(index, &key)
+        {
+            return self.array_define_length(index, descriptor);
+        }
         let current = self.own_descriptor(object, &key)?;
         let extensible = property_descriptor::is_extensible(self, object)?;
         property_descriptor::validate_and_apply_property_descriptor(
@@ -959,11 +1061,16 @@ impl<'a, H: Host> Machine<'a, H> {
         if self.same_value(proposed, current) {
             return Ok(true);
         }
-        if !property_descriptor::is_extensible(self, object)? {
+        // %Object.prototype% is an immutable prototype exotic object.
+        if object == self.intrinsics.object_prototype
+            || !property_descriptor::is_extensible(self, object)?
+        {
             return Ok(false);
         }
+        // The cycle walk stops at a proxy, whose [[GetPrototypeOf]] is not ordinary.
         let mut node = proposed;
-        while !matches!(node.decode(), Some(Decoded::Null)) {
+        while !matches!(node.decode(), Some(Decoded::Null)) && !self.heap_entry_is_proxy_value(node)
+        {
             if node == object {
                 return Ok(false);
             }
@@ -1188,6 +1295,10 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Ok(None);
         };
+        if let Some(property) = self.string_exotic_property(index, key)? {
+            return Ok(Some(property));
+        }
+        self.reify_function_properties(index)?;
         let properties = match &self.heap[index] {
             HeapEntry::ModuleNamespace { module } => {
                 let PropertyKey::Named(name) = key else {
@@ -1272,7 +1383,12 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Timeout { properties, .. }
             | HeapEntry::ArrayBuffer { properties, .. }
             | HeapEntry::SharedArrayBuffer { properties, .. }
-            | HeapEntry::DataView { properties, .. } => properties,
+            | HeapEntry::DataView { properties, .. }
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::AsyncFromSync { properties, .. }
+            | HeapEntry::ProxyRevoker { properties, .. } => properties,
             _ => return Ok(None),
         };
         Ok(properties.get(key).cloned())
@@ -1396,6 +1512,23 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Err(type_error("Object.defineProperty called on non-object"));
         };
+        self.reify_function_properties(index)?;
+        if let Some(Property::Data {
+            value: stored,
+            enumerable,
+            ..
+        }) = self.string_exotic_property(index, &key)?
+        {
+            return match descriptor {
+                Property::Data {
+                    value,
+                    writable: false,
+                    enumerable: requested,
+                    configurable: false,
+                } if requested == enumerable && self.same_value(value, stored) => Ok(()),
+                _ => Err(type_error("Cannot redefine property")),
+            };
+        }
         if let PropertyKey::Named(name) = &key
             && let Some(typed_index) = typedarray_all::typed_array_index(name)
             && matches!(self.heap[index], HeapEntry::TypedArray { .. })
@@ -1577,6 +1710,21 @@ impl<'a, H: Host> Machine<'a, H> {
                     properties,
                     extensible,
                     ..
+                }
+                | HeapEntry::Promise {
+                    properties,
+                    extensible,
+                    ..
+                }
+                | HeapEntry::Generator {
+                    properties,
+                    extensible,
+                    ..
+                }
+                | HeapEntry::AsyncGenerator {
+                    properties,
+                    extensible,
+                    ..
                 } => {
                     let exists = properties.contains_key(&key);
                     let (property_growth, property_refund) =
@@ -1685,7 +1833,10 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::WeakRef { properties, .. }
             | HeapEntry::FinalizationRegistry { properties, .. }
             | HeapEntry::DisposableStack { properties, .. }
-            | HeapEntry::Timeout { properties, .. } => {
+            | HeapEntry::Timeout { properties, .. }
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. } => {
                 properties.insert(key, descriptor);
             }
             _ => unreachable!("validated object cannot change heap entry kind"),
@@ -1804,7 +1955,10 @@ impl<'a, H: Host> Machine<'a, H> {
         self.refund_slot(index, refund);
         Ok(())
     }
-    fn observable_property_key(&mut self, key: Value) -> Result<PropertyKey, EvalFailure> {
+    pub(crate) fn observable_property_key(
+        &mut self,
+        key: Value,
+    ) -> Result<PropertyKey, EvalFailure> {
         let primitive = self.coerce_primitive_observable(key, true)?;
         Ok(
             match self.runtime_slot(primitive).map_err(EvalFailure::Runtime)? {
@@ -2118,6 +2272,43 @@ mod tests {
             }
             Property::Accessor { .. } => panic!("NaN must be a data property"),
         }
+    }
+    #[test]
+    fn round_half_up_keeps_zero_signs_and_the_value_just_below_a_tie() {
+        assert!(round_half_up(-0.0).is_sign_negative());
+        assert!(round_half_up(-0.5).is_sign_negative());
+        assert_eq!(round_half_up(-0.5), 0.0);
+        assert!(round_half_up(0.2).is_sign_positive());
+        assert_eq!(round_half_up(0.49999999999999994), 0.0);
+        assert_eq!(round_half_up(2.5), 3.0);
+        assert_eq!(round_half_up(-2.5), -2.0);
+        assert_eq!(round_half_up(9007199254740991.0), 9007199254740991.0);
+        assert!(round_half_up(f64::NAN).is_nan());
+        assert_eq!(round_half_up(f64::NEG_INFINITY), f64::NEG_INFINITY);
+    }
+    #[test]
+    fn global_undefined_descriptor_is_frozen() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let global_this = machine
+            .intrinsics
+            .global("globalThis")
+            .expect("globalThis is installed");
+        let key = PropertyKey::Named(EcmaString::encode("undefined"));
+        let descriptor = machine
+            .own_descriptor(global_this, &key)
+            .expect("descriptor lookup succeeds")
+            .expect("undefined is defined on globalThis");
+        assert!(matches!(
+            descriptor,
+            Property::Data {
+                value: Value::UNDEFINED,
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            }
+        ));
     }
     #[test]
     fn global_infinity_and_nan_are_stable_across_reads() {

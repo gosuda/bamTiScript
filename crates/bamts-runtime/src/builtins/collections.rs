@@ -7,7 +7,7 @@ use super::{
     allocate_array, builtin_property, define_data, heap_index, install_constructor_function,
     install_function, type_error,
 };
-use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
+use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable, IteratorFamily};
 use crate::vm::async_iterators::{ASYNC_FROM_SYNC_METHODS, ASYNC_GENERATOR_METHODS};
 use crate::vm::generator_async::{GENERATOR_METHODS, GeneratorCompletion, GeneratorOperation};
 use crate::{
@@ -139,7 +139,6 @@ pub(super) fn install_iterator_prototype<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
-    let next = install_function(heap, builtins, "next", 0, iterator_next::<H>);
     let identity = install_function(
         heap,
         builtins,
@@ -147,9 +146,25 @@ pub(super) fn install_iterator_prototype<H: Host>(
         0,
         iterator_identity::<H>,
     );
-    define_data(heap, prototype, "next", next);
     define_symbol(heap, prototype, builtins.symbol_iterator(), identity);
     builtins.set_iterator_prototype(prototype);
+    let family_prototypes = [
+        (
+            "Array Iterator",
+            array_iterator_next::<H> as BuiltinHandler<H>,
+        ),
+        ("Map Iterator", map_iterator_next::<H>),
+        ("Set Iterator", set_iterator_next::<H>),
+        ("String Iterator", string_iterator_next::<H>),
+    ]
+    .map(|(tag, handler)| {
+        let family = ordinary(heap, Some(prototype));
+        let next = install_function(heap, builtins, "next", 0, handler);
+        define_data(heap, family, "next", next);
+        super::define_to_string_tag(heap, family, builtins.symbol_to_string_tag(), tag);
+        family
+    });
+    builtins.set_iterator_family_prototypes(family_prototypes);
 }
 
 pub(super) fn install_async_iterator_prototype<H: Host>(
@@ -327,18 +342,46 @@ fn generator_throw<H: Host>(
     })
 }
 
+fn iterator_family<H: Host>(
+    machine: &Machine<'_, H>,
+    source: Value,
+    kind: IterationKind,
+) -> Result<IteratorFamily, EvalFailure> {
+    if kind == IterationKind::StringCodePoint {
+        return Ok(IteratorFamily::String);
+    }
+    let index = machine.runtime_slot(source).map_err(EvalFailure::Runtime)?;
+    Ok(match index.map(|index| &machine.heap[index]) {
+        Some(HeapEntry::Collection {
+            kind: CollectionKind::Map,
+            ..
+        }) => IteratorFamily::Map,
+        Some(HeapEntry::Collection {
+            kind: CollectionKind::Set,
+            ..
+        }) => IteratorFamily::Set,
+        _ => IteratorFamily::Array,
+    })
+}
+
 pub(super) fn iterator<H: Host>(
     machine: &mut Machine<'_, H>,
     source: Value,
     kind: IterationKind,
 ) -> Result<Value, EvalFailure> {
+    let family = iterator_family(machine, source, kind)?;
     machine
         .allocate(HeapEntry::BuiltinIterator {
             source,
             kind,
             position: Some(0),
             properties: PropertyMap::default(),
-            prototype: Some(machine.intrinsics.builtins.iterator_prototype()),
+            prototype: Some(
+                machine
+                    .intrinsics
+                    .builtins
+                    .iterator_family_prototype(family),
+            ),
             extensible: true,
         })
         .map_err(EvalFailure::Runtime)
@@ -353,11 +396,46 @@ fn iterator_identity<H: Host>(
     Ok(BuiltinOutcome::Value(this))
 }
 
-fn iterator_next<H: Host>(
+fn array_iterator_next<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     _args: &[Value],
     _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    iterator_next(machine, this, IteratorFamily::Array)
+}
+
+fn map_iterator_next<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    iterator_next(machine, this, IteratorFamily::Map)
+}
+
+fn set_iterator_next<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    iterator_next(machine, this, IteratorFamily::Set)
+}
+
+fn string_iterator_next<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    iterator_next(machine, this, IteratorFamily::String)
+}
+
+fn iterator_next<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    family: IteratorFamily,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let Some(iterator_index) = machine.runtime_slot(this).map_err(EvalFailure::Runtime)? else {
         return Err(type_error("iterator next called on incompatible receiver"));
@@ -371,6 +449,16 @@ fn iterator_next<H: Host>(
     else {
         return Err(type_error("iterator next called on incompatible receiver"));
     };
+    let builtin_family = matches!(
+        kind,
+        IterationKind::Key
+            | IterationKind::Value
+            | IterationKind::Entry
+            | IterationKind::StringCodePoint
+    );
+    if !builtin_family || iterator_family(machine, source, kind)? != family {
+        return Err(type_error("iterator next called on incompatible receiver"));
+    }
     let (done, value, next_position) = match position {
         None => (true, Value::UNDEFINED, None),
         Some(cursor) => {
@@ -382,6 +470,9 @@ fn iterator_next<H: Host>(
                 let bounds = crate::intrinsics::builtins::typedarray_all::typed_array_bounds(
                     machine, source,
                 )?;
+                if bounds.out_of_bounds {
+                    return Err(type_error("iterated typed array is out of bounds"));
+                }
                 match usize::try_from(cursor) {
                     Ok(index) if !bounds.out_of_bounds && index < bounds.element_length => {
                         let value = crate::intrinsics::builtins::typedarray_all::read_element(
@@ -439,8 +530,13 @@ fn iterator_next<H: Host>(
                 Some((next, key, item_value)) => {
                     let value = match kind {
                         IterationKind::Key => key,
-                        IterationKind::Value => item_value,
+                        IterationKind::Value | IterationKind::StringCodePoint => item_value,
                         IterationKind::Entry => allocate_array(machine, vec![key, item_value])?,
+                        IterationKind::RegExpString
+                        | IterationKind::IteratorHelper(_)
+                        | IterationKind::WrapForValid => {
+                            unreachable!("the family check admits only the four families")
+                        }
                     };
                     (false, value, Some(next))
                 }
@@ -1057,7 +1153,7 @@ fn set_for_each<H: Host>(
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 
-fn map_put<H: Host>(
+pub(super) fn map_put<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
     key: Value,
@@ -1196,7 +1292,7 @@ fn collection<H: Host>(
         .map_err(EvalFailure::Runtime)
 }
 
-fn collection_slot<H: Host>(
+pub(super) fn collection_slot<H: Host>(
     machine: &Machine<'_, H>,
     object: Value,
     expected: CollectionKind,
@@ -1254,7 +1350,10 @@ fn collection_iterator<H: Host>(
     Ok(BuiltinOutcome::Value(iterator(machine, object, kind)?))
 }
 
-fn require_weak_key<H: Host>(machine: &Machine<'_, H>, key: Value) -> Result<(), EvalFailure> {
+pub(super) fn require_weak_key<H: Host>(
+    machine: &Machine<'_, H>,
+    key: Value,
+) -> Result<(), EvalFailure> {
     let Some(index) = machine.runtime_slot(key).map_err(EvalFailure::Runtime)? else {
         return Err(type_error("Invalid value used as weak collection key"));
     };
@@ -1328,6 +1427,9 @@ fn constructor_prototype<H: Host>(
         CollectionKind::WeakSet => machine.intrinsics.builtins.weak_set_prototype(),
     };
     Ok(prototype)
+}
+pub(super) fn ordinary_intrinsic(heap: &mut Vec<HeapEntry>, prototype: Value) -> Value {
+    ordinary(heap, Some(prototype))
 }
 fn ordinary(heap: &mut Vec<HeapEntry>, prototype: Option<Value>) -> Value {
     super::super::push(
@@ -1813,6 +1915,35 @@ mod tests {
     }
 
     // ---- %GeneratorPrototype% tests ----------------------------------------
+
+    #[test]
+    fn each_iterator_family_owns_next_and_rejects_the_others() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let iterator_prototype = machine.intrinsics.builtins.iterator_prototype();
+        assert_eq!(
+            machine
+                .get_named_property(iterator_prototype, "next")
+                .unwrap(),
+            Value::UNDEFINED,
+            "a subclass of Iterator must not inherit a builtin next"
+        );
+        let array = allocate_array(&mut machine, Vec::new()).unwrap();
+        let array_iterator = iterator(&mut machine, array, IterationKind::Value).unwrap();
+        let map_constructor = machine.intrinsics.global("Map").unwrap();
+        let map = machine.construct_value(map_constructor, &[]).unwrap();
+        let map_iterator = iterator(&mut machine, map, IterationKind::Entry).unwrap();
+
+        let array_next = machine.get_named_property(array_iterator, "next").unwrap();
+        let map_next = machine.get_named_property(map_iterator, "next").unwrap();
+        assert_ne!(array_next, map_next);
+        assert!(machine.call_value(array_next, array_iterator, &[]).is_ok());
+        assert!(matches!(
+            machine.call_value(array_next, map_iterator, &[]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+    }
 
     #[test]
     fn generator_prototype_chains_to_iterator_prototype() {

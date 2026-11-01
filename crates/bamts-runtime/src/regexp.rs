@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Range;
 
 use bamts_bytecode::EcmaString;
@@ -13,7 +13,7 @@ pub(crate) const STEP_BUDGET: usize = 100_000;
 /// Identity of a backtracking state: input position plus capture bindings. Two
 /// states sharing one continue identically, so a repetition level keeps only the
 /// first — that is what stops equivalent alternatives multiplying per level.
-type StateKey = (usize, Vec<Option<(usize, usize)>>);
+type StateKey = (usize, usize, Vec<Option<(usize, usize)>>);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Flags {
@@ -23,6 +23,8 @@ pub(crate) struct Flags {
     pub(crate) dot_all: bool,
     pub(crate) unicode: bool,
     pub(crate) sticky: bool,
+    /// Inside a lookbehind, which reads from right to left. Never set by a flag.
+    backward: bool,
 }
 
 impl Flags {
@@ -132,7 +134,8 @@ impl RegexError {
 pub(crate) struct Match {
     pub(crate) range: Range<usize>,
     pub(crate) captures: Vec<Option<Range<usize>>>,
-    pub(crate) named: BTreeMap<String, Option<Range<usize>>>,
+    /// Each group name once, in source order, with the group that participated.
+    pub(crate) named: Vec<(String, Option<Range<usize>>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -140,16 +143,21 @@ pub(crate) struct Regex {
     expression: Node,
     flags: Flags,
     capture_count: usize,
-    names: BTreeMap<String, usize>,
+    names: Vec<(String, Vec<usize>)>,
 }
 
 impl Regex {
     pub(crate) fn compile(pattern: &EcmaString, flags: &EcmaString) -> Result<Self, RegexError> {
         let flags = Flags::parse(flags)?;
-        let mut parser = Parser::new(pattern.as_units(), flags.unicode);
+        let mut parser = Parser::new(pattern.as_units(), flags);
         let expression = parser.parse_disjunction(None)?;
         if parser.peek().is_some() {
             return Err(parser.error("unexpected token"));
+        }
+        for name in &parser.referenced_names {
+            if !parser.names.iter().any(|(known, _)| known == name) {
+                return Err(parser.error("invalid named reference"));
+            }
         }
         Ok(Self {
             expression,
@@ -179,7 +187,7 @@ impl Regex {
                 captures: vec![None; self.capture_count + 1],
             };
             if let Some(mut matched) = self
-                .match_node(&self.expression, input, state)?
+                .match_node(self.flags, &self.expression, input, state)?
                 .into_iter()
                 .next()
             {
@@ -187,7 +195,12 @@ impl Regex {
                 let named = self
                     .names
                     .iter()
-                    .map(|(name, index)| (name.clone(), matched.captures[*index].clone()))
+                    .map(|(name, indices)| {
+                        let participant = indices
+                            .iter()
+                            .find_map(|index| matched.captures[*index].clone());
+                        (name.clone(), participant)
+                    })
                     .collect();
                 return Ok(Some(Match {
                     range: position..matched.position,
@@ -204,60 +217,61 @@ impl Regex {
 
     fn match_node(
         &self,
+        flags: Flags,
         node: &Node,
         input: &[u16],
         state: State,
     ) -> Result<Vec<State>, RegexError> {
         match node {
-            Node::Sequence(nodes) => self.match_sequence(nodes, input, state),
+            Node::Sequence(nodes) => self.match_sequence(flags, nodes, input, state),
             Node::Alternation(branches) => {
                 let mut out = Vec::new();
                 for branch in branches {
-                    out.extend(self.match_node(branch, input, state.clone())?);
+                    out.extend(self.match_node(flags, branch, input, state.clone())?);
                 }
                 Ok(out)
             }
             Node::Literal(expected) => {
-                if state.position == input.len() {
+                let Some((actual, width)) = adjacent_code_point(input, state.position, flags)
+                else {
                     return Ok(Vec::new());
-                }
-                let (actual, width) = next_code_point(input, state.position, self.flags.unicode);
+                };
                 Ok(self
-                    .code_point_eq(actual, *expected)
-                    .then(|| state.advanced(width))
+                    .code_point_eq(flags, actual, *expected)
+                    .then(|| state.moved(width, flags.backward))
                     .into_iter()
                     .collect())
             }
             Node::Dot => {
-                if state.position == input.len() {
+                let Some((actual, width)) = adjacent_code_point(input, state.position, flags)
+                else {
                     return Ok(Vec::new());
-                }
-                let (actual, width) = next_code_point(input, state.position, self.flags.unicode);
-                Ok((self.flags.dot_all || !is_line_terminator(actual))
-                    .then(|| state.advanced(width))
+                };
+                Ok((flags.dot_all || !is_line_terminator(actual))
+                    .then(|| state.moved(width, flags.backward))
                     .into_iter()
                     .collect())
             }
             Node::Class(class) => {
-                if state.position == input.len() {
+                let Some((actual, width)) = adjacent_code_point(input, state.position, flags)
+                else {
                     return Ok(Vec::new());
-                }
-                let (actual, width) = next_code_point(input, state.position, self.flags.unicode);
+                };
                 Ok(class
-                    .matches(actual, self.flags.ignore_case, self.flags.unicode)
-                    .then(|| state.advanced(width))
+                    .matches(actual, flags.ignore_case, flags.unicode)
+                    .then(|| state.moved(width, flags.backward))
                     .into_iter()
                     .collect())
             }
             Node::Start => Ok((state.position == 0
-                || (self.flags.multiline
+                || (flags.multiline
                     && state.position > 0
                     && is_line_terminator(u32::from(input[state.position - 1]))))
             .then_some(state)
             .into_iter()
             .collect()),
             Node::End => Ok((state.position == input.len()
-                || (self.flags.multiline
+                || (flags.multiline
                     && input
                         .get(state.position)
                         .is_some_and(|value| is_line_terminator(u32::from(*value)))))
@@ -269,7 +283,7 @@ impl Regex {
                     false
                 } else {
                     let low = input[state.position - 1];
-                    let value = if self.flags.unicode
+                    let value = if flags.unicode
                         && (0xdc00..=0xdfff).contains(&low)
                         && state.position >= 2
                         && (0xd800..=0xdbff).contains(&input[state.position - 2])
@@ -278,13 +292,11 @@ impl Regex {
                     } else {
                         u32::from(low)
                     };
-                    is_word(value, self.flags.ignore_case, self.flags.unicode)
+                    is_word(value, flags.ignore_case, flags.unicode)
                 };
                 let right = (state.position < input.len())
-                    .then(|| next_code_point(input, state.position, self.flags.unicode).0)
-                    .is_some_and(|value| {
-                        is_word(value, self.flags.ignore_case, self.flags.unicode)
-                    });
+                    .then(|| next_code_point(input, state.position, flags.unicode).0)
+                    .is_some_and(|value| is_word(value, flags.ignore_case, flags.unicode));
                 Ok(((left != right) == *positive)
                     .then_some(state)
                     .into_iter()
@@ -293,57 +305,53 @@ impl Regex {
             Node::Group { index, body } => {
                 let begin = state.position;
                 Ok(self
-                    .match_node(body, input, state)?
+                    .match_node(flags, body, input, state)?
                     .into_iter()
                     .map(|mut matched| {
                         if let Some(index) = index {
-                            matched.captures[*index] = Some(begin..matched.position);
+                            matched.captures[*index] = Some(if flags.backward {
+                                matched.position..begin
+                            } else {
+                                begin..matched.position
+                            });
                         }
                         matched
                     })
                     .collect())
             }
+            Node::Modified { flags, body } => self.match_node(*flags, body, input, state),
             Node::BackReference(index) => {
                 let Some(range) = state.captures.get(*index).and_then(Clone::clone) else {
                     return Ok(vec![state]);
                 };
-                Ok(self.match_backreference(input, range, state))
+                Ok(self.match_backreference(flags, input, range, state))
             }
-            Node::NamedBackReference(name) => match self.names.get(name) {
-                Some(index) => Ok(self.match_node(&Node::BackReference(*index), input, state)?),
-                None => Ok(Vec::new()),
-            },
+            Node::NamedBackReference(name) => {
+                let Some((_, indices)) = self.names.iter().find(|(known, _)| known == name) else {
+                    return Ok(Vec::new());
+                };
+                match indices
+                    .iter()
+                    .find_map(|index| state.captures[*index].clone())
+                {
+                    Some(range) => Ok(self.match_backreference(flags, input, range, state)),
+                    None => Ok(vec![state]),
+                }
+            }
             Node::Look {
                 body,
                 behind,
                 positive,
             } => {
-                let candidates = if *behind {
-                    let mut candidates = Vec::new();
-                    let mut begin = 0;
-                    loop {
-                        let mut initial = state.clone();
-                        initial.position = begin;
-                        candidates.extend(
-                            self.match_node(body, input, initial)?
-                                .into_iter()
-                                .filter(|matched| matched.position == state.position),
-                        );
-                        if begin == state.position {
-                            break;
-                        }
-                        begin += next_code_point(input, begin, self.flags.unicode).1;
-                        if begin > state.position {
-                            break;
-                        }
-                    }
-                    candidates
-                } else {
-                    self.match_node(body, input, state.clone())?
+                let direction = Flags {
+                    backward: *behind,
+                    ..flags
                 };
+                let candidates = self.match_node(direction, body, input, state.clone())?;
                 Ok(if *positive {
                     candidates
                         .into_iter()
+                        .take(1)
                         .map(|mut matched| {
                             matched.position = state.position;
                             matched
@@ -359,32 +367,54 @@ impl Regex {
         }
     }
 
-    fn match_backreference(&self, input: &[u16], range: Range<usize>, state: State) -> Vec<State> {
-        let mut captured = range.start;
-        let mut candidate = state.position;
+    fn match_backreference(
+        &self,
+        flags: Flags,
+        input: &[u16],
+        range: Range<usize>,
+        state: State,
+    ) -> Vec<State> {
+        let width = range.len();
+        let start = if flags.backward {
+            state.position.checked_sub(width)
+        } else {
+            Some(state.position).filter(|position| position + width <= input.len())
+        };
+        let Some(start) = start else {
+            return Vec::new();
+        };
+        let (mut captured, mut candidate) = (range.start, start);
         while captured < range.end {
             if candidate >= input.len() {
                 return Vec::new();
             }
-            let (left, left_width) = next_code_point(input, captured, self.flags.unicode);
-            let (right, right_width) = next_code_point(input, candidate, self.flags.unicode);
-            if captured + left_width > range.end || !self.code_point_eq(left, right) {
+            let (left, left_width) = next_code_point(input, captured, flags.unicode);
+            let (right, right_width) = next_code_point(input, candidate, flags.unicode);
+            if captured + left_width > range.end || !self.code_point_eq(flags, left, right) {
                 return Vec::new();
             }
             captured += left_width;
             candidate += right_width;
         }
-        let width = candidate - state.position;
-        vec![state.advanced(width)]
+        if candidate != start + width {
+            return Vec::new();
+        }
+        vec![state.moved(width, flags.backward)]
     }
 
     fn match_sequence(
         &self,
+        flags: Flags,
         nodes: &[Node],
         input: &[u16],
         state: State,
     ) -> Result<Vec<State>, RegexError> {
-        let Some((first, rest)) = nodes.split_first() else {
+        let split = if flags.backward {
+            nodes.split_last()
+        } else {
+            nodes.split_first()
+        };
+        let Some((first, rest)) = split else {
             return Ok(vec![state]);
         };
         if let Node::Repeat {
@@ -392,91 +422,130 @@ impl Regex {
             min,
             max,
             greedy,
+            captures,
         } = first
         {
-            // Deduplicate states within each repetition level by (position,
-            // captures).  Equivalent alternatives like (a|a|a) produce k
-            // identical states at every level — without dedup these multiply to
-            // k^n states, each cloning its captures Vec.  Two states that share
-            // position and captures yield identical continuations, so collapsing
-            // duplicates is lossless.
-            //
-            // The hash set is allocated once and cleared per level so its bucket
-            // capacity is reused — ordinary patterns (1 state per level) pay one
-            // allocation for the whole repeat, not one per level.  Dedup is kept
-            // even for single-source levels because the body itself can be an
-            // alternation (e.g. (a|a)*) whose branches yield duplicate
-            // (position, captures) states from one prior — skipping would let
-            // those duplicates through and reintroduce the multiplication.
-            //
-            // The step budget remains as a backstop for non-dedupable blowups
-            // (e.g. ((a)|(a))* where branches set different capture groups).
-            // On exhaustion it returns a distinct error rather than an empty
-            // result, so a caller can tell an aborted match from a real non-match.
-            let mut levels = vec![vec![state]];
-            let limit = max.unwrap_or(input.len().saturating_add(*min).saturating_add(1));
-            let mut total_states: usize = 1;
-            let mut seen: HashSet<StateKey> = HashSet::new();
-            for count in 0..limit {
-                let mut next = Vec::new();
-                seen.clear();
-                for prior in &levels[count] {
-                    for matched in self.match_node(body, input, prior.clone())? {
-                        if matched.position == prior.position && count + 1 >= *min {
-                            continue;
-                        }
-                        let key = (
-                            matched.position,
-                            matched
-                                .captures
-                                .iter()
-                                .map(|c| c.as_ref().map(|r| (r.start, r.end)))
-                                .collect(),
-                        );
-                        if seen.insert(key) {
-                            next.push(matched);
-                        }
-                    }
-                }
-                if next.is_empty() {
-                    break;
-                }
-                total_states += next.len();
-                if total_states > STEP_BUDGET {
-                    return Err(RegexError::budget_exhausted());
-                }
-                levels.push(next);
-            }
-            let counts: Box<dyn Iterator<Item = usize>> = if *greedy {
-                Box::new((*min..levels.len()).rev())
-            } else {
-                Box::new(*min..levels.len())
-            };
-            let mut result = Vec::new();
-            for count in counts {
-                // Move ownership instead of cloning: each level is visited
-                // exactly once, so the deep copy of every captures allocation
-                // on each iteration was pure waste.
-                for candidate in std::mem::take(&mut levels[count]) {
-                    result.extend(self.match_sequence(rest, input, candidate)?);
-                }
-            }
-            Ok(result)
+            self.match_repeat(
+                flags,
+                &Repeat {
+                    body,
+                    min: *min,
+                    max: *max,
+                    greedy: *greedy,
+                    captures,
+                },
+                rest,
+                input,
+                state,
+            )
         } else {
             let mut result = Vec::new();
-            for matched in self.match_node(first, input, state)? {
-                result.extend(self.match_sequence(rest, input, matched)?);
+            for matched in self.match_node(flags, first, input, state)? {
+                result.extend(self.match_sequence(flags, rest, input, matched)?);
             }
             Ok(result)
         }
     }
 
-    fn code_point_eq(&self, left: u32, right: u32) -> bool {
-        left == right
-            || (self.flags.ignore_case
-                && canonicalize(left, self.flags.unicode)
-                    == canonicalize(right, self.flags.unicode))
+    /// `RepeatMatcher` as a depth-first walk with its own stack, because the number
+    /// of iterations follows the input. Results stay in priority order: a greedy
+    /// repeat tries another iteration before the continuation, and a lazy one after.
+    ///
+    /// A state already expanded cannot do better the second time, since everything
+    /// it reaches was reached earlier at a higher priority. Skipping it keeps
+    /// equivalent alternatives such as (a|a)* linear; the step budget is the backstop
+    /// for states that differ only in their captures, as in ((a)|(a))*. It grows with
+    /// the input, since a plain repeat over a long string takes a step per character.
+    fn match_repeat(
+        &self,
+        flags: Flags,
+        repeat: &Repeat<'_>,
+        rest: &[Node],
+        input: &[u16],
+        state: State,
+    ) -> Result<Vec<State>, RegexError> {
+        enum Step {
+            Expand { state: State, count: usize },
+            Continue(State),
+        }
+        let mut result = Vec::new();
+        let mut steps = 0;
+        let mut seen: HashSet<StateKey> = HashSet::new();
+        let mut stack = vec![Step::Expand { state, count: 0 }];
+        while let Some(step) = stack.pop() {
+            let (state, count) = match step {
+                Step::Continue(state) => {
+                    result.extend(self.match_sequence(flags, rest, input, state)?);
+                    continue;
+                }
+                Step::Expand { state, count } => (state, count),
+            };
+            let tracked = if repeat.max.is_some() {
+                count
+            } else {
+                count.min(repeat.min)
+            };
+            let key = (
+                tracked,
+                state.position,
+                state
+                    .captures
+                    .iter()
+                    .map(|capture| capture.as_ref().map(|range| (range.start, range.end)))
+                    .collect(),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            steps += 1;
+            if steps > STEP_BUDGET.max(input.len().saturating_mul(2)) {
+                return Err(RegexError::budget_exhausted());
+            }
+            let mut iterations = Vec::new();
+            if repeat.max.is_none_or(|max| count < max) {
+                let mut attempt = state.clone();
+                attempt.captures[repeat.captures.clone()].fill(None);
+                iterations = self.match_node(flags, repeat.body, input, attempt)?;
+                iterations
+                    .retain(|matched| count < repeat.min || matched.position != state.position);
+            }
+            let stop = (count >= repeat.min).then_some(Step::Continue(state));
+            let next = iterations.into_iter().rev().map(|state| Step::Expand {
+                state,
+                count: count + 1,
+            });
+            if repeat.greedy {
+                stack.extend(stop);
+                stack.extend(next);
+            } else {
+                stack.extend(next);
+                stack.extend(stop);
+            }
+        }
+        Ok(result)
     }
+
+    fn code_point_eq(&self, flags: Flags, left: u32, right: u32) -> bool {
+        left == right
+            || (flags.ignore_case
+                && canonicalize(left, flags.unicode) == canonicalize(right, flags.unicode))
+    }
+}
+
+/// The code point the matcher reads next, on whichever side of `position` that is.
+fn adjacent_code_point(input: &[u16], position: usize, flags: Flags) -> Option<(u32, usize)> {
+    if !flags.backward {
+        return (position < input.len()).then(|| next_code_point(input, position, flags.unicode));
+    }
+    let low = *input.get(position.checked_sub(1)?)?;
+    if flags.unicode
+        && (0xdc00..=0xdfff).contains(&low)
+        && position >= 2
+        && (0xd800..=0xdbff).contains(&input[position - 2])
+    {
+        return Some((combine_surrogates(input[position - 2], low), 2));
+    }
+    Some((u32::from(low), 1))
 }
 
 pub(crate) fn next_code_point(input: &[u16], position: usize, unicode: bool) -> (u32, usize) {
@@ -493,6 +562,15 @@ pub(crate) fn next_code_point(input: &[u16], position: usize, unicode: bool) -> 
     (u32::from(first), 1)
 }
 
+/// A quantified atom, as `Regex::match_repeat` reads it.
+struct Repeat<'a> {
+    body: &'a Node,
+    min: usize,
+    max: Option<usize>,
+    greedy: bool,
+    captures: &'a Range<usize>,
+}
+
 #[derive(Clone, Debug)]
 struct State {
     position: usize,
@@ -500,8 +578,12 @@ struct State {
 }
 
 impl State {
-    fn advanced(mut self, count: usize) -> Self {
-        self.position += count;
+    fn moved(mut self, count: usize, backward: bool) -> Self {
+        if backward {
+            self.position -= count;
+        } else {
+            self.position += count;
+        }
         self
     }
 }
@@ -520,6 +602,11 @@ enum Node {
         index: Option<usize>,
         body: Box<Node>,
     },
+    /// `(?ims-ims:...)`: its body runs under these flags instead.
+    Modified {
+        flags: Flags,
+        body: Box<Node>,
+    },
     BackReference(usize),
     NamedBackReference(String),
     Look {
@@ -532,6 +619,8 @@ enum Node {
         min: usize,
         max: Option<usize>,
         greedy: bool,
+        /// The groups inside `body`, which each iteration starts without.
+        captures: Range<usize>,
     },
 }
 
@@ -579,12 +668,8 @@ impl ClassItem {
             Self::NotDigit => !(value <= 0x7f && (value as u8).is_ascii_digit()),
             Self::Word => is_word(value, ignore_case, unicode),
             Self::NotWord => !is_word(value, ignore_case, unicode),
-            Self::Space => {
-                char::from_u32(value).is_some_and(char::is_whitespace) || value == 0xfeff
-            }
-            Self::NotSpace => {
-                !(char::from_u32(value).is_some_and(char::is_whitespace) || value == 0xfeff)
-            }
+            Self::Space => is_space(value),
+            Self::NotSpace => !is_space(value),
         }
     }
 }
@@ -749,6 +834,11 @@ fn is_word(value: u32, ignore_case: bool, unicode: bool) -> bool {
         value
     };
     value <= 0x7f && ((value as u8).is_ascii_alphanumeric() || value == u32::from(b'_'))
+}
+
+/// `WhiteSpace` and `LineTerminator`. Rust's own set adds U+0085 and omits U+FEFF.
+fn is_space(value: u32) -> bool {
+    value != 0x85 && (value == 0xfeff || char::from_u32(value).is_some_and(char::is_whitespace))
 }
 
 fn is_line_terminator(value: u32) -> bool {
@@ -996,30 +1086,48 @@ struct Parser<'a> {
     units: &'a [u16],
     position: usize,
     capture_count: usize,
-    names: BTreeMap<String, usize>,
+    names: Vec<(String, Vec<usize>)>,
+    /// Names that could already have matched at this point of the pattern. A
+    /// repeat within them is an error; a repeat in another alternative is not.
+    reachable_names: Vec<String>,
     unicode: bool,
+    flags: Flags,
+    /// The pattern's capturing groups, including those not parsed yet.
+    total_captures: usize,
+    has_named_groups: bool,
+    referenced_names: Vec<String>,
 }
 
 impl<'a> Parser<'a> {
-    fn new(units: &'a [u16], unicode: bool) -> Self {
+    fn new(units: &'a [u16], flags: Flags) -> Self {
+        let (total_captures, has_named_groups) = scan_groups(units);
         Self {
             units,
             position: 0,
             capture_count: 0,
-            names: BTreeMap::new(),
-            unicode,
+            names: Vec::new(),
+            reachable_names: Vec::new(),
+            unicode: flags.unicode,
+            flags,
+            total_captures,
+            has_named_groups,
+            referenced_names: Vec::new(),
         }
     }
 
     fn parse_disjunction(&mut self, terminator: Option<u16>) -> Result<Node, RegexError> {
+        let reachable = self.reachable_names.len();
+        let mut branch_names = Vec::new();
         let mut branches = Vec::new();
         loop {
             branches.push(Node::Sequence(self.parse_sequence(terminator)?));
+            branch_names.extend(self.reachable_names.drain(reachable..));
             if self.peek() != Some(u16::from(b'|')) {
                 break;
             }
             self.position += 1;
         }
+        self.reachable_names.extend(branch_names);
         if branches.len() == 1 {
             Ok(branches.pop().expect("one branch"))
         } else {
@@ -1033,8 +1141,22 @@ impl<'a> Parser<'a> {
             if Some(token) == terminator || token == u16::from(b'|') {
                 break;
             }
+            let first_capture = self.capture_count + 1;
             let atom = self.parse_atom()?;
-            nodes.push(self.parse_quantifier(atom)?);
+            let assertion = match &atom {
+                Node::Start | Node::End | Node::WordBoundary(_) => true,
+                Node::Look { behind, .. } => *behind || self.unicode,
+                _ => false,
+            };
+            if assertion && self.at_quantifier()? {
+                return Err(self.error("nothing to repeat"));
+            }
+            let quantified = self.parse_quantifier(atom, first_capture)?;
+            let repeated = matches!(quantified, Node::Repeat { .. });
+            nodes.push(quantified);
+            if repeated && self.at_quantifier()? {
+                return Err(self.error("nothing to repeat"));
+            }
         }
         Ok(nodes)
     }
@@ -1043,6 +1165,14 @@ impl<'a> Parser<'a> {
         let token = self
             .next()
             .ok_or_else(|| self.error("expected regular expression atom"))?;
+        if token == 0x7b && !self.unicode {
+            self.position -= 1;
+            let quantifier = self.at_quantifier()?;
+            self.position += 1;
+            if quantifier {
+                return Err(self.error("nothing to repeat"));
+            }
+        }
         match token {
             0x2e => Ok(Node::Dot),
             0x5e => Ok(Node::Start),
@@ -1052,6 +1182,7 @@ impl<'a> Parser<'a> {
             0x5c => self.parse_escape(false),
             0x29 => Err(self.error("unmatched ')'")),
             0x2a | 0x2b | 0x3f => Err(self.error("nothing to repeat")),
+            0x7b | 0x7d | 0x5d if self.unicode => Err(self.error("lone bracket in Unicode mode")),
             _ => {
                 let start = self.position - 1;
                 let (value, width) = next_code_point(self.units, start, self.unicode);
@@ -1064,6 +1195,8 @@ impl<'a> Parser<'a> {
     fn parse_group(&mut self) -> Result<Node, RegexError> {
         let mut index = None;
         let mut look = None;
+        let outer_flags = self.flags;
+        let mut modified = false;
         if self.peek() == Some(u16::from(b'?')) {
             self.position += 1;
             match self.next() {
@@ -1080,15 +1213,24 @@ impl<'a> Parser<'a> {
                         look = Some((true, false));
                     }
                     _ => {
-                        let name = self.take_until(0x3e)?;
-                        if name.is_empty() || self.names.contains_key(&name) {
+                        let name = self.parse_group_name()?;
+                        if self.reachable_names.contains(&name) {
                             return Err(self.error("invalid duplicate capture group name"));
                         }
                         self.capture_count += 1;
                         index = Some(self.capture_count);
-                        self.names.insert(name, self.capture_count);
+                        self.reachable_names.push(name.clone());
+                        match self.names.iter_mut().find(|(known, _)| *known == name) {
+                            Some((_, indices)) => indices.push(self.capture_count),
+                            None => self.names.push((name, vec![self.capture_count])),
+                        }
                     }
                 },
+                Some(0x69 | 0x6d | 0x73 | 0x2d) => {
+                    self.position -= 1;
+                    self.flags = self.parse_modifiers()?;
+                    modified = true;
+                }
                 _ => return Err(self.error("invalid group")),
             }
         } else {
@@ -1099,7 +1241,13 @@ impl<'a> Parser<'a> {
         if self.next() != Some(0x29) {
             return Err(self.error("unterminated group"));
         }
-        Ok(if let Some((behind, positive)) = look {
+        let body_flags = std::mem::replace(&mut self.flags, outer_flags);
+        Ok(if modified {
+            Node::Modified {
+                flags: body_flags,
+                body: Box::new(body),
+            }
+        } else if let Some((behind, positive)) = look {
             Node::Look {
                 body: Box::new(body),
                 behind,
@@ -1113,6 +1261,29 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// The flags inside `(?ims-ims:`. Each letter may appear once, in either
+    /// list, and at least one must appear.
+    fn parse_modifiers(&mut self) -> Result<Flags, RegexError> {
+        let mut flags = self.flags;
+        let mut seen = Vec::new();
+        let mut enable = true;
+        loop {
+            match self.next() {
+                Some(0x3a) if !seen.is_empty() => return Ok(flags),
+                Some(0x2d) if enable => enable = false,
+                Some(unit @ (0x69 | 0x6d | 0x73)) if !seen.contains(&unit) => {
+                    seen.push(unit);
+                    match unit {
+                        0x69 => flags.ignore_case = enable,
+                        0x6d => flags.multiline = enable,
+                        _ => flags.dot_all = enable,
+                    }
+                }
+                _ => return Err(self.error("invalid group")),
+            }
+        }
+    }
+
     fn parse_class(&mut self) -> Result<CharacterClass, RegexError> {
         let negated = if self.peek() == Some(0x5e) {
             self.position += 1;
@@ -1121,13 +1292,11 @@ impl<'a> Parser<'a> {
             false
         };
         let mut items = Vec::new();
-        let mut first = true;
         while let Some(token) = self.peek() {
-            if token == 0x5d && !first {
+            if token == 0x5d {
                 self.position += 1;
                 return Ok(CharacterClass { negated, items });
             }
-            first = false;
             let left = self.parse_class_item()?;
             if self.peek() == Some(0x2d) && self.units.get(self.position + 1) != Some(&0x5d) {
                 self.position += 1;
@@ -1181,10 +1350,16 @@ impl<'a> Parser<'a> {
             0x53 => Ok(class_node(ClassItem::NotSpace)),
             0x62 => Ok(Node::WordBoundary(true)),
             0x42 => Ok(Node::WordBoundary(false)),
-            0x6b if self.next() == Some(0x3c) => {
-                Ok(Node::NamedBackReference(self.take_until(0x3e)?))
+            0x6b if self.unicode || self.has_named_groups => {
+                if self.next() != Some(0x3c) {
+                    return Err(self.error("invalid named reference"));
+                }
+                let name = self.parse_group_name()?;
+                self.referenced_names.push(name.clone());
+                Ok(Node::NamedBackReference(name))
             }
             value if value <= 0x7f && (value as u8).is_ascii_digit() && value != 0x30 => {
+                let checkpoint = self.position;
                 let mut number = (value - 0x30) as usize;
                 while let Some(digit) = self.peek().and_then(decimal_digit) {
                     self.position += 1;
@@ -1193,7 +1368,14 @@ impl<'a> Parser<'a> {
                         .and_then(|number| number.checked_add(digit))
                         .ok_or_else(|| self.error("backreference number is too large"))?;
                 }
-                Ok(Node::BackReference(number))
+                if number <= self.total_captures {
+                    return Ok(Node::BackReference(number));
+                }
+                if self.unicode {
+                    return Err(self.error("invalid back reference"));
+                }
+                self.position = checkpoint;
+                self.escape_character(value, false).map(Node::Literal)
             }
             value => self.escape_character(value, false).map(Node::Literal),
         }
@@ -1206,8 +1388,16 @@ impl<'a> Parser<'a> {
             0x74 => Ok(0x09),
             0x66 => Ok(0x0c),
             0x76 => Ok(0x0b),
-            0x30 => Ok(0),
-            0x78 => self.hex_escape(2),
+            0x30 if self.unicode && self.peek().and_then(decimal_digit).is_some() => {
+                Err(self.error("invalid decimal escape"))
+            }
+            0x30 if self.unicode || !self.peek().is_some_and(is_octal_digit) => Ok(0),
+            0x30..=0x37 if !self.unicode => Ok(self.legacy_octal_escape(escaped)),
+            0x63 => self.control_escape(in_class),
+            0x78 => match self.hex_escape(2) {
+                Err(_) if !self.unicode => Ok(0x78),
+                result => result,
+            },
             0x75 if self.unicode && self.peek() == Some(0x7b) => {
                 self.position += 1;
                 let digits = self.take_until(0x7d)?;
@@ -1246,6 +1436,43 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `\c`. Without a letter, Annex B reads the backslash as itself and leaves the
+    /// `c` to be read next, and a class also takes a digit or `_`.
+    fn control_escape(&mut self, in_class: bool) -> Result<u32, RegexError> {
+        let letter = self.peek().filter(|unit| {
+            u8::try_from(*unit).is_ok_and(|byte| {
+                byte.is_ascii_alphabetic()
+                    || (in_class && !self.unicode && (byte.is_ascii_digit() || byte == b'_'))
+            })
+        });
+        match letter {
+            Some(letter) => {
+                self.position += 1;
+                Ok(u32::from(letter) % 32)
+            }
+            None if !self.unicode => {
+                self.position -= 1;
+                Ok(0x5c)
+            }
+            None => Err(self.error("invalid control escape")),
+        }
+    }
+
+    /// Annex B `LegacyOctalEscapeSequence`: at most three digits, up to `\377`.
+    fn legacy_octal_escape(&mut self, first: u16) -> u32 {
+        let mut value = u32::from(first) - 0x30;
+        for _ in 0..2 {
+            match self.peek().filter(|unit| is_octal_digit(*unit)) {
+                Some(unit) if value * 8 + u32::from(unit) - 0x30 <= 0o377 => {
+                    value = value * 8 + u32::from(unit) - 0x30;
+                    self.position += 1;
+                }
+                _ => break,
+            }
+        }
+        value
+    }
+
     fn hex_escape(&mut self, count: usize) -> Result<u32, RegexError> {
         if self.position + count > self.units.len() {
             return Err(self.error("invalid hexadecimal escape"));
@@ -1261,7 +1488,7 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
-    fn parse_quantifier(&mut self, atom: Node) -> Result<Node, RegexError> {
+    fn parse_quantifier(&mut self, atom: Node, first_capture: usize) -> Result<Node, RegexError> {
         let Some(token) = self.peek() else {
             return Ok(atom);
         };
@@ -1279,26 +1506,10 @@ impl<'a> Parser<'a> {
                 (0, Some(1))
             }
             0x7b => {
-                let checkpoint = self.position;
-                self.position += 1;
-                let Some(minimum) = self.parse_decimal() else {
-                    self.position = checkpoint;
+                let Some(bounds) = self.parse_braced_bounds()? else {
                     return Ok(atom);
                 };
-                match self.next() {
-                    Some(0x7d) => (minimum, Some(minimum)),
-                    Some(0x2c) => {
-                        let maximum = self.parse_decimal();
-                        if self.next() != Some(0x7d) {
-                            return Err(self.error("invalid quantifier"));
-                        }
-                        if maximum.is_some_and(|value| value < minimum) {
-                            return Err(self.error("quantifier range out of order"));
-                        }
-                        (minimum, maximum)
-                    }
-                    _ => return Err(self.error("invalid quantifier")),
-                }
+                bounds
             }
             _ => return Ok(atom),
         };
@@ -1313,7 +1524,49 @@ impl<'a> Parser<'a> {
             min,
             max,
             greedy,
+            captures: first_capture..self.capture_count + 1,
         })
+    }
+
+    /// `{n}`, `{n,}` or `{n,m}` at the cursor. Anything else leaves the cursor
+    /// there: it is a literal `{` under Annex B and an error in Unicode mode.
+    fn parse_braced_bounds(&mut self) -> Result<Option<(usize, Option<usize>)>, RegexError> {
+        let checkpoint = self.position;
+        self.position += 1;
+        let bounds = self.parse_decimal().and_then(|minimum| match self.next() {
+            Some(0x7d) => Some((minimum, Some(minimum))),
+            Some(0x2c) => {
+                let maximum = self.parse_decimal();
+                (self.next() == Some(0x7d)).then_some((minimum, maximum))
+            }
+            _ => None,
+        });
+        let Some((minimum, maximum)) = bounds else {
+            self.position = checkpoint;
+            return if self.unicode {
+                Err(self.error("invalid quantifier"))
+            } else {
+                Ok(None)
+            };
+        };
+        if maximum.is_some_and(|maximum| maximum < minimum) {
+            return Err(self.error("quantifier range out of order"));
+        }
+        Ok(Some((minimum, maximum)))
+    }
+
+    /// Whether a quantifier starts here, without consuming it.
+    fn at_quantifier(&mut self) -> Result<bool, RegexError> {
+        match self.peek() {
+            Some(0x2a | 0x2b | 0x3f) => Ok(true),
+            Some(0x7b) => {
+                let checkpoint = self.position;
+                let bounds = self.parse_braced_bounds()?;
+                self.position = checkpoint;
+                Ok(bounds.is_some())
+            }
+            _ => Ok(false),
+        }
     }
 
     fn parse_decimal(&mut self) -> Option<usize> {
@@ -1324,6 +1577,70 @@ impl<'a> Parser<'a> {
             value = value.checked_mul(10)?.checked_add(digit)?;
         }
         (self.position > begin).then_some(value)
+    }
+
+    /// `GroupName` up to and including `>`. Escapes name a code point, and each
+    /// code point must fit an identifier.
+    fn parse_group_name(&mut self) -> Result<String, RegexError> {
+        let mut name = String::new();
+        loop {
+            let invalid = |parser: &Self| parser.error("invalid capture group name");
+            let unit = self.next().ok_or_else(|| invalid(self))?;
+            if unit == 0x3e {
+                break;
+            }
+            let value = if unit == 0x5c {
+                if self.next() != Some(0x75) {
+                    return Err(invalid(self));
+                }
+                self.group_name_escape()?
+            } else {
+                let start = self.position - 1;
+                let (value, width) = next_code_point(self.units, start, true);
+                self.position = start + width;
+                value
+            };
+            let character = char::from_u32(value).ok_or_else(|| invalid(self))?;
+            let allowed = matches!(character, '$' | '_')
+                || character.is_alphabetic()
+                || (!name.is_empty()
+                    && (character.is_alphanumeric()
+                        || matches!(character, '\u{200c}' | '\u{200d}')));
+            if !allowed {
+                return Err(invalid(self));
+            }
+            name.push(character);
+        }
+        if name.is_empty() {
+            return Err(self.error("invalid capture group name"));
+        }
+        Ok(name)
+    }
+
+    /// The code point after `\u` in a group name, which reads as in Unicode mode
+    /// whatever the pattern's flags are.
+    fn group_name_escape(&mut self) -> Result<u32, RegexError> {
+        if self.peek() == Some(0x7b) {
+            self.position += 1;
+            let digits = self.take_until(0x7d)?;
+            return u32::from_str_radix(&digits, 16)
+                .ok()
+                .filter(|value| *value <= 0x10ffff)
+                .ok_or_else(|| self.error("invalid Unicode escape"));
+        }
+        let first = self.hex_escape(4)?;
+        if (0xd800..=0xdbff).contains(&first) && self.units.get(self.position) == Some(&0x5c) {
+            let checkpoint = self.position;
+            self.position += 1;
+            if self.next() == Some(0x75)
+                && let Ok(second) = self.hex_escape(4)
+                && (0xdc00..=0xdfff).contains(&second)
+            {
+                return Ok(combine_surrogates(first as u16, second as u16));
+            }
+            self.position = checkpoint;
+        }
+        Ok(first)
     }
 
     fn take_until(&mut self, terminator: u16) -> Result<String, RegexError> {
@@ -1359,6 +1676,34 @@ fn class_node(item: ClassItem) -> Node {
         negated: false,
         items: vec![item],
     })
+}
+
+fn is_octal_digit(unit: u16) -> bool {
+    (0x30..=0x37).contains(&unit)
+}
+
+/// Counts the capturing groups in a pattern, and says whether any is named.
+fn scan_groups(units: &[u16]) -> (usize, bool) {
+    let (mut count, mut named, mut in_class, mut position) = (0, false, false, 0);
+    while let Some(unit) = units.get(position).copied() {
+        match unit {
+            0x5c => position += 1,
+            0x5b => in_class = true,
+            0x5d => in_class = false,
+            0x28 if !in_class => match units.get(position + 1) {
+                Some(0x3f) => {
+                    let name = units.get(position + 2) == Some(&0x3c)
+                        && !matches!(units.get(position + 3), Some(0x3d | 0x21));
+                    count += usize::from(name);
+                    named |= name;
+                }
+                _ => count += 1,
+            },
+            _ => {}
+        }
+        position += 1;
+    }
+    (count, named)
 }
 
 fn decimal_digit(unit: u16) -> Option<usize> {
@@ -1510,6 +1855,172 @@ mod tests {
                 .exec(&text("foobaz"), 0)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn modifiers_change_flags_only_inside_their_group() {
+        assert_eq!(ranges("(?i:a)b", "", "Ab"), [Some(0..2)]);
+        assert!(regex("(?i:a)b", "").exec(&text("AB"), 0).unwrap().is_none());
+        assert!(
+            regex("(?-i:a)b", "i")
+                .exec(&text("Ab"), 0)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(ranges("(?-i:a)b", "i", "aB"), [Some(0..2)]);
+        assert_eq!(ranges("(?s:.).", "", "\na"), [Some(0..2)]);
+        assert_eq!(ranges("(?m:^b)", "", "a\nb"), [Some(2..3)]);
+        assert_eq!(ranges("(?i:(?-i:a)b)", "", "aB"), [Some(0..2)]);
+        for pattern in [
+            "(?-:a)",
+            "(?ii:a)",
+            "(?i-i:a)",
+            "(?g:a)",
+            "(?i--s:a)",
+            "(?I:a)",
+        ] {
+            assert!(
+                Regex::compile(&text(pattern), &text("")).is_err(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_name_may_repeat_only_across_alternatives() {
+        let regex = regex("(?<year>a)|(?<year>b)", "");
+        let matched = regex.exec(&text("b"), 0).unwrap().unwrap();
+        assert_eq!(matched.named, [("year".to_owned(), Some(0..1))]);
+        for pattern in ["(?<x>a)(?<x>b)", "(?<x>(?<x>a))", "(?:(?<x>a)|b)(?<x>c)"] {
+            assert!(
+                Regex::compile(&text(pattern), &text("")).is_err(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_groups_keep_source_order() {
+        let matched = regex("(?<z>a)(?<b>b)", "")
+            .exec(&text("ab"), 0)
+            .unwrap()
+            .unwrap();
+        let names: Vec<_> = matched
+            .named
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(names, ["z", "b"]);
+    }
+
+    #[test]
+    fn annex_b_escapes_read_literally_outside_unicode_mode() {
+        assert_eq!(ranges("\\x", "", "x"), [Some(0..1)]);
+        assert_eq!(ranges("\\c", "", "\\c"), [Some(0..2)]);
+        assert_eq!(ranges("\\ca", "", "\u{1}"), [Some(0..1)]);
+        assert_eq!(ranges("[\\c1]", "", "\u{11}"), [Some(0..1)]);
+        assert_eq!(ranges("[\\12-\\14]", "", "\n"), [Some(0..1)]);
+        assert_eq!(ranges("\\1", "", "\u{1}"), [Some(0..1)]);
+        assert_eq!(ranges("a{1,b}", "", "a{1,b}"), [Some(0..6)]);
+        assert_eq!(ranges("\\k<a", "", "k<a"), [Some(0..3)]);
+        for pattern in ["\\1", "\\c", "a{1,b}", "}", "]"] {
+            assert!(
+                Regex::compile(&text(pattern), &text("u")).is_err(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_can_repeat_a_quantifier_or_an_assertion() {
+        for pattern in ["a**", "a{1}{2}", "a+?+", "^*", "\\b+", "(?<=a)*", "{1}"] {
+            assert!(
+                Regex::compile(&text(pattern), &text("")).is_err(),
+                "{pattern}"
+            );
+        }
+        assert!(Regex::compile(&text("(?=a)*"), &text("")).is_ok());
+        assert!(Regex::compile(&text("(?=a)*"), &text("u")).is_err());
+    }
+
+    #[test]
+    fn an_empty_class_matches_nothing_and_its_negation_anything() {
+        assert!(regex("[]", "").exec(&text("a"), 0).unwrap().is_none());
+        assert_eq!(ranges("[^]", "", "a"), [Some(0..1)]);
+    }
+
+    #[test]
+    fn a_required_iteration_may_match_empty() {
+        assert_eq!(ranges("(a*)b\\1+", "", "baaac"), [Some(0..1), Some(0..0)]);
+    }
+
+    #[test]
+    fn group_names_take_escapes_and_references_must_resolve() {
+        let matched = regex("(?<\\u{41}b>x)", "")
+            .exec(&text("x"), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(matched.named[0].0, "Ab");
+        for pattern in ["\\k<x>(?<y>a)", "(?<1a>x)", "(?<>x)"] {
+            assert!(
+                Regex::compile(&text(pattern), &text("")).is_err(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeat_explores_each_alternative_before_giving_back_an_iteration() {
+        assert_eq!(
+            ranges("(aa|aabaac|ba|b|c)*", "", "aabaac"),
+            [Some(0..4), Some(2..4)]
+        );
+        assert_eq!(
+            ranges("^([a-z]+)*[a-z]$", "", "abc"),
+            [Some(0..3), Some(0..2)]
+        );
+    }
+
+    #[test]
+    fn a_lookahead_keeps_only_its_first_match() {
+        assert_eq!(
+            ranges("(?=(a+))a*b\\1", "", "baaabac"),
+            [Some(3..6), Some(3..4)]
+        );
+    }
+
+    #[test]
+    fn whitespace_follows_the_ecmascript_set() {
+        assert_eq!(ranges("\\s", "", "\u{feff}"), [Some(0..1)]);
+        assert!(regex("\\s", "").exec(&text("\u{85}"), 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_lookbehind_reads_its_body_from_right_to_left() {
+        assert_eq!(
+            ranges("(?<=(\\d+)(\\d+))$", "", "1053"),
+            [Some(4..4), Some(0..1), Some(1..4)]
+        );
+        assert_eq!(
+            ranges("(?<=([abc])+)def", "", "abcdef"),
+            [Some(3..6), Some(0..1)]
+        );
+        assert_eq!(ranges("(?<=\\1(a))b", "", "aab"), [Some(2..3), Some(1..2)]);
+        assert!(
+            regex("(?<!abc)\\w\\w\\w", "")
+                .exec(&text("abcdef"), 3)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn each_repeat_iteration_forgets_the_captures_inside_it() {
+        assert_eq!(ranges("(?:(a)|b)*", "", "ab"), [Some(0..2), None]);
+        assert_eq!(
+            ranges("(?:(?<x>a)|(?<x>b)){2}\\k<x>", "", "abb"),
+            [Some(0..3), None, Some(1..2)]
         );
     }
 
