@@ -84,6 +84,7 @@ sweep catalog runner shards="32" jobs="10":
     merged="target/evidence-local/merged/{{catalog}}-{{runner}}-{{host_triple}}.jsonl"
     target/release/bamts-verification suite merge --catalog {{catalog}} --receipts "$out" --out "$merged"
     target/release/bamts-verification suite merge --catalog {{catalog}} --receipts "$out" --out "$merged" --check
+    target/release/bamts-verification suite status --receipts target/evidence-local/merged --out target/evidence-local/status.md
     printf 'SWEEP PASS %s\n' "$merged"
 
 # Counts by state, facet and failure family for one sweep. `receipt` defaults to
@@ -123,6 +124,11 @@ recount family catalog="typescript-7.0.2" runner="compiler" receipt="":
     export BAMTS_SUITE_JIT_ADAPTER=target/release/runtime_lane_worker
     export BAMTS_SUITE_AOT_ADAPTER=target/release/runtime_lane_worker
     cargo run --locked -q -p bamts-verification --bin bamts-verification -- suite recount --catalog {{catalog}} --runner {{runner}} --baseline "$receipt" --family "{{family}}" --fail-on-regression
+
+# Rewrites target/evidence-local/status.md from every receipt in a directory (the merged
+# ones `sweep` writes) and shows what changed since the previous report.
+status-report receipts="target/evidence-local/merged" out="target/evidence-local/status.md":
+    cargo run --locked -q -p bamts-verification --bin bamts-verification -- suite status --receipts {{receipts}} --out {{out}}
 
 nightly: ci ci-accounting ci-formal
     just sweep typescript-7.0.2 compiler
