@@ -4,10 +4,10 @@ use bamts_native::Value;
 
 use super::super::intl::temporal_to_locale_string;
 use super::fields::{
-    CalendarFields, FieldNames, calendar_argument, iso_year, prepare_partial_fields,
-    require_partial_temporal_object, resolved_date_fields, to_calendar_identifier,
-    to_integer_with_truncation, to_temporal_date, to_temporal_duration, to_temporal_time,
-    to_time_zone_identifier,
+    CalendarFields, FieldNames, calendar_argument, date_from_fields, iso_year,
+    prepare_partial_fields, providers, require_partial_temporal_object, resolved_date_fields,
+    to_calendar_identifier, to_integer_with_truncation, to_temporal_date, to_temporal_duration,
+    to_temporal_time, to_time_zone_identifier,
 };
 use super::options::{
     DATE_UNITS, DifferencePolicy, difference_settings, get_options_object, overflow_option,
@@ -18,12 +18,16 @@ use super::{
     require_new, string_outcome, temporal_record, type_error, value_of_throws,
 };
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
+use crate::temporal::calendar::{self, Calendar};
 use crate::temporal::instant_duration::{Instant, Overflow, Unit};
 use crate::temporal::now_rounding::{ShowCalendar, format_calendar_annotation};
 use crate::temporal::plain_types::{PlainDate, PlainDateTime, PlainTime};
-use crate::temporal::relative::date_duration_without_time;
+use crate::temporal::relative::{
+    DifferenceRounding, date_duration_without_time, difference_plain_date,
+};
 use crate::temporal::zoned_date_time::{
-    CalendarId, FixedOffsetTimeZones, ZonedDateTime, epoch_nanoseconds_for, start_of_day,
+    CalendarDateFields, CalendarId, FixedOffsetTimeZones, ZonedDateTime, epoch_nanoseconds_for,
+    start_of_day,
 };
 use crate::temporal::{TemporalKind, TemporalObject};
 use crate::{EvalFailure, HeapEntry, Host, Machine};
@@ -139,7 +143,10 @@ fn to_plain_year_month<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let (date, calendar) = this_date(machine, this)?;
-    let value = date.to_plain_year_month();
+    let value = match Calendar::from_id(&calendar) {
+        Some(kind) => calendar::year_month_of(kind, date).or_throw(machine)?,
+        None => date.to_plain_year_month(),
+    };
     create(machine, TemporalObject::PlainYearMonth { value, calendar }).map(BuiltinOutcome::Value)
 }
 
@@ -150,7 +157,10 @@ fn to_plain_month_day<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let (date, calendar) = this_date(machine, this)?;
-    let value = date.to_plain_month_day();
+    let value = match Calendar::from_id(&calendar) {
+        Some(kind) => calendar::month_day_of(kind, date).or_throw(machine)?,
+        None => date.to_plain_month_day(),
+    };
     create(machine, TemporalObject::PlainMonthDay { value, calendar }).map(BuiltinOutcome::Value)
 }
 
@@ -166,12 +176,15 @@ fn add_duration<H: Host>(
     let date_duration = date_duration_without_time(&duration).or_throw(machine)?;
     let options = get_options_object(machine, arg(args, 1))?;
     let overflow = overflow_option(machine, options)?;
-    let value = if subtract {
-        date.subtract(&date_duration, overflow)
+    let date_duration = if subtract {
+        date_duration.negated()
     } else {
-        date.add(&date_duration, overflow)
-    }
-    .or_throw(machine)?;
+        date_duration
+    };
+    let value = providers()
+        .calendar
+        .date_add(&calendar, date, &date_duration, overflow)
+        .or_throw(machine)?;
     date_outcome(machine, value, calendar)
 }
 
@@ -202,14 +215,17 @@ fn with<H: Host>(
     let (date, calendar) = this_date(machine, this)?;
     let like = arg(args, 0);
     require_partial_temporal_object(machine, like)?;
-    let partial = prepare_partial_fields(machine, like, FieldNames::DATE)?;
-    let fields = CalendarFields::from_date(date).merged_with(partial);
+    let partial = prepare_partial_fields(machine, &calendar, like, FieldNames::DATE)?;
+    let fields = CalendarFields::from_date(machine, &calendar, date)?.merged_with(partial);
     let options = get_options_object(machine, arg(args, 1))?;
     let overflow = overflow_option(machine, options)?;
-    let (year, month, day) = resolved_date_fields(machine, &fields)?;
-    let value = date
-        .with(Some(year), Some(month), Some(day), overflow)
-        .or_throw(machine)?;
+    let value = if calendar.is_iso8601() {
+        let (year, month, day) = resolved_date_fields(machine, &fields)?;
+        date.with(Some(year), Some(month), Some(day), overflow)
+            .or_throw(machine)?
+    } else {
+        date_from_fields(machine, &calendar, &fields, overflow)?
+    };
     date_outcome(machine, value, calendar)
 }
 
@@ -248,15 +264,29 @@ fn difference<H: Host>(
             smallest_largest_default: Unit::Day,
         },
     )?;
-    let value = date
-        .until(
+    let value = if calendar.is_iso8601() {
+        date.until(
             other,
             settings.largest_unit,
             settings.smallest_unit,
             settings.rounding_increment,
             settings.rounding_mode,
         )
-        .or_throw(machine)?;
+    } else {
+        difference_plain_date(
+            &providers(),
+            date,
+            other,
+            &calendar,
+            DifferenceRounding {
+                largest_unit: settings.largest_unit,
+                smallest_unit: settings.smallest_unit,
+                increment: settings.rounding_increment,
+                mode: settings.rounding_mode,
+            },
+        )
+    }
+    .or_throw(machine)?;
     let value = if since { value.negated() } else { value };
     create(machine, TemporalObject::Duration(value)).map(BuiltinOutcome::Value)
 }

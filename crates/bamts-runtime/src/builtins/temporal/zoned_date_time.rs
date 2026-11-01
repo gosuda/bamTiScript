@@ -30,9 +30,9 @@ use crate::temporal::instant_duration::{
 use crate::temporal::parse::parse_time_zone_identifier;
 use crate::temporal::plain_types::{PlainDate, PlainDateTime};
 use crate::temporal::zoned_date_time::{
-    ArithmeticOptions, CalendarId, DifferenceOptions, FixedOffsetTimeZones, OffsetMatch,
-    OffsetOption, ResolveOptions, RoundOptions, TimeZoneId, ToStringOptions, TransitionDirection,
-    ZonedDateTime, epoch_nanoseconds_for, format_utc_offset, start_of_day,
+    ArithmeticOptions, CalendarDateFields, CalendarId, DifferenceOptions, FixedOffsetTimeZones,
+    OffsetMatch, OffsetOption, ResolveOptions, RoundOptions, TimeZoneId, ToStringOptions,
+    TransitionDirection, ZonedDateTime, epoch_nanoseconds_for, format_utc_offset, start_of_day,
 };
 use crate::temporal::{TemporalKind, TemporalObject};
 use crate::{EvalFailure, HeapEntry, Host, Machine};
@@ -306,24 +306,25 @@ fn with<H: Host>(
     require_partial_temporal_object(machine, like)?;
     let local = local_date_time(machine, &zoned)?;
     let current = current_offset(machine, &zoned)?;
-    let mut base = CalendarFields::from_date(local.date).with_time(local.time);
+    let calendar = zoned.calendar_id().clone();
+    let mut base = CalendarFields::from_date(machine, &calendar, local.date)?.with_time(local.time);
     base.offset = Some(i128::from(current.get()));
     let names = FieldNames::DATE
         .with(FieldNames::TIME)
         .with(FieldNames::OFFSET);
-    let partial = prepare_partial_fields(machine, like, names)?;
+    let partial = prepare_partial_fields(machine, &calendar, like, names)?;
     let fields = base.merged_with(partial);
     let options = get_options_object(machine, arg(args, 1))?;
     let disambiguation = disambiguation_option(machine, options)?;
     let offset = offset_option(machine, options, OffsetOption::Prefer)?;
     let overflow = overflow_option(machine, options)?;
-    let resolved = date_time_from_fields(machine, &fields, overflow)?;
+    let resolved = date_time_from_fields(machine, &calendar, &fields, overflow)?;
     let value = interpret_offset(
         machine,
         resolved,
         OffsetBehaviour::Option(fields.offset.unwrap_or(0)),
         zoned.time_zone_id().clone(),
-        zoned.calendar_id().clone(),
+        calendar,
         ResolveOptions {
             disambiguation,
             offset,

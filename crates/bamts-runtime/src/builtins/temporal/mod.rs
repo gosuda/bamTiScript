@@ -18,15 +18,23 @@ macro_rules! date_accessors {
             string_outcome(machine, calendar.as_str())
         }
 
-        /// The ISO calendar has no eras.
-        fn no_era<H: Host>(
+        /// The calendar's view of the receiver's date.
+        fn calendar_fields<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+        ) -> Result<CalendarDateFields, EvalFailure> {
+            let (date, calendar) = $this(machine, this)?;
+            super::fields::calendar_date(machine, &calendar, date)
+        }
+
+        fn era<H: Host>(
             machine: &mut Machine<'_, H>,
             this: Value,
             _args: &[Value],
             _constructing: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
-            $this(machine, this)?;
-            Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+            let fields = calendar_fields(machine, this)?;
+            super::optional_string_outcome(machine, fields.era.as_deref())
         }
 
         fn month_code<H: Host>(
@@ -35,8 +43,8 @@ macro_rules! date_accessors {
             _args: &[Value],
             _constructing: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
-            let (date, _) = $this(machine, this)?;
-            string_outcome(machine, &format!("M{:02}", date.month))
+            let fields = calendar_fields(machine, this)?;
+            string_outcome(machine, &fields.month_code)
         }
 
         fn in_leap_year<H: Host>(
@@ -45,37 +53,38 @@ macro_rules! date_accessors {
             _args: &[Value],
             _constructing: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
-            let (date, _) = $this(machine, this)?;
-            Ok(BuiltinOutcome::Value(Value::boolean(date.in_leap_year())))
+            let fields = calendar_fields(machine, this)?;
+            Ok(BuiltinOutcome::Value(Value::boolean(fields.in_leap_year)))
         }
 
         date_number_accessors! {
-            $this,
-            year: |date| f64::from(date.year),
-            month: |date| f64::from(date.month),
-            day: |date| f64::from(date.day),
-            day_of_week: |date| f64::from(date.day_of_week()),
-            day_of_year: |date| f64::from(date.day_of_year()),
-            week_of_year: |date| f64::from(date.week_of_year().1),
-            year_of_week: |date| f64::from(date.week_of_year().0),
-            days_in_week: |_date| 7.0,
-            days_in_month: |date| f64::from(date.days_in_month()),
-            days_in_year: |date| f64::from(date.days_in_year()),
-            months_in_year: |date| f64::from(date.months_in_year()),
+            calendar_fields,
+            era_year: |fields| fields.era_year.map(f64::from),
+            year: |fields| Some(f64::from(fields.year)),
+            month: |fields| Some(f64::from(fields.month)),
+            day: |fields| Some(f64::from(fields.day)),
+            day_of_week: |fields| Some(f64::from(fields.day_of_week)),
+            day_of_year: |fields| Some(f64::from(fields.day_of_year)),
+            week_of_year: |fields| fields.week_of_year.map(f64::from),
+            year_of_week: |fields| fields.year_of_week.map(f64::from),
+            days_in_week: |fields| Some(f64::from(fields.days_in_week)),
+            days_in_month: |fields| Some(f64::from(fields.days_in_month)),
+            days_in_year: |fields| Some(f64::from(fields.days_in_year)),
+            months_in_year: |fields| Some(f64::from(fields.months_in_year)),
         }
     };
 }
 
 macro_rules! date_number_accessors {
-    ($this:ident, $($name:ident: |$date:ident| $value:expr),+ $(,)?) => {
+    ($this:ident, $($name:ident: |$fields:ident| $value:expr),+ $(,)?) => {
         $(fn $name<H: Host>(
             machine: &mut Machine<'_, H>,
             this: Value,
             _args: &[Value],
             _constructing: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
-            let ($date, _) = $this(machine, this)?;
-            number_outcome($value)
+            let $fields = $this(machine, this)?;
+            super::optional_number_outcome($value)
         })+
     };
 }
@@ -85,8 +94,8 @@ macro_rules! date_getter_table {
     ($H:ident) => {
         [
             ("calendarId", "get calendarId", calendar_id::<$H>),
-            ("era", "get era", no_era::<$H>),
-            ("eraYear", "get eraYear", no_era::<$H>),
+            ("era", "get era", era::<$H>),
+            ("eraYear", "get eraYear", era_year::<$H>),
             ("year", "get year", year::<$H>),
             ("month", "get month", month::<$H>),
             ("monthCode", "get monthCode", month_code::<$H>),
@@ -353,6 +362,22 @@ pub(super) fn string_outcome<H: Host>(
 
 pub(super) fn number_outcome(value: f64) -> Result<BuiltinOutcome, EvalFailure> {
     Ok(BuiltinOutcome::Value(crate::number_value(value)))
+}
+
+/// A calendar answer that some calendars leave `undefined`.
+pub(super) fn optional_number_outcome(value: Option<f64>) -> Result<BuiltinOutcome, EvalFailure> {
+    value.map_or(Ok(BuiltinOutcome::Value(Value::UNDEFINED)), number_outcome)
+}
+
+/// A calendar answer that some calendars leave `undefined`.
+pub(super) fn optional_string_outcome<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Option<&str>,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    match value {
+        Some(text) => string_outcome(machine, text),
+        None => Ok(BuiltinOutcome::Value(Value::UNDEFINED)),
+    }
 }
 
 /// `valueOf` on every Temporal class: comparison must be explicit.

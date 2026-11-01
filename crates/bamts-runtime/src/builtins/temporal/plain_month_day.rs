@@ -4,9 +4,9 @@ use bamts_native::Value;
 
 use super::super::intl::temporal_to_locale_string;
 use super::fields::{
-    CalendarFields, FieldNames, calendar_argument, iso_year, month_day_from_fields,
-    prepare_calendar_fields, prepare_partial_fields, require_partial_temporal_object,
-    to_integer_with_truncation, to_temporal_month_day,
+    CalendarFields, FieldNames, calendar_argument, calendar_date, date_from_fields, iso_year,
+    month_day_from_fields, prepare_calendar_fields, prepare_partial_fields,
+    require_partial_temporal_object, to_integer_with_truncation, to_temporal_month_day,
 };
 use super::options::{get_options_object, overflow_option, show_calendar_option};
 use super::{
@@ -125,8 +125,12 @@ fn month_code<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let (value, _) = this_month_day(machine, this)?;
-    string_outcome(machine, &value.month_code())
+    let (value, calendar) = this_month_day(machine, this)?;
+    if calendar.is_iso8601() {
+        return string_outcome(machine, &value.month_code());
+    }
+    let fields = calendar_date(machine, &calendar, value.iso_date())?;
+    string_outcome(machine, &fields.month_code)
 }
 
 fn day<H: Host>(
@@ -135,8 +139,9 @@ fn day<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let (value, _) = this_month_day(machine, this)?;
-    number_outcome(f64::from(value.day))
+    let (value, calendar) = this_month_day(machine, this)?;
+    let fields = calendar_date(machine, &calendar, value.iso_date())?;
+    number_outcome(f64::from(fields.day))
 }
 
 fn with<H: Host>(
@@ -148,11 +153,11 @@ fn with<H: Host>(
     let (value, calendar) = this_month_day(machine, this)?;
     let like = arg(args, 0);
     require_partial_temporal_object(machine, like)?;
-    let partial = prepare_partial_fields(machine, like, FieldNames::DATE)?;
-    let fields = CalendarFields::from_month_day(value).merged_with(partial);
+    let partial = prepare_partial_fields(machine, &calendar, like, FieldNames::DATE)?;
+    let fields = CalendarFields::from_month_day(machine, &calendar, value)?.merged_with(partial);
     let options = get_options_object(machine, arg(args, 1))?;
     let overflow = overflow_option(machine, options)?;
-    let result = month_day_from_fields(machine, &fields, overflow)?;
+    let result = month_day_from_fields(machine, &calendar, &fields, overflow)?;
     month_day_outcome(machine, result, calendar)
 }
 
@@ -222,14 +227,20 @@ fn to_plain_date<H: Host>(
     if !is_object(machine, item)? {
         return Err(type_error(machine, "argument must be an object"));
     }
-    let input = prepare_calendar_fields(machine, item, FieldNames::YEAR, FieldNames::NONE)?;
-    let Some(year) = input.year else {
-        return Err(type_error(machine, "year is required"));
+    let input =
+        prepare_calendar_fields(machine, &calendar, item, FieldNames::YEAR, FieldNames::NONE)?;
+    let date = if calendar.is_iso8601() {
+        let Some(year) = input.year else {
+            return Err(type_error(machine, "year is required"));
+        };
+        let year = iso_year(machine, year)?;
+        value
+            .to_plain_date(year, Overflow::Constrain)
+            .or_throw(machine)?
+    } else {
+        let fields = CalendarFields::from_month_day(machine, &calendar, value)?.merged_with(input);
+        date_from_fields(machine, &calendar, &fields, Overflow::Constrain)?
     };
-    let year = iso_year(machine, year)?;
-    let date = value
-        .to_plain_date(year, Overflow::Constrain)
-        .or_throw(machine)?;
     create(
         machine,
         TemporalObject::PlainDate {

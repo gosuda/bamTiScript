@@ -10,6 +10,7 @@ use super::options::{
 };
 use super::{OrThrow, is_object, range_error, temporal_record, type_error};
 use crate::temporal::TemporalObject;
+use crate::temporal::calendar::{self, Calendar, Calendars, MonthCode, MonthField};
 use crate::temporal::instant_duration::{Duration, Instant, Overflow};
 use crate::temporal::parse::{
     UtcOffsetRecord, parse_calendar_string, parse_date_time_string, parse_date_time_utc_offset,
@@ -20,7 +21,7 @@ use crate::temporal::plain_types::{
     regulate_iso_date,
 };
 use crate::temporal::zoned_date_time::{
-    CalendarId, Disambiguation, FixedOffsetTimeZones, IsoCalendarProvider, OffsetMatch,
+    CalendarDateFields, CalendarId, Disambiguation, FixedOffsetTimeZones, OffsetMatch,
     OffsetOption, ResolveOptions, TemporalProviders, TimeZoneId, UtcOffsetNanoseconds,
     ZonedDateTime, start_of_day,
 };
@@ -28,7 +29,19 @@ use crate::{EvalFailure, Host, Machine};
 
 /// The providers behind every Temporal operation in this runtime.
 pub(super) fn providers() -> TemporalProviders<'static> {
-    TemporalProviders::new(&FixedOffsetTimeZones, &IsoCalendarProvider)
+    TemporalProviders::new(&FixedOffsetTimeZones, &Calendars)
+}
+
+/// CalendarISOToDate.
+pub(super) fn calendar_date<H: Host>(
+    machine: &mut Machine<'_, H>,
+    calendar: &CalendarId,
+    date: PlainDate,
+) -> Result<CalendarDateFields, EvalFailure> {
+    providers()
+        .calendar
+        .fields(calendar, date)
+        .or_throw(machine)
 }
 
 fn to_number<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<f64, EvalFailure> {
@@ -163,6 +176,8 @@ impl FieldNames {
     const SECOND: Self = Self(1 << 9);
     pub(super) const TIME_ZONE: Self = Self(1 << 10);
     pub(super) const YEAR: Self = Self(1 << 11);
+    const ERA: Self = Self(1 << 12);
+    const ERA_YEAR: Self = Self(1 << 13);
 
     /// «year, month, month-code, day»
     pub(super) const DATE: Self =
@@ -193,6 +208,8 @@ impl FieldNames {
 /// rejected there, after every property has been read.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct CalendarFields {
+    pub(super) era: Option<String>,
+    pub(super) era_year: Option<f64>,
     pub(super) year: Option<f64>,
     pub(super) month: Option<f64>,
     pub(super) month_code: Option<String>,
@@ -209,31 +226,46 @@ pub(super) struct CalendarFields {
 
 impl CalendarFields {
     /// ISODateToFields of type `date`.
-    pub(super) fn from_date(date: PlainDate) -> Self {
-        Self {
-            year: Some(f64::from(date.year)),
-            month_code: Some(format!("M{:02}", date.month)),
-            day: Some(f64::from(date.day)),
+    pub(super) fn from_date<H: Host>(
+        machine: &mut Machine<'_, H>,
+        calendar: &CalendarId,
+        date: PlainDate,
+    ) -> Result<Self, EvalFailure> {
+        let fields = calendar_date(machine, calendar, date)?;
+        Ok(Self {
+            year: Some(f64::from(fields.year)),
+            month_code: Some(fields.month_code.to_string()),
+            day: Some(f64::from(fields.day)),
             ..Self::default()
-        }
+        })
     }
 
     /// ISODateToFields of type `year-month`.
-    pub(super) fn from_year_month(value: PlainYearMonth) -> Self {
-        Self {
-            year: Some(f64::from(value.year)),
-            month_code: Some(format!("M{:02}", value.month)),
+    pub(super) fn from_year_month<H: Host>(
+        machine: &mut Machine<'_, H>,
+        calendar: &CalendarId,
+        value: PlainYearMonth,
+    ) -> Result<Self, EvalFailure> {
+        let fields = calendar_date(machine, calendar, value.iso_date())?;
+        Ok(Self {
+            year: Some(f64::from(fields.year)),
+            month_code: Some(fields.month_code.to_string()),
             ..Self::default()
-        }
+        })
     }
 
     /// ISODateToFields of type `month-day`.
-    pub(super) fn from_month_day(value: PlainMonthDay) -> Self {
-        Self {
-            month_code: Some(value.month_code()),
-            day: Some(f64::from(value.day)),
+    pub(super) fn from_month_day<H: Host>(
+        machine: &mut Machine<'_, H>,
+        calendar: &CalendarId,
+        value: PlainMonthDay,
+    ) -> Result<Self, EvalFailure> {
+        let fields = calendar_date(machine, calendar, value.iso_date())?;
+        Ok(Self {
+            month_code: Some(fields.month_code.to_string()),
+            day: Some(f64::from(fields.day)),
             ..Self::default()
-        }
+        })
     }
 
     pub(super) fn with_time(mut self, time: PlainTime) -> Self {
@@ -247,11 +279,17 @@ impl CalendarFields {
     }
 
     /// CalendarMergeFields: `month` and `monthCode` replace each other as one
-    /// field, so a new `month` cannot conflict with an inherited `monthCode`.
+    /// field, and so do `year`, `era`, and `eraYear`, so a new value cannot
+    /// conflict with an inherited one.
     pub(super) fn merged_with(mut self, additional: Self) -> Self {
         if additional.month.is_some() || additional.month_code.is_some() {
             self.month = None;
             self.month_code = None;
+        }
+        if additional.year.is_some() || additional.era.is_some() || additional.era_year.is_some() {
+            self.year = None;
+            self.era = None;
+            self.era_year = None;
         }
         macro_rules! merge {
             ($($field:ident),+) => {
@@ -261,6 +299,8 @@ impl CalendarFields {
             };
         }
         merge!(
+            era,
+            era_year,
             year,
             month,
             month_code,
@@ -312,20 +352,22 @@ fn to_offset_nanoseconds<H: Host>(
 /// PrepareCalendarFields with a list of required fields, possibly empty.
 pub(super) fn prepare_calendar_fields<H: Host>(
     machine: &mut Machine<'_, H>,
+    calendar: &CalendarId,
     item: Value,
     names: FieldNames,
     required: FieldNames,
 ) -> Result<CalendarFields, EvalFailure> {
-    read_calendar_fields(machine, item, names, required).map(|(fields, _)| fields)
+    read_calendar_fields(machine, calendar, item, names, required).map(|(fields, _)| fields)
 }
 
 /// PrepareCalendarFields with `partial`: at least one listed field must exist.
 pub(super) fn prepare_partial_fields<H: Host>(
     machine: &mut Machine<'_, H>,
+    calendar: &CalendarId,
     item: Value,
     names: FieldNames,
 ) -> Result<CalendarFields, EvalFailure> {
-    let (fields, any) = read_calendar_fields(machine, item, names, FieldNames::NONE)?;
+    let (fields, any) = read_calendar_fields(machine, calendar, item, names, FieldNames::NONE)?;
     if any {
         Ok(fields)
     } else {
@@ -333,19 +375,28 @@ pub(super) fn prepare_partial_fields<H: Host>(
     }
 }
 
-/// The ISO calendar's field list has no `era`. Reads go in sorted property-name
+/// The ISO calendar's field list has no `era`; every other calendar reads
+/// `era` and `eraYear` wherever it reads `year`. Reads go in sorted property-name
 /// order and each value converts as soon as it is read, so a throwing `valueOf`
 /// stops every later read. Also reports whether any field was present.
 fn read_calendar_fields<H: Host>(
     machine: &mut Machine<'_, H>,
+    calendar: &CalendarId,
     item: Value,
     names: FieldNames,
     required: FieldNames,
 ) -> Result<(CalendarFields, bool), EvalFailure> {
     let mut fields = CalendarFields::default();
     let mut any = false;
+    let names = if names.contains(FieldNames::YEAR) && !calendar.is_iso8601() {
+        names.with(FieldNames::ERA).with(FieldNames::ERA_YEAR)
+    } else {
+        names
+    };
     let table = [
         ("day", FieldNames::DAY),
+        ("era", FieldNames::ERA),
+        ("eraYear", FieldNames::ERA_YEAR),
         ("hour", FieldNames::HOUR),
         ("microsecond", FieldNames::MICROSECOND),
         ("millisecond", FieldNames::MILLISECOND),
@@ -378,6 +429,12 @@ fn read_calendar_fields<H: Host>(
                 fields.month = Some(to_positive_integer_with_truncation(machine, value)?);
             }
             FieldNames::MONTH_CODE => fields.month_code = Some(to_month_code(machine, value)?),
+            FieldNames::ERA => {
+                fields.era = Some(machine.coerce_string_observable(value)?.to_utf8_lossy());
+            }
+            FieldNames::ERA_YEAR => {
+                fields.era_year = Some(to_integer_with_truncation(machine, value)?);
+            }
             FieldNames::OFFSET => fields.offset = Some(to_offset_nanoseconds(machine, value)?),
             FieldNames::TIME_ZONE => {
                 fields.time_zone = Some(to_time_zone_identifier(machine, value)?);
@@ -456,12 +513,89 @@ pub(super) fn resolved_date_fields<H: Host>(
     Ok((iso_year(machine, year)?, month as i64, day as i64))
 }
 
+/// Which fields a resolution needs.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Shape {
+    Date,
+    YearMonth,
+    MonthDay,
+}
+
+/// CalendarResolveFields outside the ISO calendar. Every `TypeError` for a
+/// missing field comes before any `RangeError` for a field's value. Returns the
+/// year, if the record names one, the month, and the day, 1 when not needed.
+fn resolve_calendar_fields<H: Host>(
+    machine: &mut Machine<'_, H>,
+    calendar: Calendar,
+    fields: &CalendarFields,
+    shape: Shape,
+) -> Result<(Option<f64>, MonthField, f64), EvalFailure> {
+    if fields.era.is_some() != fields.era_year.is_some() {
+        return Err(type_error(machine, "era and eraYear go together"));
+    }
+    if shape != Shape::MonthDay && fields.year.is_none() && fields.era.is_none() {
+        return Err(type_error(machine, "year is required"));
+    }
+    if fields.month.is_none() && fields.month_code.is_none() {
+        return Err(type_error(machine, "month or monthCode is required"));
+    }
+    if shape == Shape::MonthDay
+        && fields.month.is_some()
+        && fields.year.is_none()
+        && fields.era.is_none()
+    {
+        return Err(type_error(machine, "month needs a year"));
+    }
+    let day = match (fields.day, shape) {
+        (Some(day), _) => day,
+        (None, Shape::YearMonth) => 1.0,
+        (None, _) => return Err(type_error(machine, "day is required")),
+    };
+    let mut year = fields.year;
+    if let (Some(era), Some(era_year)) = (&fields.era, fields.era_year) {
+        let Some(from_era) = calendar.year_of_era(era, era_year.clamp(-1e9, 1e9) as i64) else {
+            return Err(range_error(
+                machine,
+                format!("{era} is not an era of the {} calendar", calendar.id()),
+            ));
+        };
+        let from_era = from_era as f64;
+        if year.is_some_and(|year| year != from_era) {
+            return Err(range_error(machine, "year and eraYear do not agree"));
+        }
+        year = Some(from_era);
+    }
+    let Some(text) = &fields.month_code else {
+        let month = fields.month.expect("one of month and monthCode is present");
+        return Ok((year, MonthField::Ordinal(month), day));
+    };
+    let code = MonthCode::parse(text).filter(|code| calendar.has_month_code(*code));
+    let Some(code) = code else {
+        return Err(range_error(
+            machine,
+            format!("{text} is not a month of the {} calendar", calendar.id()),
+        ));
+    };
+    if let (Some(year), Some(month)) = (year, fields.month)
+        && !calendar::month_matches(calendar, year, month, code)
+    {
+        return Err(range_error(machine, "month and monthCode do not agree"));
+    }
+    Ok((year, MonthField::Code(code), day))
+}
+
 /// CalendarDateFromFields.
 pub(super) fn date_from_fields<H: Host>(
     machine: &mut Machine<'_, H>,
+    calendar: &CalendarId,
     fields: &CalendarFields,
     overflow: Overflow,
 ) -> Result<PlainDate, EvalFailure> {
+    if let Some(kind) = Calendar::from_id(calendar) {
+        let (year, month, day) = resolve_calendar_fields(machine, kind, fields, Shape::Date)?;
+        let year = year.expect("a date's year was required");
+        return calendar::date_from_fields(kind, year, month, day, overflow).or_throw(machine);
+    }
     let (year, month, day) = resolved_date_fields(machine, fields)?;
     PlainDate::new(year, month, day, overflow).or_throw(machine)
 }
@@ -469,9 +603,15 @@ pub(super) fn date_from_fields<H: Host>(
 /// CalendarYearMonthFromFields.
 pub(super) fn year_month_from_fields<H: Host>(
     machine: &mut Machine<'_, H>,
+    calendar: &CalendarId,
     fields: &CalendarFields,
     overflow: Overflow,
 ) -> Result<PlainYearMonth, EvalFailure> {
+    if let Some(kind) = Calendar::from_id(calendar) {
+        let (year, month, _) = resolve_calendar_fields(machine, kind, fields, Shape::YearMonth)?;
+        let year = year.expect("a year-month's year was required");
+        return calendar::year_month_from_fields(kind, year, month, overflow).or_throw(machine);
+    }
     let Some(year) = fields.year else {
         return Err(type_error(machine, "year is required"));
     };
@@ -485,9 +625,14 @@ pub(super) fn year_month_from_fields<H: Host>(
 /// reference year, so no year is too large to consult.
 pub(super) fn month_day_from_fields<H: Host>(
     machine: &mut Machine<'_, H>,
+    calendar: &CalendarId,
     fields: &CalendarFields,
     overflow: Overflow,
 ) -> Result<PlainMonthDay, EvalFailure> {
+    if let Some(kind) = Calendar::from_id(calendar) {
+        let (year, month, day) = resolve_calendar_fields(machine, kind, fields, Shape::MonthDay)?;
+        return calendar::month_day_from_fields(kind, year, month, day, overflow).or_throw(machine);
+    }
     let Some(day) = fields.day else {
         return Err(type_error(machine, "day is required"));
     };
@@ -523,10 +668,11 @@ pub(super) fn time_from_fields<H: Host>(
 /// its own; whoever creates an object from it applies that object's limit.
 pub(super) fn date_time_from_fields<H: Host>(
     machine: &mut Machine<'_, H>,
+    calendar: &CalendarId,
     fields: &CalendarFields,
     overflow: Overflow,
 ) -> Result<PlainDateTime, EvalFailure> {
-    let date = date_from_fields(machine, fields, overflow)?;
+    let date = date_from_fields(machine, calendar, fields, overflow)?;
     let time = time_from_fields(machine, fields, overflow)?;
     Ok(PlainDateTime { date, time })
 }
@@ -596,10 +742,11 @@ pub(super) fn to_temporal_date<H: Host>(
             _ => {}
         }
         let calendar = calendar_with_iso_default(machine, item)?;
-        let fields = prepare_calendar_fields(machine, item, FieldNames::DATE, FieldNames::NONE)?;
+        let fields =
+            prepare_calendar_fields(machine, &calendar, item, FieldNames::DATE, FieldNames::NONE)?;
         let resolved = get_options_object(machine, options)?;
         let overflow = overflow_option(machine, resolved)?;
-        let date = date_from_fields(machine, &fields, overflow)?;
+        let date = date_from_fields(machine, &calendar, &fields, overflow)?;
         return Ok((date, calendar));
     }
     let text = require_string(machine, item, "date")?;
@@ -639,10 +786,10 @@ pub(super) fn to_temporal_date_time<H: Host>(
         }
         let calendar = calendar_with_iso_default(machine, item)?;
         let names = FieldNames::DATE.with(FieldNames::TIME);
-        let fields = prepare_calendar_fields(machine, item, names, FieldNames::NONE)?;
+        let fields = prepare_calendar_fields(machine, &calendar, item, names, FieldNames::NONE)?;
         let resolved = get_options_object(machine, options)?;
         let overflow = overflow_option(machine, resolved)?;
-        let value = date_time_from_fields(machine, &fields, overflow)?;
+        let value = date_time_from_fields(machine, &calendar, &fields, overflow)?;
         let value = PlainDateTime::from_parts(value.date, value.time).or_throw(machine)?;
         return Ok((value, calendar));
     }
@@ -679,7 +826,8 @@ pub(super) fn to_temporal_time<H: Host>(
             }
             _ => {}
         }
-        let fields = prepare_partial_fields(machine, item, FieldNames::TIME)?;
+        let fields =
+            prepare_partial_fields(machine, &CalendarId::iso8601(), item, FieldNames::TIME)?;
         let resolved = get_options_object(machine, options)?;
         let overflow = overflow_option(machine, resolved)?;
         return time_from_fields(machine, &fields, overflow);
@@ -704,11 +852,16 @@ pub(super) fn to_temporal_year_month<H: Host>(
             return Ok((value, calendar));
         }
         let calendar = calendar_with_iso_default(machine, item)?;
-        let fields =
-            prepare_calendar_fields(machine, item, FieldNames::YEAR_MONTH, FieldNames::NONE)?;
+        let fields = prepare_calendar_fields(
+            machine,
+            &calendar,
+            item,
+            FieldNames::YEAR_MONTH,
+            FieldNames::NONE,
+        )?;
         let resolved = get_options_object(machine, options)?;
         let overflow = overflow_option(machine, resolved)?;
-        let value = year_month_from_fields(machine, &fields, overflow)?;
+        let value = year_month_from_fields(machine, &calendar, &fields, overflow)?;
         return Ok((value, calendar));
     }
     let text = require_string(machine, item, "year-month")?;
@@ -716,6 +869,15 @@ pub(super) fn to_temporal_year_month<H: Host>(
     let calendar = parsed_calendar(machine, &parsed)?;
     read_overflow(machine, options)?;
     let value = PlainYearMonth::from_parsed(&parsed).or_throw(machine)?;
+    let Some(kind) = Calendar::from_id(&calendar) else {
+        return Ok((value, calendar));
+    };
+    let date = PlainDate {
+        year: parsed.year,
+        month: parsed.month,
+        day: parsed.day,
+    };
+    let value = calendar::year_month_of(kind, date).or_throw(machine)?;
     Ok((value, calendar))
 }
 
@@ -733,10 +895,11 @@ pub(super) fn to_temporal_month_day<H: Host>(
             return Ok((value, calendar));
         }
         let calendar = calendar_with_iso_default(machine, item)?;
-        let fields = prepare_calendar_fields(machine, item, FieldNames::DATE, FieldNames::NONE)?;
+        let fields =
+            prepare_calendar_fields(machine, &calendar, item, FieldNames::DATE, FieldNames::NONE)?;
         let resolved = get_options_object(machine, options)?;
         let overflow = overflow_option(machine, resolved)?;
-        let value = month_day_from_fields(machine, &fields, overflow)?;
+        let value = month_day_from_fields(machine, &calendar, &fields, overflow)?;
         return Ok((value, calendar));
     }
     let text = require_string(machine, item, "month-day")?;
@@ -744,6 +907,11 @@ pub(super) fn to_temporal_month_day<H: Host>(
     let calendar = parsed_calendar(machine, &parsed)?;
     read_overflow(machine, options)?;
     let value = PlainMonthDay::from_parsed(&parsed).or_throw(machine)?;
+    let Some(kind) = Calendar::from_id(&calendar) else {
+        return Ok((value, calendar));
+    };
+    let date = PlainDate::from_parsed(&parsed).or_throw(machine)?;
+    let value = calendar::month_day_of(kind, date).or_throw(machine)?;
     Ok((value, calendar))
 }
 
@@ -806,12 +974,13 @@ pub(super) fn to_temporal_zoned_date_time<H: Host>(
             .with(FieldNames::TIME)
             .with(FieldNames::OFFSET)
             .with(FieldNames::TIME_ZONE);
-        let fields = prepare_calendar_fields(machine, item, names, FieldNames::TIME_ZONE)?;
+        let fields =
+            prepare_calendar_fields(machine, &calendar, item, names, FieldNames::TIME_ZONE)?;
         let resolved = get_options_object(machine, options)?;
         let disambiguation = disambiguation_option(machine, resolved)?;
         let offset = offset_option(machine, resolved, OffsetOption::Reject)?;
         let overflow = overflow_option(machine, resolved)?;
-        let local = date_time_from_fields(machine, &fields, overflow)?;
+        let local = date_time_from_fields(machine, &calendar, &fields, overflow)?;
         let behaviour = fields
             .offset
             .map_or(OffsetBehaviour::Wall, OffsetBehaviour::Option);
@@ -1012,8 +1181,8 @@ pub(super) fn relative_to_option<H: Host>(
             .with(FieldNames::TIME)
             .with(FieldNames::OFFSET)
             .with(FieldNames::TIME_ZONE);
-        let fields = prepare_calendar_fields(machine, value, names, FieldNames::NONE)?;
-        let local = date_time_from_fields(machine, &fields, Overflow::Constrain)?;
+        let fields = prepare_calendar_fields(machine, &calendar, value, names, FieldNames::NONE)?;
+        let local = date_time_from_fields(machine, &calendar, &fields, Overflow::Constrain)?;
         let Some(time_zone) = fields.time_zone.clone() else {
             return Ok(RelativeTo::Plain(local.date, calendar));
         };

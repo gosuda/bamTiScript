@@ -20,7 +20,7 @@ use super::relative::{
     round_time_duration, temporal_duration_from_internal,
 };
 use super::zoned_date_time::{
-    CalendarId, FixedOffsetTimeZones, IsoCalendarProvider, TemporalProviders,
+    CalendarId, CalendarProvider, FixedOffsetTimeZones, IsoCalendarProvider, TemporalProviders,
 };
 
 // ---------------------------------------------------------------------------
@@ -402,10 +402,6 @@ impl PlainDate {
         Ok(d)
     }
 
-    pub fn subtract(&self, duration: &Duration, overflow: Overflow) -> TemporalResult<PlainDate> {
-        self.add(&duration.negated(), overflow)
-    }
-
     /// CalendarDateAdd for the ISO calendar. Years and months move first and
     /// land under `overflow`, then weeks and days move on the day line, so the
     /// intermediate year may lie far outside the representable range as long as
@@ -596,6 +592,22 @@ impl PlainDateTime {
 
     /// AddDuration: time part first, carry whole days into the date.
     pub fn add(&self, duration: &Duration, overflow: Overflow) -> TemporalResult<PlainDateTime> {
+        self.add_in(
+            &IsoCalendarProvider,
+            &CalendarId::iso8601(),
+            duration,
+            overflow,
+        )
+    }
+
+    /// `add` under a calendar.
+    pub fn add_in(
+        &self,
+        provider: &dyn CalendarProvider,
+        calendar: &CalendarId,
+        duration: &Duration,
+        overflow: Overflow,
+    ) -> TemporalResult<PlainDateTime> {
         let (carry, new_time) = self
             .time
             .add_signed_nanoseconds(duration.time_total_nanoseconds());
@@ -611,7 +623,7 @@ impl PlainDateTime {
             0,
             0,
         ])?;
-        let new_date = self.date.add(&date_shift, overflow)?;
+        let new_date = provider.date_add(calendar, self.date, &date_shift, overflow)?;
         PlainDateTime::from_parts(new_date, new_time)
     }
 
@@ -633,27 +645,38 @@ impl PlainDateTime {
         increment: i128,
         mode: RoundingMode,
     ) -> TemporalResult<Duration> {
-        if smallest_unit < largest_unit {
-            return Err(TemporalError::range(
-                "smallestUnit must not be larger than largestUnit",
-            ));
-        }
-        if increment < 1 {
-            return Err(TemporalError::range("roundingIncrement must be >= 1"));
-        }
-        let internal = difference_plain_date_time_with_rounding(
+        self.until_in(
             &iso_providers(),
-            *self,
-            other,
             &CalendarId::iso8601(),
+            other,
             DifferenceRounding {
                 largest_unit,
                 smallest_unit,
                 increment,
                 mode,
             },
-        )?;
-        temporal_duration_from_internal(internal, largest_unit)
+        )
+    }
+
+    /// `until` under a calendar.
+    pub fn until_in(
+        &self,
+        providers: &TemporalProviders<'_>,
+        calendar: &CalendarId,
+        other: PlainDateTime,
+        rounding: DifferenceRounding,
+    ) -> TemporalResult<Duration> {
+        if rounding.smallest_unit < rounding.largest_unit {
+            return Err(TemporalError::range(
+                "smallestUnit must not be larger than largestUnit",
+            ));
+        }
+        if rounding.increment < 1 {
+            return Err(TemporalError::range("roundingIncrement must be >= 1"));
+        }
+        let internal =
+            difference_plain_date_time_with_rounding(providers, *self, other, calendar, rounding)?;
+        temporal_duration_from_internal(internal, rounding.largest_unit)
     }
 
     /// RoundISODateTime: rounds the time of day, whose sign is always positive,
@@ -772,24 +795,22 @@ impl PlainYearMonth {
         self.reference_day
     }
 
+    /// The ISO date a year-month holds. Unlike a `PlainDate`, it may lie before
+    /// the first representable date, in the first representable month.
+    pub fn iso_date(&self) -> PlainDate {
+        PlainDate {
+            year: self.year,
+            month: self.month,
+            day: self.reference_day,
+        }
+    }
+
     fn first_of_month(&self) -> TemporalResult<PlainDate> {
         PlainDate::from_validated(self.year, self.month, 1)
     }
 
     pub fn days_in_month(&self) -> u8 {
         days_in_month(self.year, self.month)
-    }
-
-    pub fn days_in_year(&self) -> u16 {
-        days_in_year(self.year)
-    }
-
-    pub fn in_leap_year(&self) -> bool {
-        is_leap_year(self.year)
-    }
-
-    pub fn months_in_year(&self) -> u8 {
-        12
     }
 
     /// AddDurationToYearMonth. Only years and months move a year-month; a unit
@@ -912,6 +933,15 @@ impl PlainMonthDay {
 
     pub fn reference_year(&self) -> i32 {
         self.year
+    }
+
+    /// The ISO date a month-day holds.
+    pub fn iso_date(&self) -> PlainDate {
+        PlainDate {
+            year: self.year,
+            month: self.month,
+            day: self.day,
+        }
     }
 
     /// Temporal monthCode (e.g. "M02", "M02L" for leap months in other
@@ -1181,6 +1211,11 @@ mod tests {
         let d = PlainDate::new(2020, 1, 1, Overflow::Reject).unwrap();
         let t = Duration::new([0, 0, 0, 0, 1, 0, 0, 0, 0, 0]).unwrap();
         assert!(d.add(&t, Overflow::Constrain).is_err());
+    }
+
+    #[test]
+    fn critical_unknown_calendar_is_rejected() {
+        assert!(parse_date("2000-01-01[!u-ca=discordian]").is_err());
     }
 
     #[test]

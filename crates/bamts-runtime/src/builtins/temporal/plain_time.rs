@@ -22,6 +22,7 @@ use crate::temporal::instant_duration::{
 };
 use crate::temporal::now_rounding::{ToStringRoundingOptions, serialize_plain_time};
 use crate::temporal::plain_types::PlainTime;
+use crate::temporal::zoned_date_time::CalendarId;
 use crate::temporal::{TemporalKind, TemporalObject};
 use crate::{EvalFailure, HeapEntry, Host, Machine};
 
@@ -175,7 +176,7 @@ fn with<H: Host>(
     let time = this_time(machine, this)?;
     let like = arg(args, 0);
     require_partial_temporal_object(machine, like)?;
-    let partial = prepare_partial_fields(machine, like, FieldNames::TIME)?;
+    let partial = prepare_partial_fields(machine, &CalendarId::iso8601(), like, FieldNames::TIME)?;
     let options = get_options_object(machine, arg(args, 1))?;
     let overflow = overflow_option(machine, options)?;
     let fields = super::fields::CalendarFields::default()

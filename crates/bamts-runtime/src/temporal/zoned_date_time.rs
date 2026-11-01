@@ -7,6 +7,7 @@
 
 use std::{fmt, sync::Arc};
 
+use super::calendar::canonical_calendar;
 use super::instant_duration::{
     Duration, INSTANT_NS_MAX, INSTANT_NS_MIN, Instant, NS_PER_DAY, NS_PER_HOUR, NS_PER_MICROSECOND,
     NS_PER_MILLISECOND, NS_PER_MINUTE, NS_PER_SECOND, Overflow, Precision, RoundingMode,
@@ -18,9 +19,7 @@ use super::now_rounding::{
     serialize_zoned_date_time,
 };
 use super::parse::{ParsedTimeZone, parse_time_zone_identifier};
-use super::plain_types::{
-    PlainDate, PlainDateTime, PlainTime, iso_day_of_week, iso_day_of_year, iso_week_of_year,
-};
+use super::plain_types::{PlainDate, PlainDateTime, PlainTime};
 use super::relative::{
     DifferenceRounding, InternalDuration, add_instant, check_iso_days_range,
     difference_zoned_date_time_with_rounding, iso_date_until, temporal_duration_from_internal,
@@ -94,15 +93,11 @@ impl CalendarId {
         Self(Arc::from("iso8601"))
     }
 
-    /// CanonicalizeCalendar. `iso8601` is the only calendar available.
+    /// CanonicalizeCalendar.
     pub fn canonicalize(identifier: &str) -> TemporalResult<Self> {
-        if identifier.eq_ignore_ascii_case("iso8601") {
-            Ok(Self::iso8601())
-        } else {
-            Err(TemporalError::range(format!(
-                "calendar {identifier} is not supported"
-            )))
-        }
+        canonical_calendar(identifier)
+            .map(|canonical| Self(Arc::from(canonical)))
+            .ok_or_else(|| TemporalError::range(format!("calendar {identifier} is not supported")))
     }
 
     pub fn as_str(&self) -> &str {
@@ -350,8 +345,7 @@ impl CalendarProvider for IsoCalendarProvider {
         iso_date: PlainDate,
     ) -> TemporalResult<CalendarDateFields> {
         Self::require_iso(calendar)?;
-        let (year_of_week, week_of_year) =
-            iso_week_of_year(iso_date.year, iso_date.month, iso_date.day);
+        let (year_of_week, week_of_year) = iso_date.week_of_year();
         Ok(CalendarDateFields {
             era: None,
             era_year: None,
@@ -359,14 +353,14 @@ impl CalendarProvider for IsoCalendarProvider {
             month: iso_date.month,
             month_code: Arc::from(format!("M{:02}", iso_date.month)),
             day: iso_date.day,
-            day_of_week: iso_day_of_week(iso_date.year, iso_date.month, iso_date.day),
-            day_of_year: iso_day_of_year(iso_date.year, iso_date.month, iso_date.day),
+            day_of_week: iso_date.day_of_week(),
+            day_of_year: iso_date.day_of_year(),
             week_of_year: Some(week_of_year),
             year_of_week: Some(year_of_week),
             days_in_week: 7,
             days_in_month: iso_date.days_in_month(),
             days_in_year: iso_date.days_in_year(),
-            months_in_year: 12,
+            months_in_year: iso_date.months_in_year(),
             in_leap_year: iso_date.in_leap_year(),
         })
     }

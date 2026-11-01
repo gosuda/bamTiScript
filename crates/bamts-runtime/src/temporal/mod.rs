@@ -1,5 +1,6 @@
 //! ECMA-402 Temporal primitives.
 
+pub mod calendar;
 pub mod instant_duration;
 pub mod now_rounding;
 pub mod parse;

@@ -4,23 +4,27 @@ use bamts_native::Value;
 
 use super::super::intl::temporal_to_locale_string;
 use super::fields::{
-    CalendarFields, FieldNames, calendar_argument, iso_year, prepare_calendar_fields,
-    prepare_partial_fields, require_partial_temporal_object, to_integer_with_truncation,
-    to_temporal_duration, to_temporal_year_month, year_month_from_fields,
+    CalendarFields, FieldNames, calendar_argument, calendar_date, date_from_fields, iso_year,
+    prepare_calendar_fields, prepare_partial_fields, providers, require_partial_temporal_object,
+    to_integer_with_truncation, to_temporal_duration, to_temporal_year_month,
+    year_month_from_fields,
 };
 use super::options::{
     DATE_UNITS, DifferencePolicy, difference_settings, get_options_object, overflow_option,
     show_calendar_option,
 };
 use super::{
-    Class, OrThrow, arg, construct, create, install_class, is_object, number_outcome, range_error,
-    require_new, string_outcome, temporal_record, type_error, value_of_throws,
+    Class, OrThrow, arg, construct, create, install_class, is_object, number_outcome,
+    optional_number_outcome, optional_string_outcome, range_error, require_new, string_outcome,
+    temporal_record, type_error, value_of_throws,
 };
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
-use crate::temporal::instant_duration::{Overflow, Unit, format_iso_date};
+use crate::temporal::calendar::{self, Calendar};
+use crate::temporal::instant_duration::{Duration, Overflow, Unit, format_iso_date};
 use crate::temporal::now_rounding::{ShowCalendar, format_calendar_annotation};
 use crate::temporal::plain_types::PlainYearMonth;
-use crate::temporal::zoned_date_time::CalendarId;
+use crate::temporal::relative::{DifferenceRounding, difference_plain_year_month};
+use crate::temporal::zoned_date_time::{CalendarDateFields, CalendarId};
 use crate::temporal::{TemporalKind, TemporalObject};
 use crate::{EvalFailure, HeapEntry, Host, Machine};
 
@@ -42,8 +46,8 @@ pub(super) fn install<H: Host>(
             statics: &[("from", 1, from::<H>), ("compare", 2, compare::<H>)],
             getters: &[
                 ("calendarId", "get calendarId", calendar_id::<H>),
-                ("era", "get era", no_era::<H>),
-                ("eraYear", "get eraYear", no_era::<H>),
+                ("era", "get era", era::<H>),
+                ("eraYear", "get eraYear", era_year::<H>),
                 ("year", "get year", year::<H>),
                 ("month", "get month", month::<H>),
                 ("monthCode", "get monthCode", month_code::<H>),
@@ -146,15 +150,33 @@ fn calendar_id<H: Host>(
     string_outcome(machine, calendar.as_str())
 }
 
-/// The ISO calendar has no eras.
-fn no_era<H: Host>(
+/// The calendar's view of the receiver's date.
+fn calendar_fields<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+) -> Result<CalendarDateFields, EvalFailure> {
+    let (value, calendar) = this_year_month(machine, this)?;
+    calendar_date(machine, &calendar, value.iso_date())
+}
+
+fn era<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    this_year_month(machine, this)?;
-    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    let fields = calendar_fields(machine, this)?;
+    optional_string_outcome(machine, fields.era.as_deref())
+}
+
+fn era_year<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let fields = calendar_fields(machine, this)?;
+    optional_number_outcome(fields.era_year.map(f64::from))
 }
 
 fn month_code<H: Host>(
@@ -163,8 +185,8 @@ fn month_code<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let (value, _) = this_year_month(machine, this)?;
-    string_outcome(machine, &format!("M{:02}", value.month))
+    let fields = calendar_fields(machine, this)?;
+    string_outcome(machine, &fields.month_code)
 }
 
 fn in_leap_year<H: Host>(
@@ -173,30 +195,43 @@ fn in_leap_year<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let (value, _) = this_year_month(machine, this)?;
-    Ok(BuiltinOutcome::Value(Value::boolean(value.in_leap_year())))
+    let fields = calendar_fields(machine, this)?;
+    Ok(BuiltinOutcome::Value(Value::boolean(fields.in_leap_year)))
 }
 
 macro_rules! number_getter {
-    ($($name:ident: |$value:ident| $number:expr),+ $(,)?) => {
+    ($($name:ident: |$fields:ident| $number:expr),+ $(,)?) => {
         $(fn $name<H: Host>(
             machine: &mut Machine<'_, H>,
             this: Value,
             _args: &[Value],
             _constructing: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
-            let ($value, _) = this_year_month(machine, this)?;
+            let $fields = calendar_fields(machine, this)?;
             number_outcome($number)
         })+
     };
 }
 
 number_getter! {
-    year: |value| f64::from(value.year),
-    month: |value| f64::from(value.month),
-    days_in_year: |value| f64::from(value.days_in_year()),
-    days_in_month: |value| f64::from(value.days_in_month()),
-    months_in_year: |value| f64::from(value.months_in_year()),
+    year: |fields| f64::from(fields.year),
+    month: |fields| f64::from(fields.month),
+    days_in_year: |fields| f64::from(fields.days_in_year),
+    months_in_year: |fields| f64::from(fields.months_in_year),
+}
+
+fn days_in_month<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let (value, calendar) = this_year_month(machine, this)?;
+    if calendar.is_iso8601() {
+        return number_outcome(f64::from(value.days_in_month()));
+    }
+    let fields = calendar_date(machine, &calendar, value.iso_date())?;
+    number_outcome(f64::from(fields.days_in_month))
 }
 
 fn with<H: Host>(
@@ -208,11 +243,11 @@ fn with<H: Host>(
     let (value, calendar) = this_year_month(machine, this)?;
     let like = arg(args, 0);
     require_partial_temporal_object(machine, like)?;
-    let partial = prepare_partial_fields(machine, like, FieldNames::YEAR_MONTH)?;
-    let fields = CalendarFields::from_year_month(value).merged_with(partial);
+    let partial = prepare_partial_fields(machine, &calendar, like, FieldNames::YEAR_MONTH)?;
+    let fields = CalendarFields::from_year_month(machine, &calendar, value)?.merged_with(partial);
     let options = get_options_object(machine, arg(args, 1))?;
     let overflow = overflow_option(machine, options)?;
-    let result = year_month_from_fields(machine, &fields, overflow)?;
+    let result = year_month_from_fields(machine, &calendar, &fields, overflow)?;
     year_month_outcome(machine, result, calendar)
 }
 
@@ -227,10 +262,13 @@ fn add_duration<H: Host>(
     let duration = to_temporal_duration(machine, arg(args, 0))?;
     let options = get_options_object(machine, arg(args, 1))?;
     let overflow = overflow_option(machine, options)?;
-    let result = if subtract {
-        value.subtract(&duration, overflow)
-    } else {
-        value.add(&duration, overflow)
+    let result = match Calendar::from_id(&calendar) {
+        Some(kind) if subtract => {
+            calendar::add_to_year_month(kind, value, &duration.negated(), overflow)
+        }
+        Some(kind) => calendar::add_to_year_month(kind, value, &duration, overflow),
+        None if subtract => value.subtract(&duration, overflow),
+        None => value.add(&duration, overflow),
     }
     .or_throw(machine)?;
     year_month_outcome(machine, result, calendar)
@@ -278,15 +316,31 @@ fn difference<H: Host>(
             smallest_largest_default: Unit::Year,
         },
     )?;
-    let result = value
-        .until(
+    let result = match Calendar::from_id(&calendar) {
+        Some(_) if value == other => Ok(Duration::default()),
+        Some(kind) => calendar::first_of_month(kind, value).and_then(|one| {
+            difference_plain_year_month(
+                &providers(),
+                one,
+                calendar::first_of_month(kind, other)?,
+                &calendar,
+                DifferenceRounding {
+                    largest_unit: settings.largest_unit,
+                    smallest_unit: settings.smallest_unit,
+                    increment: settings.rounding_increment,
+                    mode: settings.rounding_mode,
+                },
+            )
+        }),
+        None => value.until(
             other,
             settings.largest_unit,
             settings.smallest_unit,
             settings.rounding_increment,
             settings.rounding_mode,
-        )
-        .or_throw(machine)?;
+        ),
+    }
+    .or_throw(machine)?;
     let result = if since { result.negated() } else { result };
     create(machine, TemporalObject::Duration(result)).map(BuiltinOutcome::Value)
 }
@@ -375,13 +429,19 @@ fn to_plain_date<H: Host>(
     if !is_object(machine, item)? {
         return Err(type_error(machine, "argument must be an object"));
     }
-    let input = prepare_calendar_fields(machine, item, FieldNames::DAY, FieldNames::NONE)?;
-    let Some(day) = input.day else {
-        return Err(type_error(machine, "day is required"));
+    let input =
+        prepare_calendar_fields(machine, &calendar, item, FieldNames::DAY, FieldNames::NONE)?;
+    let date = if calendar.is_iso8601() {
+        let Some(day) = input.day else {
+            return Err(type_error(machine, "day is required"));
+        };
+        value
+            .to_plain_date(day as i64, Overflow::Constrain)
+            .or_throw(machine)?
+    } else {
+        let fields = CalendarFields::from_year_month(machine, &calendar, value)?.merged_with(input);
+        date_from_fields(machine, &calendar, &fields, Overflow::Constrain)?
     };
-    let date = value
-        .to_plain_date(day as i64, Overflow::Constrain)
-        .or_throw(machine)?;
     create(
         machine,
         TemporalObject::PlainDate {

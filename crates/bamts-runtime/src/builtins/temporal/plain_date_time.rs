@@ -27,7 +27,10 @@ use crate::temporal::now_rounding::{
     ShowCalendar, ToStringRoundingOptions, serialize_plain_date_time,
 };
 use crate::temporal::plain_types::{PlainDate, PlainDateTime, PlainTime};
-use crate::temporal::zoned_date_time::{CalendarId, ResolveOptions, ZonedDateTime};
+use crate::temporal::relative::DifferenceRounding;
+use crate::temporal::zoned_date_time::{
+    CalendarDateFields, CalendarId, ResolveOptions, ZonedDateTime,
+};
 use crate::temporal::{TemporalKind, TemporalObject};
 use crate::{EvalFailure, HeapEntry, Host, Machine};
 
@@ -188,13 +191,13 @@ fn with<H: Host>(
     let like = arg(args, 0);
     require_partial_temporal_object(machine, like)?;
     let names = FieldNames::DATE.with(FieldNames::TIME);
-    let partial = prepare_partial_fields(machine, like, names)?;
-    let fields = CalendarFields::from_date(date_time.date)
+    let partial = prepare_partial_fields(machine, &calendar, like, names)?;
+    let fields = CalendarFields::from_date(machine, &calendar, date_time.date)?
         .with_time(date_time.time)
         .merged_with(partial);
     let options = get_options_object(machine, arg(args, 1))?;
     let overflow = overflow_option(machine, options)?;
-    let value = date_time_from_fields(machine, &fields, overflow)?;
+    let value = date_time_from_fields(machine, &calendar, &fields, overflow)?;
     let value = PlainDateTime::from_parts(value.date, value.time).or_throw(machine)?;
     date_time_outcome(machine, value, calendar)
 }
@@ -238,10 +241,19 @@ fn add_duration<H: Host>(
     let duration = to_temporal_duration(machine, arg(args, 0))?;
     let options = get_options_object(machine, arg(args, 1))?;
     let overflow = overflow_option(machine, options)?;
-    let value = if subtract {
-        date_time.subtract(&duration, overflow)
+    let value = if calendar.is_iso8601() {
+        if subtract {
+            date_time.subtract(&duration, overflow)
+        } else {
+            date_time.add(&duration, overflow)
+        }
     } else {
-        date_time.add(&duration, overflow)
+        let duration = if subtract {
+            duration.negated()
+        } else {
+            duration
+        };
+        date_time.add_in(providers().calendar, &calendar, &duration, overflow)
     }
     .or_throw(machine)?;
     date_time_outcome(machine, value, calendar)
@@ -289,15 +301,28 @@ fn difference<H: Host>(
             smallest_largest_default: Unit::Day,
         },
     )?;
-    let value = date_time
-        .until(
+    let value = if calendar.is_iso8601() {
+        date_time.until(
             other,
             settings.largest_unit,
             settings.smallest_unit,
             settings.rounding_increment,
             settings.rounding_mode,
         )
-        .or_throw(machine)?;
+    } else {
+        date_time.until_in(
+            &providers(),
+            &calendar,
+            other,
+            DifferenceRounding {
+                largest_unit: settings.largest_unit,
+                smallest_unit: settings.smallest_unit,
+                increment: settings.rounding_increment,
+                mode: settings.rounding_mode,
+            },
+        )
+    }
+    .or_throw(machine)?;
     let value = if since { value.negated() } else { value };
     create(machine, TemporalObject::Duration(value)).map(BuiltinOutcome::Value)
 }
