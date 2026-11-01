@@ -1150,9 +1150,25 @@ impl Walker<'_> {
                 if !patterns_allowed {
                     self.error(target.range(), "this operator cannot assign to a pattern");
                 }
-                for element in &array.elements {
-                    if let AssignmentArrayElement::Target(element) = element {
-                        self.array_element(element, context);
+                let last = array.elements.len().saturating_sub(1);
+                for (position, element) in array.elements.iter().enumerate() {
+                    match element {
+                        AssignmentArrayElement::Target(element) => {
+                            self.array_element(element, context);
+                        }
+                        AssignmentArrayElement::Rest(element) => {
+                            if position != last {
+                                self.error(element.range(), "a rest element must come last");
+                            }
+                            if matches!(element.data(), AssignmentTarget::Invalid(_)) {
+                                self.error(
+                                    element.range(),
+                                    "a rest element cannot have an initializer",
+                                );
+                            }
+                            self.target(element, true, context);
+                        }
+                        AssignmentArrayElement::Elision | AssignmentArrayElement::Missing(_) => {}
                     }
                 }
             }
@@ -1457,6 +1473,8 @@ mod tests {
             "'use strict'; f() = 1;",
             "class C { static { function await() {} } }",
             "a + b = c;",
+            "[...a, b] = c;",
+            "[...a = 1] = c;",
             "[a] += 1;",
             "var [...a, b] = c;",
             "var [...a = 1] = c;",
@@ -1535,6 +1553,7 @@ mod tests {
             "class C { #\\u{6F}; m() { this.#o; } }",
             "class C { constructor() {} static constructor() {} static *constructor() {} }",
             "[a = 1, [b = 2]] = c;",
+            "[...a] = b; [...[c, d]] = e; [...f.g] = h;",
             "for (var a of b) ({ x: [c = 1] } = a);",
             "for (let a of b) { let a; }",
             "for (var a in b) var c;",

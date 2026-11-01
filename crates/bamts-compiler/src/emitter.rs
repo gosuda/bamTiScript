@@ -3566,6 +3566,10 @@ impl<'a> Emitter<'a> {
                         AssignmentArrayElement::Target(target) => {
                             self.emit_assignment_target(target)
                         }
+                        AssignmentArrayElement::Rest(target) => {
+                            self.raw("...");
+                            self.emit_assignment_target(target);
+                        }
                         AssignmentArrayElement::Elision => {}
                         AssignmentArrayElement::Missing(_) => {
                             self.diag_here(codes::MISSING_TARGET, "cannot emit a missing target");
@@ -5988,6 +5992,20 @@ export default answer;
 
         let output = emit_output(parsed.product(), &EmitOptions::default());
         assert_eq!(javascript(&output).code, "");
+    }
+
+    #[test]
+    fn array_assignment_rest_and_defaults_emit_as_written() {
+        let input = "[a = 1, ...b] = c;\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(!output.has_errors());
+        assert_eq!(javascript(&output).code, input);
     }
 
     #[test]

@@ -6686,7 +6686,11 @@ impl<'a> FunctionContext<'a> {
                         }
                         AssignmentArrayElement::Target(inner) => {
                             let element = self.iterator_step_value(builder, range, iterator)?;
-                            self.assign_target(builder, inner, element)?;
+                            self.assign_array_element(builder, inner, element)?;
+                        }
+                        AssignmentArrayElement::Rest(inner) => {
+                            let rest = self.rest_array(builder, range, iterator)?;
+                            self.assign_target(builder, inner, rest)?;
                         }
                         AssignmentArrayElement::Missing(missing) => {
                             return Err(self.missing(range, missing.expected()));
@@ -6700,6 +6704,23 @@ impl<'a> FunctionContext<'a> {
                 Err(self.missing(range, NodeKind::AssignmentExpression))
             }
         }
+    }
+    /// Assigns one array element. The parser keeps `[a = 1]`'s element as the
+    /// assignment it read, so a default arrives as that expression.
+    fn assign_array_element(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        target: &AssignmentTargetNode,
+        value: Register,
+    ) -> Result<(), LowerError> {
+        if let AssignmentTarget::Invalid(operand) = target.data()
+            && let Expression::Assignment(assignment) = operand.data()
+            && assignment.operator == AssignmentOperator::Assign
+        {
+            let value = self.apply_default(builder, target.range(), value, &assignment.right)?;
+            return self.assign_target(builder, &assignment.left, value);
+        }
+        self.assign_target(builder, target, value)
     }
     fn assign_object_property(
         &mut self,
@@ -10145,7 +10166,9 @@ impl<'a> FreeVarScanner<'a> {
             }
             AssignmentTarget::Array(array) => {
                 for element in &array.elements {
-                    if let AssignmentArrayElement::Target(inner) = element {
+                    if let AssignmentArrayElement::Target(inner)
+                    | AssignmentArrayElement::Rest(inner) = element
+                    {
                         self.scan_assignment_target(inner);
                     }
                 }
@@ -14194,6 +14217,15 @@ mod tests {
             Instruction::CreateRegExp { .. }
         )));
     }
+    #[test]
+    fn array_assignment_patterns_take_defaults_and_rest() {
+        let module = lower_js("var a, b, c, d = {}; [a = 1, [b = 2], ...d.rest] = c;");
+        assert!(any_instruction(&module, |i| matches!(
+            i,
+            Instruction::GetIterator { .. }
+        )));
+    }
+
     #[test]
     fn class_methods_are_defined_as_hidden_and_object_methods_are_not() {
         let class = lower_js("class C { m() {} get v() { return 1; } set v(x) {} }");

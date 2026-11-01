@@ -5486,12 +5486,9 @@ impl Parser {
                     let target = self.expression_to_target(*expr);
                     elements.push(AssignmentArrayElement::Target(target));
                 }
-                ArrayElement::Spread(_) => {
-                    // A rest element has no array-target slot. Record a missing
-                    // element so the checker can report it; the parser stays silent.
-                    elements.push(AssignmentArrayElement::Missing(MissingNode::new(
-                        NodeKind::MissingAssignmentTarget,
-                    )));
+                ArrayElement::Spread(spread) => {
+                    let target = self.expression_to_target(*spread.argument);
+                    elements.push(AssignmentArrayElement::Rest(target));
                 }
                 ArrayElement::Missing(node) => {
                     elements.push(AssignmentArrayElement::Missing(node));

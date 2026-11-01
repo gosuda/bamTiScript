@@ -2011,7 +2011,9 @@ impl DynamicEdgeCollector<'_> {
             }
             AssignmentTarget::Array(value) => {
                 for element in &value.elements {
-                    if let AssignmentArrayElement::Target(value) = element {
+                    if let AssignmentArrayElement::Target(value)
+                    | AssignmentArrayElement::Rest(value) = element
+                    {
                         self.scan_target(value);
                     }
                 }

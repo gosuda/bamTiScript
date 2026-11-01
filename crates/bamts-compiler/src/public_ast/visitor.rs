@@ -748,7 +748,9 @@ where
         }
         AssignmentTarget::Array(array) => {
             for element in &array.elements {
-                if let AssignmentArrayElement::Target(target) = element {
+                if let AssignmentArrayElement::Target(target)
+                | AssignmentArrayElement::Rest(target) = element
+                {
                     visit_node(NodeRef::AssignmentTarget(target), visitor)?;
                 }
             }

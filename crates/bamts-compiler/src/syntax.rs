@@ -916,6 +916,8 @@ pub enum AssignmentArrayElement {
     Target(AssignmentTargetNode),
     Elision,
     Missing(MissingNode),
+    /// `...target`, which collects what the iterator has left.
+    Rest(AssignmentTargetNode),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
