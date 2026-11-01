@@ -3636,9 +3636,12 @@ impl<'a, H: Host> Machine<'a, H> {
                 Ok((true, _)) => break,
                 Ok((false, value)) => value,
                 Err(failure) => {
-                    self.mark_promise_all_settled(aggregate)?;
-                    self.call_promise_reject(capability_reject, failure)?;
-                    return Ok(());
+                    return self.reject_promise_all_abrupt(
+                        aggregate,
+                        capability_reject,
+                        iterator,
+                        failure,
+                    );
                 }
             };
             let index = match self.add_promise_all_element(aggregate) {
