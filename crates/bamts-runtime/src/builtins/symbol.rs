@@ -261,6 +261,14 @@ mod tests {
     }
 
     #[test]
+    fn symbols_are_primitives_not_objects() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+        assert!(!machine.is_object(machine.intrinsics.builtins.symbol_iterator()));
+    }
+
+    #[test]
     fn well_known_symbols_are_installed_with_expected_descriptors() {
         let module = blank_program("<test>");
         let mut host = TestHost;

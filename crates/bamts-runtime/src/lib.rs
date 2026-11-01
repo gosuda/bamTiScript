@@ -13310,6 +13310,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 self.heap[index],
                 HeapEntry::String(_)
                     | HeapEntry::BigInt(_)
+                    | HeapEntry::Symbol { .. }
+                    | HeapEntry::PrivateName { .. }
                     | HeapEntry::PromiseResolver { .. }
                     | HeapEntry::PromiseAll { .. }
                     | HeapEntry::AsyncActivation { .. }
