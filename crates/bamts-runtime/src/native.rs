@@ -2353,12 +2353,20 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             InvokeOutcome::Value(close) => close,
             outcome => return map_outcome(outcome),
         };
+        if matches!(close.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            return Ok(Value::UNDEFINED);
+        }
         let callable = match self.machine.borrow().is_callable(close) {
             Ok(callable) => callable,
             Err(failure) => return map_outcome(self.failure_outcome(failure)),
         };
         if !callable {
-            return Ok(Value::UNDEFINED);
+            return map_outcome(InvokeOutcome::Threw(
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "iterator return method is not callable",
+                },
+            ));
         }
         frame.set_register(called_reg, Value::TRUE);
         map_outcome(self.invoke_callee(close, target, &[], Value::UNDEFINED))

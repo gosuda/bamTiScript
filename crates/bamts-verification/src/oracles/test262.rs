@@ -2308,6 +2308,37 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn closing_an_iterator_checks_its_return_method() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n\
+            function iterable(close) {\n\
+            var it = { next() { return { done: false }; }, return: close };\n\
+            return { [Symbol.iterator]() { return it; } };\n\
+            }\n";
+        const CASES: [&str; 3] = [
+            "assert.sameValue(throws(TypeError, function () { \
+             for (var x of iterable(1)) { break; } }), true);",
+            "for (var x of iterable(null)) { break; }",
+            "for (var x of iterable(undefined)) { break; }",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: iterator close", &format!("{THROWS}{body}"));
+                let label = format!("iterator-close-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn construction_behaves_the_same_in_every_tier() {
         const THROWS: &str = "function throws(kind, body) {\n\
             try { body(); } catch (error) { return error instanceof kind; }\n\
