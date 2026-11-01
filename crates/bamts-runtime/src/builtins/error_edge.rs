@@ -5,7 +5,7 @@ use bamts_native::Value;
 
 use super::{
     allocate_array, allocate_string, heap_index, install_constructor_function, install_function,
-    type_error,
+    type_error, with_roots,
 };
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
@@ -63,6 +63,12 @@ pub(super) fn install<H: Host>(
             define_static(heap, constructor, "captureStackTrace", capture);
             let is_error = install_function(heap, builtins, "isError", 1, is_error::<H>);
             define_static(heap, constructor, "isError", is_error);
+        } else {
+            let HeapEntry::NativeFunction { prototype, .. } = &mut heap[heap_index(constructor)]
+            else {
+                panic!("error constructors are native");
+            };
+            *prototype = Some(globals[&EcmaString::encode("Error")]);
         }
         globals.insert(EcmaString::encode(name), constructor);
     }
@@ -202,53 +208,55 @@ pub(super) fn error_constructor<H: Host>(
         "SuppressedError" => (2, 3),
         _ => (0, 1),
     };
-    let message = args
-        .get(message_index)
-        .copied()
-        .filter(|value| *value != Value::UNDEFINED)
-        .map(|value| machine.to_string(value))
-        .transpose()?;
-    if let Some(text) = &message {
-        let value = allocate_string(machine, text.clone())?;
-        define_own(machine, object, "message", value)?;
-    }
-
-    if let Some(options) = args.get(options_index).copied()
-        && machine.is_object(options)
-    {
-        let key = PropertyKey::Named(EcmaString::encode("cause"));
-        if machine.internal_has_property(options, &key)? {
-            let cause = machine.get_named_property(options, "cause")?;
-            define_own(machine, object, "cause", cause)?;
+    with_roots(machine, &[object], |machine, _| {
+        let message = args
+            .get(message_index)
+            .copied()
+            .filter(|value| *value != Value::UNDEFINED)
+            .map(|value| machine.coerce_string_observable(value))
+            .transpose()?;
+        if let Some(text) = &message {
+            let value = allocate_string(machine, text.clone())?;
+            define_own(machine, object, "message", value)?;
         }
-    }
 
-    match name {
-        "AggregateError" => {
-            let source = args.first().copied().unwrap_or(Value::UNDEFINED);
-            let values = machine.iterable_values(source)?;
-            let array = allocate_array(machine, values)?;
-            define_own(machine, object, "errors", array)?;
+        if let Some(options) = args.get(options_index).copied()
+            && machine.is_object(options)
+        {
+            let key = PropertyKey::Named(EcmaString::encode("cause"));
+            if machine.internal_has_property(options, &key)? {
+                let cause = machine.get_named_property(options, "cause")?;
+                define_own(machine, object, "cause", cause)?;
+            }
         }
-        "SuppressedError" => {
-            define_own(
-                machine,
-                object,
-                "error",
-                args.first().copied().unwrap_or(Value::UNDEFINED),
-            )?;
-            define_own(
-                machine,
-                object,
-                "suppressed",
-                args.get(1).copied().unwrap_or(Value::UNDEFINED),
-            )?;
-        }
-        _ => {}
-    }
 
-    install_stack(machine, object, name, message.as_ref(), None)?;
-    Ok(BuiltinOutcome::Value(object))
+        match name {
+            "AggregateError" => {
+                let source = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let values = machine.iterable_values(source)?;
+                let array = allocate_array(machine, values)?;
+                define_own(machine, object, "errors", array)?;
+            }
+            "SuppressedError" => {
+                define_own(
+                    machine,
+                    object,
+                    "error",
+                    args.first().copied().unwrap_or(Value::UNDEFINED),
+                )?;
+                define_own(
+                    machine,
+                    object,
+                    "suppressed",
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                )?;
+            }
+            _ => {}
+        }
+
+        install_stack(machine, object, name, message.as_ref(), None)?;
+        Ok(BuiltinOutcome::Value(object))
+    })
 }
 
 fn install_stack<H: Host>(
