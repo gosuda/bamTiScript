@@ -58,7 +58,7 @@ Scope: Complete the clean-room Rust compiler, TypeScript-compatible Node 24 API 
 
 - [ ] G6: Interpreter, JIT, AOT, formal correspondence, target cells, and performance evidence satisfy every compiler-product release obligation
   CHECK: cargo run -p bamts-verification -- completion verify --root native
-  EXPECT: NATIVE COMPLETE formal=PASS targets=28/28 benchmarks=9/9
+  EXPECT: NATIVE COMPLETE formal=PASS targets=49/49 benchmarks=9/9
   EVIDENCE: 2026-08-28 `completion verify --root native` exit 1: unproven E1.1, E1.2, E2.1 through E2.3, E3.1 through E3.3, E4.1, E4.2, and 389 more
 
 - [ ] G7: The strict TypeScript-product completion gate accepts only receipt-backed PASS states or exact machine-evidenced policy exclusions
