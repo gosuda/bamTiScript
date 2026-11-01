@@ -91,6 +91,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     disposable_stack_prototype: Option<Value>,
     async_disposable_stack_prototype: Option<Value>,
     date_prototype: Option<Value>,
+    temporal_prototypes: [Option<Value>; crate::temporal::TemporalKind::COUNT],
     weak_ref_prototype: Option<Value>,
     finalization_registry_prototype: Option<Value>,
     map_prototype: Option<Value>,
@@ -161,6 +162,7 @@ impl<H: Host> BuiltinTable<H> {
             disposable_stack_prototype: None,
             async_disposable_stack_prototype: None,
             date_prototype: None,
+            temporal_prototypes: [None; crate::temporal::TemporalKind::COUNT],
             weak_ref_prototype: None,
             finalization_registry_prototype: None,
             map_prototype: None,
@@ -467,6 +469,16 @@ impl<H: Host> BuiltinTable<H> {
         self.async_disposable_stack_prototype
             .expect("AsyncDisposableStack builtins install their prototype")
     }
+    pub(crate) fn set_temporal_prototype(
+        &mut self,
+        kind: crate::temporal::TemporalKind,
+        prototype: Value,
+    ) {
+        self.temporal_prototypes[kind.index()] = Some(prototype);
+    }
+    pub(crate) fn temporal_prototype(&self, kind: crate::temporal::TemporalKind) -> Value {
+        self.temporal_prototypes[kind.index()].expect("Temporal builtins install their prototypes")
+    }
     pub(crate) fn set_date_prototype(&mut self, prototype: Value) {
         self.date_prototype = Some(prototype);
     }
@@ -608,7 +620,8 @@ impl<H: Host> BuiltinTable<H> {
         match &mut heap[prototype_index] {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Array { properties, .. }
-            | HeapEntry::Date { properties, .. } => {
+            | HeapEntry::Date { properties, .. }
+            | HeapEntry::Temporal { properties, .. } => {
                 properties.insert(
                     crate::PropertyKey::Named(EcmaString::encode("constructor")),
                     constructor_property,
@@ -706,6 +719,7 @@ impl<H: Host> BuiltinTable<H> {
             disposable_stack_prototype,
             async_disposable_stack_prototype,
             date_prototype,
+            temporal_prototypes,
             weak_ref_prototype,
             finalization_registry_prototype,
             map_prototype,
@@ -790,6 +804,7 @@ impl<H: Host> BuiltinTable<H> {
         for value in typedarray_constructors
             .iter()
             .chain(typedarray_prototypes.iter())
+            .chain(temporal_prototypes.iter())
             .flatten()
         {
             visit(*value);

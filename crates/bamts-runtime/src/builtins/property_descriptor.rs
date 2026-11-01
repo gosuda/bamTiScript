@@ -412,6 +412,7 @@ pub(crate) fn is_extensible<H: Host>(
         | HeapEntry::Script { extensible, .. }
         | HeapEntry::RegExp { extensible, .. }
         | HeapEntry::Date { extensible, .. }
+        | HeapEntry::Temporal { extensible, .. }
         | HeapEntry::Collection { extensible, .. }
         | HeapEntry::BuiltinIterator { extensible, .. }
         | HeapEntry::Generator { extensible, .. }

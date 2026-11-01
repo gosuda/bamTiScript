@@ -411,6 +411,7 @@ impl<H: Host> Machine<'_, H> {
                     HeapEntry::Object { properties, .. }
                     | HeapEntry::Script { properties, .. }
                     | HeapEntry::Date { properties, .. }
+                    | HeapEntry::Temporal { properties, .. }
                     | HeapEntry::BuiltinIterator { properties, .. }
                     | HeapEntry::Collection { properties, .. }
                     | HeapEntry::Generator { properties, .. }

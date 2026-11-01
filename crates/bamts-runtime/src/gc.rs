@@ -741,6 +741,11 @@ fn trace_entry(
             prototype,
             ..
         }
+        | HeapEntry::Temporal {
+            properties,
+            prototype,
+            ..
+        }
         | HeapEntry::Timeout {
             properties,
             prototype,

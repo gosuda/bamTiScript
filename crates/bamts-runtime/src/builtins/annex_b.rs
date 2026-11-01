@@ -693,7 +693,8 @@ fn properties_of(heap: &mut [HeapEntry], object: Value) -> &mut PropertyMap {
         | HeapEntry::Script { properties, .. }
         | HeapEntry::NativeFunction { properties, .. }
         | HeapEntry::RegExp { properties, .. }
-        | HeapEntry::Date { properties, .. } => properties,
+        | HeapEntry::Date { properties, .. }
+        | HeapEntry::Temporal { properties, .. } => properties,
         _ => panic!("Annex B property target must be an ordinary object"),
     }
 }
@@ -711,7 +712,8 @@ fn clone_property(heap: &[HeapEntry], object: Value, name: &str) -> Property {
         | HeapEntry::Script { properties, .. }
         | HeapEntry::NativeFunction { properties, .. }
         | HeapEntry::RegExp { properties, .. }
-        | HeapEntry::Date { properties, .. } => properties,
+        | HeapEntry::Date { properties, .. }
+        | HeapEntry::Temporal { properties, .. } => properties,
         _ => panic!("Annex B property source must be an ordinary object"),
     };
     properties
@@ -901,6 +903,7 @@ fn ordinary_set_prototype_of<H: Host>(
         | HeapEntry::Script { extensible, .. }
         | HeapEntry::RegExp { extensible, .. }
         | HeapEntry::Date { extensible, .. }
+        | HeapEntry::Temporal { extensible, .. }
         | HeapEntry::BuiltinIterator { extensible, .. }
         | HeapEntry::Collection { extensible, .. }
         | HeapEntry::TypedArray { extensible, .. }

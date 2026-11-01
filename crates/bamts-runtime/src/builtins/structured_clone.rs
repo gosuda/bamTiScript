@@ -439,6 +439,7 @@ fn build_plan<H: Host>(
             | HeapEntry::AsyncFromSync { .. }
             | HeapEntry::DisposableStack { .. }
             | HeapEntry::ProcessEnv { .. }
+            | HeapEntry::Temporal { .. }
             | HeapEntry::Promise { .. }
             | HeapEntry::Timeout { .. }
             | HeapEntry::PromiseResolver { .. }
