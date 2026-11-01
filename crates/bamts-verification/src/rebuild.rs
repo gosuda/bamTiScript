@@ -11,6 +11,11 @@
 //! run binding, or a missing receipt is a rejection, and a rejection never
 //! publishes.
 //!
+//! One ledger row is one manifest identifier.  A receipt names it by lane key,
+//! and an identifier is proven in every mode its catalog declares: `test262`
+//! needs the interpreter, JIT, and AOT to agree, so its row settles only when
+//! all three have reported the same state.
+//!
 //! Memory is one receipt row, one ledger row, and bounded per-obligation
 //! outcome state.  The ledger document is never materialized as a value tree.
 //! Publication streams into a sibling temporary file and renames it only after
@@ -41,7 +46,7 @@ use crate::{
         validate_manifest,
     },
     shard::{ExecutionMode, ObligationKey},
-    suite::completion::current_run_bindings,
+    suite::completion::{current_run_bindings, logical_obligation, required_modes},
 };
 
 /// Canonical published ledger, relative to the repository root.
@@ -184,12 +189,14 @@ impl LedgerProse {
 /// Why one obligation cannot be projected into a green ledger row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RejectionReason {
-    /// No receipt recorded this obligation.
-    MissingReceipt,
+    /// No receipt recorded this obligation in a mode its catalog requires.
+    MissingReceipt { mode: ExecutionMode },
     /// A receipt named an obligation the manifest does not declare.
     UnknownObligation,
     /// Two receipts recorded the same obligation and run coordinates.
     DuplicateReceipt,
+    /// The modes of one obligation reported different states.
+    ModeDisagreement { states: String },
     /// A PASS row did not declare exactly the identity's observables.
     ObservableMismatch { expected: String, actual: String },
     /// A receipt declared an observable without a digest.
@@ -213,11 +220,20 @@ pub enum RejectionReason {
 impl fmt::Display for RejectionReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingReceipt => formatter.write_str("no receipt recorded this obligation"),
+            Self::MissingReceipt { mode } => {
+                write!(
+                    formatter,
+                    "no {} receipt recorded this obligation",
+                    mode.as_str()
+                )
+            }
             Self::UnknownObligation => {
                 formatter.write_str("receipt names an obligation the manifest does not declare")
             }
             Self::DuplicateReceipt => formatter.write_str("duplicate receipt for one obligation"),
+            Self::ModeDisagreement { states } => {
+                write!(formatter, "modes disagree on this obligation: {states}")
+            }
             Self::ObservableMismatch { expected, actual } => write!(
                 formatter,
                 "PASS declares observables `{actual}` instead of `{expected}`"
@@ -302,10 +318,9 @@ impl RebuildReport {
 pub struct ObligationSlot {
     catalog: String,
     identifier: String,
-    configuration: String,
-    mode: ExecutionMode,
+    modes: Vec<ExecutionMode>,
     platform: String,
-    declared_observable: Option<String>,
+    observables: BTreeSet<String>,
     classification: Option<ClassificationState>,
 }
 
@@ -313,12 +328,22 @@ pub struct ObligationSlot {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObligationIndex {
     slots: BTreeMap<String, ObligationSlot>,
+    /// The row each lane cell proves.  Mode and platform are not part of a cell:
+    /// they are checked against the slot, so a wrong one reads as stale.
+    rows: BTreeMap<String, String>,
+}
+
+/// A lane cell as one string.  Key tokens cannot contain NUL, so this is injective.
+fn lane_cell(key: &ObligationKey) -> String {
+    format!("{}\0{}\0{}", key.catalog(), key.case(), key.configuration())
 }
 
 impl ObligationIndex {
     /// Builds the index from manifest row ids of the form `catalog:identifier`.
     pub fn from_row_ids(row_ids: &BTreeSet<String>) -> Result<Self> {
+        let platform = bamts_platform::host_triple();
         let mut slots = BTreeMap::new();
+        let mut rows = BTreeMap::new();
         for row_id in row_ids {
             let (catalog, identifier) = row_id.split_once(':').ok_or_else(|| {
                 VerificationError::new(
@@ -332,20 +357,36 @@ impl ObligationIndex {
                     format!("manifest row `{row_id}` has an empty component"),
                 ));
             }
+            let modes = required_modes(catalog)?;
+            let obligation = logical_obligation(catalog, identifier, modes[0], &platform)?;
+            if rows
+                .insert(lane_cell(&obligation.key), row_id.clone())
+                .is_some()
+            {
+                return Err(VerificationError::new(
+                    ErrorCode::SetMismatch,
+                    format!("manifest row `{row_id}` shares a lane key with another row"),
+                ));
+            }
             slots.insert(
                 row_id.clone(),
                 ObligationSlot {
                     catalog: catalog.to_owned(),
                     identifier: identifier.to_owned(),
-                    configuration: declared_configuration(identifier),
-                    mode: ExecutionMode::Interpreter,
-                    platform: bamts_platform::host_triple(),
-                    declared_observable: declared_observable(identifier),
+                    modes,
+                    platform: platform.clone(),
+                    observables: obligation.observables,
                     classification: None,
                 },
             );
         }
-        Ok(Self { slots })
+        Ok(Self { slots, rows })
+    }
+
+    /// The manifest row a receipt key proves, if it proves one.
+    fn resolve(&self, key: &ObligationKey) -> Option<(&str, &ObligationSlot)> {
+        let row_id = self.rows.get(&lane_cell(key))?;
+        Some((row_id, self.slots.get(row_id)?))
     }
 
     fn attach_classifications(
@@ -402,24 +443,6 @@ impl ObligationIndex {
             .map(|slot| slot.catalog.clone())
             .collect()
     }
-}
-
-/// A cell identity ends with `#observable`; other identities declare none.
-fn declared_observable(identifier: &str) -> Option<String> {
-    identifier
-        .rsplit_once('#')
-        .map(|(_, observable)| observable.to_owned())
-        .filter(|observable| !observable.is_empty())
-}
-
-fn declared_configuration(identifier: &str) -> String {
-    identifier
-        .rsplit_once('#')
-        .and_then(|(prefix, _)| prefix.rsplit_once('#'))
-        .map_or_else(
-            || "default".to_owned(),
-            |(_, configuration)| configuration.to_owned(),
-        )
 }
 
 /// Rebuilds the ledger from the manifest and the supplied receipts.
@@ -583,6 +606,21 @@ struct Outcome {
     rejection: Option<RejectionReason>,
 }
 
+/// Every mode one obligation has reported in, including any it should not have.
+type ModeOutcomes = BTreeMap<ExecutionMode, Outcome>;
+
+/// The state one row publishes.  It needs every required mode to have reported,
+/// nothing rejected, and all modes in agreement.
+fn settled_state(slot: &ObligationSlot, recorded: &ModeOutcomes) -> Option<TerminalState> {
+    let complete = slot.modes.iter().all(|mode| recorded.contains_key(mode));
+    if !complete || recorded.values().any(|outcome| outcome.rejection.is_some()) {
+        return None;
+    }
+    let mut states = recorded.values().map(|outcome| outcome.state);
+    let first = states.next()?;
+    states.all(|state| state == first).then_some(first)
+}
+
 pub(crate) fn rebuild_projection(
     root: &Path,
     index: &ObligationIndex,
@@ -606,7 +644,7 @@ pub(crate) fn rebuild_projection(
     }
 
     let ledger_path = root.join(LEDGER_PATH);
-    let mut outcomes: BTreeMap<String, Outcome> = BTreeMap::new();
+    let mut outcomes: BTreeMap<String, ModeOutcomes> = BTreeMap::new();
     let mut rejections: Vec<RebuildRejection> = Vec::new();
     let mut receipts_consumed = 0usize;
     let catalogs = index.catalogs();
@@ -673,28 +711,44 @@ pub(crate) fn rebuild_projection(
         reader.finish()?;
     }
 
-    for row_id in index.slots.keys() {
-        match outcomes.get_mut(row_id) {
-            None => rejections.push(RebuildRejection {
+    for (row_id, slot) in &index.slots {
+        let recorded = outcomes.entry(row_id.clone()).or_default();
+        let before = rejections.len();
+        let mut reject = |reason: RejectionReason| {
+            rejections.push(RebuildRejection {
                 row_id: row_id.clone(),
-                reason: RejectionReason::MissingReceipt,
-            }),
-            Some(outcome) => {
-                if !outcome.state.is_pass()
-                    && outcome.rejection.is_none()
-                    && !prose.contains_key(row_id)
-                {
-                    outcome.rejection = Some(RejectionReason::MissingPolicyProse {
-                        state: outcome.state,
-                    });
-                }
-                if let Some(reason) = &outcome.rejection {
-                    rejections.push(RebuildRejection {
-                        row_id: row_id.clone(),
-                        reason: reason.clone(),
-                    });
-                }
+                reason,
+            });
+        };
+        for mode in &slot.modes {
+            if !recorded.contains_key(mode) {
+                reject(RejectionReason::MissingReceipt { mode: *mode });
             }
+        }
+        for outcome in recorded.values_mut() {
+            if !outcome.state.is_pass()
+                && outcome.rejection.is_none()
+                && !prose.contains_key(row_id)
+            {
+                outcome.rejection = Some(RejectionReason::MissingPolicyProse {
+                    state: outcome.state,
+                });
+            }
+            if let Some(reason) = &outcome.rejection {
+                reject(reason.clone());
+            }
+        }
+        if rejections.len() == before && settled_state(slot, recorded).is_none() {
+            let states: Vec<String> = recorded
+                .iter()
+                .map(|(mode, outcome)| format!("{}={}", mode.as_str(), outcome.state.as_str()))
+                .collect();
+            rejections.push(RebuildRejection {
+                row_id: row_id.clone(),
+                reason: RejectionReason::ModeDisagreement {
+                    states: states.join(","),
+                },
+            });
         }
     }
 
@@ -744,14 +798,13 @@ pub(crate) fn rebuild_projection(
 
 fn record_outcome(
     index: &ObligationIndex,
-    outcomes: &mut BTreeMap<String, Outcome>,
+    outcomes: &mut BTreeMap<String, ModeOutcomes>,
     rejections: &mut Vec<RebuildRejection>,
     row: &EvidenceRow,
 ) {
-    let row_id = row_id_for(row.key());
-    let Some(slot) = index.slots.get(&row_id) else {
+    let Some((row_id, slot)) = index.resolve(row.key()) else {
         rejections.push(RebuildRejection {
-            row_id,
+            row_id: row_id_for(row.key()),
             reason: RejectionReason::UnknownObligation,
         });
         return;
@@ -763,7 +816,8 @@ fn record_outcome(
         row.observables(),
         row.artifacts(),
     );
-    match outcomes.entry(row_id) {
+    let recorded = outcomes.entry(row_id.to_owned()).or_default();
+    match recorded.entry(row.key().mode()) {
         Entry::Vacant(slot) => {
             slot.insert(Outcome {
                 state: row.state(),
@@ -787,8 +841,7 @@ fn admit(
     artifacts: &BTreeMap<String, String>,
 ) -> Option<RejectionReason> {
     for (field, matches) in [
-        ("configuration", key.configuration() == slot.configuration),
-        ("execution_mode", key.mode() == slot.mode),
+        ("execution_mode", slot.modes.contains(&key.mode())),
         ("platform", key.platform() == slot.platform),
     ] {
         if !matches {
@@ -806,14 +859,11 @@ fn admit(
         });
     }
     if state.is_pass() {
-        if let Some(declared) = &slot.declared_observable {
-            let expected: BTreeSet<String> = BTreeSet::from([declared.clone()]);
-            if observables != &expected {
-                return Some(RejectionReason::ObservableMismatch {
-                    expected: render_set(&expected),
-                    actual: render_set(observables),
-                });
-            }
+        if observables != &slot.observables {
+            return Some(RejectionReason::ObservableMismatch {
+                expected: render_set(&slot.observables),
+                actual: render_set(observables),
+            });
         }
         for observable in observables {
             if !artifacts.contains_key(observable) {
@@ -911,7 +961,7 @@ struct LedgerRowOut<'a> {
 
 struct Projection<'a> {
     index: &'a ObligationIndex,
-    outcomes: &'a BTreeMap<String, Outcome>,
+    outcomes: &'a BTreeMap<String, ModeOutcomes>,
     prose: &'a BTreeMap<String, LedgerProse>,
     manifest_sha256: &'a str,
 }
@@ -1016,13 +1066,14 @@ impl Projection<'_> {
 
         let mut first = true;
         for (row_id, slot) in &self.index.slots {
-            let Some(outcome) = self.outcomes.get(row_id) else {
+            let Some(settled) = self
+                .outcomes
+                .get(row_id)
+                .and_then(|recorded| settled_state(slot, recorded))
+            else {
                 continue;
             };
-            if outcome.rejection.is_some() {
-                continue;
-            }
-            let Some(state) = ledger_state(outcome.state) else {
+            let Some(state) = ledger_state(settled) else {
                 continue;
             };
             let empty = LedgerProse {
@@ -1031,7 +1082,7 @@ impl Projection<'_> {
                 reason: String::new(),
                 matcher: String::new(),
             };
-            let prose = if outcome.state.is_pass() {
+            let prose = if settled.is_pass() {
                 &empty
             } else {
                 let prose = self.prose.get(row_id).ok_or_else(|| {
@@ -1177,6 +1228,7 @@ mod tests {
     use crate::{
         evidence::{PublishMode, ToolchainPin, WorkingDirectoryPolicy, publish_evidence},
         shard::{ExecutionMode, ShardIdentity, ShardSpec},
+        suite::completion::{SuiteRunner, logical_obligation, materialize_obligations},
     };
 
     const DIGEST: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
@@ -1206,15 +1258,15 @@ mod tests {
         ObligationIndex::from_row_ids(&row_ids).expect("index")
     }
 
+    /// The key a lane really writes, so a fixture cannot drift from a receipt.
+    fn lane_key(catalog: &str, identity: &str, mode: ExecutionMode) -> ObligationKey {
+        logical_obligation(catalog, identity, mode, &platform())
+            .expect("logical obligation")
+            .key
+    }
+
     fn key_for(identity: &str) -> ObligationKey {
-        ObligationKey::new(
-            CATALOG,
-            identity,
-            "default",
-            ExecutionMode::Interpreter,
-            platform(),
-        )
-        .expect("obligation key")
+        lane_key(CATALOG, identity, ExecutionMode::Aot)
     }
     fn toolchain_pin() -> ToolchainPin {
         ToolchainPin::new("rustc-1.97.1", DIGEST).expect("toolchain pin")
@@ -1228,8 +1280,8 @@ mod tests {
         BTreeMap::from([(CATALOG.to_owned(), binding())])
     }
 
-    const CATALOG_A: &str = "catalog-a";
-    const CATALOG_B: &str = "catalog-b";
+    const CATALOG_A: &str = "typescript-a";
+    const CATALOG_B: &str = "typescript-b";
     const THIRD: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
     fn catalog_identity(catalog: &str, index: usize) -> String {
@@ -1246,14 +1298,7 @@ mod tests {
 
     fn pass_row_for_catalog(catalog: &str, identity: &str) -> EvidenceRow {
         EvidenceRow::new(
-            ObligationKey::new(
-                catalog,
-                identity,
-                "default",
-                ExecutionMode::Interpreter,
-                platform(),
-            )
-            .expect("catalog key"),
+            lane_key(catalog, identity, ExecutionMode::Aot),
             vec!["bamts".to_owned()],
             WorkingDirectoryPolicy::RepositoryRoot,
             BTreeSet::from(["diagnostics".to_owned()]),
@@ -1445,10 +1490,10 @@ mod tests {
             report.rejections
         );
         assert!(
-            report
-                .rejections
-                .iter()
-                .any(|rejection| rejection.reason == RejectionReason::MissingReceipt),
+            report.rejections.iter().any(|rejection| rejection.reason
+                == RejectionReason::MissingReceipt {
+                    mode: ExecutionMode::Aot
+                }),
             "the declared obligation is still unproven"
         );
 
@@ -1602,23 +1647,22 @@ mod tests {
         // Mode, platform, and normalization are bound by the obligation key and
         // the canonical environment: a receipt naming another mode or platform
         // projects to no declared obligation.
-        for key in [
-            ObligationKey::new(
-                CATALOG,
-                &declared,
-                "default",
-                ExecutionMode::Jit,
-                platform(),
-            )
-            .expect("mode"),
-            ObligationKey::new(
-                CATALOG,
-                &declared,
-                "default",
-                ExecutionMode::Interpreter,
-                format!("{}-foreign", platform()),
-            )
-            .expect("platform"),
+        for (field, key) in [
+            (
+                "execution_mode",
+                lane_key(CATALOG, &declared, ExecutionMode::Jit),
+            ),
+            (
+                "platform",
+                logical_obligation(
+                    CATALOG,
+                    &declared,
+                    ExecutionMode::Aot,
+                    &format!("{}-foreign", platform()),
+                )
+                .expect("platform")
+                .key,
+            ),
         ] {
             let index = index_of(std::slice::from_ref(&declared));
             let row = EvidenceRow::new(
@@ -1637,7 +1681,14 @@ mod tests {
             let report = project(&root, &index, &[path], RebuildMode::Write).expect("coordinate");
             // The obligation key carries mode and platform, so a divergent run
             // coordinate cannot satisfy the declared obligation.
-            assert!(!report.is_clean());
+            assert!(
+                report.rejections.iter().any(|rejection| rejection.reason
+                    == RejectionReason::StaleBinding {
+                        field: field.to_owned()
+                    }),
+                "{field}: {:?}",
+                report.rejections
+            );
         }
 
         assert!(!root.join(LEDGER_PATH).exists());
@@ -1924,14 +1975,7 @@ mod tests {
             .iter()
             .map(|identity| {
                 EvidenceRow::new(
-                    ObligationKey::new(
-                        CATALOG,
-                        identity,
-                        declared_configuration(identity),
-                        ExecutionMode::Interpreter,
-                        platform(),
-                    )
-                    .expect("key"),
+                    key_for(identity),
                     vec!["bamts".to_owned()],
                     WorkingDirectoryPolicy::RepositoryRoot,
                     BTreeSet::from(["diagnostics".to_owned()]),
@@ -1974,6 +2018,297 @@ mod tests {
         assert_eq!(text.matches("\"state\":\"PASS\"").count(), 2_000);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    const TEST262_CASE: &str = "test262/test262/test/built-ins/Array/case.js#default#runtime";
+
+    fn test262_index() -> ObligationIndex {
+        multi_index(&[("test262", TEST262_CASE)])
+    }
+
+    fn test262_row(mode: ExecutionMode, state: TerminalState) -> EvidenceRow {
+        let pass = state == TerminalState::Pass;
+        EvidenceRow::new(
+            lane_key("test262", TEST262_CASE, mode),
+            vec!["bamts".to_owned()],
+            WorkingDirectoryPolicy::RepositoryRoot,
+            BTreeSet::from(["runtime".to_owned()]),
+            if pass {
+                BTreeMap::from([("runtime".to_owned(), DIGEST.to_owned())])
+            } else {
+                BTreeMap::new()
+            },
+            state,
+            1,
+            "receipt",
+        )
+        .expect("test262 row")
+    }
+
+    /// One receipt per row, the way one lane writes one receipt per mode.
+    fn test262_receipts(root: &Path, rows: Vec<EvidenceRow>) -> Vec<PathBuf> {
+        rows.into_iter()
+            .enumerate()
+            .map(|(position, row)| {
+                let path = root.join(format!("test262-{position}.jsonl"));
+                write_receipt(&path, &[row], binding());
+                path
+            })
+            .collect()
+    }
+
+    fn project_test262(root: &Path, receipts: &[PathBuf]) -> RebuildReport {
+        let expected = BTreeMap::from([("test262".to_owned(), binding())]);
+        project_with_bindings(
+            root,
+            &test262_index(),
+            receipts,
+            &expected,
+            RebuildMode::Write,
+        )
+        .expect("test262 projection")
+    }
+
+    #[test]
+    fn a_compiler_receipt_row_is_admitted() {
+        let root = scratch("compiler-row");
+        let declared = identity(0, "diagnostics");
+        let index = index_of(std::slice::from_ref(&declared));
+        let lanes = materialize_obligations(
+            CATALOG,
+            std::slice::from_ref(&declared),
+            SuiteRunner::Compiler,
+            &platform(),
+        )
+        .expect("lane keys");
+        assert_eq!(lanes[0].key, key_for(&declared));
+
+        let receipt = root.join("compiler.jsonl");
+        write_receipt(&receipt, &[pass_row(&declared, "diagnostics")], binding());
+        let report = project(&root, &index, &[receipt], RebuildMode::Write).expect("rebuild");
+        assert!(report.is_clean(), "{:?}", report.rejections);
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report.ledger_path).expect("ledger")).expect("json");
+        assert_eq!(ledger["rows"][0]["state"], "PASS");
+        assert_eq!(ledger["rows"][0]["id"], format!("{CATALOG}:{declared}"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_test262_case_is_complete_only_in_all_three_modes() {
+        let root = scratch("three-modes");
+        let partial = test262_receipts(
+            &root,
+            vec![
+                test262_row(ExecutionMode::Interpreter, TerminalState::Pass),
+                test262_row(ExecutionMode::Jit, TerminalState::Pass),
+            ],
+        );
+        let report = project_test262(&root, &partial);
+        assert_eq!(
+            report.rejections,
+            [RebuildRejection {
+                row_id: format!("test262:{TEST262_CASE}"),
+                reason: RejectionReason::MissingReceipt {
+                    mode: ExecutionMode::Aot
+                },
+            }]
+        );
+        assert!(
+            !root.join(LEDGER_PATH).exists(),
+            "a JIT row without an AOT row leaves the case incomplete"
+        );
+
+        let all = test262_receipts(
+            &root,
+            ExecutionMode::ALL
+                .into_iter()
+                .map(|mode| test262_row(mode, TerminalState::Pass))
+                .collect(),
+        );
+        let report = project_test262(&root, &all);
+        assert!(report.is_clean(), "{:?}", report.rejections);
+        assert_eq!(report.receipts_consumed, 3);
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report.ledger_path).expect("ledger")).expect("json");
+        assert_eq!(ledger["rows"].as_array().expect("rows").len(), 1);
+        assert_eq!(ledger["rows"][0]["state"], "PASS");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_row_settles_only_when_every_required_mode_has_reported() {
+        let index = test262_index();
+        let slot = index.slots.values().next().expect("one slot");
+        let pass = Outcome {
+            state: TerminalState::Pass,
+            rejection: None,
+        };
+        let mut recorded = ModeOutcomes::new();
+        for mode in ExecutionMode::ALL {
+            assert_eq!(settled_state(slot, &recorded), None);
+            recorded.insert(mode, pass.clone());
+        }
+        assert_eq!(settled_state(slot, &recorded), Some(TerminalState::Pass));
+
+        recorded.insert(
+            ExecutionMode::Jit,
+            Outcome {
+                state: TerminalState::Pass,
+                rejection: Some(RejectionReason::DuplicateReceipt),
+            },
+        );
+        assert_eq!(settled_state(slot, &recorded), None);
+    }
+
+    #[test]
+    fn one_failing_mode_keeps_a_test262_case_out_of_the_ledger() {
+        let root = scratch("one-mode-fails");
+        let receipts = test262_receipts(
+            &root,
+            vec![
+                test262_row(ExecutionMode::Interpreter, TerminalState::Pass),
+                test262_row(ExecutionMode::Jit, TerminalState::Pass),
+                test262_row(ExecutionMode::Aot, TerminalState::BlockingFail),
+            ],
+        );
+        let report = project_test262(&root, &receipts);
+        assert_eq!(report.rejections.len(), 1, "{:?}", report.rejections);
+        assert!(matches!(
+            report.rejections[0].reason,
+            RejectionReason::BlockingState { .. }
+        ));
+        assert!(!root.join(LEDGER_PATH).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn modes_that_disagree_do_not_settle_a_row() {
+        let root = scratch("disagreement");
+        let receipts = test262_receipts(
+            &root,
+            vec![
+                test262_row(ExecutionMode::Interpreter, TerminalState::Pass),
+                test262_row(ExecutionMode::Jit, TerminalState::Pass),
+                test262_row(
+                    ExecutionMode::Aot,
+                    TerminalState::InapplicableOutOfScopeHostFeature,
+                ),
+            ],
+        );
+        let row_id = format!("test262:{TEST262_CASE}");
+        let prose = BTreeMap::from([(
+            row_id.clone(),
+            LedgerProse {
+                citation: "citation".to_owned(),
+                owner: "owner".to_owned(),
+                reason: "reason".to_owned(),
+                matcher: "matcher".to_owned(),
+            },
+        )]);
+        let report = rebuild_projection(
+            &root,
+            &test262_index(),
+            DIGEST,
+            &receipts,
+            RebuildMode::Write,
+            &BTreeMap::from([("test262".to_owned(), binding())]),
+            &prose,
+        )
+        .expect("disagreement");
+        assert_eq!(report.rejections.len(), 1, "{:?}", report.rejections);
+        assert_eq!(report.rejections[0].row_id, row_id);
+        assert!(matches!(
+            report.rejections[0].reason,
+            RejectionReason::ModeDisagreement { .. }
+        ));
+        assert!(!root.join(LEDGER_PATH).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_mode_is_a_duplicate_only_of_itself() {
+        let root = scratch("mode-duplicate");
+        let receipts = test262_receipts(
+            &root,
+            vec![
+                test262_row(ExecutionMode::Interpreter, TerminalState::Pass),
+                test262_row(ExecutionMode::Interpreter, TerminalState::Pass),
+                test262_row(ExecutionMode::Jit, TerminalState::Pass),
+                test262_row(ExecutionMode::Aot, TerminalState::Pass),
+            ],
+        );
+        let report = project_test262(&root, &receipts);
+        assert_eq!(report.rejections.len(), 1, "{:?}", report.rejections);
+        assert_eq!(
+            report.rejections[0].reason,
+            RejectionReason::DuplicateReceipt
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_receipt_in_a_mode_the_catalog_does_not_run_cannot_hide_in_a_complete_row() {
+        let root = scratch("extra-mode");
+        let declared = identity(0, "diagnostics");
+        let index = index_of(std::slice::from_ref(&declared));
+        let proper = root.join("proper.jsonl");
+        write_receipt(&proper, &[pass_row(&declared, "diagnostics")], binding());
+        let extra = root.join("extra.jsonl");
+        let row = EvidenceRow::new(
+            lane_key(CATALOG, &declared, ExecutionMode::Jit),
+            vec!["bamts".to_owned()],
+            WorkingDirectoryPolicy::RepositoryRoot,
+            BTreeSet::from(["diagnostics".to_owned()]),
+            BTreeMap::from([("diagnostics".to_owned(), DIGEST.to_owned())]),
+            TerminalState::Pass,
+            1,
+            "receipt",
+        )
+        .expect("row");
+        write_receipt(&extra, &[row], binding());
+        let report = project(&root, &index, &[proper, extra], RebuildMode::Write).expect("rebuild");
+        assert_eq!(
+            report
+                .rejections
+                .iter()
+                .map(|r| &r.reason)
+                .collect::<Vec<_>>(),
+            [&RejectionReason::StaleBinding {
+                field: "execution_mode".to_owned()
+            }]
+        );
+        assert!(!root.join(LEDGER_PATH).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_manifest_identifier_is_reached_from_its_own_lane_key() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = root.join(MANIFEST_PATH);
+        let bytes = read_bytes(&path).expect("manifest");
+        let manifest: VerificationManifest = parse_json(&path, &bytes).expect("manifest json");
+        let row_ids: BTreeSet<String> = manifest
+            .catalogs
+            .iter()
+            .flat_map(|catalog| {
+                catalog
+                    .identifiers
+                    .iter()
+                    .map(|identifier| format!("{}:{identifier}", catalog.id))
+            })
+            .collect();
+        let index = ObligationIndex::from_row_ids(&row_ids).expect("every identifier has a key");
+        assert_eq!(index.len(), row_ids.len());
+        for (row_id, slot) in &index.slots {
+            for mode in &slot.modes {
+                let obligation =
+                    logical_obligation(&slot.catalog, &slot.identifier, *mode, &platform())
+                        .expect("lane key");
+                let (reached, _) = index.resolve(&obligation.key).expect("key resolves");
+                assert_eq!(reached, row_id);
+            }
+        }
     }
 
     #[test]

@@ -381,6 +381,15 @@ pub(crate) fn logical_obligation(
     Ok(LogicalObligation { key, observables })
 }
 
+/// The modes every identifier of `catalog` must be proven in: one per runner
+/// the catalog declares.
+pub(crate) fn required_modes(catalog: &str) -> Result<Vec<crate::shard::ExecutionMode>> {
+    Ok(allowed_runners(catalog)?
+        .iter()
+        .map(|runner| runner.execution_mode())
+        .collect())
+}
+
 /// Splits one logical identifier into〈case, configuration, observables〉.
 ///
 /// The returned `case` still carries the authority prefix for TS/test262
@@ -2368,6 +2377,23 @@ mod tests {
             observables,
             BTreeSet::from(["rule::property_get".to_owned()])
         );
+    }
+
+    #[test]
+    fn test262_is_proven_in_all_three_modes_and_other_catalogs_in_one() {
+        use crate::shard::ExecutionMode as Mode;
+        assert_eq!(
+            required_modes("test262").expect("modes"),
+            [Mode::Interpreter, Mode::Jit, Mode::Aot]
+        );
+        for catalog in [
+            "typescript-7.0.2",
+            "formal-redex",
+            "target-cells",
+            "benchmarks",
+        ] {
+            assert_eq!(required_modes(catalog).expect("modes"), [Mode::Aot]);
+        }
     }
 
     #[test]
