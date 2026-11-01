@@ -383,6 +383,10 @@ pub enum UnaryOp {
     LogicalNot,
     /// ECMAScript `ToString`, which a template literal applies to a substitution.
     ToString,
+    /// ECMAScript `ToPropertyKey`, applied once to a key that is both read and
+    /// written. A primitive stays as it is, since it converts the same way each
+    /// time; only an object runs user code.
+    ToPropertyKey,
 }
 
 impl UnaryOp {
@@ -395,6 +399,7 @@ impl UnaryOp {
             Self::BitwiseNot => 4,
             Self::LogicalNot => 5,
             Self::ToString => 6,
+            Self::ToPropertyKey => 7,
         }
     }
 
@@ -407,6 +412,7 @@ impl UnaryOp {
             4 => Some(Self::BitwiseNot),
             5 => Some(Self::LogicalNot),
             6 => Some(Self::ToString),
+            7 => Some(Self::ToPropertyKey),
             _ => None,
         }
     }

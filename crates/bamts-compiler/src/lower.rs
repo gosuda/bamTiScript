@@ -4389,8 +4389,13 @@ impl<'a> FunctionContext<'a> {
         assignment: &AssignmentExpression,
     ) -> Result<Register, LowerError> {
         let base = self.member_base(builder, range, &member.object)?;
-        let key = self.member_key(builder, &member.property)?;
-        match compound_operator(assignment.operator) {
+        let compound = compound_operator(assignment.operator);
+        let key = if compound.is_some() {
+            self.read_write_key(builder, range, base, &member.property)?
+        } else {
+            self.member_key(builder, &member.property)?
+        };
+        match compound {
             None => {
                 let value = self.lower_expression(builder, &assignment.right)?;
                 self.set_member(range, base, key, value)?;
@@ -4463,7 +4468,7 @@ impl<'a> FunctionContext<'a> {
                     return Err(self.const_enum_operation(range, ConstEnumOperation::Write));
                 }
                 let base = self.member_base(builder, range, &member.object)?;
-                let key = self.member_key(builder, &member.property)?;
+                let key = self.read_write_key(builder, range, base, &member.property)?;
                 let old = self.get_member(range, base, key)?;
                 let one = self.load_constant(builder, Constant::Int32(1), range)?;
                 let updated = self.alloc_register(range)?;
@@ -4985,6 +4990,33 @@ impl<'a> FunctionContext<'a> {
             return Ok(MemberBase::Super { home, receiver });
         }
         Ok(MemberBase::Object(self.lower_expression(builder, object)?))
+    }
+    /// The key of a reference that is read and then written, converted now so
+    /// user conversion runs once. A reference through nothing still fails first.
+    fn read_write_key(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        base: MemberBase,
+        property: &MemberProperty,
+    ) -> Result<Register, LowerError> {
+        let operand = self.member_key(builder, property)?;
+        if !matches!(property, MemberProperty::Computed(_)) {
+            return Ok(operand);
+        }
+        if let MemberBase::Object(object) = base {
+            self.require_object_coercible(range, object)?;
+        }
+        let dst = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::Unary {
+                dst,
+                op: UnaryOp::ToPropertyKey,
+                operand,
+            },
+        )?;
+        Ok(dst)
     }
     fn get_member(
         &mut self,

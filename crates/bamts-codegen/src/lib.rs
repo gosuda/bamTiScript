@@ -854,6 +854,7 @@ const fn unary_op_selector(op: UnaryOp) -> i64 {
         UnaryOp::BitwiseNot => 4,
         UnaryOp::LogicalNot => 5,
         UnaryOp::ToString => 6,
+        UnaryOp::ToPropertyKey => 7,
     }
 }
 

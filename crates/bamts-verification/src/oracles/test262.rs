@@ -2272,6 +2272,39 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn a_read_write_reference_converts_its_key_once() {
+        const KEY: &str = "var n = 0;\n\
+            var k = { toString() { n++; return 'a'; } };\n\
+            function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [&str; 6] = [
+            "var o = { a: 1 }; o[k] += 1; assert.sameValue(n, 1); assert.sameValue(o.a, 2);",
+            "var o = { a: 1 }; o[k]++; assert.sameValue(n, 1); assert.sameValue(o.a, 2);",
+            "var o = { a: 0 }; o[k] ||= 5; assert.sameValue(n, 1); assert.sameValue(o.a, 5);",
+            "var o = null; assert.sameValue(throws(TypeError, function () { o[k] += 1; }), true); \
+             assert.sameValue(n, 0);",
+            "var a = [1, 2]; a[1] += 1; a[0]--; assert.sameValue(a[1], 3); \
+             assert.sameValue(a[0], 0);",
+            "var s = Symbol(); var o = { [s]: 1 }; o[s]++; assert.sameValue(o[s], 2);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: one key conversion", &format!("{KEY}{body}"));
+                let label = format!("key-once-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn construction_behaves_the_same_in_every_tier() {
         const THROWS: &str = "function throws(kind, body) {\n\
             try { body(); } catch (error) { return error instanceof kind; }\n\

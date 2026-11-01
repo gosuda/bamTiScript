@@ -243,7 +243,7 @@ fn is_extensible<H: Host>(
     )))
 }
 
-fn property_key_value<H: Host>(
+pub(crate) fn property_key_value<H: Host>(
     machine: &mut Machine<'_, H>,
     key: PropertyKey,
 ) -> Result<Value, EvalFailure> {

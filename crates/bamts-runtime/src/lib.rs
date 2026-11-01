@@ -12850,6 +12850,13 @@ impl<'a, H: Host> Machine<'a, H> {
                 self.allocate(HeapEntry::String(text))
                     .map_err(EvalFailure::Runtime)
             }
+            UnaryOp::ToPropertyKey => {
+                if !self.is_object(operand) {
+                    return Ok(operand);
+                }
+                let key = self.observable_property_key(operand)?;
+                intrinsics::builtins::reflect::property_key_value(self, key)
+            }
         }
     }
 
@@ -13905,6 +13912,7 @@ pub(crate) fn unary_from_selector(op: u32) -> Option<UnaryOp> {
         4 => Some(UnaryOp::BitwiseNot),
         5 => Some(UnaryOp::LogicalNot),
         6 => Some(UnaryOp::ToString),
+        7 => Some(UnaryOp::ToPropertyKey),
         _ => None,
     }
 }
