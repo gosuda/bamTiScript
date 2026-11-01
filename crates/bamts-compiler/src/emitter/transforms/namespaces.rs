@@ -14,7 +14,7 @@ use crate::enum_plan::{EnumMemberPlan, EnumScalar};
 use crate::source::TextRange;
 use crate::syntax::*;
 
-use super::Rewriter;
+use super::{RestExcludeKey, Rewriter, property_key_text};
 
 /// One namespace body being lowered.
 pub(super) struct NamespaceFrame {
@@ -421,8 +421,23 @@ impl Rewriter<'_> {
                 }
             }
             BindingPattern::Object(object) => {
-                let source = self.single_read_source(value, object.properties.len(), range, out);
+                let collects_rest = object
+                    .properties
+                    .iter()
+                    .any(|property| matches!(property.binding.data(), BindingPattern::Rest(_)));
+                let reads = object.properties.len() + usize::from(collects_rest);
+                let source = self.single_read_source(value, reads, range, out);
+                let mut keys = Vec::new();
                 for property in &object.properties {
+                    if let BindingPattern::Rest(rest) = property.binding.data() {
+                        if let Expression::Identifier(held) = source.data() {
+                            let excluded = self.rest_exclude_array(&keys, range);
+                            let collected = self.rest_call(held, excluded, range);
+                            self.flatten_export(&rest.argument, collected, parameter, out);
+                        }
+                        continue;
+                    }
+                    keys.extend(property_key_text(self, property).map(RestExcludeKey::Static));
                     let name = self.rewrite_property_name(&property.name);
                     let read = self.property_read(&source, name, range);
                     let read = self.with_default(read, property.initializer.as_deref(), out);
@@ -430,11 +445,23 @@ impl Rewriter<'_> {
                 }
             }
             BindingPattern::Array(array) => {
-                let source = self.single_read_source(value, array.elements.len(), range, out);
+                let collects_rest = array.elements.iter().any(|element| {
+                    matches!(element, ArrayBindingElement::Binding(binding)
+                        if matches!(binding.data(), BindingPattern::Rest(_)))
+                });
+                let reads = array.elements.len() + usize::from(collects_rest);
+                let source = self.single_read_source(value, reads, range, out);
                 for (index, element) in array.elements.iter().enumerate() {
                     let ArrayBindingElement::Binding(binding) = element else {
                         continue;
                     };
+                    if let BindingPattern::Rest(rest) = binding.data() {
+                        if let Expression::Identifier(held) = source.data() {
+                            let collected = self.slice_call(held, index, range);
+                            self.flatten_export(&rest.argument, collected, parameter, out);
+                        }
+                        continue;
+                    }
                     let index = self.number_expr(&index.to_string());
                     let property = MemberProperty::Computed(Box::new(index));
                     let read = self.member_expr(&source, property, range);

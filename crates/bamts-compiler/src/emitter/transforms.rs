@@ -10924,6 +10924,24 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
     }
 
     #[test]
+    fn an_exported_pattern_collects_its_rest() {
+        let output = emit_at(
+            "namespace M {\n\
+             \x20   export var [a, ...b] = [1, 2, 3];\n\
+             \x20   export var { c, ...d } = { c: 1, e: 2 };\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        for expected in [
+            "_a = [1, 2, 3], M.a = _a[0], M.b = _a.slice(1);",
+            "_b = { c: 1, e: 2 }, M.c = _b.c, M.d = __rest(_b, [\"c\"]);",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+    }
+
+    #[test]
     fn an_exported_namespace_publishes_its_container() {
         let source = "export namespace M { export var x = 1; }\n";
         let esm = emit_at(source, ScriptTarget::Es2015);
