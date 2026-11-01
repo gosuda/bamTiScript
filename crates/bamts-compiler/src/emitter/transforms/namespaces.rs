@@ -377,7 +377,7 @@ impl Rewriter<'_> {
 
     /// An exported variable lives only on the container, so its declaration
     /// is the assignment of its initializer, and it has none without one.
-    fn namespace_export_variables(
+    pub(super) fn namespace_export_variables(
         &mut self,
         declaration: &VariableDeclaration,
         parameter: &str,
@@ -476,18 +476,18 @@ impl Rewriter<'_> {
         let occupied = self
             .occupied_names
             .get_or_insert_with(|| super::identifier_names(file));
-        let frame = self
-            .namespace_frames
-            .last_mut()
-            .expect("an exported pattern is lowered inside a namespace body");
-        let (index, name) = (frame.temps..)
+        let temps = match self.namespace_frames.last_mut() {
+            Some(frame) => &mut frame.temps,
+            None => &mut self.module_temps,
+        };
+        let (index, name) = (*temps..)
             .map(|index| match LETTERS.get(index) {
                 Some(&letter) => (index, format!("_{}", char::from(letter))),
                 None => (index, format!("_{}", index - LETTERS.len())),
             })
             .find(|(_, candidate)| !occupied.contains(candidate))
             .expect("an unbounded index range reaches an unused name");
-        frame.temps = index + 1;
+        *temps = index + 1;
         let temp = self.ident(&name);
         if let Some(scope) = self.expression_temp_scopes.last_mut() {
             scope.push(temp.clone());

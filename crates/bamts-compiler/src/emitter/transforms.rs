@@ -612,6 +612,8 @@ struct Rewriter<'a> {
     value_symbol_ranges: Option<std::collections::HashMap<String, Vec<TextRange>>>,
     /// Where each alias read as a value is declared, once one needs to know.
     read_aliases: Option<BTreeSet<Utf16Pos>>,
+    /// Temporaries taken outside any namespace body.
+    module_temps: usize,
 }
 
 /// Per-file CommonJS lowering plan built before the rewrite walk.
@@ -625,6 +627,8 @@ struct CjsPlan {
     requires: Vec<String>,
     /// Import binding replacement by resolved module-scope symbol.
     imports: BTreeMap<crate::checker::SymbolId, CjsImportRef>,
+    /// Exported `var`/`let` bindings, which live only on `exports`.
+    exported_variables: BTreeSet<crate::checker::SymbolId>,
     /// Require-local names whose member calls become `(0, m.p)()`.
     require_roots: BTreeSet<String>,
 }
@@ -714,6 +718,7 @@ impl<'a> Rewriter<'a> {
             occupied_names: None,
             value_symbol_ranges: None,
             read_aliases: None,
+            module_temps: 0,
         }
     }
     /// Scans top-level module syntax into a CommonJS lowering plan.
@@ -839,9 +844,14 @@ impl<'a> Rewriter<'a> {
                                 }
                             }
                             _ => {
-                                for name in declared_binding_names(file, inner) {
-                                    plan.void_0.push(name);
+                                let names = declared_binding_names(file, inner);
+                                if let Statement::Variable(declaration) = inner.data()
+                                    && is_reassignable(declaration)
+                                {
+                                    plan.exported_variables
+                                        .extend(names.iter().filter_map(|name| symbol_of(name)));
                                 }
+                                plan.void_0.extend(names);
                             }
                         }
                     }
@@ -965,8 +975,12 @@ impl<'a> Rewriter<'a> {
                 out.push(self.cjs_export_assignment(&name, &name, range));
                 out
             }
+            Statement::Variable(declaration) if is_reassignable(declaration) => {
+                self.namespace_export_variables(declaration, "exports", range)
+            }
             _ => {
-                let names = self.cjs_declared_names(inner);
+                // A const never changes, so its local copy stays accurate.
+                let names = declared_binding_names(self.file, inner);
                 let mut out = self.rewrite_statement(inner);
                 for name in &names {
                     out.push(self.cjs_export_assignment(name, name, range));
@@ -1022,25 +1036,6 @@ impl<'a> Rewriter<'a> {
     }
 
     /// Declared value names of a statement, via the rewrite text.
-    fn cjs_declared_names(&self, statement: &Stmt) -> Vec<String> {
-        match statement.data() {
-            Statement::Variable(declaration) => declaration
-                .declarations
-                .iter()
-                .filter_map(|declarator| match declarator.data().binding.data() {
-                    BindingPattern::Identifier(ident) => {
-                        Some(self.token_text(ident.data().token()).to_owned())
-                    }
-                    _ => None,
-                })
-                .collect(),
-            Statement::Enum(declaration) => {
-                vec![self.token_text(declaration.name.data().token()).to_owned()]
-            }
-            _ => Vec::new(),
-        }
-    }
-
     fn rewrite_export_named_declaration(&mut self, statement: &Stmt, inner: &Stmt) -> Vec<Stmt> {
         let binding = if self.cjs.is_some() {
             ContainerBinding::CommonJs
@@ -1101,6 +1096,15 @@ impl<'a> Rewriter<'a> {
         out
     }
 
+    /// Whether a use resolved to a binding that lives only on `exports`.
+    fn cjs_reads_exported_variable(&self, reference: NodeId) -> bool {
+        self.cjs.as_ref().is_some_and(|plan| {
+            self.model
+                .and_then(|model| model.reference(reference))
+                .is_some_and(|symbol| plan.exported_variables.contains(&symbol))
+        })
+    }
+
     /// Rewrites a resolved import reference to its CommonJS member form.
     fn cjs_identifier_replacement(&mut self, expression: &Expr) -> Option<Expr> {
         let (root, property) = {
@@ -1138,6 +1142,9 @@ impl<'a> Rewriter<'a> {
         let Some(symbol) = self.model.and_then(|model| model.reference(ident.id())) else {
             return false;
         };
+        if plan.exported_variables.contains(&symbol) {
+            return true;
+        }
         plan.imports
             .get(&symbol)
             .is_some_and(|reference| reference.property.is_some())
@@ -7029,6 +7036,11 @@ impl<'a> Rewriter<'a> {
                 {
                     return self.namespace_member(&parameter, &name, expression.range());
                 }
+                if self.cjs_reads_exported_variable(expression.id())
+                    && let Some(name) = self.identifier_name(ident)
+                {
+                    return self.namespace_member("exports", &name, expression.range());
+                }
                 if let Some(replacement) = self.cjs_identifier_replacement(expression) {
                     replacement
                 } else {
@@ -7173,7 +7185,11 @@ impl<'a> Rewriter<'a> {
             AssignmentTarget::Identifier(ident) => {
                 let parameter = self
                     .namespace_member_parameter(target.id())
-                    .or_else(|| self.namespace_member_parameter(ident.id()));
+                    .or_else(|| self.namespace_member_parameter(ident.id()))
+                    .or_else(|| {
+                        self.cjs_reads_exported_variable(ident.id())
+                            .then(|| "exports".to_owned())
+                    });
                 let (Some(parameter), Some(name)) = (parameter, self.identifier_name(ident)) else {
                     return target.clone();
                 };
@@ -9050,17 +9066,44 @@ fn identifier_text(file: &SourceFile, ident: &IdentifierNode) -> String {
     raw_token_text(file, ident.data().token())
 }
 
+/// Whether a declaration's bindings can change after it runs.
+fn is_reassignable(declaration: &VariableDeclaration) -> bool {
+    matches!(declaration.kind, VariableKind::Var | VariableKind::Let)
+}
+
+fn collect_pattern_names(file: &SourceFile, pattern: &Pattern, names: &mut Vec<String>) {
+    match pattern.data() {
+        BindingPattern::Identifier(ident) => names.push(identifier_text(file, ident)),
+        BindingPattern::Object(object) => {
+            for property in &object.properties {
+                collect_pattern_names(file, &property.binding, names);
+            }
+        }
+        BindingPattern::Array(array) => {
+            for element in &array.elements {
+                if let ArrayBindingElement::Binding(binding) = element {
+                    collect_pattern_names(file, binding, names);
+                }
+            }
+        }
+        BindingPattern::Rest(rest) => collect_pattern_names(file, &rest.argument, names),
+        BindingPattern::Assignment(assignment) => {
+            collect_pattern_names(file, &assignment.left, names);
+        }
+        BindingPattern::Missing(_) => {}
+    }
+}
+
 /// Declared value names of a statement, for export assignment generation.
 fn declared_binding_names(file: &SourceFile, statement: &Stmt) -> Vec<String> {
     match statement.data() {
-        Statement::Variable(declaration) => declaration
-            .declarations
-            .iter()
-            .filter_map(|declarator| match declarator.data().binding.data() {
-                BindingPattern::Identifier(ident) => Some(identifier_text(file, ident)),
-                _ => None,
-            })
-            .collect(),
+        Statement::Variable(declaration) => {
+            let mut names = Vec::new();
+            for declarator in &declaration.declarations {
+                collect_pattern_names(file, &declarator.data().binding, &mut names);
+            }
+            names
+        }
         Statement::Enum(declaration) if !declaration.is_const => {
             vec![raw_token_text(file, declaration.name.data().token())]
         }
@@ -10870,6 +10913,44 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
              \x20   M.x = 1;\n\
              })(M || (exports.M = M = {}));\n"
         );
+    }
+
+    #[test]
+    fn commonjs_keeps_an_exported_variable_on_exports() {
+        // Upstream downlevelLetConst13 and internalAliasVarInsideTopLevelModuleWithExport.
+        let output = emit_with_options(
+            "export var a = 1, b;\n\
+             export let [c] = [1];\n\
+             a = 2;\n\
+             a++;\n\
+             const box = { a };\n\
+             a();\n\
+             function f(a: number) { return a; }\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        let body = code
+            .split_once("void 0;\n")
+            .map(|(_, body)| body)
+            .expect("the preamble declares the exports");
+        assert_eq!(
+            body,
+            "exports.a = 1;\n\
+             exports.c = [1][0];\n\
+             exports.a = 2;\n\
+             exports.a++;\n\
+             const box = { a: exports.a };\n\
+             (0, exports.a)();\n\
+             function f(a) { return a; }\n"
+        );
+        for name in ["exports.a", "exports.b", "exports.c"] {
+            let preamble = code.split("void 0;").next().expect("split yields a head");
+            assert!(preamble.contains(name), "{code}");
+        }
     }
 
     #[test]
