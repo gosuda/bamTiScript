@@ -886,7 +886,7 @@ fn set_time_fields<H: Host>(
         supplied.push(f64::NAN);
     }
     if raw.is_nan() {
-        return write_date_time(machine, this, f64::NAN);
+        return Ok(BuiltinOutcome::Value(Value::number(f64::NAN)));
     }
     let zone = if local {
         Some(timezone(machine)?)
@@ -924,7 +924,7 @@ fn set_calendar_fields<H: Host>(
         supplied.push(f64::NAN);
     }
     if raw.is_nan() && !invalid_zero {
-        return write_date_time(machine, this, f64::NAN);
+        return Ok(BuiltinOutcome::Value(Value::number(f64::NAN)));
     }
     let zone = if local {
         Some(timezone(machine)?)
@@ -1901,6 +1901,17 @@ mod tests {
         let value = call(&mut machine, invalid, "setHours", &[first, second]).unwrap();
         assert!(value_number(value).is_nan());
         assert_eq!(COERCION_STEP.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_setter_on_an_invalid_date_leaves_the_stored_time_alone() {
+        let module = blank_program("<date invalid setter>");
+        let mut host = ControlledHost { zone: "UTC" };
+        let mut machine = machine(&module, &mut host);
+        let date = construct_date(&mut machine, &[Value::number(f64::NAN)]);
+        let result = call(&mut machine, date, "setUTCHours", &[Value::int32(1)]).unwrap();
+        assert!(value_number(result).is_nan());
+        assert!(value_number(call(&mut machine, date, "getTime", &[]).unwrap()).is_nan());
     }
 
     static RECEIVER_ARGUMENT_COERCED: AtomicBool = AtomicBool::new(false);
