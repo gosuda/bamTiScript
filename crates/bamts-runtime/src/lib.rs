@@ -6811,6 +6811,7 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(())
     }
 
+    /// Whether a function is non-strict ECMAScript code.
     pub(crate) fn is_sloppy(&self, module: ModuleId, function: usize) -> bool {
         self.module_code(module).functions()[function]
             .flags()
