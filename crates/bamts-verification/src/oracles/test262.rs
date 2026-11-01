@@ -25,6 +25,8 @@ pub const DEFAULT_ASYNC_DEADLINE: Duration = Duration::from_millis(500);
 const HARNESS_ASSERT: &str = "assert.js";
 const HARNESS_STA: &str = "sta.js";
 const HARNESS_DONE: &str = "doneprintHandle.js";
+/// What names a file a test may import from its own directory.
+const FIXTURE_MARKER: &str = "_FIXTURE";
 const STRICT_PREFIX: &str = "\"use strict\";\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -875,16 +877,29 @@ pub fn evaluate_in_mode<R: Test262Runner>(
 pub struct InterpreterRunner {
     scratch: PathBuf,
     composed: AtomicU64,
+    origin: Option<PathBuf>,
 }
 
-/// Removes a materialized script on every exit path, including early `?`-less
+/// Removes a materialized case on every exit path, including early `?`-less
 /// classification returns and panics.
-struct MaterializedScript(PathBuf);
+struct MaterializedCase(PathBuf);
 
-impl Drop for MaterializedScript {
+impl Drop for MaterializedCase {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+/// Copies the `_FIXTURE` files beside a test, which it imports by relative path.
+fn copy_fixtures(from: &Path, to: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().contains(FIXTURE_MARKER) && entry.file_type()?.is_file() {
+            fs::copy(entry.path(), to.join(name))?;
+        }
+    }
+    Ok(())
 }
 
 impl InterpreterRunner {
@@ -896,7 +911,37 @@ impl InterpreterRunner {
         Self {
             scratch: scratch.into(),
             composed: AtomicU64::new(0),
+            origin: None,
         }
+    }
+
+    /// Materializes each composed script as `test_file` would be found: under
+    /// its name, beside copies of its fixtures. Relative imports then resolve,
+    /// including a module test that imports itself.
+    #[must_use]
+    pub fn for_test_file(mut self, test_file: impl Into<PathBuf>) -> Self {
+        self.origin = Some(test_file.into());
+        self
+    }
+
+    fn materialize(&self, request: &RunRequest, directory: &Path) -> std::io::Result<PathBuf> {
+        fs::create_dir_all(directory)?;
+        let origin = self.origin.as_deref();
+        if let Some(parent) = origin.and_then(Path::parent)
+            && request
+                .script
+                .bytes
+                .windows(FIXTURE_MARKER.len())
+                .any(|window| window == FIXTURE_MARKER.as_bytes())
+        {
+            copy_fixtures(parent, directory)?;
+        }
+        let name = origin
+            .and_then(Path::file_name)
+            .map_or_else(|| "composed.js".into(), std::ffi::OsStr::to_os_string);
+        let script = directory.join(name);
+        fs::write(&script, &request.script.bytes)?;
+        Ok(script)
     }
 }
 
@@ -911,20 +956,23 @@ impl Test262Runner for InterpreterRunner {
             };
         }
         let unique = self.composed.fetch_add(1, Ordering::Relaxed);
-        let script = MaterializedScript(
+        let case = MaterializedCase(
             self.scratch
-                .join(format!("composed-{}-{unique}.js", std::process::id())),
+                .join(format!("case-{}-{unique}", std::process::id())),
         );
-        if let Err(error) = fs::write(&script.0, &request.script.bytes) {
-            return RunOutcome::Blocked {
-                detail: format!(
-                    "could not materialize composed script `{}`: {error}",
-                    script.0.display()
-                ),
-            };
-        }
+        let script = match self.materialize(request, &case.0) {
+            Ok(script) => script,
+            Err(error) => {
+                return RunOutcome::Blocked {
+                    detail: format!(
+                        "could not materialize composed script in `{}`: {error}",
+                        case.0.display()
+                    ),
+                };
+            }
+        };
 
-        let executable = match bamts::compile_source_file(&script.0) {
+        let executable = match bamts::compile_source_file(&script) {
             Ok(executable) => executable,
             Err(bamts::Error::Diagnostics { diagnostics }) => {
                 return parse_phase_outcome(&diagnostics);
@@ -1336,6 +1384,64 @@ function $ERROR(message) {\n\
 
     fn wrap(yaml: &str, body: &str) -> String {
         format!("{FRONTMATTER_OPEN}\n{yaml}\n{FRONTMATTER_CLOSE}\n{body}")
+    }
+
+    /// Runs `body` as a module test named `case.js` beside `value_FIXTURE.js`.
+    fn run_module_beside_fixture(name: &str, body: &str) -> (RunOutcome, usize) {
+        let root =
+            std::env::temp_dir().join(format!("bamts-test262-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let tests = root.join("tests");
+        let scratch = root.join("scratch");
+        fs::create_dir_all(&tests).expect("tests directory");
+        fs::write(tests.join("value_FIXTURE.js"), "export const value = 42;\n").expect("fixture");
+        fs::write(tests.join("unrelated.js"), "throw 1;\n").expect("sibling");
+
+        let runner = InterpreterRunner::new(&scratch).for_test_file(tests.join("case.js"));
+        let request = RunRequest {
+            mode: ExecutionMode::Interpreter,
+            variant: ExecutionVariant {
+                kind: SourceKind::Module,
+            },
+            script: ComposedScript {
+                bytes: body.as_bytes().to_vec(),
+                test_offset: 0,
+                kind: SourceKind::Module,
+                untouched: true,
+            },
+            negative: None,
+            async_done: false,
+            deadline: Duration::from_secs(10),
+        };
+        let outcome = runner.run(&request);
+        let left = fs::read_dir(&scratch).map_or(0, |entries| entries.count());
+        fs::remove_dir_all(root).expect("remove scratch");
+        (outcome, left)
+    }
+
+    #[test]
+    fn a_composed_module_finds_the_fixtures_beside_its_test() {
+        let (outcome, left) = run_module_beside_fixture(
+            "fixture",
+            "import { value } from './value_FIXTURE.js';\nif (value !== 42) { throw new Error('wrong'); }\n",
+        );
+        assert!(
+            matches!(outcome, RunOutcome::Completed { thrown: None }),
+            "{outcome:?}"
+        );
+        assert_eq!(left, 0, "a run leaves nothing behind");
+    }
+
+    #[test]
+    fn a_composed_module_can_import_itself_by_its_test_name() {
+        let (outcome, _) = run_module_beside_fixture(
+            "self",
+            "import * as self from './case.js';\nexport const mine = 1;\nif (self.mine !== 1) { throw new Error('wrong'); }\n",
+        );
+        assert!(
+            matches!(outcome, RunOutcome::Completed { thrown: None }),
+            "{outcome:?}"
+        );
     }
 
     fn harness_root() -> PathBuf {
