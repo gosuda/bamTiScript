@@ -182,6 +182,11 @@ const CALENDAR_NAMES: &[(&str, &str)] = &[
     ("gregory", "Gregorian Calendar"),
     ("hebrew", "Hebrew Calendar"),
     ("indian", "Indian National Calendar"),
+    ("islamic-civil", "Hijri Calendar (tabular, civil epoch)"),
+    (
+        "islamic-tbla",
+        "Hijri Calendar (tabular, astronomical epoch)",
+    ),
     ("iso8601", "ISO-8601 Calendar"),
     ("japanese", "Japanese Calendar"),
     ("persian", "Persian Calendar"),

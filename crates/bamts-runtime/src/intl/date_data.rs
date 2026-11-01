@@ -1,4 +1,4 @@
-//! English date and time data: patterns, names, and the Gregorian calendar.
+//! English date and time data: patterns, names, and calendar dates.
 
 use super::date_time_format::{
     CalendarDateTime, DateTimeComponents, DateTimeFormatDataProvider, DateTimePattern,
@@ -8,6 +8,7 @@ use super::date_time_format::{
     TextFormatRequest, TextWidth, TimeZoneNameStyle,
 };
 use super::locale_data::{IntlData, numbering_system_digits, time_zone};
+use crate::temporal::calendar::Calendar;
 
 const NANOSECONDS_PER_MILLISECOND: i128 = 1_000_000;
 const MILLISECONDS_PER_DAY: i128 = 86_400_000;
@@ -34,6 +35,72 @@ const MONTHS: [&str; 12] = [
     "October",
     "November",
     "December",
+];
+const COPTIC_MONTHS: [&str; 13] = [
+    "Tout",
+    "Baba",
+    "Hator",
+    "Kiahk",
+    "Toba",
+    "Amshir",
+    "Baramhat",
+    "Baramouda",
+    "Bashans",
+    "Paona",
+    "Epep",
+    "Mesra",
+    "Nasie",
+];
+const ETHIOPIC_MONTHS: [&str; 13] = [
+    "Meskerem", "Tekemt", "Hedar", "Tahsas", "Ter", "Yekatit", "Megabit", "Miazia", "Genbot",
+    "Sene", "Hamle", "Nehasse", "Pagumen",
+];
+const INDIAN_MONTHS: [&str; 12] = [
+    "Chaitra",
+    "Vaisakha",
+    "Jyaistha",
+    "Asadha",
+    "Sravana",
+    "Bhadra",
+    "Asvina",
+    "Kartika",
+    "Agrahayana",
+    "Pausa",
+    "Magha",
+    "Phalguna",
+];
+const ISLAMIC_MONTHS: [&str; 12] = [
+    "Muharram",
+    "Safar",
+    "Rabi\u{02BB} I",
+    "Rabi\u{02BB} II",
+    "Jumada I",
+    "Jumada II",
+    "Rajab",
+    "Sha\u{02BB}ban",
+    "Ramadan",
+    "Shawwal",
+    "Dhu\u{02BB}l-Qi\u{02BB}dah",
+    "Dhu\u{02BB}l-Hijjah",
+];
+const PERSIAN_MONTHS: [&str; 12] = [
+    "Farvardin",
+    "Ordibehesht",
+    "Khordad",
+    "Tir",
+    "Mordad",
+    "Shahrivar",
+    "Mehr",
+    "Aban",
+    "Azar",
+    "Dey",
+    "Bahman",
+    "Esfand",
+];
+/// Hebrew months by month code, M01 to M12, without the leap month.
+const HEBREW_MONTHS: [&str; 12] = [
+    "Tishri", "Heshvan", "Kislev", "Tevet", "Shevat", "Adar", "Nisan", "Iyar", "Sivan", "Tamuz",
+    "Av", "Elul",
 ];
 
 fn literal(text: &str) -> PatternItem {
@@ -359,6 +426,12 @@ fn civil_from_days(days: i64) -> (i64, u8, u8) {
     (year, month as u8, day as u8)
 }
 
+fn local_days(local_epoch_nanoseconds: i128) -> i64 {
+    local_epoch_nanoseconds
+        .div_euclid(NANOSECONDS_PER_MILLISECOND)
+        .div_euclid(MILLISECONDS_PER_DAY) as i64
+}
+
 fn gregorian_date_time(local_epoch_nanoseconds: i128) -> CalendarDateTime {
     let milliseconds = local_epoch_nanoseconds.div_euclid(NANOSECONDS_PER_MILLISECOND);
     let days = milliseconds.div_euclid(MILLISECONDS_PER_DAY);
@@ -385,6 +458,64 @@ fn gregorian_date_time(local_epoch_nanoseconds: i128) -> CalendarDateTime {
     }
 }
 
+/// A calendar's view of a local time; the weekday and time of day are the same
+/// in every calendar.
+fn calendar_view(calendar: Calendar, local_epoch_nanoseconds: i128) -> CalendarDateTime {
+    let date = calendar.date(local_days(local_epoch_nanoseconds));
+    let (era, year) = calendar.era(date);
+    CalendarDateTime {
+        era: Some(era.to_owned()),
+        year: year as i32,
+        month: date.month,
+        month_code: calendar.month_code(date.year, date.month).render(),
+        day: date.day,
+        ..gregorian_date_time(local_epoch_nanoseconds)
+    }
+}
+
+/// The name of a Hebrew month: Adar is Adar II in a year that has Adar I.
+fn hebrew_month_name(local: &CalendarDateTime) -> &'static str {
+    match local.month_code.as_str() {
+        "M05L" => "Adar I",
+        "M06" if local.month == 7 => "Adar II",
+        code => {
+            let number = code[1..].parse::<usize>().unwrap_or(1);
+            HEBREW_MONTHS[number - 1]
+        }
+    }
+}
+
+fn month_name(calendar: &str, local: &CalendarDateTime) -> &'static str {
+    let names: &[&'static str] = match calendar {
+        "coptic" => &COPTIC_MONTHS,
+        "ethioaa" | "ethiopic" => &ETHIOPIC_MONTHS,
+        "hebrew" => return hebrew_month_name(local),
+        "indian" => &INDIAN_MONTHS,
+        "islamic-civil" | "islamic-tbla" => &ISLAMIC_MONTHS,
+        "persian" => &PERSIAN_MONTHS,
+        _ => &MONTHS,
+    };
+    names[usize::from(local.month) - 1]
+}
+
+/// Calendars other than Gregorian show their era wherever they show a year.
+fn show_calendar_era(calendar: &str, pattern: &mut DateTimePattern) {
+    if matches!(calendar, "gregory" | "iso8601") {
+        return;
+    }
+    let has_era = |item: &PatternItem| matches!(item, PatternItem::Field(PatternField::Era(_)));
+    let is_year = |item: &PatternItem| matches!(item, PatternItem::Field(PatternField::Year(_)));
+    if pattern.items.iter().any(has_era) {
+        return;
+    }
+    if let Some(year) = pattern.items.iter().position(is_year) {
+        pattern.items.insert(year + 1, literal(" "));
+        pattern
+            .items
+            .insert(year + 2, field(PatternField::Era(TextWidth::Short)));
+    }
+}
+
 fn day_period_text(hour: u8, width: TextWidth) -> &'static str {
     match hour {
         6..=11 => "in the morning",
@@ -401,6 +532,15 @@ fn era_text(era: &str, width: TextWidth) -> &'static str {
         ("bce", TextWidth::Long) => "Before Christ",
         ("bce", TextWidth::Short) => "BC",
         ("bce", TextWidth::Narrow) => "B",
+        ("be", _) => "BE",
+        ("am", _) => "AM",
+        ("aa", _) => "AA",
+        ("shaka", _) => "Saka",
+        ("ah", _) => "AH",
+        ("bh", _) => "BH",
+        ("ap", _) => "AP",
+        ("roc", _) => "Minguo",
+        ("broc", _) => "Before R.O.C.",
         (_, TextWidth::Long) => "Anno Domini",
         (_, TextWidth::Short) => "AD",
         (_, TextWidth::Narrow) => "A",
@@ -476,13 +616,13 @@ impl DateTimeFormatDataProvider for IntlData {
         &self,
         request: &PatternRequest<'_>,
     ) -> Result<DateTimePattern, ProviderError> {
-        Ok(
-            if request.date_style.is_some() || request.time_style.is_some() {
-                style_pattern(request.date_style, request.time_style, request.hour_cycle)
-            } else {
-                components_pattern(request.components, request.hour_cycle)
-            },
-        )
+        let mut pattern = if request.date_style.is_some() || request.time_style.is_some() {
+            style_pattern(request.date_style, request.time_style, request.hour_cycle)
+        } else {
+            components_pattern(request.components, request.hour_cycle)
+        };
+        show_calendar_era(request.calendar, &mut pattern);
+        Ok(pattern)
     }
 
     fn select_range_pattern(
@@ -512,7 +652,9 @@ impl DateTimeFormatDataProvider for IntlData {
     ) -> Result<CalendarDateTime, ProviderError> {
         match calendar {
             "gregory" | "iso8601" => Ok(gregorian_date_time(local_epoch_nanoseconds)),
-            other => Err(ProviderError::missing("calendar", other)),
+            other => Calendar::from_name(other)
+                .map(|calendar| calendar_view(calendar, local_epoch_nanoseconds))
+                .ok_or_else(|| ProviderError::missing("calendar", other)),
         }
     }
 
@@ -572,10 +714,82 @@ impl DateTimeFormatDataProvider for IntlData {
                 era_text(local.era.as_deref().unwrap_or("ce"), width).to_owned()
             }
             TextField::YearName(_) => local.year_name.clone().unwrap_or_default(),
-            TextField::Month(width) => abbreviated(MONTHS[usize::from(local.month) - 1], width),
+            TextField::Month(width) => abbreviated(month_name(request.calendar, local), width),
             TextField::DayPeriod(width) => day_period_text(local.hour, width).to_owned(),
             TextField::AmPm => String::from(if local.hour < 12 { "AM" } else { "PM" }),
             TextField::TimeZoneName(style) => time_zone_text(request.time_zone, style),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NANOSECONDS_PER_DAY: i128 = 86_400_000_000_000;
+
+    fn view(calendar: Calendar, days: i128) -> CalendarDateTime {
+        calendar_view(calendar, days * NANOSECONDS_PER_DAY)
+    }
+
+    #[test]
+    fn calendar_view_shows_the_era_year_and_keeps_the_weekday() {
+        // 2024-03-26, a Tuesday.
+        let days = 19_808;
+        let gregorian = gregorian_date_time(days * NANOSECONDS_PER_DAY);
+        assert_eq!(gregorian.weekday, 2);
+
+        let buddhist = view(Calendar::Buddhist, days);
+        assert_eq!((buddhist.year, buddhist.month, buddhist.day), (2567, 3, 26));
+        assert_eq!(buddhist.era.as_deref(), Some("be"));
+        assert_eq!(buddhist.weekday, gregorian.weekday);
+
+        let islamic = view(Calendar::IslamicCivil, days);
+        assert_eq!((islamic.year, islamic.month), (1445, 9));
+        assert_eq!(month_name("islamic-civil", &islamic), "Ramadan");
+
+        // Before 1912 the ROC year counts down from the era's start.
+        let before_roc = view(Calendar::Roc, -30_000);
+        assert_eq!(before_roc.era.as_deref(), Some("broc"));
+        assert!(before_roc.year > 0);
+    }
+
+    #[test]
+    fn hebrew_month_names_follow_the_month_code() {
+        let calendar = Calendar::Hebrew;
+        let named = |year, month| {
+            let days = calendar.epoch_days(year, month, 1);
+            let local = view(calendar, i128::from(days));
+            month_name("hebrew", &local)
+        };
+        // 5784 is a leap year, 5783 is not.
+        assert_eq!(named(5784, 6), "Adar I");
+        assert_eq!(named(5784, 7), "Adar II");
+        assert_eq!(named(5784, 8), "Nisan");
+        assert_eq!(named(5783, 6), "Adar");
+        assert_eq!(named(5783, 7), "Nisan");
+        assert_eq!(named(5783, 12), "Elul");
+    }
+
+    #[test]
+    fn only_calendars_other_than_gregorian_add_an_era() {
+        let year_pattern = || DateTimePattern {
+            components: DateTimeComponents::default(),
+            items: vec![field(PatternField::Year(NumericStyle::Numeric))],
+        };
+        let mut plain = year_pattern();
+        show_calendar_era("gregory", &mut plain);
+        assert_eq!(plain.items.len(), 1);
+        show_calendar_era("iso8601", &mut plain);
+        assert_eq!(plain.items.len(), 1);
+
+        let mut with_era = year_pattern();
+        show_calendar_era("buddhist", &mut with_era);
+        assert_eq!(
+            with_era.items[2],
+            field(PatternField::Era(TextWidth::Short))
+        );
+        show_calendar_era("buddhist", &mut with_era);
+        assert_eq!(with_era.items.len(), 3, "an era is added only once");
     }
 }

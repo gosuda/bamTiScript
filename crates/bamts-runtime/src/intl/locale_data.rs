@@ -854,7 +854,20 @@ pub static DATA: LazyLock<IntlData> = LazyLock::new(|| {
     );
     IntlData {
         available: owned(&["en", "en-US"]),
-        calendars: owned(&["gregory", "iso8601"]),
+        calendars: owned(&[
+            "buddhist",
+            "coptic",
+            "ethioaa",
+            "ethiopic",
+            "gregory",
+            "hebrew",
+            "indian",
+            "islamic-civil",
+            "islamic-tbla",
+            "iso8601",
+            "persian",
+            "roc",
+        ]),
         collations: owned(COLLATIONS),
         currencies: owned(CURRENCIES),
         numbering_systems,
@@ -869,7 +882,20 @@ pub static DATA: LazyLock<IntlData> = LazyLock::new(|| {
         case_first_keywords: owned(&["false", "lower", "upper"]),
         numeric_keywords: owned(&["false", "true"]),
         numbering_keywords,
-        calendar_keywords: owned(&["gregory", "iso8601"]),
+        calendar_keywords: owned(&[
+            "gregory",
+            "buddhist",
+            "coptic",
+            "ethioaa",
+            "ethiopic",
+            "hebrew",
+            "indian",
+            "islamic-civil",
+            "islamic-tbla",
+            "iso8601",
+            "persian",
+            "roc",
+        ]),
         hour_cycle_keywords: owned(&["h12", "h11", "h23", "h24"]),
     }
 });
