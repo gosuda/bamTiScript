@@ -551,6 +551,50 @@ pub(super) fn to_temporal_date<H: Host>(
     Ok((date, calendar))
 }
 
+/// ToTemporalDateTime.
+pub(super) fn to_temporal_date_time<H: Host>(
+    machine: &mut Machine<'_, H>,
+    item: Value,
+    options: Value,
+) -> Result<(PlainDateTime, CalendarId), EvalFailure> {
+    if is_object(machine, item)? {
+        match temporal_record(machine, item)? {
+            Some(TemporalObject::PlainDateTime { value, calendar }) => {
+                read_overflow(machine, options)?;
+                return Ok((value, calendar));
+            }
+            Some(TemporalObject::ZonedDateTime(zoned)) => {
+                let local = zoned
+                    .to_plain_date_time(&FixedOffsetTimeZones)
+                    .or_throw(machine)?;
+                read_overflow(machine, options)?;
+                return Ok((local, zoned.calendar_id().clone()));
+            }
+            Some(TemporalObject::PlainDate { value, calendar }) => {
+                read_overflow(machine, options)?;
+                let local =
+                    PlainDateTime::from_parts(value, PlainTime::midnight()).or_throw(machine)?;
+                return Ok((local, calendar));
+            }
+            _ => {}
+        }
+        let calendar = calendar_with_iso_default(machine, item)?;
+        let names = FieldNames::DATE.with(FieldNames::TIME);
+        let fields = prepare_calendar_fields(machine, item, names, FieldNames::NONE)?;
+        let resolved = get_options_object(machine, options)?;
+        let overflow = overflow_option(machine, resolved)?;
+        let value = date_time_from_fields(machine, &fields, overflow)?;
+        let value = PlainDateTime::from_parts(value.date, value.time).or_throw(machine)?;
+        return Ok((value, calendar));
+    }
+    let text = require_string(machine, item, "date-time")?;
+    let parsed = parse_date_time_string(&text, false).or_throw(machine)?;
+    let calendar = parsed_calendar(machine, &parsed)?;
+    read_overflow(machine, options)?;
+    let value = PlainDateTime::from_parsed(&parsed).or_throw(machine)?;
+    Ok((value, calendar))
+}
+
 /// ToTemporalTime.
 pub(super) fn to_temporal_time<H: Host>(
     machine: &mut Machine<'_, H>,

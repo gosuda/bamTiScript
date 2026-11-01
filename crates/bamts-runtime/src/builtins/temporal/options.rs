@@ -9,6 +9,7 @@ use crate::temporal::instant_duration::{
     Overflow, RoundingMode, Unit, UnitCategory, validate_rounding_increment,
 };
 use crate::temporal::now_rounding::{FractionalSecondDigits, SecondsStringPrecision, ShowCalendar};
+use crate::temporal::zoned_date_time::Disambiguation;
 use crate::{EvalFailure, Host, Machine};
 
 /// A resolved options argument. `None` stands for the empty null-prototype
@@ -72,6 +73,25 @@ pub(super) fn overflow_option<H: Host>(
         .as_deref()
         .and_then(Overflow::from_name)
         .unwrap_or_default())
+}
+
+/// GetTemporalDisambiguationOption.
+pub(super) fn disambiguation_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<Disambiguation, EvalFailure> {
+    let value = string_option(
+        machine,
+        options,
+        "disambiguation",
+        &["compatible", "earlier", "later", "reject"],
+    )?;
+    Ok(match value.as_deref() {
+        Some("earlier") => Disambiguation::Earlier,
+        Some("later") => Disambiguation::Later,
+        Some("reject") => Disambiguation::Reject,
+        _ => Disambiguation::Compatible,
+    })
 }
 
 /// GetTemporalShowCalendarNameOption.

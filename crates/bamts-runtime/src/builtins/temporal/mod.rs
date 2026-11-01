@@ -109,6 +109,7 @@ mod fields;
 mod instant;
 mod options;
 mod plain_date;
+mod plain_date_time;
 mod plain_time;
 
 use std::collections::BTreeMap;
@@ -203,6 +204,7 @@ pub(super) fn install<H: Host>(
     instant::install(heap, builtins, namespace);
     plain_time::install(heap, builtins, namespace);
     plain_date::install(heap, builtins, namespace);
+    plain_date_time::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Temporal"), namespace);
 }
 
