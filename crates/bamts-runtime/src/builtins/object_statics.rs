@@ -137,6 +137,9 @@ pub(super) fn own_keys<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
 ) -> Result<Vec<PropertyKey>, EvalFailure> {
+    if let Some(index) = machine.runtime_slot(object).map_err(EvalFailure::Runtime)? {
+        machine.reify_function_properties(index)?;
+    }
     let stored = machine.own_property_keys(object)?;
     let primitive = machine.unbox_primitive_or_self(object)?;
     let Some(index) = machine

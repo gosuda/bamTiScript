@@ -84,6 +84,13 @@ pub(super) fn install<H: Host>(
         define_data(heap, builtins.function_prototype(), name, function);
     }
     install_restricted_function_properties(heap, builtins);
+    let reified = crate::intrinsics::push(
+        heap,
+        HeapEntry::PrivateName {
+            description: EcmaString::encode("[[FunctionPropertiesStored]]"),
+        },
+    );
+    builtins.set_function_reified_brand(reified);
     let has_instance = install_function(
         heap,
         builtins,
@@ -984,6 +991,52 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn function_length_and_name_become_own_properties_that_can_be_deleted() {
+        let module = constructable_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let function = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                context: None,
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        assert_eq!(
+            machine.get_named_property(function, "length").unwrap(),
+            Value::int32(0),
+            "reads work before anything stores them"
+        );
+        let keys = machine.internal_own_property_keys(function).unwrap();
+        assert_eq!(keys[..2], [named("length"), named("name")]);
+        assert!(matches!(
+            machine.own_descriptor(function, &named("name")).unwrap(),
+            Some(Property::Data {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                ..
+            })
+        ));
+        assert!(machine.internal_delete(function, &named("length")).unwrap());
+        assert!(
+            !machine
+                .has_own_property_key(function, &named("length"))
+                .unwrap()
+        );
+        assert!(
+            machine
+                .own_descriptor(function, &named("length"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

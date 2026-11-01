@@ -6746,6 +6746,73 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(properties)
     }
 
+    /// A function's `length` and `name` come from its code until something could
+    /// tell that from stored properties: a descriptor read, a key list, a delete or
+    /// a redefinition stores them first, ahead of whatever is already stored.
+    pub(crate) fn reify_function_properties(&mut self, index: usize) -> Result<(), EvalFailure> {
+        let reified = self.intrinsics.builtins.function_reified_key();
+        let name_key = PropertyKey::Named(EcmaString::encode("name"));
+        let length_key = PropertyKey::Named(EcmaString::encode("length"));
+        let HeapEntry::Function {
+            module,
+            function,
+            properties,
+            ..
+        } = &self.heap[index]
+        else {
+            return Ok(());
+        };
+        if properties.contains_key(&reified) {
+            return Ok(());
+        }
+        let metadata = &self.module_code(*module).functions()[function.get() as usize];
+        let length = (!properties.contains_key(&length_key))
+            .then(|| number_value(metadata.parameter_count() as f64));
+        let name = (!properties.contains_key(&name_key)).then(|| {
+            metadata
+                .name()
+                .map(|id| self.constant_text(*module, id).clone())
+                .unwrap_or_default()
+        });
+        let name = name
+            .map(|text| self.allocate(HeapEntry::String(text)))
+            .transpose()
+            .map_err(EvalFailure::Runtime)?;
+        let mut stored = PropertyMap::default();
+        for (key, value) in [(length_key, length), (name_key, name)] {
+            if let Some(value) = value {
+                stored.insert(
+                    key,
+                    Property::Data {
+                        value,
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                );
+            }
+        }
+        stored.insert(
+            reified,
+            Property::Data {
+                value: Value::TRUE,
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        self.charge_slot(index, stored.charge_bytes())
+            .map_err(EvalFailure::Runtime)?;
+        let HeapEntry::Function { properties, .. } = &mut self.heap[index] else {
+            unreachable!("function checked above");
+        };
+        for (key, property) in std::mem::take(properties).0 {
+            stored.insert(key, property);
+        }
+        *properties = stored;
+        Ok(())
+    }
+
     pub(crate) fn is_sloppy(&self, module: ModuleId, function: usize) -> bool {
         self.module_code(module).functions()[function]
             .flags()
@@ -8637,6 +8704,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 if let Some(found) = property_lookup_ascii(properties, name) {
                     return Some(found);
                 }
+                if properties.contains_key(&self.intrinsics.builtins.function_reified_key()) {
+                    return None;
+                }
                 let metadata = &self.module_code(*module).functions()[function.get() as usize];
                 if name == "length" {
                     return Some(Found::Value(
@@ -8771,7 +8841,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 if let Some(found) = property_lookup(properties, key) {
                     return Some(found);
                 }
-                if let PropertyKey::Named(name) = key {
+                if let PropertyKey::Named(name) = key
+                    && !properties.contains_key(&self.intrinsics.builtins.function_reified_key())
+                {
                     let metadata = &self.module_code(*module).functions()[function.get() as usize];
                     if name.eq_ascii("length") {
                         return Some(Found::Value(
@@ -9953,6 +10025,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 {
                     return Ok(false);
                 }
+                self.reify_function_properties(index)?;
                 if let PropertyKey::Named(name) = key
                     && let Some(typed_index) = typedarray_all::typed_array_index(name)
                     && matches!(self.heap[index], HeapEntry::TypedArray { .. })

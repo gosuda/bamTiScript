@@ -1228,6 +1228,7 @@ impl<'a, H: Host> Machine<'a, H> {
         if let Some(property) = self.string_exotic_property(index, key)? {
             return Ok(Some(property));
         }
+        self.reify_function_properties(index)?;
         let properties = match &self.heap[index] {
             HeapEntry::ModuleNamespace { module } => {
                 let PropertyKey::Named(name) = key else {
@@ -1434,6 +1435,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Err(type_error("Object.defineProperty called on non-object"));
         };
+        self.reify_function_properties(index)?;
         if let Some(Property::Data {
             value: stored,
             enumerable,
