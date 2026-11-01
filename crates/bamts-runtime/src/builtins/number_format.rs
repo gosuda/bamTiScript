@@ -154,7 +154,9 @@ impl Big {
 
     fn set_bit(&mut self, index: u32) {
         let word = (index / 32) as usize;
-        self.0.resize(word + 1, 0);
+        if self.0.len() <= word {
+            self.0.resize(word + 1, 0);
+        }
         self.0[word] |= 1_u32 << (index % 32);
     }
 
@@ -735,6 +737,30 @@ mod tests {
         assert_eq!(to_exponential(2.5, Some(0.0)), Ok("3e+0".to_owned()));
         assert_eq!(to_exponential(123.456, Some(2.0)), Ok("1.23e+2".to_owned()));
         assert_eq!(to_exponential(77.0, None), Ok("7.7e+1".to_owned()));
+    }
+
+    /// `div_rem` sets quotient bits from the top down, so a quotient of 2^32 or
+    /// more is only right if setting a low bit keeps the limbs above it. Losing
+    /// them made `rounded_significand` oscillate between exponents forever.
+    #[test]
+    fn precision_past_one_limb_of_quotient_terminates_with_exact_digits() {
+        let cases = [
+            (1.5, 16.0, "1.500000000000000"),
+            (1.1, 16.0, "1.100000000000000"),
+            (123.456, 21.0, "123.456000000000003070"),
+            (0.5, 16.0, "0.5000000000000000"),
+            (100.0, 16.0, "100.0000000000000"),
+        ];
+        for (value, precision, expected) in cases {
+            assert_eq!(
+                to_precision(value, Some(precision)),
+                Ok(expected.to_owned())
+            );
+        }
+        assert_eq!(
+            to_fixed(0.1, 25.0),
+            Ok("0.1000000000000000055511151".to_owned())
+        );
     }
 
     #[test]
