@@ -6726,8 +6726,13 @@ impl<'a, H: Host> Machine<'a, H> {
         } else {
             let name = self.constant_text(module, name).to_owned();
             let global = self.context_global.unwrap_or(self.global_object);
-            let stored = self.internal_set(global, PropertyKey::Named(name), value, global)?;
-            if !stored && !sloppy {
+            let key = PropertyKey::Named(name);
+            let stored = self.internal_set(global, key.clone(), value, global)?;
+            // This instruction also carries global declarations, whose failure
+            // always throws. Only an assignment can fail on an existing
+            // property, and sloppy code ignores that; a missing property on a
+            // non-extensible global is taken to be a declaration.
+            if !stored && !(sloppy && self.has_own_property_key(global, &key)?) {
                 return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "assign to read only property",
                 }));
