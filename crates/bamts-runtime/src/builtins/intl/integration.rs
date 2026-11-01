@@ -23,6 +23,21 @@ use crate::temporal::TemporalObject;
 use crate::temporal::instant_duration::Duration;
 use crate::{EvalFailure, Host, Machine};
 
+/// `Number.prototype.toLocaleString` after the receiver check.
+pub(in crate::intrinsics::builtins) fn number_to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    number: f64,
+    locales: Value,
+    options: Value,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    number_to_string(
+        machine,
+        &IntlMathematicalValue::from_f64(number),
+        locales,
+        options,
+    )
+}
+
 /// `BigInt.prototype.toLocaleString` after the receiver check.
 pub(in crate::intrinsics::builtins) fn bigint_to_locale_string<H: Host>(
     machine: &mut Machine<'_, H>,

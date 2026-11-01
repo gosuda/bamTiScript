@@ -41,6 +41,7 @@ pub(super) fn install<H: Host>(
         ("splice", 2, splice::<H>),
         ("concat", 1, concat::<H>),
         ("join", 1, join::<H>),
+        ("toLocaleString", 0, to_locale_string::<H>),
         ("indexOf", 1, index_of::<H>),
         ("lastIndexOf", 1, last_index_of::<H>),
         ("includes", 1, includes::<H>),
@@ -522,6 +523,42 @@ fn join<H: Host>(
         output.finish(),
     )?))
 }
+/// `Array.prototype.toLocaleString`: ECMA-402 passes `locales` and `options` on
+/// to every element.
+fn to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let object = machine.value_to_object(this)?;
+    let length = array_es2023::length_of_array_like(machine, object)?;
+    let argument = |index: usize| args.get(index).copied().unwrap_or(Value::UNDEFINED);
+    let forwarded = [argument(0), argument(1)];
+    let mut output = bamts_bytecode::EcmaStringBuilder::new();
+    for index in 0..length {
+        if index != 0 {
+            output.push_unit(u16::from(b','));
+        }
+        let value = machine.get_named_property(object, &index.to_string())?;
+        if matches!(value.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            continue;
+        }
+        let method = machine.get_named_property(value, "toLocaleString")?;
+        if !machine.is_callable(method)? {
+            return Err(type_error("toLocaleString is not callable"));
+        }
+        let localized = machine.call_value(method, value, &forwarded)?;
+        for &unit in machine.coerce_string_observable(localized)?.as_units() {
+            output.push_unit(unit);
+        }
+    }
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        output.finish(),
+    )?))
+}
+
 fn to_string<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,

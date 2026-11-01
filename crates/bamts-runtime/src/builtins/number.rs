@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
+use super::intl::number_to_locale_string;
 use super::{
     allocate_string, define_data, install_constructor_function, install_function, number_format,
     range_error, to_integer_or_infinity, type_error, value_number,
@@ -45,6 +46,7 @@ pub(super) fn install<H: Host>(
     for (name, length, handler) in [
         ("toString", 1, to_string::<H> as BuiltinHandler<H>),
         ("toFixed", 1, to_fixed::<H>),
+        ("toLocaleString", 0, to_locale_string::<H>),
         ("toExponential", 1, to_exponential::<H>),
         ("toPrecision", 1, to_precision::<H>),
         ("valueOf", 0, value_of::<H>),
@@ -229,6 +231,21 @@ fn to_string<H: Host>(
         EcmaString::encode(&text),
     )?))
 }
+fn to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let n = primitive_number(
+        machine,
+        this,
+        "Number.prototype.toLocaleString requires that 'this' be a Number",
+    )?;
+    let argument = |index: usize| args.get(index).copied().unwrap_or(Value::UNDEFINED);
+    number_to_locale_string(machine, n, argument(0), argument(1))
+}
+
 fn to_fixed<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,

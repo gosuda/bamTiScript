@@ -19,7 +19,7 @@ mod segmenter;
 
 pub(super) use integration::{
     bigint_to_locale_string, date_to_locale_string, duration_to_locale_string,
-    temporal_to_locale_string,
+    number_to_locale_string, temporal_to_locale_string,
 };
 
 use std::collections::BTreeMap;
