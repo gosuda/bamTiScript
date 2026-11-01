@@ -392,6 +392,7 @@ impl Regex {
             min,
             max,
             greedy,
+            captures,
         } = first
         {
             // Deduplicate states within each repetition level by (position,
@@ -421,7 +422,9 @@ impl Regex {
                 let mut next = Vec::new();
                 seen.clear();
                 for prior in &levels[count] {
-                    for matched in self.match_node(body, input, prior.clone())? {
+                    let mut attempt = prior.clone();
+                    attempt.captures[captures.clone()].fill(None);
+                    for matched in self.match_node(body, input, attempt)? {
                         if matched.position == prior.position && count + 1 >= *min {
                             continue;
                         }
@@ -532,6 +535,8 @@ enum Node {
         min: usize,
         max: Option<usize>,
         greedy: bool,
+        /// The groups inside `body`, which each iteration starts without.
+        captures: Range<usize>,
     },
 }
 
@@ -1033,8 +1038,9 @@ impl<'a> Parser<'a> {
             if Some(token) == terminator || token == u16::from(b'|') {
                 break;
             }
+            let first_capture = self.capture_count + 1;
             let atom = self.parse_atom()?;
-            nodes.push(self.parse_quantifier(atom)?);
+            nodes.push(self.parse_quantifier(atom, first_capture)?);
         }
         Ok(nodes)
     }
@@ -1261,7 +1267,7 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
-    fn parse_quantifier(&mut self, atom: Node) -> Result<Node, RegexError> {
+    fn parse_quantifier(&mut self, atom: Node, first_capture: usize) -> Result<Node, RegexError> {
         let Some(token) = self.peek() else {
             return Ok(atom);
         };
@@ -1313,6 +1319,7 @@ impl<'a> Parser<'a> {
             min,
             max,
             greedy,
+            captures: first_capture..self.capture_count + 1,
         })
     }
 
@@ -1511,6 +1518,11 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn each_repeat_iteration_forgets_the_captures_inside_it() {
+        assert_eq!(ranges("(?:(a)|b)*", "", "ab"), [Some(0..2), None]);
     }
 
     #[test]
