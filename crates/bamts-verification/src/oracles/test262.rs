@@ -2015,6 +2015,44 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn an_object_pattern_refuses_null_and_undefined() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [(&str, &str); 3] = [
+            (
+                "",
+                "assert.sameValue(throws(TypeError, function () { let {} = undefined; }), true);",
+            ),
+            (
+                "",
+                "var a; assert.sameValue(throws(TypeError, function () { ({} = null); }), true);",
+            ),
+            (
+                "",
+                "var read = 0; var key = function () { read += 1; return 'k'; }; assert.sameValue(throws(TypeError, function () { var { [key()]: x } = null; }), true); assert.sameValue(read, 0);",
+            ),
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, (flags, body)) in CASES.iter().enumerate() {
+                let source = wrap(
+                    &format!("description: object patterns\n{flags}"),
+                    &format!("{THROWS}{body}"),
+                );
+                let label = format!("object-patterns-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_script_declares_on_the_global_object() {
         const CASES: [(&str, &str); 11] = [
             (

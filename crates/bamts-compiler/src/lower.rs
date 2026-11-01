@@ -6501,6 +6501,7 @@ impl<'a> FunctionContext<'a> {
                 )
             }
             BindingPattern::Object(object) => {
+                self.require_object_coercible(range, value)?;
                 let mut taken: Vec<Register> = Vec::new();
                 for property in &object.properties {
                     if let BindingPattern::Rest(rest) = property.binding.data() {
@@ -6730,6 +6731,17 @@ impl<'a> FunctionContext<'a> {
         }
         Ok(rest)
     }
+    /// An object pattern refuses null and undefined before anything else, which
+    /// reading its first property could not do for `{}` or a computed key.
+    fn require_object_coercible(
+        &mut self,
+        range: TextRange,
+        value: Register,
+    ) -> Result<(), LowerError> {
+        let dst = self.alloc_register(range)?;
+        self.emit(range, Instruction::ToObject { dst, src: value })?;
+        Ok(())
+    }
     fn assign_target(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -6752,6 +6764,7 @@ impl<'a> FunctionContext<'a> {
                 Ok(())
             }
             AssignmentTarget::Object(object) => {
+                self.require_object_coercible(range, value)?;
                 let mut taken: Vec<Register> = Vec::new();
                 for property in &object.properties {
                     self.assign_object_property(builder, range, value, property, &mut taken)?;
