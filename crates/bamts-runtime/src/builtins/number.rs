@@ -40,7 +40,20 @@ pub(super) fn install<H: Host>(
         ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
         ("NaN", f64::NAN),
     ] {
-        define_static(heap, constructor, name, crate::number_value(value))
+        let HeapEntry::NativeFunction { properties, .. } =
+            &mut heap[super::heap_index(constructor)]
+        else {
+            panic!("Number constructor must be native")
+        };
+        properties.insert(
+            PropertyKey::Named(EcmaString::encode(name)),
+            crate::Property::Data {
+                value: crate::number_value(value),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
     }
     for (name, length, handler) in [
         ("toString", 1, to_string::<H> as BuiltinHandler<H>),
@@ -333,6 +346,35 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program};
     use super::*;
     use crate::Limits;
+
+    #[test]
+    fn number_constants_are_read_only() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Number").unwrap();
+        for name in [
+            "MAX_SAFE_INTEGER",
+            "MIN_SAFE_INTEGER",
+            "EPSILON",
+            "MAX_VALUE",
+            "MIN_VALUE",
+            "POSITIVE_INFINITY",
+            "NEGATIVE_INFINITY",
+            "NaN",
+        ] {
+            let key = PropertyKey::Named(EcmaString::encode(name));
+            assert!(matches!(
+                machine.own_descriptor(constructor, &key).unwrap(),
+                Some(crate::Property::Data {
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                    ..
+                })
+            ));
+        }
+    }
 
     #[test]
     fn numeric_prefixes_stop_at_lone_surrogates() {
