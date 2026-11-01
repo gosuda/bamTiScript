@@ -5365,22 +5365,52 @@ impl<'a> FunctionContext<'a> {
                         },
                     )?;
                 }
-                ArrayElement::Elision => {
-                    let hole = self.undefined(builder, range)?;
-                    self.emit(
-                        range,
-                        Instruction::ArrayPush {
-                            array: dst,
-                            value: hole,
-                        },
-                    )?;
-                }
+                ArrayElement::Elision => self.extend_array_length(builder, range, dst)?,
                 ArrayElement::Missing(missing) => {
                     return Err(self.missing(range, missing.expected()));
                 }
             }
         }
         Ok(dst)
+    }
+    /// An elision has no element, so it only makes the array one longer. That
+    /// leaves a hole, which an element holding `undefined` would not be.
+    fn extend_array_length(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        array: Register,
+    ) -> Result<(), LowerError> {
+        let key = self.string_reg(builder, EcmaString::from("length"), range)?;
+        let length = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::GetProperty {
+                dst: length,
+                object: array,
+                key,
+            },
+        )?;
+        let one = self.load_constant(builder, Constant::Int32(1), range)?;
+        let value = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::Binary {
+                dst: value,
+                op: BinaryOp::Add,
+                left: length,
+                right: one,
+            },
+        )?;
+        self.emit(
+            range,
+            Instruction::SetProperty {
+                object: array,
+                key,
+                value,
+            },
+        )?;
+        Ok(())
     }
     fn lower_object(
         &mut self,

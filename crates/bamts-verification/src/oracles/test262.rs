@@ -2225,6 +2225,31 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn an_array_elision_leaves_a_hole() {
+        const CASES: [&str; 4] = [
+            "var a = [0, , 2]; assert.sameValue(a.length, 3); \
+             assert.sameValue(1 in a, false); assert.sameValue(a[2], 2);",
+            "var a = [,]; assert.sameValue(a.length, 1); assert.sameValue(0 in a, false);",
+            "var a = [1, , ]; assert.sameValue(a.length, 2); assert.sameValue(1 in a, false);",
+            "var a = [...[1, 2], , 4]; assert.sameValue(a.length, 4); \
+             assert.sameValue(2 in a, false); assert.sameValue(a[3], 4);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: array elisions", body);
+                let label = format!("array-elision-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_template_substitution_is_converted_with_to_string() {
         const THROWS: &str = "function throws(kind, body) {\n\
             try { body(); } catch (error) { return error instanceof kind; }\n\
