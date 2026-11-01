@@ -1553,7 +1553,9 @@ impl<'a> Rewriter<'a> {
                         }
                         ForBinding::Variable(declaration)
                     }
-                    target @ ForBinding::Target(_) => target.clone(),
+                    ForBinding::Target(target) => {
+                        ForBinding::Target(self.rewrite_assignment_target(target))
+                    }
                 };
                 let object = self.rewrite_expr(&for_in.object);
                 let body = self.rewrite_single_statement(&for_in.body);
@@ -6962,17 +6964,7 @@ impl<'a> Rewriter<'a> {
                     return self.lower_logical_assignment(expression, assignment);
                 }
                 let right = self.rewrite_expr(&assignment.right);
-                let left = if self.replace_await
-                    && let AssignmentTarget::Member(member) = assignment.left.data()
-                    && target_contains_await(&member.object, &member.property)
-                {
-                    // Convert awaits inside the target too, so a
-                    // suspending target becomes a visible machine refusal
-                    // instead of a live `await` in ES5 output.
-                    self.rewrite_member_target(member, assignment.left.range())
-                } else {
-                    assignment.left.clone()
-                };
+                let left = self.rewrite_assignment_target(&assignment.left);
                 self.node(
                     expression.range(),
                     Expression::Assignment(AssignmentExpression {
@@ -6989,8 +6981,179 @@ impl<'a> Rewriter<'a> {
                     expression.clone()
                 }
             }
+            Expression::Template(template) => {
+                let template = self.rewrite_template(template);
+                self.node(expression.range(), Expression::Template(template))
+            }
+            Expression::TaggedTemplate(tagged) => {
+                let tag = self.rewrite_expr(&tagged.tag);
+                let template = self.rewrite_template(&tagged.template);
+                self.node(
+                    expression.range(),
+                    Expression::TaggedTemplate(TaggedTemplateExpression {
+                        tag: Box::new(tag),
+                        template,
+                    }),
+                )
+            }
+            Expression::Array(array) => {
+                let elements = array
+                    .elements
+                    .iter()
+                    .map(|element| match element {
+                        ArrayElement::Expression(value) => {
+                            ArrayElement::Expression(Box::new(self.rewrite_expr(value)))
+                        }
+                        ArrayElement::Spread(spread) => ArrayElement::Spread(SpreadElement {
+                            argument: Box::new(self.rewrite_expr(&spread.argument)),
+                        }),
+                        other => other.clone(),
+                    })
+                    .collect();
+                self.node(
+                    expression.range(),
+                    Expression::Array(ArrayLiteral { elements }),
+                )
+            }
+            Expression::Object(object) => {
+                let members = object
+                    .members
+                    .iter()
+                    .map(|member| self.rewrite_object_member(member))
+                    .collect();
+                self.node(
+                    expression.range(),
+                    Expression::Object(ObjectLiteral { members }),
+                )
+            }
+            Expression::Yield(value) => {
+                let argument = value
+                    .argument
+                    .as_deref()
+                    .map(|argument| Box::new(self.rewrite_expr(argument)));
+                self.node(
+                    expression.range(),
+                    Expression::Yield(YieldExpression {
+                        delegate: value.delegate,
+                        argument,
+                    }),
+                )
+            }
+            Expression::Update(value) => {
+                let argument = self.rewrite_assignment_target(&value.argument);
+                self.node(
+                    expression.range(),
+                    Expression::Update(UpdateExpression {
+                        operator: value.operator,
+                        argument: Box::new(argument),
+                        prefix: value.prefix,
+                    }),
+                )
+            }
             _ => expression.clone(),
         }
+    }
+
+    fn rewrite_template(&mut self, template: &TemplateLiteral) -> TemplateLiteral {
+        TemplateLiteral {
+            elements: template.elements.clone(),
+            expressions: template
+                .expressions
+                .iter()
+                .map(|value| self.rewrite_expr(value))
+                .collect(),
+        }
+    }
+
+    fn rewrite_object_member(&mut self, member: &ObjectMemberNode) -> ObjectMemberNode {
+        let rewritten = match member.data() {
+            ObjectMember::Property(property) => {
+                let name = self.rewrite_property_name(&property.name);
+                let value = self.rewrite_expr(&property.value);
+                // A shorthand that no longer reads its own name has to spell
+                // the value out.
+                let shorthand =
+                    property.shorthand && matches!(value.data(), Expression::Identifier(_));
+                ObjectMember::Property(ObjectProperty {
+                    name,
+                    value: Box::new(value),
+                    modifier: property.modifier,
+                    shorthand,
+                })
+            }
+            ObjectMember::Method(method)
+                if (method.function.is_generator
+                    && Self::needs(LanguageFeature::Generators, self.options))
+                    || (method.function.is_async
+                        && Self::needs(LanguageFeature::AsyncFunctions, self.options)) =>
+            {
+                // A method owns its suspensions, so a target without them
+                // keeps the method as written rather than lowering it here.
+                return member.clone();
+            }
+            ObjectMember::Method(method) => {
+                let name = self.rewrite_property_name(&method.name);
+                let previous = self.replace_await;
+                self.replace_await = false;
+                let function = self.rewrite_function_like(&method.function, member.range());
+                self.replace_await = previous;
+                ObjectMember::Method(ObjectMethod {
+                    name,
+                    modifier: method.modifier,
+                    function,
+                })
+            }
+            ObjectMember::Spread(spread) => ObjectMember::Spread(SpreadElement {
+                argument: Box::new(self.rewrite_expr(&spread.argument)),
+            }),
+            ObjectMember::Missing(_) => return member.clone(),
+        };
+        self.node(member.range(), rewritten)
+    }
+
+    /// An assignment target with its nested expressions rewritten. A member
+    /// target is how a suspending target reaches the machine as a visible
+    /// refusal instead of a live `await` in ES5 output.
+    fn rewrite_assignment_target(&mut self, target: &AssignmentTargetNode) -> AssignmentTargetNode {
+        let rewritten = match target.data() {
+            AssignmentTarget::Member(member) => {
+                return self.rewrite_member_target(member, target.range());
+            }
+            AssignmentTarget::Object(pattern) => {
+                let properties = pattern
+                    .properties
+                    .iter()
+                    .map(|property| AssignmentObjectProperty {
+                        name: self.rewrite_property_name(&property.name),
+                        target: self.rewrite_assignment_target(&property.target),
+                        initializer: property
+                            .initializer
+                            .as_deref()
+                            .map(|value| Box::new(self.rewrite_expr(value))),
+                        rest: property.rest,
+                    })
+                    .collect();
+                AssignmentTarget::Object(AssignmentObjectPattern { properties })
+            }
+            AssignmentTarget::Array(pattern) => {
+                let elements = pattern
+                    .elements
+                    .iter()
+                    .map(|element| match element {
+                        AssignmentArrayElement::Target(target) => {
+                            AssignmentArrayElement::Target(self.rewrite_assignment_target(target))
+                        }
+                        AssignmentArrayElement::Rest(target) => {
+                            AssignmentArrayElement::Rest(self.rewrite_assignment_target(target))
+                        }
+                        other => other.clone(),
+                    })
+                    .collect();
+                AssignmentTarget::Array(AssignmentArrayPattern { elements })
+            }
+            _ => return target.clone(),
+        };
+        self.node(target.range(), rewritten)
     }
 
     fn rewrite_member_target(
@@ -10373,6 +10536,36 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         assert!(code.contains("exports.a = a;"), "{code}");
         assert!(code.contains("exports.c = b;"), "{code}");
         assert!(!code.contains("export {"), "{code}");
+    }
+
+    #[test]
+    fn commonjs_rewrites_an_import_wherever_it_is_read() {
+        let output = emit_with_options(
+            "import { a } from './m';\n\
+             const list = [a, ...a];\n\
+             const box = { a, b: a, [a]: 1, c() { return a; } };\n\
+             const text = `${a}`;\n\
+             a.b = 1;\n\
+             a.b++;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        for expected in [
+            "const list = [m_1.a, ...m_1.a];",
+            "a: m_1.a",
+            "b: m_1.a",
+            "[m_1.a]: 1",
+            "return m_1.a;",
+            "`${m_1.a}`",
+            "m_1.a.b = 1;",
+            "m_1.a.b++;",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
     }
 
     #[test]
