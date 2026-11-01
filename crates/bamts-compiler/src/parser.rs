@@ -214,11 +214,10 @@ pub fn parse_with_cancel(
     let mut parser = Parser::new_with_cancel(source_id, script_kind, source, tokens, eof, cancel);
     let statements = parser.parse_statements_until(&[]);
 
-    // The default scanner pass emits only `Slash`/`SlashEq`, never a
-    // `RegularExpressionLiteral`; every such token in the final stream is a
-    // committed parser regex rescan. The lexical diagnostics the default pass
-    // recorded inside those spans reflect the wrong (division) interpretation,
-    // so they are dropped and superseded by the rescan's own diagnostics.
+    // Every `RegularExpressionLiteral` in the final stream is either one the
+    // default pass was certain of or a committed parser regex rescan. Any lexical
+    // diagnostics recorded inside those spans reflect the wrong (division)
+    // interpretation, so they are dropped and superseded by the rescan's own.
     let regex_spans: Vec<TextRange> = parser
         .tokens
         .iter()
@@ -3928,7 +3927,7 @@ impl Parser {
     fn parse_primary_expression(&mut self) -> Expr {
         let start = self.cur_start();
         match self.kind() {
-            TokenKind::Slash | TokenKind::SlashEq => {
+            TokenKind::Slash | TokenKind::SlashEq | TokenKind::RegularExpressionLiteral => {
                 self.rescan_regex_here();
                 let token = self.bump();
                 let range = token.range();
@@ -6954,6 +6953,13 @@ mod tests {
             assert_eq!(recovered.product().script_kind(), kind);
             assert_eq!(recovered.product().source_id(), SourceId::new(0));
         }
+    }
+
+    #[test]
+    fn jsx_text_that_looks_like_a_regex_stays_text() {
+        let source = "const a = <p>, /x</p>;\nconst b = <p>= /'</p>;\n";
+        let parsed = parse_text(source, ScriptKind::TypeScriptReact);
+        assert!(errors(&parsed).is_empty(), "{:?}", errors(&parsed));
     }
 
     #[test]
