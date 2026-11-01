@@ -30,6 +30,7 @@ const RUNNER_URL: &str = "https://github.com/actions/runner/releases/download/v2
 const RUNNER_SHA256: &str = "04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d";
 const MAX_API_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
+#[cfg(any(target_os = "linux", test))]
 const MAX_JIT_BYTES: usize = 1024 * 1024;
 const WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
 const PERF_JOB: &str = "perf-bh1";
@@ -2003,6 +2004,7 @@ if not authorized:
     ))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn read_jit_secret(mut input: impl Read) -> Result<String> {
     let bytes = read_bounded(&mut input, MAX_JIT_BYTES).map_err(|_| {
         JitError::new(
@@ -2024,6 +2026,7 @@ fn read_jit_secret(mut input: impl Read) -> Result<String> {
     })
 }
 
+#[cfg(target_os = "linux")]
 pub fn run_internal_launcher() -> Result<()> {
     let secret = read_jit_secret(io::stdin().lock())?;
     #[allow(unsafe_code)]
@@ -2047,6 +2050,15 @@ pub fn run_internal_launcher() -> Result<()> {
     Err(JitError::new(
         JitErrorCode::Provision,
         format!("internal launcher could not start runner: {}", error.kind()),
+    ))
+}
+
+// Refuses before reading the secret: the launcher needs Linux process hardening.
+#[cfg(not(target_os = "linux"))]
+pub fn run_internal_launcher() -> Result<()> {
+    Err(JitError::new(
+        JitErrorCode::Provision,
+        "internal launcher is supported only on Linux",
     ))
 }
 

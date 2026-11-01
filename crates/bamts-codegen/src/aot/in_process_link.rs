@@ -29,8 +29,8 @@ use bamts_native::{
 };
 
 use cranelift_object::object::{
-    File, Object, ObjectSection, ObjectSymbol, Relocation, RelocationEncoding, RelocationKind,
-    RelocationTarget, SectionIndex, SectionKind, SymbolIndex,
+    File, Object, ObjectSection, ObjectSymbol, Relocation, RelocationEncoding, RelocationFlags,
+    RelocationKind, RelocationTarget, SectionIndex, SectionKind, SymbolIndex, elf,
 };
 
 use crate::AotObject;
@@ -125,13 +125,20 @@ impl NativeEntryTable for LinkedAotProgram {
 
 /// Returns the Cranelift target triple for the host, or an error if the host
 /// architecture is not supported for in-process AOT.
+///
+/// The triple selects the calling convention generated code uses to call the
+/// `bamts_*` helpers, which are compiled for the real host. The container stays
+/// ELF on every host: the `-elf` suffix makes Cranelift write ELF while the
+/// rest of the triple still picks the host ABI. Do not pass these triples to
+/// `linking::TargetFormat::for_triple`, which would read `darwin` as Mach-O.
 pub fn host_target() -> Result<&'static str, HostTargetError> {
-    if cfg!(target_arch = "x86_64") {
-        Ok("x86_64-unknown-linux-gnu")
-    } else if cfg!(target_arch = "aarch64") {
-        Ok("aarch64-unknown-linux-gnu")
-    } else {
-        Err(HostTargetError::UnsupportedArch(std::env::consts::ARCH))
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin-elf"),
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin-elf"),
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc-elf"),
+        (_, "x86_64") => Ok("x86_64-unknown-linux-gnu"),
+        (_, "aarch64") => Ok("aarch64-unknown-linux-gnu"),
+        _ => Err(HostTargetError::UnsupportedArch(std::env::consts::ARCH)),
     }
 }
 
@@ -154,12 +161,24 @@ pub enum InProcessLinkError {
         size: u8,
         encoding: RelocationEncoding,
     },
+    /// A relocation value does not fit the field of the instruction it patches.
+    RelocationOutOfRange {
+        relocation: &'static str,
+        displacement: i64,
+    },
+    /// A relocation needs an address with alignment the address does not have.
+    RelocationMisaligned {
+        relocation: &'static str,
+        address: u64,
+    },
     /// The mapped ProgramDescriptor failed validation.
     DescriptorValidation(AbiError),
     /// A memory mapping operation failed.
     Map(String),
     /// A memory protection operation failed.
     Protect(String),
+    /// Making the patched code visible to instruction fetch failed.
+    InstructionCache(String),
 }
 
 impl fmt::Display for InProcessLinkError {
@@ -181,11 +200,29 @@ impl fmt::Display for InProcessLinkError {
                     "unsupported relocation: kind={kind:?} size={size} encoding={encoding:?}"
                 )
             }
+            Self::RelocationOutOfRange {
+                relocation,
+                displacement,
+            } => {
+                write!(
+                    f,
+                    "{relocation} displacement {displacement} is out of range"
+                )
+            }
+            Self::RelocationMisaligned {
+                relocation,
+                address,
+            } => {
+                write!(f, "{relocation} address {address:#x} is misaligned")
+            }
             Self::DescriptorValidation(error) => {
                 write!(f, "program descriptor validation failed: {error:?}")
             }
             Self::Map(msg) => write!(f, "memory mapping failed: {msg}"),
             Self::Protect(msg) => write!(f, "memory protection failed: {msg}"),
+            Self::InstructionCache(msg) => {
+                write!(f, "instruction cache maintenance failed: {msg}")
+            }
         }
     }
 }
@@ -243,7 +280,7 @@ pub fn link_aot_in_process(
             .section_by_index(section.original_index)
             .map_err(|e| InProcessLinkError::Parse(e.to_string()))?;
         for (_offset, reloc) in original_section.relocations() {
-            if reloc.kind() == RelocationKind::GotRelative
+            if needs_got_entry(&reloc)
                 && let RelocationTarget::Symbol(idx) = reloc.target()
                 && got_seen.insert(idx)
             {
@@ -371,7 +408,7 @@ pub fn link_aot_in_process(
 
         for (reloc_offset, relocation) in original_section.relocations() {
             // For GotRelative, the "symbol address" is the GOT entry address.
-            let symbol_addr = if relocation.kind() == RelocationKind::GotRelative {
+            let symbol_addr = if needs_got_entry(&relocation) {
                 let RelocationTarget::Symbol(sym_idx) = relocation.target() else {
                     return Err(InProcessLinkError::UnknownRelocationTarget(format!(
                         "{:?}",
@@ -393,7 +430,16 @@ pub fn link_aot_in_process(
     // -- 7. Protect text as executable --------------------------------------
 
     if text_region_size > 0 {
+        // AArch64 fetches instructions through a cache that stores into the
+        // mapping do not update, so the patched code must be made visible.
+        // The order matches `jit_memory`: clear the cache before the RW -> RX
+        // transition, flush the pipeline after it.
+        //
+        // SAFETY: `text_base..text_base+text_region_size` is the text part of
+        // `mapping`, which this function owns and keeps alive.
         unsafe {
+            wasmtime_internal_jit_icache_coherence::clear_cache(text_base.cast(), text_region_size)
+                .map_err(|e| InProcessLinkError::InstructionCache(e.to_string()))?;
             region::protect(
                 text_base as *const (),
                 text_region_size,
@@ -401,6 +447,8 @@ pub fn link_aot_in_process(
             )
             .map_err(|e| InProcessLinkError::Protect(e.to_string()))?;
         }
+        wasmtime_internal_jit_icache_coherence::pipeline_flush_mt()
+            .map_err(|e| InProcessLinkError::InstructionCache(e.to_string()))?;
     }
 
     // -- 8. Build ProgramDescriptor from mapped data ------------------------
@@ -561,6 +609,20 @@ fn apply_relocation(
     let size = relocation.size();
     let encoding = relocation.encoding();
 
+    // `object` leaves the AArch64 GOT forms as `Unknown`, so they are told
+    // apart by the raw ELF relocation type.
+    match elf_relocation_type(relocation) {
+        Some(elf::R_AARCH64_ADR_GOT_PAGE) => {
+            return patch_instruction(place, |word| {
+                patch_adrp_page(word, place_addr as u64, symbol_addr as u64)
+            });
+        }
+        Some(elf::R_AARCH64_LD64_GOT_LO12_NC) => {
+            return patch_instruction(place, |word| patch_ldr_got_lo12(word, symbol_addr as u64));
+        }
+        _ => {}
+    }
+
     match (kind, size) {
         (RelocationKind::Absolute, 64) => {
             // S + A
@@ -587,20 +649,13 @@ fn apply_relocation(
                 place.cast::<u32>().write_unaligned(value);
             }
         }
-        (RelocationKind::Relative, 26) => {
-            // AArch64 call: (S + A - P) >> 2, 26-bit, masked into place[31:0]
-            // The lower 2 bits of the place are 00 (ARM alignment), so we
-            // encode the 26-bit immediate directly.
-            let displacement = (symbol_addr as i64)
-                .wrapping_add(addend)
-                .wrapping_sub(place_addr as i64);
-            let imm26 = (displacement >> 2) as u32 & 0x03FF_FFFF;
-            unsafe {
-                let existing = place.cast::<u32>().read_unaligned();
-                place
-                    .cast::<u32>()
-                    .write_unaligned((existing & 0xFC00_0000) | imm26);
-            }
+        // AArch64 `B`/`BL`. `object` reports an ELF `R_AARCH64_CALL26` as
+        // `PltRelative`; COFF and Mach-O readers report `Relative`.
+        (RelocationKind::Relative | RelocationKind::PltRelative, 26) => {
+            let target = (symbol_addr as i64).wrapping_add(addend) as u64;
+            return patch_instruction(place, |word| {
+                patch_branch26(word, place_addr as u64, target)
+            });
         }
         _ => {
             return Err(InProcessLinkError::UnsupportedRelocation {
@@ -611,6 +666,87 @@ fn apply_relocation(
         }
     }
     Ok(())
+}
+
+fn elf_relocation_type(relocation: &Relocation) -> Option<u32> {
+    match relocation.flags() {
+        RelocationFlags::Elf { r_type } => Some(r_type),
+        _ => None,
+    }
+}
+
+/// Whether the relocation reads its symbol through a GOT entry instead of
+/// addressing the symbol directly.
+fn needs_got_entry(relocation: &Relocation) -> bool {
+    relocation.kind() == RelocationKind::GotRelative
+        || matches!(
+            elf_relocation_type(relocation),
+            Some(elf::R_AARCH64_ADR_GOT_PAGE | elf::R_AARCH64_LD64_GOT_LO12_NC)
+        )
+}
+
+/// Rewrites the 32-bit instruction at `place` through `patch`.
+fn patch_instruction(
+    place: *mut u8,
+    patch: impl FnOnce(u32) -> Result<u32, InProcessLinkError>,
+) -> Result<(), InProcessLinkError> {
+    unsafe {
+        let patched = patch(place.cast::<u32>().read_unaligned())?;
+        place.cast::<u32>().write_unaligned(patched);
+    }
+    Ok(())
+}
+
+/// `R_AARCH64_ADR_GOT_PAGE`: points an `ADRP` at the 4 KiB page holding the
+/// GOT entry. `ADRP` counts 4 KiB pages whatever the OS page size is.
+fn patch_adrp_page(
+    instruction: u32,
+    place: u64,
+    got_entry: u64,
+) -> Result<u32, InProcessLinkError> {
+    let pages = (got_entry >> 12) as i64 - (place >> 12) as i64;
+    if !(-(1 << 20)..(1 << 20)).contains(&pages) {
+        return Err(InProcessLinkError::RelocationOutOfRange {
+            relocation: "R_AARCH64_ADR_GOT_PAGE",
+            displacement: pages,
+        });
+    }
+    let immediate = pages as u32 & 0x1F_FFFF;
+    let immlo = immediate & 0x3;
+    let immhi = immediate >> 2;
+    Ok((instruction & !((0x3 << 29) | (0x7_FFFF << 5))) | (immlo << 29) | (immhi << 5))
+}
+
+/// `R_AARCH64_LD64_GOT_LO12_NC`: gives an 8-byte `LDR` the offset of the GOT
+/// entry inside its page.
+fn patch_ldr_got_lo12(instruction: u32, got_entry: u64) -> Result<u32, InProcessLinkError> {
+    if got_entry & 0x7 != 0 {
+        return Err(InProcessLinkError::RelocationMisaligned {
+            relocation: "R_AARCH64_LD64_GOT_LO12_NC",
+            address: got_entry,
+        });
+    }
+    let scaled_offset = ((got_entry & 0xFFF) >> 3) as u32;
+    Ok((instruction & !(0xFFF << 10)) | (scaled_offset << 10))
+}
+
+/// `R_AARCH64_CALL26`: gives a `B` or `BL` the word distance to `target`. The
+/// field is 26 bits of signed 4-byte words, so the reach is +-128 MiB.
+fn patch_branch26(instruction: u32, place: u64, target: u64) -> Result<u32, InProcessLinkError> {
+    let displacement = (target as i64).wrapping_sub(place as i64);
+    if displacement & 0x3 != 0 {
+        return Err(InProcessLinkError::RelocationMisaligned {
+            relocation: "R_AARCH64_CALL26",
+            address: target,
+        });
+    }
+    if !(-(1 << 27)..(1 << 27)).contains(&displacement) {
+        return Err(InProcessLinkError::RelocationOutOfRange {
+            relocation: "R_AARCH64_CALL26",
+            displacement,
+        });
+    }
+    Ok((instruction & 0xFC00_0000) | ((displacement >> 2) as u32 & 0x03FF_FFFF))
 }
 
 /// Builds a map of helper symbol names to their live function addresses.
@@ -767,6 +903,186 @@ mod tests {
             ModuleId::new(1),
         )
         .expect("test program verifies")
+    }
+
+    /// `adrp x16, #0` and `ldr x17, [x16]`. The expected words below come from
+    /// assembling `adrp x16, #N` and `ldr x17, [x16, #N]` with clang.
+    const ADRP_X16: u32 = 0x9000_0010;
+    const LDR_X17_FROM_X16: u32 = 0xF940_0211;
+
+    #[test]
+    fn adrp_patch_matches_assembler_output() {
+        assert_eq!(patch_adrp_page(ADRP_X16, 0, 0x1000).unwrap(), 0xB000_0010);
+        assert_eq!(patch_adrp_page(ADRP_X16, 0x2000, 0).unwrap(), 0xD0FF_FFF0);
+    }
+
+    #[test]
+    fn adrp_patch_counts_4k_pages_and_ignores_the_offset_in_the_page() {
+        assert_eq!(
+            patch_adrp_page(ADRP_X16, 0xFFC, 0x1008).unwrap(),
+            patch_adrp_page(ADRP_X16, 0, 0x1000).unwrap()
+        );
+    }
+
+    #[test]
+    fn adrp_patch_replaces_an_earlier_immediate() {
+        let stale = ADRP_X16 | (0x3 << 29) | (0x7_FFFF << 5);
+        assert_eq!(patch_adrp_page(stale, 0, 0x1000).unwrap(), 0xB000_0010);
+    }
+
+    #[test]
+    fn adrp_patch_accepts_exactly_the_21_bit_page_range() {
+        let span = 1u64 << 32;
+        assert!(patch_adrp_page(ADRP_X16, 0, span - 0x1000).is_ok());
+        assert!(patch_adrp_page(ADRP_X16, span, 0).is_ok());
+        assert!(matches!(
+            patch_adrp_page(ADRP_X16, 0, span),
+            Err(InProcessLinkError::RelocationOutOfRange { .. })
+        ));
+        assert!(matches!(
+            patch_adrp_page(ADRP_X16, span + 0x1000, 0),
+            Err(InProcessLinkError::RelocationOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn ldr_patch_matches_assembler_output() {
+        assert_eq!(
+            patch_ldr_got_lo12(LDR_X17_FROM_X16, 8).unwrap(),
+            0xF940_0611
+        );
+        assert_eq!(
+            patch_ldr_got_lo12(LDR_X17_FROM_X16, 0x7008).unwrap(),
+            0xF940_0611
+        );
+    }
+
+    #[test]
+    fn ldr_patch_replaces_an_earlier_offset_and_covers_the_whole_page() {
+        let stale = LDR_X17_FROM_X16 | (0xFFF << 10);
+        assert_eq!(patch_ldr_got_lo12(stale, 0).unwrap(), LDR_X17_FROM_X16);
+        assert_eq!(
+            patch_ldr_got_lo12(LDR_X17_FROM_X16, 0xFF8).unwrap(),
+            LDR_X17_FROM_X16 | (0x1FF << 10)
+        );
+    }
+
+    #[test]
+    fn ldr_patch_rejects_an_entry_that_is_not_8_aligned() {
+        assert!(matches!(
+            patch_ldr_got_lo12(LDR_X17_FROM_X16, 4),
+            Err(InProcessLinkError::RelocationMisaligned { .. })
+        ));
+    }
+
+    /// `bl #0`. The expected words below come from assembling `bl #N` with clang.
+    const BL: u32 = 0x9400_0000;
+
+    #[test]
+    fn branch_patch_matches_assembler_output() {
+        assert_eq!(patch_branch26(BL, 0, 8).unwrap(), 0x9400_0002);
+        assert_eq!(patch_branch26(BL, 4, 0).unwrap(), 0x97FF_FFFF);
+    }
+
+    #[test]
+    fn branch_patch_keeps_the_opcode_of_b_and_bl() {
+        assert_eq!(patch_branch26(0x1400_0000, 0, 8).unwrap(), 0x1400_0002);
+    }
+
+    #[test]
+    fn branch_patch_accepts_exactly_plus_or_minus_128_mib() {
+        let reach = 1u64 << 27;
+        assert_eq!(patch_branch26(BL, 0, reach - 4).unwrap(), 0x95FF_FFFF);
+        assert_eq!(patch_branch26(BL, reach, 0).unwrap(), 0x9600_0000);
+        assert!(matches!(
+            patch_branch26(BL, 0, reach),
+            Err(InProcessLinkError::RelocationOutOfRange { .. })
+        ));
+        assert!(matches!(
+            patch_branch26(BL, reach + 4, 0),
+            Err(InProcessLinkError::RelocationOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn branch_patch_rejects_a_target_that_is_not_word_aligned() {
+        assert!(matches!(
+            patch_branch26(BL, 0, 6),
+            Err(InProcessLinkError::RelocationMisaligned { .. })
+        ));
+    }
+
+    #[test]
+    fn apply_relocation_patches_the_call26_that_elf_readers_call_plt_relative() {
+        use cranelift_object::object::write;
+        use cranelift_object::object::{
+            Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope,
+        };
+
+        let mut object =
+            write::Object::new(BinaryFormat::Elf, Architecture::Aarch64, Endianness::Little);
+        let text = object.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+        object.append_section_data(text, &BL.to_le_bytes(), 4);
+        let callee = object.add_symbol(write::Symbol {
+            name: b"callee".to_vec(),
+            value: 0,
+            size: 0,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: write::SymbolSection::Undefined,
+            flags: SymbolFlags::None,
+        });
+        object
+            .add_relocation(
+                text,
+                write::Relocation {
+                    offset: 0,
+                    symbol: callee,
+                    addend: 0,
+                    flags: RelocationFlags::Elf {
+                        r_type: elf::R_AARCH64_CALL26,
+                    },
+                },
+            )
+            .expect("relocation records");
+        let bytes = object.write().expect("object writes");
+
+        let file = File::parse(&*bytes).expect("object parses");
+        let section = file.section_by_name(".text").expect("text section");
+        let (_, relocation) = section.relocations().next().expect("one relocation");
+        assert_eq!(relocation.kind(), RelocationKind::PltRelative);
+
+        let mut word = [BL];
+        let place = word.as_mut_ptr().cast::<u8>();
+        apply_relocation(place, place as usize + 8, &relocation).expect("call26 applies");
+        assert_eq!(word[0], 0x9400_0002);
+    }
+
+    #[test]
+    fn host_target_selects_the_host_abi_and_keeps_elf() {
+        use cranelift_codegen::isa::{self, CallConv};
+        use cranelift_codegen::settings::{self, Flags};
+        use cranelift_object::object::BinaryFormat;
+
+        let target = host_target().expect("host target supported");
+        let isa = isa::lookup_by_name(target)
+            .expect("target exists")
+            .finish(Flags::new(settings::builder()))
+            .expect("target builds");
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => CallConv::AppleAarch64,
+            ("windows", "x86_64") => CallConv::WindowsFastcall,
+            _ => CallConv::SystemV,
+        };
+        assert_eq!(isa.frontend_config().default_call_conv, expected);
+        if cfg!(target_os = "macos") {
+            assert!(target.contains("apple-darwin"), "target was {target}");
+        }
+
+        let object = crate::compile_aot(&test_program(), target).expect("AOT object emits");
+        let file = File::parse(&*object.bytes).expect("object parses");
+        assert_eq!(file.format(), BinaryFormat::Elf);
     }
 
     #[test]

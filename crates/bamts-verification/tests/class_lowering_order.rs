@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bamts_compiler::emitter::transforms::ScriptTarget;
 use bamts_compiler::emitter::transpile::transpile_text;
@@ -13,11 +13,14 @@ struct FixtureDir(PathBuf);
 
 impl FixtureDir {
     fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock is after the Unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("bamts-class-lowering-{nonce}"));
+        // The process id and a process-wide counter keep parallel tests from
+        // sharing a fixture directory name, which a clock reading could not.
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let nonce = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "bamts-class-lowering-{}-{nonce}",
+            std::process::id()
+        ));
         fs::create_dir(&path).expect("create class lowering fixture directory");
         Self(path)
     }

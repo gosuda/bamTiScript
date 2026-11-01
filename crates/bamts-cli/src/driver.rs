@@ -2491,7 +2491,7 @@ fn effective_uid_in_context(context: &ExecutionContext) -> Result<u32, DriverErr
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn effective_uid() -> Result<u32, DriverError> {
     let context = ExecutionContext::ambient()?;
     effective_uid_in_context(&context)
@@ -3897,7 +3897,7 @@ printf '#!/bin/sh\npwd\n' > "$output"
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn managed_capture_kills_descendant_without_external_kill_before_reader_join()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3942,10 +3942,12 @@ printf '#!/bin/sh\npwd\n' > "$output"
         let pid = std::fs::read_to_string(&pid_file)?.trim().parse::<u32>()?;
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            let alive = process::Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
                 .ok()
-                .and_then(|stat| stat.split_whitespace().nth(2).map(str::to_owned))
-                .is_some_and(|state| state != "Z");
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                .is_some_and(|state| !state.is_empty() && !state.starts_with('Z'));
             if !alive {
                 break;
             }

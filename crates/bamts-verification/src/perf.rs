@@ -283,7 +283,7 @@ impl ObservedConditions {
     }
 }
 
-/// A live machine fingerprint read from `/proc` and `/sys`.
+/// A live machine fingerprint read from the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineFingerprint {
     /// `uname -r` kernel release.
@@ -306,187 +306,19 @@ pub struct MachineFingerprint {
     pub swap_total_kib: u64,
 }
 
-/// Parses the kernel release and build-version tail from `/proc/version`.
-fn parse_proc_version(content: &str) -> Result<(String, String)> {
-    let mut tokens = content.split_whitespace();
-    // Expected: "Linux version <release> ..."
-    let release = tokens
-        .nth(2)
-        .ok_or_else(|| PerfError::harness("/proc/version missing kernel release"))?
-        .to_owned();
-    let version = content
-        .find('#')
-        .map(|start| content[start..].trim_end().to_owned())
-        .unwrap_or_default();
-    Ok((release, version))
-}
-
-/// Parses `(cpu_model, sockets, cores_per_socket, microcode)` from cpuinfo.
-fn parse_proc_cpuinfo(content: &str) -> Result<(String, u32, u32, String)> {
-    let mut model = None;
-    let mut microcode = None;
-    let mut cores_per_socket = None;
-    let mut sockets = BTreeSet::new();
-
-    for line in content.lines() {
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let (key, value) = (key.trim(), value.trim());
-        match key {
-            "model name" if model.is_none() => model = Some(value.to_owned()),
-            "microcode" if microcode.is_none() => microcode = Some(value.to_owned()),
-            "cpu cores" if cores_per_socket.is_none() => cores_per_socket = value.parse().ok(),
-            "physical id" => {
-                sockets.insert(value.to_owned());
-            }
-            _ => {}
-        }
-    }
-
-    let model = model.ok_or_else(|| PerfError::harness("/proc/cpuinfo missing model name"))?;
-    let microcode =
-        microcode.ok_or_else(|| PerfError::harness("/proc/cpuinfo missing microcode"))?;
-    let cores_per_socket =
-        cores_per_socket.ok_or_else(|| PerfError::harness("/proc/cpuinfo missing cpu cores"))?;
-    let socket_count = u32::try_from(sockets.len())
-        .map_err(|_| PerfError::harness("/proc/cpuinfo socket count overflow"))?
-        .max(1);
-    Ok((model, socket_count, cores_per_socket, microcode))
-}
-
-/// Parses `SwapTotal` (KiB) from `/proc/meminfo`.
-fn parse_proc_meminfo_swap(content: &str) -> Result<u64> {
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("SwapTotal:") {
-            let value = rest
-                .split_whitespace()
-                .next()
-                .ok_or_else(|| PerfError::harness("/proc/meminfo SwapTotal malformed"))?;
-            return value
-                .parse()
-                .map_err(|_| PerfError::harness("/proc/meminfo SwapTotal not a number"));
-        }
-    }
-    Err(PerfError::harness("/proc/meminfo missing SwapTotal"))
-}
-
-fn parse_cpu_affinity(status: &str) -> Result<String> {
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| PerfError::harness("/proc/thread-self/status missing Cpus_allowed_list"))
-}
-
-#[cfg(target_os = "linux")]
-const NUMA_MASK_BITS: usize = 1024;
-#[cfg(target_os = "linux")]
-const NUMA_MASK_WORDS: usize = NUMA_MASK_BITS.div_ceil(libc::c_ulong::BITS as usize);
-
-#[cfg(target_os = "linux")]
-fn format_memory_nodes(mask: &[libc::c_ulong]) -> String {
-    let mut ranges = Vec::new();
-    let mut start = None;
-    for node in 0..NUMA_MASK_BITS {
-        let word = node / libc::c_ulong::BITS as usize;
-        let bit = node % libc::c_ulong::BITS as usize;
-        let is_set = mask[word] & (1 as libc::c_ulong) << bit != 0;
-        if is_set && start.is_none() {
-            start = Some(node);
-        } else if !is_set && start.is_some() {
-            let first = start.take().expect("checked above");
-            let last = node - 1;
-            ranges.push(if first == last {
-                first.to_string()
-            } else {
-                format!("{first}-{last}")
-            });
-        }
-    }
-    if let Some(first) = start {
-        let last = NUMA_MASK_BITS - 1;
-        ranges.push(if first == last {
-            first.to_string()
-        } else {
-            format!("{first}-{last}")
-        });
-    }
-    ranges.join(",")
-}
-
-#[cfg(target_os = "linux")]
-fn decode_memory_policy(mode: libc::c_int, mask: &[libc::c_ulong]) -> Result<(String, String)> {
-    let mode_flags = libc::MPOL_F_STATIC_NODES | libc::MPOL_F_RELATIVE_NODES;
-    let base_mode = mode & !mode_flags;
-    let mut policy = match base_mode {
-        libc::MPOL_DEFAULT => "default".to_owned(),
-        libc::MPOL_PREFERRED => "preferred".to_owned(),
-        libc::MPOL_BIND => "bind".to_owned(),
-        libc::MPOL_INTERLEAVE => "interleave".to_owned(),
-        libc::MPOL_LOCAL => "local".to_owned(),
-        _ => {
-            return Err(PerfError::harness(format!(
-                "get_mempolicy(2) returned unsupported mode {mode}"
-            )));
-        }
-    };
-    if mode & libc::MPOL_F_STATIC_NODES != 0 {
-        policy.push_str("|static");
-    }
-    if mode & libc::MPOL_F_RELATIVE_NODES != 0 {
-        policy.push_str("|relative");
-    }
-    Ok((policy, format_memory_nodes(mask)))
-}
-
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-fn read_memory_policy() -> Result<(String, String)> {
-    let mut mode = 0 as libc::c_int;
-    let mut mask = [0 as libc::c_ulong; NUMA_MASK_WORDS];
-    // SAFETY: get_mempolicy writes one c_int and at most NUMA_MASK_BITS into
-    // the two live buffers. flags=0 and addr=NULL request this thread's
-    // default policy, as required by get_mempolicy(2).
-    let status = unsafe {
-        libc::syscall(
-            libc::SYS_get_mempolicy,
-            std::ptr::addr_of_mut!(mode),
-            mask.as_mut_ptr(),
-            NUMA_MASK_BITS as libc::c_ulong,
-            std::ptr::null::<libc::c_void>(),
-            0 as libc::c_ulong,
-        )
-    };
-    if status != 0 {
-        return Err(PerfError::harness(format!(
-            "get_mempolicy(2): {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    decode_memory_policy(mode, &mask)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn read_memory_policy() -> Result<(String, String)> {
-    Err(PerfError::harness(
-        "NUMA memory policy evidence requires Linux",
-    ))
-}
-
 fn read_observed_conditions(machine: &MachineFingerprint) -> Result<ObservedConditions> {
-    let status = read_evidence("/proc/thread-self/status")?;
-    let cpu_affinity = parse_cpu_affinity(&status)?;
-    let (memory_policy, memory_nodes) = read_memory_policy()?;
+    let placement = bamts_platform::thread_placement().map_err(platform_error)?;
     Ok(ObservedConditions {
         governor: machine.governor.clone(),
         swap_total_kib: machine.swap_total_kib,
-        cpu_affinity,
-        memory_policy,
-        memory_nodes,
+        cpu_affinity: placement.cpu_affinity,
+        memory_policy: placement.memory_policy,
+        memory_nodes: placement.memory_nodes,
     })
+}
+
+fn platform_error(error: bamts_platform::PlatformError) -> PerfError {
+    PerfError::harness(error.to_string())
 }
 
 fn require_conditions(observed: &ObservedConditions, expected: &HostConditions) -> Result<()> {
@@ -505,38 +337,24 @@ fn read_validated_host(host: &HostManifest) -> Result<(MachineFingerprint, Obser
     Ok((machine, observed))
 }
 
-/// Reads the live machine fingerprint from `/proc` and `/sys`.
+/// Reads the live machine fingerprint from the host.
 ///
 /// # Errors
-/// Returns [`PerfErrorCode::HarnessError`] if any evidence file cannot be read
+/// Returns [`PerfErrorCode::HarnessError`] if any host fact cannot be read
 /// or parsed.
 pub fn read_machine_fingerprint() -> Result<MachineFingerprint> {
-    let version = read_evidence("/proc/version")?;
-    let cpuinfo = read_evidence("/proc/cpuinfo")?;
-    let meminfo = read_evidence("/proc/meminfo")?;
-    let governor = read_evidence("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
-        .map(|text| text.trim().to_owned())
-        .unwrap_or_else(|_| "unknown".to_owned());
-
-    let (kernel_release, kernel_version) = parse_proc_version(&version)?;
-    let (cpu_model, sockets, cores_per_socket, microcode) = parse_proc_cpuinfo(&cpuinfo)?;
-    let swap_total_kib = parse_proc_meminfo_swap(&meminfo)?;
-
+    let facts = bamts_platform::machine_facts().map_err(platform_error)?;
     Ok(MachineFingerprint {
-        kernel_release,
-        kernel_version,
+        kernel_release: facts.kernel_release,
+        kernel_version: facts.kernel_version,
         arch: std::env::consts::ARCH.to_owned(),
-        cpu_model,
-        sockets,
-        cores_per_socket,
-        microcode,
-        governor,
-        swap_total_kib,
+        cpu_model: facts.cpu_model,
+        sockets: facts.sockets,
+        cores_per_socket: facts.cores_per_socket,
+        microcode: facts.microcode,
+        governor: facts.governor,
+        swap_total_kib: facts.swap_total_kib,
     })
-}
-
-fn read_evidence(path: &str) -> Result<String> {
-    fs::read_to_string(path).map_err(|error| PerfError::harness(format!("{path}: {error}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,30 +843,33 @@ pub fn measure(options: &MeasureOptions) -> Result<MeasureResult> {
     let mut check_samples = Vec::with_capacity(repeats as usize);
     let mut emit_samples = Vec::with_capacity(repeats as usize);
     let mut rss_samples = Vec::with_capacity(repeats as usize);
-    // Reset the peak RSS high-water mark before every repeat so each sample
-    // measures only that run's allocation peak, not the cumulative peak of
-    // every prior repeat and the harness.
+    // Open a peak-memory window around every repeat so each sample measures only
+    // that run's allocation peak, not the cumulative peak of every prior repeat
+    // and the harness. The wall time is taken inside the window, so it spans the
+    // same work it always did.
     for _ in 0..repeats {
-        reset_peak_rss()?;
-        let started = Instant::now();
-        let (_report, telemetry) = run_suite_with_telemetry(
-            &options.workspace_root,
-            &options.snapshot_root,
-            &RunFilterOptions {
-                status: StatusFilter::All,
-                slice: Some(options.slice.clone()),
-                backends: BackendFilter::All,
-                shards: None,
-            },
-        )
-        .map_err(|error| PerfError::harness(format!("run_suite seam failed: {error}")))?;
-        wall_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+        let ((telemetry, wall_ms), peak) = measure_peak(|| {
+            let started = Instant::now();
+            let (_report, telemetry) = run_suite_with_telemetry(
+                &options.workspace_root,
+                &options.snapshot_root,
+                &RunFilterOptions {
+                    status: StatusFilter::All,
+                    slice: Some(options.slice.clone()),
+                    backends: BackendFilter::All,
+                    shards: None,
+                },
+            )
+            .map_err(|error| PerfError::harness(format!("run_suite seam failed: {error}")))?;
+            Ok((telemetry, started.elapsed().as_secs_f64() * 1_000.0))
+        })?;
+        wall_samples.push(wall_ms);
         scan_samples.push(telemetry.millis(Phase::Scan));
         parse_samples.push(telemetry.millis(Phase::Parse));
         bind_samples.push(telemetry.millis(Phase::Bind));
         check_samples.push(telemetry.millis(Phase::Check));
         emit_samples.push(telemetry.millis(Phase::Emit));
-        rss_samples.push(read_peak_rss_bytes()? as f64);
+        rss_samples.push(peak as f64);
     }
 
     // `total` is the whole measured seam wall; the phase split is the compiler's
@@ -1160,64 +981,17 @@ fn load_baseline(path: Option<&Path>, host: &HostManifest) -> Result<Option<Base
     }))
 }
 
-/// Resets the process peak RSS high-water mark (`VmHWM`) so each benchmark
-/// repeat measures its own allocation peak.
+/// Runs `work` and returns its output with the peak memory of this process
+/// across it, in bytes.
 ///
-/// On Linux this writes `5` to `/proc/self/clear_refs`, which the kernel
-/// documents as resetting the high-water mark to the current resident set
-/// size. On other platforms this returns a contextual error instead of
-/// silently producing fake data.
-fn reset_peak_rss() -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        fs::write("/proc/self/clear_refs", "5")
-            .map_err(|error| PerfError::harness(format!("/proc/self/clear_refs: {error}")))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        Err(PerfError::harness(
-            "peak RSS reset requires /proc/self/clear_refs and is only available on Linux",
-        ))
-    }
-}
-
-/// Reads the current process peak RSS high-water mark (`VmHWM`) in bytes.
-///
-/// After a [`reset_peak_rss`] call this is the peak since that reset, so the
-/// benchmark can attribute peak memory to each measured repeat. On non-Linux
-/// hosts this returns a contextual error instead of a fake zero.
-fn read_peak_rss_bytes() -> Result<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let content = fs::read_to_string("/proc/self/status")
-            .map_err(|error| PerfError::harness(format!("/proc/self/status: {error}")))?;
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("VmHWM:") {
-                let kib: u64 = rest
-                    .split_whitespace()
-                    .next()
-                    .ok_or_else(|| PerfError::harness("/proc/self/status: VmHWM has no value"))?
-                    .parse()
-                    .map_err(|error| {
-                        PerfError::harness(format!(
-                            "/proc/self/status: VmHWM is not a number: {error}"
-                        ))
-                    })?;
-                return Ok(kib * 1024);
-            }
-        }
-        Err(PerfError::harness(
-            "/proc/self/status: VmHWM field not found",
-        ))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        Err(PerfError::harness(
-            "peak RSS read requires /proc/self/status and is only available on Linux",
-        ))
-    }
+/// The peak is the resident-set peak on Linux, reset when the window opens, and
+/// the sampled physical-footprint peak on macOS, which can miss a spike shorter
+/// than a millisecond. A window cannot overlap another on Linux.
+fn measure_peak<T>(work: impl FnOnce() -> Result<T>) -> Result<(T, u64)> {
+    let window = bamts_platform::PeakWindow::start().map_err(platform_error)?;
+    let output = work()?;
+    let peak = window.finish().map_err(platform_error)?;
+    Ok((output, peak))
 }
 
 fn write_result(path: &Path, result: &MeasureResult) -> Result<()> {
@@ -1682,24 +1456,26 @@ fn invalid_conditions(observed: &ObservedConditions, expected: &HostConditions) 
     )
 }
 
+/// Polls the peak memory of a child until it is gone, and returns the highest
+/// value seen. Run it beside the `wait` that reaps the child: `ProcessGone`
+/// comes only after the reap.
 fn poll_child_peak_rss(pid: u32) -> u64 {
-    let status_path = format!("/proc/{pid}/status");
+    poll_peak(|| bamts_platform::peak_memory_bytes(pid))
+}
+
+fn poll_peak(
+    mut read: impl FnMut() -> std::result::Result<u64, bamts_platform::PlatformError>,
+) -> u64 {
     let mut peak = 0_u64;
     loop {
-        let Ok(status) = fs::read_to_string(&status_path) else {
-            return peak;
-        };
-        for line in status.lines() {
-            if let Some(value) = line.strip_prefix("VmHWM:") {
-                if let Some(kib) = value
-                    .split_whitespace()
-                    .next()
-                    .and_then(|v| v.parse::<u64>().ok())
-                {
-                    peak = peak.max(kib.saturating_mul(1024));
-                }
-                break;
-            }
+        match read() {
+            Ok(bytes) => peak = peak.max(bytes),
+            // Not the end: Linux reads this for most of a child's exit, and
+            // macOS while a live child execs.
+            Err(bamts_platform::PlatformError::NoAddressSpace(_)) => {}
+            // Gone after the reap, or unreadable. Stop on every other error, so a
+            // persistent one cannot hang the thread that joins this poller.
+            Err(_) => return peak,
         }
         thread::sleep(Duration::from_millis(2));
     }
@@ -2505,7 +2281,7 @@ mod tests {
         assert_eq!(host.conditions.swap_total_kib, 403_979_000);
         assert_eq!(
             host.source.get("governor").map(String::as_str),
-            Some("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+            Some(bamts_platform::LINUX_GOVERNOR_SOURCE)
         );
         assert_eq!(host.conditions.cpu_affinity, "0-19");
         assert_eq!(host.conditions.memory_policy, "bind");
@@ -2687,30 +2463,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_proc_version_extracts_release_and_tail() {
-        let content = "Linux version 7.0.0-28-generic (buildd@lcy02) (gcc 15) #28-Ubuntu SMP PREEMPT_DYNAMIC Sun Jun 21 01:01:36 UTC 2026\n";
-        let (release, version) = parse_proc_version(content).unwrap();
-        assert_eq!(release, "7.0.0-28-generic");
-        assert!(version.starts_with("#28-Ubuntu SMP PREEMPT_DYNAMIC"));
-    }
-
-    #[test]
-    fn parse_proc_cpuinfo_counts_sockets_and_cores() {
-        let content = "model name\t: Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz\nmicrocode\t: 0x2007006\ncpu cores\t: 20\nphysical id\t: 0\n\nphysical id\t: 1\ncpu cores\t: 20\n";
-        let (model, sockets, cores, micro) = parse_proc_cpuinfo(content).unwrap();
-        assert_eq!(model, "Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz");
-        assert_eq!(sockets, 2);
-        assert_eq!(cores, 20);
-        assert_eq!(micro, "0x2007006");
-    }
-
-    #[test]
-    fn parse_proc_meminfo_reads_swap_total() {
-        let content = "MemTotal:  791180784 kB\nSwapTotal:      0 kB\n";
-        assert_eq!(parse_proc_meminfo_swap(content).unwrap(), 0);
-    }
-
-    #[test]
     fn nearest_rank_uses_ceil_rank() {
         let samples = [10.0, 20.0, 30.0, 40.0];
         assert_eq!(nearest_rank(&samples, 0.50), 20.0);
@@ -2785,104 +2537,76 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(target_os = "linux")]
-    fn parse_proc_status_value(rest: &str, field: &str) -> Result<u64> {
-        let kib: u64 = rest
-            .split_whitespace()
-            .next()
-            .ok_or_else(|| PerfError::harness(format!("/proc/self/status: {field} has no value")))?
-            .parse()
-            .map_err(|error| {
-                PerfError::harness(format!(
-                    "/proc/self/status: {field} is not a number: {error}"
-                ))
-            })?;
-        Ok(kib * 1024)
-    }
-
-    #[cfg(target_os = "linux")]
-    /// Reads the current `(VmHWM, VmRSS)` pair from a single `/proc/self/status`
-    /// snapshot so the test compares the two fields atomically.
-    fn read_hwm_and_rss() -> Result<(u64, u64)> {
-        let content = std::fs::read_to_string("/proc/self/status")
-            .map_err(|error| PerfError::harness(format!("/proc/self/status: {error}")))?;
-        let mut hwm = None;
-        let mut rss = None;
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("VmHWM:") {
-                hwm = Some(parse_proc_status_value(rest, "VmHWM")?);
-            } else if let Some(rest) = line.strip_prefix("VmRSS:") {
-                rss = Some(parse_proc_status_value(rest, "VmRSS")?);
-            }
-        }
-        match (hwm, rss) {
-            (Some(h), Some(r)) => Ok((h, r)),
-            (None, _) => Err(PerfError::harness("/proc/self/status: VmHWM not found")),
-            (_, None) => Err(PerfError::harness("/proc/self/status: VmRSS not found")),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires Node 24.18.0 or /proc/self/clear_refs permission; external_blocked in this environment"]
-    fn reset_peak_rss_resets_hwm_to_current_rss() {
-        // Raise the high-water mark by faulting in a large allocation.
-        let (hwm_before, _rss_before) =
-            read_hwm_and_rss().expect("read /proc/self/status before allocation");
-        let big = {
-            let mut v = vec![0u8; 64 * 1024 * 1024];
-            for i in (0..v.len()).step_by(4096) {
-                v[i] = 1;
-            }
-            std::hint::black_box(v)
+    fn the_peak_window_reports_a_touched_allocation() {
+        const BYTES: usize = 64 * 1024 * 1024;
+        let (marker, peak) = measure_peak(|| {
+            let block = vec![1_u8; BYTES];
+            // Hold it long enough for the 1 ms macOS sampler to see it.
+            thread::sleep(Duration::from_millis(150));
+            assert_eq!(block.iter().filter(|byte| **byte == 1).count(), BYTES);
+            Ok("done")
+        })
+        .unwrap();
+        assert_eq!(marker, "done");
+        assert!(peak >= BYTES as u64, "peak {peak} is below the allocation");
+    }
+
+    #[test]
+    fn a_failed_measurement_returns_the_work_error() {
+        let error =
+            measure_peak(|| -> Result<()> { Err(PerfError::harness("work failed")) }).unwrap_err();
+        assert!(error.detail.contains("work failed"));
+    }
+
+    fn scripted(script: Vec<std::result::Result<u64, bamts_platform::PlatformError>>) -> u64 {
+        let mut reads = script.into_iter();
+        poll_peak(|| reads.next().expect("the poller read past its script"))
+    }
+
+    #[test]
+    fn the_poller_keeps_the_highest_peak_until_the_child_is_gone() {
+        use bamts_platform::PlatformError::ProcessGone;
+        assert_eq!(scripted(vec![Ok(5), Ok(9), Ok(7), Err(ProcessGone(1))]), 9);
+    }
+
+    /// Nearly every Linux child reads this way for most of its exit, and macOS
+    /// reads it while a child execs. Neither is the end.
+    #[test]
+    fn the_poller_keeps_polling_through_a_missing_address_space() {
+        use bamts_platform::PlatformError::{NoAddressSpace, ProcessGone};
+        let script = vec![
+            Ok(5),
+            Err(NoAddressSpace(1)),
+            Err(NoAddressSpace(1)),
+            Ok(9),
+            Err(ProcessGone(1)),
+        ];
+        assert_eq!(scripted(script), 9);
+    }
+
+    /// A persistent read error must end the poll, or `sampler.join()` would hang.
+    #[test]
+    fn the_poller_stops_on_any_other_error() {
+        use bamts_platform::PlatformError::Read;
+        let broken = Read {
+            source: "peak".to_owned(),
+            detail: "denied".to_owned(),
         };
-        let (hwm_during, _rss_during) =
-            read_hwm_and_rss().expect("read /proc/self/status during allocation");
-        assert!(hwm_during >= hwm_before, "allocation must not lower VmHWM");
-
-        // Dropping the allocation returns the mapped pages to the OS on glibc,
-        // lowering current RSS while leaving the lifetime HWM high.
-        drop(big);
-
-        reset_peak_rss().expect("reset VmHWM");
-
-        let (hwm_after, rss_after) =
-            read_hwm_and_rss().expect("read /proc/self/status after reset");
-        assert!(
-            hwm_after > 0,
-            "VmHWM after reset must be positive, not fake"
-        );
-        assert!(
-            hwm_after >= rss_after,
-            "VmHWM cannot be below current VmRSS (hwm={hwm_after}, rss={rss_after})"
-        );
-        assert!(
-            hwm_after <= rss_after + 8 * 1024 * 1024,
-            "VmHWM after reset must be near current VmRSS (within test overhead); \
-             got hwm={hwm_after}, rss={rss_after}"
-        );
+        assert_eq!(scripted(vec![Ok(5), Err(broken.clone())]), 5);
+        assert_eq!(scripted(vec![Err(broken)]), 0);
     }
 
-    #[cfg(not(target_os = "linux"))]
     #[test]
-    fn peak_rss_sampling_is_unsupported_outside_linux() {
-        // Resetting and reading VmHWM are platform-specific; on non-Linux they
-        // must fail with a typed, contextual error rather than return fake data.
-        let reset =
-            reset_peak_rss().expect_err("reset should fail on non-Linux with a contextual error");
-        assert_eq!(reset.code, PerfErrorCode::HarnessError);
-        assert!(
-            reset.detail.contains("Linux"),
-            "reset error must name the platform"
-        );
-
-        let read = read_peak_rss_bytes()
-            .expect_err("read should fail on non-Linux with a contextual error");
-        assert_eq!(read.code, PerfErrorCode::HarnessError);
-        assert!(
-            read.detail.contains("Linux"),
-            "read error must name the platform"
-        );
+    fn polling_beside_a_real_child_ends_when_it_is_reaped() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 0.3"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let poller = thread::spawn(move || poll_child_peak_rss(pid));
+        child.wait().unwrap();
+        assert!(poller.join().unwrap() > 0);
     }
 
     #[test]
@@ -3167,25 +2891,5 @@ mod tests {
         for mismatch in mismatches {
             assert!(!mismatch.satisfies(&expected));
         }
-    }
-
-    #[test]
-    fn parses_thread_cpu_affinity() {
-        let status =
-            "Name:\tperf_budget\nCpus_allowed:\t00000000,000fffff\nCpus_allowed_list:\t0-19\n";
-        assert_eq!(parse_cpu_affinity(status).unwrap(), "0-19");
-        assert!(parse_cpu_affinity("Name:\tperf_budget\n").is_err());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn decodes_memory_policy_and_node_ranges() {
-        let mut mask = [0 as libc::c_ulong; NUMA_MASK_WORDS];
-        mask[0] = 0b1_1111;
-        assert_eq!(
-            decode_memory_policy(libc::MPOL_BIND, &mask).unwrap(),
-            ("bind".to_owned(), "0-4".to_owned())
-        );
-        assert!(decode_memory_policy(-1, &mask).is_err());
     }
 }

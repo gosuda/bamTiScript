@@ -108,6 +108,7 @@ dependencies = [
  "bamts-bytecode",
  "bamts-cancel",
  "bamts-native",
+ "bamts-platform",
  "bamts-runtime",
  "cranelift-codegen",
  "cranelift-frontend",
@@ -164,12 +165,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bamts-platform"
+version = "0.2.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "bamts-runtime"
 version = "0.2.0"
 dependencies = [
  "bamts-bytecode",
  "bamts-cancel",
  "bamts-native",
+ "bamts-platform",
  "icu_properties",
  "unicode-normalization",
 ]
@@ -186,6 +195,7 @@ dependencies = [
  "bamts-compiler",
  "bamts-native",
  "bamts-node",
+ "bamts-platform",
  "bamts-runtime",
  "getrandom 0.3.4",
  "libc",

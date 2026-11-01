@@ -339,7 +339,7 @@ impl ObligationIndex {
                     identifier: identifier.to_owned(),
                     configuration: declared_configuration(identifier),
                     mode: ExecutionMode::Interpreter,
-                    platform: native_platform(),
+                    platform: bamts_platform::host_triple(),
                     declared_observable: declared_observable(identifier),
                     classification: None,
                 },
@@ -420,21 +420,6 @@ fn declared_configuration(identifier: &str) -> String {
             || "default".to_owned(),
             |(_, configuration)| configuration.to_owned(),
         )
-}
-fn native_platform() -> String {
-    let environment = if cfg!(target_env = "musl") {
-        "musl"
-    } else if cfg!(target_env = "msvc") {
-        "msvc"
-    } else {
-        "gnu"
-    };
-    match std::env::consts::OS {
-        "linux" => format!("{}-unknown-linux-{environment}", std::env::consts::ARCH),
-        "macos" => format!("{}-apple-darwin", std::env::consts::ARCH),
-        "windows" => format!("{}-pc-windows-{environment}", std::env::consts::ARCH),
-        os => format!("{}-unknown-{os}", std::env::consts::ARCH),
-    }
 }
 
 /// Rebuilds the ledger from the manifest and the supplied receipts.
@@ -1197,7 +1182,9 @@ mod tests {
     const DIGEST: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
     const OTHER: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
     const CATALOG: &str = "typescript-7.0.2";
-    const PLATFORM: &str = "x86_64-unknown-linux-gnu";
+    fn platform() -> String {
+        bamts_platform::host_triple()
+    }
     fn scratch(name: &str) -> PathBuf {
         let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
         let root =
@@ -1225,7 +1212,7 @@ mod tests {
             identity,
             "default",
             ExecutionMode::Interpreter,
-            PLATFORM,
+            platform(),
         )
         .expect("obligation key")
     }
@@ -1264,7 +1251,7 @@ mod tests {
                 identity,
                 "default",
                 ExecutionMode::Interpreter,
-                PLATFORM,
+                platform(),
             )
             .expect("catalog key"),
             vec!["bamts".to_owned()],
@@ -1616,14 +1603,20 @@ mod tests {
         // the canonical environment: a receipt naming another mode or platform
         // projects to no declared obligation.
         for key in [
-            ObligationKey::new(CATALOG, &declared, "default", ExecutionMode::Jit, PLATFORM)
-                .expect("mode"),
+            ObligationKey::new(
+                CATALOG,
+                &declared,
+                "default",
+                ExecutionMode::Jit,
+                platform(),
+            )
+            .expect("mode"),
             ObligationKey::new(
                 CATALOG,
                 &declared,
                 "default",
                 ExecutionMode::Interpreter,
-                "aarch64-unknown-linux-gnu",
+                format!("{}-foreign", platform()),
             )
             .expect("platform"),
         ] {
@@ -1936,7 +1929,7 @@ mod tests {
                         identity,
                         declared_configuration(identity),
                         ExecutionMode::Interpreter,
-                        PLATFORM,
+                        platform(),
                     )
                     .expect("key"),
                     vec!["bamts".to_owned()],

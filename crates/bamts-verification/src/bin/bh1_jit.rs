@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::{
     env,
     ffi::OsString,
@@ -6,18 +7,22 @@ use std::{
     process,
 };
 
+#[cfg(unix)]
 use bamts_verification::jit_runner::{
     Attempt, HeadSha, JitError, ProvisionArgs, PullRequestNumber, RepoName, Result, RunId,
     RunnerGroupId, provision, run_internal_launcher,
 };
 
+#[cfg(unix)]
 const USAGE: &str = "usage: bh1_jit provision --repo owner/name --pr N --run ID --attempt N --head-sha 40hex --runner-group-id ID [--runner-parent PATH]";
 
+#[cfg(unix)]
 enum Command {
     Provision(ProvisionArgs),
     InternalLaunch,
 }
 
+#[cfg(unix)]
 fn main() {
     if let Err(error) = run() {
         let _ = writeln!(io::stderr().lock(), "{error}");
@@ -25,6 +30,7 @@ fn main() {
     }
 }
 
+#[cfg(unix)]
 fn run() -> Result<()> {
     match parse_command(env::args_os())? {
         Command::Provision(args) => {
@@ -39,6 +45,7 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Command> {
     let _program = arguments.next();
     let command = next_utf8(&mut arguments, "command")?;
@@ -54,6 +61,7 @@ fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Comman
     }
 }
 
+#[cfg(unix)]
 fn parse_provision(arguments: &mut impl Iterator<Item = OsString>) -> Result<ProvisionArgs> {
     let mut repo: Option<RepoName> = None;
     let mut pull_request: Option<PullRequestNumber> = None;
@@ -101,6 +109,7 @@ fn parse_provision(arguments: &mut impl Iterator<Item = OsString>) -> Result<Pro
     })
 }
 
+#[cfg(unix)]
 fn next_utf8(arguments: &mut impl Iterator<Item = OsString>, subject: &str) -> Result<String> {
     arguments
         .next()
@@ -109,6 +118,7 @@ fn next_utf8(arguments: &mut impl Iterator<Item = OsString>, subject: &str) -> R
         .map_err(|_| JitError::usage(format!("{subject} is not valid UTF-8; {USAGE}")))
 }
 
+#[cfg(unix)]
 fn set_once<T>(slot: &mut Option<T>, value: T, flag: &str) -> Result<()> {
     if slot.replace(value).is_some() {
         return Err(JitError::usage(format!("duplicate flag `{flag}`; {USAGE}")));
@@ -116,10 +126,12 @@ fn set_once<T>(slot: &mut Option<T>, value: T, flag: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn required<T>(value: Option<T>, flag: &str) -> Result<T> {
     value.ok_or_else(|| JitError::usage(format!("missing required flag `{flag}`; {USAGE}")))
 }
 
+#[cfg(unix)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,4 +242,12 @@ mod tests {
             .is_err()
         );
     }
+}
+
+/// The JIT runner provisioning drives unix process groups, file modes, and
+/// locks, so it exists only on unix hosts.
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("bh1_jit is not supported on this platform: it needs a unix host");
+    std::process::exit(1);
 }

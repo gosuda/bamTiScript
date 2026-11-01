@@ -28,7 +28,10 @@ const SPECIAL_ASPECT_LEAVES: [&str; 11] = [
     "A1.1", "A1.2", "A1.3", "A1.4", "A1.5", "A2.1", "A2.2", "A2.3", "A2.6", "A2.7", "F2.4",
 ];
 
-// These recovery ledgers are not part of the frozen 105-leaf product authority.
+/// Leaves the contract table freezes; a table with any other count is stale.
+const FROZEN_LEAF_COUNT: usize = 114;
+
+// These recovery ledgers are not part of the frozen product authority.
 const LEGACY_INTEGRATION_LEDGER_IDS: [&str; 14] = [
     "clean-port-authority-evidence",
     "clean-port-authority-root",
@@ -268,7 +271,7 @@ impl CompletionReport {
                 Some("RUNTIME COMPLETE modes=3 blocking=0 external_blocked=0".into())
             }
             CompletionScope::Root(id) if id == "native" => {
-                Some("NATIVE COMPLETE formal=PASS targets=28/28 benchmarks=9/9".into())
+                Some("NATIVE COMPLETE formal=PASS targets=49/49 benchmarks=9/9".into())
             }
             CompletionScope::Root(id) if id == "package" => {
                 Some("PACKAGE COMPLETE exports=13 cli=PASS api=PASS".into())
@@ -570,7 +573,7 @@ fn validate_program(root: &Path, p: &Program) -> Vec<CompletionFailure> {
     let authority_path = root.join(".outline/type-script-7.0.2-completion.md");
     let require_authority = !cfg!(test) || authority_path.exists();
     let (authority, strict_authority) = completion_authority_leaves(root);
-    if require_authority && (!strict_authority || authority.len() != 105) {
+    if require_authority && (!strict_authority || authority.len() != FROZEN_LEAF_COUNT) {
         out.push(CompletionFailure::StaleEvidence {
             id: format!("completion-authority-leaf-count={}", authority.len()),
         });
@@ -1354,18 +1357,22 @@ fn replace_atomically(path: &Path, bytes: &[u8]) -> Result<(), CompletionError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
     struct Scratch(PathBuf);
     impl Scratch {
         fn new(name: &str) -> Self {
+            // The clock cannot keep these apart: macOS reads it in microseconds,
+            // and `fixture` gives every test the same label. A collision does not
+            // fail, because `create_dir_all` accepts an existing directory, so
+            // two tests would share one and one would delete it under the other.
+            static NEXT: AtomicU64 = AtomicU64::new(0);
             let p = std::env::temp_dir().join(format!(
                 "bamts-completion-{name}-{}-{}",
                 process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
+                NEXT.fetch_add(1, Ordering::Relaxed)
             ));
+            // A directory left by an earlier process with the same id is stale.
+            let _ = fs::remove_dir_all(&p);
             fs::create_dir_all(p.join("verification")).unwrap();
             fs::create_dir_all(p.join(".outline/gates")).unwrap();
             fs::create_dir_all(p.join("proof")).unwrap();
@@ -1376,6 +1383,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn scratch_directories_made_together_never_share_a_path() {
+        const THREADS: usize = 32;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    Scratch::new("state")
+                })
+            })
+            .collect();
+        let scratches: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        let distinct: std::collections::BTreeSet<_> = scratches.iter().map(|s| &s.0).collect();
+        assert_eq!(distinct.len(), THREADS);
     }
     fn fixture(state: &str, public: Option<&str>, mutation: bool) -> Scratch {
         let scratch = Scratch::new("state");
@@ -1724,24 +1749,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn frozen_authority_rejects_joint_leaf_removal() {
-        let fixture = fixture("PASS", None, true);
+    fn write_authority_table(root: &Path, leaves: usize) {
         let mut authority = String::from(
             "---\nrelease: typescript-7.0.2\nproduct: bamti\n---\n\
              | Leaf | Wave | Cluster | Deliverable | Owned paths | Gate ledger |\n\
              |---|---|---|---|---|---|\n",
         );
-        for index in 1..=105 {
+        for index in 1..=leaves {
             authority.push_str(&format!(
                 "| X{index} | W0 | X | d | `src/x.rs` | `.outline/gates/X{index}.md` |\n"
             ));
         }
         fs::write(
-            fixture.0.join(".outline/type-script-7.0.2-completion.md"),
+            root.join(".outline/type-script-7.0.2-completion.md"),
             authority,
         )
         .unwrap();
+    }
+
+    fn leaf_count_failures(leaves: usize) -> Vec<CompletionFailure> {
+        let fixture = fixture("PASS", None, true);
+        write_authority_table(&fixture.0, leaves);
+        match verify_completion(
+            &fixture.0,
+            &CompletionScope::Leaf("X1".into()),
+            CompletionAspect::Contract,
+        ) {
+            Err(CompletionError::Invalid(failures)) => failures,
+            other => panic!("a table that disagrees with the program must be invalid: {other:?}"),
+        }
+    }
+
+    fn reports_stale_leaf_count(failures: &[CompletionFailure], leaves: usize) -> bool {
+        failures.iter().any(|failure| {
+            matches!(failure, CompletionFailure::StaleEvidence { id }
+                if *id == format!("completion-authority-leaf-count={leaves}"))
+        })
+    }
+
+    #[test]
+    fn authority_table_must_hold_exactly_the_frozen_leaf_count() {
+        for leaves in [FROZEN_LEAF_COUNT - 1, FROZEN_LEAF_COUNT + 1] {
+            assert!(
+                reports_stale_leaf_count(&leaf_count_failures(leaves), leaves),
+                "{leaves} leaves must be reported as a stale count"
+            );
+        }
+        assert!(
+            !reports_stale_leaf_count(&leaf_count_failures(FROZEN_LEAF_COUNT), FROZEN_LEAF_COUNT),
+            "the frozen count itself must not be reported as stale"
+        );
+    }
+
+    #[test]
+    fn frozen_authority_rejects_joint_leaf_removal() {
+        let fixture = fixture("PASS", None, true);
+        write_authority_table(&fixture.0, FROZEN_LEAF_COUNT);
         let error = verify_completion(
             &fixture.0,
             &CompletionScope::Leaf("X1".into()),

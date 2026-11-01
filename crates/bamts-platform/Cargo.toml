@@ -1,0 +1,18 @@
+[package]
+name = "bamts-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = true
+license.workspace = true
+repository.workspace = true
+description = "Host facts and process observation for BamTS"
+
+[dependencies]
+libc = "=0.2.189"
+
+[lints.rust]
+# `unsafe_code` is downgraded from the workspace `forbid` to `deny` so that the
+# OS backend modules alone can carry `#[allow(unsafe_code)]`.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"

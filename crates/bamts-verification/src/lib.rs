@@ -10,6 +10,7 @@ pub mod facets;
 pub mod fixtures;
 pub mod formal_bridge;
 pub mod formal_gates;
+#[cfg(unix)]
 pub mod jit_runner;
 pub mod lane;
 pub mod leaf_evidence;
@@ -27,6 +28,7 @@ pub(crate) mod schema;
 pub mod shard;
 pub mod source_fetch;
 pub mod suite;
+pub mod sweep_report;
 pub mod toolchain_schema;
 pub mod ts_ledger;
 pub mod unicode;

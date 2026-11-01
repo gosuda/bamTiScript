@@ -31,6 +31,7 @@ workspace = true
 members = [
     "crates/bamts-compiler",
     "crates/bamts-cancel",
+    "crates/bamts-platform",
     "crates/bamts-bytecode",
     "crates/bamts-runtime",
     "crates/bamts-native",
@@ -58,6 +59,7 @@ bamts-cli = { path = "crates/bamts-cli", version = "0.2.0" }
 bamts-codegen = { path = "crates/bamts-codegen", version = "0.2.0" }
 bamts-compiler = { path = "crates/bamts-compiler", version = "0.2.0" }
 bamts-native = { path = "crates/bamts-native", version = "0.2.0" }
+bamts-platform = { path = "crates/bamts-platform", version = "0.2.0" }
 bamts-node = { path = "crates/bamts-node", version = "0.2.0" }
 bamts-runtime = { path = "crates/bamts-runtime", version = "0.2.0" }
 base64 = "=0.23.1"

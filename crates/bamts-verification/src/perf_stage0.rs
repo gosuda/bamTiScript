@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use bamts_cli::args::{ExecutionTarget, Mode};
 use bamts_cli::driver;
+use bamts_platform::{MemoryRegion, PlatformError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -41,12 +42,14 @@ pub struct HostConditions {
 
 impl HostConditions {
     fn new() -> Result<Self> {
+        let facts = bamts_platform::machine_facts()?;
+        let placement = bamts_platform::thread_placement()?;
         Ok(Self {
-            governor: capture_governor()?,
-            swap_total_kib: capture_swap_total_kib()?,
-            cpu_affinity: capture_cpu_affinity()?,
-            mempolicy_mode: capture_mempolicy_mode(),
-            memory_nodes: capture_memory_nodes()?,
+            governor: facts.governor,
+            swap_total_kib: facts.swap_total_kib,
+            cpu_affinity: placement.cpu_affinity,
+            mempolicy_mode: bamts_platform::numa_policy_mode(),
+            memory_nodes: bamts_platform::numa_memory_nodes()?,
         })
     }
 }
@@ -253,13 +256,6 @@ impl RealEvidenceProvider<'_> {
             "anonymous_executable_mappings": anonymous.len(),
         }))
     }
-}
-
-#[derive(Debug, Clone)]
-struct ProcessMapping {
-    identity: String,
-    permissions: String,
-    pathname: Option<String>,
 }
 
 pub fn run() -> Value {
@@ -669,7 +665,7 @@ fn validate_event_stream(stdout: &[u8]) -> Result<Vec<String>> {
 
 #[derive(Debug)]
 struct ChildMapSample {
-    mappings: Vec<ProcessMapping>,
+    mappings: Vec<MemoryRegion>,
     executable_mappings: usize,
     samples: usize,
 }
@@ -715,10 +711,26 @@ fn sample_child_maps(child: Child, executable: &Path, timeout: Duration) -> Resu
 }
 
 fn sample_child_maps_with_observer(
+    child: Child,
+    executable: &Path,
+    timeout: Duration,
+    observed: impl FnMut(&mut Child, &[MemoryRegion]) -> Result<()>,
+) -> Result<ChildMapSample> {
+    sample_child_maps_from(
+        child,
+        executable,
+        timeout,
+        |child| process_maps_for(child.id()),
+        observed,
+    )
+}
+
+fn sample_child_maps_from(
     mut child: Child,
     executable: &Path,
     timeout: Duration,
-    mut observed: impl FnMut(&mut Child, &[ProcessMapping]) -> Result<()>,
+    mut read_maps: impl FnMut(&mut Child) -> Result<Vec<MemoryRegion>>,
+    mut observed: impl FnMut(&mut Child, &[MemoryRegion]) -> Result<()>,
 ) -> Result<ChildMapSample> {
     let stdout = child
         .stdout
@@ -740,8 +752,21 @@ fn sample_child_maps_with_observer(
             Ok(None) => {}
             Err(error) => break Err(error),
         }
-        let mappings = match process_maps_for(child.id()) {
+        if std::time::Instant::now() >= deadline {
+            break Err(anyhow::anyhow!(
+                "controlled child did not exit before timeout"
+            ));
+        }
+        let mappings = match read_maps(&mut child) {
             Ok(mappings) => mappings,
+            // Neither answer is final. An exiting child gives them before it
+            // can be reaped, and a live child gives `NoAddressSpace` during an
+            // exec. Keep sampling: `try_wait` decides an exit, and a new image
+            // that outlives a poll still gets checked.
+            Err(error) if child_is_between_states(&error) => {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
             Err(error) => match child
                 .try_wait()
                 .context("checking child after map-read failure")
@@ -774,11 +799,6 @@ fn sample_child_maps_with_observer(
         }
         for mapping in mappings {
             union.entry(mapping.identity.clone()).or_insert(mapping);
-        }
-        if std::time::Instant::now() >= deadline {
-            break Err(anyhow::anyhow!(
-                "controlled child did not exit before timeout"
-            ));
         }
         thread::sleep(Duration::from_millis(1));
     };
@@ -833,103 +853,29 @@ fn join_pipe_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Resu
         .map_err(|_| io::Error::other("controlled child pipe reader panicked"))?
 }
 
-fn process_maps_for(pid: u32) -> Result<Vec<ProcessMapping>> {
-    let text = fs::read_to_string(format!("/proc/{pid}/maps"))
-        .with_context(|| format!("reading /proc/{pid}/maps"))?;
-    parse_process_maps(&text)
+fn process_maps_for(pid: u32) -> Result<Vec<MemoryRegion>> {
+    bamts_platform::process_regions(pid)
+        .with_context(|| format!("reading the memory regions of process {pid}"))
 }
 
-fn process_maps() -> Result<Vec<ProcessMapping>> {
+fn process_maps() -> Result<Vec<MemoryRegion>> {
     process_maps_for(std::process::id())
 }
 
-fn parse_process_maps(text: &str) -> Result<Vec<ProcessMapping>> {
-    text.lines()
-        .map(|line| {
-            let mut fields = line.split_whitespace();
-            let range = fields.next().context("mapping lacks range")?;
-            let permissions = fields
-                .next()
-                .context("mapping lacks permissions")?
-                .to_owned();
-            let offset = fields.next().context("mapping lacks offset")?;
-            let device = fields.next().context("mapping lacks device")?;
-            let inode = fields.next().context("mapping lacks inode")?;
-            let pathname = fields.next().map(str::to_owned);
-            Ok(ProcessMapping {
-                identity: format!(
-                    "{range} {offset} {device} {inode} {}",
-                    pathname.as_deref().unwrap_or("")
-                ),
-                permissions,
-                pathname,
-            })
-        })
-        .collect()
+fn child_is_between_states(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<PlatformError>(),
+        Some(PlatformError::ProcessGone(_) | PlatformError::NoAddressSpace(_))
+    )
 }
 
-fn anonymous_executable_mappings(maps: &[ProcessMapping]) -> BTreeSet<String> {
+fn anonymous_executable_mappings(maps: &[MemoryRegion]) -> BTreeSet<String> {
     maps.iter()
         .filter(|mapping| mapping.permissions.contains('x') && mapping.pathname.is_none())
         .map(|mapping| mapping.identity.clone())
         .collect()
 }
 
-fn capture_governor() -> Result<String> {
-    Ok(
-        fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")?
-            .trim()
-            .to_owned(),
-    )
-}
-fn capture_swap_total_kib() -> Result<u64> {
-    let text = fs::read_to_string("/proc/meminfo")?;
-    text.lines()
-        .find_map(|line| line.strip_prefix("SwapTotal:"))
-        .and_then(|rest| rest.split_whitespace().next())
-        .context("SwapTotal not found")?
-        .parse()
-        .context("parsing SwapTotal")
-}
-fn capture_cpu_affinity() -> Result<String> {
-    let text = fs::read_to_string("/proc/self/status")?;
-    text.lines()
-        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
-        .map(str::trim)
-        .map(str::to_owned)
-        .context("Cpus_allowed_list not found")
-}
-fn capture_mempolicy_mode() -> String {
-    Command::new("numactl")
-        .arg("--show")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|text| {
-            text.lines().find_map(|line| {
-                line.strip_prefix("policy:")
-                    .map(str::trim)
-                    .map(str::to_owned)
-            })
-        })
-        .unwrap_or_else(|| "unavailable".into())
-}
-fn capture_memory_nodes() -> Result<Vec<u32>> {
-    if let Ok(output) = Command::new("numactl").arg("--show").output()
-        && output.status.success()
-        && let Ok(text) = String::from_utf8(output.stdout)
-        && let Some(nodes) = text.lines().find_map(|line| line.strip_prefix("nodebind:"))
-    {
-        return parse_whitespace_list(nodes.trim());
-    }
-    let text = fs::read_to_string("/proc/self/status")?;
-    text.lines()
-        .find_map(|line| line.strip_prefix("Mems_allowed_list:"))
-        .map(str::trim)
-        .context("Mems_allowed_list not found")
-        .and_then(parse_range_list)
-}
 fn parse_range_list(text: &str) -> Result<Vec<u32>> {
     anyhow::ensure!(!text.trim().is_empty(), "memory-node list is empty");
     let mut nodes = Vec::new();
@@ -949,11 +895,6 @@ fn parse_range_list(text: &str) -> Result<Vec<u32>> {
     }
     Ok(nodes)
 }
-fn parse_whitespace_list(text: &str) -> Result<Vec<u32>> {
-    text.split_whitespace()
-        .map(|token| token.parse().map_err(Into::into))
-        .collect()
-}
 
 #[cfg(test)]
 mod tests {
@@ -970,6 +911,22 @@ mod tests {
             anyhow::ensure!(self.fail != Some(name), "mutated evidence rejected");
             Ok(json!({"provider": rule.decided_by, "checked": true}))
         }
+    }
+
+    /// The conditions come from the platform crate on every host, so macOS can
+    /// read them too. The old readers opened `/sys` and `/proc` directly.
+    #[test]
+    fn host_conditions_come_from_the_platform_crate() {
+        let conditions = HostConditions::new().unwrap();
+        let facts = bamts_platform::machine_facts().unwrap();
+        let placement = bamts_platform::thread_placement().unwrap();
+        assert_eq!(conditions.governor, facts.governor);
+        assert_eq!(conditions.swap_total_kib, facts.swap_total_kib);
+        assert_eq!(conditions.cpu_affinity, placement.cpu_affinity);
+        assert_eq!(
+            conditions.mempolicy_mode,
+            bamts_platform::numa_policy_mode()
+        );
     }
 
     fn conditions() -> HostConditions {
@@ -1190,6 +1147,121 @@ requires="live map captured"
         assert!(sample.samples > 1);
         assert!(sample.executable_mappings > 0);
         assert!(anonymous_executable_mappings(&sample.mappings).is_empty());
+    }
+
+    fn spawn_idle_cat() -> (PathBuf, Child) {
+        let executable = fs::canonicalize("/bin/cat").unwrap();
+        let child = Command::new(&executable)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        (executable, child)
+    }
+
+    /// `spawn` can return before the executable is mapped, so a fixture that
+    /// needs it observed reads real maps until it appears.
+    fn shows_executable(mappings: &[MemoryRegion], executable: &Path) -> bool {
+        mappings
+            .iter()
+            .any(|mapping| mapping.pathname.as_deref().map(Path::new) == Some(executable))
+    }
+
+    /// macOS gives both errors before an exiting child can be reaped. How often
+    /// a real read lands there depends on load, so these reads are scripted.
+    #[test]
+    fn continuous_sampler_polls_a_child_that_reads_as_gone_until_it_exits() {
+        for error in [
+            PlatformError::ProcessGone(1),
+            PlatformError::NoAddressSpace(1),
+        ] {
+            let (executable, child) = spawn_idle_cat();
+            let mut mapped = false;
+            let sample = sample_child_maps_from(
+                child,
+                &executable,
+                Duration::from_secs(2),
+                |child| {
+                    if mapped {
+                        // EOF starts the exit, so `try_wait` still sees a live child.
+                        drop(child.stdin.take());
+                        return Err(anyhow::Error::new(error.clone()));
+                    }
+                    let mappings = process_maps_for(child.id())?;
+                    mapped = shows_executable(&mappings, &executable);
+                    Ok(mappings)
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+            assert!(sample.executable_mappings > 0);
+        }
+    }
+
+    /// macOS also reports no address space while a live child execs, so that
+    /// answer must never end sampling: the new image still has to be checked.
+    #[test]
+    fn continuous_sampler_checks_the_image_a_child_execs_into() {
+        let (executable, child) = spawn_idle_cat();
+        let mut mapped = false;
+        let mut execed = false;
+        let error = sample_child_maps_from(
+            child,
+            &executable,
+            Duration::from_secs(2),
+            |child| {
+                if execed {
+                    return Ok(vec![MemoryRegion {
+                        identity: "new image".to_owned(),
+                        permissions: "rwxp".to_owned(),
+                        pathname: None,
+                    }]);
+                }
+                if mapped {
+                    execed = true;
+                    let error = PlatformError::NoAddressSpace(child.id());
+                    return Err(anyhow::Error::new(error));
+                }
+                let mappings = process_maps_for(child.id())?;
+                mapped = shows_executable(&mappings, &executable);
+                Ok(mappings)
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("RWX"), "{error:#}");
+    }
+
+    #[test]
+    fn continuous_sampler_times_out_on_a_child_that_stays_unreadable() {
+        let (executable, child) = spawn_idle_cat();
+        let error = sample_child_maps_from(
+            child,
+            &executable,
+            Duration::from_millis(50),
+            |child| {
+                let error = PlatformError::NoAddressSpace(child.id());
+                Err(anyhow::Error::new(error))
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("did not exit before timeout"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_reaped_child_is_recognised_through_the_error_context() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(child_is_between_states(&process_maps_for(pid).unwrap_err()));
     }
 
     #[test]

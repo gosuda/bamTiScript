@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml::{Table, Value};
 
-const MEMBERS: [(&str, &str); 11] = [
+const MEMBERS: [(&str, &str); 12] = [
     ("bamts-compiler", "crates/bamts-compiler"),
     ("bamts-cancel", "crates/bamts-cancel"),
+    ("bamts-platform", "crates/bamts-platform"),
     ("bamts-bytecode", "crates/bamts-bytecode"),
     ("bamts-runtime", "crates/bamts-runtime"),
     ("bamts-native", "crates/bamts-native"),
@@ -336,7 +337,12 @@ fn validate_member_lints(name: &str, manifest: &Value, context: &str) -> Result<
     // `deny` policy instead of inheriting the workspace-wide `forbid`.
     if matches!(
         name,
-        "bamts-native" | "bamts-node" | "bamts-codegen" | "bamts-napi" | "bamts-verification"
+        "bamts-native"
+            | "bamts-node"
+            | "bamts-codegen"
+            | "bamts-napi"
+            | "bamts-verification"
+            | "bamts-platform"
     ) {
         if lints.contains_key("workspace") {
             return Err(workspace_error(format!(
@@ -363,7 +369,10 @@ fn validate_member_lints(name: &str, manifest: &Value, context: &str) -> Result<
                 "deny",
                 &format!("{context} [lints.rust]"),
             )?;
-            if matches!(name, "bamts-codegen" | "bamts-napi" | "bamts-verification") {
+            if matches!(
+                name,
+                "bamts-codegen" | "bamts-napi" | "bamts-verification" | "bamts-platform"
+            ) {
                 require_exact_string(
                     rust,
                     "unsafe_op_in_unsafe_fn",
@@ -993,6 +1002,7 @@ fn expected_internal_graph() -> InternalGraph {
     let mut graph = BTreeMap::new();
     graph.insert("bamts-bytecode".to_owned(), BTreeMap::new());
     graph.insert("bamts-cancel".to_owned(), BTreeMap::new());
+    graph.insert("bamts-platform".to_owned(), BTreeMap::new());
     graph.insert(
         "bamts-native".to_owned(),
         BTreeMap::from([("bamts-bytecode".to_owned(), internal_dependency(false, &[]))]),
@@ -1013,6 +1023,7 @@ fn expected_internal_graph() -> InternalGraph {
                 "bamts-native".to_owned(),
                 internal_dependency(false, &["gc"]),
             ),
+            ("bamts-platform".to_owned(), internal_dependency(false, &[])),
         ]),
     );
     graph.insert(
@@ -1031,6 +1042,7 @@ fn expected_internal_graph() -> InternalGraph {
         BTreeMap::from([
             ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
             ("bamts-cancel".to_owned(), internal_dependency(false, &[])),
+            ("bamts-platform".to_owned(), internal_dependency(false, &[])),
             ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
             ("bamts-native".to_owned(), internal_dependency(true, &[])),
         ]),
@@ -1088,6 +1100,7 @@ fn expected_internal_graph() -> InternalGraph {
                 "bamts-node".to_owned(),
                 internal_dependency(false, &["script-compiler"]),
             ),
+            ("bamts-platform".to_owned(), internal_dependency(false, &[])),
             ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
         ]),
     );
