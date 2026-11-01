@@ -656,11 +656,7 @@ pub trait IntlServiceDataProvider {
     fn locale_data(&self) -> &dyn LocaleDataProvider;
 
     /// Ordered plural categories exposed by `resolvedOptions()`.
-    fn plural_categories(
-        &self,
-        _locale: &str,
-        _rule_type: PluralRuleType,
-    ) -> &[PluralCategory] {
+    fn plural_categories(&self, _locale: &str, _rule_type: PluralRuleType) -> &[PluralCategory] {
         &[]
     }
 
@@ -1088,7 +1084,9 @@ fn resolve_service_locale(
     keys: &[String],
 ) -> Result<super::locale_negotiation::ResolvedLocale, IntlError> {
     let requested = requested_with_default(requested, host, provider)?;
-    Ok(resolve_locale(&requested, options, keys, matcher, provider)?)
+    Ok(resolve_locale(
+        &requested, options, keys, matcher, provider,
+    )?)
 }
 
 /// The exact values reported by `PluralRules.prototype.resolvedOptions`.
@@ -1205,16 +1203,16 @@ impl<'a> PluralRules<'a> {
     pub fn resolved_options(&self) -> PluralRulesResolvedOptions {
         let fraction_active = matches!(
             self.digits.rounding_type,
-            RoundingType::FractionDigits | RoundingType::MorePrecision | RoundingType::LessPrecision
+            RoundingType::FractionDigits
+                | RoundingType::MorePrecision
+                | RoundingType::LessPrecision
         );
         PluralRulesResolvedOptions {
             locale: self.locale.clone(),
             plural_type: self.rule_type,
             minimum_integer_digits: self.digits.minimum_integer_digits,
-            minimum_fraction_digits: fraction_active
-                .then_some(self.digits.minimum_fraction_digits),
-            maximum_fraction_digits: fraction_active
-                .then_some(self.digits.maximum_fraction_digits),
+            minimum_fraction_digits: fraction_active.then_some(self.digits.minimum_fraction_digits),
+            maximum_fraction_digits: fraction_active.then_some(self.digits.maximum_fraction_digits),
             minimum_significant_digits: self
                 .digits
                 .has_significant_digits
@@ -1333,11 +1331,7 @@ fn round_finite(value: f64, options: DigitOptions) -> RoundedDecimal {
     }
 }
 
-fn round_fraction(
-    exact: &ExactDecimal,
-    negative: bool,
-    options: DigitOptions,
-) -> RoundedDecimal {
+fn round_fraction(exact: &ExactDecimal, negative: bool, options: DigitOptions) -> RoundedDecimal {
     let magnitude = -i32::from(options.maximum_fraction_digits);
     let coefficient = quantize(
         exact,
@@ -1399,13 +1393,7 @@ fn quantize(
     let has_remainder = integer_remainder != 0 || has_fraction;
     let relation = compare_half(integer_remainder, &fraction, increment);
     let quotient_is_odd = quotient.last().is_some_and(|digit| digit % 2 == 1);
-    if should_increment(
-        mode,
-        negative,
-        has_remainder,
-        relation,
-        quotient_is_odd,
-    ) {
+    if should_increment(mode, negative, has_remainder, relation, quotient_is_odd) {
         add_one(&mut quotient);
     }
     multiply_small(&quotient, increment)
@@ -1503,8 +1491,7 @@ fn should_increment(
         RoundingMode::HalfExpand => relation != HalfRelation::Below,
         RoundingMode::HalfTrunc => relation == HalfRelation::Above,
         RoundingMode::HalfEven => {
-            relation == HalfRelation::Above
-                || (relation == HalfRelation::Equal && quotient_is_odd)
+            relation == HalfRelation::Above || (relation == HalfRelation::Equal && quotient_is_odd)
         }
     }
 }
@@ -1801,12 +1788,9 @@ impl<'a> RelativeTimeFormat<'a> {
             && value.fract() == 0.0
             && value >= i64::MIN as f64
             && value <= i64::MAX as f64
-            && let Some(term) = self.provider.relative_time_auto(
-                &self.data_locale,
-                self.style,
-                unit,
-                value as i64,
-            )
+            && let Some(term) =
+                self.provider
+                    .relative_time_auto(&self.data_locale, self.style, unit, value as i64)
         {
             return Ok(vec![RelativeTimePart {
                 kind: RelativeTimePartKind::Literal,
@@ -1884,7 +1868,11 @@ impl<'a> RelativeTimeFormat<'a> {
 
 fn validate_formatted_number(number: &FormattedNumber) -> Result<(), IntlError> {
     if number.parts.is_empty()
-        || number.parts.iter().map(|part| part.value.as_str()).collect::<String>()
+        || number
+            .parts
+            .iter()
+            .map(|part| part.value.as_str())
+            .collect::<String>()
             != number.value
     {
         return Err(IntlError::InvalidData(
@@ -1894,11 +1882,7 @@ fn validate_formatted_number(number: &FormattedNumber) -> Result<(), IntlError> 
     Ok(())
 }
 
-fn push_relative_literal(
-    parts: &mut Vec<RelativeTimePart>,
-    literal: &str,
-    index: &mut usize,
-) {
+fn push_relative_literal(parts: &mut Vec<RelativeTimePart>, literal: &str, index: &mut usize) {
     if literal.is_empty() {
         return;
     }
@@ -1911,7 +1895,10 @@ fn push_relative_literal(
     *index += utf16_len(literal);
 }
 
-fn one_placeholder<'a>(pattern: &'a str, placeholder: &str) -> Result<(&'a str, &'a str), IntlError> {
+fn one_placeholder<'a>(
+    pattern: &'a str,
+    placeholder: &str,
+) -> Result<(&'a str, &'a str), IntlError> {
     let (prefix, suffix) = pattern
         .split_once(placeholder)
         .ok_or(IntlError::InvalidData("pattern is missing a placeholder"))?;
@@ -2628,9 +2615,10 @@ fn is_unicode_language_id(value: &str) -> bool {
         return false;
     }
     let mut index = 0;
-    if rest.get(index).is_some_and(|part| {
-        part.len() == 4 && part.bytes().all(|byte| byte.is_ascii_alphabetic())
-    }) {
+    if rest
+        .get(index)
+        .is_some_and(|part| part.len() == 4 && part.bytes().all(|byte| byte.is_ascii_alphabetic()))
+    {
         index += 1;
     }
     if rest.get(index).is_some_and(|part| is_region_subtag(part)) {
@@ -2659,8 +2647,7 @@ fn is_region_subtag(value: &str) -> bool {
 fn is_unicode_type(value: &str) -> bool {
     !value.is_empty()
         && value.split('-').all(|part| {
-            (3..=8).contains(&part.len())
-                && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            (3..=8).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
         })
 }
 

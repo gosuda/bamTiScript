@@ -43,6 +43,7 @@ use intrinsics::builtins::typedarray_all::{self, ElementKind, LengthSlot};
 mod external_modules;
 mod gc;
 mod host_objects;
+pub mod intl;
 mod intrinsics;
 mod native;
 #[cfg(test)]

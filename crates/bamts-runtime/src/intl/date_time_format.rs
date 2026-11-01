@@ -36,12 +36,18 @@ pub enum ProviderError {
 impl ProviderError {
     #[must_use]
     pub fn missing(kind: &'static str, key: impl Into<String>) -> Self {
-        Self::MissingData { kind, key: key.into() }
+        Self::MissingData {
+            kind,
+            key: key.into(),
+        }
     }
 
     #[must_use]
     pub fn invalid(kind: &'static str, detail: impl Into<String>) -> Self {
-        Self::InvalidData { kind, detail: detail.into() }
+        Self::InvalidData {
+            kind,
+            detail: detail.into(),
+        }
     }
 }
 
@@ -76,7 +82,10 @@ impl DateTimeFormatError {
     }
 
     fn range(option: &'static str, value: impl Into<String>) -> Self {
-        Self::Range { option, value: value.into() }
+        Self::Range {
+            option,
+            value: value.into(),
+        }
     }
 }
 
@@ -102,11 +111,15 @@ impl Error for DateTimeFormatError {
 }
 
 impl From<LocaleError> for DateTimeFormatError {
-    fn from(value: LocaleError) -> Self { Self::Locale(value) }
+    fn from(value: LocaleError) -> Self {
+        Self::Locale(value)
+    }
 }
 
 impl From<ProviderError> for DateTimeFormatError {
-    fn from(value: ProviderError) -> Self { Self::Provider(value) }
+    fn from(value: ProviderError) -> Self {
+        Self::Provider(value)
+    }
 }
 
 /// ECMA-402 hour-cycle identifiers.
@@ -140,7 +153,9 @@ impl HourCycle {
     }
 
     #[must_use]
-    pub const fn is_twelve_hour(self) -> bool { matches!(self, Self::H11 | Self::H12) }
+    pub const fn is_twelve_hour(self) -> bool {
+        matches!(self, Self::H11 | Self::H12)
+    }
 }
 
 /// Provider preferences used when `hour12` suppresses the `hc` option.
@@ -344,16 +359,25 @@ pub struct CalendarDateTime {
 impl CalendarDateTime {
     fn validate(&self) -> Result<(), ProviderError> {
         if !(1..=13).contains(&self.month) {
-            return Err(ProviderError::invalid("calendar", "month must be in 1..=13"));
+            return Err(ProviderError::invalid(
+                "calendar",
+                "month must be in 1..=13",
+            ));
         }
         if self.month_code.is_empty() {
-            return Err(ProviderError::invalid("calendar", "month_code must not be empty"));
+            return Err(ProviderError::invalid(
+                "calendar",
+                "month_code must not be empty",
+            ));
         }
         if !(1..=31).contains(&self.day) {
             return Err(ProviderError::invalid("calendar", "day must be in 1..=31"));
         }
         if !(1..=7).contains(&self.weekday) {
-            return Err(ProviderError::invalid("calendar", "weekday must be in 1..=7"));
+            return Err(ProviderError::invalid(
+                "calendar",
+                "weekday must be in 1..=7",
+            ));
         }
         if self.hour > 23 || self.minute > 59 || self.second > 59 || self.millisecond > 999 {
             return Err(ProviderError::invalid(
@@ -398,7 +422,10 @@ pub struct DateTimePattern {
 impl DateTimePattern {
     fn validate(&self) -> Result<(), ProviderError> {
         if self.items.is_empty() {
-            return Err(ProviderError::invalid("pattern", "pattern must not be empty"));
+            return Err(ProviderError::invalid(
+                "pattern",
+                "pattern must not be empty",
+            ));
         }
         for item in &self.items {
             if let PatternItem::Field(PatternField::FractionalSecond(digits)) = item
@@ -414,32 +441,47 @@ impl DateTimePattern {
     }
 
     fn has_hour(&self) -> bool {
-        self.items.iter().any(|item| matches!(item, PatternItem::Field(PatternField::Hour(_))))
+        self.items
+            .iter()
+            .any(|item| matches!(item, PatternItem::Field(PatternField::Hour(_))))
     }
 
     fn has_field(&self, difference: RangeDifference) -> bool {
         self.items.iter().any(|item| {
             matches!(
                 (difference, item),
-                (RangeDifference::Era, PatternItem::Field(PatternField::Era(_)))
-                    | (
-                        RangeDifference::Year,
-                        PatternItem::Field(
-                            PatternField::Year(_)
-                                | PatternField::RelatedYear(_)
-                                | PatternField::YearName(_)
-                        )
+                (
+                    RangeDifference::Era,
+                    PatternItem::Field(PatternField::Era(_))
+                ) | (
+                    RangeDifference::Year,
+                    PatternItem::Field(
+                        PatternField::Year(_)
+                            | PatternField::RelatedYear(_)
+                            | PatternField::YearName(_)
                     )
-                    | (RangeDifference::Month, PatternItem::Field(PatternField::Month(_)))
-                    | (RangeDifference::Day, PatternItem::Field(PatternField::Day(_)))
-                    | (RangeDifference::DayPeriod, PatternItem::Field(PatternField::DayPeriod(_)))
-                    | (RangeDifference::Hour, PatternItem::Field(PatternField::Hour(_)))
-                    | (RangeDifference::Minute, PatternItem::Field(PatternField::Minute(_)))
-                    | (RangeDifference::Second, PatternItem::Field(PatternField::Second(_)))
-                    | (
-                        RangeDifference::FractionalSecond,
-                        PatternItem::Field(PatternField::FractionalSecond(_))
-                    )
+                ) | (
+                    RangeDifference::Month,
+                    PatternItem::Field(PatternField::Month(_))
+                ) | (
+                    RangeDifference::Day,
+                    PatternItem::Field(PatternField::Day(_))
+                ) | (
+                    RangeDifference::DayPeriod,
+                    PatternItem::Field(PatternField::DayPeriod(_))
+                ) | (
+                    RangeDifference::Hour,
+                    PatternItem::Field(PatternField::Hour(_))
+                ) | (
+                    RangeDifference::Minute,
+                    PatternItem::Field(PatternField::Minute(_))
+                ) | (
+                    RangeDifference::Second,
+                    PatternItem::Field(PatternField::Second(_))
+                ) | (
+                    RangeDifference::FractionalSecond,
+                    PatternItem::Field(PatternField::FractionalSecond(_))
+                )
             )
         })
     }
@@ -480,7 +522,10 @@ pub struct DateTimeRangePattern {
 impl DateTimeRangePattern {
     fn validate(&self) -> Result<(), ProviderError> {
         if self.items.is_empty() {
-            return Err(ProviderError::invalid("range pattern", "pattern must not be empty"));
+            return Err(ProviderError::invalid(
+                "range pattern",
+                "pattern must not be empty",
+            ));
         }
         for item in &self.items {
             if let PatternItem::Field(PatternField::FractionalSecond(digits)) = &item.item
@@ -576,8 +621,10 @@ pub trait DateTimeFormatDataProvider: LocaleDataProvider {
         data_locale: &str,
     ) -> Result<HourCyclePreferences, ProviderError>;
 
-    fn select_pattern(&self, request: &PatternRequest<'_>)
-    -> Result<DateTimePattern, ProviderError>;
+    fn select_pattern(
+        &self,
+        request: &PatternRequest<'_>,
+    ) -> Result<DateTimePattern, ProviderError>;
 
     /// Returns a difference-specific range pattern or `None` when the caller
     /// must request the mandatory default pattern with `largest_difference=None`.
@@ -600,10 +647,7 @@ pub trait DateTimeFormatDataProvider: LocaleDataProvider {
         local_epoch_nanoseconds: i128,
     ) -> Result<CalendarDateTime, ProviderError>;
 
-    fn format_integer(
-        &self,
-        request: &IntegerFormatRequest<'_>,
-    ) -> Result<String, ProviderError>;
+    fn format_integer(&self, request: &IntegerFormatRequest<'_>) -> Result<String, ProviderError>;
 
     fn format_text(&self, request: &TextFormatRequest<'_>) -> Result<String, ProviderError>;
 }
@@ -611,7 +655,10 @@ pub trait DateTimeFormatDataProvider: LocaleDataProvider {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CanonicalTimeZone {
     Named(String),
-    Offset { identifier: String, nanoseconds: i64 },
+    Offset {
+        identifier: String,
+        nanoseconds: i64,
+    },
 }
 
 impl CanonicalTimeZone {
@@ -762,12 +809,7 @@ impl DateTimeFormat {
         if let Some(numbering_system) = &options.numbering_system {
             locale_options.insert(
                 "nu".to_owned(),
-                canonicalize_unicode_type(
-                    "numberingSystem",
-                    "nu",
-                    numbering_system,
-                    provider,
-                )?,
+                canonicalize_unicode_type("numberingSystem", "nu", numbering_system, provider)?,
             );
         }
 
@@ -781,7 +823,9 @@ impl DateTimeFormat {
         )?;
         let calendar = resolved_keyword(&locale.values, "ca")?;
         let numbering_system = resolved_keyword(&locale.values, "nu")?;
-        let preferences = provider.hour_cycle_preferences(&locale.data_locale)?.validate()?;
+        let preferences = provider
+            .hour_cycle_preferences(&locale.data_locale)?
+            .validate()?;
         let hour_cycle = match options.hour12 {
             Some(true) => preferences.twelve_hour,
             Some(false) => preferences.twenty_four_hour,
@@ -839,11 +883,17 @@ impl DateTimeFormat {
             components: resolved_components,
         };
 
-        Ok(Self { resolved, time_zone, pattern })
+        Ok(Self {
+            resolved,
+            time_zone,
+            pattern,
+        })
     }
 
     #[must_use]
-    pub const fn resolved_options(&self) -> &ResolvedDateTimeFormatOptions { &self.resolved }
+    pub const fn resolved_options(&self) -> &ResolvedDateTimeFormatOptions {
+        &self.resolved
+    }
 
     pub fn format(
         &self,
@@ -870,13 +920,12 @@ impl DateTimeFormat {
         end_epoch_milliseconds: f64,
         provider: &dyn DateTimeFormatDataProvider,
     ) -> Result<String, DateTimeFormatError> {
-        let parts = self.format_range_to_parts(
-            start_epoch_milliseconds,
-            end_epoch_milliseconds,
-            provider,
-        )?;
+        let parts =
+            self.format_range_to_parts(start_epoch_milliseconds, end_epoch_milliseconds, provider)?;
         let mut result = String::new();
-        for part in parts { result.push_str(&part.value); }
+        for part in parts {
+            result.push_str(&part.value);
+        }
         Ok(result)
     }
 
@@ -952,8 +1001,8 @@ impl DateTimeFormat {
         let offset = match &self.time_zone {
             CanonicalTimeZone::Offset { nanoseconds, .. } => i128::from(*nanoseconds),
             CanonicalTimeZone::Named(identifier) => {
-                let offset = provider
-                    .named_time_zone_offset_nanoseconds(identifier, epoch_nanoseconds)?;
+                let offset =
+                    provider.named_time_zone_offset_nanoseconds(identifier, epoch_nanoseconds)?;
                 let offset = i128::from(offset);
                 if !(-NANOS_PER_DAY..NANOS_PER_DAY).contains(&offset) {
                     return Err(ProviderError::invalid(
@@ -996,7 +1045,9 @@ impl DateTimeFormat {
     ) -> Result<DateTimePart, DateTimeFormatError> {
         let (part_type, value) = match item {
             PatternItem::Literal(value) => (DateTimePartType::Literal, value.clone()),
-            PatternItem::Field(field) => self.render_field(field, epoch_nanoseconds, local, provider)?,
+            PatternItem::Field(field) => {
+                self.render_field(field, epoch_nanoseconds, local, provider)?
+            }
         };
         Ok(DateTimePart { part_type, value })
     }
@@ -1041,9 +1092,7 @@ impl DateTimeFormat {
             PatternField::Weekday(width) => {
                 Ok((DateTimePartType::Weekday, text(TextField::Weekday(width))?))
             }
-            PatternField::Era(width) => {
-                Ok((DateTimePartType::Era, text(TextField::Era(width))?))
-            }
+            PatternField::Era(width) => Ok((DateTimePartType::Era, text(TextField::Era(width))?)),
             PatternField::Year(style) => Ok((
                 DateTimePartType::Year,
                 integer(i64::from(local.year), numeric_width(style))?,
@@ -1057,18 +1106,17 @@ impl DateTimeFormat {
                     integer(i64::from(year), numeric_width(style))?,
                 ))
             }
-            PatternField::YearName(width) => {
-                Ok((DateTimePartType::YearName, text(TextField::YearName(width))?))
-            }
+            PatternField::YearName(width) => Ok((
+                DateTimePartType::YearName,
+                text(TextField::YearName(width))?,
+            )),
             PatternField::Month(style) => match style {
-                MonthStyle::Numeric => Ok((
-                    DateTimePartType::Month,
-                    integer(i64::from(local.month), 1)?,
-                )),
-                MonthStyle::TwoDigit => Ok((
-                    DateTimePartType::Month,
-                    integer(i64::from(local.month), 2)?,
-                )),
+                MonthStyle::Numeric => {
+                    Ok((DateTimePartType::Month, integer(i64::from(local.month), 1)?))
+                }
+                MonthStyle::TwoDigit => {
+                    Ok((DateTimePartType::Month, integer(i64::from(local.month), 2)?))
+                }
                 MonthStyle::Narrow => Ok((
                     DateTimePartType::Month,
                     text(TextField::Month(TextWidth::Narrow))?,
@@ -1101,7 +1149,13 @@ impl DateTimeFormat {
                         if hour == 0 { 12 } else { hour }
                     }
                     HourCycle::H23 => local.hour,
-                    HourCycle::H24 => if local.hour == 0 { 24 } else { local.hour },
+                    HourCycle::H24 => {
+                        if local.hour == 0 {
+                            24
+                        } else {
+                            local.hour
+                        }
+                    }
                 };
                 Ok((
                     DateTimePartType::Hour,
@@ -1209,7 +1263,9 @@ impl DateTimeFormat {
                     start.millisecond / divisor == end.millisecond / divisor
                 }
             };
-            if !equal { return Ok(Some(difference)); }
+            if !equal {
+                return Ok(Some(difference));
+            }
         }
         Ok(None)
     }
@@ -1265,14 +1321,17 @@ fn canonicalize_unicode_type(
     provider: &dyn DateTimeFormatDataProvider,
 ) -> Result<String, DateTimeFormatError> {
     if value.is_empty()
-        || value
-            .split('-')
-            .any(|part| !(3..=8).contains(&part.len()) || !part.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        || value.split('-').any(|part| {
+            !(3..=8).contains(&part.len()) || !part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
     {
         return Err(DateTimeFormatError::range(option, value));
     }
     let canonical = value.to_ascii_lowercase();
-    Ok(provider.unicode_type_alias(key, &canonical).unwrap_or(&canonical).to_owned())
+    Ok(provider
+        .unicode_type_alias(key, &canonical)
+        .unwrap_or(&canonical)
+        .to_owned())
 }
 
 fn resolved_keyword(
@@ -1326,9 +1385,7 @@ fn parse_offset_minutes(value: &str) -> Result<Option<i32>, DateTimeFormatError>
         None => (body, None),
     };
     if fraction.is_some_and(|digits| {
-        digits.is_empty()
-            || digits.len() > 9
-            || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        digits.is_empty() || digits.len() > 9 || !digits.bytes().all(|byte| byte.is_ascii_digit())
     }) {
         return Err(DateTimeFormatError::range("timeZone", value));
     }
@@ -1338,18 +1395,20 @@ fn parse_offset_minutes(value: &str) -> Result<Option<i32>, DateTimeFormatError>
         let parts: Vec<_> = main.split(':').collect();
         if !(1..=3).contains(&parts.len())
             || parts.iter().any(|part| part.len() != 2)
-            || parts.iter().any(|part| !part.bytes().all(|byte| byte.is_ascii_digit()))
+            || parts
+                .iter()
+                .any(|part| !part.bytes().all(|byte| byte.is_ascii_digit()))
         {
             return Err(DateTimeFormatError::range("timeZone", value));
         }
         for (index, part) in parts.iter().enumerate() {
-            fields[index] = part.parse().map_err(|_| DateTimeFormatError::range("timeZone", value))?;
+            fields[index] = part
+                .parse()
+                .map_err(|_| DateTimeFormatError::range("timeZone", value))?;
         }
         parts.len()
     } else {
-        if !matches!(main.len(), 2 | 4 | 6)
-            || !main.bytes().all(|byte| byte.is_ascii_digit())
-        {
+        if !matches!(main.len(), 2 | 4 | 6) || !main.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(DateTimeFormatError::range("timeZone", value));
         }
         let count = main.len() / 2;
@@ -1388,7 +1447,9 @@ fn is_invalid_date_value(value: f64) -> bool {
 fn concatenate_parts(parts: &[DateTimePart]) -> String {
     let capacity = parts.iter().map(|part| part.value.len()).sum();
     let mut result = String::with_capacity(capacity);
-    for part in parts { result.push_str(&part.value); }
+    for part in parts {
+        result.push_str(&part.value);
+    }
     result
 }
 
@@ -1462,15 +1523,8 @@ fn date_adapter(
     if is_invalid_date_value(epoch_milliseconds) {
         return Ok("Invalid Date".to_owned());
     }
-    DateTimeFormat::try_new_with_mode(
-        locales,
-        options,
-        required,
-        defaults,
-        provider,
-        host_locale,
-    )?
-    .format(epoch_milliseconds, provider)
+    DateTimeFormat::try_new_with_mode(locales, options, required, defaults, provider, host_locale)?
+        .format(epoch_milliseconds, provider)
 }
 
 #[cfg(test)]
@@ -1486,7 +1540,9 @@ mod tests {
     struct FixtureHost;
 
     impl HostLocaleHook for FixtureHost {
-        fn preferred_locales(&self) -> Vec<String> { vec!["en".to_owned()] }
+        fn preferred_locales(&self) -> Vec<String> {
+            vec!["en".to_owned()]
+        }
     }
 
     struct FixtureProvider {
@@ -1513,9 +1569,13 @@ mod tests {
             }
         }
 
-        fn record(&self, entry: impl Into<String>) { self.log.borrow_mut().push(entry.into()); }
+        fn record(&self, entry: impl Into<String>) {
+            self.log.borrow_mut().push(entry.into());
+        }
 
-        fn take_log(&self) -> Vec<String> { std::mem::take(&mut *self.log.borrow_mut()) }
+        fn take_log(&self) -> Vec<String> {
+            std::mem::take(&mut *self.log.borrow_mut())
+        }
     }
 
     impl LocaleDataProvider for FixtureProvider {
@@ -1548,7 +1608,11 @@ mod tests {
         }
 
         fn add_likely_subtags(&self, locale: &LanguageId) -> Option<LanguageId> {
-            self.record(format!("locale:likely:{}.{}", locale.language, locale.region.as_deref().unwrap_or("")));
+            self.record(format!(
+                "locale:likely:{}.{}",
+                locale.language,
+                locale.region.as_deref().unwrap_or("")
+            ));
             Some(LanguageId {
                 language: locale.language.clone(),
                 script: Some("Latn".to_owned()),
@@ -1618,13 +1682,17 @@ mod tests {
                 date_items.push(PatternItem::Field(PatternField::Year(style)));
             }
             if let Some(style) = components.month {
-                if !date_items.is_empty() && !matches!(date_items.last(), Some(PatternItem::Literal(_))) {
+                if !date_items.is_empty()
+                    && !matches!(date_items.last(), Some(PatternItem::Literal(_)))
+                {
                     date_items.push(PatternItem::Literal("/".to_owned()));
                 }
                 date_items.push(PatternItem::Field(PatternField::Month(style)));
             }
             if let Some(style) = components.day {
-                if !date_items.is_empty() && !matches!(date_items.last(), Some(PatternItem::Literal(_))) {
+                if !date_items.is_empty()
+                    && !matches!(date_items.last(), Some(PatternItem::Literal(_)))
+                {
                     date_items.push(PatternItem::Literal("/".to_owned()));
                 }
                 date_items.push(PatternItem::Field(PatternField::Day(style)));
@@ -1635,11 +1703,15 @@ mod tests {
                 time_items.push(PatternItem::Field(PatternField::Hour(style)));
             }
             if let Some(style) = components.minute {
-                if !time_items.is_empty() { time_items.push(PatternItem::Literal(":".to_owned())); }
+                if !time_items.is_empty() {
+                    time_items.push(PatternItem::Literal(":".to_owned()));
+                }
                 time_items.push(PatternItem::Field(PatternField::Minute(style)));
             }
             if let Some(style) = components.second {
-                if !time_items.is_empty() { time_items.push(PatternItem::Literal(":".to_owned())); }
+                if !time_items.is_empty() {
+                    time_items.push(PatternItem::Literal(":".to_owned()));
+                }
                 time_items.push(PatternItem::Field(PatternField::Second(style)));
             }
             if let Some(digits) = components.fractional_second_digits {
@@ -1647,11 +1719,15 @@ mod tests {
                 time_items.push(PatternItem::Field(PatternField::FractionalSecond(digits)));
             }
             if let Some(width) = components.day_period {
-                if !time_items.is_empty() { time_items.push(PatternItem::Literal(" ".to_owned())); }
+                if !time_items.is_empty() {
+                    time_items.push(PatternItem::Literal(" ".to_owned()));
+                }
                 time_items.push(PatternItem::Field(PatternField::DayPeriod(width)));
             }
             if let Some(style) = components.time_zone_name {
-                if !time_items.is_empty() { time_items.push(PatternItem::Literal(" ".to_owned())); }
+                if !time_items.is_empty() {
+                    time_items.push(PatternItem::Literal(" ".to_owned()));
+                }
                 time_items.push(PatternItem::Field(PatternField::TimeZoneName(style)));
             }
 
@@ -1687,8 +1763,10 @@ mod tests {
             let Some(difference) = request.largest_difference else {
                 return Ok(Some(simple_hour_range()));
             };
-            Ok(matches!(difference, RangeDifference::Hour | RangeDifference::Minute)
-                .then(simple_hour_range))
+            Ok(
+                matches!(difference, RangeDifference::Hour | RangeDifference::Minute)
+                    .then(simple_hour_range),
+            )
         }
 
         fn named_time_zone_offset_nanoseconds(
@@ -1724,7 +1802,11 @@ mod tests {
             let (era, year) = match calendar {
                 "gregory" => (
                     Some(if gregorian_year >= 1 { "ce" } else { "bce" }.to_owned()),
-                    if gregorian_year >= 1 { gregorian_year } else { 1 - gregorian_year },
+                    if gregorian_year >= 1 {
+                        gregorian_year
+                    } else {
+                        1 - gregorian_year
+                    },
                 ),
                 "buddhist" => (Some("be".to_owned()), gregorian_year + 543),
                 _ => return Err(ProviderError::missing("calendar", calendar)),
@@ -1755,7 +1837,10 @@ mod tests {
             ));
             let negative = request.value < 0;
             let magnitude = request.value.unsigned_abs();
-            let mut value = format!("{magnitude:0width$}", width = usize::from(request.minimum_digits));
+            let mut value = format!(
+                "{magnitude:0width$}",
+                width = usize::from(request.minimum_digits)
+            );
             if request.numbering_system == "arab" {
                 const DIGITS: [char; 10] = ['٠', '١', '٢', '٣', '٤', '٥', '٦', '٧', '٨', '٩'];
                 value = value
@@ -1768,16 +1853,21 @@ mod tests {
                     request.numbering_system,
                 ));
             }
-            if negative { value.insert(0, '-'); }
+            if negative {
+                value.insert(0, '-');
+            }
             Ok(value)
         }
 
         fn format_text(&self, request: &TextFormatRequest<'_>) -> Result<String, ProviderError> {
-            self.record(format!("text:{:?}:{}", request.field, request.epoch_nanoseconds));
+            self.record(format!(
+                "text:{:?}:{}",
+                request.field, request.epoch_nanoseconds
+            ));
             let value = match request.field {
                 TextField::Weekday(_) => ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
                     [usize::from(request.local.weekday - 1)]
-                    .to_owned(),
+                .to_owned(),
                 TextField::Era(_) => match request.local.era.as_deref() {
                     Some("ce") => "AD".to_owned(),
                     Some("bce") => "BC".to_owned(),
@@ -1791,8 +1881,19 @@ mod tests {
                     .clone()
                     .ok_or_else(|| ProviderError::missing("year name", request.calendar))?,
                 TextField::Month(_) => [
-                    "January", "February", "March", "April", "May", "June", "July",
-                    "August", "September", "October", "November", "December", "Undecimber",
+                    "January",
+                    "February",
+                    "March",
+                    "April",
+                    "May",
+                    "June",
+                    "July",
+                    "August",
+                    "September",
+                    "October",
+                    "November",
+                    "December",
+                    "Undecimber",
                 ][usize::from(request.local.month - 1)]
                 .to_owned(),
                 TextField::DayPeriod(_) => {
@@ -1842,8 +1943,7 @@ mod tests {
         let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
         let day_of_era = z - era * 146_097;
         let year_of_era =
-            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096)
-                / 365;
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
         let mut year = year_of_era + era * 400;
         let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
         let month_prime = (5 * day_of_year + 2) / 153;
@@ -1862,14 +1962,17 @@ mod tests {
 
     fn utc_milliseconds(year: i32, month: u8, day: u8, hour: u8, minute: u8) -> f64 {
         let adjusted_year = i64::from(year) - i64::from(month <= 2);
-        let era = if adjusted_year >= 0 { adjusted_year } else { adjusted_year - 399 } / 400;
+        let era = if adjusted_year >= 0 {
+            adjusted_year
+        } else {
+            adjusted_year - 399
+        } / 400;
         let year_of_era = adjusted_year - era * 400;
         let adjusted_month = i64::from(month) + if month > 2 { -3 } else { 9 };
         let day_of_year = (153 * adjusted_month + 2) / 5 + i64::from(day) - 1;
         let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
         let days = era * 146_097 + day_of_era - 719_468;
-        (days * 86_400_000 + i64::from(hour) * 3_600_000 + i64::from(minute) * 60_000)
-            as f64
+        (days * 86_400_000 + i64::from(hour) * 3_600_000 + i64::from(minute) * 60_000) as f64
     }
 
     #[test]
@@ -1918,14 +2021,14 @@ mod tests {
         let provider = FixtureProvider::new();
         let host = FixtureHost;
         for time_zone in ["Mars/Phobos", "+24:00", "+01:00:01", "+1:00"] {
-            let error = DateTimeFormat::try_new(
-                &[],
-                &options_with_time_zone(time_zone),
-                &provider,
-                &host,
-            )
-            .expect_err("invalid zone must fail");
-            assert_eq!(error.kind(), DateTimeFormatErrorKind::RangeError, "{time_zone}");
+            let error =
+                DateTimeFormat::try_new(&[], &options_with_time_zone(time_zone), &provider, &host)
+                    .expect_err("invalid zone must fail");
+            assert_eq!(
+                error.kind(),
+                DateTimeFormatErrorKind::RangeError,
+                "{time_zone}"
+            );
         }
         for (calendar, numbering_system) in [(Some("a"), None), (None, Some("ab"))] {
             let options = DateTimeFormatOptions {
@@ -1941,13 +2044,9 @@ mod tests {
             );
         }
 
-        let offset = DateTimeFormat::try_new(
-            &[],
-            &options_with_time_zone("-2359"),
-            &provider,
-            &host,
-        )
-        .expect("valid offset zone");
+        let offset =
+            DateTimeFormat::try_new(&[], &options_with_time_zone("-2359"), &provider, &host)
+                .expect("valid offset zone");
         assert_eq!(offset.resolved_options().time_zone, "-23:59");
         let zero = DateTimeFormat::try_new(
             &[],
@@ -2008,9 +2107,12 @@ mod tests {
                 },
                 ..DateTimeFormatOptions::default()
             };
-            let format = DateTimeFormat::try_new(&[], &options, &provider, &host)
-                .expect("hour formatter");
-            assert_eq!(format.format(midnight, &provider).expect("midnight"), midnight_expected);
+            let format =
+                DateTimeFormat::try_new(&[], &options, &provider, &host).expect("hour formatter");
+            assert_eq!(
+                format.format(midnight, &provider).expect("midnight"),
+                midnight_expected
+            );
             assert_eq!(format.format(noon, &provider).expect("noon"), noon_expected);
         }
 
@@ -2045,8 +2147,8 @@ mod tests {
             },
             ..DateTimeFormatOptions::default()
         };
-        let format = DateTimeFormat::try_new(&[], &options, &provider, &host)
-            .expect("time formatter");
+        let format =
+            DateTimeFormat::try_new(&[], &options, &provider, &host).expect("time formatter");
         assert_eq!(
             format.format(-1.9, &provider).expect("negative epoch"),
             "23:59:59.999"
@@ -2067,19 +2169,31 @@ mod tests {
             },
             ..DateTimeFormatOptions::default()
         };
-        let format = DateTimeFormat::try_new(&[], &options, &provider, &host)
-            .expect("transition formatter");
+        let format =
+            DateTimeFormat::try_new(&[], &options, &provider, &host).expect("transition formatter");
         provider.take_log();
 
         let spring_before = (SPRING_TRANSITION_SECONDS - 1_800) as f64 * 1_000.0;
         let spring_after = (SPRING_TRANSITION_SECONDS + 1_800) as f64 * 1_000.0;
-        assert_eq!(format.format(spring_before, &provider).expect("before gap"), "01:30 EST");
-        assert_eq!(format.format(spring_after, &provider).expect("after gap"), "03:30 EDT");
+        assert_eq!(
+            format.format(spring_before, &provider).expect("before gap"),
+            "01:30 EST"
+        );
+        assert_eq!(
+            format.format(spring_after, &provider).expect("after gap"),
+            "03:30 EDT"
+        );
 
         let fall_before = (FALL_TRANSITION_SECONDS - 1_800) as f64 * 1_000.0;
         let fall_after = (FALL_TRANSITION_SECONDS + 1_800) as f64 * 1_000.0;
-        assert_eq!(format.format(fall_before, &provider).expect("first fold"), "01:30 EDT");
-        assert_eq!(format.format(fall_after, &provider).expect("second fold"), "01:30 EST");
+        assert_eq!(
+            format.format(fall_before, &provider).expect("first fold"),
+            "01:30 EDT"
+        );
+        assert_eq!(
+            format.format(fall_after, &provider).expect("second fold"),
+            "01:30 EST"
+        );
 
         let log = provider.take_log();
         for milliseconds in [spring_before, spring_after, fall_before, fall_after] {
@@ -2103,8 +2217,8 @@ mod tests {
             },
             ..DateTimeFormatOptions::default()
         };
-        let format = DateTimeFormat::try_new(&[], &options, &provider, &host)
-            .expect("range formatter");
+        let format =
+            DateTimeFormat::try_new(&[], &options, &provider, &host).expect("range formatter");
         let start = utc_milliseconds(2024, 1, 2, 1, 0);
         let end = utc_milliseconds(2024, 1, 2, 3, 0);
         let parts = format
@@ -2130,41 +2244,60 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(format.format_range(start, end, &provider).expect("range"), "1–3");
+        assert_eq!(
+            format.format_range(start, end, &provider).expect("range"),
+            "1–3"
+        );
 
         provider.take_log();
         let collapsed = format
             .format_range_to_parts(start, start, &provider)
             .expect("collapsed range");
-        assert!(collapsed.iter().all(|part| part.source == RangeSource::Shared));
-        assert!(!provider.take_log().iter().any(|entry| entry.starts_with("range:")));
+        assert!(
+            collapsed
+                .iter()
+                .all(|part| part.source == RangeSource::Shared)
+        );
+        assert!(
+            !provider
+                .take_log()
+                .iter()
+                .any(|entry| entry.starts_with("range:"))
+        );
     }
 
     #[test]
     fn non_finite_format_is_range_error_but_invalid_date_adapter_is_literal() {
         let provider = FixtureProvider::new();
         let host = FixtureHost;
-        let format = DateTimeFormat::try_new(
-            &[],
-            &options_with_time_zone("UTC"),
-            &provider,
-            &host,
-        )
-        .expect("formatter");
+        let format = DateTimeFormat::try_new(&[], &options_with_time_zone("UTC"), &provider, &host)
+            .expect("formatter");
         for value in [f64::NAN, f64::INFINITY, MAX_TIME_MILLISECONDS + 1.0] {
             assert_eq!(
-                format.format(value, &provider).expect_err("invalid time").kind(),
+                format
+                    .format(value, &provider)
+                    .expect_err("invalid time")
+                    .kind(),
                 DateTimeFormatErrorKind::RangeError
             );
         }
 
         provider.take_log();
         assert_eq!(
-            date_to_locale_string(f64::NAN, &[], &DateTimeFormatOptions::default(), &provider, &host)
-                .expect("invalid Date is a string"),
+            date_to_locale_string(
+                f64::NAN,
+                &[],
+                &DateTimeFormatOptions::default(),
+                &provider,
+                &host
+            )
+            .expect("invalid Date is a string"),
             "Invalid Date"
         );
-        assert!(provider.take_log().is_empty(), "invalid Date must not access Intl data");
+        assert!(
+            provider.take_log().is_empty(),
+            "invalid Date must not access Intl data"
+        );
     }
 
     #[test]
@@ -2203,7 +2336,10 @@ mod tests {
         let second_log = provider.take_log();
         assert_eq!(first, second);
         assert_eq!(first_log, second_log);
-        assert_eq!(first_log[0], format!("offset:UTC:{}", time_clip_to_nanoseconds(instant).unwrap()));
+        assert_eq!(
+            first_log[0],
+            format!("offset:UTC:{}", time_clip_to_nanoseconds(instant).unwrap())
+        );
         assert!(first_log[1].starts_with("calendar:gregory:"));
     }
 }

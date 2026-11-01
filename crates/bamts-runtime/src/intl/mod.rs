@@ -2,16 +2,16 @@
 
 use std::fmt;
 
-pub mod locale_negotiation;
 pub mod canonical_locales;
 pub mod collator;
 pub mod date_time_format;
+pub mod locale_negotiation;
 pub mod number_format;
 pub mod plural_rules;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
-pub(crate) enum IntlKind {
+pub enum IntlKind {
     Collator,
     NumberFormat,
     DateTimeFormat,
@@ -24,17 +24,17 @@ pub(crate) enum IntlKind {
 }
 
 impl IntlKind {
-    pub(crate) const COUNT: usize = 9;
+    pub const COUNT: usize = 9;
 
-    pub(crate) const fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         self as usize
     }
 }
 
 #[derive(Clone)]
-pub(crate) enum IntlObject {
+pub enum IntlObject {
     Collator(collator::Collator),
-    NumberFormat(number_format::NumberFormat<'static>),
+    NumberFormat(Box<number_format::NumberFormat<'static>>),
     DateTimeFormat(date_time_format::DateTimeFormat),
     PluralRules(plural_rules::PluralRules<'static>),
     RelativeTimeFormat(plural_rules::RelativeTimeFormat<'static>),
@@ -45,7 +45,7 @@ pub(crate) enum IntlObject {
 }
 
 impl IntlObject {
-    pub(crate) const fn kind(&self) -> IntlKind {
+    pub const fn kind(&self) -> IntlKind {
         match self {
             Self::Collator(_) => IntlKind::Collator,
             Self::NumberFormat(_) => IntlKind::NumberFormat,
@@ -62,6 +62,9 @@ impl IntlObject {
 
 impl fmt::Debug for IntlObject {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("IntlObject").field(&self.kind()).finish()
+        formatter
+            .debug_tuple("IntlObject")
+            .field(&self.kind())
+            .finish()
     }
 }

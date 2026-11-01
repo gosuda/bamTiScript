@@ -170,7 +170,10 @@ impl LanguageTag {
             } else if singleton == 't' {
                 extensions.insert(singleton, parse_transformed_extension(body, input)?);
             } else {
-                if body.iter().any(|part| !(2..=8).contains(&part.len()) || !is_alnum(part)) {
+                if body
+                    .iter()
+                    .any(|part| !(2..=8).contains(&part.len()) || !is_alnum(part))
+                {
                     return Err(LocaleError::InvalidLanguageTag(input.to_owned()));
                 }
                 extensions.insert(
@@ -180,7 +183,12 @@ impl LanguageTag {
             }
         }
         id.normalize();
-        let mut tag = Self { id, unicode, extensions, private_use };
+        let mut tag = Self {
+            id,
+            unicode,
+            extensions,
+            private_use,
+        };
         tag.normalize();
         Ok(tag)
     }
@@ -267,14 +275,20 @@ fn parse_language_id(
         return Err(LocaleError::InvalidLanguageTag(original.to_owned()));
     }
     let mut index = start + 1;
-    let script = parts.get(index).filter(|value| is_script(value)).map(|value| {
-        index += 1;
-        titlecase(value)
-    });
-    let region = parts.get(index).filter(|value| is_region(value)).map(|value| {
-        index += 1;
-        value.to_ascii_uppercase()
-    });
+    let script = parts
+        .get(index)
+        .filter(|value| is_script(value))
+        .map(|value| {
+            index += 1;
+            titlecase(value)
+        });
+    let region = parts
+        .get(index)
+        .filter(|value| is_region(value))
+        .map(|value| {
+            index += 1;
+            value.to_ascii_uppercase()
+        });
     let mut variants = Vec::new();
     let mut seen = BTreeSet::new();
     while let Some(part) = parts.get(index) {
@@ -288,15 +302,21 @@ fn parse_language_id(
         variants.push(variant);
         index += 1;
     }
-    Ok((LanguageId {
-        language: language.to_ascii_lowercase(),
-        script,
-        region,
-        variants,
-    }, index))
+    Ok((
+        LanguageId {
+            language: language.to_ascii_lowercase(),
+            script,
+            region,
+            variants,
+        },
+        index,
+    ))
 }
 
-fn parse_unicode_extension(parts: &[&str], original: &str) -> Result<UnicodeExtension, LocaleError> {
+fn parse_unicode_extension(
+    parts: &[&str],
+    original: &str,
+) -> Result<UnicodeExtension, LocaleError> {
     let mut extension = UnicodeExtension::default();
     let mut seen_attributes = BTreeSet::new();
     let mut index = 0;
@@ -400,19 +420,28 @@ fn parse_transformed_extension(parts: &[&str], original: &str) -> Result<Vec<Str
 fn is_language(value: &str) -> bool {
     ((2..=3).contains(&value.len()) || (5..=8).contains(&value.len())) && is_alpha(value)
 }
-fn is_script(value: &&str) -> bool { value.len() == 4 && is_alpha(value) }
+fn is_script(value: &&str) -> bool {
+    value.len() == 4 && is_alpha(value)
+}
 fn is_region(value: &&str) -> bool {
-    (value.len() == 2 && is_alpha(value)) || (value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_digit()))
+    (value.len() == 2 && is_alpha(value))
+        || (value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_digit()))
 }
 fn is_variant(value: &str) -> bool {
     ((5..=8).contains(&value.len()) && is_alnum(value))
         || (value.len() == 4 && value.as_bytes()[0].is_ascii_digit() && is_alnum(value))
 }
 fn is_unicode_key(value: &str) -> bool {
-    value.len() == 2 && value.as_bytes()[0].is_ascii_alphanumeric() && value.as_bytes()[1].is_ascii_alphabetic()
+    value.len() == 2
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value.as_bytes()[1].is_ascii_alphabetic()
 }
-fn is_alpha(value: &str) -> bool { value.bytes().all(|byte| byte.is_ascii_alphabetic()) }
-fn is_alnum(value: &str) -> bool { value.bytes().all(|byte| byte.is_ascii_alphanumeric()) }
+fn is_alpha(value: &str) -> bool {
+    value.bytes().all(|byte| byte.is_ascii_alphabetic())
+}
+fn is_alnum(value: &str) -> bool {
+    value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
 fn titlecase(value: &str) -> String {
     let mut result = value.to_ascii_lowercase();
     result[0..1].make_ascii_uppercase();
@@ -429,23 +458,41 @@ pub trait LocaleDataProvider {
     /// Canonical, deduplicated locales supported by the active Intl service.
     fn available_locales(&self) -> &[String];
     /// Preferred replacement for a language subtag or language identifier.
-    fn language_alias(&self, _language: &str) -> Option<&str> { None }
+    fn language_alias(&self, _language: &str) -> Option<&str> {
+        None
+    }
     /// Preferred replacement for a script subtag.
-    fn script_alias(&self, _script: &str) -> Option<&str> { None }
+    fn script_alias(&self, _script: &str) -> Option<&str> {
+        None
+    }
     /// Preferred replacement for a region subtag.
-    fn region_alias(&self, _region: &str) -> Option<&str> { None }
+    fn region_alias(&self, _region: &str) -> Option<&str> {
+        None
+    }
     /// Preferred replacement for a variant subtag.
-    fn variant_alias(&self, _variant: &str) -> Option<&str> { None }
+    fn variant_alias(&self, _variant: &str) -> Option<&str> {
+        None
+    }
     /// Preferred replacement for a Unicode extension key.
-    fn unicode_key_alias(&self, _key: &str) -> Option<&str> { None }
+    fn unicode_key_alias(&self, _key: &str) -> Option<&str> {
+        None
+    }
     /// Preferred replacement for a Unicode extension type.
-    fn unicode_type_alias(&self, _key: &str, _value: &str) -> Option<&str> { None }
+    fn unicode_type_alias(&self, _key: &str, _value: &str) -> Option<&str> {
+        None
+    }
     /// Supported values for a relevant extension key. The first value is the default.
-    fn key_values(&self, _data_locale: &str, _key: &str) -> &[String] { &[] }
+    fn key_values(&self, _data_locale: &str, _key: &str) -> &[String] {
+        &[]
+    }
     /// Maximizes a language identifier with provider likely-subtags data.
-    fn add_likely_subtags(&self, _locale: &LanguageId) -> Option<LanguageId> { None }
+    fn add_likely_subtags(&self, _locale: &LanguageId) -> Option<LanguageId> {
+        None
+    }
     /// Canonical last-resort locale, which must be in [`Self::available_locales`].
-    fn fallback_locale(&self) -> Option<&str> { None }
+    fn fallback_locale(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Supplies a host-preferred default locale without granting environment access
@@ -473,46 +520,66 @@ pub struct MapLocaleData {
 impl MapLocaleData {
     /// Creates an empty provider. It intentionally contains no CLDR guesses.
     #[must_use]
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
     /// Replaces the supported locale set, sorting and deduplicating it.
     #[must_use]
     pub fn with_available(mut self, mut locales: Vec<String>) -> Self {
-        locales.sort(); locales.dedup(); self.available = locales; self
+        locales.sort();
+        locales.dedup();
+        self.available = locales;
+        self
     }
     /// Adds a language or compound-language alias.
     #[must_use]
     pub fn with_language_alias(mut self, from: &str, to: &str) -> Self {
-        self.language_aliases.insert(from.to_ascii_lowercase(), to.to_owned()); self
+        self.language_aliases
+            .insert(from.to_ascii_lowercase(), to.to_owned());
+        self
     }
     /// Adds a script alias.
     #[must_use]
     pub fn with_script_alias(mut self, from: &str, to: &str) -> Self {
-        self.script_aliases.insert(titlecase(from), to.to_owned()); self
+        self.script_aliases.insert(titlecase(from), to.to_owned());
+        self
     }
     /// Adds a region alias.
     #[must_use]
     pub fn with_region_alias(mut self, from: &str, to: &str) -> Self {
-        self.region_aliases.insert(from.to_ascii_uppercase(), to.to_owned()); self
+        self.region_aliases
+            .insert(from.to_ascii_uppercase(), to.to_owned());
+        self
     }
     /// Adds a variant alias.
     #[must_use]
     pub fn with_variant_alias(mut self, from: &str, to: &str) -> Self {
-        self.variant_aliases.insert(from.to_ascii_lowercase(), to.to_owned()); self
+        self.variant_aliases
+            .insert(from.to_ascii_lowercase(), to.to_owned());
+        self
     }
     /// Adds a Unicode extension key alias.
     #[must_use]
     pub fn with_key_alias(mut self, from: &str, to: &str) -> Self {
-        self.key_aliases.insert(from.to_ascii_lowercase(), to.to_ascii_lowercase()); self
+        self.key_aliases
+            .insert(from.to_ascii_lowercase(), to.to_ascii_lowercase());
+        self
     }
     /// Adds a Unicode extension type alias.
     #[must_use]
     pub fn with_type_alias(mut self, key: &str, from: &str, to: &str) -> Self {
-        self.type_aliases.insert((key.to_ascii_lowercase(), from.to_ascii_lowercase()), to.to_ascii_lowercase()); self
+        self.type_aliases.insert(
+            (key.to_ascii_lowercase(), from.to_ascii_lowercase()),
+            to.to_ascii_lowercase(),
+        );
+        self
     }
     /// Defines supported key values; the first value is the locale-data default.
     #[must_use]
     pub fn with_key_values(mut self, locale: &str, key: &str, values: Vec<String>) -> Self {
-        self.key_values.insert((locale.to_owned(), key.to_ascii_lowercase()), values); self
+        self.key_values
+            .insert((locale.to_owned(), key.to_ascii_lowercase()), values);
+        self
     }
     /// Adds one likely-subtags expansion.
     ///
@@ -529,41 +596,78 @@ impl MapLocaleData {
     }
     /// Defines the provider's canonical last-resort locale.
     #[must_use]
-    pub fn with_fallback(mut self, locale: &str) -> Self { self.fallback = Some(locale.to_owned()); self }
+    pub fn with_fallback(mut self, locale: &str) -> Self {
+        self.fallback = Some(locale.to_owned());
+        self
+    }
 }
 
 impl LocaleDataProvider for MapLocaleData {
-    fn available_locales(&self) -> &[String] { &self.available }
-    fn language_alias(&self, value: &str) -> Option<&str> { self.language_aliases.get(value).map(String::as_str) }
-    fn script_alias(&self, value: &str) -> Option<&str> { self.script_aliases.get(value).map(String::as_str) }
-    fn region_alias(&self, value: &str) -> Option<&str> { self.region_aliases.get(value).map(String::as_str) }
-    fn variant_alias(&self, value: &str) -> Option<&str> { self.variant_aliases.get(value).map(String::as_str) }
-    fn unicode_key_alias(&self, value: &str) -> Option<&str> { self.key_aliases.get(value).map(String::as_str) }
+    fn available_locales(&self) -> &[String] {
+        &self.available
+    }
+    fn language_alias(&self, value: &str) -> Option<&str> {
+        self.language_aliases.get(value).map(String::as_str)
+    }
+    fn script_alias(&self, value: &str) -> Option<&str> {
+        self.script_aliases.get(value).map(String::as_str)
+    }
+    fn region_alias(&self, value: &str) -> Option<&str> {
+        self.region_aliases.get(value).map(String::as_str)
+    }
+    fn variant_alias(&self, value: &str) -> Option<&str> {
+        self.variant_aliases.get(value).map(String::as_str)
+    }
+    fn unicode_key_alias(&self, value: &str) -> Option<&str> {
+        self.key_aliases.get(value).map(String::as_str)
+    }
     fn unicode_type_alias(&self, key: &str, value: &str) -> Option<&str> {
-        self.type_aliases.get(&(key.to_owned(), value.to_owned())).map(String::as_str)
+        self.type_aliases
+            .get(&(key.to_owned(), value.to_owned()))
+            .map(String::as_str)
     }
     fn key_values(&self, locale: &str, key: &str) -> &[String] {
-        self.key_values.get(&(locale.to_owned(), key.to_owned())).map_or(&[], Vec::as_slice)
+        self.key_values
+            .get(&(locale.to_owned(), key.to_owned()))
+            .map_or(&[], Vec::as_slice)
     }
     fn add_likely_subtags(&self, locale: &LanguageId) -> Option<LanguageId> {
         let candidates = [
             locale.render(),
-            LanguageId { language: locale.language.clone(), script: None, region: locale.region.clone(), variants: Vec::new() }.render(),
-            LanguageId { language: locale.language.clone(), script: locale.script.clone(), region: None, variants: Vec::new() }.render(),
+            LanguageId {
+                language: locale.language.clone(),
+                script: None,
+                region: locale.region.clone(),
+                variants: Vec::new(),
+            }
+            .render(),
+            LanguageId {
+                language: locale.language.clone(),
+                script: locale.script.clone(),
+                region: None,
+                variants: Vec::new(),
+            }
+            .render(),
             locale.language.clone(),
         ];
         for candidate in candidates {
             if let Some(expanded) = self.likely_subtags.get(&candidate) {
                 let mut result = expanded.clone();
-                if locale.script.is_some() { result.script.clone_from(&locale.script); }
-                if locale.region.is_some() { result.region.clone_from(&locale.region); }
+                if locale.script.is_some() {
+                    result.script.clone_from(&locale.script);
+                }
+                if locale.region.is_some() {
+                    result.region.clone_from(&locale.region);
+                }
                 result.variants.clone_from(&locale.variants);
                 return Some(result);
             }
         }
         None
     }
-    fn fallback_locale(&self) -> Option<&str> { self.fallback.as_deref() }
+    fn fallback_locale(&self) -> Option<&str> {
+        self.fallback.as_deref()
+    }
 }
 
 /// Canonicalizes a Unicode locale identifier using provider alias data.
@@ -578,8 +682,12 @@ pub fn canonicalize_unicode_locale_id(
     if let Some(alias) = provider.language_alias(&tag.id.language) {
         let replacement = LanguageTag::parse(alias)?;
         tag.id.language = replacement.id.language;
-        if tag.id.script.is_none() { tag.id.script = replacement.id.script; }
-        if tag.id.region.is_none() { tag.id.region = replacement.id.region; }
+        if tag.id.script.is_none() {
+            tag.id.script = replacement.id.script;
+        }
+        if tag.id.region.is_none() {
+            tag.id.region = replacement.id.region;
+        }
         tag.id.variants.extend(replacement.id.variants);
     }
     if let Some(script) = tag.id.script.clone()
@@ -590,17 +698,32 @@ pub fn canonicalize_unicode_locale_id(
     if let Some(region) = tag.id.region.clone()
         && let Some(alias) = provider.region_alias(&region)
     {
-        tag.id.region = alias.split_ascii_whitespace().next().map(str::to_ascii_uppercase);
+        tag.id.region = alias
+            .split_ascii_whitespace()
+            .next()
+            .map(str::to_ascii_uppercase);
     }
     for variant in &mut tag.id.variants {
-        if let Some(alias) = provider.variant_alias(variant) { *variant = alias.to_ascii_lowercase(); }
+        if let Some(alias) = provider.variant_alias(variant) {
+            *variant = alias.to_ascii_lowercase();
+        }
     }
     if let Some(extension) = &mut tag.unicode {
         let old = std::mem::take(&mut extension.keywords);
         for (key, value) in old {
-            let canonical_key = provider.unicode_key_alias(&key).unwrap_or(&key).to_ascii_lowercase();
-            let canonical_value = provider.unicode_type_alias(&canonical_key, &value).unwrap_or(&value).to_ascii_lowercase();
-            if extension.keywords.insert(canonical_key.clone(), canonical_value).is_some() {
+            let canonical_key = provider
+                .unicode_key_alias(&key)
+                .unwrap_or(&key)
+                .to_ascii_lowercase();
+            let canonical_value = provider
+                .unicode_type_alias(&canonical_key, &value)
+                .unwrap_or(&value)
+                .to_ascii_lowercase();
+            if extension
+                .keywords
+                .insert(canonical_key.clone(), canonical_value)
+                .is_some()
+            {
                 return Err(LocaleError::DuplicateSubtag(canonical_key));
             }
         }
@@ -621,16 +744,21 @@ pub fn canonicalize_locale_list(
     let mut result = Vec::new();
     for locale in locales {
         let canonical = canonicalize_unicode_locale_id(locale, provider)?;
-        if seen.insert(canonical.clone()) { result.push(canonical); }
+        if seen.insert(canonical.clone()) {
+            result.push(canonical);
+        }
     }
     Ok(result)
 }
 
 /// Locale matching strategy selected by `localeMatcher`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LocaleMatcher { /// RFC 4647 lookup matching.
-    Lookup, /// Provider-driven best-fit matching.
-    BestFit }
+pub enum LocaleMatcher {
+    /// RFC 4647 lookup matching.
+    Lookup,
+    /// Provider-driven best-fit matching.
+    BestFit,
+}
 
 /// The locale and requested Unicode extension selected by a matcher.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -644,11 +772,17 @@ pub struct MatchResult {
 fn best_available_locale(available: &[String], candidate: &str) -> Option<String> {
     let mut candidate = candidate.to_owned();
     loop {
-        if available.binary_search(&candidate).is_ok() || available.iter().any(|item| item == &candidate) {
+        if available.binary_search(&candidate).is_ok()
+            || available.iter().any(|item| item == &candidate)
+        {
             return Some(candidate);
         }
         let position = candidate.rfind('-')?;
-        let truncate = if position >= 2 && candidate.as_bytes()[position - 2] == b'-' { position - 2 } else { position };
+        let truncate = if position >= 2 && candidate.as_bytes()[position - 2] == b'-' {
+            position - 2
+        } else {
+            position
+        };
         candidate.truncate(truncate);
     }
 }
@@ -663,8 +797,14 @@ pub fn lookup_matcher(
 ) -> Result<MatchResult, LocaleError> {
     for requested_locale in canonicalize_locale_list(requested, provider)? {
         let tag = LanguageTag::parse(&requested_locale)?;
-        if let Some(locale) = best_available_locale(provider.available_locales(), &tag.without_unicode().render()) {
-            return Ok(MatchResult { locale, extension: tag.unicode });
+        if let Some(locale) = best_available_locale(
+            provider.available_locales(),
+            &tag.without_unicode().render(),
+        ) {
+            return Ok(MatchResult {
+                locale,
+                extension: tag.unicode,
+            });
         }
     }
     fallback_match(provider)
@@ -673,11 +813,26 @@ pub fn lookup_matcher(
 fn fallback_match(provider: &dyn LocaleDataProvider) -> Result<MatchResult, LocaleError> {
     if let Some(locale) = provider.fallback_locale() {
         let locale = canonicalize_unicode_locale_id(locale, provider)?;
-        if provider.available_locales().iter().any(|available| available == &locale) {
-            return Ok(MatchResult { locale, extension: None });
+        if provider
+            .available_locales()
+            .iter()
+            .any(|available| available == &locale)
+        {
+            return Ok(MatchResult {
+                locale,
+                extension: None,
+            });
         }
     }
-    provider.available_locales().first().cloned().map(|locale| MatchResult { locale, extension: None }).ok_or(LocaleError::NoAvailableLocale)
+    provider
+        .available_locales()
+        .first()
+        .cloned()
+        .map(|locale| MatchResult {
+            locale,
+            extension: None,
+        })
+        .ok_or(LocaleError::NoAvailableLocale)
 }
 
 /// Applies provider-driven best-fit matching. If likely-subtags data is absent,
@@ -723,14 +878,20 @@ fn best_fit_available(
             }
         }
         if let Some((_, locale)) = best {
-            return Ok(Some(MatchResult { locale, extension: requested_tag.unicode }));
+            return Ok(Some(MatchResult {
+                locale,
+                extension: requested_tag.unicode,
+            }));
         }
     }
     Ok(best_available_locale(
         provider.available_locales(),
         &requested_tag.without_unicode().render(),
     )
-    .map(|locale| MatchResult { locale, extension: requested_tag.unicode }))
+    .map(|locale| MatchResult {
+        locale,
+        extension: requested_tag.unicode,
+    }))
 }
 
 /// Returns the requested locales supported by a service, preserving requested
@@ -749,11 +910,17 @@ pub fn supported_locales(
         let matched = match matcher {
             LocaleMatcher::Lookup => {
                 let tag = LanguageTag::parse(&locale)?;
-                best_available_locale(provider.available_locales(), &tag.without_unicode().render()).is_some()
+                best_available_locale(
+                    provider.available_locales(),
+                    &tag.without_unicode().render(),
+                )
+                .is_some()
             }
             LocaleMatcher::BestFit => best_fit_available(&locale, provider)?.is_some(),
         };
-        if matched { result.push(locale); }
+        if matched {
+            result.push(locale);
+        }
     }
     Ok(result)
 }
@@ -793,28 +960,57 @@ pub fn resolve_locale(
         let supported = provider.key_values(&matched.locale, &key);
         let mut value = supported.first().cloned().unwrap_or_default();
         let mut requested_supported = false;
-        if let Some(requested) = matched.extension.as_ref().and_then(|extension| extension.keywords.get(&key)) {
-            let requested = if requested.is_empty() { "true" } else { requested };
-            if supported.iter().any(|supported_value| supported_value == requested) {
+        if let Some(requested) = matched
+            .extension
+            .as_ref()
+            .and_then(|extension| extension.keywords.get(&key))
+        {
+            let requested = if requested.is_empty() {
+                "true"
+            } else {
+                requested
+            };
+            if supported
+                .iter()
+                .any(|supported_value| supported_value == requested)
+            {
                 value = requested.to_owned();
                 requested_supported = true;
             }
         }
         if let Some(option) = options.get(&key)
-            && supported.iter().any(|supported_value| supported_value == option)
+            && supported
+                .iter()
+                .any(|supported_value| supported_value == option)
         {
-            if option != &value { requested_supported = false; }
+            if option != &value {
+                requested_supported = false;
+            }
             value.clone_from(option);
         }
         if requested_supported {
-            supported_keywords.insert(key.clone(), if value == "true" { String::new() } else { value.clone() });
+            supported_keywords.insert(
+                key.clone(),
+                if value == "true" {
+                    String::new()
+                } else {
+                    value.clone()
+                },
+            );
         }
         values.insert(key, value);
     }
     if !supported_keywords.is_empty() {
-        result_tag.unicode = Some(UnicodeExtension { attributes: Vec::new(), keywords: supported_keywords });
+        result_tag.unicode = Some(UnicodeExtension {
+            attributes: Vec::new(),
+            keywords: supported_keywords,
+        });
     }
-    Ok(ResolvedLocale { locale: result_tag.render(), data_locale: matched.locale, values })
+    Ok(ResolvedLocale {
+        locale: result_tag.render(),
+        data_locale: matched.locale,
+        values,
+    })
 }
 
 /// Resolves the injected host preference against provider locales, then uses
@@ -830,7 +1026,10 @@ pub fn default_locale(
     if !preferred.is_empty() {
         for locale in canonicalize_locale_list(&preferred, provider)? {
             let tag = LanguageTag::parse(&locale)?;
-            if let Some(found) = best_available_locale(provider.available_locales(), &tag.without_unicode().render()) {
+            if let Some(found) = best_available_locale(
+                provider.available_locales(),
+                &tag.without_unicode().render(),
+            ) {
                 return Ok(found);
             }
         }
@@ -844,7 +1043,15 @@ mod tests {
 
     fn provider() -> MapLocaleData {
         MapLocaleData::new()
-            .with_available(vec!["en".into(), "en-GB".into(), "he-IL".into(), "sr-Cyrl".into(), "sr-Latn".into(), "zh-Hans".into(), "zh-Hant".into()])
+            .with_available(vec![
+                "en".into(),
+                "en-GB".into(),
+                "he-IL".into(),
+                "sr-Cyrl".into(),
+                "sr-Latn".into(),
+                "zh-Hans".into(),
+                "zh-Hant".into(),
+            ])
             .with_language_alias("iw", "he")
             .with_language_alias("sh", "sr-Latn")
             .with_region_alias("BU", "MM")
@@ -857,24 +1064,50 @@ mod tests {
 
     #[test]
     fn canonical_aliases_come_only_from_provider() {
-        assert_eq!(canonicalize_unicode_locale_id("IW-il-u-ca-islamicc", &provider()), Ok("he-IL-u-ca-islamic-civil".into()));
-        assert_eq!(canonicalize_unicode_locale_id("iw-IL", &MapLocaleData::new()), Ok("iw-IL".into()));
-        assert_eq!(canonicalize_unicode_locale_id("sh-Cyrl", &provider()), Ok("sr-Cyrl".into()));
+        assert_eq!(
+            canonicalize_unicode_locale_id("IW-il-u-ca-islamicc", &provider()),
+            Ok("he-IL-u-ca-islamic-civil".into())
+        );
+        assert_eq!(
+            canonicalize_unicode_locale_id("iw-IL", &MapLocaleData::new()),
+            Ok("iw-IL".into())
+        );
+        assert_eq!(
+            canonicalize_unicode_locale_id("sh-Cyrl", &provider()),
+            Ok("sr-Cyrl".into())
+        );
     }
 
     #[test]
     fn structural_ordering_and_true_are_canonical() {
-        let value = canonicalize_unicode_locale_id("EN-latn-us-1996-u-FOO-kn-true-ca-buddhist-a-ZZZ", &MapLocaleData::new());
-        assert_eq!(value, Ok("en-Latn-US-1996-a-zzz-u-foo-ca-buddhist-kn".into()));
+        let value = canonicalize_unicode_locale_id(
+            "EN-latn-us-1996-u-FOO-kn-true-ca-buddhist-a-ZZZ",
+            &MapLocaleData::new(),
+        );
+        assert_eq!(
+            value,
+            Ok("en-Latn-US-1996-a-zzz-u-foo-ca-buddhist-kn".into())
+        );
         let once = value.unwrap_or_default();
-        assert_eq!(canonicalize_unicode_locale_id(&once, &MapLocaleData::new()), Ok(once));
+        assert_eq!(
+            canonicalize_unicode_locale_id(&once, &MapLocaleData::new()),
+            Ok(once)
+        );
     }
 
     #[test]
     fn invalid_tags_are_rejected() {
         for invalid in [
-            "", "e", "en--US", "en-US-", "en-u", "en-x", "en-abcdefghi",
-            "i-klingon", "en-GB-oed", "en-t-a0",
+            "",
+            "e",
+            "en--US",
+            "en-US-",
+            "en-u",
+            "en-x",
+            "en-abcdefghi",
+            "i-klingon",
+            "en-GB-oed",
+            "en-t-a0",
         ] {
             assert!(LanguageTag::parse(invalid).is_err(), "accepted {invalid}");
         }
@@ -890,15 +1123,29 @@ mod tests {
             "en-t-es-1996-1996-h0-hybrid",
             "en-t-h0-hybrid-h0-ascii",
         ] {
-            assert!(matches!(LanguageTag::parse(invalid), Err(LocaleError::DuplicateSubtag(_))), "wrong result for {invalid}");
+            assert!(
+                matches!(
+                    LanguageTag::parse(invalid),
+                    Err(LocaleError::DuplicateSubtag(_))
+                ),
+                "wrong result for {invalid}"
+            );
         }
     }
 
     #[test]
     fn lookup_truncates_and_drops_singleton_sequences() {
-        let data = MapLocaleData::new().with_available(vec!["de".into()]).with_fallback("de");
-        assert_eq!(lookup_matcher(&["de-DE-x-goethe".into()], &data).map(|result| result.locale), Ok("de".into()));
-        assert_eq!(lookup_matcher(&["de-a-foo".into()], &data).map(|result| result.locale), Ok("de".into()));
+        let data = MapLocaleData::new()
+            .with_available(vec!["de".into()])
+            .with_fallback("de");
+        assert_eq!(
+            lookup_matcher(&["de-DE-x-goethe".into()], &data).map(|result| result.locale),
+            Ok("de".into())
+        );
+        assert_eq!(
+            lookup_matcher(&["de-a-foo".into()], &data).map(|result| result.locale),
+            Ok("de".into())
+        );
     }
 
     #[test]
@@ -906,23 +1153,44 @@ mod tests {
         let data = provider();
         let requested = vec!["en-u-ca-buddhist-kn".into()];
         let keys = vec!["ca".into(), "kn".into()];
-        let extension = resolve_locale(&requested, &BTreeMap::new(), &keys, LocaleMatcher::Lookup, &data).unwrap_or_else(|error| panic!("{error}"));
+        let extension = resolve_locale(
+            &requested,
+            &BTreeMap::new(),
+            &keys,
+            LocaleMatcher::Lookup,
+            &data,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(extension.locale, "en-u-ca-buddhist-kn");
-        assert_eq!(extension.values.get("ca").map(String::as_str), Some("buddhist"));
+        assert_eq!(
+            extension.values.get("ca").map(String::as_str),
+            Some("buddhist")
+        );
         assert_eq!(extension.values.get("kn").map(String::as_str), Some("true"));
         let options = BTreeMap::from([("ca".into(), "gregory".into())]);
-        let overridden = resolve_locale(&requested, &options, &keys, LocaleMatcher::Lookup, &data).unwrap_or_else(|error| panic!("{error}"));
+        let overridden = resolve_locale(&requested, &options, &keys, LocaleMatcher::Lookup, &data)
+            .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(overridden.locale, "en-u-kn");
-        assert_eq!(overridden.values.get("ca").map(String::as_str), Some("gregory"));
+        assert_eq!(
+            overridden.values.get("ca").map(String::as_str),
+            Some("gregory")
+        );
     }
 
     struct Hook(Vec<String>);
-    impl HostLocaleHook for Hook { fn preferred_locales(&self) -> Vec<String> { self.0.clone() } }
+    impl HostLocaleHook for Hook {
+        fn preferred_locales(&self) -> Vec<String> {
+            self.0.clone()
+        }
+    }
 
     #[test]
     fn default_locale_uses_hook_then_provider_fallback() {
         let data = provider();
-        assert_eq!(default_locale(&Hook(vec!["en-GB-u-ca-buddhist".into()]), &data), Ok("en-GB".into()));
+        assert_eq!(
+            default_locale(&Hook(vec!["en-GB-u-ca-buddhist".into()]), &data),
+            Ok("en-GB".into())
+        );
         assert_eq!(default_locale(&Hook(Vec::new()), &data), Ok("en".into()));
     }
 
@@ -931,7 +1199,10 @@ mod tests {
         let requested = vec!["EN-gb-u-ca-gregory".into(), "fr-FR".into(), "en".into()];
         let first = supported_locales(&requested, LocaleMatcher::Lookup, &provider());
         assert_eq!(first, Ok(vec!["en-GB-u-ca-gregory".into(), "en".into()]));
-        assert_eq!(first, supported_locales(&requested, LocaleMatcher::Lookup, &provider()));
+        assert_eq!(
+            first,
+            supported_locales(&requested, LocaleMatcher::Lookup, &provider())
+        );
         assert_eq!(
             supported_locales(&requested, LocaleMatcher::BestFit, &provider()),
             Ok(vec!["en-GB-u-ca-gregory".into(), "en".into()]),
@@ -943,11 +1214,22 @@ mod tests {
         let data = MapLocaleData::new()
             .with_available(vec!["zh-Hans".into(), "zh-Hant".into()])
             .with_fallback("zh-Hans")
-            .with_likely_subtag("zh-TW", "zh-Hant-TW").unwrap_or_else(|error| panic!("{error}"))
-            .with_likely_subtag("zh-Hant", "zh-Hant-TW").unwrap_or_else(|error| panic!("{error}"))
-            .with_likely_subtag("zh-Hans", "zh-Hans-CN").unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(best_fit_matcher(&["zh-TW".into()], &data).map(|result| result.locale), Ok("zh-Hant".into()));
-        let no_likely = MapLocaleData::new().with_available(vec!["en".into()]).with_fallback("en");
-        assert_eq!(best_fit_matcher(&["en-US".into()], &no_likely), lookup_matcher(&["en-US".into()], &no_likely));
+            .with_likely_subtag("zh-TW", "zh-Hant-TW")
+            .unwrap_or_else(|error| panic!("{error}"))
+            .with_likely_subtag("zh-Hant", "zh-Hant-TW")
+            .unwrap_or_else(|error| panic!("{error}"))
+            .with_likely_subtag("zh-Hans", "zh-Hans-CN")
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            best_fit_matcher(&["zh-TW".into()], &data).map(|result| result.locale),
+            Ok("zh-Hant".into())
+        );
+        let no_likely = MapLocaleData::new()
+            .with_available(vec!["en".into()])
+            .with_fallback("en");
+        assert_eq!(
+            best_fit_matcher(&["en-US".into()], &no_likely),
+            lookup_matcher(&["en-US".into()], &no_likely)
+        );
     }
 }

@@ -49,13 +49,19 @@ impl IntlError {
     /// Builds a `TypeError` failure.
     #[must_use]
     pub fn type_error(message: impl Into<String>) -> Self {
-        Self { kind: IntlErrorKind::TypeError, message: message.into() }
+        Self {
+            kind: IntlErrorKind::TypeError,
+            message: message.into(),
+        }
     }
 
     /// Builds a `RangeError` failure.
     #[must_use]
     pub fn range_error(message: impl Into<String>) -> Self {
-        Self { kind: IntlErrorKind::RangeError, message: message.into() }
+        Self {
+            kind: IntlErrorKind::RangeError,
+            message: message.into(),
+        }
     }
 
     /// Converts a C10.1 locale failure, preserving its JS error class.
@@ -117,9 +123,9 @@ pub enum IntlCallForm {
 pub fn require_constructor_call(name: &str, form: IntlCallForm) -> Result<(), IntlError> {
     match form {
         IntlCallForm::Construct => Ok(()),
-        IntlCallForm::Apply => {
-            Err(IntlError::type_error(format!("Constructor {name} requires 'new'")))
-        }
+        IntlCallForm::Apply => Err(IntlError::type_error(format!(
+            "Constructor {name} requires 'new'"
+        ))),
     }
 }
 
@@ -132,9 +138,9 @@ pub fn require_constructor_call(name: &str, form: IntlCallForm) -> Result<(), In
 pub fn require_ordinary_call(name: &str, form: IntlCallForm) -> Result<(), IntlError> {
     match form {
         IntlCallForm::Apply => Ok(()),
-        IntlCallForm::Construct => {
-            Err(IntlError::type_error(format!("{name} is not a constructor")))
-        }
+        IntlCallForm::Construct => Err(IntlError::type_error(format!(
+            "{name} is not a constructor"
+        ))),
     }
 }
 
@@ -174,9 +180,7 @@ pub fn get_canonical_locales(
 ) -> Result<Vec<String>, IntlError> {
     match argument {
         LocaleListArgument::Undefined | LocaleListArgument::Primitive => Ok(Vec::new()),
-        LocaleListArgument::Null => {
-            Err(IntlError::type_error("invalid locales argument: null"))
-        }
+        LocaleListArgument::Null => Err(IntlError::type_error("invalid locales argument: null")),
         LocaleListArgument::Text(text) => Ok(vec![canonicalize_single_tag(text, provider)?]),
         LocaleListArgument::Elements(elements) => {
             let mut seen = BTreeSet::new();
@@ -412,9 +416,9 @@ fn is_currency_code(value: &str) -> bool {
 /// `_`, `-`, `+`, and `/`. IANA zone names contain no `.` runs.
 fn is_time_zone_name(value: &str) -> bool {
     !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b'/')
-        })
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b'/'))
 }
 
 /// A well-formed simple or compound Unicode unit identifier: `-`-separated
@@ -422,9 +426,9 @@ fn is_time_zone_name(value: &str) -> bool {
 /// denominator separator.
 fn is_unit_identifier(value: &str) -> bool {
     !value.is_empty()
-        && value.split('-').all(|part| {
-            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        })
+        && value
+            .split('-')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_alphanumeric()))
         && value.matches("-per-").count() <= 1
         && !value.starts_with("per-")
         && !value.ends_with("-per")
@@ -441,52 +445,66 @@ mod tests {
 
     fn inventory() -> MapSupportedValues {
         MapSupportedValues::new()
-            .with_values(SupportedValuesKey::Calendar, vec![
-                "gregory".into(),
-                "ROC".into(),
-                "Buddhist".into(),
-                "gregory".into(),
-            ])
-            .with_values(SupportedValuesKey::Collation, vec![
-                "search".into(),
-                "emoji".into(),
-                "standard".into(),
-                "EMOJI".into(),
-                "big5han".into(),
-            ])
-            .with_values(SupportedValuesKey::Currency, vec![
-                "thb".into(),
-                "usd".into(),
-                "EUR".into(),
-                "USD".into(),
-            ])
-            .with_values(SupportedValuesKey::NumberingSystem, vec![
-                "thai".into(),
-                "Latn".into(),
-                "thai".into(),
-            ])
-            .with_values(SupportedValuesKey::TimeZone, vec![
-                "Europe/Paris".into(),
-                "UTC".into(),
-                "America/New_York".into(),
-                "Europe/Paris".into(),
-            ])
-            .with_values(SupportedValuesKey::Unit, vec![
-                "square-meter".into(),
-                "celsius".into(),
-                "liter-per-100kilometer".into(),
-                "celsius".into(),
-            ])
+            .with_values(
+                SupportedValuesKey::Calendar,
+                vec![
+                    "gregory".into(),
+                    "ROC".into(),
+                    "Buddhist".into(),
+                    "gregory".into(),
+                ],
+            )
+            .with_values(
+                SupportedValuesKey::Collation,
+                vec![
+                    "search".into(),
+                    "emoji".into(),
+                    "standard".into(),
+                    "EMOJI".into(),
+                    "big5han".into(),
+                ],
+            )
+            .with_values(
+                SupportedValuesKey::Currency,
+                vec!["thb".into(), "usd".into(), "EUR".into(), "USD".into()],
+            )
+            .with_values(
+                SupportedValuesKey::NumberingSystem,
+                vec!["thai".into(), "Latn".into(), "thai".into()],
+            )
+            .with_values(
+                SupportedValuesKey::TimeZone,
+                vec![
+                    "Europe/Paris".into(),
+                    "UTC".into(),
+                    "America/New_York".into(),
+                    "Europe/Paris".into(),
+                ],
+            )
+            .with_values(
+                SupportedValuesKey::Unit,
+                vec![
+                    "square-meter".into(),
+                    "celsius".into(),
+                    "liter-per-100kilometer".into(),
+                    "celsius".into(),
+                ],
+            )
     }
 
     #[test]
     fn canonical_locales_argument_forms() {
         let data = MapLocaleData::new();
-        assert_eq!(tag_list(&LocaleListArgument::Undefined, &data), Vec::<String>::new());
-        assert_eq!(tag_list(&LocaleListArgument::Primitive, &data), Vec::<String>::new());
         assert_eq!(
-            get_canonical_locales(&LocaleListArgument::Null, &data)
-                .map_err(|error| error.kind),
+            tag_list(&LocaleListArgument::Undefined, &data),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            tag_list(&LocaleListArgument::Primitive, &data),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            get_canonical_locales(&LocaleListArgument::Null, &data).map_err(|error| error.kind),
             Err(IntlErrorKind::TypeError),
         );
         // A single string argument is wrapped, not iterated character-wise.
@@ -515,7 +533,11 @@ mod tests {
     #[test]
     fn canonical_list_rejects_non_string_elements() {
         let data = MapLocaleData::new();
-        for element in [IntlValue::Null, IntlValue::Boolean(true), IntlValue::Number(3.0)] {
+        for element in [
+            IntlValue::Null,
+            IntlValue::Boolean(true),
+            IntlValue::Number(3.0),
+        ] {
             let error = get_canonical_locales(&LocaleListArgument::Elements(vec![element]), &data)
                 .expect_err("accepted a non-string element");
             assert_eq!(error.kind, IntlErrorKind::TypeError);
@@ -528,19 +550,23 @@ mod tests {
         for tag in ["", "en_US", "en--US", "en-u", "-en"] {
             let error = get_canonical_locales(&LocaleListArgument::Text(tag.to_owned()), &data)
                 .expect_err("accepted a malformed tag");
-            assert_eq!(error.kind, IntlErrorKind::RangeError, "wrong class for {tag}");
+            assert_eq!(
+                error.kind,
+                IntlErrorKind::RangeError,
+                "wrong class for {tag}"
+            );
         }
     }
 
     #[test]
     fn canonical_list_is_deterministic_across_calls() {
         let data = MapLocaleData::new().with_language_alias("sh", "sr-Latn");
-        let elements = vec![IntlValue::String("SH".into()), IntlValue::String("sh".into())];
+        let elements = vec![
+            IntlValue::String("SH".into()),
+            IntlValue::String("sh".into()),
+        ];
         let argument = LocaleListArgument::Elements(elements);
-        assert_eq!(
-            tag_list(&argument, &data),
-            tag_list(&argument, &data),
-        );
+        assert_eq!(tag_list(&argument, &data), tag_list(&argument, &data),);
         assert_eq!(tag_list(&argument, &data), vec!["sr-Latn".to_owned()]);
     }
 
@@ -548,28 +574,27 @@ mod tests {
     fn supported_values_returns_each_key_sorted_unique_canonical() {
         let data = inventory();
         assert_eq!(
-            supported_values_of("calendar", &data)
-                .unwrap_or_else(|error| panic!("{error}")),
-            vec!["buddhist".to_owned(), "gregory".to_owned(), "roc".to_owned()],
+            supported_values_of("calendar", &data).unwrap_or_else(|error| panic!("{error}")),
+            vec![
+                "buddhist".to_owned(),
+                "gregory".to_owned(),
+                "roc".to_owned()
+            ],
         );
         assert_eq!(
-            supported_values_of("collation", &data)
-                .unwrap_or_else(|error| panic!("{error}")),
+            supported_values_of("collation", &data).unwrap_or_else(|error| panic!("{error}")),
             vec!["big5han".to_owned(), "emoji".to_owned()],
         );
         assert_eq!(
-            supported_values_of("currency", &data)
-                .unwrap_or_else(|error| panic!("{error}")),
+            supported_values_of("currency", &data).unwrap_or_else(|error| panic!("{error}")),
             vec!["EUR".to_owned(), "THB".to_owned(), "USD".to_owned()],
         );
         assert_eq!(
-            supported_values_of("numberingSystem", &data)
-                .unwrap_or_else(|error| panic!("{error}")),
+            supported_values_of("numberingSystem", &data).unwrap_or_else(|error| panic!("{error}")),
             vec!["latn".to_owned(), "thai".to_owned()],
         );
         assert_eq!(
-            supported_values_of("timeZone", &data)
-                .unwrap_or_else(|error| panic!("{error}")),
+            supported_values_of("timeZone", &data).unwrap_or_else(|error| panic!("{error}")),
             vec![
                 "America/New_York".to_owned(),
                 "Europe/Paris".to_owned(),
@@ -577,8 +602,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            supported_values_of("unit", &data)
-                .unwrap_or_else(|error| panic!("{error}")),
+            supported_values_of("unit", &data).unwrap_or_else(|error| panic!("{error}")),
             vec![
                 "celsius".to_owned(),
                 "liter-per-100kilometer".to_owned(),
@@ -592,7 +616,11 @@ mod tests {
         let data = MapSupportedValues::new();
         for key in ["", "Calendar", "calendars", "ca", "timezone", "units"] {
             let error = supported_values_of(key, &data).expect_err("accepted an invalid key");
-            assert_eq!(error.kind, IntlErrorKind::RangeError, "wrong class for {key}");
+            assert_eq!(
+                error.kind,
+                IntlErrorKind::RangeError,
+                "wrong class for {key}"
+            );
             assert_eq!(error.message, "Invalid key", "wrong message for {key}");
         }
     }
@@ -612,7 +640,11 @@ mod tests {
             let data = MapSupportedValues::new().with_values(key, vec![entry.to_owned()]);
             let error = supported_values_of(key.name(), &data)
                 .expect_err("accepted a malformed inventory entry");
-            assert_eq!(error.kind, IntlErrorKind::RangeError, "wrong class for {entry}");
+            assert_eq!(
+                error.kind,
+                IntlErrorKind::RangeError,
+                "wrong class for {entry}"
+            );
             assert!(
                 error.message.contains(key.name()) && error.message.contains(entry),
                 "message {error:?} names neither key nor value",
@@ -622,11 +654,10 @@ mod tests {
 
     #[test]
     fn collation_exclusions_apply_before_sort_and_dedup() {
-        let data = MapSupportedValues::new().with_values(SupportedValuesKey::Collation, vec![
-            "standard".into(),
-            "search".into(),
-            "EMO".into(),
-        ]);
+        let data = MapSupportedValues::new().with_values(
+            SupportedValuesKey::Collation,
+            vec!["standard".into(), "search".into(), "EMO".into()],
+        );
         assert_eq!(
             supported_values_of("collation", &data).unwrap_or_else(|error| panic!("{error}")),
             vec!["emo".to_owned()],
@@ -636,7 +667,14 @@ mod tests {
     #[test]
     fn supported_values_is_deterministic_across_calls() {
         let data = inventory();
-        for key in ["calendar", "collation", "currency", "numberingSystem", "timeZone", "unit"] {
+        for key in [
+            "calendar",
+            "collation",
+            "currency",
+            "numberingSystem",
+            "timeZone",
+            "unit",
+        ] {
             assert_eq!(
                 supported_values_of(key, &data),
                 supported_values_of(key, &data),
