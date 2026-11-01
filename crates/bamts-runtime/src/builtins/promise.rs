@@ -738,13 +738,8 @@ fn perform_ordered_aggregate<H: Host>(
             Ok((true, _)) => break,
             Ok((false, value)) => value,
             Err(failure) => {
-                return reject_aggregate_failure(
-                    machine,
-                    aggregate,
-                    capability.reject,
-                    iterator,
-                    failure,
-                );
+                machine.mark_promise_all_settled(aggregate)?;
+                return reject_failure(machine, capability.reject, failure);
             }
         };
         let index = match machine.add_promise_all_element(aggregate) {
