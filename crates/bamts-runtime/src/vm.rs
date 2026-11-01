@@ -38,15 +38,15 @@ pub(crate) fn install<H: Host>(
             extensible: true,
         },
     );
-    let script = register(heap, builtins, "Script", 1, script_constructor::<H>);
-    let run_in_this_context = register(
+    let script = register_constructor(heap, builtins, "Script", 1, script_constructor::<H>);
+    let run_in_this_context = register_constructor(
         heap,
         builtins,
         "runInThisContext",
         2,
         run_in_this_context::<H>,
     );
-    let run_in_new_context = register(
+    let run_in_new_context = register_constructor(
         heap,
         builtins,
         "runInNewContext",
@@ -122,6 +122,23 @@ fn register<H: Host>(
     handler: intrinsics::BuiltinHandler<H>,
 ) -> Value {
     let id = builtins.register(BuiltinDef {
+        name,
+        length,
+        handler,
+    });
+    intrinsics::native_function(heap, id, name, length)
+}
+
+/// Registers a function `new` can reach. Node's `runIn*Context` are plain
+/// functions, so unlike `Script` they work with or without it.
+fn register_constructor<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    builtins: &mut BuiltinTable<H>,
+    name: &'static str,
+    length: u32,
+    handler: intrinsics::BuiltinHandler<H>,
+) -> Value {
+    let id = builtins.register_constructor(BuiltinDef {
         name,
         length,
         handler,
