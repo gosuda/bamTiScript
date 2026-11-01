@@ -152,7 +152,7 @@ fn install_restricted_function_properties<H: Host>(
 }
 
 /// %ThrowTypeError%. A non-strict `function` has no call-stack introspection here,
-/// so it reads `caller` and `arguments` as null instead of throwing.
+/// so it reads `caller` and `arguments` as undefined instead of throwing.
 fn throw_type_error<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -160,7 +160,7 @@ fn throw_type_error<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     if machine.is_sloppy_ordinary_function(this)? {
-        return Ok(BuiltinOutcome::Value(Value::NULL));
+        return Ok(BuiltinOutcome::Value(Value::UNDEFINED));
     }
     Err(type_error(
         "caller and arguments are restricted function properties",
