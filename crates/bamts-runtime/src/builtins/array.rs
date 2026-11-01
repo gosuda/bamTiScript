@@ -34,6 +34,7 @@ pub(super) fn install<H: Host>(
     for (name, length, handler) in [
         ("toString", 0, to_string::<H> as BuiltinHandler<H>),
         ("toLocaleString", 0, to_locale_string::<H>),
+        ("copyWithin", 2, copy_within::<H>),
         ("push", 1, push::<H> as BuiltinHandler<H>),
         ("pop", 0, pop::<H>),
         ("shift", 0, shift::<H>),
@@ -580,6 +581,80 @@ fn locale_join<H: Host>(
     }
     Ok(output.finish())
 }
+/// The clamped position `value` names in a list of `length` elements, with the
+/// conversion running user code in specification order.
+fn relative_position<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+    length: usize,
+) -> Result<usize, EvalFailure> {
+    let relative = array_es2023::integer_or_infinity(machine, value)?;
+    let length = length as f64;
+    Ok(if relative < 0.0 {
+        (length + relative).max(0.0) as usize
+    } else {
+        relative.min(length) as usize
+    })
+}
+/// `Array.prototype.copyWithin`. Each step reads and writes through the
+/// object's own internal methods, so a hole deletes its destination and a
+/// proxy or accessor observes every step in specification order.
+fn copy_within<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let object = array_es2023::to_object(machine, this)?;
+    let depth = machine.native_roots.len();
+    machine.push_native_roots(depth, &[object]);
+    let copied = copy_within_steps(machine, object, args);
+    machine.pop_native_roots(depth);
+    copied?;
+    Ok(BuiltinOutcome::Value(object))
+}
+fn copy_within_steps<H: Host>(
+    machine: &mut Machine<'_, H>,
+    object: Value,
+    args: &[Value],
+) -> Result<(), EvalFailure> {
+    let length = array_es2023::length_of_array_like(machine, object)?;
+    let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let mut to = relative_position(machine, target, length)?;
+    let start = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let mut from = relative_position(machine, start, length)?;
+    let end = match args.get(2).copied() {
+        None | Some(Value::UNDEFINED) => length,
+        Some(end) => relative_position(machine, end, length)?,
+    };
+    let mut count = end.saturating_sub(from).min(length - to);
+    let backward = from < to && to < from + count;
+    if backward && count > 0 {
+        from += count - 1;
+        to += count - 1;
+    }
+    while count > 0 {
+        let from_key = array_es2023::index_key(from);
+        let to_key = array_es2023::index_key(to);
+        if machine.internal_has_property(object, &from_key)? {
+            let value = machine.get_property_key(object, &from_key)?;
+            machine.set_data_property_key(object, to_key, value)?;
+        } else if !machine.internal_delete(object, &to_key)? {
+            return Err(type_error("Cannot delete property during copyWithin"));
+        }
+        count -= 1;
+        if count > 0 {
+            if backward {
+                from -= 1;
+                to -= 1;
+            } else {
+                from += 1;
+                to += 1;
+            }
+        }
+    }
+    Ok(())
+}
 fn from_index<H: Host>(
     machine: &Machine<'_, H>,
     arg: Option<Value>,
@@ -1106,6 +1181,64 @@ fn entries_iterator<H: Host>(
         this,
         IterationKind::Entry,
     )?))
+}
+
+#[cfg(test)]
+mod copy_within_tests {
+    use super::super::test_support::{TestHost, blank_program};
+    use super::*;
+    use crate::Limits;
+
+    fn array_of(machine: &mut Machine<'_, TestHost>, values: &[i32]) -> Value {
+        let elements = values.iter().map(|value| Value::int32(*value as u32));
+        allocate_array(machine, elements.collect()).unwrap()
+    }
+
+    fn copy(machine: &mut Machine<'_, TestHost>, array: Value, args: &[Value]) -> Vec<Value> {
+        let method = machine
+            .get_named_property(array, "copyWithin")
+            .expect("copyWithin is installed");
+        let result = machine.call_value(method, array, args).unwrap();
+        assert_eq!(result, array, "copyWithin returns its receiver");
+        machine.array_elements(array).unwrap().unwrap()
+    }
+
+    #[test]
+    fn overlapping_ranges_copy_as_if_through_a_temporary() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let forward = array_of(&mut machine, &[1, 2, 3, 4, 5]);
+        assert_eq!(
+            copy(&mut machine, forward, &[Value::int32(0), Value::int32(1)]),
+            [2, 3, 4, 5, 5].map(Value::int32)
+        );
+        let backward = array_of(&mut machine, &[1, 2, 3, 4, 5]);
+        assert_eq!(
+            copy(&mut machine, backward, &[Value::int32(1), Value::int32(0)]),
+            [1, 1, 2, 3, 4].map(Value::int32)
+        );
+    }
+
+    #[test]
+    fn a_hole_at_the_source_deletes_the_destination() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = allocate_array(
+            &mut machine,
+            vec![Value::HOLE, Value::int32(2), Value::int32(3)],
+        )
+        .unwrap();
+        assert_eq!(
+            copy(
+                &mut machine,
+                array,
+                &[Value::int32(2), Value::int32(0), Value::int32(1)]
+            ),
+            [Value::HOLE, Value::int32(2), Value::HOLE]
+        );
+    }
 }
 
 #[cfg(test)]

@@ -83,7 +83,7 @@ fn number<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<f64, Ev
     machine.coerce_number_observable(value).map(value_number)
 }
 
-fn integer_or_infinity<H: Host>(
+pub(super) fn integer_or_infinity<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<f64, EvalFailure> {
