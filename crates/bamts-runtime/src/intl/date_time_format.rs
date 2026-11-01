@@ -259,26 +259,20 @@ impl DateTimeComponents {
         Ok(())
     }
 
-    fn has_any(&self) -> bool {
-        self.weekday.is_some()
-            || self.era.is_some()
-            || self.year.is_some()
-            || self.month.is_some()
-            || self.day.is_some()
-            || self.day_period.is_some()
-            || self.hour.is_some()
-            || self.minute.is_some()
-            || self.second.is_some()
-            || self.fractional_second_digits.is_some()
-            || self.time_zone_name.is_some()
+    /// Whether every component is unset, which a style needs of them.
+    fn is_empty(&self) -> bool {
+        !self.has_any() && self.era.is_none() && self.time_zone_name.is_none()
     }
 
+    /// Whether anything in the `any` required list is set. `era` and
+    /// `timeZoneName` qualify a date or time but do not ask for one.
+    fn has_any(&self) -> bool {
+        self.has_date() || self.has_time()
+    }
+
+    /// Whether anything in the `date` required list is set.
     fn has_date(&self) -> bool {
-        self.weekday.is_some()
-            || self.era.is_some()
-            || self.year.is_some()
-            || self.month.is_some()
-            || self.day.is_some()
+        self.weekday.is_some() || self.year.is_some() || self.month.is_some() || self.day.is_some()
     }
 
     fn has_time(&self) -> bool {
@@ -399,6 +393,8 @@ pub enum PatternField {
     Month(MonthStyle),
     Day(NumericStyle),
     DayPeriod(TextWidth),
+    /// The AM or PM of a 12-hour clock.
+    AmPm,
     Hour(NumericStyle),
     Minute(NumericStyle),
     Second(NumericStyle),
@@ -468,7 +464,7 @@ impl DateTimePattern {
                     PatternItem::Field(PatternField::Day(_))
                 ) | (
                     RangeDifference::DayPeriod,
-                    PatternItem::Field(PatternField::DayPeriod(_))
+                    PatternItem::Field(PatternField::DayPeriod(_) | PatternField::AmPm)
                 ) | (
                     RangeDifference::Hour,
                     PatternItem::Field(PatternField::Hour(_))
@@ -486,9 +482,12 @@ impl DateTimePattern {
         })
     }
 
-    fn day_period_width(&self) -> Option<TextWidth> {
+    fn day_period_field(&self) -> Option<TextField> {
         self.items.iter().find_map(|item| match item {
-            PatternItem::Field(PatternField::DayPeriod(width)) => Some(*width),
+            PatternItem::Field(PatternField::DayPeriod(width)) => {
+                Some(TextField::DayPeriod(*width))
+            }
+            PatternItem::Field(PatternField::AmPm) => Some(TextField::AmPm),
             PatternItem::Literal(_) | PatternItem::Field(_) => None,
         })
     }
@@ -594,6 +593,7 @@ pub enum TextField {
     YearName(TextWidth),
     Month(TextWidth),
     DayPeriod(TextWidth),
+    AmPm,
     TimeZoneName(TimeZoneNameStyle),
 }
 
@@ -650,6 +650,16 @@ pub trait DateTimeFormatDataProvider: LocaleDataProvider {
     fn format_integer(&self, request: &IntegerFormatRequest<'_>) -> Result<String, ProviderError>;
 
     fn format_text(&self, request: &TextFormatRequest<'_>) -> Result<String, ProviderError>;
+
+    /// The components a `dateStyle` and `timeStyle` amount to, for a Temporal
+    /// type that can show only some of them.
+    fn style_components(
+        &self,
+        _date: Option<DateTimeStyle>,
+        _time: Option<DateTimeStyle>,
+    ) -> DateTimeComponents {
+        DateTimeComponents::default()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -742,17 +752,113 @@ pub struct DateTimeFormat {
     resolved: ResolvedDateTimeFormatOptions,
     time_zone: CanonicalTimeZone,
     pattern: DateTimePattern,
+    /// The cycle in effect, whether or not the main pattern has an hour.
+    hour_cycle: HourCycle,
+    format_matcher: FormatMatcher,
+    /// The components as requested, before defaults.
+    requested: DateTimeComponents,
 }
 
+/// A Temporal type with its own formatter, per CreateDateTimeFormat.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TemporalFormatKind {
+    PlainDate,
+    PlainYearMonth,
+    PlainMonthDay,
+    PlainTime,
+    PlainDateTime,
+    Instant,
+}
+
+/// The components of `base` a Temporal type can show, or `None` when it can
+/// show none of them.
+fn filter_components(
+    base: &DateTimeComponents,
+    kind: TemporalFormatKind,
+) -> Option<DateTimeComponents> {
+    let date = |result: &mut DateTimeComponents, weekday: bool, day: bool, era: bool| {
+        if weekday {
+            result.weekday = base.weekday;
+        }
+        if era {
+            result.era = base.era;
+        }
+        result.year = base.year;
+        result.month = base.month;
+        if day {
+            result.day = base.day;
+        }
+    };
+    let time = |result: &mut DateTimeComponents| {
+        result.day_period = base.day_period;
+        result.hour = base.hour;
+        result.minute = base.minute;
+        result.second = base.second;
+        result.fractional_second_digits = base.fractional_second_digits;
+    };
+    let mut result = DateTimeComponents::default();
+    match kind {
+        TemporalFormatKind::PlainDate => date(&mut result, true, true, true),
+        TemporalFormatKind::PlainYearMonth => date(&mut result, false, false, true),
+        TemporalFormatKind::PlainMonthDay => {
+            date(&mut result, false, true, false);
+            result.year = None;
+        }
+        TemporalFormatKind::PlainTime => time(&mut result),
+        TemporalFormatKind::PlainDateTime => {
+            date(&mut result, true, true, true);
+            time(&mut result);
+        }
+        TemporalFormatKind::Instant => result = base.clone(),
+    }
+    Some(result)
+}
+
+/// The fields a Temporal type falls back on when no requested one applies.
+fn default_components(kind: TemporalFormatKind, components: &mut DateTimeComponents) {
+    use TemporalFormatKind as Kind;
+    if matches!(
+        kind,
+        Kind::PlainDate | Kind::PlainYearMonth | Kind::PlainDateTime | Kind::Instant
+    ) {
+        components.year = Some(NumericStyle::Numeric);
+    }
+    if kind != Kind::PlainTime {
+        components.month = Some(MonthStyle::Numeric);
+    }
+    if matches!(
+        kind,
+        Kind::PlainDate | Kind::PlainMonthDay | Kind::PlainDateTime | Kind::Instant
+    ) {
+        components.day = Some(NumericStyle::Numeric);
+    }
+    if matches!(kind, Kind::PlainTime | Kind::PlainDateTime | Kind::Instant) {
+        components.add_time_defaults();
+    }
+}
+
+fn shows_required(components: &DateTimeComponents, kind: TemporalFormatKind) -> bool {
+    use TemporalFormatKind as Kind;
+    match kind {
+        Kind::PlainDate => components.has_date(),
+        Kind::PlainYearMonth => components.year.is_some() || components.month.is_some(),
+        Kind::PlainMonthDay => components.month.is_some() || components.day.is_some(),
+        Kind::PlainTime => components.has_time(),
+        Kind::PlainDateTime | Kind::Instant => components.has_any(),
+    }
+}
+
+/// Which components a formatter must end up with, or take the defaults.
 #[derive(Clone, Copy)]
-enum RequiredComponents {
+pub enum RequiredComponents {
     Date,
     Time,
     Any,
 }
 
+/// Which components the defaults add.
 #[derive(Clone, Copy)]
-enum DefaultComponents {
+pub enum DefaultComponents {
     Date,
     Time,
     All,
@@ -777,7 +883,9 @@ impl DateTimeFormat {
         )
     }
 
-    fn try_new_with_mode(
+    /// Constructs a formatter for the given component requirements, as
+    /// `Date.prototype.toLocaleDateString` and its peers do.
+    pub fn try_new_with_mode(
         locales: &[String],
         options: &DateTimeFormatOptions,
         required: RequiredComponents,
@@ -801,10 +909,15 @@ impl DateTimeFormat {
                 canonicalize_unicode_type("calendar", "ca", calendar, provider)?,
             );
         }
-        if options.hour12.is_none()
-            && let Some(hour_cycle) = options.hour_cycle
-        {
-            locale_options.insert("hc".to_owned(), hour_cycle.as_str().to_owned());
+        match (options.hour12, options.hour_cycle) {
+            // hour12 overrides any requested cycle, and the extension with it.
+            (Some(_), _) => {
+                locale_options.insert("hc".to_owned(), String::new());
+            }
+            (None, Some(hour_cycle)) => {
+                locale_options.insert("hc".to_owned(), hour_cycle.as_str().to_owned());
+            }
+            (None, None) => {}
         }
         if let Some(numbering_system) = &options.numbering_system {
             locale_options.insert(
@@ -887,7 +1000,111 @@ impl DateTimeFormat {
             resolved,
             time_zone,
             pattern,
+            hour_cycle,
+            format_matcher: options.format_matcher,
+            requested: options.components.clone(),
         })
+    }
+
+    /// GetDateTimeFormat for a Temporal type: the pattern that type uses, or
+    /// `None` when the options and the type do not overlap.
+    fn temporal_pattern(
+        &self,
+        kind: TemporalFormatKind,
+        provider: &dyn DateTimeFormatDataProvider,
+    ) -> Result<Option<DateTimePattern>, DateTimeFormatError> {
+        let (date_style, time_style) = (self.resolved.date_style, self.resolved.time_style);
+        let components = if date_style.is_some() || time_style.is_some() {
+            if matches!(kind, TemporalFormatKind::Instant) {
+                return Ok(Some(self.pattern.clone()));
+            }
+            let needs_date = matches!(
+                kind,
+                TemporalFormatKind::PlainDate
+                    | TemporalFormatKind::PlainYearMonth
+                    | TemporalFormatKind::PlainMonthDay
+            );
+            if (needs_date && date_style.is_none())
+                || (kind == TemporalFormatKind::PlainTime && time_style.is_none())
+            {
+                return Ok(None);
+            }
+            filter_components(&provider.style_components(date_style, time_style), kind)
+        } else {
+            let mut filtered = filter_components(&self.requested, kind);
+            if let Some(components) = &mut filtered
+                && !shows_required(components, kind)
+            {
+                if kind != TemporalFormatKind::Instant && self.requested.has_any() {
+                    return Ok(None);
+                }
+                default_components(kind, components);
+            }
+            filtered
+        };
+        let Some(components) = components else {
+            return Ok(None);
+        };
+        let pattern = provider.select_pattern(&PatternRequest {
+            locale: &self.resolved.locale,
+            data_locale: &self.resolved.data_locale,
+            calendar: &self.resolved.calendar,
+            numbering_system: &self.resolved.numbering_system,
+            time_zone: self.time_zone.identifier(),
+            hour_cycle: self.hour_cycle,
+            format_matcher: self.format_matcher,
+            date_style: None,
+            time_style: None,
+            components: &components,
+        })?;
+        pattern.validate()?;
+        Ok(Some(pattern))
+    }
+
+    /// The zone a Temporal type renders in. Only an Instant has a place on
+    /// the time line; the plain types show their fields as they are.
+    fn temporal_zone(&self, kind: TemporalFormatKind) -> CanonicalTimeZone {
+        if kind == TemporalFormatKind::Instant {
+            self.time_zone.clone()
+        } else {
+            CanonicalTimeZone::Offset {
+                identifier: String::from("+00:00"),
+                nanoseconds: 0,
+            }
+        }
+    }
+
+    /// Partitions a Temporal value, given as epoch nanoseconds. `Ok(None)`
+    /// means the type has no format here, which is a TypeError.
+    pub fn format_temporal_to_parts(
+        &self,
+        kind: TemporalFormatKind,
+        epoch_nanoseconds: i128,
+        provider: &dyn DateTimeFormatDataProvider,
+    ) -> Result<Option<Vec<DateTimePart>>, DateTimeFormatError> {
+        let Some(pattern) = self.temporal_pattern(kind, provider)? else {
+            return Ok(None);
+        };
+        let zone = self.temporal_zone(kind);
+        let local = self.local_time_in(&zone, epoch_nanoseconds, provider)?;
+        self.render_pattern(&pattern.items, epoch_nanoseconds, &local, provider)
+            .map(Some)
+    }
+
+    /// Partitions a range of two values of one Temporal type.
+    pub fn format_temporal_range_to_parts(
+        &self,
+        kind: TemporalFormatKind,
+        start: i128,
+        end: i128,
+        provider: &dyn DateTimeFormatDataProvider,
+    ) -> Result<Option<Vec<DateTimeRangePart>>, DateTimeFormatError> {
+        let Some(pattern) = self.temporal_pattern(kind, provider)? else {
+            return Ok(None);
+        };
+        let zone = self.temporal_zone(kind);
+        self.range_parts(&pattern, &zone, start, end, provider)
+            .map(Some)
     }
 
     #[must_use]
@@ -937,10 +1154,23 @@ impl DateTimeFormat {
     ) -> Result<Vec<DateTimeRangePart>, DateTimeFormatError> {
         let start_instant = time_clip_to_nanoseconds(start_epoch_milliseconds)?;
         let end_instant = time_clip_to_nanoseconds(end_epoch_milliseconds)?;
-        let start_local = self.to_local_time(start_instant, provider)?;
-        let end_local = self.to_local_time(end_instant, provider)?;
+        let zone = self.time_zone.clone();
+        self.range_parts(&self.pattern, &zone, start_instant, end_instant, provider)
+    }
+
+    fn range_parts(
+        &self,
+        pattern: &DateTimePattern,
+        zone: &CanonicalTimeZone,
+        start_instant: i128,
+        end_instant: i128,
+        provider: &dyn DateTimeFormatDataProvider,
+    ) -> Result<Vec<DateTimeRangePart>, DateTimeFormatError> {
+        let start_local = self.local_time_in(zone, start_instant, provider)?;
+        let end_local = self.local_time_in(zone, end_instant, provider)?;
 
         let difference = self.largest_range_difference(
+            pattern,
             start_instant,
             &start_local,
             end_instant,
@@ -949,7 +1179,7 @@ impl DateTimeFormat {
         )?;
         let Some(difference) = difference else {
             return Ok(self
-                .render_pattern(&self.pattern.items, start_instant, &start_local, provider)?
+                .render_pattern(&pattern.items, start_instant, &start_local, provider)?
                 .into_iter()
                 .map(|part| DateTimeRangePart {
                     part_type: part.part_type,
@@ -965,8 +1195,8 @@ impl DateTimeFormat {
             calendar: &self.resolved.calendar,
             numbering_system: &self.resolved.numbering_system,
             time_zone: self.time_zone.identifier(),
-            hour_cycle: self.resolved.hour_cycle.unwrap_or(HourCycle::H23),
-            pattern: &self.pattern,
+            hour_cycle: self.hour_cycle,
+            pattern,
             largest_difference,
         };
         let range_pattern = match provider.select_range_pattern(&request(Some(difference)))? {
@@ -998,7 +1228,16 @@ impl DateTimeFormat {
         epoch_nanoseconds: i128,
         provider: &dyn DateTimeFormatDataProvider,
     ) -> Result<CalendarDateTime, DateTimeFormatError> {
-        let offset = match &self.time_zone {
+        self.local_time_in(&self.time_zone, epoch_nanoseconds, provider)
+    }
+
+    fn local_time_in(
+        &self,
+        zone: &CanonicalTimeZone,
+        epoch_nanoseconds: i128,
+        provider: &dyn DateTimeFormatDataProvider,
+    ) -> Result<CalendarDateTime, DateTimeFormatError> {
+        let offset = match zone {
             CanonicalTimeZone::Offset { nanoseconds, .. } => i128::from(*nanoseconds),
             CanonicalTimeZone::Named(identifier) => {
                 let offset =
@@ -1093,10 +1332,14 @@ impl DateTimeFormat {
                 Ok((DateTimePartType::Weekday, text(TextField::Weekday(width))?))
             }
             PatternField::Era(width) => Ok((DateTimePartType::Era, text(TextField::Era(width))?)),
-            PatternField::Year(style) => Ok((
-                DateTimePartType::Year,
-                integer(i64::from(local.year), numeric_width(style))?,
-            )),
+            PatternField::Year(style) => {
+                let year = i64::from(local.year);
+                let year = match style {
+                    NumericStyle::Numeric => year,
+                    NumericStyle::TwoDigit => year.rem_euclid(100),
+                };
+                Ok((DateTimePartType::Year, integer(year, numeric_width(style))?))
+            }
             PatternField::RelatedYear(style) => {
                 let year = local.related_year.ok_or_else(|| {
                     ProviderError::missing("calendar related year", &self.resolved.calendar)
@@ -1138,11 +1381,9 @@ impl DateTimeFormat {
                 DateTimePartType::DayPeriod,
                 text(TextField::DayPeriod(width))?,
             )),
+            PatternField::AmPm => Ok((DateTimePartType::DayPeriod, text(TextField::AmPm)?)),
             PatternField::Hour(style) => {
-                let cycle = self.resolved.hour_cycle.ok_or_else(|| {
-                    ProviderError::invalid("pattern", "hour field has no resolved hour cycle")
-                })?;
-                let hour = match cycle {
+                let hour = match self.hour_cycle {
                     HourCycle::H11 => local.hour % 12,
                     HourCycle::H12 => {
                         let hour = local.hour % 12;
@@ -1197,6 +1438,7 @@ impl DateTimeFormat {
 
     fn largest_range_difference(
         &self,
+        pattern: &DateTimePattern,
         start_instant: i128,
         start: &CalendarDateTime,
         end_instant: i128,
@@ -1215,7 +1457,7 @@ impl DateTimeFormat {
             RangeDifference::FractionalSecond,
         ];
         for difference in differences {
-            if !self.pattern.has_field(difference) {
+            if !pattern.has_field(difference) {
                 continue;
             }
             let equal = match difference {
@@ -1230,7 +1472,7 @@ impl DateTimeFormat {
                 }
                 RangeDifference::Day => start.day == end.day,
                 RangeDifference::DayPeriod => {
-                    let width = self.pattern.day_period_width().ok_or_else(|| {
+                    let period = pattern.day_period_field().ok_or_else(|| {
                         ProviderError::invalid("pattern", "missing day-period width")
                     })?;
                     let format = |instant, local| {
@@ -1242,7 +1484,7 @@ impl DateTimeFormat {
                             time_zone: self.time_zone.identifier(),
                             epoch_nanoseconds: instant,
                             local,
-                            field: TextField::DayPeriod(width),
+                            field: period,
                         })
                     };
                     format(start_instant, start)? == format(end_instant, end)?
@@ -1251,7 +1493,7 @@ impl DateTimeFormat {
                 RangeDifference::Minute => start.minute == end.minute,
                 RangeDifference::Second => start.second == end.second,
                 RangeDifference::FractionalSecond => {
-                    let digits = self.pattern.fractional_second_digits().ok_or_else(|| {
+                    let digits = pattern.fractional_second_digits().ok_or_else(|| {
                         ProviderError::invalid("pattern", "missing fractional-second width")
                     })?;
                     let divisor = match digits {
@@ -1277,7 +1519,7 @@ fn resolve_component_options(
     defaults: DefaultComponents,
 ) -> Result<DateTimeComponents, DateTimeFormatError> {
     if (options.date_style.is_some() || options.time_style.is_some())
-        && options.components.has_any()
+        && !options.components.is_empty()
     {
         return Err(DateTimeFormatError::Type {
             message: "dateStyle/timeStyle may not be combined with explicit components",
@@ -1345,6 +1587,12 @@ fn resolved_keyword(
         .ok_or_else(|| ProviderError::missing("locale keyword", key).into())
 }
 
+/// Whether a `timeZone` option names something the provider can use.
+#[must_use]
+pub fn is_valid_time_zone(value: &str, provider: &dyn DateTimeFormatDataProvider) -> bool {
+    canonicalize_time_zone(value, provider).is_ok()
+}
+
 fn canonicalize_time_zone(
     value: &str,
     provider: &dyn DateTimeFormatDataProvider,
@@ -1371,66 +1619,36 @@ fn canonicalize_time_zone(
     Ok(CanonicalTimeZone::Named(canonical))
 }
 
+/// A time zone offset: a sign, then `hh`, `hhmm`, or `hh:mm`.
 fn parse_offset_minutes(value: &str) -> Result<Option<i32>, DateTimeFormatError> {
     let (sign, body) = if let Some(body) = value.strip_prefix('+') {
         (1, body)
-    } else if let Some(body) = value.strip_prefix('-').or_else(|| value.strip_prefix('−')) {
+    } else if let Some(body) = value.strip_prefix('-') {
         (-1, body)
     } else {
         return Ok(None);
     };
-
-    let (main, fraction) = match body.find(['.', ',']) {
-        Some(index) => (&body[..index], Some(&body[index + 1..])),
-        None => (body, None),
+    let invalid = || DateTimeFormatError::range("timeZone", value);
+    let (hours, minutes) = match body.len() {
+        2 => (body, "00"),
+        4 => body.split_at(2),
+        5 if body.as_bytes()[2] == b':' => (&body[..2], &body[3..]),
+        _ => return Err(invalid()),
     };
-    if fraction.is_some_and(|digits| {
-        digits.is_empty() || digits.len() > 9 || !digits.bytes().all(|byte| byte.is_ascii_digit())
-    }) {
-        return Err(DateTimeFormatError::range("timeZone", value));
+    if !hours
+        .bytes()
+        .chain(minutes.bytes())
+        .all(|byte| byte.is_ascii_digit())
+    {
+        return Err(invalid());
     }
-
-    let mut fields = [0_u8; 3];
-    let count = if main.contains(':') {
-        let parts: Vec<_> = main.split(':').collect();
-        if !(1..=3).contains(&parts.len())
-            || parts.iter().any(|part| part.len() != 2)
-            || parts
-                .iter()
-                .any(|part| !part.bytes().all(|byte| byte.is_ascii_digit()))
-        {
-            return Err(DateTimeFormatError::range("timeZone", value));
-        }
-        for (index, part) in parts.iter().enumerate() {
-            fields[index] = part
-                .parse()
-                .map_err(|_| DateTimeFormatError::range("timeZone", value))?;
-        }
-        parts.len()
-    } else {
-        if !matches!(main.len(), 2 | 4 | 6) || !main.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(DateTimeFormatError::range("timeZone", value));
-        }
-        let count = main.len() / 2;
-        for (index, field) in fields.iter_mut().take(count).enumerate() {
-            *field = main[index * 2..index * 2 + 2]
-                .parse()
-                .map_err(|_| DateTimeFormatError::range("timeZone", value))?;
-        }
-        count
-    };
-
-    if fields[0] > 23 || fields[1] > 59 || fields[2] > 59 {
-        return Err(DateTimeFormatError::range("timeZone", value));
+    let hours: i32 = hours.parse().map_err(|_| invalid())?;
+    let minutes: i32 = minutes.parse().map_err(|_| invalid())?;
+    if hours > 23 || minutes > 59 {
+        return Err(invalid());
     }
-    if fraction.is_some() && count < 3 {
-        return Err(DateTimeFormatError::range("timeZone", value));
-    }
-    if fields[2] != 0 || fraction.is_some_and(|digits| digits.bytes().any(|byte| byte != b'0')) {
-        return Err(DateTimeFormatError::range("timeZone", value));
-    }
-    let minutes = i32::from(fields[0]) * 60 + i32::from(fields[1]);
-    Ok(Some(if minutes == 0 { 0 } else { sign * minutes }))
+    let total = hours * 60 + minutes;
+    Ok(Some(if total == 0 { 0 } else { sign * total }))
 }
 
 fn time_clip_to_nanoseconds(value: f64) -> Result<i128, DateTimeFormatError> {
@@ -1896,7 +2114,7 @@ mod tests {
                     "Undecimber",
                 ][usize::from(request.local.month - 1)]
                 .to_owned(),
-                TextField::DayPeriod(_) => {
+                TextField::DayPeriod(_) | TextField::AmPm => {
                     if request.local.hour < 12 { "AM" } else { "PM" }.to_owned()
                 }
                 TextField::TimeZoneName(_) => match request.time_zone {
@@ -2048,13 +2266,9 @@ mod tests {
             DateTimeFormat::try_new(&[], &options_with_time_zone("-2359"), &provider, &host)
                 .expect("valid offset zone");
         assert_eq!(offset.resolved_options().time_zone, "-23:59");
-        let zero = DateTimeFormat::try_new(
-            &[],
-            &options_with_time_zone("-00:00:00.000"),
-            &provider,
-            &host,
-        )
-        .expect("negative zero canonicalizes");
+        let zero =
+            DateTimeFormat::try_new(&[], &options_with_time_zone("-00:00"), &provider, &host)
+                .expect("negative zero canonicalizes");
         assert_eq!(zero.resolved_options().time_zone, "+00:00");
     }
 

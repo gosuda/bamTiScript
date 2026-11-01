@@ -1162,15 +1162,18 @@ pub fn resolve_locale(
                 requested_supported = true;
             }
         }
-        if let Some(option) = options.get(&key)
-            && supported
+        if let Some(option) = options.get(&key) {
+            if option.is_empty() {
+                requested_supported = false;
+            } else if supported
                 .iter()
                 .any(|supported_value| supported_value == option)
-        {
-            if option != &value {
-                requested_supported = false;
+            {
+                if option != &value {
+                    requested_supported = false;
+                }
+                value.clone_from(option);
             }
-            value.clone_from(option);
         }
         if requested_supported {
             supported_keywords.insert(

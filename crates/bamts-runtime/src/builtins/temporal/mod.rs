@@ -271,7 +271,7 @@ pub(super) fn is_object<H: Host>(
 }
 
 /// The Temporal record `value` carries, if it is a Temporal instance.
-pub(super) fn temporal_record<H: Host>(
+pub(in crate::intrinsics::builtins) fn temporal_record<H: Host>(
     machine: &Machine<'_, H>,
     value: Value,
 ) -> Result<Option<TemporalObject>, EvalFailure> {

@@ -465,27 +465,29 @@ const TIME_ZONES: [(&str, i8); 27] = [
     ("UTC", 0),
 ];
 
+/// The links to UTC, which keep their own names: an identifier is reported as
+/// written, in its canonical case, rather than replaced by its target.
+const UTC_LINKS: [&str; 10] = [
+    "Etc/GMT",
+    "Etc/Greenwich",
+    "Etc/UCT",
+    "Etc/UTC",
+    "Etc/Universal",
+    "Etc/Zulu",
+    "GMT",
+    "UCT",
+    "Universal",
+    "Zulu",
+];
+
 /// The time zone a case-insensitive identifier names and its offset in hours.
-/// The links to UTC resolve to it.
 #[must_use]
 pub fn time_zone(identifier: &str) -> Option<(&'static str, i8)> {
-    const UTC_LINKS: [&str; 10] = [
-        "Etc/UCT",
-        "Etc/UTC",
-        "Etc/Universal",
-        "Etc/Zulu",
-        "UCT",
-        "Universal",
-        "Zulu",
-        "Etc/GMT",
-        "GMT",
-        "Etc/Greenwich",
-    ];
-    if UTC_LINKS
+    if let Some(link) = UTC_LINKS
         .iter()
-        .any(|link| link.eq_ignore_ascii_case(identifier))
+        .find(|link| link.eq_ignore_ascii_case(identifier))
     {
-        return Some(("UTC", 0));
+        return Some((link, 0));
     }
     TIME_ZONES
         .iter()
@@ -830,6 +832,8 @@ pub struct IntlData {
     case_first_keywords: Vec<String>,
     numeric_keywords: Vec<String>,
     numbering_keywords: Vec<String>,
+    calendar_keywords: Vec<String>,
+    hour_cycle_keywords: Vec<String>,
 }
 
 /// The one instance services hold a reference to.
@@ -865,6 +869,8 @@ pub static DATA: LazyLock<IntlData> = LazyLock::new(|| {
         case_first_keywords: owned(&["false", "lower", "upper"]),
         numeric_keywords: owned(&["false", "true"]),
         numbering_keywords,
+        calendar_keywords: owned(&["gregory", "iso8601"]),
+        hour_cycle_keywords: owned(&["h12", "h11", "h23", "h24"]),
     }
 });
 
@@ -957,7 +963,9 @@ impl LocaleDataProvider for IntlData {
     }
     fn key_values(&self, _data_locale: &str, key: &str) -> &[String] {
         match key {
+            "ca" => &self.calendar_keywords,
             "co" => &self.collation_keywords,
+            "hc" => &self.hour_cycle_keywords,
             "kf" => &self.case_first_keywords,
             "kn" => &self.numeric_keywords,
             "nu" => &self.numbering_keywords,

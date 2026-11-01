@@ -5,6 +5,7 @@
 //! receiver checks, and the shape of the installed objects.
 
 mod collator;
+mod date_time_format;
 mod display_names;
 mod list_format;
 mod locale;
@@ -124,6 +125,7 @@ pub(super) fn install<H: Host>(
     locale::install(heap, builtins, namespace);
     collator::install(heap, builtins, namespace);
     number_format::install(heap, builtins, namespace);
+    date_time_format::install(heap, builtins, namespace);
     plural_rules::install(heap, builtins, namespace);
     list_format::install(heap, builtins, namespace);
     relative_time_format::install(heap, builtins, namespace);

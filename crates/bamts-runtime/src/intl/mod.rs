@@ -5,6 +5,7 @@ use std::fmt;
 pub mod canonical_locales;
 mod collation;
 pub mod collator;
+mod date_data;
 pub mod date_time_format;
 mod locale_aliases;
 pub mod locale_data;
