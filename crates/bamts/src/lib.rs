@@ -15,11 +15,14 @@ use bamts_cancel::{CancellationToken, Cancelled};
 use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
 use bamts_compiler::lint::{LintProfile, LintTable};
 use bamts_compiler::lower::LowerOptions;
+use bamts_compiler::parser::parse;
 use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend_with_cancel};
 use bamts_compiler::program::{
     ProgramLoadError, ProgramLoader, ProgramLowerError, ResolvedProgram, lower_program_with_cancel,
 };
 use bamts_compiler::project::{ConfigError, ProjectConfig, ProjectRoot};
+use bamts_compiler::scanner::scan;
+use bamts_compiler::source::ScriptKind;
 
 pub use bamts_bytecode as bytecode;
 pub use bamts_compiler as compiler;
@@ -210,6 +213,10 @@ pub fn compile_source_file_with_cancel(
     if !diagnostics.is_empty() {
         return Err(Error::Diagnostics { diagnostics });
     }
+    let diagnostics = early_errors(&resolved.program);
+    if !diagnostics.is_empty() {
+        return Err(Error::Diagnostics { diagnostics });
+    }
     lower_program_with_cancel(
         &resolved.program,
         &frontend,
@@ -219,6 +226,29 @@ pub fn compile_source_file_with_cancel(
         cancel,
     )
     .map_err(Error::from)
+}
+
+/// The early errors of every JavaScript module about to run. TypeScript sources
+/// answer to the checker instead.
+fn early_errors(program: &ResolvedProgram) -> Vec<Diagnostic> {
+    program
+        .modules()
+        .iter()
+        .filter(|module| {
+            matches!(
+                module.script_kind(),
+                ScriptKind::JavaScript | ScriptKind::JavaScriptReact
+            )
+        })
+        .flat_map(|module| {
+            let scanned = scan(
+                module.source_id(),
+                module.script_kind(),
+                module.source().clone(),
+            );
+            bamts_compiler::early_errors::check(parse(scanned).product())
+        })
+        .collect()
 }
 
 /// Runs an entrypoint and its complete local module graph with the deterministic
