@@ -4365,10 +4365,12 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     }
                 }
                 HelperCall::StoreGlobal { name, value } => {
+                    let sloppy = self.running_is_sloppy();
                     let stored = self.machine.borrow_mut().store_global(
                         module,
                         ConstantId::new(name),
                         value,
+                        sloppy,
                     );
                     match stored {
                         Ok(()) => HelperResult::normal(Value::UNDEFINED),

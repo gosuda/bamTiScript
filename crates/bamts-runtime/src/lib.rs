@@ -5899,7 +5899,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 },
                 Instruction::StoreGlobal { name, value } => {
                     let value = self.read_register(frame_index, value.get());
-                    match self.store_global(module_id, name, value) {
+                    let sloppy = self.is_sloppy(module_id, function_index);
+                    match self.store_global(module_id, name, value, sloppy) {
                         Ok(()) => self.frames[frame_index].pc = pc + 1,
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
@@ -6698,6 +6699,7 @@ impl<'a, H: Host> Machine<'a, H> {
         module: ModuleId,
         name: ConstantId,
         value: Value,
+        sloppy: bool,
     ) -> Result<(), EvalFailure> {
         let cell = self
             .registry
@@ -6724,7 +6726,12 @@ impl<'a, H: Host> Machine<'a, H> {
         } else {
             let name = self.constant_text(module, name).to_owned();
             let global = self.context_global.unwrap_or(self.global_object);
-            self.set_data_property_key(global, PropertyKey::Named(name), value)?;
+            let stored = self.internal_set(global, PropertyKey::Named(name), value, global)?;
+            if !stored && !sloppy {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "assign to read only property",
+                }));
+            }
         }
         Ok(())
     }
@@ -19332,6 +19339,55 @@ mod tests {
             HeapEntry::Iterator {
                 state: IteratorState::Protocol { iterator, .. }
             } if iterator == object
+        ));
+    }
+
+    #[test]
+    fn a_failed_global_store_is_silent_only_in_sloppy_code() {
+        fn store_to_read_only_global(is_sloppy: bool) -> Result<Value, RuntimeErrorKind> {
+            let entry = Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags {
+                    is_sloppy,
+                    ..FunctionFlags::default()
+                },
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(0),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                vec![],
+            );
+            let program = verified(
+                vec![
+                    Constant::String(EcmaString::encode("undefined")),
+                    Constant::Int32(1),
+                ],
+                vec![entry],
+            );
+            let mut host = TestHost;
+            Machine::new(&program, &mut host, Limits::default())
+                .run()
+                .map(|execution| execution.value)
+                .map_err(|error| error.kind)
+        }
+
+        assert_eq!(store_to_read_only_global(true), Ok(Value::int32(1)));
+        assert!(matches!(
+            store_to_read_only_global(false),
+            Err(RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError { .. },
+                ..
+            })
         ));
     }
 
