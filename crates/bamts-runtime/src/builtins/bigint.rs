@@ -12,7 +12,7 @@
 //! - mixed BigInt/Number arithmetic is a `TypeError`;
 //! - non-integral `Number -> BigInt` conversion is a `RangeError`;
 //! - `StringToBigInt` failures are real `SyntaxError` objects built through
-//!   the installed `SyntaxError` constructor (mirrors `json.rs`); a zero-length
+//!   the installed `SyntaxError` constructor (mirrors `json_edge.rs`); a zero-length
 //!   or whitespace-only string is `0n`, never an error.
 
 use std::collections::BTreeMap;
@@ -1271,7 +1271,7 @@ pub(crate) enum BigIntBinaryOp {
 
 /// Maps a core `BigIntError` to an abrupt completion. Type and range stays in
 /// the typed `ThrowOrigin` channel; syntax failures build a real `SyntaxError`
-/// instance through the installed error constructor, exactly as `json.rs` does.
+/// instance through the installed error constructor, exactly as `json_edge.rs` does.
 fn bigint_failure<H: Host>(machine: &mut Machine<'_, H>, error: BigIntError) -> EvalFailure {
     match error {
         BigIntError::Range(operation) => range_error(operation),
