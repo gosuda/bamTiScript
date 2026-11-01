@@ -27,7 +27,9 @@ pub(super) fn install<H: Host>(
         define_static(heap, constructor, name, f)
     }
     for (name, length, handler) in [
-        ("charAt", 1, char_at::<H> as BuiltinHandler<H>),
+        ("toString", 0, this_string_value::<H> as BuiltinHandler<H>),
+        ("valueOf", 0, this_string_value::<H>),
+        ("charAt", 1, char_at::<H>),
         ("charCodeAt", 1, char_code_at::<H>),
         ("codePointAt", 1, code_point_at::<H>),
         ("at", 1, at::<H>),
@@ -129,6 +131,24 @@ fn append(out: &mut EcmaStringBuilder, text: &EcmaString) {
 fn integer<H: Host>(machine: &Machine<'_, H>, value: Value) -> Result<isize, EvalFailure> {
     Ok(to_integer_or_infinity(machine, value)? as isize)
 }
+/// `String.prototype.toString` and `valueOf`: the receiver's own string. Neither
+/// coerces, so a receiver that is not a String throws.
+fn this_string_value<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let value = machine.unbox_primitive(this, "String.prototype.toString")?;
+    if machine.string_value(value).is_some() {
+        Ok(BuiltinOutcome::Value(value))
+    } else {
+        Err(type_error(
+            "String.prototype.toString called on incompatible receiver",
+        ))
+    }
+}
+
 fn from_char_code<H: Host>(
     machine: &mut Machine<'_, H>,
     _: Value,

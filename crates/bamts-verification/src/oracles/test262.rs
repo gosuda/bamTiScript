@@ -2164,6 +2164,32 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn wrapper_prototypes_report_their_own_primitive() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [&str; 7] = [
+            "assert.sameValue('a'.toString(), 'a');",
+            "assert.sameValue('a'.valueOf(), 'a');",
+            "assert.sameValue(new String('a').toString(), 'a');",
+            "assert.sameValue(String.prototype.toString.call(new String('')), '');",
+            "assert.sameValue(throws(TypeError, function () { String.prototype.toString.call(1); }), true);",
+            "assert.sameValue(true.toString(), 'true'); assert.sameValue(new Boolean(false).toString(), 'false');",
+            "assert.sameValue(throws(TypeError, function () { Boolean.prototype.toString.call('a'); }), true);",
+        ];
+        for (index, body) in CASES.iter().enumerate() {
+            let source = wrap(
+                "description: wrapper prototypes",
+                &format!("{THROWS}{body}"),
+            );
+            if let Err(error) = run_fixture(&format!("wrapper-prototypes-{index}"), &source) {
+                panic!("{body}: {error:?}");
+            }
+        }
+    }
+
+    #[test]
     fn indirect_eval_runs_in_the_global_scope() {
         const THROWS: &str = "function throws(kind, body) {\n\
             try { body(); } catch (error) { return error instanceof kind; }\n\

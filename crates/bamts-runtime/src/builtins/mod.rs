@@ -301,6 +301,8 @@ fn install_boolean<H: Host>(
     globals.insert(EcmaString::encode("Boolean"), constructor);
     let value_of = install_function(heap, builtins, "valueOf", 0, boolean_value_of::<H>);
     define_data(heap, prototype, "valueOf", value_of);
+    let to_string = install_function(heap, builtins, "toString", 0, boolean_to_string::<H>);
+    define_data(heap, prototype, "toString", to_string);
 }
 fn boolean_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -328,6 +330,21 @@ fn boolean_value_of<H: Host>(
             "Boolean.prototype.valueOf called on incompatible receiver",
         )),
     }
+}
+fn boolean_to_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let value = machine.unbox_primitive(this, "Boolean.prototype.toString")?;
+    let Some(bamts_native::Decoded::Boolean(value)) = value.decode() else {
+        return Err(type_error(
+            "Boolean.prototype.toString called on incompatible receiver",
+        ));
+    };
+    let text = EcmaString::encode(if value { "true" } else { "false" });
+    allocate_string(machine, text).map(BuiltinOutcome::Value)
 }
 fn install_math<H: Host>(
     heap: &mut Vec<HeapEntry>,
