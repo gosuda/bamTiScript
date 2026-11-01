@@ -2,68 +2,82 @@
   <title id="title">bamTiScript pre-release social preview</title>
   <desc id="description">A compiler pipeline from TypeScript source through an abstract syntax tree and bytecode to native output.</desc>
   <style>
-    .background { fill: #181a1b; }
-    .panel { fill: #232728; stroke: #3b4343; stroke-width: 2; }
-    .brand { fill: #d94f28; font: 700 72px "IBM Plex Sans", Inter, sans-serif; }
-    .subtitle { fill: #f4f1e8; font: 400 30px "IBM Plex Mono", "JetBrains Mono", monospace; letter-spacing: 1px; }
-    .status { fill: #f4f1e8; font: 700 16px "IBM Plex Sans", Inter, sans-serif; letter-spacing: 2px; }
-    .code { fill: #f4f1e8; font: 500 16px "IBM Plex Mono", "JetBrains Mono", monospace; }
-    .muted { fill: #a9b1aa; font: 500 14px "IBM Plex Mono", "JetBrains Mono", monospace; }
-    .accent-fill { fill: #0f8a83; }
-    .accent-stroke { fill: none; stroke: #0f8a83; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
-    .node { fill: #f4f1e8; stroke: #0f8a83; stroke-width: 3; }
-    .machine { fill: #f4f1e8; stroke: #d94f28; stroke-width: 1.5; }
+    .background { fill: #161819; }
+    .panel { fill: #202425; stroke: #343b3b; stroke-width: 2; }
+    .rule { stroke: #343b3b; stroke-width: 2; }
+    .brand { fill: #e0562d; font: 700 84px "IBM Plex Sans", sans-serif; letter-spacing: -1px; }
+    .subtitle { fill: #f4f1e8; font: 400 30px "IBM Plex Mono", monospace; }
+    .status { fill: #0f1312; font: 600 15px "IBM Plex Sans", sans-serif; letter-spacing: 2px; }
+    .label { fill: #9aa39c; font: 600 14px "IBM Plex Mono", monospace; letter-spacing: 1.5px; }
+    .code { fill: #f4f1e8; font: 400 17px "IBM Plex Mono", monospace; }
+    .kw { fill: #e0562d; }
+    .ty { fill: #3cc2b8; }
+    .op { font: 500 14px "IBM Plex Mono", monospace; }
+    .op-on { fill: #0f1312; }
+    .op-off { fill: #f4f1e8; }
+    .cell { fill: #2b3132; stroke: #3f4848; stroke-width: 1.5; }
+    .accent { fill: #19a39a; }
+    .edge { fill: none; stroke: #19a39a; stroke-width: 3; stroke-linecap: round; }
+    .node { fill: #f4f1e8; stroke: #19a39a; stroke-width: 3; }
+    .arrow { fill: none; stroke: #19a39a; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+    .bit { fill: #f4f1e8; }
+    .bit-on { fill: #e0562d; }
   </style>
   <rect class="background" width="1280" height="640"/>
 
-  <text class="brand" x="80" y="116">bamTiScript</text>
-  <text class="subtitle" x="82" y="164">TypeScript 7.0.2 in Rust</text>
-  <rect class="accent-fill" x="82" y="190" width="140" height="34" rx="17"/>
-  <text class="status" x="105" y="213">PRE-RELEASE</text>
+  <text class="brand" x="76" y="138">bamTiScript</text>
+  <text class="subtitle" x="80" y="190">TypeScript 7.2 in Rust</text>
+  <rect class="accent" x="80" y="210" width="148" height="32" rx="16"/>
+  <text class="status" x="154" y="231" text-anchor="middle">PRE-RELEASE</text>
 
-  <rect class="panel" x="80" y="286" width="250" height="220" rx="12"/>
-  <text class="muted" x="104" y="318">TYPESCRIPT SOURCE</text>
-  <text class="code" x="104" y="362">interface Node {</text>
-  <text class="code" x="124" y="390">kind: string</text>
-  <text class="code" x="104" y="418">}</text>
-  <text class="code" x="104" y="454">const answer = 42</text>
-  <text class="code" x="104" y="482">compile(answer)</text>
-
-  <path class="accent-stroke" d="M348 396h62m-16-12 16 12-16 12"/>
-
-  <rect class="panel" x="430" y="286" width="180" height="220" rx="12"/>
-  <text class="muted" x="454" y="318">SYNTAX TREE</text>
-  <path class="accent-stroke" d="M520 350v36m0 0-42 48m42-48 42 48m-84 0-22 36m22-36 22 36m62-36-22 36m22-36 22 36"/>
-  <circle class="node" cx="520" cy="350" r="8"/>
-  <circle class="node" cx="520" cy="386" r="8"/>
-  <circle class="node" cx="478" cy="434" r="8"/>
-  <circle class="node" cx="562" cy="434" r="8"/>
-  <circle class="node" cx="456" cy="470" r="7"/>
-  <circle class="node" cx="500" cy="470" r="7"/>
-  <circle class="node" cx="540" cy="470" r="7"/>
-  <circle class="node" cx="584" cy="470" r="7"/>
-
-  <path class="accent-stroke" d="M628 396h62m-16-12 16 12-16 12"/>
-
-  <rect class="panel" x="710" y="286" width="210" height="220" rx="12"/>
-  <text class="muted" x="734" y="318">VERIFIED BYTECODE</text>
-  <g class="code" text-anchor="middle">
-    <rect class="accent-fill" x="734" y="344" width="74" height="34" rx="4"/><text x="771" y="367">OP_PUSH</text>
-    <rect class="panel" x="822" y="344" width="74" height="34" rx="4"/><text x="859" y="367">OP_CALL</text>
-    <rect class="panel" x="734" y="390" width="74" height="34" rx="4"/><text x="771" y="413">OP_LOAD</text>
-    <rect class="accent-fill" x="822" y="390" width="74" height="34" rx="4"/><text x="859" y="413">OP_ADD</text>
-    <rect class="panel" x="734" y="436" width="74" height="34" rx="4"/><text x="771" y="459">OP_STORE</text>
-    <rect class="accent-fill" x="822" y="436" width="74" height="34" rx="4"/><text x="859" y="459">OP_RET</text>
-  </g>
-
-  <path class="accent-stroke" d="M938 396h62m-16-12 16 12-16 12"/>
-
-  <rect class="panel" x="1020" y="286" width="180" height="220" rx="12"/>
-  <text class="muted" x="1044" y="318">NATIVE OUTPUT</text>
-  <g>
-    <rect class="machine" x="1046" y="348" width="24" height="24"/><rect class="machine" x="1080" y="348" width="24" height="24"/><rect class="machine" x="1114" y="348" width="24" height="24"/><rect class="machine" x="1148" y="348" width="24" height="24"/>
-    <rect class="machine" x="1046" y="382" width="24" height="24"/><rect class="accent-fill" x="1080" y="382" width="24" height="24"/><rect class="machine" x="1114" y="382" width="24" height="24"/><rect class="machine" x="1148" y="382" width="24" height="24"/>
-    <rect class="machine" x="1046" y="416" width="24" height="24"/><rect class="machine" x="1080" y="416" width="24" height="24"/><rect class="accent-fill" x="1114" y="416" width="24" height="24"/><rect class="machine" x="1148" y="416" width="24" height="24"/>
-    <rect class="machine" x="1046" y="450" width="24" height="24"/><rect class="machine" x="1080" y="450" width="24" height="24"/><rect class="machine" x="1114" y="450" width="24" height="24"/><rect class="accent-fill" x="1148" y="450" width="24" height="24"/>
-  </g>
+  <rect class="panel" x="80" y="286" width="238" height="268" rx="14"/>
+  <text class="label" x="104" y="324">TYPESCRIPT SOURCE</text>
+  <path class="rule" d="M104 342H294"/>
+  <text class="code" x="104" y="382"><tspan class="kw">interface</tspan> <tspan class="ty">Node</tspan> {</text>
+  <text class="code" x="124" y="412">kind: <tspan class="ty">string</tspan></text>
+  <text class="code" x="104" y="442">}</text>
+  <text class="code" x="104" y="486"><tspan class="kw">const</tspan> answer = 42</text>
+  <text class="code" x="104" y="516">compile(answer)</text>
+  <path class="arrow" d="M330 420h32m-11-10 11 10-11 10"/>
+  <rect class="panel" x="374" y="286" width="238" height="268" rx="14"/>
+  <text class="label" x="398" y="324">SYNTAX TREE</text>
+  <path class="rule" d="M398 342H588"/>
+  <path class="edge" d="M493 382L445 442M493 382L541 442M445 442L419 502M445 442L471 502M541 442L515 502M541 442L567 502"/>
+  <circle class="node" cx="493" cy="382" r="9"/>
+  <circle class="node" cx="445" cy="442" r="8"/>
+  <circle class="node" cx="541" cy="442" r="8"/>
+  <circle class="node" cx="419" cy="502" r="7"/>
+  <circle class="node" cx="471" cy="502" r="7"/>
+  <circle class="node" cx="515" cy="502" r="7"/>
+  <circle class="node" cx="567" cy="502" r="7"/>
+  <path class="arrow" d="M624 420h32m-11-10 11 10-11 10"/>
+  <rect class="panel" x="668" y="286" width="238" height="268" rx="14"/>
+  <text class="label" x="692" y="324">VERIFIED BYTECODE</text>
+  <path class="rule" d="M692 342H882"/>
+  <rect class="accent" x="688" y="368" width="92" height="36" rx="6"/><text class="op op-on" x="734" y="391" text-anchor="middle">OP_PUSH</text>
+  <rect class="cell" x="794" y="368" width="92" height="36" rx="6"/><text class="op op-off" x="840" y="391" text-anchor="middle">OP_CALL</text>
+  <rect class="cell" x="688" y="420" width="92" height="36" rx="6"/><text class="op op-off" x="734" y="443" text-anchor="middle">OP_LOAD</text>
+  <rect class="accent" x="794" y="420" width="92" height="36" rx="6"/><text class="op op-on" x="840" y="443" text-anchor="middle">OP_ADD</text>
+  <rect class="cell" x="688" y="472" width="92" height="36" rx="6"/><text class="op op-off" x="734" y="495" text-anchor="middle">OP_STORE</text>
+  <rect class="accent" x="794" y="472" width="92" height="36" rx="6"/><text class="op op-on" x="840" y="495" text-anchor="middle">OP_RET</text>
+  <path class="arrow" d="M918 420h32m-11-10 11 10-11 10"/>
+  <rect class="panel" x="962" y="286" width="238" height="268" rx="14"/>
+  <text class="label" x="986" y="324">NATIVE OUTPUT</text>
+  <path class="rule" d="M986 342H1176"/>
+  <rect class="bit" x="1010" y="372" width="28" height="28" rx="3"/>
+  <rect class="bit" x="1048" y="372" width="28" height="28" rx="3"/>
+  <rect class="bit-on" x="1086" y="372" width="28" height="28" rx="3"/>
+  <rect class="bit" x="1124" y="372" width="28" height="28" rx="3"/>
+  <rect class="bit" x="1010" y="410" width="28" height="28" rx="3"/>
+  <rect class="bit-on" x="1048" y="410" width="28" height="28" rx="3"/>
+  <rect class="bit" x="1086" y="410" width="28" height="28" rx="3"/>
+  <rect class="bit" x="1124" y="410" width="28" height="28" rx="3"/>
+  <rect class="bit" x="1010" y="448" width="28" height="28" rx="3"/>
+  <rect class="bit" x="1048" y="448" width="28" height="28" rx="3"/>
+  <rect class="bit-on" x="1086" y="448" width="28" height="28" rx="3"/>
+  <rect class="bit" x="1124" y="448" width="28" height="28" rx="3"/>
+  <rect class="bit" x="1010" y="486" width="28" height="28" rx="3"/>
+  <rect class="bit" x="1048" y="486" width="28" height="28" rx="3"/>
+  <rect class="bit" x="1086" y="486" width="28" height="28" rx="3"/>
+  <rect class="bit-on" x="1124" y="486" width="28" height="28" rx="3"/>
 </svg>
