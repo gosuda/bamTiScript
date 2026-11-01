@@ -7,6 +7,7 @@
 mod collator;
 mod date_time_format;
 mod display_names;
+mod duration_format;
 mod list_format;
 mod locale;
 mod number_format;
@@ -131,6 +132,7 @@ pub(super) fn install<H: Host>(
     relative_time_format::install(heap, builtins, namespace);
     segmenter::install(heap, builtins, namespace);
     display_names::install(heap, builtins, namespace);
+    duration_format::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Intl"), namespace);
 }
 

@@ -116,6 +116,8 @@ mod plain_time;
 mod plain_year_month;
 mod zoned_date_time;
 
+pub(in crate::intrinsics::builtins) use fields::to_temporal_duration;
+
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;

@@ -924,7 +924,7 @@ pub(super) fn to_temporal_instant<H: Host>(
 }
 
 /// ToTemporalDuration.
-pub(super) fn to_temporal_duration<H: Host>(
+pub(in crate::intrinsics::builtins) fn to_temporal_duration<H: Host>(
     machine: &mut Machine<'_, H>,
     item: Value,
 ) -> Result<Duration, EvalFailure> {

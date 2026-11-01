@@ -7,6 +7,7 @@ mod collation;
 pub mod collator;
 mod date_data;
 pub mod date_time_format;
+pub mod duration_format;
 mod locale_aliases;
 pub mod locale_data;
 pub mod locale_negotiation;
@@ -66,6 +67,7 @@ pub enum IntlObject {
     Segmenter(plural_rules::Segmenter<'static>),
     DisplayNames(plural_rules::DisplayNames<'static>),
     Locale(locale_negotiation::LanguageTag),
+    DurationFormat(Box<duration_format::DurationFormat>),
     Segments(Box<SegmentsRecord>),
     SegmentIterator(Box<SegmentIteratorRecord>),
 }
@@ -97,6 +99,7 @@ impl IntlObject {
             Self::Segmenter(_) => IntlKind::Segmenter,
             Self::DisplayNames(_) => IntlKind::DisplayNames,
             Self::Locale(_) => IntlKind::Locale,
+            Self::DurationFormat(_) => IntlKind::DurationFormat,
             Self::Segments(_) => IntlKind::Segments,
             Self::SegmentIterator(_) => IntlKind::SegmentIterator,
         }
