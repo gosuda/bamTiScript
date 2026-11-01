@@ -37,8 +37,10 @@ use bamts_verification::{
         DiffRequest, FamiliesRequest, StatusRequest, diff as diff_receipts, families,
         render_recount, status_report,
     },
+    toolchain_measure::measure_cell,
     toolchain_schema::{
         blocking_obligations, catalog_identifiers, emit_probe_object, load_target_cells,
+        write_committed_record,
     },
     unicode,
     workspace_guard::audit_workspace,
@@ -87,6 +89,10 @@ enum Command {
         check: bool,
     },
     ToolchainEvidence,
+    ToolchainMeasure {
+        target: String,
+        write: bool,
+    },
     ToolchainObject {
         target: String,
         out: PathBuf,
@@ -167,6 +173,7 @@ fn dispatch(root: &Path, command: Command) -> Result<()> {
         Command::CompletionRegenerate { check } => regenerate_completion_command(root, check),
         Command::DiagnosticsRegenerate { check } => regenerate_diagnostics(root, check),
         Command::ToolchainEvidence => audit_toolchain_evidence(root),
+        Command::ToolchainMeasure { target, write } => measure_toolchain_cell(root, &target, write),
         Command::ToolchainObject { target, out } => emit_toolchain_object(&target, &out),
         Command::PerfStage0 => run_perf_stage0(),
         Command::PerfJit => run_perf_jit(),
@@ -620,6 +627,14 @@ fn parse_toolchain_command(arguments: &mut impl Iterator<Item = OsString>) -> Re
         "evidence" => {
             reject_extra_arguments(arguments, &[])?;
             Ok(Command::ToolchainEvidence)
+        }
+        "measure" => {
+            let flags = parse_flags(arguments, &["--target"], &["--write"])?;
+            let target = required_flag(&flags.values, "--target", "toolchain measure")?;
+            Ok(Command::ToolchainMeasure {
+                target,
+                write: flags.switches.contains("--write"),
+            })
         }
         "object" => {
             let flags = parse_flags(arguments, &["--target", "--out"], &[])?;
@@ -1130,6 +1145,32 @@ fn audit_toolchain_evidence(root: &Path) -> Result<()> {
         catalog_identifiers().len(),
     ))
 }
+fn measure_toolchain_cell(root: &Path, target: &str, write: bool) -> Result<()> {
+    let work = root.join("target/toolchain-measure").join(target);
+    let measured = measure_cell(target, &work)?;
+    for note in &measured.notes {
+        emit(&format!("NOTE {note}\n"))?;
+    }
+    for (obligation, evidence) in measured.record.obligations() {
+        emit(&format!(
+            "{obligation} {} {}\n",
+            evidence.status().as_str(),
+            evidence.reason()
+        ))?;
+    }
+    if write {
+        let path = write_committed_record(root, &measured.record)?;
+        emit(&format!("TOOLCHAIN MEASURE WROTE {}\n", path.display()))
+    } else if measured.record.is_closed() {
+        emit(&format!("TOOLCHAIN MEASURE PASS target={target}\n"))
+    } else {
+        Err(VerificationError::new(
+            ErrorCode::SetMismatch,
+            format!("target cell `{target}` did not close"),
+        ))
+    }
+}
+
 fn emit_toolchain_object(target: &str, out: &Path) -> Result<()> {
     let object = emit_probe_object(target, out)?;
     emit(&format!(

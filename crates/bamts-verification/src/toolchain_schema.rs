@@ -389,6 +389,16 @@ impl TargetCellRecord {
             .all(|obligation| obligation.status == TerminalState::Pass)
     }
 
+    /// Holds this record to the rules a committed record must meet.
+    ///
+    /// # Errors
+    ///
+    /// Returns a schema error naming the first rule the record breaks.
+    pub fn check_committable(&self, path: &Path) -> Result<()> {
+        self.validate(path)?;
+        self.validate_committed_evidence(path)
+    }
+
     fn validate_committed_evidence(&self, path: &Path) -> Result<()> {
         if !self.is_closed() {
             return Err(schema_error(
@@ -623,6 +633,7 @@ pub struct HostObservation {
     native_executions: BTreeMap<String, String>,
     reproducible_builds: BTreeMap<String, String>,
     target_objects: BTreeMap<String, String>,
+    toolchain_manifest: Option<String>,
 }
 
 impl HostObservation {
@@ -637,7 +648,15 @@ impl HostObservation {
             native_executions: BTreeMap::new(),
             reproducible_builds: BTreeMap::new(),
             target_objects: BTreeMap::new(),
+            toolchain_manifest: None,
         }
+    }
+
+    /// Replaces the plain compiler identity with content-addressed evidence.
+    #[must_use]
+    pub fn with_toolchain_manifest(mut self, evidence: impl Into<String>) -> Self {
+        self.toolchain_manifest = Some(evidence.into());
+        self
     }
 
     #[must_use]
@@ -818,6 +837,29 @@ pub fn encode_record(record: &TargetCellRecord) -> Result<Vec<u8>> {
         bytes.push(b'\n');
     }
     Ok(bytes)
+}
+
+/// Writes `record` to its committed path, if it meets the committed rules.
+///
+/// # Errors
+///
+/// Returns a schema error for a record [`load_committed_cells`] would refuse, and
+/// an I/O error when the file cannot be written.
+pub fn write_committed_record(
+    root: &Path,
+    record: &TargetCellRecord,
+) -> Result<std::path::PathBuf> {
+    let path = root
+        .join(TOOLCHAIN_DIR)
+        .join(format!("{}.json", record.triple));
+    record.check_committable(&path)?;
+    let bytes = encode_record(record)?;
+    let io = |error: std::io::Error| {
+        VerificationError::new(ErrorCode::Io, format!("{}: {error}", path.display()))
+    };
+    std::fs::create_dir_all(root.join(TOOLCHAIN_DIR)).map_err(io)?;
+    std::fs::write(&path, bytes).map_err(io)?;
+    Ok(path)
 }
 
 /// Parse and validate one record.  Duplicate JSON keys are rejected by the
@@ -1008,7 +1050,10 @@ fn generate_obligation(
 ) -> ObligationEvidence {
     match obligation {
         "toolchain-manifest" => pass(
-            observation.rustc.identity(),
+            observation
+                .toolchain_manifest
+                .clone()
+                .unwrap_or_else(|| observation.rustc.identity()),
             "Recorded from rustc -vV on this host.",
         ),
         "target-object" => match observation.target_objects.get(triple) {
@@ -1732,6 +1777,29 @@ mod tests {
     fn write_record(root: &Path, file_triple: &str, bytes: &[u8]) {
         let path = root.join(TOOLCHAIN_DIR).join(format!("{file_triple}.json"));
         std::fs::write(path, bytes).expect("write record");
+    }
+
+    #[test]
+    fn writing_a_closed_record_makes_it_load_and_an_open_one_is_refused() {
+        let root =
+            std::env::temp_dir().join(format!("bamts-target-cells-{}-write", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let closed = closed_cell(ROUTES[5]);
+        write_committed_record(&root, &closed).expect("the directory is created");
+        assert_eq!(
+            load_committed_cells(&root).expect("loads")[closed.triple()],
+            closed
+        );
+
+        let open = generate_cell("x86_64-unknown-linux-gnu", &hosted()).expect("open cell");
+        write_committed_record(&root, &open).expect_err("an open record is not committed");
+        assert!(
+            !root
+                .join(TOOLCHAIN_DIR)
+                .join("x86_64-unknown-linux-gnu.json")
+                .exists()
+        );
+        std::fs::remove_dir_all(root).expect("remove scratch");
     }
 
     #[test]

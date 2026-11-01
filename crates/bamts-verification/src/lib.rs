@@ -31,6 +31,7 @@ pub mod source_fetch;
 pub mod suite;
 pub mod sweep_report;
 pub mod toolchain_image;
+pub mod toolchain_measure;
 pub mod toolchain_schema;
 pub mod ts_ledger;
 pub mod unicode;
