@@ -1872,26 +1872,23 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         let handle = self.code_ref(target.module);
         let flags = handle.code(target.module).functions()[index].flags();
         if flags.is_async && flags.is_generator {
-            let created = self
-                .machine
-                .borrow_mut()
-                .create_async_generator(GeneratorStart {
-                    target,
-                    captures: captures.to_vec(),
-                    context,
-                    this_value: this,
-                    new_target,
-                    args: args.to_vec(),
-                });
-            return match created {
+            // An async generator's prologue runs on the shared Machine, like
+            // the rest of its body.
+            let start = GeneratorStart {
+                target,
+                captures: captures.to_vec(),
+                context,
+                this_value: this,
+                new_target,
+                args: args.to_vec(),
+            };
+            let started = self.machine.borrow_mut().start_generator(start, flags);
+            return match started {
                 Ok(generator) => InvokeOutcome::Value(generator),
-                Err(kind) => {
-                    self.pending_fatal_kind.set(Some(kind));
-                    InvokeOutcome::Fatal
-                }
+                Err(failure) => self.failure_outcome(failure),
             };
         }
-        if flags.is_generator && !flags.is_async {
+        if flags.is_generator {
             let created = self.machine.borrow_mut().create_generator(GeneratorStart {
                 target,
                 captures: captures.to_vec(),
@@ -1900,13 +1897,21 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 new_target,
                 args: args.to_vec(),
             });
-            return match created {
-                Ok(generator) => InvokeOutcome::Value(generator),
+            let generator = match created {
+                Ok(generator) => generator,
                 Err(kind) => {
                     self.pending_fatal_kind.set(Some(kind));
-                    InvokeOutcome::Fatal
+                    return InvokeOutcome::Fatal;
                 }
             };
+            if flags.binds_at_call {
+                let completion = GeneratorCompletion::Normal(Value::UNDEFINED);
+                match self.resume_generator(generator, completion) {
+                    InvokeOutcome::Value(_) => {}
+                    other => return other,
+                }
+            }
+            return InvokeOutcome::Value(generator);
         }
         if flags.is_async && !flags.is_generator {
             // Async calls route through the shared reference Machine state

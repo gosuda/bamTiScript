@@ -377,6 +377,16 @@ fn assemble_with_linkage_strings(
         .collect();
     Ok(Module::new(builder.constants, functions, entry))
 }
+/// Whether binding `parameters` can neither run code nor throw.
+fn has_simple_parameters(parameters: &[ParameterNode]) -> bool {
+    parameters.iter().all(|parameter| {
+        parameter.data().initializer.is_none()
+            && matches!(
+                parameter.data().binding.data(),
+                BindingPattern::Identifier(_)
+            )
+    })
+}
 /// Whether code at the top of `file` is strict.
 fn source_is_strict(file: &SourceFile) -> bool {
     !matches!(
@@ -7065,6 +7075,13 @@ impl<'a> FunctionContext<'a> {
         } else if let LoweredBody::Block(block) = body {
             inner.hoist_vars(builder, &block.data().statements, range)?;
         }
+        // A generator binds its parameters when called, before the body's
+        // first `next`. Parameters that can run code stop here for that call.
+        let binds_at_call = flags.is_generator && !has_simple_parameters(parameters);
+        if binds_at_call {
+            let value = inner.undefined(builder, range)?;
+            inner.emit_suspend(builder, range, value)?;
+        }
         match body {
             LoweredBody::Function(FunctionBody::Block(block))
             | LoweredBody::Arrow(FunctionBody::Block(block))
@@ -7087,6 +7104,10 @@ impl<'a> FunctionContext<'a> {
         let name_constant = match name {
             Some(name) => Some(builder.intern(Constant::String(EcmaString::encode(&name)), range)?),
             None => None,
+        };
+        let flags = FunctionFlags {
+            binds_at_call,
+            ..flags
         };
         let assembled = inner.into_function(name_constant, flags);
         builder.fill_function(id, assembled);

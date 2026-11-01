@@ -7251,37 +7251,24 @@ impl<'a, H: Host> Machine<'a, H> {
                     let flags = self.module_code(target.module).functions()
                         [target.function.get() as usize]
                         .flags();
-                    if flags.is_async && flags.is_generator {
-                        let generator = self
-                            .create_async_generator(GeneratorStart {
-                                target,
-                                captures,
-                                context,
-                                this_value,
-                                new_target,
-                                args: arguments.as_ref().to_vec(),
-                            })
-                            .map_err(|kind| self.error_here_at(kind, call_pc))?;
-                        if let Some(register) = destination {
-                            self.write_register(self.frames.len() - 1, register, generator);
-                        }
-                        return Ok(());
-                    }
-                    if flags.is_generator && !flags.is_async {
-                        let generator = self
-                            .create_generator(GeneratorStart {
-                                target,
-                                captures,
-                                context,
-                                this_value,
-                                new_target,
-                                args: arguments.as_ref().to_vec(),
-                            })
-                            .map_err(|kind| self.error_here_at(kind, call_pc))?;
-                        if let Some(register) = destination {
-                            self.write_register(self.frames.len() - 1, register, generator);
-                        }
-                        return Ok(());
+                    if flags.is_generator {
+                        let start = GeneratorStart {
+                            target,
+                            captures,
+                            context,
+                            this_value,
+                            new_target,
+                            args: arguments.as_ref().to_vec(),
+                        };
+                        return match self.start_generator(start, flags) {
+                            Ok(generator) => {
+                                if let Some(register) = destination {
+                                    self.write_register(self.frames.len() - 1, register, generator);
+                                }
+                                Ok(())
+                            }
+                            Err(failure) => self.resolve_failure(failure, call_pc),
+                        };
                     }
                     if flags.is_async && !flags.is_generator {
                         return match crate::vm::generator_async::start_async_function(
@@ -7973,29 +7960,16 @@ impl<'a, H: Host> Machine<'a, H> {
                     let flags = self.module_code(target.module).functions()
                         [target.function.get() as usize]
                         .flags();
-                    if flags.is_async && flags.is_generator {
-                        return self
-                            .create_async_generator(GeneratorStart {
-                                target,
-                                captures,
-                                context,
-                                this_value,
-                                new_target: Value::UNDEFINED,
-                                args: arguments.as_ref().to_vec(),
-                            })
-                            .map_err(EvalFailure::Runtime);
-                    }
-                    if flags.is_generator && !flags.is_async {
-                        return self
-                            .create_generator(GeneratorStart {
-                                target,
-                                context,
-                                captures,
-                                this_value,
-                                new_target: Value::UNDEFINED,
-                                args: arguments.as_ref().to_vec(),
-                            })
-                            .map_err(EvalFailure::Runtime);
+                    if flags.is_generator {
+                        let start = GeneratorStart {
+                            target,
+                            context,
+                            captures,
+                            this_value,
+                            new_target: Value::UNDEFINED,
+                            args: arguments.as_ref().to_vec(),
+                        };
+                        return self.start_generator(start, flags);
                     }
                     if flags.is_async && !flags.is_generator {
                         return crate::vm::generator_async::start_async_function(
@@ -10382,6 +10356,78 @@ impl<'a, H: Host> Machine<'a, H> {
             None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "set prototype on host object",
             })),
+        }
+    }
+
+    /// Calls a generator function. When its parameters can run code, the
+    /// compiler ended its prologue with a `Suspend`, and running to that point
+    /// now lets a throw from a parameter reach the caller.
+    pub(crate) fn start_generator(
+        &mut self,
+        start: GeneratorStart,
+        flags: bamts_bytecode::FunctionFlags,
+    ) -> Result<Value, EvalFailure> {
+        if flags.is_async {
+            let generator = self
+                .create_async_generator(start)
+                .map_err(EvalFailure::Runtime)?;
+            if flags.binds_at_call {
+                self.run_async_generator_prologue(generator)?;
+            }
+            return Ok(generator);
+        }
+        let generator = self.create_generator(start).map_err(EvalFailure::Runtime)?;
+        if flags.binds_at_call {
+            self.resume_generator(generator, GeneratorCompletion::Normal(Value::UNDEFINED))?;
+        }
+        Ok(generator)
+    }
+
+    /// Runs an async generator to the `Suspend` that ends its prologue. No
+    /// request is queued yet, so the stop settles nothing; the first request
+    /// resumes it the way any later one resumes a `yield`.
+    fn run_async_generator_prologue(&mut self, generator: Value) -> Result<(), EvalFailure> {
+        let AsyncGeneratorState::SuspendedStart(start) =
+            self.take_async_generator_state(generator)?
+        else {
+            unreachable!("a new async generator is suspended at its start")
+        };
+        let stop_depth = self.frames.len();
+        let return_to = self.frames.last().map(|frame| ReturnTo {
+            destination: None,
+            call_pc: frame.pc,
+            constructed: None,
+        });
+        let pushed = self
+            .push_frame(ActivationRequest {
+                target: start.target,
+                captures: &start.captures,
+                context: start.context,
+                this_value: start.this_value,
+                new_target: start.new_target,
+                arguments: &start.args,
+                return_to,
+            })
+            .map_err(|error| EvalFailure::Runtime(error.kind));
+        let step = pushed.and_then(|()| self.drive_async_generator_activation(stop_depth, None));
+        match step {
+            Ok(AsyncGeneratorStep::Yield { activation, .. }) => self
+                .replace_async_generator_state(
+                    generator,
+                    AsyncGeneratorState::SuspendedYield(activation),
+                )
+                .map_err(EvalFailure::Runtime),
+            Ok(AsyncGeneratorStep::Throw { value, origin }) => {
+                self.complete_async_generator(generator)?;
+                Err(EvalFailure::ThrowValueOrigin { value, origin })
+            }
+            Ok(AsyncGeneratorStep::Await { .. } | AsyncGeneratorStep::Return(_)) => {
+                unreachable!("parameters cannot await, and the prologue ends at a Suspend")
+            }
+            Err(failure) => {
+                self.complete_async_generator(generator)?;
+                Err(failure)
+            }
         }
     }
 

@@ -1982,6 +1982,7 @@ function $ERROR(message) {\n\
         let scratch = runner_scratch(&format!("{label}-scratch"));
         write_harness(&harness, "assert.js", ASSERT_JS);
         write_harness(&harness, "sta.js", STA_JS);
+        write_harness(&harness, "doneprintHandle.js", DONEPRINT_JS);
         let parsed = parse_test(source).unwrap();
         let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
         let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
@@ -2045,6 +2046,68 @@ function $ERROR(message) {\n\
                     &format!("{THROWS}{body}"),
                 );
                 let label = format!("object-patterns-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_generator_binds_its_parameters_at_the_call() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [(&str, &str); 9] = [
+            (
+                "",
+                "function* g({}) {} assert.sameValue(throws(TypeError, function () { g(undefined); }), true);",
+            ),
+            (
+                "",
+                "async function* g({}) {} assert.sameValue(throws(TypeError, function () { g(undefined); }), true);",
+            ),
+            (
+                "",
+                "class C { static *m({}) {} } assert.sameValue(throws(TypeError, function () { C.m(undefined); }), true);",
+            ),
+            (
+                "",
+                "function* g(a = (function () { throw new Test262Error(); })()) {} assert.sameValue(throws(Test262Error, function () { g(); }), true);",
+            ),
+            (
+                "",
+                "var log = 0; function* g(a = log += 1) { log += 10; } var it = g(); assert.sameValue(log, 1); it.next(); assert.sameValue(log, 11);",
+            ),
+            (
+                "",
+                "function* g(a = 1) { yield a; } var it = g(); assert.sameValue(it.next(5).value, 1); assert.sameValue(it.next().done, true);",
+            ),
+            (
+                "",
+                "function* g(a = 1) { yield a; } var it = g(); assert.sameValue(it.return(7).value, 7); assert.sameValue(it.next().done, true);",
+            ),
+            (
+                "",
+                "function* g(a = 1) { yield a; } var it = g(); assert.sameValue(throws(Test262Error, function () { it.throw(new Test262Error()); }), true); assert.sameValue(it.next().done, true);",
+            ),
+            (
+                "flags: [async]",
+                "async function* g(a = 1) { yield a; } g().next().then(function (result) { assert.sameValue(result.value, 1); }).then($DONE, $DONE);",
+            ),
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, (flags, body)) in CASES.iter().enumerate() {
+                let source = wrap(
+                    &format!("description: generator parameters\n{flags}"),
+                    &format!("{THROWS}{body}"),
+                );
+                let label = format!("generator-parameters-{mode:?}-{index}");
                 if let Err(error) = run_fixture_in(mode, &label, &source) {
                     panic!("{mode:?} {body}: {error:?}");
                 }
