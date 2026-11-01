@@ -11,6 +11,11 @@ doctor:
     test -x formal/quint/node_modules/.bin/quint
     printf '%s\n' 'DOCTOR PASS'
 
+# Fails while any gate ledger has an unchecked box or pending evidence, and lists
+# the open ledgers; prints ALL MET otherwise. This is the check for GATES.md G1.
+gate-status:
+    python3 -c 'import glob,re,sys; rows=[(f,len(re.findall(r"(?m)^- \[ \]",t)),len(re.findall(r"(?m)^  EVIDENCE: pending\s*$",t))) for f in sorted(glob.glob(".outline/gates/*.md")) for t in [open(f).read()]]; open_=[r for r in rows if r[1] or r[2]]; [print("OPEN %s unchecked=%d pending=%d"%r) for r in open_]; print("NO LEDGERS FOUND" if not rows else "ALL MET" if not open_ else "OPEN LEDGERS: %d of %d"%(len(open_),len(rows))); sys.exit(1 if open_ or not rows else 0)'
+
 ci: ci-quality ci-npm ci-corpus xcheck portability-check
     printf '%s\n' 'LOCAL CI PASS'
 

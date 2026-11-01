@@ -3,7 +3,7 @@
 Scope: Complete the clean-room Rust compiler, TypeScript-compatible Node 24 API package, ECMAScript runtime, native tiers, formal proof bindings, target cells, and release evidence for the stable TypeScript 7.0.2 product contract.
 
 - [ ] G1: Every leaf and integration ledger is met with recorded evidence
-  CHECK: python3 /home/alpha/.claude/plugins/cache/odin-marketplace/odin/1.17.108/skills/unlazy/scripts/gate_check.py --status .outline/gates/*.md
+  CHECK: just gate-status
   EXPECT: ALL MET
   EVIDENCE: 2026-08-28 not run to ALL MET; leaf ledgers still have unchecked G1-G6 boxes (F2.1, A3.1, C4.2, A2.7 G2-G6)
 
