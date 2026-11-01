@@ -3,10 +3,14 @@
 //! Grounded in ECMA-262 + the Temporal proposal (tc39/proposal-temporal, ECMA-402
 //! aligned option semantics). All arithmetic is exact checked `i128`; no floats
 //! participate in any date/time computation. No ambient host access (no clock,
-//! no environment, no time zone database) — zoned/tzdb work is the jiff-backed
-//! C11.3 boundary and is intentionally absent here.
+//! no environment, no time zone database).
 
 use std::fmt;
+
+use super::now_rounding::round_and_balance_duration;
+use super::parse::{
+    ParsedIsoDateTime, UtcOffsetRecord, parse_duration_string, parse_instant_string,
+};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -34,13 +38,22 @@ pub struct TemporalError {
 
 impl TemporalError {
     pub fn range(message: impl Into<String>) -> Self {
-        Self { kind: TemporalErrorKind::Range, message: message.into() }
+        Self {
+            kind: TemporalErrorKind::Range,
+            message: message.into(),
+        }
     }
     pub fn type_error(message: impl Into<String>) -> Self {
-        Self { kind: TemporalErrorKind::Type, message: message.into() }
+        Self {
+            kind: TemporalErrorKind::Type,
+            message: message.into(),
+        }
     }
     pub fn syntax(message: impl Into<String>) -> Self {
-        Self { kind: TemporalErrorKind::Syntax, message: message.into() }
+        Self {
+            kind: TemporalErrorKind::Syntax,
+            message: message.into(),
+        }
     }
 }
 
@@ -108,7 +121,11 @@ impl Unit {
     ];
 
     pub fn category(self) -> UnitCategory {
-        if self <= Unit::Day { UnitCategory::Date } else { UnitCategory::Time }
+        if self <= Unit::Day {
+            UnitCategory::Date
+        } else {
+            UnitCategory::Time
+        }
     }
 
     /// Nanoseconds per unit for time units (and Day, defined as exactly 24h in
@@ -245,7 +262,7 @@ impl Overflow {
 /// combined with smallestUnit precision resolution).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Precision {
-    /// Emit exactly the digits needed (trailing zeros trimmed in groups of 3).
+    /// Emit exactly the digits needed (every trailing zero trimmed).
     #[default]
     Auto,
     /// Truncate the seconds part entirely (smallestUnit: "minute").
@@ -269,55 +286,154 @@ impl Precision {
 // Rounding core
 // ---------------------------------------------------------------------------
 
+/// Which neighbour `ApplyUnsignedRoundingMode` selects for a magnitude strictly
+/// between two adjacent multiples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsignedRounding {
+    Zero,
+    Infinity,
+    HalfZero,
+    HalfInfinity,
+    HalfEven,
+}
+
+/// GetUnsignedRoundingMode.
+fn unsigned_rounding(mode: RoundingMode, is_negative: bool) -> UnsignedRounding {
+    match (mode, is_negative) {
+        (RoundingMode::Ceil, false) | (RoundingMode::Floor, true) | (RoundingMode::Expand, _) => {
+            UnsignedRounding::Infinity
+        }
+        (RoundingMode::Ceil, true) | (RoundingMode::Floor, false) | (RoundingMode::Trunc, _) => {
+            UnsignedRounding::Zero
+        }
+        (RoundingMode::HalfCeil, false)
+        | (RoundingMode::HalfFloor, true)
+        | (RoundingMode::HalfExpand, _) => UnsignedRounding::HalfInfinity,
+        (RoundingMode::HalfCeil, true)
+        | (RoundingMode::HalfFloor, false)
+        | (RoundingMode::HalfTrunc, _) => UnsignedRounding::HalfZero,
+        (RoundingMode::HalfEven, _) => UnsignedRounding::HalfEven,
+    }
+}
+
+/// ApplyUnsignedRoundingMode: whether a non-exact magnitude with this
+/// `remainder` above the lower quotient rounds up to the next multiple.
+fn rounds_up(
+    remainder: u128,
+    increment: u128,
+    lower_quotient: u128,
+    mode: UnsignedRounding,
+) -> bool {
+    match mode {
+        UnsignedRounding::Zero => false,
+        UnsignedRounding::Infinity => true,
+        UnsignedRounding::HalfZero
+        | UnsignedRounding::HalfInfinity
+        | UnsignedRounding::HalfEven => {
+            // `distance_up` is positive because the magnitude is not an exact
+            // multiple, so this compares the two neighbours without doubling.
+            let distance_up = increment - remainder;
+            match remainder.cmp(&distance_up) {
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => match mode {
+                    UnsignedRounding::HalfInfinity => true,
+                    UnsignedRounding::HalfEven => lower_quotient % 2 == 1,
+                    _ => false,
+                },
+            }
+        }
+    }
+}
+
+/// Whether a value lying `remainder / divisor` of the way from one multiple to
+/// the next rounds to the farther one. `lower_quotient` is the nearer multiple's
+/// count and `is_negative` the sign of the value being rounded. The fraction
+/// must be strictly between 0 and 1.
+pub fn rounds_past_fraction(
+    remainder: u128,
+    divisor: u128,
+    lower_quotient: u128,
+    mode: RoundingMode,
+    is_negative: bool,
+) -> bool {
+    rounds_up(
+        remainder,
+        divisor,
+        lower_quotient,
+        unsigned_rounding(mode, is_negative),
+    )
+}
+
 /// RoundNumberToIncrement on exact integers: rounds `x` to a multiple of
-/// `increment` (> 0) under `mode`. Errors only on i128 overflow at the extreme
-/// edge of the domain.
+/// `increment` (> 0) under `mode`. The direction is decided on the magnitude,
+/// so negative ties follow the mode's sign-aware meaning. Errors only on i128
+/// overflow at the extreme edge of the domain.
 pub fn round_to_increment(x: i128, increment: i128, mode: RoundingMode) -> TemporalResult<i128> {
     debug_assert!(increment > 0);
-    let quotient = x.div_euclid(increment);
-    let remainder = x.rem_euclid(increment); // 0 <= remainder < increment
+    let is_negative = x < 0;
+    let divisor = increment.unsigned_abs();
+    let magnitude = x.unsigned_abs();
+    let lower = magnitude / divisor;
+    let remainder = magnitude % divisor;
     if remainder == 0 {
         return Ok(x);
     }
-    // `floor` result is quotient; `ceil` result is quotient + 1.
-    let is_negative = x < 0;
-    let double_rem = remainder.checked_mul(2).ok_or_else(|| overflow_err("round"))?;
-    let round_up = match mode {
-        RoundingMode::Ceil => true,
-        RoundingMode::Floor => false,
-        RoundingMode::Expand => !is_negative,
-        RoundingMode::Trunc => is_negative,
-        RoundingMode::HalfCeil => double_rem >= increment,
-        RoundingMode::HalfFloor => double_rem > increment,
-        RoundingMode::HalfExpand => {
-            if is_negative { double_rem <= increment } else { double_rem >= increment }
-        }
-        RoundingMode::HalfTrunc => {
-            if is_negative { double_rem >= increment } else { double_rem > increment }
-        }
-        RoundingMode::HalfEven => {
-            if double_rem > increment {
-                true
-            } else if double_rem < increment {
-                false
-            } else {
-                quotient.rem_euclid(2) == 1
-            }
-        }
-    };
-    let q = if round_up {
-        quotient.checked_add(1).ok_or_else(|| overflow_err("round"))?
+    let up = rounds_up(
+        remainder,
+        divisor,
+        lower,
+        unsigned_rounding(mode, is_negative),
+    );
+    let quotient = if up { lower + 1 } else { lower };
+    let quotient = i128::try_from(quotient).map_err(|_| overflow_err("round"))?;
+    let signed = if is_negative { -quotient } else { quotient };
+    signed
+        .checked_mul(increment)
+        .ok_or_else(|| overflow_err("round"))
+}
+
+/// RoundNumberToIncrementAsIfPositive: rounds an epoch value, whose direction
+/// is interpreted as if it were positive even before 1970. Euclidean division
+/// keeps the lower neighbour the numerically smaller one.
+pub fn round_to_increment_as_if_positive(
+    x: i128,
+    increment: i128,
+    mode: RoundingMode,
+) -> TemporalResult<i128> {
+    debug_assert!(increment > 0);
+    let lower = x.div_euclid(increment);
+    let remainder = x.rem_euclid(increment);
+    if remainder == 0 {
+        return Ok(x);
+    }
+    let up = rounds_up(
+        remainder.unsigned_abs(),
+        increment.unsigned_abs(),
+        lower.rem_euclid(2).unsigned_abs(),
+        unsigned_rounding(mode, false),
+    );
+    let quotient = if up {
+        lower.checked_add(1).ok_or_else(|| overflow_err("round"))?
     } else {
-        quotient
+        lower
     };
-    q.checked_mul(increment).ok_or_else(|| overflow_err("round"))
+    quotient
+        .checked_mul(increment)
+        .ok_or_else(|| overflow_err("round"))
 }
 
 /// ValidateTemporalRoundingIncrement: `increment` must be >= 1, and when the
 /// unit is bounded, `increment` must be < max and divide max evenly.
-pub fn validate_rounding_increment(unit: Unit, increment: i128, inclusive: bool) -> TemporalResult<()> {
+pub fn validate_rounding_increment(
+    unit: Unit,
+    increment: i128,
+    inclusive: bool,
+) -> TemporalResult<()> {
     if increment < 1 {
-        return Err(TemporalError::range(format!("roundingIncrement must be >= 1, got {increment}")));
+        return Err(TemporalError::range(format!(
+            "roundingIncrement must be >= 1, got {increment}"
+        )));
     }
     if let Some(max) = unit.max_rounding_increment() {
         let bound = if inclusive { max } else { max - 1 };
@@ -376,13 +492,9 @@ impl Instant {
         self.epoch_ns.div_euclid(NS_PER_MILLISECOND) as i64
     }
 
-    pub fn epoch_seconds(self) -> i64 {
-        self.epoch_ns.div_euclid(NS_PER_SECOND) as i64
-    }
-
     /// AddDurationToInstant (sign = +1). Date units are rejected: an instant
     /// has no calendar.
-    pub fn add(self, duration: &Duration) -> TemporalResult<Instant> {
+    pub fn add(&self, duration: &Duration) -> TemporalResult<Instant> {
         self.add_signed(duration, 1)
     }
 
@@ -391,7 +503,8 @@ impl Instant {
     }
 
     fn add_signed(self, duration: &Duration, sign: i128) -> TemporalResult<Instant> {
-        if duration.years != 0 || duration.months != 0 || duration.weeks != 0 || duration.days != 0 {
+        if duration.years != 0 || duration.months != 0 || duration.weeks != 0 || duration.days != 0
+        {
             return Err(TemporalError::range(
                 "Instant arithmetic does not accept date units (years/months/weeks/days)",
             ));
@@ -399,7 +512,10 @@ impl Instant {
         let delta = duration.time_total_nanoseconds();
         let shifted = self
             .epoch_ns
-            .checked_add(sign.checked_mul(delta).ok_or_else(|| overflow_err("Instant.add"))?)
+            .checked_add(
+                sign.checked_mul(delta)
+                    .ok_or_else(|| overflow_err("Instant.add"))?,
+            )
             .ok_or_else(|| overflow_err("Instant.add"))?;
         Instant::from_epoch_nanoseconds(shifted)
     }
@@ -414,7 +530,9 @@ impl Instant {
         increment: i128,
         mode: RoundingMode,
     ) -> TemporalResult<Duration> {
-        if largest_unit.category() == UnitCategory::Date || smallest_unit.category() == UnitCategory::Date {
+        if largest_unit.category() == UnitCategory::Date
+            || smallest_unit.category() == UnitCategory::Date
+        {
             return Err(TemporalError::range(
                 "Instant difference supports time units only (hour..nanosecond)",
             ));
@@ -426,21 +544,14 @@ impl Instant {
         }
         validate_rounding_increment(smallest_unit, increment, false)?;
         let diff = other.epoch_ns - self.epoch_ns; // both within ±8.64e21: no overflow
-        let unit_ns = smallest_unit.ns_per().ok_or_else(|| overflow_err("until"))?;
-        let step = unit_ns.checked_mul(increment).ok_or_else(|| overflow_err("until"))?;
+        let unit_ns = smallest_unit
+            .ns_per()
+            .ok_or_else(|| overflow_err("until"))?;
+        let step = unit_ns
+            .checked_mul(increment)
+            .ok_or_else(|| overflow_err("until"))?;
         let rounded = round_to_increment(diff, step, mode)?;
         Duration::from_time_nanoseconds(rounded, largest_unit)
-    }
-
-    pub fn since(
-        self,
-        other: Instant,
-        largest_unit: Unit,
-        smallest_unit: Unit,
-        increment: i128,
-        mode: RoundingMode,
-    ) -> TemporalResult<Duration> {
-        other.until(self, largest_unit, smallest_unit, increment, mode)
     }
 
     /// Temporal.Instant.prototype.round. `unit` must be a time unit; the
@@ -460,26 +571,18 @@ impl Instant {
             )));
         }
         let step = unit_ns * increment; // <= NS_PER_DAY: no overflow
-        let rounded = round_to_increment(self.epoch_ns, step, mode)?;
+        let rounded = round_to_increment_as_if_positive(self.epoch_ns, step, mode)?;
         Instant::from_epoch_nanoseconds(rounded)
     }
 
-    /// ParseTemporalInstantString: full date-time with a required UTC offset
-    /// (`Z`, `z`, or numeric ±hh[:mm[:ss[.f{1,9}]]]), optional annotations.
-    pub fn parse(text: &str) -> TemporalResult<Instant> {
-        let parsed = parse_iso_datetime_string(text)?;
+    /// The exact time an already-parsed Instant string names. Calendar
+    /// annotations are ignored here, critical or not: an Instant has no
+    /// calendar for one to apply to.
+    pub fn from_parsed(parsed: &ParsedIsoDateTime) -> TemporalResult<Instant> {
         let offset_ns = match parsed.offset {
-            Some(UtcOffsetRecord::Zulu) => 0,
-            Some(UtcOffsetRecord::Numeric(ns)) => ns,
-            None => {
-                return Err(TemporalError::syntax(
-                    "Instant string requires a UTC offset (Z or ±hh:mm)",
-                ))
-            }
+            Some(UtcOffsetRecord::Numeric { nanoseconds, .. }) => nanoseconds,
+            _ => 0,
         };
-        if !parsed.has_time {
-            return Err(TemporalError::syntax("Instant string requires a time component"));
-        }
         let days = epoch_days_checked(parsed.year, parsed.month, parsed.day)?;
         let ns = (days as i128)
             .checked_mul(NS_PER_DAY)
@@ -487,6 +590,11 @@ impl Instant {
             .and_then(|d| d.checked_sub(offset_ns))
             .ok_or_else(|| overflow_err("Instant.parse"))?;
         Instant::from_epoch_nanoseconds(ns)
+    }
+
+    /// ParseTemporalInstantString.
+    pub fn parse(text: &str) -> TemporalResult<Instant> {
+        Instant::from_parsed(&parse_instant_string(text)?)
     }
 
     /// TemporalInstantToString with UTC ("Z") output.
@@ -513,42 +621,50 @@ impl fmt::Display for Instant {
 // ---------------------------------------------------------------------------
 
 /// |years|, |months|, |weeks| must each be < 2^32 (IsValidDuration).
-const CALENDAR_FIELD_LIMIT: i64 = 1 << 32;
-/// Normalized time duration bound: |days·86400 + h·3600 + … + s| ≤ 2^53 − 1
-/// seconds with the sub-second remainder attached (IsValidDuration step 6).
-const MAX_TIME_DURATION_SECONDS: i128 = (1_i128 << 53) - 1;
+const CALENDAR_FIELD_LIMIT: i128 = 1 << 32;
+/// A time duration's magnitude must stay below 2^53 seconds, in nanoseconds.
+pub const MAX_TIME_DURATION: i128 = (1_i128 << 53) * NS_PER_SECOND;
 
-/// Ten-field Temporal.Duration. All fields are exact integers; a duration is
-/// valid only when every field shares one sign (or is zero) and magnitudes are
-/// within the spec bounds.
+/// Ten-field Temporal.Duration. Fields hold exact integers that a Number can
+/// represent: `Duration::new` rounds each through a double, as the proposal's
+/// `𝔽(value)` does, so a field reads back as the same Number the object reports.
+/// `i128` is required because a valid `nanoseconds` reaches about 9e24, past
+/// the range of `i64`. A duration is valid only when every field shares one
+/// sign (or is zero) and magnitudes are within the spec bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Duration {
-    pub years: i64,
-    pub months: i64,
-    pub weeks: i64,
-    pub days: i64,
-    pub hours: i64,
-    pub minutes: i64,
-    pub seconds: i64,
-    pub milliseconds: i64,
-    pub microseconds: i64,
-    pub nanoseconds: i64,
+    pub years: i128,
+    pub months: i128,
+    pub weeks: i128,
+    pub days: i128,
+    pub hours: i128,
+    pub minutes: i128,
+    pub seconds: i128,
+    pub milliseconds: i128,
+    pub microseconds: i128,
+    pub nanoseconds: i128,
+}
+
+/// The integer a Number holds after `𝔽(value)`.
+fn float64_representable(value: i128) -> i128 {
+    value as f64 as i128
 }
 
 impl Duration {
-    #[allow(clippy::too_many_arguments)] // mirrors the ten-argument spec constructor
-    pub fn new(
-        years: i64,
-        months: i64,
-        weeks: i64,
-        days: i64,
-        hours: i64,
-        minutes: i64,
-        seconds: i64,
-        milliseconds: i64,
-        microseconds: i64,
-        nanoseconds: i64,
-    ) -> TemporalResult<Duration> {
+    /// CreateTemporalDuration, fields largest to smallest.
+    pub fn new(fields: [i128; 10]) -> TemporalResult<Duration> {
+        let [
+            years,
+            months,
+            weeks,
+            days,
+            hours,
+            minutes,
+            seconds,
+            milliseconds,
+            microseconds,
+            nanoseconds,
+        ] = fields.map(float64_representable);
         let d = Duration {
             years,
             months,
@@ -565,18 +681,17 @@ impl Duration {
         Ok(d)
     }
 
-    pub fn from_time(
-        hours: i64,
-        minutes: i64,
-        seconds: i64,
-        milliseconds: i64,
-        microseconds: i64,
-        nanoseconds: i64,
+    /// CreateDateDurationRecord.
+    pub fn from_date(
+        years: i128,
+        months: i128,
+        weeks: i128,
+        days: i128,
     ) -> TemporalResult<Duration> {
-        Duration::new(0, 0, 0, 0, hours, minutes, seconds, milliseconds, microseconds, nanoseconds)
+        Duration::new([years, months, weeks, days, 0, 0, 0, 0, 0, 0])
     }
 
-    fn fields(&self) -> [i64; 10] {
+    pub fn fields(&self) -> [i128; 10] {
         [
             self.years,
             self.months,
@@ -591,9 +706,20 @@ impl Duration {
         ]
     }
 
+    /// The date portion alone, with every time field zero.
+    pub fn date_part(&self) -> Duration {
+        Duration {
+            years: self.years,
+            months: self.months,
+            weeks: self.weeks,
+            days: self.days,
+            ..Duration::default()
+        }
+    }
+
     /// IsValidDuration.
     fn validate(&self) -> TemporalResult<()> {
-        let mut sign = 0_i64;
+        let mut sign = 0_i128;
         for v in self.fields() {
             let s = v.signum();
             if s != 0 {
@@ -605,25 +731,23 @@ impl Duration {
                 sign = s;
             }
         }
-        for name_value in [
+        for (name, value) in [
             ("years", self.years),
             ("months", self.months),
             ("weeks", self.weeks),
         ] {
-            if name_value.1.abs() >= CALENDAR_FIELD_LIMIT {
+            if value.abs() >= CALENDAR_FIELD_LIMIT {
                 return Err(TemporalError::range(format!(
-                    "|{}| must be < 2^32, got {}",
-                    name_value.0, name_value.1
+                    "|{name}| must be < 2^32, got {value}"
                 )));
             }
         }
-        // Normalized seconds bound, computed exactly in i128.
-        let total_ns = self.time_total_nanoseconds_with_days()?;
-        let bound = MAX_TIME_DURATION_SECONDS
-            .checked_mul(NS_PER_SECOND)
-            .and_then(|v| v.checked_add(NS_PER_SECOND - 1))
-            .ok_or_else(|| overflow_err("Duration"))?;
-        if total_ns.abs() > bound {
+        // Every field carries one sign, so overflow in this sum can only mean
+        // a magnitude far beyond the limit.
+        let total_ns = self
+            .checked_time_total_nanoseconds()
+            .ok_or_else(|| TemporalError::range("Duration time total exceeds 2^53 seconds"))?;
+        if total_ns.abs() >= MAX_TIME_DURATION {
             return Err(TemporalError::range(
                 "Duration time total exceeds 2^53 seconds",
             ));
@@ -631,8 +755,23 @@ impl Duration {
         Ok(())
     }
 
+    fn checked_time_total_nanoseconds(&self) -> Option<i128> {
+        let terms = [
+            (self.days, NS_PER_DAY),
+            (self.hours, NS_PER_HOUR),
+            (self.minutes, NS_PER_MINUTE),
+            (self.seconds, NS_PER_SECOND),
+            (self.milliseconds, NS_PER_MILLISECOND),
+            (self.microseconds, NS_PER_MICROSECOND),
+            (self.nanoseconds, 1),
+        ];
+        terms.iter().try_fold(0_i128, |total, &(value, unit)| {
+            total.checked_add(value.checked_mul(unit)?)
+        })
+    }
+
     /// DurationSign.
-    pub fn sign(&self) -> i64 {
+    pub fn sign(&self) -> i128 {
         for v in self.fields() {
             if v != 0 {
                 return v.signum();
@@ -661,25 +800,36 @@ impl Duration {
     }
 
     pub fn abs(&self) -> Duration {
-        if self.sign() < 0 { self.negated() } else { *self }
+        if self.sign() < 0 {
+            self.negated()
+        } else {
+            *self
+        }
     }
 
-    /// Total nanoseconds of the time portion (hours and smaller). Exact:
-    /// worst case magnitudes fit i128 with vast headroom.
+    /// DefaultTemporalLargestUnit: the largest unit with a non-zero field,
+    /// `nanosecond` for a blank duration.
+    pub fn default_largest_unit(&self) -> Unit {
+        self.fields()
+            .iter()
+            .position(|&value| value != 0)
+            .map_or(Unit::Nanosecond, |index| Unit::ALL[index])
+    }
+
+    /// Total nanoseconds of the time portion (hours and smaller). Exact: a
+    /// validated duration keeps this below `MAX_TIME_DURATION`.
     pub fn time_total_nanoseconds(&self) -> i128 {
-        (self.hours as i128) * NS_PER_HOUR
-            + (self.minutes as i128) * NS_PER_MINUTE
-            + (self.seconds as i128) * NS_PER_SECOND
-            + (self.milliseconds as i128) * NS_PER_MILLISECOND
-            + (self.microseconds as i128) * NS_PER_MICROSECOND
-            + (self.nanoseconds as i128)
+        self.hours * NS_PER_HOUR
+            + self.minutes * NS_PER_MINUTE
+            + self.seconds * NS_PER_SECOND
+            + self.milliseconds * NS_PER_MILLISECOND
+            + self.microseconds * NS_PER_MICROSECOND
+            + self.nanoseconds
     }
 
-    fn time_total_nanoseconds_with_days(&self) -> TemporalResult<i128> {
-        (self.days as i128)
-            .checked_mul(NS_PER_DAY)
-            .and_then(|d| d.checked_add(self.time_total_nanoseconds()))
-            .ok_or_else(|| overflow_err("Duration"))
+    /// Time portion plus days taken as exactly 24 hours.
+    pub fn total_nanoseconds_with_24_hour_days(&self) -> i128 {
+        self.days * NS_PER_DAY + self.time_total_nanoseconds()
     }
 
     /// BalanceTimeDuration: build a duration from total nanoseconds, carrying
@@ -687,39 +837,28 @@ impl Duration {
     pub fn from_time_nanoseconds(total_ns: i128, largest_unit: Unit) -> TemporalResult<Duration> {
         if largest_unit < Unit::Day {
             return Err(TemporalError::range(
-                "balancing calendar units requires a relativeTo (C11.3 boundary)",
+                "balancing calendar units requires a relativeTo",
             ));
         }
         let sign: i128 = if total_ns < 0 { -1 } else { 1 };
         let mut rest = total_ns.abs();
-        let mut out = Duration::default();
+        let mut fields = [0_i128; 10];
         let order = [
-            (Unit::Day, NS_PER_DAY),
-            (Unit::Hour, NS_PER_HOUR),
-            (Unit::Minute, NS_PER_MINUTE),
-            (Unit::Second, NS_PER_SECOND),
-            (Unit::Millisecond, NS_PER_MILLISECOND),
-            (Unit::Microsecond, NS_PER_MICROSECOND),
+            (3, Unit::Day, NS_PER_DAY),
+            (4, Unit::Hour, NS_PER_HOUR),
+            (5, Unit::Minute, NS_PER_MINUTE),
+            (6, Unit::Second, NS_PER_SECOND),
+            (7, Unit::Millisecond, NS_PER_MILLISECOND),
+            (8, Unit::Microsecond, NS_PER_MICROSECOND),
         ];
-        for (unit, ns) in order {
+        for (slot, unit, ns) in order {
             if largest_unit <= unit {
-                let amount = rest / ns;
+                fields[slot] = rest / ns * sign;
                 rest %= ns;
-                let field = i64::try_from(amount * sign).map_err(|_| overflow_err("balance"))?;
-                match unit {
-                    Unit::Day => out.days = field,
-                    Unit::Hour => out.hours = field,
-                    Unit::Minute => out.minutes = field,
-                    Unit::Second => out.seconds = field,
-                    Unit::Millisecond => out.milliseconds = field,
-                    Unit::Microsecond => out.microseconds = field,
-                    _ => unreachable!("order contains only day..microsecond"),
-                }
             }
         }
-        out.nanoseconds = i64::try_from(rest * sign).map_err(|_| overflow_err("balance"))?;
-        out.validate()?;
-        Ok(out)
+        fields[9] = rest * sign;
+        Duration::new(fields)
     }
 
     /// Temporal.Duration.prototype.round without relativeTo: valid only when
@@ -734,12 +873,12 @@ impl Duration {
     ) -> TemporalResult<Duration> {
         if self.years != 0 || self.months != 0 || self.weeks != 0 {
             return Err(TemporalError::range(
-                "rounding a duration with calendar units requires relativeTo (C11.3 boundary)",
+                "rounding a duration with calendar units requires relativeTo",
             ));
         }
         if smallest_unit < Unit::Day || largest_unit < Unit::Day {
             return Err(TemporalError::range(
-                "rounding to calendar units requires relativeTo (C11.3 boundary)",
+                "rounding to calendar units requires relativeTo",
             ));
         }
         if smallest_unit < largest_unit {
@@ -747,12 +886,13 @@ impl Duration {
                 "smallestUnit must not be larger than largestUnit",
             ));
         }
-        validate_rounding_increment(smallest_unit, increment, false)?;
-        let total = self.time_total_nanoseconds_with_days()?;
-        let unit_ns = smallest_unit.ns_per().ok_or_else(|| overflow_err("round"))?;
-        let step = unit_ns.checked_mul(increment).ok_or_else(|| overflow_err("round"))?;
-        let rounded = round_to_increment(total, step, mode)?;
-        Duration::from_time_nanoseconds(rounded, largest_unit)
+        round_and_balance_duration(
+            self.total_nanoseconds_with_24_hour_days(),
+            smallest_unit,
+            largest_unit,
+            increment,
+            mode,
+        )
     }
 
     /// Temporal.Duration.prototype.total without relativeTo (unit must be Day
@@ -761,154 +901,40 @@ impl Duration {
     pub fn total_exact(&self, unit: Unit) -> TemporalResult<(i128, i128, i128)> {
         if self.years != 0 || self.months != 0 || self.weeks != 0 {
             return Err(TemporalError::range(
-                "totaling a duration with calendar units requires relativeTo (C11.3 boundary)",
+                "totaling a duration with calendar units requires relativeTo",
             ));
         }
         let unit_ns = unit.ns_per().ok_or_else(|| {
             TemporalError::range("total unit must be day..nanosecond without relativeTo")
         })?;
-        let total = self.time_total_nanoseconds_with_days()?;
-        Ok((total.div_euclid(unit_ns), total.rem_euclid(unit_ns), unit_ns))
+        let total = self.total_nanoseconds_with_24_hour_days();
+        Ok((
+            total.div_euclid(unit_ns),
+            total.rem_euclid(unit_ns),
+            unit_ns,
+        ))
     }
 
-    /// Presentation-only float conversion of `total_exact` (the JS `total()`
-    /// return value). Never feeds back into arithmetic.
+    /// The JS `total()` return value: the exact quotient rounded once to the
+    /// nearest Number. Never feeds back into arithmetic.
     pub fn total_as_f64(&self, unit: Unit) -> TemporalResult<f64> {
-        let (q, r, unit_ns) = self.total_exact(unit)?;
-        Ok(q as f64 + (r as f64) / (unit_ns as f64))
+        let (quotient, remainder, unit_ns) = self.total_exact(unit)?;
+        Ok(exact_ratio_to_f64(quotient * unit_ns + remainder, unit_ns))
     }
 
     /// ParseTemporalDurationString (ISO 8601-2 duration).
     pub fn parse(text: &str) -> TemporalResult<Duration> {
-        let bytes = text.as_bytes();
-        let mut pos = 0_usize;
-        let sign: i64 = match bytes.first() {
-            Some(b'-') => {
-                pos += 1;
-                -1
-            }
-            Some(b'+') => {
-                pos += 1;
-                1
-            }
-            _ => 1,
-        };
-        if !matches!(bytes.get(pos), Some(b'P') | Some(b'p')) {
-            return Err(TemporalError::syntax("duration string must contain 'P'"));
-        }
-        pos += 1;
-
-        let mut d = Duration::default();
-        let mut any = false;
-        let mut fraction_seen = false;
-
-        // Date part designators, in mandatory order.
-        let date_slots: [(u8, u8); 4] = [(b'Y', 0), (b'M', 1), (b'W', 2), (b'D', 3)];
-        let mut slot_idx = 0;
-        while pos < bytes.len() && !matches!(bytes[pos], b'T' | b't') {
-            let (value, digits, frac) = parse_duration_number(bytes, &mut pos)?;
-            if frac.is_some() {
-                return Err(TemporalError::syntax("fractions are only allowed on time components"));
-            }
-            if digits == 0 {
-                return Err(TemporalError::syntax("expected digits in duration"));
-            }
-            let designator = *bytes
-                .get(pos)
-                .ok_or_else(|| TemporalError::syntax("missing duration designator"))?;
-            pos += 1;
-            let upper = designator.to_ascii_uppercase();
-            let slot = date_slots
-                .iter()
-                .position(|&(c, _)| c == upper)
-                .ok_or_else(|| TemporalError::syntax("invalid date designator in duration"))?;
-            if slot < slot_idx {
-                return Err(TemporalError::syntax("duration designators out of order"));
-            }
-            slot_idx = slot + 1;
-            let field = value.checked_mul(sign as i128).ok_or_else(|| overflow_err("parse"))?;
-            let field = i64::try_from(field).map_err(|_| overflow_err("Duration.parse"))?;
-            match upper {
-                b'Y' => d.years = field,
-                b'M' => d.months = field,
-                b'W' => d.weeks = field,
-                _ => d.days = field,
-            }
-            any = true;
-        }
-
-        if pos < bytes.len() {
-            // Time part.
-            pos += 1; // consume 'T'
-            let mut time_any = false;
-            let mut time_slot = 0; // H=0, M=1, S=2
-            while pos < bytes.len() {
-                if fraction_seen {
-                    return Err(TemporalError::syntax(
-                        "no components may follow a fractional component",
-                    ));
-                }
-                let (value, digits, frac) = parse_duration_number(bytes, &mut pos)?;
-                if digits == 0 {
-                    return Err(TemporalError::syntax("expected digits in duration"));
-                }
-                let designator = *bytes
-                    .get(pos)
-                    .ok_or_else(|| TemporalError::syntax("missing duration designator"))?;
-                pos += 1;
-                let (slot, unit_ns): (usize, i128) = match designator.to_ascii_uppercase() {
-                    b'H' => (0, NS_PER_HOUR),
-                    b'M' => (1, NS_PER_MINUTE),
-                    b'S' => (2, NS_PER_SECOND),
-                    _ => return Err(TemporalError::syntax("invalid time designator in duration")),
-                };
-                if slot < time_slot {
-                    return Err(TemporalError::syntax("duration designators out of order"));
-                }
-                time_slot = slot + 1;
-                let whole = value.checked_mul(sign as i128).ok_or_else(|| overflow_err("parse"))?;
-                match slot {
-                    0 => d.hours = i64::try_from(whole).map_err(|_| overflow_err("Duration.parse"))?,
-                    1 => d.minutes = i64::try_from(whole).map_err(|_| overflow_err("Duration.parse"))?,
-                    _ => d.seconds = i64::try_from(whole).map_err(|_| overflow_err("Duration.parse"))?,
-                }
-                if let Some(frac_ns_of_unit) = frac {
-                    fraction_seen = true;
-                    // frac_ns_of_unit is the fraction scaled to 10^-9 of one
-                    // unit; convert exactly to nanoseconds of that unit.
-                    let frac_ns = frac_ns_of_unit
-                        .checked_mul(unit_ns / NS_PER_SECOND * (sign as i128))
-                        .ok_or_else(|| overflow_err("parse"))?;
-                    // Distribute into ms/us/ns exactly.
-                    let extra = if unit_ns == NS_PER_SECOND {
-                        frac_ns_of_unit * (sign as i128)
-                    } else {
-                        frac_ns
-                    };
-                    d.milliseconds = i64::try_from(extra / NS_PER_MILLISECOND)
-                        .map_err(|_| overflow_err("Duration.parse"))?;
-                    d.microseconds = i64::try_from((extra % NS_PER_MILLISECOND) / NS_PER_MICROSECOND)
-                        .map_err(|_| overflow_err("Duration.parse"))?;
-                    d.nanoseconds = i64::try_from(extra % NS_PER_MICROSECOND)
-                        .map_err(|_| overflow_err("Duration.parse"))?;
-                }
-                time_any = true;
-                any = true;
-            }
-            if !time_any {
-                return Err(TemporalError::syntax("'T' must be followed by a time component"));
-            }
-        }
-
-        if !any {
-            return Err(TemporalError::syntax("duration must contain at least one component"));
-        }
-        d.validate()?;
-        Ok(d)
+        Duration::new(parse_duration_string(text)?)
     }
 
     /// TemporalDurationToString (auto precision).
     pub fn format(&self) -> String {
+        self.format_with_precision(Precision::Auto)
+    }
+
+    /// TemporalDurationToString. Sub-second fields carry exactly into seconds,
+    /// so a field past 1000 still serializes in canonical form.
+    pub fn format_with_precision(&self, precision: Precision) -> String {
         let sign = self.sign();
         let a = self.abs();
         let mut out = String::new();
@@ -916,28 +942,29 @@ impl Duration {
             out.push('-');
         }
         out.push('P');
-        if a.years != 0 {
-            out.push_str(&format!("{}Y", a.years));
+        for (value, designator) in [
+            (a.years, 'Y'),
+            (a.months, 'M'),
+            (a.weeks, 'W'),
+            (a.days, 'D'),
+        ] {
+            if value != 0 {
+                out.push_str(&format!("{value}{designator}"));
+            }
         }
-        if a.months != 0 {
-            out.push_str(&format!("{}M", a.months));
-        }
-        if a.weeks != 0 {
-            out.push_str(&format!("{}W", a.weeks));
-        }
-        if a.days != 0 {
-            out.push_str(&format!("{}D", a.days));
-        }
-        let sub_ns =
-            a.milliseconds as i128 * NS_PER_MILLISECOND + a.microseconds as i128 * NS_PER_MICROSECOND
-                + a.nanoseconds as i128;
-        // Carry sub-second overflow into seconds for canonical output.
-        let extra_seconds = (sub_ns / NS_PER_SECOND) as i64;
-        let frac_ns = (sub_ns % NS_PER_SECOND) as u64;
-        let seconds = a.seconds + extra_seconds;
-        let has_time = a.hours != 0 || a.minutes != 0 || seconds != 0 || frac_ns != 0;
+        let total_seconds_ns = a.seconds * NS_PER_SECOND
+            + a.milliseconds * NS_PER_MILLISECOND
+            + a.microseconds * NS_PER_MICROSECOND
+            + a.nanoseconds;
+        let seconds = total_seconds_ns / NS_PER_SECOND;
+        let fraction = total_seconds_ns % NS_PER_SECOND;
         let date_empty = a.years == 0 && a.months == 0 && a.weeks == 0 && a.days == 0;
-        if has_time || date_empty {
+        let zero_clock = a.hours == 0 && a.minutes == 0;
+        let show_seconds = seconds != 0
+            || (date_empty && zero_clock)
+            || !matches!(precision, Precision::Auto)
+            || fraction != 0;
+        if !zero_clock || show_seconds {
             out.push('T');
             if a.hours != 0 {
                 out.push_str(&format!("{}H", a.hours));
@@ -945,16 +972,9 @@ impl Duration {
             if a.minutes != 0 {
                 out.push_str(&format!("{}M", a.minutes));
             }
-            if seconds != 0 || frac_ns != 0 || (a.hours == 0 && a.minutes == 0 && date_empty) {
+            if show_seconds {
                 out.push_str(&seconds.to_string());
-                if frac_ns != 0 {
-                    let mut frac = format!("{frac_ns:09}");
-                    while frac.ends_with('0') {
-                        frac.pop();
-                    }
-                    out.push('.');
-                    out.push_str(&frac);
-                }
+                out.push_str(&format_fractional_seconds(fraction, precision));
                 out.push('S');
             }
         }
@@ -962,57 +982,52 @@ impl Duration {
     }
 }
 
+/// FormatFractionalSeconds: the leading `.` and digits, or nothing when none
+/// are called for. `fraction_ns` is below one second.
+pub fn format_fractional_seconds(fraction_ns: i128, precision: Precision) -> String {
+    let digits = format!("{fraction_ns:09}");
+    match precision {
+        Precision::Digits(0) | Precision::Minute => String::new(),
+        Precision::Digits(count) => format!(".{}", &digits[..usize::from(count)]),
+        Precision::Auto if fraction_ns == 0 => String::new(),
+        Precision::Auto => format!(".{}", digits.trim_end_matches('0')),
+    }
+}
+
+/// The Number nearest `numerator / denominator` (`denominator` > 0), rounded
+/// once from the exact quotient. Dividing two rounded doubles would round
+/// twice, which is observable in `total()`.
+pub fn exact_ratio_to_f64(numerator: i128, denominator: i128) -> f64 {
+    debug_assert!(denominator > 0);
+    if numerator == 0 {
+        return 0.0;
+    }
+    let divisor = denominator.unsigned_abs();
+    let dividend = numerator.unsigned_abs();
+    let mut quotient = dividend / divisor;
+    let mut remainder = dividend % divisor;
+    let mut exponent = 0_i32;
+    // Binary long division until the quotient holds more bits than a double
+    // keeps, leaving `remainder` as the sticky information below them.
+    while quotient < (1_u128 << 64) && remainder != 0 {
+        let doubled = remainder << 1;
+        let bit = doubled >= divisor;
+        quotient = (quotient << 1) | u128::from(bit);
+        remainder = if bit { doubled - divisor } else { doubled };
+        exponent -= 1;
+    }
+    let excess = (128 - quotient.leading_zeros()).saturating_sub(64);
+    let kept = quotient >> excess;
+    let lost = quotient & ((1_u128 << excess) - 1);
+    let sticky = u64::from(lost != 0 || remainder != 0);
+    let magnitude = (kept as u64 | sticky) as f64 * 2_f64.powi(exponent + excess as i32);
+    if numerator < 0 { -magnitude } else { magnitude }
+}
+
 impl fmt::Display for Duration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.format())
     }
-}
-
-/// Parses digits (and optional `.`/`,` fraction of up to 9 digits) at `pos`.
-/// Returns (whole value, digit count, optional fraction scaled to 10^-9).
-fn parse_duration_number(
-    bytes: &[u8],
-    pos: &mut usize,
-) -> TemporalResult<(i128, usize, Option<i128>)> {
-    let mut value: i128 = 0;
-    let mut digits = 0_usize;
-    while let Some(&b) = bytes.get(*pos) {
-        if !b.is_ascii_digit() {
-            break;
-        }
-        value = value
-            .checked_mul(10)
-            .and_then(|v| v.checked_add((b - b'0') as i128))
-            .ok_or_else(|| overflow_err("Duration.parse"))?;
-        digits += 1;
-        *pos += 1;
-    }
-    let mut fraction = None;
-    if matches!(bytes.get(*pos), Some(b'.') | Some(b',')) {
-        *pos += 1;
-        let mut frac: i128 = 0;
-        let mut frac_digits = 0_usize;
-        while let Some(&b) = bytes.get(*pos) {
-            if !b.is_ascii_digit() {
-                break;
-            }
-            if frac_digits < 9 {
-                frac = frac * 10 + (b - b'0') as i128;
-                frac_digits += 1;
-            } else {
-                return Err(TemporalError::syntax("fraction exceeds 9 digits"));
-            }
-            *pos += 1;
-        }
-        if frac_digits == 0 {
-            return Err(TemporalError::syntax("fraction requires at least one digit"));
-        }
-        for _ in frac_digits..9 {
-            frac *= 10;
-        }
-        fraction = Some(frac);
-    }
-    Ok((value, digits, fraction))
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,16 +1116,10 @@ pub fn format_time_ns(time_ns: i128, precision: Precision) -> String {
         Precision::Auto => {
             out.push_str(&format!(":{second:02}"));
             if frac != 0 {
-                let mut digits = format!("{frac:09}");
-                while digits.len() > 3 && digits[digits.len() - 3..].bytes().all(|b| b == b'0') {
-                    digits.truncate(digits.len() - 3);
-                }
-                while digits.ends_with('0') && digits.len() % 3 != 0 {
-                    // keep groups of 3 per spec auto precision
-                    break;
-                }
+                let digits = format!("{frac:09}");
+                let digits = digits.trim_end_matches('0');
                 out.push('.');
-                out.push_str(&digits);
+                out.push_str(digits);
             }
             out
         }
@@ -1124,326 +1133,6 @@ pub fn format_time_ns(time_ns: i128, precision: Precision) -> String {
             out
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// ISO 8601 string parsing (shared with plain_types)
-// ---------------------------------------------------------------------------
-
-/// UTC offset in a parsed string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UtcOffsetRecord {
-    /// `Z` / `z`.
-    Zulu,
-    /// Numeric offset in nanoseconds east of UTC.
-    Numeric(i128),
-}
-
-/// Result of parsing an ISO date[-time] string with annotations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedIsoDateTime {
-    pub year: i32,
-    pub month: u8,
-    pub day: u8,
-    pub has_time: bool,
-    /// Nanoseconds since midnight; 0 when `has_time` is false.
-    pub time_ns: i128,
-    pub offset: Option<UtcOffsetRecord>,
-    /// Bracketed time zone annotation (e.g. `UTC`, `+01:00`, `America/New_York`),
-    /// unresolved: resolution is the jiff/tzdb C11.3 boundary.
-    pub time_zone: Option<String>,
-    /// `[u-ca=…]` value if present.
-    pub calendar: Option<String>,
-}
-
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(text: &'a str) -> Self {
-        Cursor { bytes: text.as_bytes(), pos: 0 }
-    }
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-    fn bump(&mut self) -> Option<u8> {
-        let b = self.peek()?;
-        self.pos += 1;
-        Some(b)
-    }
-    fn eat(&mut self, b: u8) -> bool {
-        if self.peek() == Some(b) {
-            self.pos += 1;
-            true
-        } else {
-            false
-        }
-    }
-    fn digits(&mut self, count: usize) -> TemporalResult<u32> {
-        let mut value: u32 = 0;
-        for _ in 0..count {
-            match self.bump() {
-                Some(b) if b.is_ascii_digit() => value = value * 10 + (b - b'0') as u32,
-                _ => return Err(TemporalError::syntax("expected digit")),
-            }
-        }
-        Ok(value)
-    }
-    fn done(&self) -> bool {
-        self.pos >= self.bytes.len()
-    }
-}
-
-fn parse_iso_year(c: &mut Cursor) -> TemporalResult<i32> {
-    match c.peek() {
-        Some(b'+') | Some(b'-') => {
-            let neg = c.bump() == Some(b'-');
-            let v = c.digits(6)? as i32;
-            if neg && v == 0 {
-                return Err(TemporalError::syntax("-000000 is not a valid extended year"));
-            }
-            Ok(if neg { -v } else { v })
-        }
-        _ => Ok(c.digits(4)? as i32),
-    }
-}
-
-/// Parses `hh[:mm[:ss[.f{1,9}]]]` (with or without separators, but
-/// consistently) returning nanoseconds since midnight.
-fn parse_iso_time(c: &mut Cursor) -> TemporalResult<i128> {
-    let hour = c.digits(2)?;
-    if hour > 23 {
-        return Err(TemporalError::syntax("hour out of range"));
-    }
-    let mut ns = hour as i128 * NS_PER_HOUR;
-    let sep = c.peek() == Some(b':');
-    if sep {
-        c.pos += 1;
-    }
-    if matches!(c.peek(), Some(b) if b.is_ascii_digit()) {
-        let minute = c.digits(2)?;
-        if minute > 59 {
-            return Err(TemporalError::syntax("minute out of range"));
-        }
-        ns += minute as i128 * NS_PER_MINUTE;
-        let had_sep = c.peek() == Some(b':');
-        if had_sep != sep && had_sep {
-            return Err(TemporalError::syntax("inconsistent time separators"));
-        }
-        if had_sep {
-            c.pos += 1;
-        }
-        if (had_sep || !sep) && matches!(c.peek(), Some(b) if b.is_ascii_digit()) {
-            if !had_sep && sep {
-                return Err(TemporalError::syntax("inconsistent time separators"));
-            }
-            let second = c.digits(2)?;
-            if second > 59 {
-                return Err(TemporalError::syntax("second out of range"));
-            }
-            ns += second as i128 * NS_PER_SECOND;
-            if matches!(c.peek(), Some(b'.') | Some(b',')) {
-                c.pos += 1;
-                let mut frac: i128 = 0;
-                let mut count = 0;
-                while let Some(b) = c.peek() {
-                    if !b.is_ascii_digit() {
-                        break;
-                    }
-                    if count >= 9 {
-                        return Err(TemporalError::syntax("fraction exceeds 9 digits"));
-                    }
-                    frac = frac * 10 + (b - b'0') as i128;
-                    count += 1;
-                    c.pos += 1;
-                }
-                if count == 0 {
-                    return Err(TemporalError::syntax("fraction requires at least one digit"));
-                }
-                for _ in count..9 {
-                    frac *= 10;
-                }
-                ns += frac;
-            }
-        }
-    } else if sep {
-        return Err(TemporalError::syntax("expected minutes after ':'"));
-    }
-    Ok(ns)
-}
-
-fn parse_utc_offset(c: &mut Cursor) -> TemporalResult<Option<UtcOffsetRecord>> {
-    match c.peek() {
-        Some(b'Z') | Some(b'z') => {
-            c.pos += 1;
-            Ok(Some(UtcOffsetRecord::Zulu))
-        }
-        Some(b'+') | Some(b'-') => {
-            let neg = c.bump() == Some(b'-');
-            let hour = c.digits(2)?;
-            if hour > 23 {
-                return Err(TemporalError::syntax("offset hour out of range"));
-            }
-            let mut ns = hour as i128 * NS_PER_HOUR;
-            let sep = c.eat(b':');
-            if matches!(c.peek(), Some(b) if b.is_ascii_digit()) {
-                let minute = c.digits(2)?;
-                if minute > 59 {
-                    return Err(TemporalError::syntax("offset minute out of range"));
-                }
-                ns += minute as i128 * NS_PER_MINUTE;
-                let sep2 = c.eat(b':');
-                if sep2 && !sep {
-                    return Err(TemporalError::syntax("inconsistent offset separators"));
-                }
-                if (sep2 || !sep) && matches!(c.peek(), Some(b) if b.is_ascii_digit()) {
-                    let second = c.digits(2)?;
-                    if second > 59 {
-                        return Err(TemporalError::syntax("offset second out of range"));
-                    }
-                    ns += second as i128 * NS_PER_SECOND;
-                    if matches!(c.peek(), Some(b'.') | Some(b',')) {
-                        c.pos += 1;
-                        let mut frac: i128 = 0;
-                        let mut count = 0;
-                        while let Some(b) = c.peek() {
-                            if !b.is_ascii_digit() {
-                                break;
-                            }
-                            if count >= 9 {
-                                return Err(TemporalError::syntax("offset fraction exceeds 9 digits"));
-                            }
-                            frac = frac * 10 + (b - b'0') as i128;
-                            count += 1;
-                            c.pos += 1;
-                        }
-                        if count == 0 {
-                            return Err(TemporalError::syntax("offset fraction requires digits"));
-                        }
-                        for _ in count..9 {
-                            frac *= 10;
-                        }
-                        ns += frac;
-                    }
-                }
-            } else if sep {
-                return Err(TemporalError::syntax("expected offset minutes after ':'"));
-            }
-            Ok(Some(UtcOffsetRecord::Numeric(if neg { -ns } else { ns })))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn parse_annotations(
-    c: &mut Cursor,
-    time_zone: &mut Option<String>,
-    calendar: &mut Option<String>,
-) -> TemporalResult<()> {
-    let mut calendar_seen = false;
-    while c.eat(b'[') {
-        let critical = c.eat(b'!');
-        let start = c.pos;
-        while let Some(b) = c.peek() {
-            if b == b']' {
-                break;
-            }
-            c.pos += 1;
-        }
-        if !c.eat(b']') {
-            return Err(TemporalError::syntax("unterminated annotation"));
-        }
-        let body = std::str::from_utf8(&c.bytes[start..c.pos - 1])
-            .map_err(|_| TemporalError::syntax("annotation is not valid UTF-8"))?;
-        if body.is_empty() {
-            return Err(TemporalError::syntax("empty annotation"));
-        }
-        if let Some(value) = body.strip_prefix("u-ca=") {
-            if value.is_empty() {
-                return Err(TemporalError::syntax("empty u-ca annotation value"));
-            }
-            if calendar_seen {
-                if critical {
-                    return Err(TemporalError::range("duplicate critical u-ca annotation"));
-                }
-                continue; // first annotation wins per spec
-            }
-            calendar_seen = true;
-            if value != "iso8601" && critical {
-                return Err(TemporalError::range(format!(
-                    "unsupported critical calendar annotation '{value}'"
-                )));
-            }
-            if value != "iso8601" {
-                return Err(TemporalError::range(format!(
-                    "only the iso8601 calendar is supported, got '{value}'"
-                )));
-            }
-            *calendar = Some(value.to_string());
-        } else if body.contains('=') {
-            // Unknown key=value annotation: ignored unless critical.
-            if critical {
-                return Err(TemporalError::range(format!(
-                    "unknown critical annotation '{body}'"
-                )));
-            }
-        } else {
-            // Time zone annotation: first bracketed non key=value item only,
-            // and it must come before any other annotation.
-            if time_zone.is_some() || calendar_seen {
-                return Err(TemporalError::syntax(
-                    "time zone annotation must be the first annotation",
-                ));
-            }
-            *time_zone = Some(body.to_string());
-        }
-    }
-    Ok(())
-}
-
-/// Parses `date[T time[offset]][annotations]`. Central grammar for Instant and
-/// the plain types (which apply their own presence rules on the result).
-pub fn parse_iso_datetime_string(text: &str) -> TemporalResult<ParsedIsoDateTime> {
-    let mut c = Cursor::new(text);
-    let year = parse_iso_year(&mut c)?;
-    let dash = c.eat(b'-');
-    let month = c.digits(2)? as u8;
-    if dash && !c.eat(b'-') {
-        return Err(TemporalError::syntax("inconsistent date separators"));
-    }
-    if !dash && c.peek() == Some(b'-') {
-        return Err(TemporalError::syntax("inconsistent date separators"));
-    }
-    let day = c.digits(2)? as u8;
-    if !(1..=12).contains(&month) {
-        return Err(TemporalError::range(format!("month {month} out of range")));
-    }
-    if day < 1 || day > days_in_month(year, month) {
-        return Err(TemporalError::range(format!("day {day} out of range")));
-    }
-
-    let mut has_time = false;
-    let mut time_ns = 0_i128;
-    let mut offset = None;
-    if matches!(c.peek(), Some(b'T') | Some(b't') | Some(b' ')) {
-        c.pos += 1;
-        has_time = true;
-        time_ns = parse_iso_time(&mut c)?;
-        offset = parse_utc_offset(&mut c)?;
-    }
-
-    let mut time_zone = None;
-    let mut calendar = None;
-    parse_annotations(&mut c, &mut time_zone, &mut calendar)?;
-    if !c.done() {
-        return Err(TemporalError::syntax(format!(
-            "unexpected trailing characters at position {}",
-            c.pos
-        )));
-    }
-    Ok(ParsedIsoDateTime { year, month, day, has_time, time_ns, offset, time_zone, calendar })
 }
 
 // ---------------------------------------------------------------------------
@@ -1469,15 +1158,18 @@ mod tests {
     #[test]
     fn instant_add_overflow_at_boundary() {
         let max = Instant::from_epoch_nanoseconds(INSTANT_NS_MAX).unwrap();
-        let one_ns = Duration::from_time(0, 0, 0, 0, 0, 1).unwrap();
+        let one_ns = Duration::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).unwrap();
         assert_eq!(max.add(&one_ns).unwrap_err().kind, TemporalErrorKind::Range);
-        assert_eq!(max.subtract(&one_ns).unwrap().epoch_nanoseconds(), INSTANT_NS_MAX - 1);
+        assert_eq!(
+            max.subtract(&one_ns).unwrap().epoch_nanoseconds(),
+            INSTANT_NS_MAX - 1
+        );
     }
 
     #[test]
     fn instant_rejects_date_units() {
         let i = Instant::from_epoch_nanoseconds(0).unwrap();
-        let d = Duration::new(0, 0, 0, 1, 0, 0, 0, 0, 0, 0).unwrap();
+        let d = Duration::new([0, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
         assert_eq!(i.add(&d).unwrap_err().kind, TemporalErrorKind::Range);
     }
 
@@ -1485,7 +1177,6 @@ mod tests {
     fn instant_epoch_milliseconds_floors_negative() {
         let i = Instant::from_epoch_nanoseconds(-1).unwrap();
         assert_eq!(i.epoch_milliseconds(), -1);
-        assert_eq!(i.epoch_seconds(), -1);
     }
 
     // ---- Rounding, including negative operands ----
@@ -1498,12 +1189,30 @@ mod tests {
         assert_eq!(round_to_increment(-7, 3, RoundingMode::Trunc).unwrap(), -6);
         assert_eq!(round_to_increment(-7, 3, RoundingMode::Expand).unwrap(), -9);
         // Half cases at exact midpoint: x = -3, increment 2.
-        assert_eq!(round_to_increment(-3, 2, RoundingMode::HalfExpand).unwrap(), -4);
-        assert_eq!(round_to_increment(-3, 2, RoundingMode::HalfTrunc).unwrap(), -2);
-        assert_eq!(round_to_increment(-3, 2, RoundingMode::HalfCeil).unwrap(), -2);
-        assert_eq!(round_to_increment(-3, 2, RoundingMode::HalfFloor).unwrap(), -4);
-        assert_eq!(round_to_increment(-3, 2, RoundingMode::HalfEven).unwrap(), -4);
-        assert_eq!(round_to_increment(-1, 2, RoundingMode::HalfEven).unwrap(), 0);
+        assert_eq!(
+            round_to_increment(-3, 2, RoundingMode::HalfExpand).unwrap(),
+            -4
+        );
+        assert_eq!(
+            round_to_increment(-3, 2, RoundingMode::HalfTrunc).unwrap(),
+            -2
+        );
+        assert_eq!(
+            round_to_increment(-3, 2, RoundingMode::HalfCeil).unwrap(),
+            -2
+        );
+        assert_eq!(
+            round_to_increment(-3, 2, RoundingMode::HalfFloor).unwrap(),
+            -4
+        );
+        assert_eq!(
+            round_to_increment(-3, 2, RoundingMode::HalfEven).unwrap(),
+            -4
+        );
+        assert_eq!(
+            round_to_increment(-1, 2, RoundingMode::HalfEven).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1578,7 +1287,10 @@ mod tests {
         let i = Instant::from_epoch_nanoseconds(1_500_000_000).unwrap();
         assert_eq!(i.format(Precision::Auto), "1970-01-01T00:00:01.5Z");
         assert_eq!(i.format(Precision::Digits(0)), "1970-01-01T00:00:01Z");
-        assert_eq!(i.format(Precision::Digits(6)), "1970-01-01T00:00:01.500000Z");
+        assert_eq!(
+            i.format(Precision::Digits(6)),
+            "1970-01-01T00:00:01.500000Z"
+        );
         assert_eq!(i.format(Precision::Minute), "1970-01-01T00:00Z");
     }
 
@@ -1602,40 +1314,43 @@ mod tests {
     #[test]
     fn instant_until_rejects_date_units() {
         let a = Instant::from_epoch_nanoseconds(0).unwrap();
-        assert!(a.until(a, Unit::Day, Unit::Nanosecond, 1, RoundingMode::Trunc).is_err());
+        assert!(
+            a.until(a, Unit::Day, Unit::Nanosecond, 1, RoundingMode::Trunc)
+                .is_err()
+        );
     }
 
     // ---- Duration validation ----
 
     #[test]
     fn duration_mixed_sign_rejected() {
-        let err = Duration::new(1, 0, 0, -1, 0, 0, 0, 0, 0, 0).unwrap_err();
+        let err = Duration::new([1, 0, 0, -1, 0, 0, 0, 0, 0, 0]).unwrap_err();
         assert_eq!(err.kind, TemporalErrorKind::Range);
-        let err = Duration::new(0, 0, 0, 0, 1, 0, 0, 0, 0, -1).unwrap_err();
+        let err = Duration::new([0, 0, 0, 0, 1, 0, 0, 0, 0, -1]).unwrap_err();
         assert_eq!(err.kind, TemporalErrorKind::Range);
-        assert!(Duration::new(0, 0, 0, 0, -1, -30, 0, 0, 0, 0).is_ok());
+        assert!(Duration::new([0, 0, 0, 0, -1, -30, 0, 0, 0, 0]).is_ok());
     }
 
     #[test]
     fn duration_calendar_field_limit() {
-        let limit = 1_i64 << 32;
-        assert!(Duration::new(limit, 0, 0, 0, 0, 0, 0, 0, 0, 0).is_err());
-        assert!(Duration::new(limit - 1, 0, 0, 0, 0, 0, 0, 0, 0, 0).is_ok());
+        let limit = 1_i128 << 32;
+        assert!(Duration::new([limit, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+        assert!(Duration::new([limit - 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_ok());
     }
 
     #[test]
     fn duration_time_limit_2_pow_53_seconds() {
-        let max_s = (1_i64 << 53) - 1;
-        assert!(Duration::new(0, 0, 0, 0, 0, 0, max_s, 0, 0, 999_999_999).is_ok());
-        assert!(Duration::new(0, 0, 0, 0, 0, 0, max_s + 1, 0, 0, 0).is_err());
+        let max_s = (1_i128 << 53) - 1;
+        assert!(Duration::new([0, 0, 0, 0, 0, 0, max_s, 0, 0, 999_999_999]).is_ok());
+        assert!(Duration::new([0, 0, 0, 0, 0, 0, max_s + 1, 0, 0, 0]).is_err());
         // Days participate in the time bound.
         let max_days = max_s / 86_400;
-        assert!(Duration::new(0, 0, 0, max_days + 1, 0, 0, 0, 0, 0, 0).is_err());
+        assert!(Duration::new([0, 0, 0, max_days + 1, 0, 0, 0, 0, 0, 0]).is_err());
     }
 
     #[test]
     fn duration_sign_and_negate() {
-        let d = Duration::new(0, 0, 0, 0, 0, 0, 0, 0, 0, -5).unwrap();
+        let d = Duration::new([0, 0, 0, 0, 0, 0, 0, 0, 0, -5]).unwrap();
         assert_eq!(d.sign(), -1);
         assert_eq!(d.negated().sign(), 1);
         assert_eq!(d.abs().nanoseconds, 5);
@@ -1659,24 +1374,35 @@ mod tests {
 
     #[test]
     fn duration_round_time_only() {
-        let d = Duration::from_time(0, 90, 0, 0, 0, 0).unwrap();
-        let r = d.round(Unit::Hour, Unit::Hour, 1, RoundingMode::HalfExpand).unwrap();
+        let d = Duration::new([0, 0, 0, 0, 0, 90, 0, 0, 0, 0]).unwrap();
+        let r = d
+            .round(Unit::Hour, Unit::Hour, 1, RoundingMode::HalfExpand)
+            .unwrap();
         assert_eq!(r.hours, 2);
-        let neg = d.negated().round(Unit::Hour, Unit::Hour, 1, RoundingMode::HalfExpand).unwrap();
+        let neg = d
+            .negated()
+            .round(Unit::Hour, Unit::Hour, 1, RoundingMode::HalfExpand)
+            .unwrap();
         assert_eq!(neg.hours, -2);
-        let cal = Duration::new(1, 0, 0, 0, 0, 0, 0, 0, 0, 0).unwrap();
-        assert!(cal.round(Unit::Hour, Unit::Hour, 1, RoundingMode::Trunc).is_err());
-        assert!(d.round(Unit::Month, Unit::Month, 1, RoundingMode::Trunc).is_err());
+        let cal = Duration::new([1, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        assert!(
+            cal.round(Unit::Hour, Unit::Hour, 1, RoundingMode::Trunc)
+                .is_err()
+        );
+        assert!(
+            d.round(Unit::Month, Unit::Month, 1, RoundingMode::Trunc)
+                .is_err()
+        );
     }
 
     #[test]
     fn duration_total_exact_and_float() {
-        let d = Duration::from_time(1, 30, 0, 0, 0, 0).unwrap();
+        let d = Duration::new([0, 0, 0, 0, 1, 30, 0, 0, 0, 0]).unwrap();
         let (q, r, unit) = d.total_exact(Unit::Hour).unwrap();
         assert_eq!((q, r, unit), (1, NS_PER_HOUR / 2, NS_PER_HOUR));
         assert_eq!(d.total_as_f64(Unit::Hour).unwrap(), 1.5);
         assert_eq!(d.total_as_f64(Unit::Minute).unwrap(), 90.0);
-        let cal = Duration::new(0, 1, 0, 0, 0, 0, 0, 0, 0, 0).unwrap();
+        let cal = Duration::new([0, 1, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
         assert!(cal.total_exact(Unit::Day).is_err());
     }
 
@@ -1686,7 +1412,9 @@ mod tests {
     fn duration_parse_basic_and_sign() {
         let d = Duration::parse("P1Y2M3W4DT5H6M7S").unwrap();
         assert_eq!(
-            (d.years, d.months, d.weeks, d.days, d.hours, d.minutes, d.seconds),
+            (
+                d.years, d.months, d.weeks, d.days, d.hours, d.minutes, d.seconds
+            ),
             (1, 2, 3, 4, 5, 6, 7)
         );
         let n = Duration::parse("-PT1H").unwrap();
@@ -1720,7 +1448,7 @@ mod tests {
     #[test]
     fn duration_format_canonical() {
         assert_eq!(Duration::default().format(), "PT0S");
-        let d = Duration::new(1, 0, 0, 2, 3, 0, 4, 500, 0, 0).unwrap();
+        let d = Duration::new([1, 0, 0, 2, 3, 0, 4, 500, 0, 0]).unwrap();
         assert_eq!(d.format(), "P1Y2DT3H4.5S");
         assert_eq!(Duration::parse("-PT1H").unwrap().format(), "-PT1H");
         // Round trip.
@@ -1752,7 +1480,7 @@ mod tests {
             (-1, 12, 31),
         ] {
             let days = epoch_days_from_ymd(y, m, d);
-            assert_eq!(ymd_from_epoch_days(days), (y, m as u8, d as u8), "case {y}-{m}-{d}");
+            assert_eq!(ymd_from_epoch_days(days), (y, m, d), "case {y}-{m}-{d}");
         }
         assert_eq!(epoch_days_from_ymd(1970, 1, 1), 0);
         assert_eq!(epoch_days_from_ymd(1969, 12, 31), -1);
