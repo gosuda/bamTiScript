@@ -1034,6 +1034,8 @@ impl Test262Runner for InterpreterRunner {
         };
         let started = Instant::now();
         let mut host = bamts_node::NodeHost::new();
+        // Local time needs a zone, and test262 accepts any of them.
+        host.set_env("TZ", "UTC");
         // Dynamic `Function(...)` synthesis needs a compile provider; the
         // facade's ScriptCompiler is the same one `bamts::run_program` uses.
         host.set_script_compiler(Box::new(bamts::ScriptCompiler));
@@ -2220,6 +2222,25 @@ function $ERROR(message) {\n\
             );
             if let Err(error) = run_fixture(&format!("wrapper-prototypes-{index}"), &source) {
                 panic!("{body}: {error:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn local_time_works_in_the_host() {
+        let source = wrap(
+            "description: local time",
+            "assert.sameValue(new Date(0).getTimezoneOffset(), 0);\n\
+             assert.sameValue(new Date(0).getHours(), 0);",
+        );
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            let label = format!("local-time-{mode:?}");
+            if let Err(error) = run_fixture_in(mode, &label, &source) {
+                panic!("{label}: {error:?}");
             }
         }
     }
