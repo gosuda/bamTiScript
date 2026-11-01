@@ -47,10 +47,82 @@ pub(super) fn install<H: Host>(
         ("call", 1, function_call::<H> as BuiltinHandler<H>),
         ("apply", 2, function_apply::<H>),
         ("bind", 1, function_bind::<H>),
+        ("toString", 0, function_to_string::<H>),
     ] {
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, builtins.function_prototype(), name, function);
     }
+}
+
+/// Whether `text` can follow `function` in the `NativeFunction` syntax:
+/// an identifier or a computed symbol name, optionally after `get` or `set`.
+/// Engine-internal labels such as `Promise resolve target` are neither.
+fn is_native_function_name(text: &str) -> bool {
+    fn is_identifier(text: &str) -> bool {
+        let mut characters = text.chars();
+        characters
+            .next()
+            .is_some_and(|first| first.is_alphabetic() || matches!(first, '$' | '_'))
+            && characters.all(|next| next.is_alphanumeric() || matches!(next, '$' | '_'))
+    }
+    let property = text
+        .strip_prefix("get ")
+        .or_else(|| text.strip_prefix("set "))
+        .unwrap_or(text);
+    match property
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        Some(computed) => computed.split('.').all(is_identifier),
+        None => is_identifier(property),
+    }
+}
+
+/// The name a function was created with. This reads metadata rather than the
+/// `name` property, which user code can redefine as an accessor.
+fn function_metadata_name<H: Host>(
+    machine: &Machine<'_, H>,
+    function: Value,
+) -> Result<Option<String>, EvalFailure> {
+    let Some(index) = machine
+        .runtime_slot(function)
+        .map_err(EvalFailure::Runtime)?
+    else {
+        return Ok(None);
+    };
+    Ok(match &machine.heap[index] {
+        HeapEntry::NativeFunction {
+            callable: NativeCallable::Builtin(id),
+            ..
+        } => Some(machine.intrinsics.builtins.get(*id).name.to_owned()),
+        HeapEntry::Function {
+            module, function, ..
+        } => machine.module_code(*module).functions()[function.get() as usize]
+            .name()
+            .map(|id| machine.constant_text(*module, id).to_utf8_lossy()),
+        _ => None,
+    })
+}
+
+/// `Function.prototype.toString`. Every callable answers in the
+/// `NativeFunction` form: bytecode does not retain source text, so a user
+/// function's exact source is not available here.
+fn function_to_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_callable(this)? {
+        return Err(type_error(
+            "Function.prototype.toString requires a callable receiver",
+        ));
+    }
+    let name = function_metadata_name(machine, this)?
+        .filter(|name| is_native_function_name(name))
+        .unwrap_or_default();
+    let source = EcmaString::encode(&format!("function {name}() {{ [native code] }}"));
+    Ok(BuiltinOutcome::Value(allocate_string(machine, source)?))
 }
 
 fn constructor<H: Host>(
@@ -506,6 +578,66 @@ mod tests {
     use super::*;
     use crate::{Limits, RuntimeErrorKind, ThrowOrigin};
     use bamts_bytecode::{FunctionId, ModuleId};
+
+    #[test]
+    fn native_function_names_exclude_engine_labels() {
+        for name in ["push", "get source", "set x", "[Symbol.replace]", "$_a1"] {
+            assert!(is_native_function_name(name), "{name}");
+        }
+        for name in ["", "Promise resolve target", "#private", "1a", "[a b]"] {
+            assert!(!is_native_function_name(name), "{name}");
+        }
+    }
+
+    fn function_source(machine: &mut Machine<'_, TestHost>, function: Value) -> EcmaString {
+        let prototype = machine.intrinsics.builtins.function_prototype();
+        let to_string = machine.get_named_property(prototype, "toString").unwrap();
+        let source = machine.call_value(to_string, function, &[]).unwrap();
+        machine.string_value(source).unwrap()
+    }
+
+    #[test]
+    fn function_to_string_uses_metadata_rather_than_the_name_property() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array_prototype = machine.intrinsics.array_prototype;
+        let push = machine.get_named_property(array_prototype, "push").unwrap();
+        assert!(function_source(&mut machine, push).eq_ascii("function push() { [native code] }"));
+
+        let renamed = machine
+            .allocate(HeapEntry::String(EcmaString::encode("renamed")))
+            .unwrap();
+        machine
+            .define_descriptor(
+                push,
+                PropertyKey::Named(EcmaString::encode("name")),
+                Property::Data {
+                    value: renamed,
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        assert!(function_source(&mut machine, push).eq_ascii("function push() { [native code] }"));
+    }
+
+    #[test]
+    fn function_to_string_rejects_non_callable_receivers() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.builtins.function_prototype();
+        let to_string = machine.get_named_property(prototype, "toString").unwrap();
+        let object = ordinary_object(&mut machine);
+        for receiver in [Value::UNDEFINED, Value::int32(1), object] {
+            assert!(matches!(
+                machine.call_value(to_string, receiver, &[]),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        }
+    }
 
     fn data_descriptor(machine: &mut Machine<'_, TestHost>, value: Value) -> Value {
         let descriptor = ordinary_object(machine);
