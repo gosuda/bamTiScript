@@ -28,6 +28,10 @@ const HARNESS_DONE: &str = "doneprintHandle.js";
 /// What names a file a test may import from its own directory.
 const FIXTURE_MARKER: &str = "_FIXTURE";
 const STRICT_PREFIX: &str = "\"use strict\";\n";
+/// Ends a module case. The compiler reads the goal from the tree, as `tsc` does,
+/// so this is what makes a test with no `import` or `export` of its own a module.
+/// It exports no name, so it cannot collide with one the test declares.
+const MODULE_MARKER: &str = "\nexport {};\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OracleError {
@@ -569,11 +573,7 @@ pub fn compose_script(
     variant: &ExecutionVariant,
     harness_sources: &[HarnessSource],
 ) -> Result<ComposedScript, OracleError> {
-    let early = plan
-        .negative
-        .as_ref()
-        .is_some_and(|negative| negative.phase.is_early());
-    if early || variant.kind == SourceKind::Raw {
+    if variant.kind == SourceKind::Raw {
         return Ok(ComposedScript {
             bytes: parsed.source_bytes.clone(),
             test_offset: 0,
@@ -582,8 +582,17 @@ pub fn compose_script(
         });
     }
 
-    let mut prefix = Vec::new();
-    if let HarnessPlan::Canonical { files, .. } = &plan.harness {
+    // `INTERPRETING.md`: the directive is the initial character sequence of the
+    // file and precedes every other text modification, so it leads the harness.
+    let mut bytes = Vec::new();
+    if variant.kind == SourceKind::ScriptStrict {
+        bytes.extend_from_slice(STRICT_PREFIX.as_bytes());
+    }
+    let early = plan
+        .negative
+        .as_ref()
+        .is_some_and(|negative| negative.phase.is_early());
+    if !early && let HarnessPlan::Canonical { files, .. } = &plan.harness {
         for file in files {
             let source = harness_sources
                 .iter()
@@ -592,22 +601,23 @@ pub fn compose_script(
                 .ok_or_else(|| OracleError::MissingHarness {
                     name: file.requested.clone(),
                 })?;
-            prefix.extend_from_slice(source);
+            bytes.extend_from_slice(source);
             if !source.ends_with(b"\n") {
-                prefix.push(b'\n');
+                bytes.push(b'\n');
             }
         }
     }
-    if variant.kind == SourceKind::ScriptStrict {
-        prefix.extend_from_slice(STRICT_PREFIX.as_bytes());
+    let test_offset = bytes.len();
+    bytes.extend_from_slice(&parsed.source_bytes);
+    if variant.kind == SourceKind::Module {
+        bytes.extend_from_slice(MODULE_MARKER.as_bytes());
     }
-    let test_offset = prefix.len();
-    prefix.extend_from_slice(&parsed.source_bytes);
+    let untouched = bytes.len() == parsed.source_bytes.len();
     Ok(ComposedScript {
-        bytes: prefix,
+        bytes,
         test_offset,
         kind: variant.kind,
-        untouched: false,
+        untouched,
     })
 }
 
@@ -1660,8 +1670,9 @@ function $ERROR(message) {\n\
             let script = compose_script(&parsed, &plan, variant, &harness_sources())
                 .expect("compose negative");
             if phase.is_early() {
-                assert!(script.untouched);
-                assert_eq!(script.bytes, parsed.source_bytes);
+                // No harness, though a module case keeps what makes it a module.
+                assert_eq!(script.untouched, variant.kind == SourceKind::Raw);
+                assert!(script.bytes.starts_with(&parsed.source_bytes));
                 assert_eq!(script.test_offset, 0);
             }
             let request = RunRequest {
@@ -1715,7 +1726,7 @@ function $ERROR(message) {\n\
         let strict_script =
             compose_script(&parsed, &plan, strict, &harness_sources()).expect("compose strict");
         let before_test = &strict_script.bytes[..strict_script.test_offset];
-        assert!(before_test.ends_with(STRICT_PREFIX.as_bytes()));
+        assert!(before_test.starts_with(STRICT_PREFIX.as_bytes()));
         assert_eq!(
             &strict_script.bytes[strict_script.test_offset..],
             parsed.source_bytes.as_slice()
@@ -1913,20 +1924,76 @@ function $ERROR(message) {\n\
         let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
         let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
 
-        // Strict frontmatter is preserved: the strict variant still composes
-        // the directive directly before the test body.
+        // The strict variant opens with the directive, ahead of the harness.
         assert_eq!(plan.variants.len(), 2);
         let strict = compose_script(&parsed, &plan, &plan.variants[1], &sources).unwrap();
         assert_eq!(strict.kind, SourceKind::ScriptStrict);
-        assert_eq!(
-            &strict.bytes[strict.test_offset - STRICT_PREFIX.len()..strict.test_offset],
-            STRICT_PREFIX.as_bytes()
-        );
+        assert!(strict.bytes.starts_with(STRICT_PREFIX.as_bytes()));
 
         let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
         for variant in &plan.variants {
             run_variant(&runner, &parsed, &plan, &sources, variant).unwrap();
         }
+    }
+
+    /// Runs every variant of `source` against the small fixture harness.
+    fn run_fixture(label: &str, source: &str) -> Result<(), OracleError> {
+        let harness = runner_scratch(&format!("{label}-harness"));
+        let scratch = runner_scratch(&format!("{label}-scratch"));
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        let parsed = parse_test(source).unwrap();
+        let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
+        let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
+        for variant in &plan.variants {
+            run_variant(&runner, &parsed, &plan, &sources, variant)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_composed_test_is_compiled_as_strict_code() {
+        let source = wrap(
+            "description: reserved in strict code only, so this must not compile\n\
+             flags: [onlyStrict]",
+            "var public;",
+        );
+        assert!(
+            run_fixture("strict-compiled", &source).is_err(),
+            "the directive reaches the test past the harness"
+        );
+    }
+
+    #[test]
+    fn an_early_negative_is_parsed_under_its_own_flags() {
+        let strict = wrap(
+            "description: reserved in strict code only\n\
+             flags: [onlyStrict]\n\
+             negative:\n  phase: parse\n  type: SyntaxError",
+            "var public;",
+        );
+        run_fixture("strict-parse", &strict).expect("rejected as strict code");
+        let module = wrap(
+            "description: reserved in module code only\n\
+             flags: [module]\n\
+             negative:\n  phase: parse\n  type: SyntaxError",
+            "var await;",
+        );
+        run_fixture("module-parse", &module).expect("rejected as module code");
+    }
+
+    #[test]
+    fn a_module_case_without_imports_has_the_module_goal() {
+        let source = wrap(
+            "description: reserved in module code only, so this must not compile\n\
+             flags: [module]",
+            "var await;",
+        );
+        assert!(
+            run_fixture("module-goal", &source).is_err(),
+            "a test with no import or export is still a module"
+        );
     }
 
     #[test]
@@ -1973,7 +2040,15 @@ function $ERROR(message) {\n\
         let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
         for variant in &plan.variants {
             let script = compose_script(&parsed, &plan, variant, &sources).unwrap();
-            assert!(script.untouched, "early negatives compose untouched");
+            assert_eq!(
+                script.untouched,
+                variant.kind == SourceKind::ScriptNonStrict,
+                "an early negative takes no harness, only its strict directive"
+            );
+            assert_eq!(
+                &script.bytes[script.test_offset..],
+                parsed.source_bytes.as_slice()
+            );
             run_variant(&runner, &parsed, &plan, &sources, variant).unwrap();
         }
     }
