@@ -709,7 +709,7 @@ fn describe_difference(expected: &[String], actual: &[String]) -> String {
             sorted_expected.sort();
             sorted_actual.sort();
             let category = if sorted_expected == sorted_actual {
-                "order"
+                "order".to_owned()
             } else {
                 line_difference(left, right)
             };
@@ -725,21 +725,62 @@ fn describe_difference(expected: &[String], actual: &[String]) -> String {
     }
 }
 
-/// How two lines at the same position differ, from the most to the least specific.
-fn line_difference(expected: &str, actual: &str) -> &'static str {
+/// How two lines at the same position differ, from the most to the least
+/// specific. Lines that differ in kind are named by the pair, such as
+/// `comment-vs-binding`: a baseline comment that the output replaced with code.
+fn line_difference(expected: &str, actual: &str) -> String {
     let unquoted = |text: &str| text.replace('\'', "\"");
     let unpunctuated = |text: &str| text.trim_end_matches([';', ',']).to_owned();
     if expected.split_whitespace().eq(actual.split_whitespace()) {
-        "spacing"
-    } else if expected.eq_ignore_ascii_case(actual) {
-        "case"
-    } else if unquoted(expected) == unquoted(actual) {
-        "quote-style"
-    } else if unpunctuated(expected) == unpunctuated(actual) {
-        "punctuation"
-    } else {
-        "text"
+        return "spacing".to_owned();
     }
+    if expected.eq_ignore_ascii_case(actual) {
+        return "case".to_owned();
+    }
+    if unquoted(expected) == unquoted(actual) {
+        return "quote-style".to_owned();
+    }
+    if unpunctuated(expected) == unpunctuated(actual) {
+        return "punctuation".to_owned();
+    }
+    let (left, right) = (line_kind(expected), line_kind(actual));
+    if left == right {
+        "text".to_owned()
+    } else {
+        format!("{left}-vs-{right}")
+    }
+}
+
+/// The kind of JavaScript line, from its first token. A small closed set, so
+/// the pairs a mismatch can name stay few.
+fn line_kind(line: &str) -> &'static str {
+    const KINDS: [(&str, &[&str]); 10] = [
+        ("comment", &["//", "/*", "*"]),
+        ("import", &["import "]),
+        ("export", &["export "]),
+        ("declare", &["declare "]),
+        ("binding", &["var ", "let ", "const "]),
+        ("function", &["function ", "async function "]),
+        ("class", &["class ", "abstract class "]),
+        ("strict", &["\"use strict\"", "'use strict'"]),
+        ("brace", &["}", "{", ")", "]"]),
+        (
+            "cjs",
+            &[
+                "exports.",
+                "module.exports",
+                "Object.defineProperty(exports",
+            ],
+        ),
+    ];
+    let line = line.trim();
+    if line.is_empty() {
+        return "blank";
+    }
+    KINDS
+        .iter()
+        .find(|(_, prefixes)| prefixes.iter().any(|prefix| line.starts_with(prefix)))
+        .map_or("other", |(kind, _)| kind)
 }
 
 /// A line cut to a readable length, with backticks replaced so it can sit in one.
@@ -2073,7 +2114,7 @@ mod tests {
 
     #[test]
     fn a_mismatch_names_its_category_and_the_first_differing_line() {
-        let cases: [(&str, &str, &str, &[&str]); 8] = [
+        let cases: [(&str, &str, &str, &[&str]); 12] = [
             (
                 "a\nb",
                 "a\nb\nc\nd",
@@ -2111,6 +2152,30 @@ mod tests {
                 "ok\na = 2;",
                 "text",
                 &["line 2", "expected `a = 1;`", "actual `a = 2;`"],
+            ),
+            (
+                "// note\nok",
+                "var x = 1;\nok",
+                "comment-vs-binding",
+                &["line 1", "expected `// note`"],
+            ),
+            (
+                "class C {",
+                "var C = (function () {",
+                "class-vs-binding",
+                &["line 1"],
+            ),
+            (
+                "exports.a = 1;",
+                "var a = 1;",
+                "cjs-vs-binding",
+                &["actual `var a = 1;`"],
+            ),
+            (
+                "var x = 1;",
+                "export var x = 1;",
+                "binding-vs-export",
+                &["line 1"],
             ),
         ];
         for (expected, actual, category, mentions) in cases {
@@ -2152,6 +2217,12 @@ mod tests {
         );
         assert_eq!(family("f()", "f();"), family("g(1, 2)", "g(1, 2);"));
         assert_ne!(family("a = 1;", "a = 2;"), family("f()", "f();"));
+        assert_eq!(
+            family("// a", "var x = 1;"),
+            family("// b c", "let y = f(z);")
+        );
+        assert_ne!(family("// a", "var x = 1;"), family("// a", "class X {"));
+        assert_ne!(family("// a", "var x = 1;"), family("var x = 1;", "// a"));
         assert_ne!(family("a\nb", "a\nb\nc"), family("a\nb\nc", "a\nb"));
     }
 
