@@ -180,7 +180,7 @@ pub(super) fn parse_float<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let text = machine
-        .to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?
+        .coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?
         .to_utf8_lossy();
     Ok(BuiltinOutcome::Value(crate::number_value(
         number_format::parse_float(&text),
