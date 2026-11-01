@@ -2247,8 +2247,8 @@ fn it18_constructability_expected_table_sweep() {
     with_machine(|machine| {
         // Expected [[Construct]] presence per installed global, derived from
         // the B1 production registration census: every
-        // install_constructor_function site is true; every plain function,
-        // namespace object, and BigInt/Symbol is false.
+        // install_constructor_function site is true; every plain function
+        // and namespace object is false.
         const CONSTRUCTABLE: &[&str] = &[
             "Object",
             "Array",
@@ -2289,10 +2289,10 @@ fn it18_constructability_expected_table_sweep() {
             "Float64Array",
             "BigInt64Array",
             "BigUint64Array",
-        ];
-        const NON_CONSTRUCTABLE: &[&str] = &[
             "BigInt",
             "Symbol",
+        ];
+        const NON_CONSTRUCTABLE: &[&str] = &[
             "Reflect",
             "Math",
             "JSON",

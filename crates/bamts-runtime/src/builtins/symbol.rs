@@ -5,7 +5,7 @@ use bamts_native::Value;
 
 use super::{
     allocate_string, builtin_property, define_data, define_to_string_tag, heap_index,
-    install_function, type_error,
+    install_constructor_function, install_function, type_error,
 };
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey};
@@ -48,7 +48,7 @@ pub(super) fn install<H: Host>(
     builtins.set_symbol_unscopables(unscopables);
     builtins.set_symbol_prototype(prototype);
 
-    let constructor = install_function(heap, builtins, "Symbol", 0, constructor::<H>);
+    let constructor = install_constructor_function(heap, builtins, "Symbol", 0, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     let symbol_for = install_function(heap, builtins, "for", 1, symbol_for::<H>);
     define_native_property(heap, constructor, "for", symbol_for);
@@ -510,6 +510,29 @@ mod tests {
                 Property::Accessor { .. } => panic!("Symbol.{name} must be a data property"),
             }
         }
+    }
+
+    #[test]
+    fn symbol_has_construct_but_new_throws_from_the_function_body() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = machine.intrinsics.global("Symbol").unwrap();
+        assert!(
+            machine.is_constructor(symbol).unwrap(),
+            "an extends clause needs Symbol to have [[Construct]]"
+        );
+        assert!(matches!(
+            machine.construct_value(symbol, &[]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Symbol is not a constructor"
+            }))
+        ));
+        let result = machine.call_value(symbol, Value::UNDEFINED, &[]).unwrap();
+        assert!(
+            !machine.is_object(result),
+            "a plain call still returns a primitive symbol"
+        );
     }
 
     #[test]
