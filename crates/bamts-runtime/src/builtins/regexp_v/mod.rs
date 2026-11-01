@@ -377,10 +377,10 @@ impl CompiledV {
         self.names
             .iter()
             .map(|(public, internal)| {
-                let resolved = internal
-                    .iter()
-                    .filter_map(|name| matched.named.get(name).cloned().flatten())
-                    .next();
+                let resolved = internal.iter().find_map(|name| {
+                    let found = matched.named.iter().find(|(known, _)| known == name)?;
+                    found.1.clone()
+                });
                 (public.clone(), resolved)
             })
             .collect()

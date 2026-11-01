@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Range;
 
 use bamts_bytecode::EcmaString;
@@ -132,7 +132,8 @@ impl RegexError {
 pub(crate) struct Match {
     pub(crate) range: Range<usize>,
     pub(crate) captures: Vec<Option<Range<usize>>>,
-    pub(crate) named: BTreeMap<String, Option<Range<usize>>>,
+    /// Each group name once, in source order, with the group that participated.
+    pub(crate) named: Vec<(String, Option<Range<usize>>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -140,7 +141,7 @@ pub(crate) struct Regex {
     expression: Node,
     flags: Flags,
     capture_count: usize,
-    names: BTreeMap<String, usize>,
+    names: Vec<(String, Vec<usize>)>,
 }
 
 impl Regex {
@@ -187,7 +188,12 @@ impl Regex {
                 let named = self
                     .names
                     .iter()
-                    .map(|(name, index)| (name.clone(), matched.captures[*index].clone()))
+                    .map(|(name, indices)| {
+                        let participant = indices
+                            .iter()
+                            .find_map(|index| matched.captures[*index].clone());
+                        (name.clone(), participant)
+                    })
                     .collect();
                 return Ok(Some(Match {
                     range: position..matched.position,
@@ -309,12 +315,18 @@ impl Regex {
                 };
                 Ok(self.match_backreference(flags, input, range, state))
             }
-            Node::NamedBackReference(name) => match self.names.get(name) {
-                Some(index) => {
-                    Ok(self.match_node(flags, &Node::BackReference(*index), input, state)?)
+            Node::NamedBackReference(name) => {
+                let Some((_, indices)) = self.names.iter().find(|(known, _)| known == name) else {
+                    return Ok(Vec::new());
+                };
+                match indices
+                    .iter()
+                    .find_map(|index| state.captures[*index].clone())
+                {
+                    Some(range) => Ok(self.match_backreference(flags, input, range, state)),
+                    None => Ok(vec![state]),
                 }
-                None => Ok(Vec::new()),
-            },
+            }
             Node::Look {
                 body,
                 behind,
@@ -1014,7 +1026,10 @@ struct Parser<'a> {
     units: &'a [u16],
     position: usize,
     capture_count: usize,
-    names: BTreeMap<String, usize>,
+    names: Vec<(String, Vec<usize>)>,
+    /// Names that could already have matched at this point of the pattern. A
+    /// repeat within them is an error; a repeat in another alternative is not.
+    reachable_names: Vec<String>,
     unicode: bool,
     flags: Flags,
 }
@@ -1025,21 +1040,26 @@ impl<'a> Parser<'a> {
             units,
             position: 0,
             capture_count: 0,
-            names: BTreeMap::new(),
+            names: Vec::new(),
+            reachable_names: Vec::new(),
             unicode: flags.unicode,
             flags,
         }
     }
 
     fn parse_disjunction(&mut self, terminator: Option<u16>) -> Result<Node, RegexError> {
+        let reachable = self.reachable_names.len();
+        let mut branch_names = Vec::new();
         let mut branches = Vec::new();
         loop {
             branches.push(Node::Sequence(self.parse_sequence(terminator)?));
+            branch_names.extend(self.reachable_names.drain(reachable..));
             if self.peek() != Some(u16::from(b'|')) {
                 break;
             }
             self.position += 1;
         }
+        self.reachable_names.extend(branch_names);
         if branches.len() == 1 {
             Ok(branches.pop().expect("one branch"))
         } else {
@@ -1104,12 +1124,16 @@ impl<'a> Parser<'a> {
                     }
                     _ => {
                         let name = self.take_until(0x3e)?;
-                        if name.is_empty() || self.names.contains_key(&name) {
+                        if name.is_empty() || self.reachable_names.contains(&name) {
                             return Err(self.error("invalid duplicate capture group name"));
                         }
                         self.capture_count += 1;
                         index = Some(self.capture_count);
-                        self.names.insert(name, self.capture_count);
+                        self.reachable_names.push(name.clone());
+                        match self.names.iter_mut().find(|(known, _)| *known == name) {
+                            Some((_, indices)) => indices.push(self.capture_count),
+                            None => self.names.push((name, vec![self.capture_count])),
+                        }
                     }
                 },
                 Some(0x69 | 0x6d | 0x73 | 0x2d) => {
@@ -1601,8 +1625,39 @@ mod tests {
     }
 
     #[test]
+    fn a_group_name_may_repeat_only_across_alternatives() {
+        let regex = regex("(?<year>a)|(?<year>b)", "");
+        let matched = regex.exec(&text("b"), 0).unwrap().unwrap();
+        assert_eq!(matched.named, [("year".to_owned(), Some(0..1))]);
+        for pattern in ["(?<x>a)(?<x>b)", "(?<x>(?<x>a))", "(?:(?<x>a)|b)(?<x>c)"] {
+            assert!(
+                Regex::compile(&text(pattern), &text("")).is_err(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_groups_keep_source_order() {
+        let matched = regex("(?<z>a)(?<b>b)", "")
+            .exec(&text("ab"), 0)
+            .unwrap()
+            .unwrap();
+        let names: Vec<_> = matched
+            .named
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(names, ["z", "b"]);
+    }
+
+    #[test]
     fn each_repeat_iteration_forgets_the_captures_inside_it() {
         assert_eq!(ranges("(?:(a)|b)*", "", "ab"), [Some(0..2), None]);
+        assert_eq!(
+            ranges("(?:(?<x>a)|(?<x>b)){2}\\k<x>", "", "abb"),
+            [Some(0..3), None, Some(1..2)]
+        );
     }
 
     #[test]

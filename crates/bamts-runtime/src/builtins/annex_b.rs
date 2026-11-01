@@ -2383,7 +2383,7 @@ mod tests {
         let matched = Match {
             range: 3..6,
             captures: vec![None, Some(3..4), None, Some(5..6)],
-            named: std::collections::BTreeMap::new(),
+            named: Vec::new(),
         };
         record_legacy_match(&mut machine, &input, &matched).unwrap();
         for (property, expected) in [
