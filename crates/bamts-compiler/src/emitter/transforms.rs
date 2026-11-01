@@ -1576,13 +1576,19 @@ impl<'a> Rewriter<'a> {
                 {
                     return self.lower_sync_for_of(statement, for_of);
                 }
+                let binding = match &for_of.binding {
+                    ForBinding::Target(target) => {
+                        ForBinding::Target(self.rewrite_assignment_target(target))
+                    }
+                    binding @ ForBinding::Variable(_) => binding.clone(),
+                };
                 let iterable = self.rewrite_expr(&for_of.iterable);
                 let body = self.rewrite_single_statement(&for_of.body);
                 vec![self.node(
                     statement.range(),
                     Statement::ForOf(ForOfStatement {
                         mode: for_of.mode,
-                        binding: for_of.binding.clone(),
+                        binding,
                         iterable: Box::new(iterable),
                         body: Box::new(body),
                     }),
@@ -3355,10 +3361,12 @@ impl<'a> Rewriter<'a> {
                 } else {
                     self.syn_node(ctor.body.range(), Block { statements })
                 };
+                let parameters = self.rewrite_parameters(&ctor.parameters);
                 Some(self.syn_node(
                     existing.range(),
                     ClassMember::Constructor(ConstructorDeclaration {
                         body,
+                        parameters,
                         ..ctor.clone()
                     }),
                 ))
@@ -10826,6 +10834,34 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
              \x20   E.w = 1;\n\
              })(E || (E = {}));\n"
         );
+    }
+
+    #[test]
+    fn a_namespace_member_is_rewritten_wherever_it_is_used() {
+        let output = emit_at(
+            "namespace N {\n\
+             \x20   export var x = 1;\n\
+             \x20   export class C {\n\
+             \x20       constructor(public p = x) {}\n\
+             \x20       m(q = x) { return () => x + q; }\n\
+             \x20   }\n\
+             \x20   for (x of [1]) {}\n\
+             \x20   for (x in {}) {}\n\
+             \x20   function shadowed(x: number) { return x; }\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        for expected in [
+            "constructor(p = N.x)",
+            "m(q = N.x)",
+            "return () => N.x + q;",
+            "for (N.x of [1])",
+            "for (N.x in {})",
+            "function shadowed(x) { return x; }",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
     }
 
     #[test]
