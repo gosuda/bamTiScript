@@ -308,15 +308,10 @@ fn slice<H: Host>(
         integer(machine, args.first().copied().unwrap_or(Value::int32(0)))?,
         string.len_units(),
     );
-    let end = rel(
-        integer(
-            machine,
-            args.get(1)
-                .copied()
-                .unwrap_or(crate::number_value(string.len_units() as f64)),
-        )?,
-        string.len_units(),
-    );
+    let end = match args.get(1).copied() {
+        None | Some(Value::UNDEFINED) => string.len_units(),
+        Some(end) => rel(integer(machine, end)?, string.len_units()),
+    };
     let result = if end > start {
         string
             .slice_units(start..end)
@@ -435,8 +430,9 @@ fn starts_with<H: Host>(
         "String.prototype.startsWith cannot search for a RegExp",
     )?;
     let needle = machine.coerce_string_observable(search)?;
-    let position =
-        integer(machine, args.get(1).copied().unwrap_or(Value::int32(0)))?.max(0) as usize;
+    let position = (integer(machine, args.get(1).copied().unwrap_or(Value::int32(0)))?.max(0)
+        as usize)
+        .min(haystack.len_units());
     Ok(BuiltinOutcome::Value(Value::boolean(
         haystack
             .as_units()
