@@ -4,7 +4,10 @@
 
 use bamts_native::Value;
 
-use super::range_error;
+use super::{is_object, locale_record, range_error, type_error};
+use crate::intl::locale_data::DATA;
+use crate::intl::locale_negotiation::canonicalize_unicode_locale_id;
+use crate::intrinsics::builtins::array_es2023::{index_key, length_of_array_like};
 use crate::{EvalFailure, Host, Machine};
 
 /// A resolved options argument. `None` stands for the empty null-prototype
@@ -70,4 +73,54 @@ pub(super) fn boolean_option<H: Host>(
     } else {
         Ok(Some(machine.to_boolean(value)))
     }
+}
+
+/// CanonicalizeLocaleList. Elements are read and validated one at a time, so
+/// an invalid tag stops the walk before any later element is touched.
+pub(super) fn canonicalize_locale_list<H: Host>(
+    machine: &mut Machine<'_, H>,
+    locales: Value,
+) -> Result<Vec<String>, EvalFailure> {
+    let mut seen = Vec::new();
+    if locales == Value::UNDEFINED {
+        return Ok(seen);
+    }
+    if machine.string_value(locales).is_some() || locale_record(machine, locales)?.is_some() {
+        add_locale(machine, &mut seen, locales)?;
+        return Ok(seen);
+    }
+    let object = machine.value_to_object(locales)?;
+    let length = length_of_array_like(machine, object)?;
+    for index in 0..length {
+        let key = index_key(index);
+        if !machine.internal_has_property(object, &key)? {
+            continue;
+        }
+        let element = machine.get_property_key(object, &key)?;
+        if machine.string_value(element).is_none() && !is_object(machine, element)? {
+            return Err(type_error(
+                machine,
+                "a locale must be a string or an object",
+            ));
+        }
+        add_locale(machine, &mut seen, element)?;
+    }
+    Ok(seen)
+}
+
+fn add_locale<H: Host>(
+    machine: &mut Machine<'_, H>,
+    seen: &mut Vec<String>,
+    element: Value,
+) -> Result<(), EvalFailure> {
+    let tag = match locale_record(machine, element)? {
+        Some(tag) => tag.to_string(),
+        None => machine.coerce_string_observable(element)?.to_utf8_lossy(),
+    };
+    let canonical = canonicalize_unicode_locale_id(&tag, &*DATA)
+        .map_err(|error| range_error(machine, error.to_string()))?;
+    if !seen.contains(&canonical) {
+        seen.push(canonical);
+    }
+    Ok(())
 }

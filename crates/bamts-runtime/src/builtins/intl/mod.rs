@@ -15,6 +15,8 @@ use bamts_native::Value;
 use super::{
     allocate_array, allocate_string, define_data, install_constructor_function, install_function,
 };
+use crate::intl::canonical_locales;
+use crate::intl::locale_data::DATA;
 use crate::intl::locale_negotiation::LanguageTag;
 use crate::intl::{IntlKind, IntlObject};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
@@ -79,8 +81,42 @@ pub(super) fn install<H: Host>(
         let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
         builtins.set_intl_prototype(kind, prototype);
     }
+    let functions: [Method<H>; 2] = [
+        ("getCanonicalLocales", 1, get_canonical_locales::<H>),
+        ("supportedValuesOf", 1, supported_values_of::<H>),
+    ];
+    for (name, length, handler) in functions {
+        let function = install_function(heap, builtins, name, length, handler);
+        define_data(heap, namespace, name, function);
+    }
     locale::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Intl"), namespace);
+}
+
+/// `Intl.getCanonicalLocales`.
+fn get_canonical_locales<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let locales = options::canonicalize_locale_list(machine, arg(args, 0))?;
+    string_array_outcome(machine, &locales)
+}
+
+/// `Intl.supportedValuesOf`.
+fn supported_values_of<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let key = machine
+        .coerce_string_observable(arg(args, 0))?
+        .to_utf8_lossy();
+    let values = canonical_locales::supported_values_of(&key, &*DATA)
+        .map_err(|error| range_error(machine, error.message))?;
+    string_array_outcome(machine, &values)
 }
 
 fn throw<H: Host>(machine: &mut Machine<'_, H>, name: &str, message: String) -> EvalFailure {
