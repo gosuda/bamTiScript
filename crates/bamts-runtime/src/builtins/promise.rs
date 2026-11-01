@@ -106,12 +106,16 @@ pub(super) fn install<H: Host>(
     let race = install_function(heap, builtins, "race", 1, race::<H>);
     let all_settled = install_function(heap, builtins, "allSettled", 1, all_settled::<H>);
     let any = install_function(heap, builtins, "any", 1, any::<H>);
+    let try_method = install_function(heap, builtins, "try", 1, promise_try::<H>);
+    let with_resolvers = install_function(heap, builtins, "withResolvers", 0, with_resolvers::<H>);
     define_static(heap, constructor, "resolve", resolve);
     define_static(heap, constructor, "reject", reject);
     define_static(heap, constructor, "all", all);
     define_static(heap, constructor, "race", race);
     define_static(heap, constructor, "allSettled", all_settled);
     define_static(heap, constructor, "any", any);
+    define_static(heap, constructor, "try", try_method);
+    define_static(heap, constructor, "withResolvers", with_resolvers);
     builtins.set_promise_capability_executor(capability_executor);
     builtins.set_promise_finally_value(finally_value);
     builtins.set_promise_finally_throw(finally_throw);
@@ -227,7 +231,9 @@ fn capability_executor<H: Host>(
         }));
     }
     let record = args.first().copied().unwrap_or(Value::UNDEFINED);
-    if machine.get_named_property(record, "resolve")? != Value::UNDEFINED {
+    if machine.get_named_property(record, "resolve")? != Value::UNDEFINED
+        || machine.get_named_property(record, "reject")? != Value::UNDEFINED
+    {
         return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
             operation: "Promise capability executor",
         }));
@@ -458,6 +464,64 @@ fn reject<H: Host>(
         &[args.first().copied().unwrap_or(Value::UNDEFINED)],
     )?;
     Ok(BuiltinOutcome::Value(capability.promise))
+}
+
+/// `Promise.try(callback, ...args)`: a synchronous throw rejects the result
+/// rather than reaching the caller. The capability stays rooted across the
+/// callback, which can run arbitrary code.
+fn promise_try<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_constructor(this)? {
+        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "Promise.try",
+        }));
+    }
+    let capability = new_promise_capability(machine, this)?;
+    let depth = machine.native_roots.len();
+    machine.push_native_roots(
+        depth,
+        &[capability.promise, capability.resolve, capability.reject],
+    );
+    let callback = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let callback_args = args.get(1..).unwrap_or_default();
+    let outcome = match machine.call_value(callback, Value::UNDEFINED, callback_args) {
+        Ok(value) => machine
+            .call_value(capability.resolve, Value::UNDEFINED, &[value])
+            .map(|_| BuiltinOutcome::Value(capability.promise)),
+        Err(failure) => reject_capability_failure(machine, &capability, failure),
+    };
+    machine.pop_native_roots(depth);
+    outcome
+}
+
+/// `Promise.withResolvers()`: a capability exposed as an ordinary object.
+fn with_resolvers<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_constructor(this)? {
+        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "Promise.withResolvers",
+        }));
+    }
+    let capability = new_promise_capability(machine, this)?;
+    let prototype = machine.intrinsics.object_prototype;
+    let result = super::ordinary_runtime(machine, Some(prototype))?;
+    for (name, value) in [
+        ("promise", capability.promise),
+        ("resolve", capability.resolve),
+        ("reject", capability.reject),
+    ] {
+        let key = PropertyKey::Named(EcmaString::encode(name));
+        machine.create_data_property_key(result, key, value)?;
+    }
+    Ok(BuiltinOutcome::Value(result))
 }
 
 fn all<H: Host>(
@@ -1239,6 +1303,76 @@ mod tests {
     use super::*;
     use crate::intrinsics::BuiltinHandler;
     use crate::{Limits, PromiseState};
+
+    fn promise_state<'m>(machine: &'m Machine<'_, TestHost>, promise: Value) -> &'m PromiseState {
+        let index = machine.runtime_slot(promise).unwrap().unwrap();
+        let HeapEntry::Promise { state, .. } = &machine.heap[index] else {
+            panic!("expected a promise");
+        };
+        state
+    }
+
+    fn static_method(machine: &mut Machine<'_, TestHost>, name: &str) -> (Value, Value) {
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let method = machine.get_named_property(constructor, name).unwrap();
+        (constructor, method)
+    }
+
+    #[test]
+    fn promise_try_rejects_a_synchronous_throw_instead_of_propagating_it() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let (constructor, method) = static_method(&mut machine, "try");
+        let thrower = callback(&mut machine, "thrower", throw_99);
+        let promise = machine
+            .call_value(method, constructor, &[thrower])
+            .expect("the throw is captured by the promise");
+        assert!(matches!(
+            promise_state(&machine, promise),
+            PromiseState::Rejected { .. }
+        ));
+    }
+
+    #[test]
+    fn promise_try_and_with_resolvers_require_a_constructor() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let parse_int = machine.intrinsics.global("parseInt").unwrap();
+        for name in ["try", "withResolvers"] {
+            let (_, method) = static_method(&mut machine, name);
+            for receiver in [Value::UNDEFINED, parse_int] {
+                assert!(matches!(
+                    machine.call_value(method, receiver, &[]),
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn with_resolvers_exposes_a_working_capability() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let (constructor, method) = static_method(&mut machine, "withResolvers");
+        let record = machine.call_value(method, constructor, &[]).unwrap();
+        let promise = machine.get_named_property(record, "promise").unwrap();
+        let resolve = machine.get_named_property(record, "resolve").unwrap();
+        machine.get_named_property(record, "reject").unwrap();
+        assert!(matches!(
+            promise_state(&machine, promise),
+            PromiseState::Pending { .. }
+        ));
+        machine
+            .call_value(resolve, Value::UNDEFINED, &[Value::int32(1)])
+            .unwrap();
+        assert!(matches!(
+            promise_state(&machine, promise),
+            PromiseState::Fulfilled { .. }
+        ));
+    }
 
     fn callback(
         machine: &mut Machine<'_, TestHost>,
