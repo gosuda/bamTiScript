@@ -1040,6 +1040,20 @@ mod tests {
     }
 
     #[test]
+    fn a_property_reference_rejects_a_nullish_base_before_converting_its_key() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let key = ordinary_object(&mut machine);
+        for base in [Value::NULL, Value::UNDEFINED] {
+            assert!(matches!(
+                machine.computed_property_key(base, key),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        }
+    }
+
+    #[test]
     fn function_prototype_is_a_function_without_construct() {
         let module = blank_program("<test>");
         let mut host = TestHost;

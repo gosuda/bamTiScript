@@ -6683,16 +6683,17 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(None)
     }
 
-    /// Whether a function is non-strict ECMAScript code.
-    /// `ToPropertyKey` for a computed access. A null or undefined base fails
-    /// before the key converts, so that conversion runs no user code.
+    /// `ToPropertyKey` for a property reference. A null or undefined base throws
+    /// here, before the key converts, so that conversion runs no user code.
     pub(crate) fn computed_property_key(
         &mut self,
         object: Value,
         key: Value,
     ) -> Result<PropertyKey, EvalFailure> {
         if matches!(object.decode(), Some(Decoded::Undefined | Decoded::Null)) {
-            return self.to_property_key(key);
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "access a property of null or undefined",
+            }));
         }
         self.observable_property_key(key)
     }
