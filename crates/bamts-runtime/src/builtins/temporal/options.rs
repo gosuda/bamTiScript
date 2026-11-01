@@ -5,7 +5,9 @@
 use bamts_native::{Decoded, Value};
 
 use super::{OrThrow, is_object, range_error, type_error};
-use crate::temporal::instant_duration::{RoundingMode, Unit, UnitCategory};
+use crate::temporal::instant_duration::{
+    RoundingMode, Unit, UnitCategory, validate_rounding_increment,
+};
 use crate::temporal::now_rounding::{FractionalSecondDigits, SecondsStringPrecision};
 use crate::{EvalFailure, Host, Machine};
 
@@ -102,6 +104,23 @@ pub(super) fn rounding_increment_option<H: Host>(
         return Err(range_error(machine, "roundingIncrement is out of range"));
     }
     Ok(increment as i128)
+}
+
+/// ValidateTemporalRoundingIncrement for an explicit dividend.
+pub(super) fn validate_increment<H: Host>(
+    machine: &mut Machine<'_, H>,
+    increment: i128,
+    dividend: i128,
+    inclusive: bool,
+) -> Result<(), EvalFailure> {
+    let maximum = if inclusive { dividend } else { dividend - 1 };
+    if increment > maximum || dividend % increment != 0 {
+        return Err(range_error(
+            machine,
+            format!("roundingIncrement {increment} does not divide {dividend}"),
+        ));
+    }
+    Ok(())
 }
 
 /// GetTemporalFractionalSecondDigitsOption.
@@ -265,6 +284,78 @@ pub(super) fn validate_unit_value<H: Host>(
     } else {
         Err(range_error(machine, "unit is not allowed in this context"))
     }
+}
+
+/// Result of GetDifferenceSettings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DifferenceSettings {
+    pub(super) largest_unit: Unit,
+    pub(super) smallest_unit: Unit,
+    pub(super) rounding_increment: i128,
+    pub(super) rounding_mode: RoundingMode,
+}
+
+/// What varies between the classes' `GetDifferenceSettings` calls.
+#[derive(Clone, Copy)]
+pub(super) struct DifferencePolicy<'a> {
+    pub(super) group: UnitGroup,
+    pub(super) disallowed: &'a [Unit],
+    pub(super) fallback_smallest: Unit,
+    pub(super) smallest_largest_default: Unit,
+}
+
+/// GetDifferenceSettings. `since` negates the rounding mode: the operation
+/// computes in the `until` direction and negates afterward.
+pub(super) fn difference_settings<H: Host>(
+    machine: &mut Machine<'_, H>,
+    since: bool,
+    options: Options,
+    policy: DifferencePolicy<'_>,
+) -> Result<DifferenceSettings, EvalFailure> {
+    let largest = unit_valued_option(machine, options, "largestUnit")?;
+    let rounding_increment = rounding_increment_option(machine, options)?;
+    let mode = rounding_mode_option(machine, options, RoundingMode::Trunc)?;
+    let smallest = unit_valued_option(machine, options, "smallestUnit")?;
+    validate_unit_value(machine, largest, policy.group, Some(UnitOption::Auto))?;
+    if let UnitOption::Unit(unit) = largest
+        && policy.disallowed.contains(&unit)
+    {
+        return Err(range_error(
+            machine,
+            format!("largestUnit {} is not allowed here", unit.name()),
+        ));
+    }
+    validate_unit_value(machine, smallest, policy.group, None)?;
+    let smallest_unit = match smallest {
+        UnitOption::Unit(unit) => unit,
+        _ => policy.fallback_smallest,
+    };
+    if policy.disallowed.contains(&smallest_unit) {
+        return Err(range_error(
+            machine,
+            format!("smallestUnit {} is not allowed here", smallest_unit.name()),
+        ));
+    }
+    let default_largest = policy.smallest_largest_default.larger(smallest_unit);
+    let largest_unit = match largest {
+        UnitOption::Unit(unit) => unit,
+        _ => default_largest,
+    };
+    if largest_unit.larger(smallest_unit) != largest_unit {
+        return Err(range_error(
+            machine,
+            "smallestUnit must not be larger than largestUnit",
+        ));
+    }
+    if smallest_unit.max_rounding_increment().is_some() {
+        validate_rounding_increment(smallest_unit, rounding_increment, false).or_throw(machine)?;
+    }
+    Ok(DifferenceSettings {
+        largest_unit,
+        smallest_unit,
+        rounding_increment,
+        rounding_mode: if since { mode.negated() } else { mode },
+    })
 }
 
 /// ToSecondsStringPrecisionRecord. `smallestUnit` takes precedence, and a

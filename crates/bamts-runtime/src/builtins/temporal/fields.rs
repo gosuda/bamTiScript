@@ -8,7 +8,7 @@ use super::super::value_number;
 use super::options::Options;
 use super::{OrThrow, is_object, range_error, temporal_record, type_error};
 use crate::temporal::TemporalObject;
-use crate::temporal::instant_duration::{Duration, Overflow};
+use crate::temporal::instant_duration::{Duration, Instant, Overflow};
 use crate::temporal::parse::{
     UtcOffsetRecord, parse_calendar_string, parse_date_time_string, parse_date_time_utc_offset,
     parse_time_zone_string,
@@ -487,6 +487,24 @@ fn zoned_from_parsed<H: Host>(
             offset_match,
         },
     )
+}
+
+/// ToTemporalInstant.
+pub(super) fn to_temporal_instant<H: Host>(
+    machine: &mut Machine<'_, H>,
+    item: Value,
+) -> Result<Instant, EvalFailure> {
+    let mut primitive = item;
+    if is_object(machine, item)? {
+        match temporal_record(machine, item)? {
+            Some(TemporalObject::Instant(value)) => return Ok(value),
+            Some(TemporalObject::ZonedDateTime(zoned)) => return Ok(zoned.to_instant()),
+            _ => {}
+        }
+        primitive = machine.coerce_primitive_observable(item, true)?;
+    }
+    let text = require_string(machine, primitive, "instant")?;
+    Instant::parse(&text).or_throw(machine)
 }
 
 /// ToTemporalDuration.

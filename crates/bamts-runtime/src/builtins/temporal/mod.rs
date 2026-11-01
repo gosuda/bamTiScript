@@ -6,6 +6,7 @@
 
 mod duration;
 mod fields;
+mod instant;
 mod options;
 
 use std::collections::BTreeMap;
@@ -97,6 +98,7 @@ pub(super) fn install<H: Host>(
         builtins.set_temporal_prototype(kind, prototype);
     }
     duration::install(heap, builtins, namespace);
+    instant::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Temporal"), namespace);
 }
 
@@ -243,6 +245,29 @@ pub(super) fn value_of_throws<H: Host>(
         machine,
         "Temporal objects are not comparable with valueOf; use compare or equals",
     ))
+}
+
+/// The value of a BigInt the caller has already produced with ToBigInt. One
+/// too large for `i128` is out of every Temporal range.
+pub(super) fn bigint_to_i128<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<i128, EvalFailure> {
+    let text = super::bigint::bigint_from_value(machine, value)?
+        .expect("ToBigInt produces a BigInt")
+        .to_string_radix(10);
+    text.parse()
+        .map_err(|_| range_error(machine, "BigInt outside the Temporal range"))
+}
+
+pub(super) fn bigint_outcome<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: i128,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    machine
+        .allocate(HeapEntry::BigInt(value.to_string()))
+        .map(BuiltinOutcome::Value)
+        .map_err(EvalFailure::Runtime)
 }
 
 /// The argument at `index`, `undefined` when absent.
