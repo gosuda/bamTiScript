@@ -16,12 +16,12 @@ use crate::{
     source::{TextRange, Utf16Pos},
     syntax::{
         ArrayBindingElement, ArrayElement, AssignmentArrayElement, AssignmentOperator,
-        AssignmentTarget, AssignmentTargetNode, BindingPattern, BlockNode, CallArgument,
-        ClassDeclaration, ClassMember, ExportDeclaration, ExportDefaultValue, Expr, Expression,
-        ForBinding, ForInitializer, FunctionBody, FunctionLike, IdentifierNode, Literal,
-        MemberProperty, MetaProperty, ObjectMember, ParameterNode, Pattern, PrivateIdentifierNode,
-        PropertyModifier, PropertyName, SourceFile, Statement, Stmt, Token, TokenKind,
-        UnaryOperator, VariableKind,
+        AssignmentTarget, AssignmentTargetNode, BinaryOperator, BindingPattern, BlockNode,
+        CallArgument, ClassDeclaration, ClassMember, ExportDeclaration, ExportDefaultValue, Expr,
+        Expression, ForBinding, ForInitializer, FunctionBody, FunctionLike, IdentifierNode,
+        Literal, LogicalOperator, MemberProperty, MetaProperty, ObjectMember, ParameterNode,
+        Pattern, PrivateIdentifierNode, PropertyModifier, PropertyName, SourceFile, Statement,
+        Stmt, Token, TokenKind, UnaryOperator, VariableKind,
     },
 };
 
@@ -41,6 +41,47 @@ const STRICT_RESERVED: [&str; 9] = [
     "yield",
 ];
 
+/// Words no identifier can spell, even with escapes.
+const RESERVED: [&str; 37] = [
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "new",
+    "null",
+    "return",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+];
+
 /// Reports every early error in `file`.
 #[must_use]
 pub fn check(file: &SourceFile) -> Vec<Diagnostic> {
@@ -50,6 +91,8 @@ pub fn check(file: &SourceFile) -> Vec<Diagnostic> {
         Context {
             strict: module || has_use_strict(file, file.statements()),
             module,
+            // The host did not name a goal, and top-level `await` implies one.
+            top_level_await: true,
             ..Context::default()
         },
     )
@@ -106,6 +149,12 @@ struct Context {
     module: bool,
     /// The host named the goal, so `import.meta` is decidable.
     script: bool,
+    /// Inside a function body, where `return` is available.
+    in_function: bool,
+    /// At the top of a module, where `await` needs no async function.
+    top_level_await: bool,
+    /// Inside an async arrow's parameters, through any arrow nested there.
+    async_parameters: bool,
     generator: bool,
     is_async: bool,
     in_parameters: bool,
@@ -213,6 +262,36 @@ fn is_trivia(token: &Token) -> bool {
     )
 }
 
+/// Whether `text` holds an octal or `\\8`-style escape, which strict code and
+/// every untagged template refuse. `\\0` alone is the null character.
+fn has_legacy_escape(text: &str) -> bool {
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            continue;
+        }
+        match characters.next() {
+            Some('1'..='9') => return true,
+            Some('0') if characters.peek().is_some_and(char::is_ascii_digit) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a member chain passes through `?.`, which a tag cannot do.
+fn in_optional_chain(expression: &Expr) -> bool {
+    match expression.data() {
+        Expression::Member(member) => member.optional || in_optional_chain(&member.object),
+        Expression::Call(call) => call.optional || in_optional_chain(&call.callee),
+        _ => false,
+    }
+}
+
+const fn is_mixed_logical(outer: LogicalOperator, inner: LogicalOperator) -> bool {
+    matches!(outer, LogicalOperator::Nullish) != matches!(inner, LogicalOperator::Nullish)
+}
+
 /// Whether `expression` reads through an `import()` call, which `new` cannot
 /// apply to at any depth of a member chain.
 fn rooted_in_import(expression: &Expr) -> bool {
@@ -238,6 +317,32 @@ impl Walker<'_> {
             range,
             message,
         ));
+    }
+
+    /// The significant token at or after `position`.
+    fn next_token(&self, position: Utf16Pos) -> Option<&Token> {
+        let tokens = self.file.tokens();
+        let start = tokens.partition_point(|token| token.range().start() < position);
+        tokens[start..].iter().find(|token| !is_trivia(token))
+    }
+
+    /// Whether a comma follows `range`, which a rest element cannot have.
+    fn comma_follows(&self, range: TextRange) -> bool {
+        self.next_token(range.end())
+            .is_some_and(|token| token.kind() == TokenKind::Comma)
+    }
+
+    /// Whether parentheses wrap `range`, which a pattern cannot have.
+    fn is_parenthesized(&self, range: TextRange) -> bool {
+        self.previous_token(range.start())
+            .is_some_and(|token| token.kind() == TokenKind::LParen)
+            && self
+                .next_token(range.end())
+                .is_some_and(|token| token.kind() == TokenKind::RParen)
+    }
+
+    fn token_of(&self, token: &Token) -> &str {
+        self.file.token_text(token).unwrap_or_default()
     }
 
     /// The last significant token before `position`.
@@ -313,13 +418,21 @@ impl Walker<'_> {
     // --- Names -----------------------------------------------------------
 
     fn check_identifier(&mut self, name: &str, range: TextRange, context: Context) {
+        if name != "yield" && RESERVED.contains(&name) {
+            self.error(range, "a reserved word cannot name anything");
+        }
         if context.strict && STRICT_RESERVED.contains(&name) {
             self.error(range, "this name is reserved in strict mode code");
         }
         if name == "yield" && context.generator {
             self.error(range, "`yield` cannot name anything in a generator");
         }
-        if name == "await" && (context.is_async || context.module || context.static_block) {
+        if name == "await"
+            && (context.is_async
+                || context.module
+                || context.static_block
+                || context.async_parameters)
+        {
             self.error(range, "`await` cannot name anything here");
         }
     }
@@ -340,7 +453,7 @@ impl Walker<'_> {
             .token_text(identifier.data().token())
             .unwrap_or_default();
         if token.starts_with('#') {
-            self.private_reference(Self::cooked_private(token), identifier.range());
+            self.error(identifier.range(), "a private name needs `in` after it");
             return;
         }
         let name = self.name(identifier);
@@ -351,6 +464,15 @@ impl Walker<'_> {
                 "`arguments` is not available in a class initializer",
             );
         }
+    }
+
+    /// The name of a private identifier standing alone as an operand.
+    fn private_operand(&self, expression: &Expr) -> Option<String> {
+        let Expression::Identifier(identifier) = expression.data() else {
+            return None;
+        };
+        let token = self.file.token_text(identifier.data().token())?;
+        token.starts_with('#').then(|| Self::cooked_private(token))
     }
 
     fn private_reference(&mut self, name: String, range: TextRange) {
@@ -417,7 +539,9 @@ impl Walker<'_> {
                 let last = array.elements.len().saturating_sub(1);
                 for (position, element) in array.elements.iter().enumerate() {
                     if let ArrayBindingElement::Binding(binding) = element {
-                        if matches!(binding.data(), BindingPattern::Rest(_)) && position != last {
+                        if matches!(binding.data(), BindingPattern::Rest(_))
+                            && (position != last || self.comma_follows(binding.range()))
+                        {
                             self.error(binding.range(), "a rest element must come last");
                         }
                         self.pattern(binding, context);
@@ -645,6 +769,17 @@ impl Walker<'_> {
         self.statement(statement, context);
     }
 
+    /// Checks a branch of an `if`, where Annex B allows a function declaration
+    /// only if no label stands in front of it.
+    fn branch(&mut self, statement: &Stmt, context: Context) {
+        if matches!(statement.data(), Statement::Labeled(_))
+            && matches!(unlabeled(statement).data(), Statement::Function(_))
+        {
+            self.error(statement.range(), "a labeled function needs a block here");
+        }
+        self.substatement(statement, true, context);
+    }
+
     /// Whether a declaration in statement position is really one. `let` before
     /// a line break there is an identifier followed by a new statement, unless
     /// `[` comes next, which no statement may start after `let`.
@@ -693,6 +828,25 @@ impl Walker<'_> {
         }
     }
 
+    /// Reports a declarator a `const` or `using` statement cannot have. A
+    /// `for-in` or `for-of` head gets its value from the loop, so it is exempt.
+    fn check_declarators(&mut self, declaration: &crate::syntax::VariableDeclaration) {
+        let needs_value = !matches!(declaration.kind, VariableKind::Var | VariableKind::Let);
+        let using = matches!(
+            declaration.kind,
+            VariableKind::Using | VariableKind::AwaitUsing
+        );
+        for declarator in &declaration.declarations {
+            let declarator = declarator.data();
+            if needs_value && declarator.initializer.is_none() {
+                self.error(declarator.binding.range(), "this declaration needs a value");
+            }
+            if using && !matches!(declarator.binding.data(), BindingPattern::Identifier(_)) {
+                self.error(declarator.binding.range(), "`using` binds a single name");
+            }
+        }
+    }
+
     /// Reports a name a `for` head binds lexically that its body redeclares.
     fn check_for_head(&mut self, declaration: &crate::syntax::VariableDeclaration, body: &Stmt) {
         if matches!(declaration.kind, VariableKind::Var) {
@@ -719,16 +873,21 @@ impl Walker<'_> {
             ..context
         };
         match statement.data() {
-            Statement::Variable(declaration) => self.variable(declaration, context),
-            Statement::Function(function) => self.function(&function.function, false, context),
+            Statement::Variable(declaration) => {
+                self.check_declarators(declaration);
+                self.variable(declaration, context);
+            }
+            Statement::Function(function) => {
+                self.function(&function.function, false, false, context);
+            }
             Statement::Class(class) => self.class(class, context),
             Statement::Block(block) => self.block(block, context),
             Statement::Expression(expression) => self.expression(&expression.expression, context),
             Statement::If(conditional) => {
                 self.expression(&conditional.test, context);
-                self.substatement(&conditional.consequent, true, context);
+                self.branch(&conditional.consequent, context);
                 if let Some(alternate) = &conditional.alternate {
-                    self.substatement(alternate, true, context);
+                    self.branch(alternate, context);
                 }
             }
             Statement::Switch(switch) => {
@@ -748,6 +907,14 @@ impl Walker<'_> {
                         self.expression(test, context);
                     }
                     for statement in &case.data().consequent {
+                        if let Statement::Variable(declaration) = statement.data()
+                            && matches!(
+                                declaration.kind,
+                                VariableKind::Using | VariableKind::AwaitUsing
+                            )
+                        {
+                            self.error(statement.range(), "`using` needs a block here");
+                        }
                         self.statement(statement, inner);
                     }
                 }
@@ -755,6 +922,7 @@ impl Walker<'_> {
             Statement::For(for_statement) => {
                 match &for_statement.initializer {
                     Some(ForInitializer::Variable(declaration)) => {
+                        self.check_declarators(declaration);
                         self.check_for_head(declaration, &for_statement.body);
                         self.variable(declaration, context);
                     }
@@ -772,6 +940,14 @@ impl Walker<'_> {
                 self.substatement(&for_statement.body, false, looping);
             }
             Statement::ForIn(for_in) => {
+                if let ForBinding::Variable(declaration) = &for_in.binding
+                    && matches!(
+                        declaration.kind,
+                        VariableKind::Using | VariableKind::AwaitUsing
+                    )
+                {
+                    self.error(statement.range(), "`using` cannot head a `for-in` loop");
+                }
                 self.for_binding(&for_in.binding, &for_in.body, context);
                 self.expression(&for_in.object, context);
                 self.substatement(&for_in.body, false, looping);
@@ -866,6 +1042,9 @@ impl Walker<'_> {
                 None => {}
             },
             Statement::Return(return_statement) => {
+                if !context.in_function {
+                    self.error(statement.range(), "`return` needs a function");
+                }
                 if let Some(argument) = &return_statement.argument {
                     self.expression(argument, context);
                 }
@@ -889,7 +1068,9 @@ impl Walker<'_> {
     fn export(&mut self, export: &ExportDeclaration, context: Context) {
         if let ExportDeclaration::Default(default) = export {
             match &default.value {
-                ExportDefaultValue::Function(function) => self.function(function, false, context),
+                ExportDefaultValue::Function(function) => {
+                    self.function(function, false, false, context);
+                }
                 ExportDefaultValue::Class(class) => self.class(class, context),
                 ExportDefaultValue::Expression(expression) => {
                     self.expression(expression, context);
@@ -901,8 +1082,16 @@ impl Walker<'_> {
 
     // --- Functions and classes -------------------------------------------
 
-    /// Walks a non-arrow function. `method` allows `super.x` in it.
-    fn function(&mut self, function: &FunctionLike, method: bool, context: Context) {
+    /// Walks a non-arrow function. `method` allows `super.x` in it. An `expression`
+    /// binds its own name, so its own kind decides what that name can be; a
+    /// declaration's name belongs to the code around it.
+    fn function(
+        &mut self,
+        function: &FunctionLike,
+        method: bool,
+        expression: bool,
+        context: Context,
+    ) {
         let inner = Context {
             generator: function.is_generator,
             is_async: function.is_async,
@@ -918,16 +1107,16 @@ impl Walker<'_> {
                     .body
                     .as_ref()
                     .is_some_and(|body| self.body_is_strict(body));
-            self.check_binding(
-                &text,
-                name.range(),
+            let around = if expression {
                 Context {
-                    strict,
-                    generator: false,
-                    is_async: false,
+                    generator: function.is_generator,
+                    is_async: function.is_async,
                     ..context
-                },
-            );
+                }
+            } else {
+                context
+            };
+            self.check_binding(&text, name.range(), Context { strict, ..around });
         }
     }
 
@@ -938,6 +1127,7 @@ impl Walker<'_> {
             module: context.module,
             script: context.script,
             new_target: true,
+            in_function: true,
             ..Context::default()
         }
     }
@@ -980,7 +1170,7 @@ impl Walker<'_> {
         for (position, parameter) in parameters.iter().enumerate() {
             let data = parameter.data();
             if let BindingPattern::Rest(rest) = data.binding.data() {
-                if position != last {
+                if position != last || self.comma_follows(parameter.range()) {
                     self.error(parameter.range(), "a rest parameter must come last");
                 }
                 if data.initializer.is_some()
@@ -1086,7 +1276,7 @@ impl Walker<'_> {
                     if let PropertyName::Computed(key) = &method.name {
                         self.expression(key, context);
                     }
-                    self.function(&method.function, true, context);
+                    self.function(&method.function, true, false, context);
                 }
                 ClassMember::Property(property) => {
                     self.check_field_name(
@@ -1117,6 +1307,7 @@ impl Walker<'_> {
                 ClassMember::StaticBlock(block) => {
                     let inner = Context {
                         static_block: true,
+                        in_function: false,
                         ..Self::initializer_context(context)
                     };
                     let saved_labels = std::mem::take(&mut self.labels);
@@ -1236,7 +1427,7 @@ impl Walker<'_> {
                 self.member(&member.object, &member.property, context);
             }
             AssignmentTarget::Object(object) => {
-                if !patterns_allowed {
+                if !patterns_allowed || self.is_parenthesized(target.range()) {
                     self.error(target.range(), "this operator cannot assign to a pattern");
                 }
                 let last = object.properties.len().saturating_sub(1);
@@ -1265,7 +1456,7 @@ impl Walker<'_> {
                 }
             }
             AssignmentTarget::Array(array) => {
-                if !patterns_allowed {
+                if !patterns_allowed || self.is_parenthesized(target.range()) {
                     self.error(target.range(), "this operator cannot assign to a pattern");
                 }
                 let last = array.elements.len().saturating_sub(1);
@@ -1275,7 +1466,7 @@ impl Walker<'_> {
                             self.array_element(element, context);
                         }
                         AssignmentArrayElement::Rest(element) => {
-                            if position != last {
+                            if position != last || self.comma_follows(element.range()) {
                                 self.error(element.range(), "a rest element must come last");
                             }
                             if matches!(element.data(), AssignmentTarget::Invalid(_)) {
@@ -1352,6 +1543,12 @@ impl Walker<'_> {
         for member in members {
             match member.data() {
                 ObjectMember::Property(property) => {
+                    if property.shorthand
+                        && (!matches!(property.name, PropertyName::Identifier(_))
+                            || matches!(property.value.data(), Expression::Assignment(_)))
+                    {
+                        self.error(member.range(), "this shorthand needs a pattern around it");
+                    }
                     if let PropertyName::Computed(key) = &property.name {
                         self.expression(key, context);
                     }
@@ -1374,7 +1571,7 @@ impl Walker<'_> {
                     if let PropertyName::Computed(key) = &method.name {
                         self.expression(key, context);
                     }
-                    self.function(&method.function, true, context);
+                    self.function(&method.function, true, false, context);
                 }
                 ObjectMember::Spread(spread) => self.expression(&spread.argument, context),
                 ObjectMember::Missing(_) => {}
@@ -1386,12 +1583,37 @@ impl Walker<'_> {
         match expression.data() {
             Expression::Identifier(identifier) => self.reference(identifier, context),
             Expression::Super => self.error(expression.range(), "`super` is not available here"),
+            Expression::Literal(Literal::Number(literal)) if context.strict => {
+                let text = self.token_of(literal.data().token());
+                if text.len() > 1 && text.starts_with('0') && text.as_bytes()[1].is_ascii_digit() {
+                    self.error(
+                        expression.range(),
+                        "legacy octal is not allowed in strict code",
+                    );
+                }
+            }
+            Expression::Literal(Literal::String(literal)) if context.strict => {
+                if has_legacy_escape(self.token_of(literal.data().token())) {
+                    self.error(
+                        expression.range(),
+                        "legacy octal is not allowed in strict code",
+                    );
+                }
+            }
             Expression::Template(template) => {
+                for element in &template.elements {
+                    if has_legacy_escape(self.token_of(element.data().token())) {
+                        self.error(element.range(), "a template cannot use a legacy escape");
+                    }
+                }
                 for inner in &template.expressions {
                     self.expression(inner, context);
                 }
             }
             Expression::TaggedTemplate(tagged) => {
+                if in_optional_chain(&tagged.tag) {
+                    self.error(expression.range(), "a template cannot follow `?.`");
+                }
                 self.expression(&tagged.tag, context);
                 for inner in &tagged.template.expressions {
                     self.expression(inner, context);
@@ -1412,6 +1634,7 @@ impl Walker<'_> {
             Expression::Function(function) => self.function(
                 &function.function,
                 false,
+                true,
                 Context {
                     static_block: false,
                     ..context
@@ -1427,6 +1650,10 @@ impl Walker<'_> {
                     in_iteration: false,
                     in_switch: false,
                     in_parameters: false,
+                    in_function: true,
+                    top_level_await: false,
+                    async_parameters: context.async_parameters
+                        || (context.in_parameters && context.is_async),
                     ..context
                 };
                 self.callable(&arrow.parameters, Some(&arrow.body), inner);
@@ -1455,6 +1682,9 @@ impl Walker<'_> {
             Expression::Await(await_expression) => {
                 if context.in_parameters {
                     self.error(expression.range(), "`await` cannot appear in parameters");
+                }
+                if !context.is_async && !context.top_level_await {
+                    self.error(expression.range(), "`await` needs an async function");
                 }
                 self.expression(&await_expression.argument, context);
             }
@@ -1487,10 +1717,22 @@ impl Walker<'_> {
             }
             Expression::Update(update) => self.target(&update.argument, false, context),
             Expression::Binary(binary) => {
-                self.expression(&binary.left, context);
+                match self.private_operand(&binary.left) {
+                    Some(name) if binary.operator == BinaryOperator::In => {
+                        self.private_reference(name, binary.left.range());
+                    }
+                    _ => self.expression(&binary.left, context),
+                }
                 self.expression(&binary.right, context);
             }
             Expression::Logical(logical) => {
+                for side in [&logical.left, &logical.right] {
+                    if let Expression::Logical(inner) = side.data()
+                        && is_mixed_logical(logical.operator, inner.operator)
+                    {
+                        self.error(side.range(), "`??` cannot mix with `&&` or `||`");
+                    }
+                }
                 self.expression(&logical.left, context);
                 self.expression(&logical.right, context);
             }
@@ -1500,6 +1742,15 @@ impl Walker<'_> {
                 self.expression(&conditional.alternate, context);
             }
             Expression::Assignment(assignment) => {
+                if matches!(
+                    assignment.operator,
+                    AssignmentOperator::LogicalAndAssign
+                        | AssignmentOperator::LogicalOrAssign
+                        | AssignmentOperator::NullishAssign
+                ) && matches!(assignment.left.data(), AssignmentTarget::Invalid(_))
+                {
+                    self.error(assignment.left.range(), "this cannot be assigned to");
+                }
                 let patterns_allowed = assignment.operator == AssignmentOperator::Assign;
                 self.target(&assignment.left, patterns_allowed, context);
                 self.expression(&assignment.right, context);
@@ -1702,6 +1953,92 @@ mod tests {
             "async function f() { () => 1; }",
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn syntax_the_grammar_alone_cannot_refuse_is_refused() {
+        for source in [
+            "var x = ({ bre\\u0061k }) => {};",
+            "var this = 1;",
+            "\"use strict\"; 010;",
+            "\"use strict\"; '\\1';",
+            "\"use strict\"; '\\8';",
+            "function f() { '\\1'; 'use strict'; }",
+            "`\\8`;",
+            "`\\00`;",
+            "({ a = 1 });",
+            "({ 0 });",
+            "({ [a] });",
+            "(...a,) => {};",
+            "function f(...a,) {}",
+            "[...a,] = b;",
+            "let [...a,] = b;",
+            "const a;",
+            "for (const a;;) {}",
+            "{ using a; }",
+            "{ using a = null, [] = null; }",
+            "for (using a in b) {}",
+            "switch (0) { case 0: using a = null; }",
+            "return;",
+            "class C { static { return; } }",
+            "0 && 0 ?? 1;",
+            "0 ?? 0 || 1;",
+            "a?.b`c`;",
+            "f() &&= 1;",
+            "({}) = 1;",
+            "[a, ({ b })] = c;",
+            "if (0) a: function f() {}",
+            "class C { #a; m() { #a in #a in this; } }",
+            "class C { #a; m() { for (#a in []); } }",
+            "async(a = await => {}) => {};",
+            "(async function* await() {});",
+            "(async function* yield() {});",
+            "(function* yield() {});",
+            "async function f() { function await() {} }",
+        ] {
+            assert!(!errors(source).is_empty(), "{source} must be rejected");
+        }
+        for source in [
+            "'\\0'; 010; '\\1'; 09;",
+            "\"use strict\"; '\\0';",
+            "`\\0`;",
+            "a`\\8`;",
+            "({ a = 1 } = b);",
+            "[{ a = 1 }] = b;",
+            "({ a = 1 }) => a;",
+            "(...a) => {};",
+            "[...a, ] ;",
+            "for (const a of b) {}",
+            "for (const a in b) {}",
+            "{ using a = null; }",
+            "for (using a of b) {}",
+            "function f() { return; }",
+            "() => { return; };",
+            "class C { static { (() => { return; })(); } }",
+            "0 && (0 ?? 1);",
+            "(0 && 0) ?? 1;",
+            "a?.b.c;",
+            "f() = 1;",
+            "({ a } = b);",
+            "if (0) function f() {}",
+            "a: function f() {}",
+            "class C { #a; m() { return #a in this; } }",
+            "async function f() { await 0; }",
+            "async(a = 1) => {};",
+            "function await() {}",
+            "(function await() {});",
+            "(async function () { function yield() {} });",
+            "async function f() { (function await() {}); }",
+            "export {}; await 0;",
+            "function f() { return await(null); }",
+            "function await() {} await(1);",
+            "var await; await instanceof f;",
+            "await 0;",
+            "await f();",
+            "function f() { return g(await); }",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
     }
 
