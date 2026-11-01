@@ -11,9 +11,12 @@ use crate::temporal::TemporalObject;
 use crate::temporal::instant_duration::{Duration, Instant, Overflow};
 use crate::temporal::parse::{
     UtcOffsetRecord, parse_calendar_string, parse_date_time_string, parse_date_time_utc_offset,
-    parse_time_zone_string, parse_year_month_string,
+    parse_month_day_string, parse_time_zone_string, parse_year_month_string,
 };
-use crate::temporal::plain_types::{PlainDate, PlainDateTime, PlainTime, PlainYearMonth};
+use crate::temporal::plain_types::{
+    MONTH_DAY_REFERENCE_YEAR, PlainDate, PlainDateTime, PlainMonthDay, PlainTime, PlainYearMonth,
+    regulate_iso_date,
+};
 use crate::temporal::zoned_date_time::{
     CalendarId, Disambiguation, FixedOffsetTimeZones, IsoCalendarProvider, OffsetMatch,
     OffsetOption, ResolveOptions, TemporalProviders, TimeZoneId, UtcOffsetNanoseconds,
@@ -218,6 +221,15 @@ impl CalendarFields {
         Self {
             year: Some(f64::from(value.year)),
             month_code: Some(format!("M{:02}", value.month)),
+            ..Self::default()
+        }
+    }
+
+    /// ISODateToFields of type `month-day`.
+    pub(super) fn from_month_day(value: PlainMonthDay) -> Self {
+        Self {
+            month_code: Some(value.month_code()),
+            day: Some(f64::from(value.day)),
             ..Self::default()
         }
     }
@@ -466,6 +478,26 @@ pub(super) fn year_month_from_fields<H: Host>(
     PlainYearMonth::new(year, month as i64, overflow).or_throw(machine)
 }
 
+/// CalendarMonthDayFromFields. A `year`, when given, only decides which days
+/// the month has, and only its leap-ness matters: the result carries the
+/// reference year, so no year is too large to consult.
+pub(super) fn month_day_from_fields<H: Host>(
+    machine: &mut Machine<'_, H>,
+    fields: &CalendarFields,
+    overflow: Overflow,
+) -> Result<PlainMonthDay, EvalFailure> {
+    let Some(day) = fields.day else {
+        return Err(type_error(machine, "day is required"));
+    };
+    let month = resolve_month(machine, fields)?;
+    let year = fields.year.map_or(MONTH_DAY_REFERENCE_YEAR, |year| {
+        year.rem_euclid(400.0) as i32 + 2000
+    });
+    let (_, month, day) =
+        regulate_iso_date(year, month as i64, day as i64, overflow).or_throw(machine)?;
+    PlainMonthDay::new(month.into(), day.into(), Overflow::Reject).or_throw(machine)
+}
+
 /// RegulateTime over a fields record; absent fields are zero.
 pub(super) fn time_from_fields<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -682,6 +714,34 @@ pub(super) fn to_temporal_year_month<H: Host>(
     let calendar = parsed_calendar(machine, &parsed)?;
     read_overflow(machine, options)?;
     let value = PlainYearMonth::from_parsed(&parsed).or_throw(machine)?;
+    Ok((value, calendar))
+}
+
+/// ToTemporalMonthDay.
+pub(super) fn to_temporal_month_day<H: Host>(
+    machine: &mut Machine<'_, H>,
+    item: Value,
+    options: Value,
+) -> Result<(PlainMonthDay, CalendarId), EvalFailure> {
+    if is_object(machine, item)? {
+        if let Some(TemporalObject::PlainMonthDay { value, calendar }) =
+            temporal_record(machine, item)?
+        {
+            read_overflow(machine, options)?;
+            return Ok((value, calendar));
+        }
+        let calendar = calendar_with_iso_default(machine, item)?;
+        let fields = prepare_calendar_fields(machine, item, FieldNames::DATE, FieldNames::NONE)?;
+        let resolved = get_options_object(machine, options)?;
+        let overflow = overflow_option(machine, resolved)?;
+        let value = month_day_from_fields(machine, &fields, overflow)?;
+        return Ok((value, calendar));
+    }
+    let text = require_string(machine, item, "month-day")?;
+    let parsed = parse_month_day_string(&text).or_throw(machine)?;
+    let calendar = parsed_calendar(machine, &parsed)?;
+    read_overflow(machine, options)?;
+    let value = PlainMonthDay::from_parsed(&parsed).or_throw(machine)?;
     Ok((value, calendar))
 }
 
