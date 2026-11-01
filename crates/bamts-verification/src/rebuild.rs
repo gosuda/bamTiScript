@@ -114,7 +114,7 @@ pub(crate) fn is_generated_run_output(path: &[u8]) -> bool {
 }
 
 /// Schema tag the G0 ledger verifier requires.
-pub const LEDGER_SCHEMA: &str = "bamti.completeness-ledger/v1";
+pub const LEDGER_SCHEMA: &str = "bamti.completeness-ledger/v2";
 
 /// Closed ledger state vocabulary, in canonical declaration order.
 pub const LEDGER_STATES: [&str; 7] = [
@@ -947,14 +947,20 @@ fn receipt_label(receipt: &Path) -> String {
     receipt.display().to_string()
 }
 
+/// One published row. Prose exists only on non-PASS rows and the case is the
+/// tail of `id`, so a PASS row is these three fields: at the manifest's full size
+/// that keeps the ledger about half the size of writing every field.
 #[derive(Serialize)]
 struct LedgerRowOut<'a> {
-    case: &'a str,
     catalog: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
     citation: &'a str,
     id: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
     matcher: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
     owner: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
     reason: &'a str,
     state: &'a str,
 }
@@ -1097,7 +1103,6 @@ impl Projection<'_> {
 
             // One row is live at a time: encoded, written, and dropped.
             let row = LedgerRowOut {
-                case: &slot.identifier,
                 catalog: &slot.catalog,
                 citation: &prose.citation,
                 id: row_id,
@@ -2000,17 +2005,6 @@ mod tests {
         // Bounded memory: exactly one ledger row is live at any time.
         assert_eq!(report.max_live_rows, 1);
 
-        // The published artifact must stay under GitHub's 100 MiB blob limit at
-        // the manifest's full logical size.
-        const LOGICAL_IDENTIFIERS: u64 = 248_802;
-        let per_row = report.bytes / 2_000;
-        let projected = per_row * LOGICAL_IDENTIFIERS;
-        assert!(
-            projected < MAX_LEDGER_BYTES,
-            "projected {projected} bytes for {LOGICAL_IDENTIFIERS} rows at {per_row} bytes/row \
-             exceeds {MAX_LEDGER_BYTES}"
-        );
-
         // Compact encoding: no per-row pretty-printing reaches the artifact.
         let bytes = fs::read(&report.ledger_path).expect("published");
         let text = String::from_utf8(bytes).expect("utf8");
@@ -2089,8 +2083,69 @@ mod tests {
         assert!(report.is_clean(), "{:?}", report.rejections);
         let ledger: serde_json::Value =
             serde_json::from_slice(&fs::read(&report.ledger_path).expect("ledger")).expect("json");
-        assert_eq!(ledger["rows"][0]["state"], "PASS");
-        assert_eq!(ledger["rows"][0]["id"], format!("{CATALOG}:{declared}"));
+        assert_eq!(
+            ledger["rows"][0],
+            serde_json::json!({
+                "catalog": CATALOG,
+                "id": format!("{CATALOG}:{declared}"),
+                "state": "PASS",
+            }),
+            "a PASS row carries nothing the id does not already say"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_non_pass_row_keeps_its_policy_prose() {
+        let root = scratch("non-pass-row");
+        let declared = identity(0, "diagnostics");
+        let index = index_of(std::slice::from_ref(&declared));
+        let receipt = root.join("blocked.jsonl");
+        write_receipt(
+            &receipt,
+            &[row_with(
+                &declared,
+                TerminalState::ExternalBlocked,
+                &["diagnostics"],
+                &[],
+            )],
+            binding(),
+        );
+        let row_id = format!("{CATALOG}:{declared}");
+        let prose = BTreeMap::from([(
+            row_id.clone(),
+            LedgerProse {
+                citation: "citation".to_owned(),
+                owner: "owner".to_owned(),
+                reason: "reason".to_owned(),
+                matcher: "matcher".to_owned(),
+            },
+        )]);
+        let report = rebuild_projection(
+            &root,
+            &index,
+            DIGEST,
+            &[receipt],
+            RebuildMode::Write,
+            &expected_bindings(),
+            &prose,
+        )
+        .expect("rebuild");
+        assert!(report.is_clean(), "{:?}", report.rejections);
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report.ledger_path).expect("ledger")).expect("json");
+        assert_eq!(
+            ledger["rows"][0],
+            serde_json::json!({
+                "catalog": CATALOG,
+                "citation": "citation",
+                "id": row_id,
+                "matcher": "matcher",
+                "owner": "owner",
+                "reason": "reason",
+                "state": "EXTERNAL_BLOCKED",
+            })
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2282,8 +2337,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn every_manifest_identifier_is_reached_from_its_own_lane_key() {
+    /// The obligation universe of the committed manifest.
+    fn committed_index() -> ObligationIndex {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let path = root.join(MANIFEST_PATH);
         let bytes = read_bytes(&path).expect("manifest");
@@ -2300,6 +2355,47 @@ mod tests {
             .collect();
         let index = ObligationIndex::from_row_ids(&row_ids).expect("every identifier has a key");
         assert_eq!(index.len(), row_ids.len());
+        index
+    }
+
+    #[test]
+    fn a_full_ledger_of_the_committed_manifest_stays_under_ninety_megabytes() {
+        const TARGET_BYTES: u64 = 90_000_000;
+        let index = committed_index();
+        let outcomes: BTreeMap<String, ModeOutcomes> = index
+            .slots
+            .iter()
+            .map(|(row_id, slot)| {
+                let recorded = slot.modes.iter().map(|mode| {
+                    let outcome = Outcome {
+                        state: TerminalState::Pass,
+                        rejection: None,
+                    };
+                    (*mode, outcome)
+                });
+                (row_id.clone(), recorded.collect())
+            })
+            .collect();
+        let prose = BTreeMap::new();
+        let measured = Projection {
+            index: &index,
+            outcomes: &outcomes,
+            prose: &prose,
+            manifest_sha256: DIGEST,
+        }
+        .measure()
+        .expect("full ledger");
+        assert!(
+            measured.bytes < TARGET_BYTES,
+            "a full ledger is {} bytes",
+            measured.bytes
+        );
+        assert_eq!(measured.max_live_rows, 1);
+    }
+
+    #[test]
+    fn every_manifest_identifier_is_reached_from_its_own_lane_key() {
+        let index = committed_index();
         for (row_id, slot) in &index.slots {
             for mode in &slot.modes {
                 let obligation =

@@ -19,7 +19,9 @@ use serde::{
     de::{IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 
-use crate::{ErrorCode, VerificationError, leaf_evidence, schema::sha256_hex};
+use crate::{
+    ErrorCode, VerificationError, leaf_evidence, rebuild::LEDGER_SCHEMA, schema::sha256_hex,
+};
 
 const PROGRAM_PATH: &str = "verification/completion-program.toml";
 const COMPLETENESS_LEDGER_PATH: &str = "proof/completeness-ledger.json";
@@ -1163,7 +1165,7 @@ impl<'de> Visitor<'de> for LedgerVisitor<'_, '_> {
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "schema" => {
-                    schema_current = map.next_value::<String>()? == "bamti.completeness-ledger/v1";
+                    schema_current = map.next_value::<String>()? == LEDGER_SCHEMA;
                 }
                 "manifest_sha256" => {
                     manifest_current = map.next_value::<String>()? == self.scan.expected_manifest;
@@ -1483,7 +1485,7 @@ mod tests {
         fs::write(
             scratch.0.join(COMPLETENESS_LEDGER_PATH),
             format!(
-                "{{\"schema\":\"bamti.completeness-ledger/v1\",\"manifest_sha256\":\"{}\",\"rows\":[{{\"id\":\"test:case\",\"state\":\"{state}\"{surface}}}]}}",
+                "{{\"schema\":\"bamti.completeness-ledger/v2\",\"manifest_sha256\":\"{}\",\"rows\":[{{\"id\":\"test:case\",\"state\":\"{state}\"{surface}}}]}}",
                 sha256_hex(manifest)
             ),
         )
