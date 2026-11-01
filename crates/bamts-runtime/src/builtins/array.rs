@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
+use super::array_es2023;
 use super::{
     allocate_array, allocate_string, define_data, install_constructor_function, install_function,
     range_error, to_integer_or_infinity, type_error, value_number,
@@ -285,10 +286,32 @@ fn of<H: Host>(
         args.to_vec(),
     )?))
 }
-fn elements<H: Host>(machine: &Machine<'_, H>, this: Value) -> Result<Vec<Value>, EvalFailure> {
-    machine
-        .array_elements(this)?
-        .ok_or_else(|| type_error("Array method called on incompatible receiver"))
+/// The most elements a non-array receiver is read into a list for. A receiver may
+/// claim a length of 2^53 - 1.
+const MAX_ARRAY_LIKE_ELEMENTS: usize = 1 << 20;
+
+/// Reads `this` as a list. Array methods are generic, so any object with a length
+/// works; one that is not an array is read once, up front, with a missing index
+/// kept as a hole.
+fn elements<H: Host>(machine: &mut Machine<'_, H>, this: Value) -> Result<Vec<Value>, EvalFailure> {
+    if let Some(values) = machine.array_elements(this)? {
+        return Ok(values);
+    }
+    let object = array_es2023::to_object(machine, this)?;
+    let length = array_es2023::length_of_array_like(machine, object)?;
+    if length > MAX_ARRAY_LIKE_ELEMENTS {
+        return Err(type_error("Array method received too long an array-like"));
+    }
+    let mut values = Vec::with_capacity(length);
+    for index in 0..length {
+        let key = array_es2023::index_key(index);
+        values.push(if machine.internal_has_property(object, &key)? {
+            machine.get_property_key(object, &key)?
+        } else {
+            Value::HOLE
+        });
+    }
+    Ok(values)
 }
 /// Validates that `this` is an Array receiver without materializing its
 /// elements. The iterator factories only need receiver validation — the
@@ -304,12 +327,29 @@ fn array_slot<H: Host>(machine: &Machine<'_, H>, object: Value) -> Result<(), Ev
     }
     Ok(())
 }
+/// Writes `values` back to `this`, deleting what is no longer there.
 fn write_elements<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     values: Vec<Value>,
 ) -> Result<(), EvalFailure> {
-    machine.replace_array_elements(this, values)
+    if machine.array_len(this)?.is_some() {
+        return machine.replace_array_elements(this, values);
+    }
+    let object = array_es2023::to_object(machine, this)?;
+    let previous = array_es2023::length_of_array_like(machine, object)?;
+    for (index, value) in values.iter().enumerate() {
+        let key = array_es2023::index_key(index);
+        if *value == Value::HOLE {
+            machine.internal_delete(object, &key)?;
+        } else {
+            machine.set_data_property_key(object, key, *value)?;
+        }
+    }
+    for index in values.len()..previous.min(MAX_ARRAY_LIKE_ELEMENTS) {
+        machine.internal_delete(object, &array_es2023::index_key(index))?;
+    }
+    machine.set_data_property(object, "length", crate::number_value(values.len() as f64))
 }
 fn push<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -1882,6 +1922,95 @@ mod tests {
 
         let (done, _) = iter_next(&mut machine, iter);
         assert!(done);
+    }
+
+    fn call_prototype(
+        machine: &mut Machine<'_, TestHost>,
+        name: &str,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        let proto = machine.intrinsics.array_prototype;
+        let method = machine.get_named_property(proto, name)?;
+        machine.call_value(method, this, args)
+    }
+
+    #[test]
+    fn array_methods_read_any_object_with_a_length() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let like = ordinary_object(&mut machine);
+        machine
+            .set_data_property(like, "0", Value::int32(7))
+            .unwrap();
+        machine
+            .set_data_property(like, "2", Value::int32(9))
+            .unwrap();
+        machine
+            .set_data_property(like, "length", Value::int32(3))
+            .unwrap();
+
+        assert_eq!(
+            elements(&mut machine, like).unwrap(),
+            [Value::int32(7), Value::HOLE, Value::int32(9)],
+            "a missing index is a hole, not undefined"
+        );
+        assert_eq!(
+            call_prototype(&mut machine, "indexOf", like, &[Value::int32(9)]).unwrap(),
+            Value::int32(2)
+        );
+    }
+
+    #[test]
+    fn array_mutators_write_back_to_any_object_with_a_length() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let like = ordinary_object(&mut machine);
+        machine
+            .set_data_property(like, "0", Value::int32(1))
+            .unwrap();
+        machine
+            .set_data_property(like, "1", Value::int32(2))
+            .unwrap();
+        machine
+            .set_data_property(like, "length", Value::int32(2))
+            .unwrap();
+
+        call_prototype(&mut machine, "push", like, &[Value::int32(3)]).unwrap();
+        assert_eq!(
+            machine.get_named_property(like, "2").unwrap(),
+            Value::int32(3)
+        );
+        assert_eq!(
+            machine.get_named_property(like, "length").unwrap(),
+            Value::int32(3)
+        );
+
+        let popped = call_prototype(&mut machine, "pop", like, &[]).unwrap();
+        assert_eq!(popped, Value::int32(3));
+        let key = array_es2023::index_key(2);
+        assert!(
+            !machine.internal_has_property(like, &key).unwrap(),
+            "a removed element is deleted"
+        );
+        assert_eq!(
+            machine.get_named_property(like, "length").unwrap(),
+            Value::int32(2)
+        );
+    }
+
+    #[test]
+    fn an_absurd_array_like_length_is_refused_before_allocating() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let like = ordinary_object(&mut machine);
+        machine
+            .set_data_property(like, "length", crate::number_value(9_007_199_254_740_991.0))
+            .unwrap();
+        assert!(elements(&mut machine, like).is_err());
     }
 
     #[test]

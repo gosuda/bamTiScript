@@ -72,7 +72,10 @@ fn argument(args: &[Value], index: usize) -> Value {
     args.get(index).copied().unwrap_or(Value::UNDEFINED)
 }
 
-fn to_object<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<Value, EvalFailure> {
+pub(super) fn to_object<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<Value, EvalFailure> {
     machine.value_to_object(value)
 }
 
@@ -92,7 +95,7 @@ fn integer_or_infinity<H: Host>(
     })
 }
 
-fn length_of_array_like<H: Host>(
+pub(super) fn length_of_array_like<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
 ) -> Result<usize, EvalFailure> {
@@ -107,7 +110,7 @@ fn length_of_array_like<H: Host>(
     Ok(length.trunc().min(MAX_SAFE_INTEGER) as usize)
 }
 
-fn index_key(index: usize) -> PropertyKey {
+pub(super) fn index_key(index: usize) -> PropertyKey {
     PropertyKey::Named(EcmaString::encode(&index.to_string()))
 }
 
