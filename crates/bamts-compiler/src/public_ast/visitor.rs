@@ -837,7 +837,7 @@ where
             }
             visit_node(NodeRef::TypeAnnotation(&signature.type_annotation), visitor)?;
         }
-        ClassMember::Missing(_) => {}
+        ClassMember::Missing(_) | ClassMember::Semicolon => {}
     }
     ControlFlow::Continue(())
 }

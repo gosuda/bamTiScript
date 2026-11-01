@@ -9212,7 +9212,7 @@ impl<'a> FunctionContext<'a> {
                 static_inits.push(StaticInit::Block(block.clone()));
                 Ok(())
             }
-            ClassMember::IndexSignature(_) => Ok(()),
+            ClassMember::IndexSignature(_) | ClassMember::Semicolon => Ok(()),
             ClassMember::Missing(missing) => Err(self.missing(range, missing.expected())),
         }
     }

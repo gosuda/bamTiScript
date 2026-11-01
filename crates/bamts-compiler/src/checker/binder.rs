@@ -8013,7 +8013,7 @@ impl<'src> Binder<'src> {
                         index.type_annotation.data().type_node.as_ref(),
                     );
                 }
-                crate::syntax::ClassMember::Missing(_) => {}
+                crate::syntax::ClassMember::Missing(_) | crate::syntax::ClassMember::Semicolon => {}
             }
         }
         Ok(())
@@ -12148,7 +12148,9 @@ impl<'src> Binder<'src> {
                         inventory,
                     );
                 }
-                ClassMember::IndexSignature(_) | ClassMember::Missing(_) => {}
+                ClassMember::IndexSignature(_)
+                | ClassMember::Missing(_)
+                | ClassMember::Semicolon => {}
             }
         }
         if local_name.is_some() {
@@ -16227,7 +16229,8 @@ impl<'src> Binder<'src> {
             ClassMember::Method(_)
             | ClassMember::Constructor(_)
             | ClassMember::StaticBlock(_)
-            | ClassMember::Missing(_) => {}
+            | ClassMember::Missing(_)
+            | ClassMember::Semicolon => {}
         }
     }
 

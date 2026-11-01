@@ -1803,7 +1803,9 @@ impl DynamicEdgeCollector<'_> {
                     }
                 }
                 ClassMember::StaticBlock(block) => self.scan_statements(&block.data().statements),
-                ClassMember::IndexSignature(_) | ClassMember::Missing(_) => {}
+                ClassMember::IndexSignature(_)
+                | ClassMember::Missing(_)
+                | ClassMember::Semicolon => {}
             }
         }
     }

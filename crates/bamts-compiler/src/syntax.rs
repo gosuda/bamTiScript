@@ -1071,6 +1071,8 @@ pub enum ClassMember {
     StaticBlock(BlockNode),
     IndexSignature(IndexSignature),
     Missing(MissingNode),
+    /// A bare `;` between members. It declares nothing, and emit keeps it.
+    Semicolon,
 }
 
 impl NodeData for ClassMember {

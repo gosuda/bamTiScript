@@ -1347,7 +1347,8 @@ fn canonical_class_member(member: &ClassMemberNode, file: &SourceFile) -> (DeclI
         ClassMember::Constructor(_)
         | ClassMember::StaticBlock(_)
         | ClassMember::IndexSignature(_)
-        | ClassMember::Missing(_) => DeclIdentity::Anonymous,
+        | ClassMember::Missing(_)
+        | ClassMember::Semicolon => DeclIdentity::Anonymous,
         ClassMember::Method(method) => property_identity(&method.name, file),
         ClassMember::Property(property) => property_identity(&property.name, file),
         ClassMember::AutoAccessor(accessor) => property_identity(&accessor.name, file),
@@ -1380,9 +1381,10 @@ fn canonical_class_member(member: &ClassMemberNode, file: &SourceFile) -> (DeclI
             children.push(&*index.type_annotation.data().type_node);
             rebuild_children(file, member.range(), children)
         }
-        ClassMember::Constructor(_) | ClassMember::StaticBlock(_) | ClassMember::Missing(_) => {
-            slice_node(file, member.range())
-        }
+        ClassMember::Constructor(_)
+        | ClassMember::StaticBlock(_)
+        | ClassMember::Missing(_)
+        | ClassMember::Semicolon => slice_node(file, member.range()),
     };
     (identity, raw)
 }

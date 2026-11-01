@@ -1994,7 +1994,13 @@ impl Parser {
                 break;
             }
             let before = self.cursor;
-            let member = self.parse_class_member();
+            let member = if self.at(TokenKind::Semicolon) {
+                let start = self.cur_start();
+                self.bump();
+                self.node(start, ClassMember::Semicolon)
+            } else {
+                self.parse_class_member()
+            };
             members.push(member);
             if self.cursor == before {
                 let skipped = self.bump();
@@ -6953,6 +6959,27 @@ mod tests {
             assert_eq!(recovered.product().script_kind(), kind);
             assert_eq!(recovered.product().source_id(), SourceId::new(0));
         }
+    }
+
+    #[test]
+    fn a_bare_semicolon_is_a_class_member() {
+        for source in [
+            "class C { ; }",
+            "class C { ;;; }",
+            "class C { a() {}; b = 1;; static c() {} ; }",
+            "class C { #a() {}; get #b() { return 1; }; }",
+        ] {
+            assert_clean(source);
+        }
+        let recovered = assert_clean("class C { a() {}; }");
+        let Statement::Class(class) = recovered.product().statements()[0].data() else {
+            panic!("expected a class");
+        };
+        let members: Vec<_> = class.members.iter().map(|member| member.data()).collect();
+        assert!(matches!(
+            members[..],
+            [ClassMember::Method(_), ClassMember::Semicolon]
+        ));
     }
 
     #[test]

@@ -3044,7 +3044,8 @@ impl<'a> Rewriter<'a> {
                 ClassMember::Constructor(_)
                 | ClassMember::StaticBlock(_)
                 | ClassMember::IndexSignature(_)
-                | ClassMember::Missing(_) => None,
+                | ClassMember::Missing(_)
+                | ClassMember::Semicolon => None,
             };
             name.is_some_and(|name| matches!(name, PropertyName::Computed(_)))
         });
@@ -3159,7 +3160,9 @@ impl<'a> Rewriter<'a> {
                         self.node(block.range(), Block { statements }),
                     ));
                 }
-                ClassMember::IndexSignature(_) | ClassMember::Missing(_) => {
+                ClassMember::IndexSignature(_)
+                | ClassMember::Missing(_)
+                | ClassMember::Semicolon => {
                     members.push(member.clone());
                 }
             }

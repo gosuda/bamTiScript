@@ -2507,7 +2507,9 @@ impl<'a> Emitter<'a> {
 
     fn class_member_emits_js(&self, member: &ClassMember) -> bool {
         match member {
-            ClassMember::Constructor(_) | ClassMember::StaticBlock(_) => true,
+            ClassMember::Constructor(_) | ClassMember::StaticBlock(_) | ClassMember::Semicolon => {
+                true
+            }
             ClassMember::Method(method) => {
                 method.function.body.is_some() && !method.modifiers.is_abstract
             }
@@ -2578,6 +2580,10 @@ impl<'a> Emitter<'a> {
             ClassMember::Missing(_) => {
                 self.diag_here(codes::MISSING_MEMBER, "cannot emit a missing class member");
                 false
+            }
+            ClassMember::Semicolon => {
+                self.raw(";");
+                true
             }
         }
     }
@@ -4362,7 +4368,7 @@ impl<'a> Emitter<'a> {
     fn class_member_emits_decl(&self, member: &ClassMember) -> bool {
         !matches!(
             member,
-            ClassMember::StaticBlock(_) | ClassMember::Missing(_)
+            ClassMember::StaticBlock(_) | ClassMember::Missing(_) | ClassMember::Semicolon
         )
     }
 
@@ -4442,7 +4448,7 @@ impl<'a> Emitter<'a> {
                 self.raw(";");
                 true
             }
-            ClassMember::StaticBlock(_) => false,
+            ClassMember::StaticBlock(_) | ClassMember::Semicolon => false,
             ClassMember::Missing(_) => {
                 self.diag_here(codes::MISSING_MEMBER, "cannot emit a missing class member");
                 false
@@ -5982,6 +5988,27 @@ export default answer;
 
         let output = emit_output(parsed.product(), &EmitOptions::default());
         assert_eq!(javascript(&output).code, "");
+    }
+
+    #[test]
+    fn a_bare_class_semicolon_survives_javascript_and_not_declarations() {
+        // Authority: `classWithSemicolonClassElement1` and `2` keep each `;`.
+        let input = "export class C {\n    ;\n    ;\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(!output.has_errors());
+        assert_eq!(
+            javascript(&output).code,
+            "export class C {\n    ;\n    ;\n}\n"
+        );
+        let declaration = emit_declaration(parsed.product());
+        assert!(!declaration.has_errors());
+        assert!(!format!("{declaration:?}").contains(";\\n    ;"));
     }
 
     #[test]
