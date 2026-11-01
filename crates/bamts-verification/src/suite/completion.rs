@@ -348,24 +348,10 @@ pub fn materialize_obligations(
         ));
     }
     let mode = runner.execution_mode();
-    let mut obligations = Vec::with_capacity(identifiers.len());
-    let authority_prefix = format!("{catalog}/");
-    for identifier in identifiers {
-        let (case, configuration, observables) = parse_logical_identifier(catalog, identifier)?;
-        // TS/test262 cases are `runner/path` tokens after the authority
-        // prefix; every other family keeps its own identity segments.
-        let key = ObligationKey::new(
-            catalog,
-            case.strip_prefix(authority_prefix.as_str())
-                .map(str::to_owned)
-                .unwrap_or(case.clone()),
-            configuration,
-            mode,
-            platform,
-        )?;
-        let _ = authority_prefix;
-        obligations.push(LogicalObligation { key, observables });
-    }
+    let mut obligations = identifiers
+        .iter()
+        .map(|identifier| logical_obligation(catalog, identifier, mode, platform))
+        .collect::<Result<Vec<_>>>()?;
     obligations.sort_by(|left, right| left.key.cmp(&right.key));
     validate_catalog(
         &obligations
@@ -374,6 +360,25 @@ pub fn materialize_obligations(
             .collect::<Vec<_>>(),
     )?;
     Ok(obligations)
+}
+
+/// The lane key that proves one manifest identifier in `mode` on `platform`,
+/// with its declared observables. This is the one mapping between the two
+/// names of an obligation: receipts carry the key, the manifest the identifier.
+pub(crate) fn logical_obligation(
+    catalog: &str,
+    identifier: &str,
+    mode: crate::shard::ExecutionMode,
+    platform: &str,
+) -> Result<LogicalObligation> {
+    let (case, configuration, observables) = parse_logical_identifier(catalog, identifier)?;
+    // TS/test262 cases are `runner/path` tokens after the authority
+    // prefix; every other family keeps its own identity segments.
+    let case = case
+        .strip_prefix(&format!("{catalog}/"))
+        .map_or_else(|| case.clone(), str::to_owned);
+    let key = ObligationKey::new(catalog, case, configuration, mode, platform)?;
+    Ok(LogicalObligation { key, observables })
 }
 
 /// Splits one logical identifier into〈case, configuration, observables〉.
@@ -413,18 +418,14 @@ fn parse_logical_identifier(
             BTreeSet::from([(*observable).to_owned()]),
         ));
     }
-    if identifier.contains("::") {
-        let segments: Vec<&str> = identifier.split("::").collect();
-        let [locator, name] = segments.as_slice() else {
-            return Err(reject());
-        };
+    if let Some((locator, name)) = identifier.split_once("::") {
         if locator.is_empty() || name.is_empty() {
             return Err(reject());
         }
         return Ok((
-            (*locator).to_owned(),
-            (*name).to_owned(),
-            BTreeSet::from([(*name).to_owned()]),
+            locator.to_owned(),
+            name.to_owned(),
+            BTreeSet::from([name.to_owned()]),
         ));
     }
     if identifier.is_empty() {
@@ -2351,6 +2352,21 @@ mod tests {
         assert_eq!(
             head.expected_count() + tail.expected_count() + 3,
             keys.len() + 1
+        );
+    }
+
+    #[test]
+    fn a_formal_name_may_itself_contain_the_separator() {
+        let (case, configuration, observables) = parse_logical_identifier(
+            "formal-redex",
+            "ecmascript/semantics.rkt::rule::property_get",
+        )
+        .expect("the manifest declares identifiers of this shape");
+        assert_eq!(case, "ecmascript/semantics.rkt");
+        assert_eq!(configuration, "rule::property_get");
+        assert_eq!(
+            observables,
+            BTreeSet::from(["rule::property_get".to_owned()])
         );
     }
 
