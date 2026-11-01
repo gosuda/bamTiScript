@@ -919,6 +919,8 @@ const fn accessor_kind_selector(kind: AccessorKind) -> i64 {
     match kind {
         AccessorKind::Getter => 0,
         AccessorKind::Setter => 1,
+        AccessorKind::ClassGetter => 2,
+        AccessorKind::ClassSetter => 3,
     }
 }
 

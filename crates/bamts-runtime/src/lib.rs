@@ -9775,21 +9775,25 @@ impl<'a, H: Host> Machine<'a, H> {
                     _ => unreachable!("validated object cannot change heap entry kind"),
                 };
                 match properties.get_mut(&key) {
-                    Some(Property::Accessor { getter, setter, .. }) => match kind {
-                        AccessorKind::Getter => *getter = Some(accessor),
-                        AccessorKind::Setter => *setter = Some(accessor),
-                    },
+                    Some(Property::Accessor { getter, setter, .. }) => {
+                        if kind.is_getter() {
+                            *getter = Some(accessor);
+                        } else {
+                            *setter = Some(accessor);
+                        }
+                    }
                     Some(Property::Data { .. }) | None => {
-                        let (getter, setter) = match kind {
-                            AccessorKind::Getter => (Some(accessor), None),
-                            AccessorKind::Setter => (None, Some(accessor)),
+                        let (getter, setter) = if kind.is_getter() {
+                            (Some(accessor), None)
+                        } else {
+                            (None, Some(accessor))
                         };
                         properties.insert(
                             key,
                             Property::Accessor {
                                 getter,
                                 setter,
-                                enumerable: true,
+                                enumerable: kind.is_enumerable(),
                                 configurable: true,
                             },
                         );
@@ -13487,6 +13491,8 @@ pub(crate) fn accessor_from_selector(kind: u32) -> Option<AccessorKind> {
     match kind {
         0 => Some(AccessorKind::Getter),
         1 => Some(AccessorKind::Setter),
+        2 => Some(AccessorKind::ClassGetter),
+        3 => Some(AccessorKind::ClassSetter),
         _ => None,
     }
 }
@@ -14192,6 +14198,52 @@ mod tests {
             machine.heap[machine.runtime_slot(callback).unwrap().unwrap()],
             HeapEntry::Function { .. }
         ));
+    }
+
+    #[test]
+    fn a_class_accessor_is_hidden_and_stays_hidden_when_its_other_half_arrives() {
+        with_machine(Limits::default(), |machine| {
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    extensible: true,
+                    boxed_primitive: None,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(object).unwrap().unwrap();
+            let key = PropertyKey::Named(EcmaString::encode("value"));
+            let enumerable = |machine: &Machine<'_, TestHost>| match &machine.heap[index] {
+                HeapEntry::Object { properties, .. } => properties
+                    .get(&PropertyKey::Named(EcmaString::encode("value")))
+                    .map(Property::enumerable),
+                _ => None,
+            };
+            machine
+                .define_accessor(
+                    object,
+                    key.clone(),
+                    Value::int32(1),
+                    AccessorKind::ClassGetter,
+                )
+                .unwrap();
+            assert_eq!(enumerable(machine), Some(false));
+            machine
+                .define_accessor(object, key, Value::int32(2), AccessorKind::ClassSetter)
+                .unwrap();
+            assert_eq!(enumerable(machine), Some(false));
+            let HeapEntry::Object { properties, .. } = &machine.heap[index] else {
+                panic!("expected an object");
+            };
+            assert!(matches!(
+                properties.get(&PropertyKey::Named(EcmaString::encode("value"))),
+                Some(Property::Accessor {
+                    getter: Some(_),
+                    setter: Some(_),
+                    ..
+                })
+            ));
+        });
     }
 
     #[test]

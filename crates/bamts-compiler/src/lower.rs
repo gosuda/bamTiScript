@@ -5280,6 +5280,37 @@ impl<'a> FunctionContext<'a> {
         }
         Ok(())
     }
+    /// Installs a method or accessor on a class, where neither is enumerable.
+    fn install_class_method(
+        &mut self,
+        range: TextRange,
+        object: Register,
+        key: Register,
+        value: Register,
+        modifier: PropertyModifier,
+    ) -> Result<(), LowerError> {
+        let kind = match modifier {
+            PropertyModifier::None => {
+                self.emit(
+                    range,
+                    Instruction::DefineDataProperty { object, key, value },
+                )?;
+                return Ok(());
+            }
+            PropertyModifier::Get => AccessorKind::ClassGetter,
+            PropertyModifier::Set => AccessorKind::ClassSetter,
+        };
+        self.emit(
+            range,
+            Instruction::DefineAccessor {
+                object,
+                key,
+                accessor: value,
+                kind,
+            },
+        )?;
+        Ok(())
+    }
     fn set_named_entry(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -8983,7 +9014,7 @@ impl<'a> FunctionContext<'a> {
                     None => self.property_key(builder, &method.name)?,
                 };
                 let value = self.build_function_value(builder, range, None, &method.function)?;
-                self.install_property(builder, range, target, key, value, method.modifier)?;
+                self.install_class_method(range, target, key, value, method.modifier)?;
                 let Some(lowered) = decorators.filter(|d| !d.decorators.is_empty()) else {
                     return Ok(());
                 };
@@ -9126,7 +9157,7 @@ impl<'a> FunctionContext<'a> {
                         object: target,
                         key: public_key,
                         accessor: generated_get,
-                        kind: AccessorKind::Getter,
+                        kind: AccessorKind::ClassGetter,
                     },
                 )?;
                 self.emit(
@@ -9135,7 +9166,7 @@ impl<'a> FunctionContext<'a> {
                         object: target,
                         key: public_key,
                         accessor: generated_set,
-                        kind: AccessorKind::Setter,
+                        kind: AccessorKind::ClassSetter,
                     },
                 )?;
                 let Some(lowered) = decorators.filter(|d| !d.decorators.is_empty()) else {
@@ -14163,6 +14194,33 @@ mod tests {
             Instruction::CreateRegExp { .. }
         )));
     }
+    #[test]
+    fn class_methods_are_defined_as_hidden_and_object_methods_are_not() {
+        let class = lower_js("class C { m() {} get v() { return 1; } set v(x) {} }");
+        assert!(any_instruction(&class, |i| matches!(
+            i,
+            Instruction::DefineDataProperty { .. }
+        )));
+        for expected in [
+            bamts_bytecode::AccessorKind::ClassGetter,
+            bamts_bytecode::AccessorKind::ClassSetter,
+        ] {
+            assert!(any_instruction(&class, |i| matches!(
+                i,
+                Instruction::DefineAccessor { kind, .. } if *kind == expected
+            )));
+        }
+        let object = lower_js("var o = { m() {}, get v() { return 1; } };");
+        assert!(!any_instruction(&object, |i| matches!(
+            i,
+            Instruction::DefineDataProperty { .. }
+        )));
+        assert!(any_instruction(&object, |i| matches!(
+            i,
+            Instruction::DefineAccessor { kind, .. } if *kind == bamts_bytecode::AccessorKind::Getter
+        )));
+    }
+
     #[test]
     fn class_with_extends_builds_prototype_chain() {
         let module = lower_js("class B {} class C extends B { m() { return 1; } }");

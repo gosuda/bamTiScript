@@ -149,6 +149,8 @@ fn accessor_to_selector(kind: bamts_bytecode::AccessorKind) -> u32 {
     match kind {
         AccessorKind::Getter => 0,
         AccessorKind::Setter => 1,
+        AccessorKind::ClassGetter => 2,
+        AccessorKind::ClassSetter => 3,
     }
 }
 

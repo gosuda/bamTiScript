@@ -581,6 +581,10 @@ impl DisposeHint {
 pub enum AccessorKind {
     Getter,
     Setter,
+    /// A [`Self::Getter`] on a class, whose accessors are not enumerable.
+    ClassGetter,
+    /// A [`Self::Setter`] on a class, whose accessors are not enumerable.
+    ClassSetter,
 }
 
 impl AccessorKind {
@@ -588,6 +592,8 @@ impl AccessorKind {
         match self {
             Self::Getter => 0,
             Self::Setter => 1,
+            Self::ClassGetter => 2,
+            Self::ClassSetter => 3,
         }
     }
 
@@ -595,8 +601,22 @@ impl AccessorKind {
         match tag {
             0 => Some(Self::Getter),
             1 => Some(Self::Setter),
+            2 => Some(Self::ClassGetter),
+            3 => Some(Self::ClassSetter),
             _ => None,
         }
+    }
+
+    /// Whether this installs the getter half of the descriptor.
+    #[must_use]
+    pub const fn is_getter(self) -> bool {
+        matches!(self, Self::Getter | Self::ClassGetter)
+    }
+
+    /// Whether a property this creates is enumerable.
+    #[must_use]
+    pub const fn is_enumerable(self) -> bool {
+        matches!(self, Self::Getter | Self::Setter)
     }
 }
 
