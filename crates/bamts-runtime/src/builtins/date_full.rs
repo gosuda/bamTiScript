@@ -1142,13 +1142,19 @@ fn iso_string(time: f64) -> Option<String> {
         ms_from_time(time)
     ))
 }
+/// At least four digits, after a `-` for a negative year.
+fn year_string(year: impl Into<i64>) -> String {
+    let year = year.into();
+    let sign = if year < 0 { "-" } else { "" };
+    format!("{sign}{:04}", year.unsigned_abs())
+}
 fn utc_string(time: f64) -> String {
     format!(
         "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
         WEEKDAYS[week_day(time) as usize],
         date_from_time(time),
         MONTHS[month_from_time(time) as usize],
-        year_from_time(time),
+        year_string(year_from_time(time)),
         hour_from_time(time),
         min_from_time(time),
         sec_from_time(time)
@@ -1164,7 +1170,7 @@ fn date_string(time: f64, zone: &TimeZoneRule, kind: DateStringKind) -> String {
         WEEKDAYS[week_day(local) as usize],
         MONTHS[month_from_time(local) as usize],
         date_from_time(local),
-        year_from_time(local)
+        year_string(year_from_time(local))
     );
     let offset = zone.offset_at_utc(time);
     let sign = if offset < 0 { '-' } else { '+' };
@@ -1924,6 +1930,13 @@ mod tests {
         let result = call(&mut machine, date, "setUTCHours", &[Value::int32(1)]).unwrap();
         assert!(value_number(result).is_nan());
         assert!(value_number(call(&mut machine, date, "getTime", &[]).unwrap()).is_nan());
+    }
+
+    #[test]
+    fn years_print_with_four_digits_and_a_sign() {
+        assert_eq!(year_string(20), "0020");
+        assert_eq!(year_string(-1), "-0001");
+        assert_eq!(year_string(12345), "12345");
     }
 
     static RECEIVER_ARGUMENT_COERCED: AtomicBool = AtomicBool::new(false);
