@@ -13,14 +13,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     diagnostic::{Diagnostic, DiagnosticCode},
-    source::TextRange,
+    source::{TextRange, Utf16Pos},
     syntax::{
         ArrayBindingElement, ArrayElement, AssignmentArrayElement, AssignmentOperator,
         AssignmentTarget, AssignmentTargetNode, BindingPattern, BlockNode, CallArgument,
         ClassDeclaration, ClassMember, ExportDeclaration, ExportDefaultValue, Expr, Expression,
         ForBinding, ForInitializer, FunctionBody, FunctionLike, IdentifierNode, Literal,
         MemberProperty, MetaProperty, ObjectMember, ParameterNode, Pattern, PrivateIdentifierNode,
-        PropertyModifier, PropertyName, SourceFile, Statement, Stmt, UnaryOperator, VariableKind,
+        PropertyModifier, PropertyName, SourceFile, Statement, Stmt, Token, TokenKind,
+        UnaryOperator, VariableKind,
     },
 };
 
@@ -205,6 +206,23 @@ const fn is_iteration(statement: &Statement) -> bool {
     )
 }
 
+fn is_trivia(token: &Token) -> bool {
+    matches!(
+        token.kind(),
+        TokenKind::Whitespace | TokenKind::LineComment | TokenKind::BlockComment
+    )
+}
+
+/// Whether `expression` reads through an `import()` call, which `new` cannot
+/// apply to at any depth of a member chain.
+fn rooted_in_import(expression: &Expr) -> bool {
+    match expression.data() {
+        Expression::Import(_) => true,
+        Expression::Member(member) => rooted_in_import(&member.object),
+        _ => false,
+    }
+}
+
 fn strip_parentheses(expression: &Expr) -> &Expr {
     match expression.data() {
         Expression::Parenthesized(inner) => strip_parentheses(inner),
@@ -220,6 +238,44 @@ impl Walker<'_> {
             range,
             message,
         ));
+    }
+
+    /// The last significant token before `position`.
+    fn previous_token(&self, position: Utf16Pos) -> Option<&Token> {
+        let tokens = self.file.tokens();
+        let end = tokens.partition_point(|token| token.range().start() < position);
+        tokens[..end].iter().rev().find(|token| !is_trivia(token))
+    }
+
+    /// The word after `import.` or `new.`, exactly as written.
+    fn meta_word(&self, expression: &Expr) -> &str {
+        self.previous_token(expression.range().end())
+            .and_then(|token| self.file.token_text(token))
+            .unwrap_or_default()
+    }
+
+    /// Whether `callee` is `import.defer` or `import.source`, which exist only
+    /// as the callee of a call. The parser reads every `import.x` as a meta
+    /// property, as `tsc` does, so the word is all that tells them apart.
+    fn is_import_phase(&self, callee: &Expr) -> bool {
+        matches!(callee.data(), Expression::Meta(MetaProperty::ImportMeta))
+            && matches!(self.meta_word(callee), "defer" | "source")
+    }
+
+    fn import_phase_call(
+        &mut self,
+        arguments: &[CallArgument],
+        range: TextRange,
+        context: Context,
+    ) {
+        if !(1..=2).contains(&arguments.len())
+            || arguments
+                .iter()
+                .any(|argument| matches!(argument, CallArgument::Spread(_)))
+        {
+            self.error(range, "an import call takes a specifier and options");
+        }
+        self.arguments(arguments, context);
     }
 
     fn name(&self, identifier: &IdentifierNode) -> String {
@@ -1375,6 +1431,9 @@ impl Walker<'_> {
                 };
                 self.callable(&arrow.parameters, Some(&arrow.body), inner);
             }
+            Expression::Call(call) if self.is_import_phase(&call.callee) => {
+                self.import_phase_call(&call.arguments, expression.range(), context);
+            }
             Expression::Call(call) => {
                 if matches!(call.callee.data(), Expression::Super) {
                     if !context.super_call {
@@ -1387,7 +1446,7 @@ impl Walker<'_> {
             }
             Expression::Member(member) => self.member(&member.object, &member.property, context),
             Expression::New(new) => {
-                if matches!(new.callee.data(), Expression::Import(_)) {
+                if rooted_in_import(&new.callee) {
                     self.error(new.callee.range(), "`import()` cannot be constructed");
                 }
                 self.expression(&new.callee, context);
@@ -1457,11 +1516,21 @@ impl Walker<'_> {
                     self.expression(options, context);
                 }
             }
-            Expression::Meta(MetaProperty::NewTarget) if !context.new_target => {
-                self.error(expression.range(), "`new.target` needs a function");
+            Expression::Meta(MetaProperty::NewTarget) => {
+                if self.meta_word(expression) != "target" {
+                    self.error(expression.range(), "`new.target` cannot contain an escape");
+                }
+                if !context.new_target {
+                    self.error(expression.range(), "`new.target` needs a function");
+                }
             }
-            Expression::Meta(MetaProperty::ImportMeta) if context.script => {
-                self.error(expression.range(), "`import.meta` needs a module");
+            Expression::Meta(MetaProperty::ImportMeta) => {
+                if self.meta_word(expression) != "meta" {
+                    self.error(expression.range(), "this `import` form is not valid here");
+                }
+                if context.script {
+                    self.error(expression.range(), "`import.meta` needs a module");
+                }
             }
             _ => {}
         }
@@ -1633,6 +1702,32 @@ mod tests {
             "async function f() { () => 1; }",
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn only_import_calls_use_a_phase() {
+        for source in [
+            "import.UNKNOWN('a');",
+            "import.defer();",
+            "import.source(...a);",
+            "new import.defer('a');",
+            "new import.source('a').b;",
+            "new import('a').b;",
+            "typeof import.source;",
+            "import.m\\u0065ta;",
+            "function f() { new.t\\u0061rget; }",
+        ] {
+            assert!(!errors(source).is_empty(), "{source} must be rejected");
+        }
+        for source in [
+            "import.defer('a');",
+            "import.source('a', {});",
+            "import . /* a.b */ meta;",
+            "function f() { new . target; }",
+            "new (import('a'));",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
     }
 
