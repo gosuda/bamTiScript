@@ -60,6 +60,11 @@ pub(crate) struct BuiltinTable<H: Host> {
     symbol_to_string_tag: Option<Value>,
     symbol_match: Option<Value>,
     symbol_replace: Option<Value>,
+    symbol_match_all: Option<Value>,
+    symbol_search: Option<Value>,
+    symbol_split: Option<Value>,
+    symbol_is_concat_spreadable: Option<Value>,
+    symbol_has_instance: Option<Value>,
     symbol_species: Option<Value>,
     symbol_to_primitive: Option<Value>,
     symbol_dispose: Option<Value>,
@@ -130,6 +135,11 @@ impl<H: Host> BuiltinTable<H> {
             symbol_to_string_tag: None,
             symbol_match: None,
             symbol_replace: None,
+            symbol_match_all: None,
+            symbol_search: None,
+            symbol_split: None,
+            symbol_is_concat_spreadable: None,
+            symbol_has_instance: None,
             symbol_species: None,
             symbol_to_primitive: None,
             symbol_dispose: None,
@@ -249,6 +259,21 @@ impl<H: Host> BuiltinTable<H> {
     }
     pub(crate) fn symbol_replace(&self) -> Value {
         self.symbol_replace.expect("Symbol builtins install first")
+    }
+    pub(crate) fn set_symbol_match_all(&mut self, symbol: Value) {
+        self.symbol_match_all = Some(symbol);
+    }
+    pub(crate) fn set_symbol_search(&mut self, symbol: Value) {
+        self.symbol_search = Some(symbol);
+    }
+    pub(crate) fn set_symbol_split(&mut self, symbol: Value) {
+        self.symbol_split = Some(symbol);
+    }
+    pub(crate) fn set_symbol_is_concat_spreadable(&mut self, symbol: Value) {
+        self.symbol_is_concat_spreadable = Some(symbol);
+    }
+    pub(crate) fn set_symbol_has_instance(&mut self, symbol: Value) {
+        self.symbol_has_instance = Some(symbol);
     }
     pub(crate) fn set_symbol_dispose(&mut self, symbol: Value) {
         self.symbol_dispose = Some(symbol);
@@ -675,6 +700,11 @@ impl<H: Host> BuiltinTable<H> {
             symbol_to_string_tag,
             symbol_match,
             symbol_replace,
+            symbol_match_all,
+            symbol_search,
+            symbol_split,
+            symbol_is_concat_spreadable,
+            symbol_has_instance,
             symbol_species,
             symbol_to_primitive,
             symbol_dispose,
@@ -740,6 +770,11 @@ impl<H: Host> BuiltinTable<H> {
             *symbol_to_string_tag,
             *symbol_match,
             *symbol_replace,
+            *symbol_match_all,
+            *symbol_search,
+            *symbol_split,
+            *symbol_is_concat_spreadable,
+            *symbol_has_instance,
             *symbol_species,
             *symbol_to_primitive,
             *symbol_dispose,
