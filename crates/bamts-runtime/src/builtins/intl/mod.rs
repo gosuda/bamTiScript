@@ -10,6 +10,7 @@ mod locale;
 mod number_format;
 mod options;
 mod plural_rules;
+mod relative_time_format;
 
 use std::collections::BTreeMap;
 
@@ -123,6 +124,7 @@ pub(super) fn install<H: Host>(
     number_format::install(heap, builtins, namespace);
     plural_rules::install(heap, builtins, namespace);
     list_format::install(heap, builtins, namespace);
+    relative_time_format::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Intl"), namespace);
 }
 
