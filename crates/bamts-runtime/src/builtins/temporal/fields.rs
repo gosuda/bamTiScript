@@ -5,7 +5,9 @@
 use bamts_native::Value;
 
 use super::super::value_number;
-use super::options::{Options, get_options_object, overflow_option};
+use super::options::{
+    Options, disambiguation_option, get_options_object, offset_option, overflow_option,
+};
 use super::{OrThrow, is_object, range_error, temporal_record, type_error};
 use crate::temporal::TemporalObject;
 use crate::temporal::instant_duration::{Duration, Instant, Overflow};
@@ -783,6 +785,70 @@ pub(super) fn interpret_offset<H: Host>(
         ResolveOptions { offset, ..resolve },
     )
     .or_throw(machine)
+}
+
+/// ToTemporalZonedDateTime.
+pub(super) fn to_temporal_zoned_date_time<H: Host>(
+    machine: &mut Machine<'_, H>,
+    item: Value,
+    options: Value,
+) -> Result<ZonedDateTime, EvalFailure> {
+    if is_object(machine, item)? {
+        if let Some(TemporalObject::ZonedDateTime(zoned)) = temporal_record(machine, item)? {
+            let resolved = get_options_object(machine, options)?;
+            disambiguation_option(machine, resolved)?;
+            offset_option(machine, resolved, OffsetOption::Reject)?;
+            overflow_option(machine, resolved)?;
+            return Ok(zoned);
+        }
+        let calendar = calendar_with_iso_default(machine, item)?;
+        let names = FieldNames::DATE
+            .with(FieldNames::TIME)
+            .with(FieldNames::OFFSET)
+            .with(FieldNames::TIME_ZONE);
+        let fields = prepare_calendar_fields(machine, item, names, FieldNames::TIME_ZONE)?;
+        let resolved = get_options_object(machine, options)?;
+        let disambiguation = disambiguation_option(machine, resolved)?;
+        let offset = offset_option(machine, resolved, OffsetOption::Reject)?;
+        let overflow = overflow_option(machine, resolved)?;
+        let local = date_time_from_fields(machine, &fields, overflow)?;
+        let behaviour = fields
+            .offset
+            .map_or(OffsetBehaviour::Wall, OffsetBehaviour::Option);
+        let time_zone = fields.time_zone.clone().expect("timeZone is required");
+        return interpret_offset(
+            machine,
+            local,
+            behaviour,
+            time_zone,
+            calendar,
+            ResolveOptions {
+                disambiguation,
+                offset,
+                offset_match: OffsetMatch::Exactly,
+            },
+        );
+    }
+    let text = require_string(machine, item, "zoned date-time")?;
+    let parsed = parse_date_time_string(&text, true).or_throw(machine)?;
+    let annotation = parsed
+        .time_zone
+        .clone()
+        .expect("the zoned goal requires one");
+    let time_zone = time_zone_from_annotation(machine, &annotation)?;
+    let calendar = parsed_calendar(machine, &parsed)?;
+    let resolved = get_options_object(machine, options)?;
+    let disambiguation = disambiguation_option(machine, resolved)?;
+    let offset = offset_option(machine, resolved, OffsetOption::Reject)?;
+    overflow_option(machine, resolved)?;
+    zoned_from_parsed(
+        machine,
+        &parsed,
+        time_zone,
+        calendar,
+        disambiguation,
+        offset,
+    )
 }
 
 fn time_zone_from_annotation<H: Host>(

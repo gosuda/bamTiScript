@@ -8,8 +8,10 @@ use super::{OrThrow, is_object, range_error, type_error};
 use crate::temporal::instant_duration::{
     Overflow, RoundingMode, Unit, UnitCategory, validate_rounding_increment,
 };
-use crate::temporal::now_rounding::{FractionalSecondDigits, SecondsStringPrecision, ShowCalendar};
-use crate::temporal::zoned_date_time::Disambiguation;
+use crate::temporal::now_rounding::{
+    FractionalSecondDigits, SecondsStringPrecision, ShowCalendar, ShowOffset, ShowTimeZone,
+};
+use crate::temporal::zoned_date_time::{Disambiguation, OffsetOption};
 use crate::{EvalFailure, Host, Machine};
 
 /// A resolved options argument. `None` stands for the empty null-prototype
@@ -94,6 +96,27 @@ pub(super) fn disambiguation_option<H: Host>(
     })
 }
 
+/// GetTemporalOffsetOption.
+pub(super) fn offset_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+    fallback: OffsetOption,
+) -> Result<OffsetOption, EvalFailure> {
+    let value = string_option(
+        machine,
+        options,
+        "offset",
+        &["prefer", "use", "ignore", "reject"],
+    )?;
+    Ok(match value.as_deref() {
+        Some("prefer") => OffsetOption::Prefer,
+        Some("use") => OffsetOption::Use,
+        Some("ignore") => OffsetOption::Ignore,
+        Some("reject") => OffsetOption::Reject,
+        _ => fallback,
+    })
+}
+
 /// GetTemporalShowCalendarNameOption.
 pub(super) fn show_calendar_option<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -111,6 +134,48 @@ pub(super) fn show_calendar_option<H: Host>(
         Some("critical") => ShowCalendar::Critical,
         _ => ShowCalendar::Auto,
     })
+}
+
+/// GetTemporalShowTimeZoneNameOption.
+pub(super) fn show_time_zone_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<ShowTimeZone, EvalFailure> {
+    let value = string_option(
+        machine,
+        options,
+        "timeZoneName",
+        &["auto", "never", "critical"],
+    )?;
+    Ok(match value.as_deref() {
+        Some("never") => ShowTimeZone::Never,
+        Some("critical") => ShowTimeZone::Critical,
+        _ => ShowTimeZone::Auto,
+    })
+}
+
+/// GetTemporalShowOffsetOption.
+pub(super) fn show_offset_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<ShowOffset, EvalFailure> {
+    let value = string_option(machine, options, "offset", &["auto", "never"])?;
+    Ok(if value.as_deref() == Some("never") {
+        ShowOffset::Never
+    } else {
+        ShowOffset::Auto
+    })
+}
+
+/// GetDirectionOption, which has no default.
+pub(super) fn direction_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<String, EvalFailure> {
+    match string_option(machine, options, "direction", &["next", "previous"])? {
+        Some(direction) => Ok(direction),
+        None => Err(range_error(machine, "direction is required")),
+    }
 }
 
 /// GetRoundingModeOption.
@@ -280,6 +345,11 @@ pub(super) fn unit_argument<H: Host>(
 }
 
 impl UnitArgument {
+    /// The string form of the argument, for an option that is not a unit.
+    pub(super) fn shorthand(&self) -> Option<&str> {
+        self.shorthand.as_deref()
+    }
+
     /// The unit under `key`, unset when neither form supplies one.
     pub(super) fn unit<H: Host>(
         &self,

@@ -113,6 +113,7 @@ mod plain_date_time;
 mod plain_month_day;
 mod plain_time;
 mod plain_year_month;
+mod zoned_date_time;
 
 use std::collections::BTreeMap;
 
@@ -209,6 +210,7 @@ pub(super) fn install<H: Host>(
     plain_date_time::install(heap, builtins, namespace);
     plain_year_month::install(heap, builtins, namespace);
     plain_month_day::install(heap, builtins, namespace);
+    zoned_date_time::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Temporal"), namespace);
 }
 
