@@ -47,7 +47,7 @@ mod intrinsics;
 mod native;
 #[cfg(test)]
 mod proxy_reflect_integration;
-pub mod temporal;
+mod temporal;
 mod vm;
 pub(crate) use intrinsics::builtins;
 
