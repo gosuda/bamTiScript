@@ -1076,7 +1076,7 @@ fn string_iterator<H: Host>(
     Ok(BuiltinOutcome::Value(super::collections::iterator(
         machine,
         source,
-        IterationKind::Value,
+        IterationKind::StringCodePoint,
     )?))
 }
 

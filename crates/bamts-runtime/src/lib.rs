@@ -690,6 +690,8 @@ enum IterationKind {
     Key,
     Value,
     Entry,
+    /// A `%StringIteratorPrototype%` instance; `source` is its code points.
+    StringCodePoint,
     /// A `%RegExpStringIteratorPrototype%` instance; `source` is its hidden state.
     RegExpString,
 }

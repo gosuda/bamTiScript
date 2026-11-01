@@ -42,6 +42,16 @@ pub(crate) struct BuiltinDef<H: Host> {
     pub(crate) length: u32,
     pub(crate) handler: BuiltinHandler<H>,
 }
+/// The builtin iterators with a prototype of their own. Each `next` serves only
+/// its family, so the discriminant also indexes their prototypes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IteratorFamily {
+    Array,
+    Map,
+    Set,
+    String,
+}
+
 pub(crate) struct BuiltinTable<H: Host> {
     defs: Vec<BuiltinDef<H>>,
     /// Index-aligned constructability flags. `register` defaults to `false`
@@ -77,6 +87,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     object_to_string: Option<Value>,
     regexp_prototype: Option<Value>,
     iterator_prototype: Option<Value>,
+    iterator_family_prototypes: Option<[Value; 4]>,
     regexp_string_iterator_prototype: Option<Value>,
     async_iterator_prototype: Option<Value>,
     generator_prototype: Option<Value>,
@@ -157,6 +168,7 @@ impl<H: Host> BuiltinTable<H> {
             object_to_string: None,
             regexp_prototype: None,
             iterator_prototype: None,
+            iterator_family_prototypes: None,
             regexp_string_iterator_prototype: None,
             async_iterator_prototype: None,
             generator_prototype: None,
@@ -374,6 +386,13 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn regexp_prototype(&self) -> Value {
         self.regexp_prototype
             .expect("RegExp builtins install their prototype")
+    }
+    pub(crate) fn set_iterator_family_prototypes(&mut self, prototypes: [Value; 4]) {
+        self.iterator_family_prototypes = Some(prototypes);
+    }
+    pub(crate) fn iterator_family_prototype(&self, family: IteratorFamily) -> Value {
+        self.iterator_family_prototypes
+            .expect("collection builtins install the iterator prototypes")[family as usize]
     }
     pub(crate) fn set_regexp_string_iterator_prototype(&mut self, prototype: Value) {
         self.regexp_string_iterator_prototype = Some(prototype);
@@ -779,6 +798,7 @@ impl<H: Host> BuiltinTable<H> {
             object_to_string,
             regexp_prototype,
             iterator_prototype,
+            iterator_family_prototypes,
             regexp_string_iterator_prototype,
             async_iterator_prototype,
             generator_prototype,
@@ -829,6 +849,9 @@ impl<H: Host> BuiltinTable<H> {
             visit(value);
         }
         for (_, value) in error_prototypes {
+            visit(*value);
+        }
+        for value in iterator_family_prototypes.iter().flatten() {
             visit(*value);
         }
         for value in [
