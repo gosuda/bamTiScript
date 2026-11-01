@@ -2011,8 +2011,10 @@ pub fn emit_javascript_baseline(
     // the document carries no `.js` sections at all; its `result.DTS` is empty
     // unless declaration emit is on. The section set follows those two maps.
     let mut outputs = 0usize;
+    // The echo above keeps split order; the output sections follow emit order.
+    let emitted = case.reached_units_in_module_order();
     if !options.emit_declaration_only() {
-        for (unit, output) in &units {
+        for (unit, output) in &emitted {
             let name = unit_basename(&unit.virtual_path);
             // A `.d.ts` input is never a JavaScript output: upstream's output
             // mapping skips declaration files outright.
@@ -2040,7 +2042,7 @@ pub fn emit_javascript_baseline(
     }
     if options.declaration() || options.emit_declaration_only() {
         let mut declarations = Vec::new();
-        for (unit, output) in &units {
+        for (unit, output) in &emitted {
             let name = unit_basename(&unit.virtual_path);
             if is_declaration_input_name(&name) {
                 continue;
