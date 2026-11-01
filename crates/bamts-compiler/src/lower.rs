@@ -582,6 +582,23 @@ struct WithBase {
     found: Register,
     key: Register,
 }
+/// What a member reference reads and writes through.
+#[derive(Clone, Copy)]
+enum MemberBase {
+    Object(Register),
+    Super { home: Register, receiver: Register },
+}
+
+impl MemberBase {
+    /// The `this` of a call through this reference.
+    const fn this_value(self) -> Register {
+        match self {
+            Self::Object(object) => object,
+            Self::Super { receiver, .. } => receiver,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum CaptureKey {
     /// Free outer binding plus the live `with` sites that still precede it at
@@ -596,6 +613,8 @@ enum CaptureKey {
     NewTarget,
     Parent(Register),
     ClassElements(Register),
+    /// The object a method was defined on, which `super` starts above.
+    Home(Register),
     Cell(Register),
     Container(crate::checker::SymbolId, ContainerKind, Register),
     WithObject(BindingSite, Register),
@@ -816,6 +835,10 @@ struct FunctionContext<'a> {
     new_target_capture: Option<Register>,
     parent_constructor_capture: Option<Register>,
     class_elements: Option<Register>,
+    /// The home object in this function, for `super` member references.
+    home_object: Option<Register>,
+    /// The home object of the method about to be built from this context.
+    method_home: Option<Register>,
     arguments_source: ArgumentsSource,
     /// Whether this code is strict. Everything but a JavaScript script is.
     strict: bool,
@@ -866,6 +889,8 @@ impl<'a> FunctionContext<'a> {
             new_target_capture: None,
             parent_constructor_capture: None,
             class_elements: None,
+            home_object: None,
+            method_home: None,
             arguments_source: ArgumentsSource::None,
             strict: source_is_strict(file),
             inferred_class_name: None,
@@ -4363,24 +4388,16 @@ impl<'a> FunctionContext<'a> {
         member: &AssignmentMemberTarget,
         assignment: &AssignmentExpression,
     ) -> Result<Register, LowerError> {
-        let object = self.lower_expression(builder, &member.object)?;
+        let base = self.member_base(builder, range, &member.object)?;
         let key = self.member_key(builder, &member.property)?;
         match compound_operator(assignment.operator) {
             None => {
                 let value = self.lower_expression(builder, &assignment.right)?;
-                self.emit(range, Instruction::SetProperty { object, key, value })?;
+                self.set_member(range, base, key, value)?;
                 Ok(value)
             }
             Some(CompoundOp::Arithmetic(op)) => {
-                let current = self.alloc_register(range)?;
-                self.emit(
-                    range,
-                    Instruction::GetProperty {
-                        dst: current,
-                        object,
-                        key,
-                    },
-                )?;
+                let current = self.get_member(range, base, key)?;
                 let right = self.lower_expression(builder, &assignment.right)?;
                 let result = self.alloc_register(range)?;
                 self.emit(
@@ -4392,31 +4409,16 @@ impl<'a> FunctionContext<'a> {
                         right,
                     },
                 )?;
-                self.emit(
-                    range,
-                    Instruction::SetProperty {
-                        object,
-                        key,
-                        value: result,
-                    },
-                )?;
+                self.set_member(range, base, key, result)?;
                 Ok(result)
             }
             Some(CompoundOp::Logical(op)) => {
                 let result = self.alloc_register(range)?;
-                let current = self.alloc_register(range)?;
-                self.emit(
-                    range,
-                    Instruction::GetProperty {
-                        dst: current,
-                        object,
-                        key,
-                    },
-                )?;
+                let current = self.get_member(range, base, key)?;
                 self.move_to(range, result, current)?;
                 let skip = self.branch_on_short_circuit(builder, range, op, current)?;
                 let value = self.lower_expression(builder, &assignment.right)?;
-                self.emit(range, Instruction::SetProperty { object, key, value })?;
+                self.set_member(range, base, key, value)?;
                 self.move_to(range, result, value)?;
                 let end = self.next_pc();
                 self.patch_jump(skip, end);
@@ -4460,17 +4462,9 @@ impl<'a> FunctionContext<'a> {
                 if self.is_const_enum_member_target(&update.argument, &member.object)? {
                     return Err(self.const_enum_operation(range, ConstEnumOperation::Write));
                 }
-                let object = self.lower_expression(builder, &member.object)?;
+                let base = self.member_base(builder, range, &member.object)?;
                 let key = self.member_key(builder, &member.property)?;
-                let old = self.alloc_register(range)?;
-                self.emit(
-                    range,
-                    Instruction::GetProperty {
-                        dst: old,
-                        object,
-                        key,
-                    },
-                )?;
+                let old = self.get_member(range, base, key)?;
                 let one = self.load_constant(builder, Constant::Int32(1), range)?;
                 let updated = self.alloc_register(range)?;
                 self.emit(
@@ -4482,14 +4476,7 @@ impl<'a> FunctionContext<'a> {
                         right: one,
                     },
                 )?;
-                self.emit(
-                    range,
-                    Instruction::SetProperty {
-                        object,
-                        key,
-                        value: updated,
-                    },
-                )?;
+                self.set_member(range, base, key, updated)?;
                 Ok(if update.prefix { updated } else { old })
             }
             AssignmentTarget::Object(_) | AssignmentTarget::Array(_) => {
@@ -4980,11 +4967,62 @@ impl<'a> FunctionContext<'a> {
             };
             return Err(self.const_enum_operation(range, operation));
         }
-        let object = self.lower_expression(builder, &member.object)?;
+        let base = self.member_base(builder, range, &member.object)?;
         let key = self.member_key(builder, &member.property)?;
+        let dst = self.get_member(range, base, key)?;
+        Ok((base.this_value(), dst))
+    }
+    /// The base of a member reference. `super` reads from above the home
+    /// object, with the current `this` as the receiver.
+    fn member_base(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        object: &Expr,
+    ) -> Result<MemberBase, LowerError> {
+        if let (Expression::Super, Some(home)) = (object.data(), self.home_object) {
+            let receiver = self.this_value(builder, range)?;
+            return Ok(MemberBase::Super { home, receiver });
+        }
+        Ok(MemberBase::Object(self.lower_expression(builder, object)?))
+    }
+    fn get_member(
+        &mut self,
+        range: TextRange,
+        base: MemberBase,
+        key: Register,
+    ) -> Result<Register, LowerError> {
         let dst = self.alloc_register(range)?;
-        self.emit(range, Instruction::GetProperty { dst, object, key })?;
-        Ok((object, dst))
+        let instruction = match base {
+            MemberBase::Object(object) => Instruction::GetProperty { dst, object, key },
+            MemberBase::Super { home, receiver } => Instruction::GetSuper {
+                dst,
+                home,
+                receiver,
+                key,
+            },
+        };
+        self.emit(range, instruction)?;
+        Ok(dst)
+    }
+    fn set_member(
+        &mut self,
+        range: TextRange,
+        base: MemberBase,
+        key: Register,
+        value: Register,
+    ) -> Result<(), LowerError> {
+        let instruction = match base {
+            MemberBase::Object(object) => Instruction::SetProperty { object, key, value },
+            MemberBase::Super { home, receiver } => Instruction::SetSuper {
+                home,
+                receiver,
+                key,
+                value,
+            },
+        };
+        self.emit(range, instruction)?;
+        Ok(())
     }
     fn has_optional_chain(mut expression: &Expr) -> bool {
         loop {
@@ -5144,17 +5182,15 @@ impl<'a> FunctionContext<'a> {
             Expression::Member(member) if !member.optional => {
                 if matches!(member.object.data(), Expression::Super) {
                     let this_value = self.this_value(builder, range)?;
-                    let object = this_value;
-                    let key = self.member_key(builder, &member.property)?;
-                    let value = self.alloc_register(range)?;
-                    self.emit(
-                        range,
-                        Instruction::GetProperty {
-                            dst: value,
-                            object,
-                            key,
+                    let base = match self.home_object {
+                        Some(home) => MemberBase::Super {
+                            home,
+                            receiver: this_value,
                         },
-                    )?;
+                        None => MemberBase::Object(this_value),
+                    };
+                    let key = self.member_key(builder, &member.property)?;
+                    let value = self.get_member(range, base, key)?;
                     return Ok((value, this_value));
                 }
                 let (object, value) = self.lower_member(builder, callee.range(), callee)?;
@@ -5449,8 +5485,11 @@ impl<'a> FunctionContext<'a> {
                 }
                 ObjectMember::Method(method) => {
                     let key = self.property_key(builder, &method.name)?;
+                    self.method_home = Some(dst);
                     let value =
-                        self.build_function_value(builder, member.range(), None, &method.function)?;
+                        self.build_function_value(builder, member.range(), None, &method.function);
+                    self.method_home = None;
+                    let value = value?;
                     self.install_property(
                         builder,
                         member.range(),
@@ -7213,6 +7252,8 @@ impl<'a> FunctionContext<'a> {
             new_target_capture: None,
             parent_constructor_capture: None,
             class_elements: None,
+            home_object: None,
+            method_home: None,
             arguments_source: if is_arrow {
                 ArgumentsSource::None
             } else {
@@ -7242,6 +7283,7 @@ impl<'a> FunctionContext<'a> {
                 CaptureKey::NewTarget => inner.new_target_capture = Some(register),
                 CaptureKey::Parent(_) => inner.parent_constructor_capture = Some(register),
                 CaptureKey::ClassElements(_) => inner.class_elements = Some(register),
+                CaptureKey::Home(_) => inner.home_object = Some(register),
                 CaptureKey::Cell(_) => {}
                 CaptureKey::Container(symbol, kind, _) => inner.containers.push(Container {
                     symbol: *symbol,
@@ -7361,6 +7403,8 @@ impl<'a> FunctionContext<'a> {
             new_target_capture: None,
             parent_constructor_capture: None,
             class_elements: None,
+            home_object: None,
+            method_home: None,
             arguments_source: ArgumentsSource::Own,
             strict: self.strict,
             inferred_class_name: None,
@@ -7387,6 +7431,7 @@ impl<'a> FunctionContext<'a> {
                 CaptureKey::NewTarget => inner.new_target_capture = Some(register),
                 CaptureKey::Parent(_) => inner.parent_constructor_capture = Some(register),
                 CaptureKey::ClassElements(_) => inner.class_elements = Some(register),
+                CaptureKey::Home(_) => inner.home_object = Some(register),
                 CaptureKey::Cell(_) => {}
                 CaptureKey::Container(symbol, kind, _) => inner.containers.push(Container {
                     symbol: *symbol,
@@ -7732,6 +7777,7 @@ impl<'a> FunctionContext<'a> {
             CaptureKey::NewTarget => self.new_target_value(range),
             CaptureKey::Parent(parent) => Ok(*parent),
             CaptureKey::ClassElements(table) => Ok(*table),
+            CaptureKey::Home(home) => Ok(*home),
             CaptureKey::Cell(cell) => Ok(*cell),
             CaptureKey::Container(_, _, object) | CaptureKey::WithObject(_, object) => Ok(*object),
         }
@@ -7770,6 +7816,15 @@ impl<'a> FunctionContext<'a> {
             if scanner.uses_new_target {
                 captures.push(CaptureKey::NewTarget);
             }
+        }
+        // An arrow's `super` is the enclosing method's.
+        let home = if is_arrow {
+            self.home_object
+        } else {
+            self.method_home
+        };
+        if let (true, Some(home)) = (scanner.uses_super, home) {
+            captures.push(CaptureKey::Home(home));
         }
         for container in &self.containers {
             captures.push(CaptureKey::Container(
@@ -8219,6 +8274,9 @@ impl<'a> FunctionContext<'a> {
             .as_deref()
             .or(declaration_name)
             .or(inferred_name.as_deref());
+        // The constructor's `super` starts from this object, so it comes first.
+        let prototype = self.alloc_register(range)?;
+        self.emit(range, Instruction::CreateObject { dst: prototype })?;
         let ctor = self.build_constructor(
             builder,
             range,
@@ -8230,10 +8288,9 @@ impl<'a> FunctionContext<'a> {
             } else {
                 Some(class_elements)
             },
+            prototype,
             source_name,
         )?;
-        let prototype = self.alloc_register(range)?;
-        self.emit(range, Instruction::CreateObject { dst: prototype })?;
         if let Some(parent) = parent {
             let parent_prototype = self.get_named(builder, range, parent, "prototype")?;
             self.emit(
@@ -8498,6 +8555,7 @@ impl<'a> FunctionContext<'a> {
         parent: Option<Register>,
         instance_steps: &[InstanceInit],
         class_elements: Option<Register>,
+        home: Register,
         source_name: Option<&str>,
     ) -> Result<Register, LowerError> {
         let (parameters, body_block): (&[ParameterNode], Option<&Block>) = match constructor {
@@ -8517,6 +8575,7 @@ impl<'a> FunctionContext<'a> {
             instance_steps,
             parent,
             class_elements,
+            home,
         );
         let id = builder.reserve_function(range)?;
         self.build_constructor_into(
@@ -8539,6 +8598,7 @@ impl<'a> FunctionContext<'a> {
         instance_steps: &[InstanceInit],
         parent: Option<Register>,
         class_elements: Option<Register>,
+        home: Register,
     ) -> Vec<CaptureKey> {
         let mut scanner = FreeVarScanner::new(self.file, self.jsx_plan);
         scanner.preseed_parameters(parameters);
@@ -8569,6 +8629,9 @@ impl<'a> FunctionContext<'a> {
         }
         if let Some(table) = class_elements {
             captures.push(CaptureKey::ClassElements(table));
+        }
+        if scanner.uses_super {
+            captures.push(CaptureKey::Home(home));
         }
         for container in &self.containers {
             captures.push(CaptureKey::Container(
@@ -8871,6 +8934,8 @@ impl<'a> FunctionContext<'a> {
             new_target_capture: None,
             parent_constructor_capture: None,
             class_elements: None,
+            home_object: None,
+            method_home: None,
             arguments_source: ArgumentsSource::Own,
             strict: true,
             inferred_class_name: None,
@@ -8889,6 +8954,7 @@ impl<'a> FunctionContext<'a> {
                 }
                 CaptureKey::Parent(_) => inner.parent_constructor_capture = Some(register),
                 CaptureKey::ClassElements(_) => inner.class_elements = Some(register),
+                CaptureKey::Home(_) => inner.home_object = Some(register),
                 CaptureKey::Cell(_) => {}
                 CaptureKey::Container(symbol, kind, _) => inner.containers.push(Container {
                     symbol: *symbol,
@@ -9384,7 +9450,10 @@ impl<'a> FunctionContext<'a> {
                     Some(lowered) => lowered.key,
                     None => self.property_key(builder, &method.name)?,
                 };
-                let value = self.build_function_value(builder, range, None, &method.function)?;
+                self.method_home = Some(target);
+                let value = self.build_function_value(builder, range, None, &method.function);
+                self.method_home = None;
+                let value = value?;
                 self.install_class_method(range, target, key, value, method.modifier)?;
                 let Some(lowered) = decorators.filter(|d| !d.decorators.is_empty()) else {
                     return Ok(());
@@ -9654,6 +9723,7 @@ struct FreeVarScanner<'a> {
     uses_this: bool,
     uses_arguments: bool,
     uses_new_target: bool,
+    uses_super: bool,
     fn_boundary: u32,
     function_depth: u32,
 }
@@ -9727,6 +9797,7 @@ impl<'a> FreeVarScanner<'a> {
             uses_this: false,
             uses_arguments: false,
             uses_new_target: false,
+            uses_super: false,
             fn_boundary: 0,
             function_depth: 0,
         }
@@ -10366,7 +10437,11 @@ impl<'a> FreeVarScanner<'a> {
                     self.uses_this = true;
                 }
             }
-            Expression::Super => {}
+            Expression::Super => {
+                if self.fn_boundary == 0 {
+                    self.uses_super = true;
+                }
+            }
             Expression::Meta(MetaProperty::NewTarget) => {
                 if self.fn_boundary == 0 {
                     self.uses_new_target = true;

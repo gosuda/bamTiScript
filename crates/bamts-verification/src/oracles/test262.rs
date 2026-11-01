@@ -2227,6 +2227,51 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn super_reads_above_the_home_object() {
+        const CASES: [&str; 9] = [
+            "class A { m() { return 1; } } \
+             class B extends A { m() { return super.m() + 1; } } \
+             assert.sameValue(new B().m(), 2);",
+            "class A { get g() { return this.v; } } \
+             class B extends A { constructor() { super(); this.v = 5; } h() { return super.g; } } \
+             assert.sameValue(new B().h(), 5);",
+            "class A { m() { return 'a'; } } \
+             class B extends A { constructor() { super(); this.r = super.m(); } } \
+             assert.sameValue(new B().r, 'a');",
+            "class A { static s() { return 1; } } \
+             class B extends A { static s() { return super.s() + 1; } } \
+             assert.sameValue(B.s(), 2);",
+            "class A { m() { return 1; } } \
+             class B extends A { m() { var f = () => super.m(); return f(); } } \
+             assert.sameValue(new B().m(), 1);",
+            "var p = { m() { return 'p'; } }; \
+             var o = { __proto__: p, m() { return super.m(); } }; \
+             assert.sameValue(o.m(), 'p');",
+            "class A {} class B extends A { w() { super.x = 1; return this.x; } } \
+             assert.sameValue(new B().w(), 1); \
+             assert.sameValue(A.prototype.x, undefined);",
+            "class A { get x() { return 1; } set x(v) { this.y = v; } } \
+             class B extends A { u() { super.x += 1; return this.y; } } \
+             assert.sameValue(new B().u(), 2);",
+            "class A { m() { return 1; } } class B extends A { f = super.m(); } \
+             assert.sameValue(new B().f, 1);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: super references", body);
+                let label = format!("super-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn construction_behaves_the_same_in_every_tier() {
         const THROWS: &str = "function throws(kind, body) {\n\
             try { body(); } catch (error) { return error instanceof kind; }\n\
