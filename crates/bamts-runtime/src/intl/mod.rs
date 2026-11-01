@@ -5,6 +5,8 @@ use std::fmt;
 pub mod canonical_locales;
 pub mod collator;
 pub mod date_time_format;
+mod locale_aliases;
+pub mod locale_data;
 pub mod locale_negotiation;
 pub mod number_format;
 pub mod plural_rules;
@@ -21,10 +23,27 @@ pub enum IntlKind {
     Segmenter,
     DisplayNames,
     Locale,
+    DurationFormat,
+    Segments,
+    SegmentIterator,
 }
 
 impl IntlKind {
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 12;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Collator,
+        Self::NumberFormat,
+        Self::DateTimeFormat,
+        Self::PluralRules,
+        Self::RelativeTimeFormat,
+        Self::ListFormat,
+        Self::Segmenter,
+        Self::DisplayNames,
+        Self::Locale,
+        Self::DurationFormat,
+        Self::Segments,
+        Self::SegmentIterator,
+    ];
 
     pub const fn index(self) -> usize {
         self as usize

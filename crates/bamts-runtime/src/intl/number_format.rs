@@ -2453,7 +2453,7 @@ fn validate_currency(value: &str) -> Result<String, NumberFormatError> {
     Ok(value.to_ascii_uppercase())
 }
 
-const SANCTIONED_UNITS: [&str; 45] = [
+pub const SANCTIONED_UNITS: [&str; 45] = [
     "acre",
     "bit",
     "byte",

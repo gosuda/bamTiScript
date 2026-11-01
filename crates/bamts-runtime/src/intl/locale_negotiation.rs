@@ -64,7 +64,9 @@ pub struct LanguageId {
 }
 
 impl LanguageId {
-    fn render(&self) -> String {
+    /// The identifier in canonical subtag order.
+    #[must_use]
+    pub fn render(&self) -> String {
         let mut out = self.language.clone();
         if let Some(script) = &self.script {
             out.push('-');
@@ -120,6 +122,20 @@ impl LanguageTag {
     /// # Errors
     /// Returns [`LocaleError`] for malformed grammar or duplicate subtags.
     pub fn parse(input: &str) -> Result<Self, LocaleError> {
+        Self::parse_with(input, false)
+    }
+
+    /// Parses as `CanonicalizeUnicodeLocaleId` reads its input: a repeated
+    /// Unicode attribute or keyword is structurally valid, and the first
+    /// occurrence stands.
+    ///
+    /// # Errors
+    /// Returns [`LocaleError`] for malformed grammar or other duplicate subtags.
+    pub fn parse_first_keyword(input: &str) -> Result<Self, LocaleError> {
+        Self::parse_with(input, true)
+    }
+
+    fn parse_with(input: &str, keep_first: bool) -> Result<Self, LocaleError> {
         if input.is_empty() || !input.is_ascii() || input.starts_with('-') || input.ends_with('-') {
             return Err(LocaleError::InvalidLanguageTag(input.to_owned()));
         }
@@ -166,7 +182,7 @@ impl LanguageTag {
             }
             let body = &parts[start..index];
             if singleton == 'u' {
-                unicode = Some(parse_unicode_extension(body, input)?);
+                unicode = Some(parse_unicode_extension(body, input, keep_first)?);
             } else if singleton == 't' {
                 extensions.insert(singleton, parse_transformed_extension(body, input)?);
             } else {
@@ -210,6 +226,30 @@ impl LanguageTag {
                 unicode.keywords.insert(key, value);
             }
         }
+    }
+
+    /// Whether `value` matches `unicode_language_subtag`.
+    #[must_use]
+    pub fn is_language_subtag(value: &str) -> bool {
+        is_language(value)
+    }
+
+    /// Whether `value` matches `unicode_script_subtag`.
+    #[must_use]
+    pub fn is_script_subtag(value: &str) -> bool {
+        is_script(&value)
+    }
+
+    /// Whether `value` matches `unicode_region_subtag`.
+    #[must_use]
+    pub fn is_region_subtag(value: &str) -> bool {
+        is_region(&value)
+    }
+
+    /// Whether `value` matches `unicode_variant_subtag`.
+    #[must_use]
+    pub fn is_variant_subtag(value: &str) -> bool {
+        is_variant(value)
     }
 
     fn without_unicode(&self) -> Self {
@@ -316,6 +356,7 @@ fn parse_language_id(
 fn parse_unicode_extension(
     parts: &[&str],
     original: &str,
+    keep_first: bool,
 ) -> Result<UnicodeExtension, LocaleError> {
     let mut extension = UnicodeExtension::default();
     let mut seen_attributes = BTreeSet::new();
@@ -325,10 +366,11 @@ fn parse_unicode_extension(
             break;
         }
         let attribute = part.to_ascii_lowercase();
-        if !seen_attributes.insert(attribute.clone()) {
+        if seen_attributes.insert(attribute.clone()) {
+            extension.attributes.push(attribute);
+        } else if !keep_first {
             return Err(LocaleError::DuplicateSubtag(attribute));
         }
-        extension.attributes.push(attribute);
         index += 1;
     }
     while index < parts.len() {
@@ -336,7 +378,8 @@ fn parse_unicode_extension(
         if !is_unicode_key(&key) {
             return Err(LocaleError::InvalidLanguageTag(original.to_owned()));
         }
-        if extension.keywords.contains_key(&key) {
+        let repeated = extension.keywords.contains_key(&key);
+        if repeated && !keep_first {
             return Err(LocaleError::DuplicateSubtag(key));
         }
         index += 1;
@@ -347,14 +390,16 @@ fn parse_unicode_extension(
             }
             index += 1;
         }
-        extension.keywords.insert(
-            key,
-            parts[start..index]
-                .iter()
-                .map(|part| part.to_ascii_lowercase())
-                .collect::<Vec<_>>()
-                .join("-"),
-        );
+        if !repeated {
+            extension.keywords.insert(
+                key,
+                parts[start..index]
+                    .iter()
+                    .map(|part| part.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join("-"),
+            );
+        }
     }
     extension.attributes.sort();
     if extension.attributes.is_empty() && extension.keywords.is_empty() {
@@ -408,7 +453,12 @@ fn parse_transformed_extension(parts: &[&str], original: &str) -> Result<Vec<Str
     let mut body = Vec::new();
     if let Some(mut id) = language {
         id.normalize();
-        body.extend(id.render().split('-').map(str::to_owned));
+        body.extend(
+            id.render()
+                .to_ascii_lowercase()
+                .split('-')
+                .map(str::to_owned),
+        );
     }
     for (key, values) in fields {
         body.push(key);
@@ -435,6 +485,10 @@ fn is_unicode_key(value: &str) -> bool {
     value.len() == 2
         && value.as_bytes()[0].is_ascii_alphanumeric()
         && value.as_bytes()[1].is_ascii_alphabetic()
+}
+fn is_transform_key(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1].is_ascii_digit()
 }
 fn is_alpha(value: &str) -> bool {
     value.bytes().all(|byte| byte.is_ascii_alphabetic())
@@ -471,6 +525,28 @@ pub trait LocaleDataProvider {
     }
     /// Preferred replacement for a variant subtag.
     fn variant_alias(&self, _variant: &str) -> Option<&str> {
+        None
+    }
+    /// Language a variant subtag stands for; the variant is dropped.
+    fn variant_language_alias(&self, _variant: &str) -> Option<&str> {
+        None
+    }
+    /// Region a variant subtag stands for; the variant is dropped.
+    fn variant_region_alias(&self, _variant: &str) -> Option<&str> {
+        None
+    }
+    /// Replacement for a region that split into several, chosen by the
+    /// language and script it is used with.
+    fn complex_region_alias(
+        &self,
+        _region: &str,
+        _language: &str,
+        _script: Option<&str>,
+    ) -> Option<&str> {
+        None
+    }
+    /// Preferred replacement for a transformed extension value.
+    fn transform_type_alias(&self, _key: &str, _value: &str) -> Option<&str> {
         None
     }
     /// Preferred replacement for a Unicode extension key.
@@ -670,6 +746,129 @@ impl LocaleDataProvider for MapLocaleData {
     }
 }
 
+/// Applies the UTS #35 alias rules to a language identifier. Whole-identifier
+/// aliases are tried first, because `art-lojban` and `sgn-GR` name one language
+/// even though their parts are ordinary subtags.
+fn canonicalize_language_id(
+    id: &mut LanguageId,
+    provider: &dyn LocaleDataProvider,
+) -> Result<(), LocaleError> {
+    apply_language_aliases(id, provider)?;
+    if let Some(script) = id.script.clone()
+        && let Some(alias) = provider.script_alias(&script)
+    {
+        id.script = Some(titlecase(alias));
+    }
+    if let Some(region) = id.region.clone() {
+        let replacement = provider
+            .complex_region_alias(&region, &id.language, id.script.as_deref())
+            .or_else(|| provider.region_alias(&region));
+        if let Some(alias) = replacement {
+            id.region = alias
+                .split_ascii_whitespace()
+                .next()
+                .map(str::to_ascii_uppercase);
+        }
+    }
+    let variants = std::mem::take(&mut id.variants);
+    let combined = variants.iter().any(|variant| variant == "hepburn")
+        && variants.iter().any(|variant| variant == "heploc");
+    for variant in variants {
+        if combined && variant == "hepburn" {
+            continue;
+        }
+        if let Some(language) = provider.variant_language_alias(&variant) {
+            id.language = language.to_owned();
+        } else if let Some(region) = provider.variant_region_alias(&variant) {
+            id.region = Some(region.to_ascii_uppercase());
+        } else if let Some(alias) = provider.variant_alias(&variant) {
+            id.variants.push(alias.to_ascii_lowercase());
+        } else {
+            id.variants.push(variant);
+        }
+    }
+    id.variants.sort();
+    id.variants.dedup();
+    Ok(())
+}
+
+fn apply_language_aliases(
+    id: &mut LanguageId,
+    provider: &dyn LocaleDataProvider,
+) -> Result<(), LocaleError> {
+    for index in 0..id.variants.len() {
+        let whole = format!("{}-{}", id.language, id.variants[index]);
+        if let Some(alias) = provider.language_alias(&whole) {
+            let alias = LanguageTag::parse(alias)?;
+            id.variants.remove(index);
+            adopt_language(id, alias.id);
+            return Ok(());
+        }
+    }
+    if let Some(region) = &id.region {
+        let whole = format!("{}-{region}", id.language);
+        if let Some(alias) = provider.language_alias(&whole) {
+            let alias = LanguageTag::parse(alias)?;
+            id.region = None;
+            adopt_language(id, alias.id);
+            return Ok(());
+        }
+    }
+    if let Some(alias) = provider.language_alias(&id.language) {
+        let alias = LanguageTag::parse(alias)?;
+        adopt_language(id, alias.id);
+    }
+    Ok(())
+}
+
+fn adopt_language(id: &mut LanguageId, replacement: LanguageId) {
+    id.language = replacement.language;
+    if id.script.is_none() {
+        id.script = replacement.script;
+    }
+    if id.region.is_none() {
+        id.region = replacement.region;
+    }
+    id.variants.extend(replacement.variants);
+}
+
+/// Canonicalizes the body of a `-t-` extension: its language identifier by the
+/// same rules as the main one, in lowercase, and each field's value.
+fn canonicalize_transformed_extension(
+    body: &[String],
+    provider: &dyn LocaleDataProvider,
+) -> Result<Vec<String>, LocaleError> {
+    let parts: Vec<&str> = body.iter().map(String::as_str).collect();
+    let original = body.join("-");
+    let mut index = 0;
+    let mut result = Vec::new();
+    if parts.first().is_some_and(|part| is_language(part)) {
+        let (mut id, next) = parse_language_id(&parts, 0, &original)?;
+        index = next;
+        canonicalize_language_id(&mut id, provider)?;
+        id.normalize();
+        result.extend(
+            id.render()
+                .to_ascii_lowercase()
+                .split('-')
+                .map(str::to_owned),
+        );
+    }
+    while index < parts.len() {
+        let key = parts[index];
+        index += 1;
+        let start = index;
+        while index < parts.len() && !is_transform_key(parts[index]) {
+            index += 1;
+        }
+        let value = parts[start..index].join("-");
+        result.push(key.to_owned());
+        let value = provider.transform_type_alias(key, &value).unwrap_or(&value);
+        result.extend(value.split('-').map(str::to_owned));
+    }
+    Ok(result)
+}
+
 /// Canonicalizes a Unicode locale identifier using provider alias data.
 ///
 /// # Errors
@@ -678,36 +877,8 @@ pub fn canonicalize_unicode_locale_id(
     locale: &str,
     provider: &dyn LocaleDataProvider,
 ) -> Result<String, LocaleError> {
-    let mut tag = LanguageTag::parse(locale)?;
-    if let Some(alias) = provider.language_alias(&tag.id.language) {
-        let replacement = LanguageTag::parse(alias)?;
-        tag.id.language = replacement.id.language;
-        if tag.id.script.is_none() {
-            tag.id.script = replacement.id.script;
-        }
-        if tag.id.region.is_none() {
-            tag.id.region = replacement.id.region;
-        }
-        tag.id.variants.extend(replacement.id.variants);
-    }
-    if let Some(script) = tag.id.script.clone()
-        && let Some(alias) = provider.script_alias(&script)
-    {
-        tag.id.script = Some(titlecase(alias));
-    }
-    if let Some(region) = tag.id.region.clone()
-        && let Some(alias) = provider.region_alias(&region)
-    {
-        tag.id.region = alias
-            .split_ascii_whitespace()
-            .next()
-            .map(str::to_ascii_uppercase);
-    }
-    for variant in &mut tag.id.variants {
-        if let Some(alias) = provider.variant_alias(variant) {
-            *variant = alias.to_ascii_lowercase();
-        }
-    }
+    let mut tag = LanguageTag::parse_first_keyword(locale)?;
+    canonicalize_language_id(&mut tag.id, provider)?;
     if let Some(extension) = &mut tag.unicode {
         let old = std::mem::take(&mut extension.keywords);
         for (key, value) in old {
@@ -727,6 +898,10 @@ pub fn canonicalize_unicode_locale_id(
                 return Err(LocaleError::DuplicateSubtag(canonical_key));
             }
         }
+    }
+    if let Some(body) = tag.extensions.get(&'t') {
+        let canonical = canonicalize_transformed_extension(body, provider)?;
+        tag.extensions.insert('t', canonical);
     }
     tag.normalize();
     LanguageTag::parse(&tag.render()).map(|validated| validated.render())
