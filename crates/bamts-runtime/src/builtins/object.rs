@@ -2,15 +2,14 @@ use std::collections::BTreeMap;
 
 use super::property_descriptor::{
     PropertyDescriptor as CanonicalPropertyDescriptor, collect_property_descriptors,
-    is_extensible as descriptor_is_extensible, to_property_descriptor,
-    validate_and_apply_property_descriptor,
+    to_property_descriptor,
 };
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
 use super::{
     allocate_string, define_data, define_symbol_property, heap_index, install_constructor_function,
-    install_function, range_error, to_integer_or_infinity, type_error, value_number,
+    install_function, to_integer_or_infinity, type_error, value_number,
 };
 use crate::intrinsics::{
     BuiltinDef, BuiltinHandler, BuiltinOutcome, BuiltinTable, native_function_properties,
@@ -289,76 +288,17 @@ pub(super) fn create<H: Host>(
     Ok(BuiltinOutcome::Value(object))
 }
 
-fn define_array_length_descriptor<H: Host>(
-    machine: &mut Machine<'_, H>,
-    object: Value,
-    key: &PropertyKey,
-    descriptor: CanonicalPropertyDescriptor,
-) -> Result<bool, EvalFailure> {
-    let Some(index) = machine.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
-        return Ok(false);
-    };
-    if !matches!(key, PropertyKey::Named(name) if name.eq_ascii("length"))
-        || !matches!(machine.heap[index], HeapEntry::Array { .. })
-    {
-        return Ok(false);
-    }
-    if descriptor.is_accessor() {
-        return Err(type_error("Invalid property descriptor"));
-    }
-    if descriptor.enumerable == Some(true) || descriptor.configurable == Some(true) {
-        return Err(type_error("Cannot redefine array length"));
-    }
-    let length = descriptor
-        .value
-        .map(|value| {
-            crate::exact_array_length(value).ok_or_else(|| range_error("define array length"))
-        })
-        .transpose()?;
-    let HeapEntry::Array {
-        elements,
-        properties,
-        length_writable,
-        ..
-    } = &mut machine.heap[index]
-    else {
-        unreachable!("array checked above");
-    };
-    if descriptor.writable == Some(true) && !*length_writable {
-        return Err(type_error("Cannot make array length writable"));
-    }
-    let result = match length {
-        Some(length) => super::define_array_length(elements, properties, *length_writable, length),
-        None => Ok(()),
-    };
-    if descriptor.writable == Some(false) {
-        *length_writable = false;
-    }
-    result?;
-    Ok(true)
-}
-
 pub(super) fn apply_property_descriptor<H: Host>(
     machine: &mut Machine<'_, H>,
     target: Value,
     key: PropertyKey,
     descriptor: CanonicalPropertyDescriptor,
 ) -> Result<(), EvalFailure> {
-    if define_array_length_descriptor(machine, target, &key, descriptor)? {
-        return Ok(());
+    if machine.internal_define_own_property(target, key, descriptor)? {
+        Ok(())
+    } else {
+        Err(type_error("Cannot redefine property"))
     }
-    let current = machine.own_descriptor(target, &key)?;
-    let extensible = descriptor_is_extensible(machine, target)?;
-    if !validate_and_apply_property_descriptor(
-        machine,
-        Some((target, key)),
-        extensible,
-        descriptor,
-        current,
-    )? {
-        return Err(type_error("Cannot redefine property"));
-    }
-    Ok(())
 }
 
 pub(super) fn define_property<H: Host>(
@@ -661,6 +601,86 @@ mod tests {
     use super::*;
     use crate::{Limits, RuntimeErrorKind, ThrowOrigin};
     use bamts_bytecode::{FunctionId, ModuleId};
+
+    fn named(name: &str) -> PropertyKey {
+        PropertyKey::Named(EcmaString::encode(name))
+    }
+
+    fn pinned_element(value: Value) -> Property {
+        Property::Data {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: false,
+        }
+    }
+
+    #[test]
+    fn a_blocked_array_truncation_stops_at_the_element_and_reports_failure() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let values = vec![Value::int32(1), Value::int32(2), Value::int32(3)];
+        let array = allocate_array(&mut machine, values).unwrap();
+        machine
+            .define_descriptor(array, named("1"), pinned_element(Value::int32(2)))
+            .unwrap();
+        let zero = CanonicalPropertyDescriptor {
+            value: Some(Value::int32(0)),
+            ..Default::default()
+        };
+        assert!(
+            !machine
+                .internal_define_own_property(array, named("length"), zero)
+                .unwrap()
+        );
+        assert_eq!(machine.array_length(array).unwrap(), 2);
+        assert!(
+            !machine
+                .internal_set(array, named("length"), Value::int32(0), array)
+                .unwrap()
+        );
+        assert_eq!(machine.array_length(array).unwrap(), 2);
+    }
+
+    #[test]
+    fn an_invalid_array_length_is_a_range_error_before_the_descriptor_is_judged() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = allocate_array(&mut machine, Vec::new()).unwrap();
+        let negative = CanonicalPropertyDescriptor {
+            value: Some(crate::number_value(-1.0)),
+            configurable: Some(true),
+            ..Default::default()
+        };
+        assert!(matches!(
+            machine.internal_define_own_property(array, named("length"), negative),
+            Err(EvalFailure::Throw(ThrowOrigin::RangeError { .. }))
+        ));
+    }
+
+    #[test]
+    fn defining_through_a_proxy_without_a_trap_reaches_the_target() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = ordinary_object(&mut machine);
+        let handler = ordinary_object(&mut machine);
+        let proxy_constructor = machine.intrinsics.global("Proxy").unwrap();
+        let proxy = machine
+            .construct_value(proxy_constructor, &[target, handler])
+            .unwrap();
+        let descriptor = CanonicalPropertyDescriptor {
+            value: Some(Value::int32(7)),
+            ..Default::default()
+        };
+        apply_property_descriptor(&mut machine, proxy, named("x"), descriptor).unwrap();
+        assert!(matches!(
+            machine.own_descriptor(target, &named("x")).unwrap(),
+            Some(Property::Data { value, .. }) if value == Value::int32(7)
+        ));
+    }
 
     #[test]
     fn function_prototype_is_a_function_without_construct() {

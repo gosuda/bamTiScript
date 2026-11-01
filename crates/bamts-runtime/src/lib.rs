@@ -9060,6 +9060,13 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.object_slot(receiver)? else {
             return Ok(false);
         };
+        if self.is_array_length_key(index, &key) {
+            let descriptor = crate::builtins::property_descriptor::PropertyDescriptor {
+                value: Some(value),
+                ..Default::default()
+            };
+            return self.array_define_length(index, descriptor);
+        }
         self.set_own_data(index, key, value)?;
         Ok(true)
     }
@@ -9157,6 +9164,102 @@ impl<'a, H: Host> Machine<'a, H> {
         self.internal_get(base, key, receiver)
     }
 
+    pub(crate) fn is_array_length_key(&self, index: usize, key: &PropertyKey) -> bool {
+        matches!(key, PropertyKey::Named(name) if name.eq_ascii("length"))
+            && matches!(self.heap[index], HeapEntry::Array { .. })
+    }
+
+    /// `ToUint32` and then `ToNumber`, which both run user code and must agree.
+    fn array_length_value(&mut self, value: Value) -> Result<usize, EvalFailure> {
+        let first = self.coerce_number_observable(value)?;
+        let second = self.coerce_number_observable(value)?;
+        let length = numeric_f64(first).map_or(0, to_uint32);
+        if numeric_f64(second) == Some(f64::from(length)) {
+            Ok(length as usize)
+        } else {
+            Err(EvalFailure::Throw(ThrowOrigin::RangeError {
+                operation: "set array length",
+            }))
+        }
+    }
+
+    /// `ArraySetLength`. A non-configurable element stops a truncation there,
+    /// which is reported as `false` after the elements above it have gone.
+    pub(crate) fn array_define_length(
+        &mut self,
+        index: usize,
+        descriptor: crate::builtins::property_descriptor::PropertyDescriptor,
+    ) -> Result<bool, EvalFailure> {
+        let length = descriptor
+            .value
+            .map(|value| self.array_length_value(value))
+            .transpose()?;
+        let HeapEntry::Array {
+            elements,
+            length_writable,
+            ..
+        } = &self.heap[index]
+        else {
+            unreachable!("array_define_length requires an array");
+        };
+        let (old_length, writable) = (elements.len(), *length_writable);
+        if descriptor.is_accessor()
+            || descriptor.enumerable == Some(true)
+            || descriptor.configurable == Some(true)
+            || (!writable
+                && (descriptor.writable == Some(true)
+                    || length.is_some_and(|length| length != old_length)))
+        {
+            return Ok(false);
+        }
+        let reached = match length {
+            Some(length) if length != old_length => self.resize_array(index, length)?,
+            _ => true,
+        };
+        if descriptor.writable == Some(false)
+            && let HeapEntry::Array {
+                length_writable, ..
+            } = &mut self.heap[index]
+        {
+            *length_writable = false;
+        }
+        Ok(reached)
+    }
+
+    /// Resizes with the heap accounting, and says whether `length` was reached.
+    fn resize_array(&mut self, index: usize, length: usize) -> Result<bool, EvalFailure> {
+        let old_length_and_bytes = |entry: &HeapEntry| match entry {
+            HeapEntry::Array {
+                elements,
+                properties,
+                ..
+            } => (elements.len(), properties.charge_bytes()),
+            _ => unreachable!("resize_array requires an array"),
+        };
+        let (old_length, old_property_bytes) = old_length_and_bytes(&self.heap[index]);
+        let growth = length
+            .saturating_sub(old_length)
+            .saturating_mul(std::mem::size_of::<Value>());
+        self.charge_slot(index, growth)
+            .map_err(EvalFailure::Runtime)?;
+        let HeapEntry::Array {
+            elements,
+            properties,
+            ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("resize_array requires an array");
+        };
+        let reached = apply_array_length(elements, properties, length);
+        let (new_length, new_property_bytes) = old_length_and_bytes(&self.heap[index]);
+        let released = old_length
+            .saturating_sub(new_length)
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(old_property_bytes.saturating_sub(new_property_bytes));
+        self.refund_slot(index, released);
+        Ok(reached)
+    }
+
     fn set_own_data(
         &mut self,
         index: usize,
@@ -9174,57 +9277,18 @@ impl<'a, H: Host> Machine<'a, H> {
             typedarray_all::write_element(self, view, offset, value)?;
             return Ok(());
         }
-        if matches!(&key, PropertyKey::Named(name) if name.eq_ascii("length"))
-            && matches!(self.heap[index], HeapEntry::Array { .. })
-        {
-            let length =
-                exact_array_length(value).ok_or(EvalFailure::Throw(ThrowOrigin::RangeError {
+        if self.is_array_length_key(index, &key) {
+            let descriptor = crate::builtins::property_descriptor::PropertyDescriptor {
+                value: Some(value),
+                ..Default::default()
+            };
+            return if self.array_define_length(index, descriptor)? {
+                Ok(())
+            } else {
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "set array length",
-                }))?;
-            let (old_length, old_property_bytes, length_writable) = match &self.heap[index] {
-                HeapEntry::Array {
-                    elements,
-                    properties,
-                    length_writable,
-                    ..
-                } => (elements.len(), properties.charge_bytes(), *length_writable),
-                _ => unreachable!("array checked above"),
+                }))
             };
-            if !length_writable {
-                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "set array length",
-                }));
-            }
-            let growth = length
-                .saturating_sub(old_length)
-                .saturating_mul(std::mem::size_of::<Value>());
-            self.charge_slot(index, growth)
-                .map_err(EvalFailure::Runtime)?;
-            let result = {
-                let HeapEntry::Array {
-                    elements,
-                    properties,
-                    ..
-                } = &mut self.heap[index]
-                else {
-                    unreachable!("array checked above");
-                };
-                apply_array_length(elements, properties, length, "set array length")
-            };
-            let (new_length, new_property_bytes) = match &self.heap[index] {
-                HeapEntry::Array {
-                    elements,
-                    properties,
-                    ..
-                } => (elements.len(), properties.charge_bytes()),
-                _ => unreachable!("array checked above"),
-            };
-            let released = old_length
-                .saturating_sub(new_length)
-                .saturating_mul(std::mem::size_of::<Value>())
-                .saturating_add(old_property_bytes.saturating_sub(new_property_bytes));
-            self.refund_slot(index, released);
-            return result;
         }
         if let HeapEntry::Array {
             elements,
@@ -13494,15 +13558,16 @@ fn exact_array_length(value: Value) -> Option<usize> {
     }
 }
 
+/// Resizes to `length`, stopping above the highest non-configurable element, and
+/// says whether the whole of `length` was reached.
 pub(crate) fn apply_array_length(
     elements: &mut Vec<Value>,
     properties: &mut PropertyMap,
     length: usize,
-    operation: &'static str,
-) -> Result<(), EvalFailure> {
+) -> bool {
     if length >= elements.len() {
         elements.resize(length, Value::HOLE);
-        return Ok(());
+        return true;
     }
     let blocked = properties
         .iter()
@@ -13521,10 +13586,7 @@ pub(crate) fn apply_array_length(
             .is_none_or(|offset| (offset as usize) < effective_length)
     });
     elements.resize(effective_length, Value::HOLE);
-    if blocked.is_some() {
-        return Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }));
-    }
-    Ok(())
+    blocked.is_none()
 }
 
 pub(crate) fn array_set_length(
@@ -13539,7 +13601,11 @@ pub(crate) fn array_set_length(
     if !length_writable {
         return Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }));
     }
-    apply_array_length(elements, properties, length, operation)
+    if apply_array_length(elements, properties, length) {
+        Ok(())
+    } else {
+        Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }))
+    }
 }
 
 fn bigint_binary_op(op: BinaryOp) -> intrinsics::builtins::bigint::BigIntBinaryOp {

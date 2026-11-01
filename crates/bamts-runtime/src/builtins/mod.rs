@@ -331,7 +331,11 @@ fn define_array_length(
     if !length_writable && length != elements.len() {
         return Err(type_error("Cannot redefine non-writable array length"));
     }
-    crate::apply_array_length(elements, properties, length, "define array length")
+    if crate::apply_array_length(elements, properties, length) {
+        Ok(())
+    } else {
+        Err(type_error("define array length"))
+    }
 }
 fn install_boolean<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -939,6 +943,11 @@ impl<'a, H: Host> Machine<'a, H> {
             return self.with_proxy_dispatch(|machine| {
                 proxy::define_own_property(machine, object, key, descriptor)
             });
+        }
+        if let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)?
+            && self.is_array_length_key(index, &key)
+        {
+            return self.array_define_length(index, descriptor);
         }
         let current = self.own_descriptor(object, &key)?;
         let extensible = property_descriptor::is_extensible(self, object)?;
