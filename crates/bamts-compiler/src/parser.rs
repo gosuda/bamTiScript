@@ -2156,8 +2156,14 @@ impl Parser {
         };
 
         // Constructor.
+        // In JavaScript a static, async, or generator `constructor` is an ordinary
+        // method, which the early-error pass judges. TypeScript keeps one shape
+        // here because its checker reports these itself.
+        let plain_in_javascript =
+            self.is_typescript() || !(modifiers.is_static || is_async || is_generator);
         if !is_accessor
             && property_modifier == PropertyModifier::None
+            && plain_in_javascript
             && self.is_constructor_name(&name)
             && self.at(TokenKind::LParen)
         {
@@ -3244,7 +3250,10 @@ impl Parser {
     fn parse_assignment_inner(&mut self, no_in: bool) -> Expr {
         let start = self.cur_start();
 
-        if self.at(TokenKind::KwYield) {
+        // Outside a generator, sloppy JavaScript reads `yield` as an identifier.
+        if self.at(TokenKind::KwYield)
+            && (self.is_typescript() || self.keyword_context.yield_reserved)
+        {
             return self.parse_yield_expression(start, no_in);
         }
 
