@@ -5672,14 +5672,17 @@ impl<'a, H: Host> Machine<'a, H> {
                     captures,
                 } => match self.read_captures(frame_index, captures.get(), function) {
                     Ok(captures) => {
+                        let properties = self
+                            .closure_properties(module_id, function)
+                            .map_err(|kind| self.error_at(kind, function_index, pc))?;
                         let value = self
                             .allocate(HeapEntry::Function {
                                 module: module_id,
                                 function,
                                 captures,
                                 context: self.frames[frame_index].context,
-                                properties: PropertyMap::default(),
-                                prototype: Some(self.intrinsics.function_prototype),
+                                properties,
+                                prototype: Some(self.closure_prototype(module_id, function)),
                                 extensible: true,
                             })
                             .map_err(|kind| self.error_at(kind, function_index, pc))?;
@@ -6654,6 +6657,55 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     /// Whether a function is non-strict ECMAScript code.
+    /// The `[[Prototype]]` a new closure starts with, which depends on its kind.
+    pub(crate) fn closure_prototype(&self, module: ModuleId, function: FunctionId) -> Value {
+        let flags = self.module_code(module).functions()[function.get() as usize].flags();
+        let builtins = &self.intrinsics.builtins;
+        match (flags.is_async, flags.is_generator) {
+            (false, false) => self.intrinsics.function_prototype,
+            (false, true) => builtins.generator_function_prototype(),
+            (true, false) => builtins.async_function_prototype(),
+            (true, true) => builtins.async_generator_function_prototype(),
+        }
+    }
+
+    /// The own properties a new closure starts with. A generator function owns
+    /// the `prototype` object its kind requires, which the compiler emits only
+    /// for constructors; every other property of a closure is materialized on
+    /// demand.
+    pub(crate) fn closure_properties(
+        &mut self,
+        module: ModuleId,
+        function: FunctionId,
+    ) -> Result<PropertyMap, RuntimeErrorKind> {
+        let flags = self.module_code(module).functions()[function.get() as usize].flags();
+        let mut properties = PropertyMap::default();
+        if flags.is_generator {
+            let builtins = &self.intrinsics.builtins;
+            let parent = if flags.is_async {
+                builtins.async_generator_prototype()
+            } else {
+                builtins.generator_prototype()
+            };
+            let value = self.allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(parent),
+                extensible: true,
+                boxed_primitive: None,
+            })?;
+            properties.insert(
+                PropertyKey::Named(EcmaString::encode("prototype")),
+                Property::Data {
+                    value,
+                    writable: true,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+        Ok(properties)
+    }
+
     pub(crate) fn is_sloppy(&self, module: ModuleId, function: usize) -> bool {
         self.module_code(module).functions()[function]
             .flags()
@@ -21718,6 +21770,96 @@ mod tests {
             .unwrap();
         machine.test_set_global("toString", key);
         assert_eq!(machine.run().unwrap().value, Value::int32(7));
+    }
+
+    #[test]
+    fn closure_prototypes_follow_the_function_kind() {
+        let plain = function(0, 1, vec![Instruction::Halt], Vec::new());
+        let kinded = |is_async, is_generator| {
+            Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags {
+                    is_async,
+                    is_generator,
+                    ..FunctionFlags::default()
+                },
+                vec![Instruction::Halt],
+                Vec::new(),
+            )
+        };
+        let program = verified(
+            Vec::new(),
+            vec![
+                plain,
+                kinded(false, true),
+                kinded(true, false),
+                kinded(true, true),
+            ],
+        );
+        let mut host = TestHost;
+        let machine = Machine::new(&program, &mut host, Limits::default());
+        let kind = |index| machine.closure_prototype(ModuleId::new(0), FunctionId::new(index));
+        let builtins = &machine.intrinsics.builtins;
+        assert_eq!(kind(0), machine.intrinsics.function_prototype);
+        assert_eq!(kind(1), builtins.generator_function_prototype());
+        assert_eq!(kind(2), builtins.async_function_prototype());
+        assert_eq!(kind(3), builtins.async_generator_function_prototype());
+        assert!(
+            !machine.is_callable(kind(1)).unwrap(),
+            "only %Function.prototype% is itself callable"
+        );
+    }
+
+    #[test]
+    fn a_generator_closure_owns_a_prototype_inheriting_from_its_kind() {
+        let generator = Function::new(
+            None,
+            0,
+            0,
+            1,
+            FunctionFlags {
+                is_generator: true,
+                ..FunctionFlags::default()
+            },
+            vec![Instruction::Halt],
+            Vec::new(),
+        );
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator,
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let module = ModuleId::new(0);
+        assert!(
+            machine
+                .closure_properties(module, FunctionId::new(0))
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        let properties = machine
+            .closure_properties(module, FunctionId::new(1))
+            .unwrap();
+        let Some(Property::Data {
+            value,
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        }) = properties.get(&PropertyKey::Named(EcmaString::encode("prototype")))
+        else {
+            panic!("a generator function's prototype is a writable data property");
+        };
+        assert_eq!(
+            machine.internal_get_prototype_of(*value).unwrap(),
+            Some(machine.intrinsics.builtins.generator_prototype())
+        );
     }
 
     #[test]

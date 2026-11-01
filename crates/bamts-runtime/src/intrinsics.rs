@@ -79,6 +79,9 @@ pub(crate) struct BuiltinTable<H: Host> {
     iterator_prototype: Option<Value>,
     async_iterator_prototype: Option<Value>,
     generator_prototype: Option<Value>,
+    generator_function_prototype: Option<Value>,
+    async_function_prototype: Option<Value>,
+    async_generator_function_prototype: Option<Value>,
     async_generator_prototype: Option<Value>,
     async_from_sync_iterator_prototype: Option<Value>,
     promise_resolver_targets: Option<(Value, Value)>,
@@ -155,6 +158,9 @@ impl<H: Host> BuiltinTable<H> {
             iterator_prototype: None,
             async_iterator_prototype: None,
             generator_prototype: None,
+            generator_function_prototype: None,
+            async_function_prototype: None,
+            async_generator_function_prototype: None,
             async_generator_prototype: None,
             async_from_sync_iterator_prototype: None,
             promise_resolver_targets: None,
@@ -370,6 +376,28 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn async_iterator_prototype(&self) -> Value {
         self.async_iterator_prototype
             .expect("async iterator builtins install their prototype")
+    }
+    pub(crate) fn set_function_kind_prototypes(
+        &mut self,
+        generator: Value,
+        asynchronous: Value,
+        async_generator: Value,
+    ) {
+        self.generator_function_prototype = Some(generator);
+        self.async_function_prototype = Some(asynchronous);
+        self.async_generator_function_prototype = Some(async_generator);
+    }
+    pub(crate) fn generator_function_prototype(&self) -> Value {
+        self.generator_function_prototype
+            .expect("Function builtins install the generator function prototype")
+    }
+    pub(crate) fn async_function_prototype(&self) -> Value {
+        self.async_function_prototype
+            .expect("Function builtins install the async function prototype")
+    }
+    pub(crate) fn async_generator_function_prototype(&self) -> Value {
+        self.async_generator_function_prototype
+            .expect("Function builtins install the async generator function prototype")
     }
     pub(crate) fn set_generator_prototype(&mut self, prototype: Value) {
         self.generator_prototype = Some(prototype);
@@ -734,6 +762,9 @@ impl<H: Host> BuiltinTable<H> {
             iterator_prototype,
             async_iterator_prototype,
             generator_prototype,
+            generator_function_prototype,
+            async_function_prototype,
+            async_generator_function_prototype,
             async_generator_prototype,
             async_from_sync_iterator_prototype,
             promise_resolver_targets,
@@ -805,6 +836,9 @@ impl<H: Host> BuiltinTable<H> {
             *iterator_prototype,
             *async_iterator_prototype,
             *generator_prototype,
+            *generator_function_prototype,
+            *async_function_prototype,
+            *async_generator_function_prototype,
             *async_generator_prototype,
             *async_from_sync_iterator_prototype,
             *promise_all_target,

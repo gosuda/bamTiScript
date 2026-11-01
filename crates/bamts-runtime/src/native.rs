@@ -3981,13 +3981,22 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     let context = self.machine.borrow().context_global;
                     match materialized {
                         Ok(captures) => {
-                            let prototype = self.machine.borrow().intrinsics.function_prototype;
+                            let prototype =
+                                self.machine.borrow().closure_prototype(module, function);
+                            let properties = self
+                                .machine
+                                .borrow_mut()
+                                .closure_properties(module, function);
+                            let properties = match properties {
+                                Ok(properties) => properties,
+                                Err(kind) => break 'result self.fatal(kind),
+                            };
                             self.allocated(HeapEntry::Function {
                                 module,
                                 function,
                                 captures,
                                 context,
-                                properties: PropertyMap::default(),
+                                properties,
                                 prototype: Some(prototype),
                                 extensible: true,
                             })
