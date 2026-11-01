@@ -12754,7 +12754,7 @@ impl<'a, H: Host> Machine<'a, H> {
             .runtime_slot(value)
             .map_err(EvalFailure::Runtime)?
             .is_some_and(|index| matches!(self.heap[index], HeapEntry::Date { .. }));
-        self.coerce_primitive_observable(value, prefer_string)
+        self.coerce_primitive_with_hint(value, "default", prefer_string)
     }
 
     pub(crate) fn coerce_primitive_observable(
@@ -12762,8 +12762,39 @@ impl<'a, H: Host> Machine<'a, H> {
         value: Value,
         prefer_string: bool,
     ) -> Result<Value, EvalFailure> {
+        let hint = if prefer_string { "string" } else { "number" };
+        self.coerce_primitive_with_hint(value, hint, prefer_string)
+    }
+
+    /// ToPrimitive. `hint` is what a `Symbol.toPrimitive` method receives, and
+    /// `prefer_string` orders the two ordinary methods when there is none.
+    fn coerce_primitive_with_hint(
+        &mut self,
+        value: Value,
+        hint: &str,
+        prefer_string: bool,
+    ) -> Result<Value, EvalFailure> {
         if self.coercion_is_primitive(value)? {
             return Ok(value);
+        }
+        let key = self.to_property_key(self.intrinsics.builtins.symbol_to_primitive())?;
+        let exotic = self.get_property_key(value, &key)?;
+        if !matches!(exotic.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            if !self.is_callable(exotic)? {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Symbol.toPrimitive is not a function",
+                }));
+            }
+            let hint = self
+                .allocate(HeapEntry::String(EcmaString::encode(hint)))
+                .map_err(EvalFailure::Runtime)?;
+            let primitive = self.call_value(exotic, value, &[hint])?;
+            if self.coercion_is_primitive(primitive)? {
+                return Ok(primitive);
+            }
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Symbol.toPrimitive returned an object",
+            }));
         }
         let methods = if prefer_string {
             ["toString", "valueOf"]

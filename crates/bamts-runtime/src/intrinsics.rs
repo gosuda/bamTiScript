@@ -61,6 +61,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     symbol_match: Option<Value>,
     symbol_replace: Option<Value>,
     symbol_species: Option<Value>,
+    symbol_to_primitive: Option<Value>,
     symbol_dispose: Option<Value>,
     symbol_async_dispose: Option<Value>,
     symbol_unscopables: Option<Value>,
@@ -129,6 +130,7 @@ impl<H: Host> BuiltinTable<H> {
             symbol_match: None,
             symbol_replace: None,
             symbol_species: None,
+            symbol_to_primitive: None,
             symbol_dispose: None,
             symbol_async_dispose: None,
             symbol_unscopables: None,
@@ -264,6 +266,13 @@ impl<H: Host> BuiltinTable<H> {
     }
     pub(crate) fn symbol_unscopables(&self) -> Value {
         self.symbol_unscopables
+            .expect("Symbol builtins install first")
+    }
+    pub(crate) fn set_symbol_to_primitive(&mut self, symbol: Value) {
+        self.symbol_to_primitive = Some(symbol);
+    }
+    pub(crate) fn symbol_to_primitive(&self) -> Value {
+        self.symbol_to_primitive
             .expect("Symbol builtins install first")
     }
     pub(crate) fn set_symbol_species(&mut self, symbol: Value) {
@@ -658,6 +667,7 @@ impl<H: Host> BuiltinTable<H> {
             symbol_match,
             symbol_replace,
             symbol_species,
+            symbol_to_primitive,
             symbol_dispose,
             symbol_async_dispose,
             symbol_unscopables,
@@ -721,6 +731,7 @@ impl<H: Host> BuiltinTable<H> {
             *symbol_match,
             *symbol_replace,
             *symbol_species,
+            *symbol_to_primitive,
             *symbol_dispose,
             *symbol_async_dispose,
             *symbol_unscopables,

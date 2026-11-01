@@ -24,11 +24,13 @@ pub(super) fn install<H: Host>(
     let async_dispose = symbol(heap, "Symbol.asyncDispose");
     let match_symbol = symbol(heap, "Symbol.match");
     let replace_symbol = symbol(heap, "Symbol.replace");
+    let to_primitive = symbol(heap, "Symbol.toPrimitive");
     let unscopables = symbol(heap, "Symbol.unscopables");
     builtins.set_symbol_iterator(iterator);
     builtins.set_symbol_async_iterator(async_iterator);
     builtins.set_symbol_match(match_symbol);
     builtins.set_symbol_replace(replace_symbol);
+    builtins.set_symbol_to_primitive(to_primitive);
     builtins.set_symbol_to_string_tag(to_string_tag);
     builtins.set_symbol_species(species);
     builtins.set_symbol_dispose(dispose);
@@ -46,6 +48,7 @@ pub(super) fn install<H: Host>(
         ("hasInstance", has_instance),
         ("match", match_symbol),
         ("replace", replace_symbol),
+        ("toPrimitive", to_primitive),
         ("toStringTag", to_string_tag),
         ("species", species),
         ("dispose", dispose),
@@ -251,6 +254,7 @@ mod tests {
             "hasInstance" => None,
             "match" => Some(builtins.symbol_match()),
             "replace" => Some(builtins.symbol_replace()),
+            "toPrimitive" => Some(builtins.symbol_to_primitive()),
             "toStringTag" => Some(builtins.symbol_to_string_tag()),
             "species" => Some(builtins.symbol_species()),
             "dispose" => Some(builtins.symbol_dispose()),
@@ -258,6 +262,93 @@ mod tests {
             "unscopables" => Some(builtins.symbol_unscopables()),
             _ => None,
         }
+    }
+
+    fn echo_hint(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        args: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(args[0]))
+    }
+
+    fn return_this(
+        _: &mut Machine<'_, TestHost>,
+        this: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(this))
+    }
+
+    fn with_to_primitive(machine: &mut Machine<'_, TestHost>, method: Value) -> Value {
+        let object = ordinary_object(machine);
+        let key = machine
+            .to_property_key(machine.intrinsics.builtins.symbol_to_primitive())
+            .unwrap();
+        machine.set_data_property_key(object, key, method).unwrap();
+        object
+    }
+
+    #[test]
+    fn to_primitive_method_receives_the_hint_of_each_coercion() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "echo hint",
+            length: 1,
+            handler: echo_hint,
+        });
+        let method = native_function(&mut machine.heap, id, "echo hint", 1);
+        let object = with_to_primitive(&mut machine, method);
+
+        let string = machine.coerce_primitive_observable(object, true).unwrap();
+        let number = machine.coerce_primitive_observable(object, false).unwrap();
+        let default = machine.coerce_primitive_default(object).unwrap();
+        for (value, hint) in [(string, "string"), (number, "number"), (default, "default")] {
+            assert!(
+                machine
+                    .string_value(value)
+                    .is_some_and(|text| text.eq_ascii(hint)),
+                "expected hint {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn to_primitive_rejects_object_results_and_non_callable_methods() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "return this",
+            length: 0,
+            handler: return_this,
+        });
+        let method = native_function(&mut machine.heap, id, "return this", 0);
+        for method in [method, Value::int32(1)] {
+            let object = with_to_primitive(&mut machine, method);
+            assert!(matches!(
+                machine.coerce_primitive_observable(object, false),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_null_to_primitive_method_falls_back_to_the_ordinary_methods() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object = with_to_primitive(&mut machine, Value::NULL);
+        let primitive = machine.coerce_primitive_observable(object, true).unwrap();
+        assert!(
+            machine
+                .string_value(primitive)
+                .is_some_and(|text| text.eq_ascii("[object Object]"))
+        );
     }
 
     #[test]
@@ -282,6 +373,7 @@ mod tests {
             ("iterator", "Symbol.iterator"),
             ("asyncIterator", "Symbol.asyncIterator"),
             ("hasInstance", "Symbol.hasInstance"),
+            ("toPrimitive", "Symbol.toPrimitive"),
             ("toStringTag", "Symbol.toStringTag"),
             ("species", "Symbol.species"),
             ("dispose", "Symbol.dispose"),
