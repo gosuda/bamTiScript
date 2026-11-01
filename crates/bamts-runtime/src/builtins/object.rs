@@ -705,6 +705,22 @@ mod tests {
     }
 
     #[test]
+    fn array_own_keys_put_length_after_indices_and_before_other_names() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = allocate_array(&mut machine, vec![Value::int32(1)]).unwrap();
+        machine
+            .set_data_property(array, "tag", Value::TRUE)
+            .unwrap();
+        assert_eq!(
+            machine.internal_own_property_keys(array).unwrap(),
+            [named("0"), named("length"), named("tag")]
+        );
+        assert!(machine.enumerable_keys(array).unwrap().len() == 2);
+    }
+
+    #[test]
     fn function_prototype_is_a_function_without_construct() {
         let module = blank_program("<test>");
         let mut host = TestHost;

@@ -11932,9 +11932,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         indices.push((offset, key));
                     }
                     indices.sort_unstable_by_key(|(offset, _)| *offset);
+                    let length = PropertyKey::Named(EcmaString::encode("length"));
                     Ok(indices
                         .into_iter()
                         .map(|(_, key)| key)
+                        .chain(std::iter::once(length))
                         .chain(suffix)
                         .collect())
                 }
