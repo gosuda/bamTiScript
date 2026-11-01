@@ -726,17 +726,18 @@ fn to_lower<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let source = text(machine, this)?;
     let mut output = EcmaStringBuilder::new();
+    // Lowering whole runs lets str::to_lowercase see the context Final_Sigma needs.
+    let mut run = String::new();
     for (_, code_point) in source.code_points() {
         if let Some(character) = char::from_u32(code_point) {
-            for mapped in character.to_lowercase() {
-                output
-                    .push_code_point(mapped as u32)
-                    .expect("Rust char is valid");
-            }
+            run.push(character);
         } else {
+            output.push_utf8(&run.to_lowercase());
+            run.clear();
             output.push_unit(code_point as u16);
         }
     }
+    output.push_utf8(&run.to_lowercase());
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
         output.finish(),
