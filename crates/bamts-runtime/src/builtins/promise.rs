@@ -585,9 +585,7 @@ fn race<H: Host>(
         let value = match machine.iterator_next(iterator) {
             Ok((true, _)) => break,
             Ok((false, value)) => value,
-            Err(failure) => {
-                return reject_iterator_failure(machine, &capability, iterator, failure);
-            }
+            Err(failure) => return reject_capability_failure(machine, &capability, failure),
         };
         let resolved = match machine.call_value(resolve, this, &[value]) {
             Ok(resolved) => resolved,
