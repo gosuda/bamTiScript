@@ -81,6 +81,44 @@ sweep catalog runner shards="32" jobs="10":
     target/release/bamts-verification suite merge --catalog {{catalog}} --receipts "$out" --out "$merged" --check
     printf 'SWEEP PASS %s\n' "$merged"
 
+# Counts by state, facet and failure family for one sweep. `receipt` defaults to
+# the merged file `sweep` writes; pass another, such as a smoke shard, to read it.
+status catalog runner receipt="" top="20":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    receipt="{{receipt}}"
+    receipt="${receipt:-target/evidence-local/merged/{{catalog}}-{{runner}}-{{host_triple}}.jsonl}"
+    cargo run --locked -q -p bamts-verification --bin bamts-verification -- suite families "$receipt" --top {{top}}
+
+# The rows of one failure family, smallest input first. Family names come from `status`.
+family-show family catalog="typescript-7.0.2" runner="compiler" receipt="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{catalog}}" in
+      typescript-7.0.2) root=target/authority/typescript-7.0.2-tests ;;
+      typescript-6.0.2) root=target/authority/typescript-6.0.2-tests ;;
+      typescript-5.9.3) root=target/authority/typescript-5.9.3-tests ;;
+      test262) root=target/authority/test262 ;;
+      *) echo "family-show: no authority tree is known for catalog {{catalog}}"; exit 1 ;;
+    esac
+    receipt="{{receipt}}"
+    receipt="${receipt:-target/evidence-local/merged/{{catalog}}-{{runner}}-{{host_triple}}.jsonl}"
+    cargo run --locked -q -p bamts-verification --bin bamts-verification -- suite families "$receipt" --family "{{family}}" --root "$root"
+
+# Rebuilds the lane workers, reruns only the rows of one family, and fails if any row
+# that passed in the receipt no longer does. A fix must convert a row and regress none.
+recount family catalog="typescript-7.0.2" runner="compiler" receipt="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    receipt="{{receipt}}"
+    receipt="${receipt:-target/evidence-local/merged/{{catalog}}-{{runner}}-{{host_triple}}.jsonl}"
+    cargo build --locked --release -p bamts-verification --bin ts_lane_worker --bin runtime_lane_worker
+    export BAMTS_SUITE_COMPILER_ADAPTER=target/release/ts_lane_worker
+    export BAMTS_SUITE_INTERPRETER_ADAPTER=target/release/runtime_lane_worker
+    export BAMTS_SUITE_JIT_ADAPTER=target/release/runtime_lane_worker
+    export BAMTS_SUITE_AOT_ADAPTER=target/release/runtime_lane_worker
+    cargo run --locked -q -p bamts-verification --bin bamts-verification -- suite recount --catalog {{catalog}} --runner {{runner}} --baseline "$receipt" --family "{{family}}" --fail-on-regression
+
 nightly: ci ci-accounting ci-formal
     just sweep typescript-7.0.2 compiler
     just sweep test262 interpreter
