@@ -347,174 +347,105 @@ impl TargetCellRecord {
             ));
         }
         for (obligation, record) in &self.obligations {
-            require_evidence_fields(
-                path,
-                &self.triple,
-                obligation,
-                &record.evidence,
-                &["command"],
-            )?;
-            let required = match obligation.as_str() {
-                "toolchain-manifest" => &["rustc_version", "rustc_sha256"][..],
-                "elf-object" => &[
+            let triple = self.triple.as_str();
+            let evidence = record.evidence.as_str();
+            let rules = self.evidence_rules(obligation);
+            require_evidence_fields(path, triple, obligation, evidence, &["command"])?;
+            require_evidence_fields(path, triple, obligation, evidence, &rules.fields)?;
+            for (field, expected) in rules.values {
+                require_evidence_value(path, triple, obligation, evidence, field, expected)?;
+            }
+            if obligation == "reproducible-build" {
+                require_equal_hashes(path, triple, obligation, evidence)?;
+            }
+            validate_evidence_hashes(path, triple, obligation, evidence)?;
+        }
+        Ok(())
+    }
+
+    /// What one obligation's evidence must state for this cell.
+    fn evidence_rules(&self, obligation: &str) -> EvidenceRules {
+        let machine = match self.triple.as_str() {
+            "x86_64-unknown-linux-gnu" => "Advanced Micro Devices X86-64",
+            "aarch64-unknown-linux-gnu" => "AArch64",
+            "s390x-unknown-linux-gnu" => "IBM S/390",
+            "riscv64gc-unknown-linux-gnu" => "RISC-V",
+            _ => unreachable!("target set was validated"),
+        };
+        match obligation {
+            "toolchain-manifest" => EvidenceRules::fields(&["rustc_version", "rustc_sha256"]),
+            "elf-object" => EvidenceRules {
+                fields: vec![
                     "object_sha256",
                     "elf_type",
                     "elf_machine",
                     "entry",
                     "helpers",
-                ][..],
-                "hardened-link" => &[
+                ],
+                values: vec![("elf_type", "REL"), ("elf_machine", machine)],
+            },
+            "hardened-link" => EvidenceRules {
+                fields: vec![
                     "executable_sha256",
                     "elf_type",
                     "elf_machine",
                     "linker_version",
                     "linker_sha256",
-                ][..],
-                "qemu-functional" | "native-runtime" => {
-                    &["executable_sha256", "execution", "exit", "result", "fuel"][..]
-                }
-                "execmem-guard" => &[
-                    "executable_sha256",
-                    "writable_executable_load_segments",
-                    "gnu_stack",
-                    "dynamic_section",
-                    "readelf_sha256",
-                ][..],
-                "reproducible-build" => &[
-                    "first_object_sha256",
-                    "second_object_sha256",
-                    "byte_identical",
-                ][..],
-                _ => unreachable!("obligation set was validated"),
-            };
-            let expected_machine = match self.triple.as_str() {
-                "x86_64-unknown-linux-gnu" => "Advanced Micro Devices X86-64",
-                "aarch64-unknown-linux-gnu" => "AArch64",
-                "s390x-unknown-linux-gnu" => "IBM S/390",
-                "riscv64gc-unknown-linux-gnu" => "RISC-V",
-                _ => unreachable!("target set was validated"),
-            };
-            if matches!(obligation.as_str(), "elf-object" | "hardened-link") {
-                require_evidence_value(
-                    path,
-                    &self.triple,
-                    obligation,
-                    &record.evidence,
-                    "elf_machine",
-                    expected_machine,
-                )?;
-            }
-            require_evidence_fields(path, &self.triple, obligation, &record.evidence, required)?;
-            if matches!(obligation.as_str(), "qemu-functional" | "native-runtime") {
-                match self.cell_class {
-                    CellClass::NativeHost => require_evidence_value(
-                        path,
-                        &self.triple,
-                        obligation,
-                        &record.evidence,
-                        "execution",
-                        "native",
-                    )?,
-                    CellClass::CrossQemu => {
-                        require_evidence_fields(
-                            path,
-                            &self.triple,
-                            obligation,
-                            &record.evidence,
-                            &["emulator_version", "emulator_sha256"],
-                        )?;
-                        let expected_execution = match self.triple.as_str() {
-                            "aarch64-unknown-linux-gnu" => "qemu-aarch64",
-                            "s390x-unknown-linux-gnu" => "qemu-s390x",
-                            "riscv64gc-unknown-linux-gnu" => "qemu-riscv64",
-                            _ => unreachable!("cross target set was validated"),
-                        };
-                        require_evidence_value(
-                            path,
-                            &self.triple,
-                            obligation,
-                            &record.evidence,
-                            "execution",
-                            expected_execution,
-                        )?;
-                    }
-                }
-                require_evidence_value(
-                    path,
-                    &self.triple,
-                    obligation,
-                    &record.evidence,
-                    "exit",
-                    "0",
-                )?;
-                require_evidence_value(
-                    path,
-                    &self.triple,
-                    obligation,
-                    &record.evidence,
-                    "result",
-                    "int32:42",
-                )?;
-            }
-            if obligation == "elf-object" {
-                require_evidence_value(
-                    path,
-                    &self.triple,
-                    obligation,
-                    &record.evidence,
-                    "elf_type",
-                    "REL",
-                )?;
-            } else if obligation == "hardened-link" {
-                require_evidence_value(
-                    path,
-                    &self.triple,
-                    obligation,
-                    &record.evidence,
-                    "elf_type",
-                    "EXEC",
-                )?;
-            } else if obligation == "execmem-guard" {
-                for (field, expected) in [
+                ],
+                values: vec![("elf_type", "EXEC"), ("elf_machine", machine)],
+            },
+            "qemu-functional" | "native-runtime" => self.execution_rules(),
+            "execmem-guard" => EvidenceRules {
+                fields: vec!["executable_sha256", "readelf_sha256"],
+                values: vec![
                     ("writable_executable_load_segments", "0"),
                     ("gnu_stack", "RW"),
                     ("dynamic_section", "absent"),
-                ] {
-                    require_evidence_value(
-                        path,
-                        &self.triple,
-                        obligation,
-                        &record.evidence,
-                        field,
-                        expected,
-                    )?;
-                }
-            } else if obligation == "reproducible-build" {
-                require_evidence_value(
-                    path,
-                    &self.triple,
-                    obligation,
-                    &record.evidence,
-                    "byte_identical",
-                    "true",
-                )?;
-                let first =
-                    evidence_value(&record.evidence, "first_object_sha256").expect("required");
-                let second =
-                    evidence_value(&record.evidence, "second_object_sha256").expect("required");
-                if first != second {
-                    return Err(schema_error(
-                        path,
-                        format!(
-                            "{}::{obligation} claims byte identity for unequal object hashes",
-                            self.triple
-                        ),
-                    ));
-                }
-            }
-            validate_evidence_hashes(path, &self.triple, obligation, &record.evidence)?;
+                ],
+            },
+            "reproducible-build" => EvidenceRules {
+                fields: vec!["first_object_sha256", "second_object_sha256"],
+                values: vec![("byte_identical", "true")],
+            },
+            _ => unreachable!("obligation set was validated"),
         }
-        Ok(())
+    }
+
+    /// Rules shared by the two obligations that run a linked image.
+    fn execution_rules(&self) -> EvidenceRules {
+        let mut rules = EvidenceRules {
+            fields: vec!["executable_sha256", "execution", "fuel"],
+            values: vec![("exit", "0"), ("result", "int32:42")],
+        };
+        match self.cell_class {
+            CellClass::NativeHost => rules.values.push(("execution", "native")),
+            CellClass::CrossQemu => {
+                rules.fields.extend(["emulator_version", "emulator_sha256"]);
+                let execution = match self.triple.as_str() {
+                    "aarch64-unknown-linux-gnu" => "qemu-aarch64",
+                    "s390x-unknown-linux-gnu" => "qemu-s390x",
+                    "riscv64gc-unknown-linux-gnu" => "qemu-riscv64",
+                    _ => unreachable!("cross target set was validated"),
+                };
+                rules.values.push(("execution", execution));
+            }
+        }
+        rules
+    }
+}
+
+/// The fields one obligation's evidence must carry, and the values some must hold.
+struct EvidenceRules {
+    fields: Vec<&'static str>,
+    values: Vec<(&'static str, &'static str)>,
+}
+
+impl EvidenceRules {
+    fn fields(fields: &[&'static str]) -> Self {
+        Self {
+            fields: fields.to_vec(),
+            values: Vec::new(),
+        }
     }
 }
 
@@ -563,6 +494,19 @@ fn require_evidence_value(
             format!(
                 "{triple}::{obligation} evidence `{field}` expected `{expected}`, found `{actual}`"
             ),
+        ))
+    }
+}
+
+fn require_equal_hashes(path: &Path, triple: &str, obligation: &str, evidence: &str) -> Result<()> {
+    let first = evidence_value(evidence, "first_object_sha256").expect("required");
+    let second = evidence_value(evidence, "second_object_sha256").expect("required");
+    if first == second {
+        Ok(())
+    } else {
+        Err(schema_error(
+            path,
+            format!("{triple}::{obligation} claims byte identity for unequal object hashes"),
         ))
     }
 }
