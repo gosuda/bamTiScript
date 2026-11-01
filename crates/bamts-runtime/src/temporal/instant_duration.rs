@@ -1555,7 +1555,7 @@ mod tests {
     fn instant_parse_annotations() {
         let i = Instant::parse("1970-01-01T00:00:00Z[UTC][u-ca=iso8601]").unwrap();
         assert_eq!(i.epoch_nanoseconds(), 0);
-        assert!(Instant::parse("1970-01-01T00:00:00Z[!u-ca=japanese]").is_err());
+        assert!(Instant::parse("1970-01-01T00:00:00Z[!u-ca=japanese]").is_ok());
         assert!(Instant::parse("1970-01-01T00:00:00Z[!unknown=x]").is_err());
         // Non-critical unknown annotation ignored.
         assert!(Instant::parse("1970-01-01T00:00:00Z[unknown=x]").is_ok());
@@ -1701,7 +1701,7 @@ mod tests {
         let n = Duration::parse("-PT0.000000001S").unwrap();
         assert_eq!(n.nanoseconds, -1);
         let h = Duration::parse("PT0.5H").unwrap();
-        assert_eq!((h.hours, h.milliseconds), (0, 1_800_000));
+        assert_eq!((h.hours, h.minutes, h.milliseconds), (0, 30, 0));
         assert!(Duration::parse("PT1.5H30M").is_err()); // fraction must be last
         assert!(Duration::parse("PT1.1234567890S").is_err()); // >9 digits
     }

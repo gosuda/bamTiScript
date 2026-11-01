@@ -1326,8 +1326,10 @@ mod tests {
         assert!(PlainDate::parse("2000-01-01[u-ca=iso8601]").is_ok());
         assert!(PlainDate::parse("2000-01-01[!u-ca=japanese]").is_err());
         // Full datetime string: date portion taken.
-        let dt = PlainDate::parse("2000-05-15T12:30:00Z").unwrap();
+        let dt = PlainDate::parse("2000-05-15T12:30:00").unwrap();
         assert_eq!(dt.format(), "2000-05-15");
+        // A UTC designator names an exact time, not a wall-clock date.
+        assert!(PlainDate::parse("2000-05-15T12:30:00Z").is_err());
     }
 
     #[test]
@@ -1434,7 +1436,7 @@ mod tests {
     fn cross_type_year_month_and_month_day() {
         let date = PlainDate::new(2024, 2, 29, Overflow::Reject).unwrap();
         let ym = date.to_plain_year_month();
-        assert_eq!(ym.format(), "2024-02-01");
+        assert_eq!(ym.format(), "2024-02");
         assert_eq!(ym.days_in_month(), 29);
         assert_eq!(ym.to_plain_date(29, Overflow::Reject).unwrap(), date);
         let md = date.to_plain_month_day();
@@ -1450,14 +1452,14 @@ mod tests {
         let ym = PlainYearMonth::new(2020, 11, Overflow::Reject).unwrap();
         let three = Duration::new(0, 14, 0, 0, 0, 0, 0, 0, 0, 0).unwrap();
         let later = ym.add(&three, Overflow::Constrain).unwrap();
-        assert_eq!(later.format(), "2022-01-01");
+        assert_eq!(later.format(), "2022-01");
         let d = ym.until(later, Unit::Month, Unit::Month, 1, RoundingMode::Trunc).unwrap();
         assert_eq!(d.months, 14);
         let yd = ym.until(later, Unit::Year, Unit::Year, 1, RoundingMode::Trunc).unwrap();
         assert_eq!((yd.years, yd.months), (1, 0));
         assert_eq!(
             PlainYearMonth::parse("2020-11").unwrap().format(),
-            "2020-11-01"
+            "2020-11"
         );
         assert!(ym.until(later, Unit::Day, Unit::Day, 1, RoundingMode::Trunc).is_err());
     }
