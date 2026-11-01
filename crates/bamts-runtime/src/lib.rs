@@ -26,8 +26,7 @@ use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 
 use crate::vm::explicit_resource::DisposalStackState;
 use crate::vm::generator_async::GeneratorCompletion;
@@ -1791,40 +1790,6 @@ struct TimerRecord {
     interval_delay: Option<u32>,
 }
 
-#[allow(dead_code)]
-pub(crate) enum ExternalJob {
-    ResolveWaitAsync { promise: u64, result: &'static str },
-}
-
-pub(crate) struct ExternalInbox {
-    queue: Mutex<VecDeque<ExternalJob>>,
-    signal: Condvar,
-    pending: AtomicUsize,
-}
-
-#[allow(dead_code)]
-impl ExternalInbox {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            queue: Mutex::new(VecDeque::new()),
-            signal: Condvar::new(),
-            pending: AtomicUsize::new(0),
-        })
-    }
-
-    pub(crate) fn reserve(&self) {
-        self.pending.fetch_add(1, AtomicOrdering::AcqRel);
-    }
-
-    pub(crate) fn push(&self, job: ExternalJob) {
-        self.queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_back(job);
-        self.signal.notify_one();
-    }
-}
-
 /// The production bytecode interpreter.
 pub struct Machine<'a, H: Host> {
     program: Option<&'a Program<Verified>>,
@@ -1871,7 +1836,6 @@ pub struct Machine<'a, H: Host> {
     async_boundaries: Vec<usize>,
     pending_async_suspend: Option<(Value, SuspendedActivation)>,
     microtasks: VecDeque<QueuedMicrotask>,
-    external_inbox: Arc<ExternalInbox>,
     /// Every pending `Atomics.waitAsync`, by the id in its `Waiter::Async`.
     async_waiters: BTreeMap<u64, intrinsics::builtins::atomics::AsyncWaiter>,
     next_async_waiter: u64,
@@ -2226,7 +2190,6 @@ impl<'a, H: Host> Machine<'a, H> {
             async_boundaries: Vec::new(),
             pending_async_suspend: None,
             microtasks: VecDeque::new(),
-            external_inbox: ExternalInbox::new(),
             async_waiters: BTreeMap::new(),
             next_async_waiter: 0,
             finalization_cleanup_queue: VecDeque::new(),
@@ -2618,54 +2581,6 @@ impl<'a, H: Host> Machine<'a, H> {
         !self.timers.is_empty()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn external_inbox(&self) -> Arc<ExternalInbox> {
-        Arc::clone(&self.external_inbox)
-    }
-
-    fn drain_external_jobs(&mut self) -> Result<(), RuntimeError> {
-        loop {
-            let job = self
-                .external_inbox
-                .queue
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .pop_front();
-            let Some(job) = job else {
-                return Ok(());
-            };
-            self.external_inbox
-                .pending
-                .fetch_sub(1, AtomicOrdering::AcqRel);
-            match job {
-                ExternalJob::ResolveWaitAsync { promise, result } => {
-                    let value = self
-                        .allocate(HeapEntry::String(EcmaString::encode(result)))
-                        .map_err(|kind| self.checkpoint_error(kind))?;
-                    self.fulfill_promise(Value::from_bits(promise), value)
-                        .map_err(|kind| self.checkpoint_error(kind))?;
-                }
-            }
-        }
-    }
-
-    fn wait_for_external_job(&self) {
-        let queue = self
-            .external_inbox
-            .queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        drop(
-            self.external_inbox
-                .signal
-                .wait_while(queue, |queue| {
-                    queue.is_empty()
-                        && self.external_inbox.pending.load(AtomicOrdering::Acquire) != 0
-                })
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-    }
-
     /// Drives the automatic event loop to quiescence after synchronous
     /// evaluation.
     ///
@@ -2685,7 +2600,6 @@ impl<'a, H: Host> Machine<'a, H> {
     /// exhausted work fails with [`RuntimeErrorKind::FuelExhausted`].
     pub(crate) fn run_to_quiescence(&mut self) -> Result<(), RuntimeError> {
         loop {
-            self.drain_external_jobs()?;
             self.drain_microtasks_automatic()?;
             self.check_cancel()
                 .map_err(|kind| self.checkpoint_error(kind))?;
@@ -2712,10 +2626,6 @@ impl<'a, H: Host> Machine<'a, H> {
                         message: None,
                     }));
                 }
-                continue;
-            }
-            if self.external_inbox.pending.load(AtomicOrdering::Acquire) != 0 {
-                self.wait_for_external_job();
                 continue;
             }
             return Ok(());
@@ -2918,7 +2828,6 @@ impl<'a, H: Host> Machine<'a, H> {
     /// throws settle their derived promises. Throws from `queueMicrotask`
     /// callbacks are returned in [`MicrotaskDrain::uncaught`].
     pub fn drain_microtasks(&mut self) -> Result<MicrotaskDrain, RuntimeError> {
-        self.drain_external_jobs()?;
         self.drain_microtasks_core(MicrotaskExceptionPolicy::CollectAndContinue)
     }
 
