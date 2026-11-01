@@ -669,8 +669,10 @@ fn iterate<H: Host>(
         keep_root(machine, depth, target);
         let mut selected = 0;
         for index in 0..length {
-            tick(machine)?;
+            // A present element is real storage or runs user code, and its callback
+            // is charged for itself. Only a gap can spin on a claimed length.
             if !has_index(machine, object, index)? {
+                tick(machine)?;
                 continue;
             }
             let value = get_index(machine, object, index)?;
