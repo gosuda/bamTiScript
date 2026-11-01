@@ -12515,6 +12515,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             UnaryOp::Plus => self.coerce_number_observable(operand),
             UnaryOp::Negate => {
+                let operand = self.coerce_primitive_observable(operand, false)?;
                 if let Some(value) = intrinsics::builtins::bigint::unary_minus(self, operand)? {
                     return Ok(value);
                 }
@@ -12523,6 +12524,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Ok(number_value(-number))
             }
             UnaryOp::BitwiseNot => {
+                let operand = self.coerce_primitive_observable(operand, false)?;
                 if let Some(value) = intrinsics::builtins::bigint::bitwise_not(self, operand)? {
                     return Ok(value);
                 }
@@ -12640,6 +12642,10 @@ impl<'a, H: Host> Machine<'a, H> {
         left: Value,
         right: Value,
     ) -> Result<Value, EvalFailure> {
+        // ToNumeric, left first: an object operand runs its `valueOf` here, and
+        // the operator only ever sees primitives after this.
+        let left = self.coerce_primitive_observable(left, false)?;
+        let right = self.coerce_primitive_observable(right, false)?;
         if let Some(result) =
             intrinsics::builtins::bigint::binary_op(self, bigint_binary_op(op), left, right)?
         {
@@ -21816,6 +21822,78 @@ mod tests {
         assert_eq!(
             machine.internal_get_prototype_of(*value).unwrap(),
             Some(machine.intrinsics.builtins.generator_prototype())
+        );
+    }
+
+    #[test]
+    fn arithmetic_converts_object_operands_left_first() {
+        fn seven<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            Ok(intrinsics::BuiltinOutcome::Value(Value::int32(7)))
+        }
+        fn fail<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            Err(EvalFailure::ThrowValue(Value::int32(1)))
+        }
+        let program = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let mut object_with = |name, handler| {
+            let id = machine
+                .intrinsics
+                .builtins
+                .register(intrinsics::BuiltinDef {
+                    name,
+                    length: 0,
+                    handler,
+                });
+            let value_of = intrinsics::native_function(&mut machine.heap, id, name, 0);
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            machine
+                .set_data_property(object, "valueOf", value_of)
+                .unwrap();
+            object
+        };
+        let number = object_with("seven", seven::<TestHost>);
+        let thrower = object_with("fail", fail::<TestHost>);
+        assert_eq!(
+            machine
+                .numeric_binary(BinaryOp::Multiply, number, Value::int32(2))
+                .unwrap(),
+            Value::int32(14)
+        );
+        assert_eq!(
+            machine.eval_unary(UnaryOp::Negate, number).unwrap(),
+            Value::int32(-7i32 as u32)
+        );
+        assert_eq!(
+            machine.eval_unary(UnaryOp::BitwiseNot, number).unwrap(),
+            Value::int32(-8i32 as u32)
+        );
+        assert!(
+            matches!(
+                machine.numeric_binary(BinaryOp::Subtract, thrower, Value::int32(1)),
+                Err(EvalFailure::ThrowValue(_))
+            ),
+            "a conversion failure propagates"
         );
     }
 
