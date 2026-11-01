@@ -3997,7 +3997,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::GetProperty { object, key } => {
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().observable_property_key(key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
@@ -4011,7 +4011,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::SetProperty { object, key, value } => {
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().observable_property_key(key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
@@ -4040,7 +4040,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::DeleteProperty { object, key } => {
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().observable_property_key(key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
@@ -4075,7 +4075,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         }
                     };
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().observable_property_key(key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
@@ -4092,7 +4092,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::DefineDataProperty { object, key, value } => {
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().observable_property_key(key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
@@ -4169,7 +4169,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     receiver,
                     key,
                 } => {
-                    let key = match self.machine.borrow().to_property_key(key) {
+                    let key = match self.machine.borrow_mut().observable_property_key(key) {
                         Ok(key) => key,
                         Err(failure) => break 'result self.fail(failure),
                     };
@@ -4182,7 +4182,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     key,
                     value,
                 } => {
-                    let key = match self.machine.borrow().to_property_key(key) {
+                    let key = match self.machine.borrow_mut().observable_property_key(key) {
                         Ok(key) => key,
                         Err(failure) => break 'result self.fail(failure),
                     };

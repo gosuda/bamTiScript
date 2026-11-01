@@ -5691,7 +5691,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Instruction::GetProperty { dst, object, key } => {
                     let object = self.read_register(frame_index, object.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5710,7 +5710,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let object = self.read_register(frame_index, object.get());
                     let value = self.read_register(frame_index, value.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5736,7 +5736,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Instruction::DeleteProperty { dst, object, key } => {
                     let object = self.read_register(frame_index, object.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5763,7 +5763,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let object = self.read_register(frame_index, object.get());
                     let accessor = self.read_register(frame_index, accessor.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5779,7 +5779,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let object = self.read_register(frame_index, object.get());
                     let value = self.read_register(frame_index, value.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -6275,7 +6275,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let home = self.read_register(frame_index, home.get());
                     let receiver = self.read_register(frame_index, receiver.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -6299,7 +6299,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let home = self.read_register(frame_index, home.get());
                     let receiver = self.read_register(frame_index, receiver.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -12567,7 +12567,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             BinaryOp::InstanceOf => self.instance_of(left, right).map(Value::boolean),
             BinaryOp::In => {
-                let key = self.to_property_key(left)?;
+                let key = self.observable_property_key(left)?;
                 self.internal_has_property(right, &key).map(Value::boolean)
             }
             BinaryOp::Add => self.add(left, right),
@@ -21641,6 +21641,83 @@ mod tests {
             })
         ));
         assert!(machine.frames.is_empty());
+    }
+
+    #[test]
+    fn computed_property_keys_run_user_conversion() {
+        fn key_text<H: Host>(
+            machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            let text = machine
+                .allocate(HeapEntry::String(EcmaString::encode("converted")))
+                .map_err(EvalFailure::Runtime)?;
+            Ok(intrinsics::BuiltinOutcome::Value(text))
+        }
+        let program = verified(
+            vec![
+                Constant::String(EcmaString::encode("converted")),
+                Constant::String(EcmaString::encode("toString")),
+                Constant::Int32(7),
+            ],
+            vec![function(
+                0,
+                6,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::SetProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(3),
+                        name: cid(1),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(4),
+                        object: reg(0),
+                        key: reg(3),
+                    },
+                    Instruction::Return { value: reg(4) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let id = machine
+            .intrinsics
+            .builtins
+            .register(intrinsics::BuiltinDef {
+                name: "key text",
+                length: 0,
+                handler: key_text::<TestHost>,
+            });
+        let to_string = intrinsics::native_function(&mut machine.heap, id, "key text", 0);
+        let key = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(key, "toString", to_string)
+            .unwrap();
+        machine.test_set_global("toString", key);
+        assert_eq!(machine.run().unwrap().value, Value::int32(7));
     }
 
     #[test]

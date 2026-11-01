@@ -1787,7 +1787,10 @@ impl<'a, H: Host> Machine<'a, H> {
         self.refund_slot(index, refund);
         Ok(())
     }
-    fn observable_property_key(&mut self, key: Value) -> Result<PropertyKey, EvalFailure> {
+    pub(crate) fn observable_property_key(
+        &mut self,
+        key: Value,
+    ) -> Result<PropertyKey, EvalFailure> {
         let primitive = self.coerce_primitive_observable(key, true)?;
         Ok(
             match self.runtime_slot(primitive).map_err(EvalFailure::Runtime)? {
