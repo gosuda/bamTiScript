@@ -848,6 +848,27 @@ mod tests {
     }
 
     #[test]
+    fn promises_and_generators_accept_defined_properties() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let promise = machine.intrinsics.global("Promise").unwrap();
+        let resolve = machine.get_named_property(promise, "resolve").unwrap();
+        let settled = machine
+            .call_value(resolve, promise, &[Value::int32(1)])
+            .unwrap();
+        let descriptor = CanonicalPropertyDescriptor {
+            value: Some(Value::int32(7)),
+            ..Default::default()
+        };
+        apply_property_descriptor(&mut machine, settled, named("tag"), descriptor).unwrap();
+        assert_eq!(
+            machine.get_named_property(settled, "tag").unwrap(),
+            Value::int32(7)
+        );
+    }
+
+    #[test]
     fn function_prototype_is_a_function_without_construct() {
         let module = blank_program("<test>");
         let mut host = TestHost;

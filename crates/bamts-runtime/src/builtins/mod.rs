@@ -1621,6 +1621,21 @@ impl<'a, H: Host> Machine<'a, H> {
                     properties,
                     extensible,
                     ..
+                }
+                | HeapEntry::Promise {
+                    properties,
+                    extensible,
+                    ..
+                }
+                | HeapEntry::Generator {
+                    properties,
+                    extensible,
+                    ..
+                }
+                | HeapEntry::AsyncGenerator {
+                    properties,
+                    extensible,
+                    ..
                 } => {
                     let exists = properties.contains_key(&key);
                     let (property_growth, property_refund) =
@@ -1727,7 +1742,10 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::WeakRef { properties, .. }
             | HeapEntry::FinalizationRegistry { properties, .. }
             | HeapEntry::DisposableStack { properties, .. }
-            | HeapEntry::Timeout { properties, .. } => {
+            | HeapEntry::Timeout { properties, .. }
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. } => {
                 properties.insert(key, descriptor);
             }
             _ => unreachable!("validated object cannot change heap entry kind"),
