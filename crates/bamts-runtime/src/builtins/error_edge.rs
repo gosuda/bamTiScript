@@ -45,6 +45,20 @@ pub(super) fn install<H: Host>(
     let stack_setter = install_function(heap, builtins, "set stack", 1, stack_set::<H>);
     define_hidden(heap, error_prototype, STACK_GETTER, stack_getter);
     define_hidden(heap, error_prototype, STACK_SETTER, stack_setter);
+    let getter = install_function(heap, builtins, "get stack", 0, prototype_stack_get::<H>);
+    let setter = install_function(heap, builtins, "set stack", 1, prototype_stack_set::<H>);
+    let HeapEntry::Object { properties, .. } = &mut heap[heap_index(error_prototype)] else {
+        panic!("Error.prototype is an ordinary object")
+    };
+    properties.insert(
+        PropertyKey::Named(EcmaString::encode("stack")),
+        Property::Accessor {
+            getter: Some(getter),
+            setter: Some(setter),
+            enumerable: false,
+            configurable: true,
+        },
+    );
 
     for (name, length) in ERROR_TYPES {
         let prototype = prototype_of(heap, globals, name);
@@ -142,6 +156,19 @@ fn define_own<H: Host>(
     )
 }
 
+fn has_error_brand<H: Host>(machine: &Machine<'_, H>, value: Value) -> Result<bool, EvalFailure> {
+    let brand = machine.intrinsics.builtins.error_brand_key();
+    Ok(machine
+        .runtime_slot(value)
+        .map_err(EvalFailure::Runtime)?
+        .is_some_and(|index| {
+            matches!(
+                &machine.heap[index],
+                HeapEntry::Object { properties, .. } if properties.contains_key(&brand)
+            )
+        }))
+}
+
 /// `Error.isError`: true only for objects an Error constructor made. The brand
 /// is a private key, so a proxy for an error or an object that merely inherits
 /// from `Error.prototype` does not have it.
@@ -152,16 +179,7 @@ fn is_error<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let value = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let brand = machine.intrinsics.builtins.error_brand_key();
-    let branded = machine
-        .runtime_slot(value)
-        .map_err(EvalFailure::Runtime)?
-        .is_some_and(|index| {
-            matches!(
-                &machine.heap[index],
-                HeapEntry::Object { properties, .. } if properties.contains_key(&brand)
-            )
-        });
+    let branded = has_error_brand(machine, value)?;
     Ok(BuiltinOutcome::Value(Value::boolean(branded)))
 }
 
@@ -447,6 +465,56 @@ fn stack_set<H: Host>(
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 
+/// `get Error.prototype.stack`, reached by an error that has lost its own `stack`.
+fn prototype_stack_get<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_object(this) {
+        return Err(type_error("Error.prototype.stack requires an object"));
+    }
+    if has_error_brand(machine, this)? {
+        return super::error_to_string(machine, this, &[], constructing);
+    }
+    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
+
+/// `set Error.prototype.stack`, which never writes to the prototype itself.
+fn prototype_stack_set<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_object(this) {
+        return Err(type_error("Error.prototype.stack requires an object"));
+    }
+    let value = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if machine.string_value(value).is_none() {
+        return Err(type_error("Error.prototype.stack requires a string"));
+    }
+    if this == prototype_of_error(machine)? {
+        return Err(type_error("Cannot set stack on Error.prototype"));
+    }
+    let key = PropertyKey::Named(EcmaString::encode("stack"));
+    if machine.internal_get_own_property(this, &key)?.is_some() {
+        machine.set_data_property_key(this, key, value)?;
+    } else {
+        machine.create_data_property_key(this, key, value)?;
+    }
+    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
+
+fn prototype_of_error<H: Host>(machine: &mut Machine<'_, H>) -> Result<Value, EvalFailure> {
+    let error = machine
+        .intrinsics
+        .global("Error")
+        .ok_or_else(|| type_error("Error constructor is not installed"))?;
+    machine.get_named_property(error, "prototype")
+}
+
 fn capture_stack_trace<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
@@ -654,6 +722,31 @@ mod tests {
             handler,
         });
         native_function(&mut machine.heap, id, name, 0)
+    }
+
+    #[test]
+    fn error_prototype_stack_setter_ignores_the_prototype_itself() {
+        machine!(machine);
+        let error = machine.intrinsics.global("Error").unwrap();
+        let prototype = machine.get_named_property(error, "prototype").unwrap();
+        let key = PropertyKey::Named(EcmaString::encode("stack"));
+        let Some(Property::Accessor {
+            setter: Some(setter),
+            ..
+        }) = machine.own_descriptor(prototype, &key).unwrap()
+        else {
+            panic!("Error.prototype.stack is an accessor");
+        };
+        let text = allocate_string(&mut machine, EcmaString::encode("trace")).unwrap();
+        assert!(machine.call_value(setter, prototype, &[text]).is_err());
+        let plain = ordinary_object(&mut machine);
+        assert!(
+            machine
+                .call_value(setter, plain, &[Value::int32(1)])
+                .is_err()
+        );
+        machine.call_value(setter, plain, &[text]).unwrap();
+        assert_eq!(machine.get_named_property(plain, "stack").unwrap(), text);
     }
 
     #[test]
