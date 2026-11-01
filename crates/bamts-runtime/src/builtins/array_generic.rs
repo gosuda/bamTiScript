@@ -135,7 +135,7 @@ fn set_length<H: Host>(
 }
 
 /// `IsArray`, which sees through proxies and throws on a revoked one.
-pub(super) fn is_array<H: Host>(
+pub(crate) fn is_array<H: Host>(
     machine: &Machine<'_, H>,
     value: Value,
 ) -> Result<bool, EvalFailure> {

@@ -1199,40 +1199,28 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::BigInt(_) => "BigInt",
                     HeapEntry::PrivateName { .. } => "Symbol",
                     HeapEntry::Date { .. } => "Date",
-                    HeapEntry::Object { .. } if self.is_error_object(index)? => "Error",
-                    HeapEntry::Proxy { .. } => "Object",
+                    HeapEntry::Object {
+                        boxed_primitive: Some(primitive),
+                        ..
+                    } => match self.object_to_string_tag(*primitive)? {
+                        tag @ ("Boolean" | "Number" | "String") => tag,
+                        _ => "Object",
+                    },
+                    HeapEntry::Object { properties, .. }
+                        if properties
+                            .get(&self.intrinsics.builtins.error_brand_key())
+                            .is_some() =>
+                    {
+                        "Error"
+                    }
+                    HeapEntry::Proxy { .. } if builtins::is_array(self, value)? => "Array",
+                    HeapEntry::Proxy { .. } if self.is_callable(value)? => "Function",
                     HeapEntry::ProxyRevoker { .. } => "Function",
                     _ => "Object",
                 })
             }
         }
     }
-    fn is_error_object(&self, mut index: usize) -> Result<bool, EvalFailure> {
-        for _ in 0..=self.heap.len() {
-            let value = Value::heap_ref(
-                bamts_native::SlotId::from_parts(
-                    crate::RUNTIME_HEAP_SEGMENT,
-                    u32::try_from(index + 1).expect("heap index fits in u32"),
-                )
-                .expect("heap index is nonzero"),
-            );
-            if self
-                .intrinsics
-                .builtins
-                .error_prototypes
-                .iter()
-                .any(|(_, prototype)| *prototype == value)
-            {
-                return Ok(true);
-            }
-            match self.prototype_index(index)? {
-                Some(next) => index = next,
-                None => return Ok(false),
-            }
-        }
-        Ok(false)
-    }
-
     /// The own `message` data property of a thrown object. Like constructor
     /// resolution, this runs no user code, so an accessor yields nothing.
     pub(crate) fn resolve_thrown_message(&self, value: Value) -> Option<EcmaString> {
@@ -1436,6 +1424,35 @@ mod tests {
             machine.get_named_property(string, "length").unwrap(),
             Value::int32(0)
         );
+    }
+    #[test]
+    fn built_in_tags_follow_the_object_rather_than_its_prototype_chain() {
+        let program = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let wrapped = machine.value_to_object(Value::int32(1)).unwrap();
+        assert_eq!(machine.object_to_string_tag(wrapped).unwrap(), "Number");
+        let flag = machine.value_to_object(Value::TRUE).unwrap();
+        assert_eq!(machine.object_to_string_tag(flag).unwrap(), "Boolean");
+        let error_prototype = machine.intrinsics.global("Error").unwrap();
+        let error_prototype = machine
+            .get_named_property(error_prototype, "prototype")
+            .unwrap();
+        assert_eq!(
+            machine.object_to_string_tag(error_prototype).unwrap(),
+            "Object"
+        );
+        let array = machine
+            .construct_value(machine.intrinsics.global("Array").unwrap(), &[])
+            .unwrap();
+        let handler = machine
+            .construct_value(machine.intrinsics.global("Object").unwrap(), &[])
+            .unwrap();
+        let proxy_constructor = machine.intrinsics.global("Proxy").unwrap();
+        let proxy = machine
+            .construct_value(proxy_constructor, &[array, handler])
+            .unwrap();
+        assert_eq!(machine.object_to_string_tag(proxy).unwrap(), "Array");
     }
     fn module() -> Program<Verified> {
         let code = Module::new(
