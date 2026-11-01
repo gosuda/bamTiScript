@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 
 use bamts_native::Value;
 
+use super::super::intl::duration_to_locale_string;
 use super::fields::{
     RelativeTo, providers, relative_to_option, to_integer_if_integral, to_partial_duration,
     to_temporal_duration,
@@ -71,7 +72,7 @@ pub(super) fn install<H: Host>(
                 ("total", 1, total::<H>),
                 ("toString", 0, to_string::<H>),
                 ("toJSON", 0, to_json::<H>),
-                ("toLocaleString", 0, to_json::<H>),
+                ("toLocaleString", 0, to_locale_string::<H>),
                 ("valueOf", 0, value_of_throws::<H>),
             ],
         },
@@ -521,4 +522,14 @@ fn to_json<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let text = this_duration(machine, this)?.format();
     string_outcome(machine, &text)
+}
+
+fn to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let duration = this_duration(machine, this)?;
+    duration_to_locale_string(machine, &duration, arg(args, 0), arg(args, 1))
 }

@@ -8,6 +8,7 @@ use super::{
     allocate_string, define_data, install_constructor_function, install_function, range_error,
     type_error, value_number,
 };
+use crate::intl::date_time_format::{DefaultComponents, RequiredComponents};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
 
@@ -545,9 +546,9 @@ pub(super) fn install<H: Host>(
         ("toDateString", 0, to_date_string::<H>),
         ("toTimeString", 0, to_time_string::<H>),
         ("toUTCString", 0, to_utc_string::<H>),
-        ("toLocaleString", 0, to_string::<H>),
-        ("toLocaleDateString", 0, to_date_string::<H>),
-        ("toLocaleTimeString", 0, to_time_string::<H>),
+        ("toLocaleString", 0, to_locale_string::<H>),
+        ("toLocaleDateString", 0, to_locale_date_string::<H>),
+        ("toLocaleTimeString", 0, to_locale_time_string::<H>),
     ];
     let mut utc_string_function = None;
     for &(name, length, handler) in methods {
@@ -1000,6 +1001,62 @@ enum DateStringKind {
     Full,
     Date,
     Time,
+}
+/// The shared body of the three `toLocale*` methods. ECMA-402 gives each a
+/// component requirement and defaults of its own.
+fn locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    required: RequiredComponents,
+    defaults: DefaultComponents,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let time = date_time(machine, this)?;
+    let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    super::intl::date_to_locale_string(machine, time, locales, options, required, defaults)
+}
+fn to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    locale_string(
+        machine,
+        this,
+        args,
+        RequiredComponents::Any,
+        DefaultComponents::All,
+    )
+}
+fn to_locale_date_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    locale_string(
+        machine,
+        this,
+        args,
+        RequiredComponents::Date,
+        DefaultComponents::Date,
+    )
+}
+fn to_locale_time_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    locale_string(
+        machine,
+        this,
+        args,
+        RequiredComponents::Time,
+        DefaultComponents::Time,
+    )
 }
 fn to_string<H: Host>(
     machine: &mut Machine<'_, H>,

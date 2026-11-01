@@ -266,7 +266,8 @@ impl DateTimeComponents {
 
     /// Whether anything in the `any` required list is set. `era` and
     /// `timeZoneName` qualify a date or time but do not ask for one.
-    fn has_any(&self) -> bool {
+    #[must_use]
+    pub fn has_any(&self) -> bool {
         self.has_date() || self.has_time()
     }
 
@@ -853,6 +854,8 @@ fn shows_required(components: &DateTimeComponents, kind: TemporalFormatKind) -> 
 pub enum RequiredComponents {
     Date,
     Time,
+    YearMonth,
+    MonthDay,
     Any,
 }
 
@@ -861,6 +864,8 @@ pub enum RequiredComponents {
 pub enum DefaultComponents {
     Date,
     Time,
+    YearMonth,
+    MonthDay,
     All,
 }
 
@@ -1525,9 +1530,13 @@ fn resolve_component_options(
             message: "dateStyle/timeStyle may not be combined with explicit components",
         });
     }
-    if matches!(required, RequiredComponents::Date) && options.time_style.is_some() {
+    if matches!(
+        required,
+        RequiredComponents::Date | RequiredComponents::YearMonth | RequiredComponents::MonthDay
+    ) && options.time_style.is_some()
+    {
         return Err(DateTimeFormatError::Type {
-            message: "timeStyle is not permitted by Date.prototype.toLocaleDateString",
+            message: "timeStyle is not permitted when formatting only a date",
         });
     }
     if matches!(required, RequiredComponents::Time) && options.date_style.is_some() {
@@ -1543,6 +1552,8 @@ fn resolve_component_options(
     let need_defaults = match required {
         RequiredComponents::Date => !components.has_date(),
         RequiredComponents::Time => !components.has_time(),
+        RequiredComponents::YearMonth => components.year.is_none() && components.month.is_none(),
+        RequiredComponents::MonthDay => components.month.is_none() && components.day.is_none(),
         RequiredComponents::Any => !components.has_any(),
     };
     if need_defaults {
@@ -1551,6 +1562,14 @@ fn resolve_component_options(
         }
         if matches!(defaults, DefaultComponents::Time | DefaultComponents::All) {
             components.add_time_defaults();
+        }
+        if matches!(defaults, DefaultComponents::YearMonth) {
+            components.year = Some(NumericStyle::Numeric);
+            components.month = Some(MonthStyle::Numeric);
+        }
+        if matches!(defaults, DefaultComponents::MonthDay) {
+            components.month = Some(MonthStyle::Numeric);
+            components.day = Some(NumericStyle::Numeric);
         }
     }
     Ok(components)

@@ -2,6 +2,7 @@
 
 use bamts_native::Value;
 
+use super::super::intl::temporal_to_locale_string;
 use super::fields::{
     FieldNames, prepare_partial_fields, require_partial_temporal_object, time_from_fields,
     to_integer_with_truncation, to_temporal_duration, to_temporal_time,
@@ -57,7 +58,7 @@ pub(super) fn install<H: Host>(
                 ("round", 1, round::<H>),
                 ("equals", 1, equals::<H>),
                 ("toString", 0, to_string::<H>),
-                ("toLocaleString", 0, to_json::<H>),
+                ("toLocaleString", 0, to_locale_string::<H>),
                 ("toJSON", 0, to_json::<H>),
                 ("valueOf", 0, value_of_throws::<H>),
             ],
@@ -308,4 +309,14 @@ fn to_json<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let text = this_time(machine, this)?.format(Precision::Auto);
     string_outcome(machine, &text)
+}
+
+fn to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    this_time(machine, this)?;
+    temporal_to_locale_string(machine, this, arg(args, 0), arg(args, 1))
 }

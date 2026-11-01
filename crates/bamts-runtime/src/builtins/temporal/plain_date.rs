@@ -2,6 +2,7 @@
 
 use bamts_native::Value;
 
+use super::super::intl::temporal_to_locale_string;
 use super::fields::{
     CalendarFields, FieldNames, calendar_argument, iso_year, prepare_partial_fields,
     require_partial_temporal_object, resolved_date_fields, to_calendar_identifier,
@@ -57,7 +58,7 @@ pub(super) fn install<H: Host>(
                 ("toPlainDateTime", 0, to_plain_date_time::<H>),
                 ("toZonedDateTime", 1, to_zoned_date_time::<H>),
                 ("toString", 0, to_string::<H>),
-                ("toLocaleString", 0, to_json::<H>),
+                ("toLocaleString", 0, to_locale_string::<H>),
                 ("toJSON", 0, to_json::<H>),
                 ("valueOf", 0, value_of_throws::<H>),
             ],
@@ -373,4 +374,14 @@ fn to_json<H: Host>(
     let (date, calendar) = this_date(machine, this)?;
     let text = date_text(machine, date, &calendar, ShowCalendar::Auto)?;
     string_outcome(machine, &text)
+}
+
+fn to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    this_date(machine, this)?;
+    temporal_to_locale_string(machine, this, arg(args, 0), arg(args, 1))
 }

@@ -167,6 +167,7 @@ fn component_options<H: Host>(
 pub(super) fn read_options<H: Host>(
     machine: &mut Machine<'_, H>,
     options: Options,
+    zone_of_value: Option<&str>,
 ) -> Result<DateTimeFormatOptions, EvalFailure> {
     let locale_matcher = locale_matcher_option(machine, options)?;
     let calendar = string_option(machine, options, "calendar", &[])?;
@@ -193,7 +194,12 @@ pub(super) fn read_options<H: Host>(
         });
     let time_zone = read(machine, options, "timeZone")?;
     let time_zone = if time_zone == Value::UNDEFINED {
-        None
+        zone_of_value.map(str::to_owned)
+    } else if zone_of_value.is_some() {
+        return Err(type_error(
+            machine,
+            "a ZonedDateTime already has its time zone",
+        ));
     } else {
         let name = machine.coerce_string_observable(time_zone)?.to_utf8_lossy();
         if !is_valid_time_zone(&name, &*DATA) {
@@ -253,7 +259,7 @@ fn constructor<H: Host>(
     let prototype = instance_prototype(machine, IntlKind::DateTimeFormat, constructing)?;
     let requested = canonicalize_locale_list(machine, arg(args, 0))?;
     let options = coerce_options_to_object(machine, arg(args, 1))?;
-    let options = read_options(machine, options)?;
+    let options = read_options(machine, options, None)?;
     let format = create_date_time_format(
         machine,
         &requested,
@@ -351,7 +357,7 @@ fn noon(date: PlainDate) -> i128 {
 
 /// HandleDateTimeValue for a Temporal object: its formatter and instant, after
 /// the checks each type's calendar must pass.
-fn temporal_value<H: Host>(
+pub(super) fn temporal_value<H: Host>(
     machine: &mut Machine<'_, H>,
     format: &DateTimeFormat,
     record: &TemporalObject,

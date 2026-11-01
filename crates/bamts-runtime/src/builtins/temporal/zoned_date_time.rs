@@ -3,6 +3,7 @@
 use bamts_native::Value;
 
 use super::super::bigint::to_bigint;
+use super::super::intl::temporal_to_locale_string;
 use super::fields::{
     CalendarFields, FieldNames, OffsetBehaviour, calendar_argument, date_time_from_fields,
     interpret_offset, prepare_partial_fields, providers, require_partial_temporal_object,
@@ -98,7 +99,7 @@ pub(super) fn install<H: Host>(
                 ("round", 1, round::<H>),
                 ("equals", 1, equals::<H>),
                 ("toString", 0, to_string::<H>),
-                ("toLocaleString", 0, to_json::<H>),
+                ("toLocaleString", 0, to_locale_string::<H>),
                 ("toJSON", 0, to_json::<H>),
                 ("valueOf", 0, value_of_throws::<H>),
                 ("startOfDay", 0, start_of_day_method::<H>),
@@ -689,4 +690,14 @@ fn to_plain_date_time<H: Host>(
     let value = local_date_time(machine, &zoned)?;
     let calendar = zoned.calendar_id().clone();
     create(machine, TemporalObject::PlainDateTime { value, calendar }).map(BuiltinOutcome::Value)
+}
+
+fn to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    this_zoned(machine, this)?;
+    temporal_to_locale_string(machine, this, arg(args, 0), arg(args, 1))
 }

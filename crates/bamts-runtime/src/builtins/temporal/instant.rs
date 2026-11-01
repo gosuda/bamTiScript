@@ -3,6 +3,7 @@
 use bamts_native::Value;
 
 use super::super::bigint::to_bigint;
+use super::super::intl::temporal_to_locale_string;
 use super::super::value_number;
 use super::fields::{
     providers, to_temporal_duration, to_temporal_instant, to_time_zone_identifier,
@@ -70,7 +71,7 @@ pub(super) fn install<H: Host>(
                 ("round", 1, round::<H>),
                 ("equals", 1, equals::<H>),
                 ("toString", 0, to_string::<H>),
-                ("toLocaleString", 0, to_json::<H>),
+                ("toLocaleString", 0, to_locale_string::<H>),
                 ("toJSON", 0, to_json::<H>),
                 ("valueOf", 0, value_of_throws::<H>),
                 ("toZonedDateTimeISO", 1, to_zoned_date_time_iso::<H>),
@@ -388,4 +389,14 @@ fn to_zoned_date_time_iso<H: Host>(
     let time_zone = to_time_zone_identifier(machine, arg(args, 0))?;
     let value = ZonedDateTime::from_instant(instant, time_zone, CalendarId::iso8601());
     create(machine, TemporalObject::ZonedDateTime(value)).map(BuiltinOutcome::Value)
+}
+
+fn to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    this_instant(machine, this)?;
+    temporal_to_locale_string(machine, this, arg(args, 0), arg(args, 1))
 }

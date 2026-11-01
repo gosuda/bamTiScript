@@ -8,6 +8,7 @@ mod collator;
 mod date_time_format;
 mod display_names;
 mod duration_format;
+mod integration;
 mod list_format;
 mod locale;
 mod number_format;
@@ -15,6 +16,11 @@ mod options;
 mod plural_rules;
 mod relative_time_format;
 mod segmenter;
+
+pub(super) use integration::{
+    bigint_to_locale_string, date_to_locale_string, duration_to_locale_string,
+    temporal_to_locale_string,
+};
 
 use std::collections::BTreeMap;
 

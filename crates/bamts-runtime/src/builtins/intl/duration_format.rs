@@ -23,6 +23,7 @@ use crate::intl::locale_data::{DATA, IntlData};
 use crate::intl::locale_negotiation::resolve_locale;
 use crate::intl::{IntlKind, IntlObject};
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
+use crate::temporal::instant_duration::Duration;
 use crate::{EvalFailure, HeapEntry, Host, Machine};
 
 pub(super) fn install<H: Host>(
@@ -109,8 +110,23 @@ fn constructor<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     require_new(machine, constructing, "DurationFormat")?;
     let prototype = instance_prototype(machine, IntlKind::DurationFormat, constructing)?;
-    let requested = canonicalize_locale_list(machine, arg(args, 0))?;
-    let options = get_options_object(machine, arg(args, 1))?;
+    let format = create_duration_format(machine, arg(args, 0), arg(args, 1))?;
+    allocate(
+        machine,
+        IntlObject::DurationFormat(Box::new(format)),
+        prototype,
+    )
+    .map(BuiltinOutcome::Value)
+}
+
+/// The body of the constructor, which `toLocaleString` shares.
+pub(super) fn create_duration_format<H: Host>(
+    machine: &mut Machine<'_, H>,
+    locales: Value,
+    options: Value,
+) -> Result<DurationFormat, EvalFailure> {
+    let requested = canonicalize_locale_list(machine, locales)?;
+    let options = get_options_object(machine, options)?;
     let matcher = locale_matcher_option(machine, options)?;
     let numbering_system = string_option(machine, options, "numberingSystem", &[])?;
     let mut locale_options = BTreeMap::new();
@@ -148,19 +164,13 @@ fn constructor<H: Host>(
     }
     let fractional_digits =
         number_option(machine, options, "fractionalDigits", 0.0, 9.0)?.map(|digits| digits as u8);
-    let format = DurationFormat {
+    Ok(DurationFormat {
         locale: resolved.locale,
         numbering_system: resolved.values.get("nu").cloned().unwrap_or_default(),
         style,
         units,
         fractional_digits,
-    };
-    allocate(
-        machine,
-        IntlObject::DurationFormat(Box::new(format)),
-        prototype,
-    )
-    .map(BuiltinOutcome::Value)
+    })
 }
 
 fn supported_locales_of<H: Host>(
@@ -196,6 +206,19 @@ fn parts<H: Host>(
         return Err(not_a_duration_format(machine));
     }
     let duration = to_temporal_duration(machine, duration)?;
+    let Some(format) = this_format(machine, this)? else {
+        return Err(not_a_duration_format(machine));
+    };
+    let format = format.clone();
+    duration_parts(machine, &format, &duration)
+}
+
+/// PartitionDurationFormatPattern.
+pub(super) fn duration_parts<H: Host>(
+    machine: &mut Machine<'_, H>,
+    format: &DurationFormat,
+    duration: &Duration,
+) -> Result<Vec<DurationPart>, EvalFailure> {
     let fields = [
         duration.years,
         duration.months,
@@ -208,9 +231,6 @@ fn parts<H: Host>(
         duration.microseconds,
         duration.nanoseconds,
     ];
-    let Some(format) = this_format(machine, this)? else {
-        return Err(not_a_duration_format(machine));
-    };
     let data: &'static IntlData = &DATA;
     let result = format.partition(&fields, data);
     result.map_err(|error| range_error(machine, error.to_string()))

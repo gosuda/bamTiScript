@@ -1817,20 +1817,18 @@ fn value_of<H: Host>(
     Ok(BuiltinOutcome::Value(allocate_bigint(machine, &bigint)?))
 }
 
-/// §21.2.3.3: `BigInt.prototype.toLocaleString()`. Without an ECMA-402 host
-/// the fallback the spec permits is the plain decimal `toString` text; locale
-/// formatting is an unsupported host capability, not silently faked beyond
-/// this spec-sanctioned equivalence.
+/// ECMA-402 `BigInt.prototype.toLocaleString(locales, options)`: formats
+/// through a new `Intl.NumberFormat`, exactly.
 fn to_locale_string<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
-    _args: &[Value],
+    args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let bigint = this_bigint_value(machine, this)?;
-    let text = bigint.to_string_radix(10);
-    let string = allocate_string(machine, EcmaString::encode(&text))?;
-    Ok(BuiltinOutcome::Value(string))
+    let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    super::intl::bigint_to_locale_string(machine, &bigint.to_string_radix(10), locales, options)
 }
 
 #[cfg(test)]
@@ -2388,8 +2386,8 @@ mod tests {
             .expect("toLocaleString succeeds");
         let text = machine.to_string(locale).expect("locale result is text");
         assert!(
-            text.eq_ascii("-9099"),
-            "toLocaleString matches decimal toString"
+            text.eq_ascii("-9,099"),
+            "toLocaleString groups like Intl.NumberFormat"
         );
     }
 
