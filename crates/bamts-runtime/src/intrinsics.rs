@@ -275,6 +275,10 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn set_symbol_has_instance(&mut self, symbol: Value) {
         self.symbol_has_instance = Some(symbol);
     }
+    pub(crate) fn symbol_has_instance(&self) -> Value {
+        self.symbol_has_instance
+            .expect("Symbol builtins install first")
+    }
     pub(crate) fn set_symbol_dispose(&mut self, symbol: Value) {
         self.symbol_dispose = Some(symbol);
     }

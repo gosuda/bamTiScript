@@ -758,7 +758,7 @@ mod tests {
             .unwrap();
         let key = has_instance_property_key(&mut machine);
         machine
-            .set_data_property_key(constructor, key, handler)
+            .create_data_property_key(constructor, key, handler)
             .unwrap();
 
         assert!(
@@ -829,7 +829,7 @@ mod tests {
             .unwrap();
         let key = has_instance_property_key(&mut machine);
         machine
-            .set_data_property_key(constructor, key, handler)
+            .create_data_property_key(constructor, key, handler)
             .unwrap();
 
         assert!(
@@ -850,7 +850,7 @@ mod tests {
         // A present but non-callable @@hasInstance is a TypeError per GetMethod.
         let key = has_instance_property_key(&mut machine);
         machine
-            .set_data_property_key(constructor, key, Value::int32(42))
+            .create_data_property_key(constructor, key, Value::int32(42))
             .unwrap();
 
         let value = ordinary_object(&mut machine);

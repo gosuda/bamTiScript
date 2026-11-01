@@ -145,6 +145,27 @@ pub(crate) fn define_data(heap: &mut [HeapEntry], object: Value, name: &str, val
         _ => panic!("intrinsic property target must be an ordinary object"),
     }
 }
+/// Installs a symbol-keyed property on an intrinsic object of any shape.
+pub(crate) fn define_symbol_property(
+    heap: &mut [HeapEntry],
+    object: Value,
+    symbol: Value,
+    property: Property,
+) {
+    let key = PropertyKey::Symbol(heap_index(symbol) as u32);
+    let index = heap_index(object);
+    match &mut heap[index] {
+        HeapEntry::Object { properties, .. }
+        | HeapEntry::Array { properties, .. }
+        | HeapEntry::Function { properties, .. }
+        | HeapEntry::NativeFunction { properties, .. }
+        | HeapEntry::RegExp { properties, .. }
+        | HeapEntry::Date { properties, .. } => {
+            properties.insert(key, property);
+        }
+        _ => panic!("intrinsic property target must be an ordinary object"),
+    }
+}
 pub(super) fn define_to_string_tag(
     heap: &mut Vec<HeapEntry>,
     object: Value,

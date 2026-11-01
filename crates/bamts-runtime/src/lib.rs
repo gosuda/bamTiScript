@@ -6838,22 +6838,6 @@ impl<'a, H: Host> Machine<'a, H> {
         })
     }
 
-    fn bound_target(&self, mut value: Value) -> Result<Value, RuntimeErrorKind> {
-        loop {
-            let Some(index) = self.runtime_slot(value)? else {
-                return Ok(value);
-            };
-            let HeapEntry::NativeFunction {
-                callable: NativeCallable::Bound(bound),
-                ..
-            } = &self.heap[index]
-            else {
-                return Ok(value);
-            };
-            value = bound.target;
-        }
-    }
-
     /// Materializes a constant into an ABI value, interning strings and bigints
     /// into the slot heap. Shared with the native engine.
     pub(crate) fn load_constant_value(
@@ -13027,14 +13011,19 @@ impl<'a, H: Host> Machine<'a, H> {
     /// prototype-chain check. A present-but-non-callable handler is a
     /// TypeError, matching `GetMethod`.
     fn instance_of(&mut self, value: Value, constructor: Value) -> Result<bool, EvalFailure> {
-        let constructor = self
-            .bound_target(constructor)
-            .map_err(EvalFailure::Runtime)?;
+        if !self.is_object(constructor) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "instanceof",
+            }));
+        }
         let key = self.has_instance_key()?;
         let handler = self.get_property_key(constructor, &key)?;
         if matches!(handler.decode(), Some(Decoded::Undefined | Decoded::Null)) {
-            // No `@@hasInstance`: ordinary prototype-chain check, byte-for-byte
-            // the pre-symbol `instanceof` behavior.
+            if !self.is_callable(constructor)? {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "instanceof",
+                }));
+            }
             return self.ordinary_has_instance(value, constructor);
         }
         // GetMethod: a present, non-nullish handler must be callable.
@@ -13049,18 +13038,29 @@ impl<'a, H: Host> Machine<'a, H> {
 
     /// `OrdinaryHasInstance` (ECMA-262 §7.3.20): walks `value`'s prototype
     /// chain for the constructor's own `prototype` object, matching by heap
-    /// identity. This is the fallback for a right-hand side that defines no
-    /// callable `Symbol.hasInstance` and is unchanged from the original
-    /// `instanceof` implementation.
+    /// identity. A bound function defers to `instanceof` on its target, and a
+    /// non-callable receiver is simply not a constructor of anything.
     fn ordinary_has_instance(
         &mut self,
         value: Value,
         constructor: Value,
     ) -> Result<bool, EvalFailure> {
         if !self.is_callable(constructor)? {
-            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "instanceof",
-            }));
+            return Ok(false);
+        }
+        if let Some(index) = self
+            .runtime_slot(constructor)
+            .map_err(EvalFailure::Runtime)?
+            && let HeapEntry::NativeFunction {
+                callable: NativeCallable::Bound(bound),
+                ..
+            } = &self.heap[index]
+        {
+            let target = bound.target;
+            return self.instance_of(value, target);
+        }
+        if !self.is_object(value) {
+            return Ok(false);
         }
         let prototype_key = PropertyKey::Named(EcmaString::encode("prototype"));
         let prototype = self.internal_get(constructor, &prototype_key, constructor)?;

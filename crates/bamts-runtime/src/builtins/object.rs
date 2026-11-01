@@ -9,8 +9,8 @@ use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
 use super::{
-    allocate_string, define_data, heap_index, install_constructor_function, install_function,
-    range_error, to_integer_or_infinity, type_error, value_number,
+    allocate_string, define_data, define_symbol_property, heap_index, install_constructor_function,
+    install_function, range_error, to_integer_or_infinity, type_error, value_number,
 };
 use crate::intrinsics::{
     BuiltinDef, BuiltinHandler, BuiltinOutcome, BuiltinTable, native_function_properties,
@@ -83,6 +83,24 @@ pub(super) fn install<H: Host>(
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, builtins.function_prototype(), name, function);
     }
+    let has_instance = install_function(
+        heap,
+        builtins,
+        "[Symbol.hasInstance]",
+        1,
+        function_has_instance::<H>,
+    );
+    define_symbol_property(
+        heap,
+        builtins.function_prototype(),
+        builtins.symbol_has_instance(),
+        Property::Data {
+            value: has_instance,
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        },
+    );
 }
 
 /// Whether `text` can follow `function` in the `NativeFunction` syntax:
@@ -154,6 +172,18 @@ fn function_to_string<H: Host>(
         .unwrap_or_default();
     let source = EcmaString::encode(&format!("function {name}() {{ [native code] }}"));
     Ok(BuiltinOutcome::Value(allocate_string(machine, source)?))
+}
+
+fn function_has_instance<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let value = args.first().copied().unwrap_or(Value::UNDEFINED);
+    Ok(BuiltinOutcome::Value(Value::boolean(
+        machine.ordinary_has_instance(value, this)?,
+    )))
 }
 
 fn constructor<H: Host>(
@@ -699,6 +729,36 @@ mod tests {
                 Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
             ));
         }
+    }
+
+    #[test]
+    fn has_instance_is_false_for_non_callable_receivers_and_primitives() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.builtins.function_prototype();
+        let key = machine
+            .to_property_key(machine.intrinsics.builtins.symbol_has_instance())
+            .unwrap();
+        let has_instance = machine.get_property_key(prototype, &key).unwrap();
+        let object = ordinary_object(&mut machine);
+        let array = machine.intrinsics.global("Array").unwrap();
+        assert_eq!(
+            machine.call_value(has_instance, object, &[object]).unwrap(),
+            Value::FALSE,
+            "a non-callable receiver is not a constructor of anything"
+        );
+        assert_eq!(
+            machine
+                .call_value(has_instance, array, &[Value::int32(1)])
+                .unwrap(),
+            Value::FALSE,
+            "a primitive has no prototype chain to walk"
+        );
+        assert!(matches!(
+            machine.instance_of(object, Value::int32(1)),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
     }
 
     fn data_descriptor(machine: &mut Machine<'_, TestHost>, value: Value) -> Value {
