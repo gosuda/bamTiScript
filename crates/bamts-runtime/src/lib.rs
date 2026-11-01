@@ -1872,6 +1872,9 @@ pub struct Machine<'a, H: Host> {
     pending_async_suspend: Option<(Value, SuspendedActivation)>,
     microtasks: VecDeque<QueuedMicrotask>,
     external_inbox: Arc<ExternalInbox>,
+    /// Every pending `Atomics.waitAsync`, by the id in its `Waiter::Async`.
+    async_waiters: BTreeMap<u64, intrinsics::builtins::atomics::AsyncWaiter>,
+    next_async_waiter: u64,
     finalization_cleanup_queue: VecDeque<Value>,
     microtask_drain_active: bool,
     next_timer_id: Option<u64>,
@@ -2224,6 +2227,8 @@ impl<'a, H: Host> Machine<'a, H> {
             pending_async_suspend: None,
             microtasks: VecDeque::new(),
             external_inbox: ExternalInbox::new(),
+            async_waiters: BTreeMap::new(),
+            next_async_waiter: 0,
             finalization_cleanup_queue: VecDeque::new(),
             microtask_drain_active: false,
             next_timer_id: Some(1),
@@ -2842,6 +2847,13 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(live_record) = self.timers.get(&id) else {
             return Ok(());
         };
+        // A bare number comes from a script, and an internal timeout is not its
+        // to cancel. Only the runtime holds that timer's handle.
+        if request_generation.is_none()
+            && live_record.callback == self.intrinsics.builtins.wait_async_timeout()
+        {
+            return Ok(());
+        }
         if let Some(request_generation) = request_generation
             && live_record.generation != request_generation
         {

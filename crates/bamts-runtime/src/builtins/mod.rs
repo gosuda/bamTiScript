@@ -24,7 +24,7 @@ pub(crate) use regexp::{canonical_source, initial_regexp_properties};
 mod annex_b;
 mod array_es2023;
 pub(crate) mod arraybuffer;
-mod atomics;
+pub(crate) mod atomics;
 pub(crate) mod dataview;
 mod disposable_stack;
 mod error_edge;
@@ -2204,6 +2204,7 @@ mod tests {
                 "store",
                 "sub",
                 "wait",
+                "waitAsync",
                 "xor",
             ]
         );

@@ -87,6 +87,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     dataview_prototype: Option<Value>,
     sharedarraybuffer_constructor: Option<Value>,
     sharedarraybuffer_prototype: Option<Value>,
+    wait_async_timeout: Option<Value>,
     disposable_stack_prototype: Option<Value>,
     async_disposable_stack_prototype: Option<Value>,
     date_prototype: Option<Value>,
@@ -156,6 +157,7 @@ impl<H: Host> BuiltinTable<H> {
             dataview_prototype: None,
             sharedarraybuffer_constructor: None,
             sharedarraybuffer_prototype: None,
+            wait_async_timeout: None,
             disposable_stack_prototype: None,
             async_disposable_stack_prototype: None,
             date_prototype: None,
@@ -418,6 +420,13 @@ impl<H: Host> BuiltinTable<H> {
     }
     pub(crate) fn set_arraybuffer_prototype(&mut self, prototype: Value) {
         self.arraybuffer_prototype = Some(prototype);
+    }
+    pub(crate) fn set_wait_async_timeout(&mut self, callback: Value) {
+        self.wait_async_timeout = Some(callback);
+    }
+    pub(crate) fn wait_async_timeout(&self) -> Value {
+        self.wait_async_timeout
+            .expect("Atomics installs before runtime execution")
     }
     pub(crate) fn set_sharedarraybuffer_constructor(&mut self, constructor: Value) {
         self.sharedarraybuffer_constructor = Some(constructor);
@@ -693,6 +702,7 @@ impl<H: Host> BuiltinTable<H> {
             dataview_prototype,
             sharedarraybuffer_constructor,
             sharedarraybuffer_prototype,
+            wait_async_timeout,
             disposable_stack_prototype,
             async_disposable_stack_prototype,
             date_prototype,
@@ -754,6 +764,7 @@ impl<H: Host> BuiltinTable<H> {
             *dataview_prototype,
             *sharedarraybuffer_constructor,
             *sharedarraybuffer_prototype,
+            *wait_async_timeout,
             *disposable_stack_prototype,
             *async_disposable_stack_prototype,
             *date_prototype,
@@ -1278,7 +1289,7 @@ mod tests {
             Value::int32(5),
             Value::int32(6),
         );
-        let roots: Vec<Value> = (101..=146).map(Value::int32).collect();
+        let roots: Vec<Value> = (101..=147).map(Value::int32).collect();
         table.typedarray_constructor = Some(roots[0]);
         table.promise_capability_executor = Some(roots[1]);
         table.promise_finally_value = Some(roots[2]);
@@ -1305,6 +1316,7 @@ mod tests {
             table.typedarray_prototypes[offset] = Some(roots[33 + offset]);
         }
         table.sharedarraybuffer_constructor = Some(roots[45]);
+        table.wait_async_timeout = Some(roots[46]);
         let mut visited = Vec::new();
         table.for_each_value(|value| visited.push(value));
         for root in roots {

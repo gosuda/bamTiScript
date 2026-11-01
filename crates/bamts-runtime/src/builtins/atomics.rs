@@ -116,11 +116,14 @@ fn install_atomics<H: Host>(
         ("store", 3, store::<H>),
         ("sub", 3, sub::<H>),
         ("wait", 4, wait::<H>),
+        ("waitAsync", 4, wait_async::<H>),
         ("xor", 3, xor::<H>),
     ] {
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, atomics, name, function);
     }
+    let timeout = install_function(heap, builtins, "", 1, wait_async_timeout::<H>);
+    builtins.set_wait_async_timeout(timeout);
     define_to_string_tag(heap, atomics, builtins.symbol_to_string_tag(), "Atomics");
     globals.insert(EcmaString::encode("Atomics"), atomics);
 }
@@ -643,11 +646,151 @@ fn notify<H: Host>(
     for waiter in &woken {
         match waiter {
             Waiter::Blocking(suspension) => suspension.wake(),
+            Waiter::Async(id) => settle_async_waiter(machine, *id, "ok")?,
         }
     }
     Ok(BuiltinOutcome::Value(crate::number_value(
         woken.len() as f64
     )))
+}
+
+/// A pending `Atomics.waitAsync`. The block's waiter list holds only its id,
+/// because a block can outlive any one heap and a `Value` in it would be
+/// invisible to the collector; the machine owns this record and traces `promise`.
+#[derive(Debug)]
+pub(crate) struct AsyncWaiter {
+    pub(crate) promise: Value,
+    block: Arc<SharedBlock>,
+    position: usize,
+    /// The armed timeout's handle, when the wait has one.
+    timer: Option<Value>,
+    /// What is left of a timeout too long for one timer.
+    remaining_ms: u64,
+}
+
+/// Arms a timer for as much of `timeout_ms` as one [`crate::TimerProvider`] delay
+/// can hold, and returns its handle with the part that is left over.
+fn arm_async_timeout<H: Host>(
+    machine: &mut Machine<'_, H>,
+    id: u64,
+    timeout_ms: u64,
+) -> Result<(Value, u64), EvalFailure> {
+    let delay = u32::try_from(timeout_ms).unwrap_or(u32::MAX);
+    let callback = machine.intrinsics.builtins.wait_async_timeout();
+    let handle = machine.schedule_timeout(callback, delay, vec![crate::number_value(id as f64)])?;
+    Ok((handle, timeout_ms - u64::from(delay)))
+}
+
+/// NotifyWaiter for a waiter of this agent: resolves the promise at once, so
+/// its reactions run at the next microtask checkpoint.
+fn settle_async_waiter<H: Host>(
+    machine: &mut Machine<'_, H>,
+    id: u64,
+    result: &str,
+) -> Result<(), EvalFailure> {
+    let Some(waiter) = machine.async_waiters.remove(&id) else {
+        return Ok(());
+    };
+    if let Some(timer) = waiter.timer {
+        machine.clear_timeout(timer)?;
+    }
+    let value = allocate_string(machine, EcmaString::encode(result))?;
+    machine
+        .fulfill_promise(waiter.promise, value)
+        .map_err(EvalFailure::Runtime)
+}
+
+/// The timer callback behind every timed `Atomics.waitAsync`. No script can
+/// reach it: the only reference is the timer record that calls it.
+fn wait_async_timeout<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let id = value_number(argument(args, 0)) as u64;
+    if let Some(waiter) = machine.async_waiters.get(&id) {
+        if waiter.remaining_ms == 0 {
+            waiter
+                .block
+                .waiters()
+                .remove(waiter.position, &Waiter::Async(id));
+            settle_async_waiter(machine, id, "timed-out")?;
+        } else {
+            let remaining_ms = waiter.remaining_ms;
+            let (timer, remaining_ms) = arm_async_timeout(machine, id, remaining_ms)?;
+            if let Some(waiter) = machine.async_waiters.get_mut(&id) {
+                waiter.timer = Some(timer);
+                waiter.remaining_ms = remaining_ms;
+            }
+        }
+    }
+    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
+
+fn wait_async_result<H: Host>(
+    machine: &mut Machine<'_, H>,
+    asynchronous: bool,
+    value: Value,
+) -> Result<Value, EvalFailure> {
+    let prototype = machine.intrinsics.object_prototype;
+    let object = super::ordinary_runtime(machine, Some(prototype))?;
+    for (name, value) in [("async", Value::boolean(asynchronous)), ("value", value)] {
+        let key = PropertyKey::Named(EcmaString::encode(name));
+        machine.create_data_property_key(object, key, value)?;
+    }
+    Ok(object)
+}
+
+fn wait_async_settled<H: Host>(
+    machine: &mut Machine<'_, H>,
+    outcome: &str,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let value = allocate_string(machine, EcmaString::encode(outcome))?;
+    wait_async_result(machine, false, value).map(BuiltinOutcome::Value)
+}
+
+fn wait_async<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let request = WaitRequest::parse(machine, args)?;
+    let block = Arc::clone(&request.block);
+    let mut waiters = block.waiters();
+    if !request.value_is_expected() {
+        drop(waiters);
+        return wait_async_settled(machine, "not-equal");
+    }
+    if request.timeout_ms == Some(0.0) {
+        drop(waiters);
+        return wait_async_settled(machine, "timed-out");
+    }
+    let promise = machine.create_promise()?;
+    let result = wait_async_result(machine, true, promise)?;
+    let id = machine.next_async_waiter;
+    machine.next_async_waiter += 1;
+    let (timer, remaining_ms) = match request.timeout_ms {
+        None => (None, 0),
+        // A cast saturates, and a fraction of a millisecond still has to pass.
+        Some(milliseconds) => {
+            let (timer, remaining_ms) = arm_async_timeout(machine, id, milliseconds.ceil() as u64)?;
+            (Some(timer), remaining_ms)
+        }
+    };
+    machine.async_waiters.insert(
+        id,
+        AsyncWaiter {
+            promise,
+            block: Arc::clone(&request.block),
+            position: request.position,
+            timer,
+            remaining_ms,
+        },
+    );
+    waiters.add(request.position, Waiter::Async(id));
+    Ok(BuiltinOutcome::Value(result))
 }
 
 fn string_outcome<H: Host>(
@@ -661,9 +804,74 @@ fn string_outcome<H: Host>(
 mod tests {
     use super::super::test_support::{TestHost, blank_program};
     use super::*;
-    use crate::{CancellationToken, Limits, RuntimeErrorKind, ThrowOrigin};
+    use crate::{
+        CancellationToken, Limits, PromiseState, RuntimeErrorKind, ThrowOrigin, TimerError,
+        TimerProvider, TimerWakeup,
+    };
 
-    fn atomics(machine: &Machine<'_, TestHost>) -> Value {
+    /// A clock that moves only when the event loop waits, straight to the next
+    /// deadline, so a timeout of any length takes no real time.
+    #[derive(Default)]
+    struct ManualTimers {
+        armed: Vec<TimerWakeup>,
+        now_ms: u64,
+    }
+
+    impl TimerProvider for ManualTimers {
+        fn schedule(&mut self, id: u64, delay_ms: u32) -> Result<u64, TimerError> {
+            let deadline_ms = self.now_ms + u64::from(delay_ms);
+            self.armed.push(TimerWakeup { id, deadline_ms });
+            Ok(deadline_ms)
+        }
+
+        fn cancel(&mut self, id: u64) -> Result<bool, TimerError> {
+            let armed = self.armed.len();
+            self.armed.retain(|timer| timer.id != id);
+            Ok(self.armed.len() != armed)
+        }
+
+        fn poll_expired(&mut self, _output: &mut Vec<TimerWakeup>) -> Result<(), TimerError> {
+            Ok(())
+        }
+
+        fn wait_expired(
+            &mut self,
+            _cancel: &CancellationToken,
+        ) -> Result<Option<TimerWakeup>, TimerError> {
+            let next = (0..self.armed.len()).min_by_key(|&index| self.armed[index].deadline_ms);
+            Ok(next.map(|index| {
+                let wakeup = self.armed.remove(index);
+                self.now_ms = wakeup.deadline_ms;
+                wakeup
+            }))
+        }
+
+        fn has_pending(&self) -> bool {
+            !self.armed.is_empty()
+        }
+    }
+
+    #[derive(Default)]
+    struct TimerHost {
+        timers: ManualTimers,
+    }
+
+    impl Host for TimerHost {
+        fn timers(&mut self) -> Option<&mut (dyn TimerProvider + 'static)> {
+            Some(&mut self.timers)
+        }
+    }
+
+    fn with_timers(test: impl FnOnce(&mut Machine<'_, TimerHost>)) -> TimerHost {
+        let program = blank_program("<atomics-test>");
+        let mut host = TimerHost::default();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        test(&mut machine);
+        drop(machine);
+        host
+    }
+
+    fn atomics<H: Host>(machine: &Machine<'_, H>) -> Value {
         machine
             .intrinsics
             .global("Atomics")
@@ -677,8 +885,8 @@ mod tests {
         test(&mut machine);
     }
 
-    fn shared_buffer(
-        machine: &mut Machine<'_, TestHost>,
+    fn shared_buffer<H: Host>(
+        machine: &mut Machine<'_, H>,
         length: i32,
         maximum: Option<u32>,
     ) -> Value {
@@ -701,15 +909,15 @@ mod tests {
             .expect("SharedArrayBuffer construction succeeds")
     }
 
-    fn view_of(machine: &mut Machine<'_, TestHost>, kind: &str, buffer: Value) -> Value {
+    fn view_of<H: Host>(machine: &mut Machine<'_, H>, kind: &str, buffer: Value) -> Value {
         let constructor = machine.intrinsics.global(kind).expect("view constructor");
         machine
             .construct_value(constructor, &[buffer])
             .expect("view construction succeeds")
     }
 
-    fn call(
-        machine: &mut Machine<'_, TestHost>,
+    fn call<H: Host>(
+        machine: &mut Machine<'_, H>,
         receiver: Value,
         method: &str,
         args: &[Value],
@@ -866,7 +1074,7 @@ mod tests {
         });
     }
 
-    fn result_is(machine: &Machine<'_, TestHost>, value: Value, expected: &str) -> bool {
+    fn result_is<H: Host>(machine: &Machine<'_, H>, value: Value, expected: &str) -> bool {
         machine
             .string_value(value)
             .is_some_and(|text| text.eq_ascii(expected))
@@ -971,22 +1179,18 @@ mod tests {
     #[test]
     fn waiters_queue_per_position_and_wake_oldest_first() {
         let block = SharedBlock::new(vec![0; 16], None);
-        let (first, second, elsewhere) = (
-            Waiter::Blocking(Arc::default()),
-            Waiter::Blocking(Arc::default()),
-            Waiter::Blocking(Arc::default()),
-        );
         let mut list = block.waiters();
-        list.add(0, first.clone());
-        list.add(8, elsewhere.clone());
-        list.add(0, second.clone());
-        let [Waiter::Blocking(taken)] = list.take(0, 1).try_into().unwrap();
-        let Waiter::Blocking(oldest) = &first;
-        assert!(Arc::ptr_eq(&taken, oldest));
-        assert!(!list.remove(0, &first), "a taken waiter is gone");
-        assert!(list.remove(0, &second));
+        list.add(0, Waiter::Async(1));
+        list.add(8, Waiter::Async(2));
+        list.add(0, Waiter::Async(3));
+        assert!(matches!(list.take(0, 1).as_slice(), [Waiter::Async(1)]));
+        assert!(!list.remove(0, &Waiter::Async(1)), "a taken waiter is gone");
+        assert!(list.remove(0, &Waiter::Async(3)));
         assert!(list.take(0, usize::MAX).is_empty());
-        assert_eq!(list.take(8, usize::MAX).len(), 1);
+        assert!(matches!(
+            list.take(8, usize::MAX).as_slice(),
+            [Waiter::Async(2)]
+        ));
     }
 
     #[test]
@@ -1050,6 +1254,192 @@ mod tests {
             ),
             Err(EvalFailure::Throw(ThrowOrigin::RangeError { .. }))
         ));
+    }
+
+    fn int32_view<H: Host>(machine: &mut Machine<'_, H>) -> Value {
+        let buffer = shared_buffer(machine, 8, None);
+        view_of(machine, "Int32Array", buffer)
+    }
+
+    /// Returns the promise of an `Atomics.waitAsync(view, 0, 0, timeout)` that
+    /// went asynchronous.
+    fn pending_wait<H: Host>(machine: &mut Machine<'_, H>, view: Value, timeout: Value) -> Value {
+        let namespace = atomics(machine);
+        let result = call(
+            machine,
+            namespace,
+            "waitAsync",
+            &[view, Value::int32(0), Value::int32(0), timeout],
+        )
+        .unwrap();
+        assert_eq!(
+            machine.get_named_property(result, "async").unwrap(),
+            Value::TRUE
+        );
+        machine.get_named_property(result, "value").unwrap()
+    }
+
+    fn fulfilled_with<H: Host>(machine: &Machine<'_, H>, promise: Value, expected: &str) -> bool {
+        let index = machine.runtime_slot(promise).unwrap().unwrap();
+        let HeapEntry::Promise { state, .. } = &machine.heap[index] else {
+            panic!("waitAsync value is a Promise");
+        };
+        matches!(state, PromiseState::Fulfilled { value } if result_is(machine, *value, expected))
+    }
+
+    fn notify_all<H: Host>(machine: &mut Machine<'_, H>, view: Value) -> Value {
+        let namespace = atomics(machine);
+        call(machine, namespace, "notify", &[view, Value::int32(0)]).unwrap()
+    }
+
+    #[test]
+    fn wait_async_answers_without_a_promise_when_it_need_not_wait() {
+        with_machine(|machine| {
+            let view = int32_view(machine);
+            let namespace = atomics(machine);
+            for (expected, timeout, outcome) in [
+                (Value::int32(1), Value::UNDEFINED, "not-equal"),
+                (Value::int32(0), Value::int32(0), "timed-out"),
+                (Value::int32(0), crate::number_value(-1.0), "timed-out"),
+            ] {
+                let result = call(
+                    machine,
+                    namespace,
+                    "waitAsync",
+                    &[view, Value::int32(0), expected, timeout],
+                )
+                .unwrap();
+                assert_eq!(
+                    machine.get_named_property(result, "async").unwrap(),
+                    Value::FALSE
+                );
+                let value = machine.get_named_property(result, "value").unwrap();
+                assert!(result_is(machine, value, outcome));
+            }
+            assert_eq!(notify_all(machine, view), Value::int32(0));
+        });
+    }
+
+    #[test]
+    fn notify_settles_a_timed_wait_at_once_and_disarms_its_timer() {
+        with_timers(|machine| {
+            let view = int32_view(machine);
+            let promise = pending_wait(machine, view, Value::int32(1000));
+            assert!(machine.has_pending_timers());
+            assert_eq!(notify_all(machine, view), Value::int32(1));
+            assert!(
+                fulfilled_with(machine, promise, "ok"),
+                "a waiter of this agent resolves inside notify"
+            );
+            assert!(!machine.has_pending_timers());
+            assert_eq!(notify_all(machine, view), Value::int32(0));
+        });
+    }
+
+    #[test]
+    fn a_timeout_settles_through_the_host_timer_and_empties_the_list() {
+        let host = with_timers(|machine| {
+            let view = int32_view(machine);
+            let promise = pending_wait(machine, view, crate::number_value(10.5));
+            machine.run_to_quiescence().unwrap();
+            assert!(fulfilled_with(machine, promise, "timed-out"));
+            assert_eq!(notify_all(machine, view), Value::int32(0));
+        });
+        assert_eq!(host.timers.now_ms, 11, "a timeout is never cut short");
+    }
+
+    #[test]
+    fn a_timeout_longer_than_one_timer_waits_out_all_of_it() {
+        let timeout = 3 * (u64::from(u32::MAX) + 1);
+        let host = with_timers(|machine| {
+            let view = int32_view(machine);
+            let promise = pending_wait(machine, view, crate::number_value(timeout as f64));
+            machine.run_to_quiescence().unwrap();
+            assert!(fulfilled_with(machine, promise, "timed-out"));
+        });
+        assert_eq!(host.timers.now_ms, timeout);
+    }
+
+    #[test]
+    fn notify_wakes_async_waiters_oldest_first_up_to_its_count() {
+        with_machine(|machine| {
+            let view = int32_view(machine);
+            let first = pending_wait(machine, view, Value::UNDEFINED);
+            let second = pending_wait(machine, view, Value::UNDEFINED);
+            let namespace = atomics(machine);
+            let woken = call(
+                machine,
+                namespace,
+                "notify",
+                &[view, Value::int32(0), Value::int32(1)],
+            )
+            .unwrap();
+            assert_eq!(woken, Value::int32(1));
+            assert!(fulfilled_with(machine, first, "ok"));
+            assert!(!fulfilled_with(machine, second, "ok"));
+            assert_eq!(notify_all(machine, view), Value::int32(1));
+            assert!(fulfilled_with(machine, second, "ok"));
+        });
+    }
+
+    #[test]
+    fn an_untimed_wait_does_not_keep_the_event_loop_alive() {
+        with_machine(|machine| {
+            let view = int32_view(machine);
+            let promise = pending_wait(machine, view, Value::UNDEFINED);
+            machine.run_to_quiescence().unwrap();
+            assert!(!fulfilled_with(machine, promise, "ok"));
+        });
+    }
+
+    #[test]
+    fn a_pending_promise_survives_collection_with_nothing_else_holding_it() {
+        with_machine(|machine| {
+            let view = int32_view(machine);
+            machine.test_set_global("view", view);
+            let promise = pending_wait(machine, view, Value::UNDEFINED);
+            machine.collect_garbage();
+            assert_eq!(notify_all(machine, view), Value::int32(1));
+            assert!(fulfilled_with(machine, promise, "ok"));
+        });
+    }
+
+    #[test]
+    fn a_script_cannot_cancel_a_wait_timeout_by_guessing_its_timer_number() {
+        with_timers(|machine| {
+            let view = int32_view(machine);
+            let promise = pending_wait(machine, view, Value::int32(5));
+            let timer = *machine.timers.keys().next().unwrap();
+            machine
+                .clear_timeout(Value::int32(u32::try_from(timer).unwrap()))
+                .unwrap();
+            machine.run_to_quiescence().unwrap();
+            assert!(fulfilled_with(machine, promise, "timed-out"));
+        });
+    }
+
+    #[test]
+    fn a_timed_wait_fails_loudly_on_a_host_without_timers() {
+        with_machine(|machine| {
+            let view = int32_view(machine);
+            let namespace = atomics(machine);
+            assert!(matches!(
+                call(
+                    machine,
+                    namespace,
+                    "waitAsync",
+                    &[view, Value::int32(0), Value::int32(0), Value::int32(5)]
+                ),
+                Err(EvalFailure::Runtime(
+                    RuntimeErrorKind::TimerProviderFailure { .. }
+                ))
+            ));
+            assert_eq!(
+                notify_all(machine, view),
+                Value::int32(0),
+                "a wait that failed to arm leaves no waiter"
+            );
+        });
     }
 
     #[test]

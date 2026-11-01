@@ -164,6 +164,9 @@ impl GcState {
         for &registry in &machine.finalization_cleanup_queue {
             self.mark_value(&machine.heap, registry);
         }
+        for waiter in machine.async_waiters.values() {
+            self.mark_value(&machine.heap, waiter.promise);
+        }
         for timer in machine.timers.values() {
             self.mark_value(&machine.heap, timer.callback);
             self.mark_values(&machine.heap, &timer.arguments);

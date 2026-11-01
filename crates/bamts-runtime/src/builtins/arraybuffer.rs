@@ -61,12 +61,16 @@ impl Suspension {
 #[derive(Clone, Debug)]
 pub(crate) enum Waiter {
     Blocking(Arc<Suspension>),
+    /// `Atomics.waitAsync`, as the id of the machine's record of it.
+    Async(u64),
 }
 
 impl Waiter {
     fn is(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Blocking(left), Self::Blocking(right)) => Arc::ptr_eq(left, right),
+            (Self::Async(left), Self::Async(right)) => left == right,
+            _ => false,
         }
     }
 }
