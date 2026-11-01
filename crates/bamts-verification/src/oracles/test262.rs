@@ -2225,7 +2225,7 @@ function $ERROR(message) {\n\
             try { body(); } catch (error) { return error instanceof kind; }\n\
             return false;\n\
             }\n";
-        const CASES: [&str; 10] = [
+        const CASES: [&str; 12] = [
             "assert.sameValue((0, eval)('1 + 1'), 2);",
             "assert.sameValue((0, eval)(1), 1);",
             "assert.sameValue((0, eval)(), undefined);",
@@ -2236,6 +2236,8 @@ function $ERROR(message) {\n\
             "assert.sameValue((0, eval)('if (true) { 4; } else { 5; }'), 4);",
             "assert.sameValue(throws(SyntaxError, function () { (0, eval)('('); }), true);",
             "assert.sameValue(throws(TypeError, function () { new eval('1'); }), true);",
+            "assert.sameValue(throws(SyntaxError, function () { (0, eval)('\"use strict\"; with (a) {}'); }), true);",
+            "assert.sameValue(throws(SyntaxError, function () { Function('\"use strict\"; var public;'); }), true);",
         ];
         for mode in [
             ExecutionMode::Interpreter,

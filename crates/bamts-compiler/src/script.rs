@@ -75,6 +75,15 @@ pub fn compile_classic_script(
         });
     }
 
+    if let Some(diagnostic) = crate::early_errors::check_script(parsed.product()).first() {
+        let (line, column) = line_column(&source, diagnostic.range().start());
+        return Err(ScriptCompileError::Syntax {
+            message: diagnostic.message().to_owned(),
+            line,
+            column,
+        });
+    }
+
     let module_name = normalized_module_name(resource_name).unwrap_or(DEFAULT_MODULE_NAME);
     let options = LowerOptions {
         javascript_compatibility: true,
