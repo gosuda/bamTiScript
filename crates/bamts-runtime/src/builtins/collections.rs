@@ -1057,7 +1057,7 @@ fn set_for_each<H: Host>(
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 
-fn map_put<H: Host>(
+pub(super) fn map_put<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
     key: Value,
@@ -1196,7 +1196,7 @@ fn collection<H: Host>(
         .map_err(EvalFailure::Runtime)
 }
 
-fn collection_slot<H: Host>(
+pub(super) fn collection_slot<H: Host>(
     machine: &Machine<'_, H>,
     object: Value,
     expected: CollectionKind,
@@ -1254,7 +1254,10 @@ fn collection_iterator<H: Host>(
     Ok(BuiltinOutcome::Value(iterator(machine, object, kind)?))
 }
 
-fn require_weak_key<H: Host>(machine: &Machine<'_, H>, key: Value) -> Result<(), EvalFailure> {
+pub(super) fn require_weak_key<H: Host>(
+    machine: &Machine<'_, H>,
+    key: Value,
+) -> Result<(), EvalFailure> {
     let Some(index) = machine.runtime_slot(key).map_err(EvalFailure::Runtime)? else {
         return Err(type_error("Invalid value used as weak collection key"));
     };
