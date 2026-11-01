@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
-use super::intl::{TargetCase, transform_case};
+use super::intl::{TargetCase, compare_with_collator, transform_case};
 use super::{
     allocate_array, allocate_string, define_data, install_constructor_function, install_function,
     range_error, to_integer_or_infinity, type_error, uri_error, value_number,
@@ -119,6 +119,11 @@ fn locale_compare<H: Host>(
     let this = machine.coerce_string_observable(this)?;
     let other =
         machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let locales = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let options = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+    if locales != Value::UNDEFINED || options != Value::UNDEFINED {
+        return compare_with_collator(machine, &this, &other, locales, options);
+    }
     let result: i32 = match this.as_units().cmp(other.as_units()) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,

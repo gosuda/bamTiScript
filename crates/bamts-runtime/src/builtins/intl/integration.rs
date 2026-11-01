@@ -5,6 +5,7 @@ use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
 use super::super::temporal::temporal_record;
+use super::collator::create_collator;
 use super::date_time_format::{
     create_date_time_format, date_failure, read_options, temporal_value,
 };
@@ -36,6 +37,21 @@ pub(in crate::intrinsics::builtins) fn number_to_locale_string<H: Host>(
         locales,
         options,
     )
+}
+
+/// `String.prototype.localeCompare` through a collator made for this call.
+pub(in crate::intrinsics::builtins) fn compare_with_collator<H: Host>(
+    machine: &mut Machine<'_, H>,
+    left: &EcmaString,
+    right: &EcmaString,
+    locales: Value,
+    options: Value,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let collator = create_collator(machine, locales, options)?;
+    let result = collator.compare(&*DATA, left.as_units(), right.as_units());
+    Ok(BuiltinOutcome::Value(crate::number_value(f64::from(
+        result,
+    ))))
 }
 
 /// `BigInt.prototype.toLocaleString` after the receiver check.

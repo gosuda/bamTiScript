@@ -100,8 +100,18 @@ fn constructor<H: Host>(
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let prototype = instance_prototype(machine, IntlKind::Collator, constructing)?;
-    let requested = canonicalize_locale_list(machine, arg(args, 0))?;
-    let options = coerce_options_to_object(machine, arg(args, 1))?;
+    let collator = create_collator(machine, arg(args, 0), arg(args, 1))?;
+    allocate(machine, IntlObject::Collator(collator), prototype).map(BuiltinOutcome::Value)
+}
+
+/// InitializeCollator without the object it initializes.
+pub(super) fn create_collator<H: Host>(
+    machine: &mut Machine<'_, H>,
+    locales: Value,
+    options: Value,
+) -> Result<Collator, EvalFailure> {
+    let requested = canonicalize_locale_list(machine, locales)?;
+    let options = coerce_options_to_object(machine, options)?;
     let mut live = LiveOptions {
         machine,
         options,
@@ -116,12 +126,11 @@ fn constructor<H: Host>(
     let LiveOptions {
         machine, failure, ..
     } = live;
-    let collator = match (result, failure) {
-        (_, Some(failure)) => return Err(failure),
-        (Ok(collator), None) => collator,
-        (Err(error), None) => return Err(collator_failure(machine, error)),
-    };
-    allocate(machine, IntlObject::Collator(collator), prototype).map(BuiltinOutcome::Value)
+    match (result, failure) {
+        (_, Some(failure)) => Err(failure),
+        (Ok(collator), None) => Ok(collator),
+        (Err(error), None) => Err(collator_failure(machine, error)),
+    }
 }
 
 fn supported_locales_of<H: Host>(
