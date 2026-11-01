@@ -449,9 +449,14 @@ fn iterator_next<H: Host>(
     else {
         return Err(type_error("iterator next called on incompatible receiver"));
     };
-    if matches!(kind, IterationKind::RegExpString)
-        || iterator_family(machine, source, kind)? != family
-    {
+    let builtin_family = matches!(
+        kind,
+        IterationKind::Key
+            | IterationKind::Value
+            | IterationKind::Entry
+            | IterationKind::StringCodePoint
+    );
+    if !builtin_family || iterator_family(machine, source, kind)? != family {
         return Err(type_error("iterator next called on incompatible receiver"));
     }
     let (done, value, next_position) = match position {
@@ -527,8 +532,10 @@ fn iterator_next<H: Host>(
                         IterationKind::Key => key,
                         IterationKind::Value | IterationKind::StringCodePoint => item_value,
                         IterationKind::Entry => allocate_array(machine, vec![key, item_value])?,
-                        IterationKind::RegExpString => {
-                            unreachable!("the family check rejects a RegExp string iterator")
+                        IterationKind::RegExpString
+                        | IterationKind::IteratorHelper(_)
+                        | IterationKind::WrapForValid => {
+                            unreachable!("the family check admits only the four families")
                         }
                     };
                     (false, value, Some(next))
@@ -1418,6 +1425,9 @@ fn constructor_prototype<H: Host>(
         CollectionKind::WeakSet => machine.intrinsics.builtins.weak_set_prototype(),
     };
     Ok(prototype)
+}
+pub(super) fn ordinary_intrinsic(heap: &mut Vec<HeapEntry>, prototype: Value) -> Value {
+    ordinary(heap, Some(prototype))
 }
 fn ordinary(heap: &mut Vec<HeapEntry>, prototype: Option<Value>) -> Value {
     super::super::push(

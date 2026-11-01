@@ -694,6 +694,10 @@ enum IterationKind {
     StringCodePoint,
     /// A `%RegExpStringIteratorPrototype%` instance; `source` is its hidden state.
     RegExpString,
+    /// An `Iterator` helper; `source` is its hidden state.
+    IteratorHelper(intrinsics::builtins::iterator_helpers::Operation),
+    /// A `%WrapForValidIteratorPrototype%` instance; `source` is its record.
+    WrapForValid,
 }
 
 #[derive(Clone, Copy, Debug)]

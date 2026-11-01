@@ -88,6 +88,8 @@ pub(crate) struct BuiltinTable<H: Host> {
     regexp_prototype: Option<Value>,
     iterator_prototype: Option<Value>,
     iterator_family_prototypes: Option<[Value; 4]>,
+    iterator_helper_prototype: Option<Value>,
+    wrap_for_valid_iterator_prototype: Option<Value>,
     regexp_string_iterator_prototype: Option<Value>,
     async_iterator_prototype: Option<Value>,
     generator_prototype: Option<Value>,
@@ -169,6 +171,8 @@ impl<H: Host> BuiltinTable<H> {
             regexp_prototype: None,
             iterator_prototype: None,
             iterator_family_prototypes: None,
+            iterator_helper_prototype: None,
+            wrap_for_valid_iterator_prototype: None,
             regexp_string_iterator_prototype: None,
             async_iterator_prototype: None,
             generator_prototype: None,
@@ -393,6 +397,18 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn iterator_family_prototype(&self, family: IteratorFamily) -> Value {
         self.iterator_family_prototypes
             .expect("collection builtins install the iterator prototypes")[family as usize]
+    }
+    pub(crate) fn set_iterator_helper_prototypes(&mut self, helper: Value, wrap: Value) {
+        self.iterator_helper_prototype = Some(helper);
+        self.wrap_for_valid_iterator_prototype = Some(wrap);
+    }
+    pub(crate) fn iterator_helper_prototype(&self) -> Value {
+        self.iterator_helper_prototype
+            .expect("Iterator builtins install the helper prototype")
+    }
+    pub(crate) fn wrap_for_valid_iterator_prototype(&self) -> Value {
+        self.wrap_for_valid_iterator_prototype
+            .expect("Iterator builtins install the wrapper prototype")
     }
     pub(crate) fn set_regexp_string_iterator_prototype(&mut self, prototype: Value) {
         self.regexp_string_iterator_prototype = Some(prototype);
@@ -799,6 +815,8 @@ impl<H: Host> BuiltinTable<H> {
             regexp_prototype,
             iterator_prototype,
             iterator_family_prototypes,
+            iterator_helper_prototype,
+            wrap_for_valid_iterator_prototype,
             regexp_string_iterator_prototype,
             async_iterator_prototype,
             generator_prototype,
@@ -877,6 +895,8 @@ impl<H: Host> BuiltinTable<H> {
             *object_to_string,
             *regexp_prototype,
             *iterator_prototype,
+            *iterator_helper_prototype,
+            *wrap_for_valid_iterator_prototype,
             *regexp_string_iterator_prototype,
             *async_iterator_prototype,
             *generator_prototype,
@@ -1946,7 +1966,6 @@ mod tests {
         let names = [
             "eval",
             "Intl",
-            "Iterator",
             "AsyncIterator",
             "URL",
             "URLSearchParams",

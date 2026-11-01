@@ -11,6 +11,7 @@ pub(crate) mod bigint;
 mod collections;
 mod date_full;
 mod function_constructor;
+pub(crate) mod iterator_helpers;
 mod json_edge;
 mod number;
 mod object;
@@ -61,6 +62,7 @@ pub(crate) fn install<H: Host>(
         timers::install(heap, globals, builtins);
     }
     collections::install_iterator_prototype(heap, builtins);
+    iterator_helpers::install(heap, globals, builtins);
     collections::install_async_iterator_prototype(heap, builtins);
     collections::install_generator_prototype(heap, builtins);
     collections::install_async_generator_prototype(heap, builtins);
