@@ -13,7 +13,7 @@ pub(crate) const STEP_BUDGET: usize = 100_000;
 /// Identity of a backtracking state: input position plus capture bindings. Two
 /// states sharing one continue identically, so a repetition level keeps only the
 /// first — that is what stops equivalent alternatives multiplying per level.
-type StateKey = (usize, Vec<Option<(usize, usize)>>);
+type StateKey = (usize, usize, Vec<Option<(usize, usize)>>);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Flags {
@@ -23,6 +23,8 @@ pub(crate) struct Flags {
     pub(crate) dot_all: bool,
     pub(crate) unicode: bool,
     pub(crate) sticky: bool,
+    /// Inside a lookbehind, which reads from right to left. Never set by a flag.
+    backward: bool,
 }
 
 impl Flags {
@@ -230,34 +232,34 @@ impl Regex {
                 Ok(out)
             }
             Node::Literal(expected) => {
-                if state.position == input.len() {
+                let Some((actual, width)) = adjacent_code_point(input, state.position, flags)
+                else {
                     return Ok(Vec::new());
-                }
-                let (actual, width) = next_code_point(input, state.position, flags.unicode);
+                };
                 Ok(self
                     .code_point_eq(flags, actual, *expected)
-                    .then(|| state.advanced(width))
+                    .then(|| state.moved(width, flags.backward))
                     .into_iter()
                     .collect())
             }
             Node::Dot => {
-                if state.position == input.len() {
+                let Some((actual, width)) = adjacent_code_point(input, state.position, flags)
+                else {
                     return Ok(Vec::new());
-                }
-                let (actual, width) = next_code_point(input, state.position, flags.unicode);
+                };
                 Ok((flags.dot_all || !is_line_terminator(actual))
-                    .then(|| state.advanced(width))
+                    .then(|| state.moved(width, flags.backward))
                     .into_iter()
                     .collect())
             }
             Node::Class(class) => {
-                if state.position == input.len() {
+                let Some((actual, width)) = adjacent_code_point(input, state.position, flags)
+                else {
                     return Ok(Vec::new());
-                }
-                let (actual, width) = next_code_point(input, state.position, flags.unicode);
+                };
                 Ok(class
                     .matches(actual, flags.ignore_case, flags.unicode)
-                    .then(|| state.advanced(width))
+                    .then(|| state.moved(width, flags.backward))
                     .into_iter()
                     .collect())
             }
@@ -307,7 +309,11 @@ impl Regex {
                     .into_iter()
                     .map(|mut matched| {
                         if let Some(index) = index {
-                            matched.captures[*index] = Some(begin..matched.position);
+                            matched.captures[*index] = Some(if flags.backward {
+                                matched.position..begin
+                            } else {
+                                begin..matched.position
+                            });
                         }
                         matched
                     })
@@ -337,32 +343,15 @@ impl Regex {
                 behind,
                 positive,
             } => {
-                let candidates = if *behind {
-                    let mut candidates = Vec::new();
-                    let mut begin = 0;
-                    loop {
-                        let mut initial = state.clone();
-                        initial.position = begin;
-                        candidates.extend(
-                            self.match_node(flags, body, input, initial)?
-                                .into_iter()
-                                .filter(|matched| matched.position == state.position),
-                        );
-                        if begin == state.position {
-                            break;
-                        }
-                        begin += next_code_point(input, begin, flags.unicode).1;
-                        if begin > state.position {
-                            break;
-                        }
-                    }
-                    candidates
-                } else {
-                    self.match_node(flags, body, input, state.clone())?
+                let direction = Flags {
+                    backward: *behind,
+                    ..flags
                 };
+                let candidates = self.match_node(direction, body, input, state.clone())?;
                 Ok(if *positive {
                     candidates
                         .into_iter()
+                        .take(1)
                         .map(|mut matched| {
                             matched.position = state.position;
                             matched
@@ -385,8 +374,16 @@ impl Regex {
         range: Range<usize>,
         state: State,
     ) -> Vec<State> {
-        let mut captured = range.start;
-        let mut candidate = state.position;
+        let width = range.len();
+        let start = if flags.backward {
+            state.position.checked_sub(width)
+        } else {
+            Some(state.position).filter(|position| position + width <= input.len())
+        };
+        let Some(start) = start else {
+            return Vec::new();
+        };
+        let (mut captured, mut candidate) = (range.start, start);
         while captured < range.end {
             if candidate >= input.len() {
                 return Vec::new();
@@ -399,8 +396,10 @@ impl Regex {
             captured += left_width;
             candidate += right_width;
         }
-        let width = candidate - state.position;
-        vec![state.advanced(width)]
+        if candidate != start + width {
+            return Vec::new();
+        }
+        vec![state.moved(width, flags.backward)]
     }
 
     fn match_sequence(
@@ -410,7 +409,12 @@ impl Regex {
         input: &[u16],
         state: State,
     ) -> Result<Vec<State>, RegexError> {
-        let Some((first, rest)) = nodes.split_first() else {
+        let split = if flags.backward {
+            nodes.split_last()
+        } else {
+            nodes.split_first()
+        };
+        let Some((first, rest)) = split else {
             return Ok(vec![state]);
         };
         if let Node::Repeat {
@@ -421,76 +425,19 @@ impl Regex {
             captures,
         } = first
         {
-            // Deduplicate states within each repetition level by (position,
-            // captures).  Equivalent alternatives like (a|a|a) produce k
-            // identical states at every level — without dedup these multiply to
-            // k^n states, each cloning its captures Vec.  Two states that share
-            // position and captures yield identical continuations, so collapsing
-            // duplicates is lossless.
-            //
-            // The hash set is allocated once and cleared per level so its bucket
-            // capacity is reused — ordinary patterns (1 state per level) pay one
-            // allocation for the whole repeat, not one per level.  Dedup is kept
-            // even for single-source levels because the body itself can be an
-            // alternation (e.g. (a|a)*) whose branches yield duplicate
-            // (position, captures) states from one prior — skipping would let
-            // those duplicates through and reintroduce the multiplication.
-            //
-            // The step budget remains as a backstop for non-dedupable blowups
-            // (e.g. ((a)|(a))* where branches set different capture groups).
-            // On exhaustion it returns a distinct error rather than an empty
-            // result, so a caller can tell an aborted match from a real non-match.
-            let mut levels = vec![vec![state]];
-            let limit = max.unwrap_or(input.len().saturating_add(*min).saturating_add(1));
-            let mut total_states: usize = 1;
-            let mut seen: HashSet<StateKey> = HashSet::new();
-            for count in 0..limit {
-                let mut next = Vec::new();
-                seen.clear();
-                for prior in &levels[count] {
-                    let mut attempt = prior.clone();
-                    attempt.captures[captures.clone()].fill(None);
-                    for matched in self.match_node(flags, body, input, attempt)? {
-                        if matched.position == prior.position && count + 1 >= *min {
-                            continue;
-                        }
-                        let key = (
-                            matched.position,
-                            matched
-                                .captures
-                                .iter()
-                                .map(|c| c.as_ref().map(|r| (r.start, r.end)))
-                                .collect(),
-                        );
-                        if seen.insert(key) {
-                            next.push(matched);
-                        }
-                    }
-                }
-                if next.is_empty() {
-                    break;
-                }
-                total_states += next.len();
-                if total_states > STEP_BUDGET {
-                    return Err(RegexError::budget_exhausted());
-                }
-                levels.push(next);
-            }
-            let counts: Box<dyn Iterator<Item = usize>> = if *greedy {
-                Box::new((*min..levels.len()).rev())
-            } else {
-                Box::new(*min..levels.len())
-            };
-            let mut result = Vec::new();
-            for count in counts {
-                // Move ownership instead of cloning: each level is visited
-                // exactly once, so the deep copy of every captures allocation
-                // on each iteration was pure waste.
-                for candidate in std::mem::take(&mut levels[count]) {
-                    result.extend(self.match_sequence(flags, rest, input, candidate)?);
-                }
-            }
-            Ok(result)
+            self.match_repeat(
+                flags,
+                &Repeat {
+                    body,
+                    min: *min,
+                    max: *max,
+                    greedy: *greedy,
+                    captures,
+                },
+                rest,
+                input,
+                state,
+            )
         } else {
             let mut result = Vec::new();
             for matched in self.match_node(flags, first, input, state)? {
@@ -500,11 +447,104 @@ impl Regex {
         }
     }
 
+    /// `RepeatMatcher` as a depth-first walk with its own stack, because the number
+    /// of iterations follows the input. Results stay in priority order: a greedy
+    /// repeat tries another iteration before the continuation, and a lazy one after.
+    ///
+    /// A state already expanded cannot do better the second time, since everything
+    /// it reaches was reached earlier at a higher priority. Skipping it keeps
+    /// equivalent alternatives such as (a|a)* linear; the step budget is the backstop
+    /// for states that differ only in their captures, as in ((a)|(a))*.
+    fn match_repeat(
+        &self,
+        flags: Flags,
+        repeat: &Repeat<'_>,
+        rest: &[Node],
+        input: &[u16],
+        state: State,
+    ) -> Result<Vec<State>, RegexError> {
+        enum Step {
+            Expand { state: State, count: usize },
+            Continue(State),
+        }
+        let mut result = Vec::new();
+        let mut steps = 0;
+        let mut seen: HashSet<StateKey> = HashSet::new();
+        let mut stack = vec![Step::Expand { state, count: 0 }];
+        while let Some(step) = stack.pop() {
+            let (state, count) = match step {
+                Step::Continue(state) => {
+                    result.extend(self.match_sequence(flags, rest, input, state)?);
+                    continue;
+                }
+                Step::Expand { state, count } => (state, count),
+            };
+            let tracked = if repeat.max.is_some() {
+                count
+            } else {
+                count.min(repeat.min)
+            };
+            let key = (
+                tracked,
+                state.position,
+                state
+                    .captures
+                    .iter()
+                    .map(|capture| capture.as_ref().map(|range| (range.start, range.end)))
+                    .collect(),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            steps += 1;
+            if steps > STEP_BUDGET {
+                return Err(RegexError::budget_exhausted());
+            }
+            let mut iterations = Vec::new();
+            if repeat.max.is_none_or(|max| count < max) {
+                let mut attempt = state.clone();
+                attempt.captures[repeat.captures.clone()].fill(None);
+                iterations = self.match_node(flags, repeat.body, input, attempt)?;
+                iterations
+                    .retain(|matched| count < repeat.min || matched.position != state.position);
+            }
+            let stop = (count >= repeat.min).then_some(Step::Continue(state));
+            let next = iterations.into_iter().rev().map(|state| Step::Expand {
+                state,
+                count: count + 1,
+            });
+            if repeat.greedy {
+                stack.extend(stop);
+                stack.extend(next);
+            } else {
+                stack.extend(next);
+                stack.extend(stop);
+            }
+        }
+        Ok(result)
+    }
+
     fn code_point_eq(&self, flags: Flags, left: u32, right: u32) -> bool {
         left == right
             || (flags.ignore_case
                 && canonicalize(left, flags.unicode) == canonicalize(right, flags.unicode))
     }
+}
+
+/// The code point the matcher reads next, on whichever side of `position` that is.
+fn adjacent_code_point(input: &[u16], position: usize, flags: Flags) -> Option<(u32, usize)> {
+    if !flags.backward {
+        return (position < input.len()).then(|| next_code_point(input, position, flags.unicode));
+    }
+    let low = *input.get(position.checked_sub(1)?)?;
+    if flags.unicode
+        && (0xdc00..=0xdfff).contains(&low)
+        && position >= 2
+        && (0xd800..=0xdbff).contains(&input[position - 2])
+    {
+        return Some((combine_surrogates(input[position - 2], low), 2));
+    }
+    Some((u32::from(low), 1))
 }
 
 pub(crate) fn next_code_point(input: &[u16], position: usize, unicode: bool) -> (u32, usize) {
@@ -521,6 +561,15 @@ pub(crate) fn next_code_point(input: &[u16], position: usize, unicode: bool) -> 
     (u32::from(first), 1)
 }
 
+/// A quantified atom, as `Regex::match_repeat` reads it.
+struct Repeat<'a> {
+    body: &'a Node,
+    min: usize,
+    max: Option<usize>,
+    greedy: bool,
+    captures: &'a Range<usize>,
+}
+
 #[derive(Clone, Debug)]
 struct State {
     position: usize,
@@ -528,8 +577,12 @@ struct State {
 }
 
 impl State {
-    fn advanced(mut self, count: usize) -> Self {
-        self.position += count;
+    fn moved(mut self, count: usize, backward: bool) -> Self {
+        if backward {
+            self.position -= count;
+        } else {
+            self.position += count;
+        }
         self
     }
 }
@@ -1897,6 +1950,11 @@ mod tests {
     }
 
     #[test]
+    fn a_required_iteration_may_match_empty() {
+        assert_eq!(ranges("(a*)b\\1+", "", "baaac"), [Some(0..1), Some(0..0)]);
+    }
+
+    #[test]
     fn group_names_take_escapes_and_references_must_resolve() {
         let matched = regex("(?<\\u{41}b>x)", "")
             .exec(&text("x"), 0)
@@ -1912,9 +1970,48 @@ mod tests {
     }
 
     #[test]
+    fn a_repeat_explores_each_alternative_before_giving_back_an_iteration() {
+        assert_eq!(
+            ranges("(aa|aabaac|ba|b|c)*", "", "aabaac"),
+            [Some(0..4), Some(2..4)]
+        );
+        assert_eq!(
+            ranges("^([a-z]+)*[a-z]$", "", "abc"),
+            [Some(0..3), Some(0..2)]
+        );
+    }
+
+    #[test]
+    fn a_lookahead_keeps_only_its_first_match() {
+        assert_eq!(
+            ranges("(?=(a+))a*b\\1", "", "baaabac"),
+            [Some(3..6), Some(3..4)]
+        );
+    }
+
+    #[test]
     fn whitespace_follows_the_ecmascript_set() {
         assert_eq!(ranges("\\s", "", "\u{feff}"), [Some(0..1)]);
         assert!(regex("\\s", "").exec(&text("\u{85}"), 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_lookbehind_reads_its_body_from_right_to_left() {
+        assert_eq!(
+            ranges("(?<=(\\d+)(\\d+))$", "", "1053"),
+            [Some(4..4), Some(0..1), Some(1..4)]
+        );
+        assert_eq!(
+            ranges("(?<=([abc])+)def", "", "abcdef"),
+            [Some(3..6), Some(0..1)]
+        );
+        assert_eq!(ranges("(?<=\\1(a))b", "", "aab"), [Some(2..3), Some(1..2)]);
+        assert!(
+            regex("(?<!abc)\\w\\w\\w", "")
+                .exec(&text("abcdef"), 3)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
