@@ -1,5 +1,84 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+host_triple := `rustc -vV | awk '/^host:/{print $2}'`
+export PATH := env_var('HOME') + "/.nvm/versions/node/v24.18.0/bin:/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/llvm/bin:" + env_var('PATH')
+
+doctor:
+    [[ "$(node -v)" == "v24.18.0" ]]
+    [[ "$(rustc -V)" == *"1.97.1"* ]]
+    [[ "$(racket --version)" == *"9.2"* ]]
+    command -v ld.lld llvm-readelf lake
+    test -x formal/quint/node_modules/.bin/quint
+    printf '%s\n' 'DOCTOR PASS'
+
+ci: ci-quality ci-npm ci-corpus xcheck portability-check
+    printf '%s\n' 'LOCAL CI PASS'
+
+ci-quality:
+    cargo fmt --all --check
+    cargo check --workspace --locked
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo test --workspace --locked
+
+ci-npm:
+    npm ci
+    node --test npm/test/*.test.mjs
+
+ci-corpus:
+    cargo test -p bamts-verification --test corpus_differential --locked -- --nocapture
+
+ci-accounting:
+    cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
+    cargo run --locked -p bamts-verification --bin ts_conformance -- audit-ledger --require-complete
+
+authority:
+    cargo run --locked -p bamts-verification -- source fetch typescript-7-compiler --dest target/authority/typescript-7.0.2
+    cargo run --locked -p bamts-verification -- source fetch typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
+    cargo run --locked -p bamts-verification -- source fetch typescript-6.0-tests --dest target/authority/typescript-6.0.2-tests
+    cargo run --locked -p bamts-verification -- source fetch typescript-compat-tests --dest target/authority/typescript-5.9.3-tests
+    cargo run --locked -p bamts-verification -- source fetch test262 --dest target/authority/test262
+
+ci-catalog: authority
+    cargo run --locked -p bamts-verification --bin bamts-verification -- catalog regenerate --release typescript-7.0.2 --check
+
+ci-formal: ci-catalog
+    cargo run --locked -p bamts-verification --bin bamts-verification -- formal audit --gates G1,G2,G5,G3,G4
+
+ci-string-oracle:
+    node npm/scripts/native-string-oracle.mjs
+
+sweep catalog runner shards="32" jobs="10":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -z "$(git status --porcelain)" || { echo "sweep needs a clean tree"; exit 1; }
+    cargo build --locked --release -p bamts-verification --bin bamts-verification --bin ts_lane_worker --bin runtime_lane_worker
+    sha="$(git rev-parse HEAD)"
+    run="local-${sha:0:12}"
+    out="target/evidence-local/{{catalog}}/{{runner}}/{{host_triple}}/$run"
+    mkdir -p "$out" target/evidence-local/merged
+    export BAMTS_SUITE_COMPILER_ADAPTER=target/release/ts_lane_worker
+    export BAMTS_SUITE_INTERPRETER_ADAPTER=target/release/runtime_lane_worker
+    export BAMTS_SUITE_JIT_ADAPTER=target/release/runtime_lane_worker
+    export BAMTS_SUITE_AOT_ADAPTER=target/release/runtime_lane_worker
+    test -f verification/ts-suite/index.json || cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
+    seq 0 $(( {{shards}} - 1 )) | xargs -P {{jobs}} -I{} target/release/bamts-verification suite run \
+      --catalog {{catalog}} --shard "{}/{{shards}}" --receipt "$out/{}.jsonl" \
+      --runner {{runner}} --platform {{host_triple}} \
+      --workflow Justfile --run-id "$run" --run-attempt 1 --source-sha "$sha" \
+      --job sweep --host "$(uname -sm | tr ' ' '-')" \
+      --runtime "node-v24.18.0;rust-$(rustc --version)"
+    merged="target/evidence-local/merged/{{catalog}}-{{runner}}-{{host_triple}}.jsonl"
+    target/release/bamts-verification suite merge --catalog {{catalog}} --receipts "$out" --out "$merged"
+    target/release/bamts-verification suite merge --catalog {{catalog}} --receipts "$out" --out "$merged" --check
+    printf 'SWEEP PASS %s\n' "$merged"
+
+nightly: ci ci-accounting ci-formal
+    just sweep typescript-7.0.2 compiler
+    just sweep test262 interpreter
+    just sweep test262 jit
+    just sweep test262 aot
+    printf '%s\n' 'NIGHTLY PASS'
+
 # Deterministic receipt-aware TypeScript product release root.
 #
 # A receipt content-addresses the binary that measured it, so the process
@@ -34,7 +113,7 @@ leaf-gate leaf:
 # "no registered adapter" and the receipt measures nothing at all.
 conformance-shard index count="4" catalog="typescript-7.0.2":
     cargo build --locked --release -p bamts-verification --bin ts_lane_worker
-    receipt="target/evidence-local/{{catalog}}/{{index}}.jsonl" && mkdir -p "$(dirname "$receipt")" && BAMTS_SUITE_COMPILER_ADAPTER=target/release/ts_lane_worker cargo run --locked --release -p bamts-verification --bin bamts-verification -- suite run --catalog {{catalog}} --shard "{{index}}/{{count}}" --receipt "$receipt" --runner compiler --platform x86_64-unknown-linux-gnu --workflow local --run-id local --run-attempt 1 --source-sha "$(git rev-parse HEAD)" --job conformance-shard --host "$(uname -sm | tr ' ' '-')" --runtime "node-v24.18.0;rust-$(rustc --version)" && printf 'SHARD %s/%s RECEIPT %s\n' "{{index}}" "{{count}}" "$receipt"
+    receipt="target/evidence-local/{{catalog}}/{{index}}.jsonl" && mkdir -p "$(dirname "$receipt")" && BAMTS_SUITE_COMPILER_ADAPTER=target/release/ts_lane_worker cargo run --locked --release -p bamts-verification --bin bamts-verification -- suite run --catalog {{catalog}} --shard "{{index}}/{{count}}" --receipt "$receipt" --runner compiler --platform {{host_triple}} --workflow local --run-id local --run-attempt 1 --source-sha "$(git rev-parse HEAD)" --job conformance-shard --host "$(uname -sm | tr ' ' '-')" --runtime "node-v24.18.0;rust-$(rustc --version)" && printf 'SHARD %s/%s RECEIPT %s\n' "{{index}}" "{{count}}" "$receipt"
 
 # Check that the whole workspace, tests included, still builds for every host
 # the product targets. This proves only that it compiles.
