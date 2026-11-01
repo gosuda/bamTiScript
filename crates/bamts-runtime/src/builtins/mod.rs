@@ -568,22 +568,6 @@ fn install_globals<H: Host>(
         crate::number_value(f64::INFINITY),
     );
     globals.insert(EcmaString::encode("NaN"), crate::number_value(f64::NAN));
-    // Node exposes `Atomics` as a global, and the corpus differential compares
-    // our output against Node byte-for-byte. `corpus/cases/is-plain-obj.ts`
-    // reads the global, so omitting it throws a ReferenceError and fails Node
-    // parity. Populating the namespace requires SharedArrayBuffer / shared
-    // memory, which the runtime does not have yet, so it is deliberately empty.
-    let atomics = push(
-        heap,
-        HeapEntry::Object {
-            properties: PropertyMap::default(),
-            prototype: Some(builtins.object_prototype()),
-            extensible: true,
-            boxed_primitive: None,
-        },
-    );
-    define_to_string_tag(heap, atomics, builtins.symbol_to_string_tag(), "Atomics");
-    globals.insert(EcmaString::encode("Atomics"), atomics);
 }
 fn install_errors<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -2186,7 +2170,7 @@ mod tests {
         }
     }
     #[test]
-    fn atomics_claims_no_methods() {
+    fn atomics_claims_exactly_the_methods_it_implements() {
         let module = blank_program("<test>");
         let mut host = TestHost;
         let machine = Machine::new(&module, &mut host, Limits::default());
@@ -2197,13 +2181,29 @@ mod tests {
         let keys = machine
             .own_property_keys(atomics)
             .expect("Atomics is an object");
-        let method_keys: Vec<_> = keys
+        let mut method_names: Vec<_> = keys
             .into_iter()
-            .filter(|key| !matches!(key, PropertyKey::Symbol(_)))
+            .filter_map(|key| match key {
+                PropertyKey::Named(name) => Some(name.to_utf8_lossy()),
+                _ => None,
+            })
             .collect();
-        assert!(
-            method_keys.is_empty(),
-            "Atomics must not claim any named methods"
+        method_names.sort();
+        assert_eq!(
+            method_names,
+            [
+                "add",
+                "and",
+                "compareExchange",
+                "exchange",
+                "isLockFree",
+                "load",
+                "or",
+                "pause",
+                "store",
+                "sub",
+                "xor",
+            ]
         );
     }
     #[test]
