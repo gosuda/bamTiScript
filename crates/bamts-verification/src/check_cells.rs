@@ -222,6 +222,20 @@ impl CheckedCase {
             .filter_map(|(unit, index)| index.map(|index| (unit, &self.output.modules()[index])))
     }
 
+    /// `(unit, output)` pairs in the order upstream's `.types` and `.symbols`
+    /// documents list them. A last unit that names its dependencies is the one
+    /// the harness compiles, so it comes first and the others follow.
+    pub fn units_in_document_order(&self) -> Vec<(&CaseUnit, &FrontendOutput)> {
+        let mut units: Vec<_> = self.reached_units().collect();
+        let last_is_root = units.last().is_some_and(|(unit, _)| {
+            unit.text.contains("require(") || unit.text.contains("reference path")
+        });
+        if last_is_root && let Some(last) = units.pop() {
+            units.insert(0, last);
+        }
+        units
+    }
+
     /// `(unit, output)` pairs for every reached unit, sorted by ascending
     /// module index. `ProgramFrontendOutput::modules()` is dependency-first
     /// (dependencies before dependents), matching upstream's output section
@@ -1527,7 +1541,7 @@ struct TypeAnnotation {
 #[must_use]
 pub fn emit_types_baseline(case: &CheckedCase, logical_path: &str) -> String {
     let mut out = format!("//// [{logical_path}] ////\n\n");
-    for (unit, output) in case.reached_units() {
+    for (unit, output) in case.units_in_document_order() {
         if is_config_unit_name(&unit.display_name) {
             continue;
         }
@@ -3072,7 +3086,7 @@ pub(crate) fn observe_trace(
 #[must_use]
 pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
     let mut out = format!("//// [{logical_path}] ////\n\n");
-    let units: Vec<_> = case.reached_units().collect();
+    let units = case.units_in_document_order();
     let mut declaration_anchors: HashMap<(String, SymbolKind), Vec<SymbolDeclAnchor>> =
         HashMap::new();
     for (unit, output) in &units {
@@ -3157,6 +3171,7 @@ pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
         emit_unit_symbols(
             output.semantic_model(),
             output.source_file(),
+            &unit.display_name,
             &section,
             &declaration_anchors,
             &mut out,
@@ -3184,6 +3199,7 @@ struct SymbolRecord {
 fn emit_unit_symbols(
     model: &SemanticModel,
     source_file: &bamts_compiler::syntax::SourceFile,
+    heading: &str,
     section: &str,
     declaration_anchors: &HashMap<(String, SymbolKind), Vec<SymbolDeclAnchor>>,
     out: &mut String,
@@ -3345,7 +3361,7 @@ fn emit_unit_symbols(
         by_line.entry(record.line).or_default().push(record);
     }
 
-    out.push_str(&format!("=== {section} ===\n"));
+    out.push_str(&format!("=== {heading} ===\n"));
     for (line_index, raw_line) in source.as_str().split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         out.push_str(line);
