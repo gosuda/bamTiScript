@@ -229,15 +229,12 @@ fn lookup_legacy_accessor<H: Host>(
     let key = machine.observable_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let mut current = Some(object);
     while let Some(object) = current {
-        if let Some(property) = machine.own_descriptor(object, &key)? {
-            return Ok(BuiltinOutcome::Value(match property {
-                Property::Accessor { getter, setter, .. } => match slot {
-                    LegacyAccessorSlot::Getter => getter,
-                    LegacyAccessorSlot::Setter => setter,
-                }
-                .unwrap_or(Value::UNDEFINED),
-                Property::Data { .. } => Value::UNDEFINED,
-            }));
+        if let Some(descriptor) = machine.internal_get_own_property(object, &key)? {
+            let accessor = match slot {
+                LegacyAccessorSlot::Getter => descriptor.getter,
+                LegacyAccessorSlot::Setter => descriptor.setter,
+            };
+            return Ok(BuiltinOutcome::Value(accessor.unwrap_or(Value::UNDEFINED)));
         }
         current = machine.internal_get_prototype_of(object)?;
     }
@@ -878,84 +875,6 @@ fn proto_getter<H: Host>(
     ))
 }
 
-/// Ordinary `[[SetPrototypeOf]]` over the machine heap representation:
-/// same-prototype fast path, non-extensible rejection, and the cycle walk
-/// that stops at exotic `[[GetPrototypeOf]]` (Proxy) carriers without running
-/// their traps. Returns the spec Boolean status; failures map to a `TypeError`
-/// at the accessor call site.
-fn ordinary_set_prototype_of<H: Host>(
-    machine: &mut Machine<'_, H>,
-    object: Value,
-    prototype: Option<Value>,
-) -> Result<bool, EvalFailure> {
-    if machine.internal_get_prototype_of(object)? == prototype {
-        return Ok(true);
-    }
-    let Some(index) = machine.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
-        return Ok(false);
-    };
-    let extensible = match &machine.heap[index] {
-        HeapEntry::Object { extensible, .. }
-        | HeapEntry::Array { extensible, .. }
-        | HeapEntry::Function { extensible, .. }
-        | HeapEntry::Script { extensible, .. }
-        | HeapEntry::RegExp { extensible, .. }
-        | HeapEntry::Date { extensible, .. }
-        | HeapEntry::BuiltinIterator { extensible, .. }
-        | HeapEntry::Collection { extensible, .. }
-        | HeapEntry::TypedArray { extensible, .. }
-        | HeapEntry::DataView { extensible, .. }
-        | HeapEntry::ArrayBuffer { extensible, .. }
-        | HeapEntry::SharedArrayBuffer { extensible, .. }
-        | HeapEntry::Generator { extensible, .. }
-        | HeapEntry::AsyncGenerator { extensible, .. }
-        | HeapEntry::AsyncFromSync { extensible, .. }
-        | HeapEntry::Promise { extensible, .. }
-        | HeapEntry::DisposableStack { extensible, .. }
-        | HeapEntry::ProcessEnv { extensible, .. }
-        | HeapEntry::Timeout { extensible, .. }
-        | HeapEntry::WeakRef { extensible, .. }
-        | HeapEntry::FinalizationRegistry { extensible, .. }
-        | HeapEntry::ProxyRevoker { extensible, .. }
-        | HeapEntry::NativeFunction { extensible, .. } => *extensible,
-        HeapEntry::Proxy { .. } => {
-            return machine.internal_is_extensible(object);
-        }
-        HeapEntry::Vacant
-        | HeapEntry::String(_)
-        | HeapEntry::BigInt(_)
-        | HeapEntry::ModuleNamespace { .. }
-        | HeapEntry::ExternalModuleNamespace { .. }
-        | HeapEntry::HashState { .. }
-        | HeapEntry::Symbol { .. }
-        | HeapEntry::PrivateName { .. }
-        | HeapEntry::Iterator { .. }
-        | HeapEntry::PromiseResolver { .. }
-        | HeapEntry::PromiseAll { .. }
-        | HeapEntry::PromiseAllElement { .. }
-        | HeapEntry::AsyncActivation { .. } => return Ok(false),
-    };
-    if !extensible {
-        return Ok(false);
-    }
-    let mut candidate = prototype;
-    let mut traversed = 0;
-    while let Some(value) = candidate {
-        if value == object {
-            return Ok(false);
-        }
-        candidate = machine.internal_get_prototype_of(value)?;
-        traversed += 1;
-        if traversed > machine.heap.len() {
-            return Ok(false);
-        }
-    }
-    if !machine.internal_set_prototype_of(object, prototype)? {
-        return Err(type_error("Cannot set prototype: object is not extensible"));
-    }
-    Ok(true)
-}
-
 fn is_annex_object<H: Host>(machine: &Machine<'_, H>, value: Value) -> Result<bool, EvalFailure> {
     let Some(index) = machine.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
         return Ok(false);
@@ -990,7 +909,7 @@ fn proto_setter<H: Host>(
     }
     let object = machine.value_to_object(this)?;
     let prototype = (value != Value::NULL).then_some(value);
-    if ordinary_set_prototype_of(machine, object, prototype)? {
+    if machine.internal_set_prototype_of(object, prototype)? {
         Ok(BuiltinOutcome::Value(Value::UNDEFINED))
     } else {
         Err(type_error("Object.prototype.__proto__ setter failed"))
