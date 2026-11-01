@@ -5,6 +5,7 @@ use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
 use super::annex_b::record_legacy_match;
+use super::regexp_protocol::flags_getter;
 use super::{
     allocate_array, allocate_string, builtin_property, define_data, heap_index,
     install_constructor_function, install_function, type_error,
@@ -33,6 +34,7 @@ pub(super) fn install<H: Host>(
     define_getter(heap, prototype, "source", source_get);
     let flags_get = install_function(heap, builtins, "get flags", 0, flags_getter::<H>);
     define_getter(heap, prototype, "flags", flags_get);
+    super::regexp_protocol::install(heap, builtins, prototype);
     let symbol_replace_fn = install_function(
         heap,
         builtins,
@@ -292,13 +294,19 @@ fn to_string<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let (pattern, flags) = regexp_parts(machine, this)
-        .ok_or_else(|| type_error("RegExp method called on incompatible receiver"))?;
+    if !machine.is_object(this) {
+        return Err(type_error("RegExp.prototype.toString requires an object"));
+    }
+    let source = machine.get_named_property(this, "source")?;
+    let source = machine.coerce_string_observable(source)?;
+    let flags = machine.get_named_property(this, "flags")?;
+    let flags = machine.coerce_string_observable(flags)?;
     let mut output = bamts_bytecode::EcmaStringBuilder::new();
     output.push_unit(u16::from(b'/'));
-    append_canonical_source(&pattern, &mut output);
+    for &unit in source.as_units() {
+        output.push_unit(unit);
+    }
     output.push_unit(u16::from(b'/'));
-    let flags = canonical_regexp_flags(&flags);
     for &unit in flags.as_units() {
         output.push_unit(unit);
     }
@@ -314,31 +322,29 @@ fn source_getter<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let (pattern, _) = regexp_parts(machine, this).ok_or_else(|| {
-        type_error("RegExp.prototype.source getter called on incompatible receiver")
-    })?;
-    Ok(BuiltinOutcome::Value(allocate_string(
-        machine,
-        canonical_source(&pattern),
-    )?))
+    if !machine.is_object(this) {
+        return Err(type_error(
+            "RegExp.prototype.source getter requires an object",
+        ));
+    }
+    if let Some((pattern, _)) = regexp_parts(machine, this) {
+        return Ok(BuiltinOutcome::Value(allocate_string(
+            machine,
+            canonical_source(&pattern),
+        )?));
+    }
+    if this == machine.intrinsics.regexp_prototype() {
+        return Ok(BuiltinOutcome::Value(allocate_string(
+            machine,
+            EcmaString::encode("(?:)"),
+        )?));
+    }
+    Err(type_error(
+        "RegExp.prototype.source getter called on incompatible receiver",
+    ))
 }
 
-fn flags_getter<H: Host>(
-    machine: &mut Machine<'_, H>,
-    this: Value,
-    _args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let (_pattern, flags) = regexp_parts(machine, this).ok_or_else(|| {
-        type_error("RegExp.prototype.flags getter called on incompatible receiver")
-    })?;
-    Ok(BuiltinOutcome::Value(allocate_string(
-        machine,
-        canonical_regexp_flags(&flags),
-    )?))
-}
-
-fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
+pub(super) fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
     let HeapEntry::Object { properties, .. } = &mut heap[super::heap_index(object)] else {
         panic!("accessor target must be an ordinary object");
     };

@@ -8573,33 +8573,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.registry.cells[cell.0].value
                 })))
             }
-            HeapEntry::RegExp {
-                pattern,
-                flags,
-                properties,
-                ..
-            } => {
-                if let Some(found) = property_lookup_ascii(properties, name) {
-                    return Some(found);
-                }
-                let flag = |unit| {
-                    Found::Value(Value::boolean(flags.as_units().contains(&u16::from(unit))))
-                };
-                match name {
-                    "source" => Some(Found::Text(crate::intrinsics::builtins::canonical_source(
-                        pattern,
-                    ))),
-                    "flags" => Some(Found::Text(flags.clone())),
-                    "global" => Some(flag(b'g')),
-                    "ignoreCase" => Some(flag(b'i')),
-                    "multiline" => Some(flag(b'm')),
-                    "sticky" => Some(flag(b'y')),
-                    "unicode" => Some(flag(b'u')),
-                    "dotAll" => Some(flag(b's')),
-                    "lastIndex" => Some(Found::Value(Value::int32(0))),
-                    _ => None,
-                }
-            }
+            HeapEntry::RegExp { properties, .. } => property_lookup_ascii(properties, name),
             HeapEntry::HashState { update, digest, .. } => match name {
                 "update" => Some(Found::Value(*update)),
                 "digest" => Some(Found::Value(*digest)),
@@ -8738,53 +8712,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 })))
             }
             HeapEntry::NativeFunction { properties, .. } => property_lookup(properties, key),
-            HeapEntry::RegExp {
-                pattern,
-                flags,
-                properties,
-                ..
-            } => {
-                if let Some(found) = property_lookup(properties, key) {
-                    return Some(found);
-                }
-                if let PropertyKey::Named(name) = key {
-                    let flag = |ascii: &str| {
-                        Found::Value(Value::boolean(
-                            flags.as_units().contains(&u16::from(ascii.as_bytes()[0])),
-                        ))
-                    };
-                    if name.eq_ascii("source") {
-                        return Some(Found::Text(crate::intrinsics::builtins::canonical_source(
-                            pattern,
-                        )));
-                    }
-                    if name.eq_ascii("flags") {
-                        return Some(Found::Text(flags.clone()));
-                    }
-                    if name.eq_ascii("global") {
-                        return Some(flag("g"));
-                    }
-                    if name.eq_ascii("ignoreCase") {
-                        return Some(flag("i"));
-                    }
-                    if name.eq_ascii("multiline") {
-                        return Some(flag("m"));
-                    }
-                    if name.eq_ascii("sticky") {
-                        return Some(flag("y"));
-                    }
-                    if name.eq_ascii("unicode") {
-                        return Some(flag("u"));
-                    }
-                    if name.eq_ascii("dotAll") {
-                        return Some(flag("s"));
-                    }
-                    if name.eq_ascii("lastIndex") {
-                        return Some(Found::Value(Value::int32(0)));
-                    }
-                }
-                None
-            }
+            HeapEntry::RegExp { properties, .. } => property_lookup(properties, key),
             HeapEntry::HashState { update, digest, .. } => {
                 let PropertyKey::Named(name) = key else {
                     return None;
