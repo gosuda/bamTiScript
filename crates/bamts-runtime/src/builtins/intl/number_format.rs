@@ -5,12 +5,13 @@ use bamts_native::{Decoded, Value};
 use super::super::bigint::bigint_from_value;
 use super::options::{
     Options, canonicalize_locale_list, coerce_options_to_object, digit_options,
-    locale_matcher_option, read, string_option,
+    locale_matcher_option, matcher_name, read, string_option,
 };
 use super::{
     Class, allocate, arg, bound_function, chain_legacy_instance, define_field, install_class,
-    instance_prototype, intl_record, new_object, part_object, range_error, register_hidden,
-    string_outcome, string_value, supported_locales_outcome, type_error, unwrap_legacy_instance,
+    instance_prototype, intl_record, is_type_sequence, new_object, part_object, range_error,
+    register_hidden, string_outcome, string_value, supported_locales_outcome, type_error,
+    unwrap_legacy_instance,
 };
 use crate::intl::locale_data::DATA;
 use crate::intl::number_data::NoHostLocale;
@@ -62,13 +63,6 @@ pub(super) fn number_failure<H: Host>(
         | NumberFormatErrorKind::MissingData
         | NumberFormatErrorKind::InvalidData => range_error(machine, error.message),
     }
-}
-
-fn is_type_sequence(value: &str) -> bool {
-    !value.is_empty()
-        && value.split('-').all(|part| {
-            (3..=8).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        })
 }
 
 /// SetNumberFormatUnitOptions, which validates each value as it is read.
@@ -160,13 +154,7 @@ pub(super) fn read_number_format_options<H: Host>(
 ) -> Result<NumberFormatOptions, EvalFailure> {
     let mut result = NumberFormatOptions::default();
     let matcher = locale_matcher_option(machine, options)?;
-    result.locale_matcher = Some(
-        match matcher {
-            crate::intl::locale_negotiation::LocaleMatcher::Lookup => "lookup",
-            crate::intl::locale_negotiation::LocaleMatcher::BestFit => "best fit",
-        }
-        .to_owned(),
-    );
+    result.locale_matcher = Some(matcher_name(matcher).to_owned());
     result.numbering_system = string_option(machine, options, "numberingSystem", &[])?;
     if let Some(name) = &result.numbering_system
         && !is_type_sequence(name)

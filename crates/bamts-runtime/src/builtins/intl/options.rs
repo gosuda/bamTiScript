@@ -88,6 +88,14 @@ pub(super) fn locale_matcher_option<H: Host>(
     })
 }
 
+/// The library's spelling of a matcher.
+pub(super) const fn matcher_name(matcher: LocaleMatcher) -> &'static str {
+    match matcher {
+        LocaleMatcher::Lookup => "lookup",
+        LocaleMatcher::BestFit => "best fit",
+    }
+}
+
 /// DefaultNumberOption.
 pub(super) fn default_number_option<H: Host>(
     machine: &mut Machine<'_, H>,

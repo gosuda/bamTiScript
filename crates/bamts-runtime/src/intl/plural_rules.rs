@@ -772,6 +772,10 @@ pub struct PluralRulesOptions {
     pub rounding_mode: Option<String>,
     /// `trailingZeroDisplay`.
     pub trailing_zero_display: Option<String>,
+    /// `notation`.
+    pub notation: Option<String>,
+    /// `compactDisplay`.
+    pub compact_display: Option<String>,
 }
 
 /// PluralRules rounding-priority mode.
@@ -927,8 +931,12 @@ impl DigitOptions {
             TrailingZeroDisplay::parse(options.trailing_zero_display.as_deref())?;
         let has_significant = options.minimum_significant_digits.is_some()
             || options.maximum_significant_digits.is_some();
+        let has_fraction =
+            options.minimum_fraction_digits.is_some() || options.maximum_fraction_digits.is_some();
+        let compact = options.notation.as_deref() == Some("compact");
         let need_significant = priority != RoundingPriority::Auto || has_significant;
-        let need_fraction = priority != RoundingPriority::Auto || !has_significant;
+        let need_fraction =
+            priority != RoundingPriority::Auto || !(has_significant || (compact && !has_fraction));
 
         let (minimum_fraction_digits, maximum_fraction_digits) = if need_fraction {
             fraction_digit_bounds(options)?
@@ -955,6 +963,21 @@ impl DigitOptions {
             return Err(IntlError::InvalidOption {
                 name: "roundingIncrement",
                 value: rounding_increment.to_string(),
+            });
+        }
+        if !need_significant && !need_fraction {
+            return Ok(Self {
+                minimum_integer_digits,
+                minimum_fraction_digits: 0,
+                maximum_fraction_digits: 0,
+                minimum_significant_digits: 1,
+                maximum_significant_digits: 2,
+                has_significant_digits: true,
+                rounding_increment,
+                rounding_mode,
+                rounding_priority: RoundingPriority::MorePrecision,
+                rounding_type: RoundingType::MorePrecision,
+                trailing_zero_display,
             });
         }
         let rounding_type = match priority {
@@ -1116,6 +1139,10 @@ pub struct PluralRulesResolvedOptions {
     pub trailing_zero_display: TrailingZeroDisplay,
     /// Provider-defined observable category order.
     pub plural_categories: Vec<PluralCategory>,
+    /// Resolved notation.
+    pub notation: String,
+    /// Resolved compact display, for compact notation.
+    pub compact_display: Option<String>,
 }
 
 /// ECMA-402 PluralRules service core.
@@ -1127,6 +1154,8 @@ pub struct PluralRules<'a> {
     rule_type: PluralRuleType,
     digits: DigitOptions,
     categories: Vec<PluralCategory>,
+    notation: String,
+    compact_display: Option<String>,
 }
 
 impl<'a> PluralRules<'a> {
@@ -1163,6 +1192,16 @@ impl<'a> PluralRules<'a> {
             rule_type,
             digits,
             categories,
+            notation: options
+                .notation
+                .clone()
+                .unwrap_or_else(|| String::from("standard")),
+            compact_display: (options.notation.as_deref() == Some("compact")).then(|| {
+                options
+                    .compact_display
+                    .clone()
+                    .unwrap_or_else(|| String::from("short"))
+            }),
         })
     }
 
@@ -1226,6 +1265,8 @@ impl<'a> PluralRules<'a> {
             rounding_priority: self.digits.rounding_priority,
             trailing_zero_display: self.digits.trailing_zero_display,
             plural_categories: self.categories.clone(),
+            notation: self.notation.clone(),
+            compact_display: self.compact_display.clone(),
         }
     }
 
@@ -2550,41 +2591,17 @@ fn canonical_calendar_code(
 fn canonical_date_time_field(code: &str) -> Result<String, IntlError> {
     const FIELDS: &[&str] = &[
         "era",
-        "era-short",
-        "era-narrow",
         "year",
-        "year-short",
-        "year-narrow",
         "quarter",
-        "quarter-short",
-        "quarter-narrow",
         "month",
-        "month-short",
-        "month-narrow",
         "weekOfYear",
-        "weekOfYear-short",
-        "weekOfYear-narrow",
         "weekday",
-        "weekday-short",
-        "weekday-narrow",
         "day",
-        "day-short",
-        "day-narrow",
         "dayPeriod",
-        "dayPeriod-short",
-        "dayPeriod-narrow",
         "hour",
-        "hour-short",
-        "hour-narrow",
         "minute",
-        "minute-short",
-        "minute-narrow",
         "second",
-        "second-short",
-        "second-narrow",
-        "zone",
-        "zone-short",
-        "zone-narrow",
+        "timeZoneName",
     ];
     if FIELDS.contains(&code) {
         Ok(code.to_owned())

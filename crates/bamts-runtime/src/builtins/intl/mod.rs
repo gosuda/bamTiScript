@@ -8,6 +8,7 @@ mod collator;
 mod locale;
 mod number_format;
 mod options;
+mod plural_rules;
 
 use std::collections::BTreeMap;
 
@@ -119,6 +120,7 @@ pub(super) fn install<H: Host>(
     locale::install(heap, builtins, namespace);
     collator::install(heap, builtins, namespace);
     number_format::install(heap, builtins, namespace);
+    plural_rules::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Intl"), namespace);
 }
 
@@ -146,6 +148,19 @@ fn supported_values_of<H: Host>(
     let values = canonical_locales::supported_values_of(&key, &*DATA)
         .map_err(|error| range_error(machine, error.message))?;
     string_array_outcome(machine, &values)
+}
+
+/// Maps a service-core error to the exception it stands for.
+pub(super) fn service_failure<H: Host>(
+    machine: &mut Machine<'_, H>,
+    error: &crate::intl::plural_rules::IntlError,
+) -> EvalFailure {
+    match error.kind() {
+        crate::intl::plural_rules::IntlErrorKind::TypeError => {
+            type_error(machine, error.to_string())
+        }
+        _ => range_error(machine, error.to_string()),
+    }
 }
 
 fn throw<H: Host>(machine: &mut Machine<'_, H>, name: &str, message: String) -> EvalFailure {
@@ -506,6 +521,14 @@ pub(super) fn string_array_outcome<H: Host>(
     values: &[String],
 ) -> Result<BuiltinOutcome, EvalFailure> {
     string_array(machine, values).map(BuiltinOutcome::Value)
+}
+
+/// The `type` production of a Unicode locale extension.
+pub(super) fn is_type_sequence(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('-').all(|part| {
+            (3..=8).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
 }
 
 /// StrWhiteSpaceChar.

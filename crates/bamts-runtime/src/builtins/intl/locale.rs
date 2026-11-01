@@ -6,8 +6,8 @@ use super::super::allocate_array;
 use super::options::{Options, boolean_option, coerce_options_to_object, string_option};
 use super::{
     Class, arg, boolean_outcome, construct, create, define_field, install_class, intl_record,
-    is_object, locale_record, new_object, optional_string_outcome, range_error, require_new,
-    string_array_outcome, string_outcome, string_value, type_error,
+    is_object, is_type_sequence, locale_record, new_object, optional_string_outcome, range_error,
+    require_new, string_array_outcome, string_outcome, string_value, type_error,
 };
 use crate::intl::locale_data::{self, DATA};
 use crate::intl::locale_negotiation::{
@@ -79,13 +79,6 @@ fn this_locale<H: Host>(
         Some(IntlObject::Locale(tag)) => Ok(tag.clone()),
         _ => Err(type_error(machine, "receiver is not an Intl.Locale")),
     }
-}
-
-fn is_type_sequence(value: &str) -> bool {
-    !value.is_empty()
-        && value.split('-').all(|part| {
-            (3..=8).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        })
 }
 
 /// GetOption for a keyword whose value must match the `type` production.

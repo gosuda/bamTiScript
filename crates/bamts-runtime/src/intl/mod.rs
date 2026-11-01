@@ -12,6 +12,8 @@ pub mod locale_negotiation;
 pub mod number_data;
 pub mod number_format;
 pub mod plural_rules;
+mod segmentation;
+pub mod service_data;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -63,6 +65,23 @@ pub enum IntlObject {
     Segmenter(plural_rules::Segmenter<'static>),
     DisplayNames(plural_rules::DisplayNames<'static>),
     Locale(locale_negotiation::LanguageTag),
+    Segments(Box<SegmentsRecord>),
+    SegmentIterator(Box<SegmentIteratorRecord>),
+}
+
+/// The state of a `Segments` object: the text and how it broke up.
+#[derive(Clone, Debug)]
+pub struct SegmentsRecord {
+    pub text: plural_rules::SegmentedText,
+    pub granularity: plural_rules::SegmenterGranularity,
+}
+
+/// The state of a Segment Iterator: what it walks and where it is.
+#[derive(Clone, Debug)]
+pub struct SegmentIteratorRecord {
+    pub text: plural_rules::SegmentedText,
+    pub granularity: plural_rules::SegmenterGranularity,
+    pub next_record: usize,
 }
 
 impl IntlObject {
@@ -77,6 +96,8 @@ impl IntlObject {
             Self::Segmenter(_) => IntlKind::Segmenter,
             Self::DisplayNames(_) => IntlKind::DisplayNames,
             Self::Locale(_) => IntlKind::Locale,
+            Self::Segments(_) => IntlKind::Segments,
+            Self::SegmentIterator(_) => IntlKind::SegmentIterator,
         }
     }
 }
