@@ -3509,7 +3509,7 @@ impl Parser {
             );
         }
 
-        if self.at(TokenKind::KwAwait) && self.can_start_expression_after(1) {
+        if self.at(TokenKind::KwAwait) && self.await_is_an_operator() {
             let keyword_range = self.cur().range();
             self.bump();
             let argument = self.parse_unary_expression();
@@ -3548,6 +3548,72 @@ impl Parser {
     }
 
     /// Whether the `n`-th token can begin the operand of a prefix operator.
+    /// Whether the `await` here starts an await expression. TypeScript always
+    /// reads one so it can report misuse. In JavaScript, `await` outside an async
+    /// function is an ordinary name, and `await instanceof f` uses that name.
+    fn await_is_an_operator(&self) -> bool {
+        if !self.can_start_expression_after(1) {
+            return false;
+        }
+        if self.is_typescript() || self.keyword_context.await_reserved {
+            return true;
+        }
+        if self.keyword_context.in_function {
+            return false;
+        }
+        let next = self.nth_kind(1);
+        if self.has_module_syntax() {
+            return !matches!(next, TokenKind::KwInstanceof | TokenKind::KwIn);
+        }
+        // Without module syntax nothing settles the goal yet. Like Node, read
+        // the name unless what follows could not continue an expression.
+        is_identifier_like(next)
+            || matches!(
+                next,
+                TokenKind::NumericLiteral
+                    | TokenKind::BigIntLiteral
+                    | TokenKind::StringLiteral
+                    | TokenKind::LBrace
+                    | TokenKind::Bang
+                    | TokenKind::Tilde
+                    | TokenKind::KwClass
+                    | TokenKind::KwDelete
+                    | TokenKind::KwFalse
+                    | TokenKind::KwFunction
+                    | TokenKind::KwImport
+                    | TokenKind::KwNew
+                    | TokenKind::KwNull
+                    | TokenKind::KwSuper
+                    | TokenKind::KwThis
+                    | TokenKind::KwTrue
+                    | TokenKind::KwTypeof
+                    | TokenKind::KwVoid
+            )
+    }
+
+    /// Whether any token in the file looks like module syntax. `import(` and
+    /// `import.` also work in a script. A keyword used as a property name
+    /// counts too, which only keeps `await` an operator.
+    fn has_module_syntax(&self) -> bool {
+        let mut index = self.next_significant(0);
+        while index < self.tokens.len() {
+            let next = self.next_significant(index + 1);
+            match self.tokens[index].kind() {
+                TokenKind::KwExport => return true,
+                TokenKind::KwImport
+                    if !self.tokens.get(next).is_some_and(|token| {
+                        matches!(token.kind(), TokenKind::LParen | TokenKind::Dot)
+                    }) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+            index = next;
+        }
+        false
+    }
+
     fn can_start_expression_after(&self, n: usize) -> bool {
         !matches!(
             self.nth_kind(n),
