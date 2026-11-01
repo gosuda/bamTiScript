@@ -89,6 +89,7 @@ fn unary_to_selector(op: bamts_bytecode::UnaryOp) -> u32 {
         UnaryOp::Negate => 3,
         UnaryOp::BitwiseNot => 4,
         UnaryOp::LogicalNot => 5,
+        UnaryOp::ToString => 6,
     }
 }
 

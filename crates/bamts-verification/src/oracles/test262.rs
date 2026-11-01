@@ -2190,6 +2190,36 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn a_template_substitution_is_converted_with_to_string() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [&str; 4] = [
+            "var o = { valueOf() { return 'V'; }, toString() { return 'T'; } }; \
+             assert.sameValue(`${o}`, 'T');",
+            "assert.sameValue(`${1}${'a'}${null}${undefined}`, '1anullundefined');",
+            "assert.sameValue(throws(TypeError, function () { `${Symbol()}`; }), true);",
+            "var log = ''; var part = function (name) { return { toString() { log += name; \
+             return name; } }; }; assert.sameValue(`${part('a')}-${part('b')}`, 'a-b'); \
+             assert.sameValue(log, 'ab');",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: template literals", &format!("{THROWS}{body}"));
+                let label = format!("template-literal-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn indirect_eval_runs_in_the_global_scope() {
         const THROWS: &str = "function throws(kind, body) {\n\
             try { body(); } catch (error) { return error instanceof kind; }\n\

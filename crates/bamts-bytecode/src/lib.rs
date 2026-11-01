@@ -381,6 +381,8 @@ pub enum UnaryOp {
     Negate,
     BitwiseNot,
     LogicalNot,
+    /// ECMAScript `ToString`, which a template literal applies to a substitution.
+    ToString,
 }
 
 impl UnaryOp {
@@ -392,6 +394,7 @@ impl UnaryOp {
             Self::Negate => 3,
             Self::BitwiseNot => 4,
             Self::LogicalNot => 5,
+            Self::ToString => 6,
         }
     }
 
@@ -403,6 +406,7 @@ impl UnaryOp {
             3 => Some(Self::Negate),
             4 => Some(Self::BitwiseNot),
             5 => Some(Self::LogicalNot),
+            6 => Some(Self::ToString),
             _ => None,
         }
     }

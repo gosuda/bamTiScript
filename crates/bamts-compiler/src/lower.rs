@@ -5824,6 +5824,17 @@ impl<'a> FunctionContext<'a> {
         let mut acc = self.string_reg(builder, first, range)?;
         for (index, expression) in template.expressions.iter().enumerate() {
             let value = self.lower_expression(builder, expression)?;
+            // `ToString`, not the `+` operator's `ToPrimitive`: `valueOf` has no
+            // say here, and a Symbol must throw.
+            let text = self.alloc_register(range)?;
+            self.emit(
+                range,
+                Instruction::Unary {
+                    dst: text,
+                    op: UnaryOp::ToString,
+                    operand: value,
+                },
+            )?;
             let joined = self.alloc_register(range)?;
             self.emit(
                 range,
@@ -5831,7 +5842,7 @@ impl<'a> FunctionContext<'a> {
                     dst: joined,
                     op: BinaryOp::Add,
                     left: acc,
-                    right: value,
+                    right: text,
                 },
             )?;
             acc = joined;

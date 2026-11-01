@@ -12597,6 +12597,14 @@ impl<'a, H: Host> Machine<'a, H> {
                 ))
             }
             UnaryOp::LogicalNot => Ok(Value::boolean(!self.truthy(operand))),
+            UnaryOp::ToString => {
+                if self.string_value(operand).is_some() {
+                    return Ok(operand);
+                }
+                let text = self.coerce_string_observable(operand)?;
+                self.allocate(HeapEntry::String(text))
+                    .map_err(EvalFailure::Runtime)
+            }
         }
     }
 
@@ -13562,6 +13570,7 @@ pub(crate) fn unary_from_selector(op: u32) -> Option<UnaryOp> {
         3 => Some(UnaryOp::Negate),
         4 => Some(UnaryOp::BitwiseNot),
         5 => Some(UnaryOp::LogicalNot),
+        6 => Some(UnaryOp::ToString),
         _ => None,
     }
 }
