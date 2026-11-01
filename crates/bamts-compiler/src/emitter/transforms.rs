@@ -1036,13 +1036,20 @@ impl<'a> Rewriter<'a> {
     }
 
     fn rewrite_export_named_declaration(&mut self, statement: &Stmt, inner: &Stmt) -> Vec<Stmt> {
-        if let Statement::Namespace(namespace) = inner.data() {
-            let binding = if self.cjs.is_some() {
-                ContainerBinding::CommonJs
-            } else {
-                ContainerBinding::Export
-            };
-            return self.lower_namespace(inner, namespace, binding, statement.range());
+        let binding = if self.cjs.is_some() {
+            ContainerBinding::CommonJs
+        } else {
+            ContainerBinding::Export
+        };
+        match inner.data() {
+            Statement::Namespace(namespace) => {
+                return self.lower_namespace(inner, namespace, binding, statement.range());
+            }
+            Statement::Enum(declaration) if declaration.is_const => return Vec::new(),
+            Statement::Enum(declaration) => {
+                return self.lower_enum(inner, declaration, binding, statement.range());
+            }
+            _ => {}
         }
         if self.cjs.is_some() {
             return self.cjs_export_declaration(statement.range(), inner);
@@ -1688,11 +1695,16 @@ impl<'a> Rewriter<'a> {
                 ContainerBinding::Local,
                 statement.range(),
             ),
+            Statement::Enum(declaration) => self.lower_enum(
+                statement,
+                declaration,
+                ContainerBinding::Local,
+                statement.range(),
+            ),
             Statement::ImportEquals(_)
             | Statement::Export(_)
             | Statement::Interface(_)
             | Statement::TypeAlias(_)
-            | Statement::Enum(_)
             | Statement::Empty
             | Statement::Break(_)
             | Statement::Continue(_)
@@ -9040,7 +9052,9 @@ fn declared_binding_names(file: &SourceFile, statement: &Stmt) -> Vec<String> {
                 _ => None,
             })
             .collect(),
-        Statement::Enum(declaration) => vec![raw_token_text(file, declaration.name.data().token())],
+        Statement::Enum(declaration) if !declaration.is_const => {
+            vec![raw_token_text(file, declaration.name.data().token())]
+        }
         _ => Vec::new(),
     }
 }
@@ -10648,6 +10662,77 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
              \x20   const box = { x: A.x };\n\
              \x20   A.f();\n\
              })(A || (A = {}));\n"
+        );
+    }
+
+    #[test]
+    fn an_enum_is_declared_once_and_published_like_a_namespace() {
+        let output = emit_at(
+            "enum E { A }\n\
+             enum E { B = 1 }\n\
+             namespace N {\n\
+             \x20   export enum F { C }\n\
+             \x20   enum G { D }\n\
+             }\n\
+             function f() {\n\
+             \x20   enum H { I }\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var E;\n\
+             (function (E) {\n\
+             \x20   E[E[\"A\"] = 0] = \"A\";\n\
+             })(E || (E = {}));\n\
+             (function (E) {\n\
+             \x20   E[E[\"B\"] = 1] = \"B\";\n\
+             })(E || (E = {}));\n\
+             var N;\n\
+             (function (N) {\n\
+             \x20   let F;\n\
+             \x20   (function (F) {\n\
+             \x20       F[F[\"C\"] = 0] = \"C\";\n\
+             \x20   })(F = N.F || (N.F = {}));\n\
+             \x20   let G;\n\
+             \x20   (function (G) {\n\
+             \x20       G[G[\"D\"] = 0] = \"D\";\n\
+             \x20   })(G || (G = {}));\n\
+             })(N || (N = {}));\n\
+             function f() {\n\
+             \x20   let H;\n\
+             \x20   (function (H) {\n\
+             \x20       H[H[\"I\"] = 0] = \"I\";\n\
+             \x20   })(H || (H = {}));\n\
+             }\n"
+        );
+    }
+
+    #[test]
+    fn an_exported_enum_publishes_its_container() {
+        let source = "export enum E { A }\nexport const enum F { B }\n";
+        let esm = emit_at(source, ScriptTarget::Es2015);
+        assert_eq!(
+            javascript(&esm),
+            "export var E;\n(function (E) {\n    E[E[\"A\"] = 0] = \"A\";\n})(E || (E = {}));\n"
+        );
+        let cjs = emit_with_options(
+            source,
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        assert_eq!(
+            javascript(&cjs),
+            "\"use strict\";\n\
+             Object.defineProperty(exports, \"__esModule\", { value: true });\n\
+             exports.E = void 0;\n\
+             var E;\n\
+             (function (E) {\n\
+             \x20   E[E[\"A\"] = 0] = \"A\";\n\
+             })(E || (exports.E = E = {}));\n"
         );
     }
 

@@ -1,13 +1,16 @@
-//! Namespace declarations as the function calls that build them at runtime.
+//! Namespaces and enums as the function calls that build them at runtime.
 //!
 //! `namespace N { export var x = 1; }` becomes a `var N;` and a call that fills
-//! the container: `(function (N) { N.x = 1; })(N || (N = {}));`. Only the first
-//! declaration of a name in a scope declares it, so merged blocks share one
-//! binding and a namespace merged into a class or function reuses theirs.
+//! the container: `(function (N) { N.x = 1; })(N || (N = {}));`. An enum fills
+//! its container with its members the same way. Only the first declaration of
+//! a name in a scope declares it, so merged blocks share one binding and a
+//! namespace merged into a class or function reuses theirs.
 
 use std::collections::BTreeSet;
 
 use crate::checker::{SymbolId, SymbolKind};
+use crate::emitter::{enum_number_lexeme, enum_string_lexeme};
+use crate::enum_plan::{EnumMemberPlan, EnumScalar};
 use crate::source::TextRange;
 use crate::syntax::*;
 
@@ -64,6 +67,94 @@ impl Rewriter<'_> {
         out
     }
 
+    pub(super) fn lower_enum(
+        &mut self,
+        statement: &Stmt,
+        declaration: &EnumDeclaration,
+        binding: ContainerBinding,
+        range: TextRange,
+    ) -> Vec<Stmt> {
+        let plan = self
+            .model
+            .and_then(|model| model.enum_facts().declaration(statement.id()))
+            .filter(|plan| plan.members().len() == declaration.members.len());
+        let local = self
+            .identifier_name(&declaration.name)
+            .filter(|local| !local.is_empty());
+        let (Some(plan), Some(local), false) = (plan, local, declaration.is_const) else {
+            return vec![statement.clone()];
+        };
+        let body = declaration
+            .members
+            .iter()
+            .zip(plan.members())
+            .filter_map(|(member, plan)| self.enum_member_statement(&local, member, plan))
+            .collect();
+        let mut out = Vec::new();
+        out.extend(self.container_declaration(&local, &binding, range));
+        let argument = self.container_argument(&local, &binding, range);
+        out.push(self.container_call(&local, body, argument, range));
+        out
+    }
+
+    /// `E[E["A"] = 0] = "A";`, or `E["A"] = "a";` for a member with no reverse
+    /// mapping. A member with neither a value nor an initializer has nothing
+    /// to store.
+    fn enum_member_statement(
+        &mut self,
+        object: &str,
+        member: &EnumMemberNode,
+        plan: &EnumMemberPlan,
+    ) -> Option<Stmt> {
+        let key = enum_string_lexeme(plan.name()?);
+        let constant = plan.value()?.constant();
+        let initializer = member.data().initializer.as_deref();
+        let range = member.range();
+        let value = match (constant, initializer) {
+            (Some(EnumScalar::Number(number)), _) => {
+                self.number_expr(&enum_number_lexeme(number.to_f64()))
+            }
+            (Some(EnumScalar::String(text)), _) => {
+                let text = enum_string_lexeme(text);
+                self.string_expr(&text, range)
+            }
+            (None, Some(initializer)) => self.rewrite_expr(initializer),
+            (None, None) => return None,
+        };
+        let key_expr = self.string_expr(&key, range);
+        let store = self.computed_assignment(object, key_expr, value, range);
+        let expression = if plan.reverse() {
+            let name = self.string_expr(&key, range);
+            self.computed_assignment(object, store, name, range)
+        } else {
+            store
+        };
+        Some(self.expression_statement(expression, range))
+    }
+
+    fn string_expr(&mut self, quoted_contents: &str, range: TextRange) -> Expr {
+        let literal = self.string_literal(quoted_contents);
+        self.syn_node(range, Expression::Literal(Literal::String(literal)))
+    }
+
+    fn computed_assignment(
+        &mut self,
+        object: &str,
+        key: Expr,
+        value: Expr,
+        range: TextRange,
+    ) -> Expr {
+        let object = self.ident_expr(object);
+        let left = self.syn_node(
+            range,
+            AssignmentTarget::Member(AssignmentMemberTarget {
+                object: Box::new(object),
+                property: MemberProperty::Computed(Box::new(key)),
+            }),
+        );
+        self.assignment(left, value, range)
+    }
+
     fn lower_namespace_body(
         &mut self,
         namespace: &NamespaceDeclaration,
@@ -105,6 +196,10 @@ impl Rewriter<'_> {
             Statement::Namespace(namespace) => {
                 let binding = ContainerBinding::Member(parameter.to_owned());
                 return self.lower_namespace(inner, namespace, binding, range);
+            }
+            Statement::Enum(declaration) if !declaration.is_const => {
+                let binding = ContainerBinding::Member(parameter.to_owned());
+                return self.lower_enum(inner, declaration, binding, range);
             }
             Statement::Function(function) if function.function.body.is_some() => {
                 function.function.name.as_ref()

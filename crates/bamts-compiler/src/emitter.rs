@@ -31,7 +31,7 @@ use std::{
 
 use crate::checker::{SemanticModel, Type, TypeId, render_type_declaration};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
-use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar};
+use crate::enum_plan::{EnumFacts, EnumScalar};
 use crate::jsx_desugar::JsxSourceDesugarPlan;
 use crate::source::{JsxEmit, SourceId, SourceText, TextRange, Utf16Pos};
 use crate::syntax::*;
@@ -884,6 +884,38 @@ struct Emitter<'a> {
     synthesized_floor: u32,
 }
 
+/// The source text of an enum's numeric value.
+pub(crate) fn enum_number_lexeme(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value == f64::INFINITY {
+        "Infinity".to_owned()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+/// The contents of a double-quoted literal holding `value`.
+pub(crate) fn enum_string_lexeme(value: &bamts_bytecode::EcmaString) -> String {
+    let mut text = String::with_capacity(value.as_units().len());
+    for &unit in value.as_units() {
+        match unit {
+            0x08 => text.push_str("\\b"),
+            0x09 => text.push_str("\\t"),
+            0x0A => text.push_str("\\n"),
+            0x0C => text.push_str("\\f"),
+            0x0D => text.push_str("\\r"),
+            0x22 => text.push_str("\\\""),
+            0x5C => text.push_str("\\\\"),
+            0x20..=0x7E => text.push(char::from_u32(u32::from(unit)).expect("ASCII unit")),
+            _ => write!(text, "\\u{unit:04X}").expect("writing to a String cannot fail"),
+        }
+    }
+    text
+}
+
 impl Emitter<'_> {
     /// The authored single-line comment between `after` and `limit` on
     /// `after`'s source line, if one exists (tsc preserves these with
@@ -1549,7 +1581,7 @@ impl<'a> Emitter<'a> {
                 true
             }
             Statement::Interface(_) | Statement::TypeAlias(_) | Statement::Declare(_) => false,
-            Statement::Enum(declaration) => self.emit_enum_js(statement.id(), declaration),
+            Statement::Enum(declaration) => self.emit_enum_js(declaration),
             Statement::Namespace(_) => {
                 self.diag_here(
                     codes::NAMESPACE_UNLOWERED,
@@ -2307,129 +2339,28 @@ impl<'a> Emitter<'a> {
     // enum lowering (JavaScript)
     // =======================================================================
 
-    fn emit_enum_js(&mut self, declaration_id: NodeId, declaration: &EnumDeclaration) -> bool {
-        let Some(name) = self
-            .text(declaration.name.data().token())
-            .map(str::to_owned)
-        else {
-            self.diag(
-                codes::UNRESOLVED_TOKEN,
-                "token text is not a valid slice of the source",
-                declaration.name.range(),
-            );
-            return false;
-        };
-        if name.is_empty() || declaration.is_const {
-            return false;
-        }
-        let Some(plan) = self.enum_facts.declaration(declaration_id) else {
+    /// The rewriter lowers every enum it has facts for, so one that reaches
+    /// the printer is either erased or has none.
+    fn emit_enum_js(&mut self, declaration: &EnumDeclaration) -> bool {
+        if !declaration.is_const {
             self.diag_here(
                 codes::ENUM_FACTS_UNAVAILABLE,
                 "runtime enum lowering requires checked enum facts",
             );
-            return false;
-        };
-        if plan.members().len() != declaration.members.len() {
-            self.diag_here(
-                codes::ENUM_FACTS_UNAVAILABLE,
-                "runtime enum lowering requires a complete checked enum plan",
-            );
-            return false;
         }
-
-        self.raw("var ");
-        self.raw(&name);
-        self.raw(";");
-        self.newline();
-        self.raw("(function (");
-        self.raw(&name);
-        self.raw(") {");
-        self.newline();
-        self.indent += 1;
-        for (member, plan_member) in declaration.members.iter().zip(plan.members()) {
-            if self.emit_enum_member(&name, member.data(), plan_member) {
-                self.newline();
-            }
-        }
-        self.indent -= 1;
-        self.raw("})(");
-        self.raw(&name);
-        self.raw(" || (");
-        self.raw(&name);
-        self.raw(" = {}));");
-        true
-    }
-
-    fn emit_enum_member(
-        &mut self,
-        object: &str,
-        member: &EnumMember,
-        plan_member: &EnumMemberPlan,
-    ) -> bool {
-        let (Some(key), Some(value)) = (plan_member.name(), plan_member.value()) else {
-            return false;
-        };
-        let initializer = member.initializer.as_deref();
-        if value.constant().is_none() && initializer.is_none() {
-            return false;
-        }
-
-        self.raw(object);
-        self.raw("[");
-        if plan_member.reverse() {
-            self.raw(object);
-            self.raw("[");
-        }
-        self.emit_enum_string(key);
-        self.raw("] = ");
-        if let Some(constant) = value.constant() {
-            self.emit_enum_scalar(constant);
-        } else if let Some(initializer) = initializer {
-            self.emit_expression_prec(initializer, P_ASSIGN);
-        }
-        if plan_member.reverse() {
-            self.raw("] = ");
-            self.emit_enum_string(key);
-        }
-        self.raw(";");
-        true
+        false
     }
 
     fn emit_enum_scalar(&mut self, scalar: &EnumScalar) {
         match scalar {
-            EnumScalar::Number(value) => {
-                let value = value.to_f64();
-                if value.is_nan() {
-                    self.raw("NaN");
-                } else if value == f64::INFINITY {
-                    self.raw("Infinity");
-                } else if value == f64::NEG_INFINITY {
-                    self.raw("-Infinity");
-                } else {
-                    write!(self.out, "{value}").expect("writing to a String cannot fail");
-                }
-            }
+            EnumScalar::Number(value) => self.raw(&enum_number_lexeme(value.to_f64())),
             EnumScalar::String(value) => self.emit_enum_string(value),
         }
     }
 
     fn emit_enum_string(&mut self, value: &bamts_bytecode::EcmaString) {
         self.raw("\"");
-        for &unit in value.as_units() {
-            match unit {
-                0x08 => self.raw("\\b"),
-                0x09 => self.raw("\\t"),
-                0x0A => self.raw("\\n"),
-                0x0C => self.raw("\\f"),
-                0x0D => self.raw("\\r"),
-                0x22 => self.raw("\\\""),
-                0x5C => self.raw("\\\\"),
-                0x20..=0x7E => self
-                    .out
-                    .push(char::from_u32(u32::from(unit)).expect("ASCII unit")),
-                _ => write!(self.out, "\\u{unit:04X}").expect("writing to a String cannot fail"),
-            }
-        }
+        self.raw(&enum_string_lexeme(value));
         self.raw("\"");
     }
 
