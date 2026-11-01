@@ -5,7 +5,7 @@
 use bamts_native::Value;
 
 use super::super::value_number;
-use super::options::Options;
+use super::options::{Options, get_options_object, overflow_option};
 use super::{OrThrow, is_object, range_error, temporal_record, type_error};
 use crate::temporal::TemporalObject;
 use crate::temporal::instant_duration::{Duration, Instant, Overflow};
@@ -188,7 +188,48 @@ pub(super) struct CalendarFields {
     pub(super) time_zone: Option<TimeZoneId>,
 }
 
-impl CalendarFields {}
+impl CalendarFields {
+    pub(super) fn with_time(mut self, time: PlainTime) -> Self {
+        self.hour = Some(f64::from(time.hour));
+        self.minute = Some(f64::from(time.minute));
+        self.second = Some(f64::from(time.second));
+        self.millisecond = Some(f64::from(time.millisecond));
+        self.microsecond = Some(f64::from(time.microsecond));
+        self.nanosecond = Some(f64::from(time.nanosecond));
+        self
+    }
+
+    /// CalendarMergeFields: `month` and `monthCode` replace each other as one
+    /// field, so a new `month` cannot conflict with an inherited `monthCode`.
+    pub(super) fn merged_with(mut self, additional: Self) -> Self {
+        if additional.month.is_some() || additional.month_code.is_some() {
+            self.month = None;
+            self.month_code = None;
+        }
+        macro_rules! merge {
+            ($($field:ident),+) => {
+                $(if additional.$field.is_some() {
+                    self.$field = additional.$field;
+                })+
+            };
+        }
+        merge!(
+            year,
+            month,
+            month_code,
+            day,
+            hour,
+            minute,
+            second,
+            millisecond,
+            microsecond,
+            nanosecond,
+            offset,
+            time_zone
+        );
+        self
+    }
+}
 
 /// ToMonthCode.
 fn to_month_code<H: Host>(
@@ -229,6 +270,20 @@ pub(super) fn prepare_calendar_fields<H: Host>(
     required: FieldNames,
 ) -> Result<CalendarFields, EvalFailure> {
     read_calendar_fields(machine, item, names, required).map(|(fields, _)| fields)
+}
+
+/// PrepareCalendarFields with `partial`: at least one listed field must exist.
+pub(super) fn prepare_partial_fields<H: Host>(
+    machine: &mut Machine<'_, H>,
+    item: Value,
+    names: FieldNames,
+) -> Result<CalendarFields, EvalFailure> {
+    let (fields, any) = read_calendar_fields(machine, item, names, FieldNames::NONE)?;
+    if any {
+        Ok(fields)
+    } else {
+        Err(type_error(machine, "no recognized properties were present"))
+    }
 }
 
 /// The ISO calendar's field list has no `era`. Reads go in sorted property-name
@@ -393,6 +448,81 @@ pub(super) fn date_time_from_fields<H: Host>(
     let date = date_from_fields(machine, fields, overflow)?;
     let time = time_from_fields(machine, fields, overflow)?;
     Ok(PlainDateTime { date, time })
+}
+
+/// IsPartialTemporalObject.
+pub(super) fn require_partial_temporal_object<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<(), EvalFailure> {
+    if !is_object(machine, value)? {
+        return Err(type_error(machine, "argument must be an object"));
+    }
+    if let Some(record) = temporal_record(machine, value)?
+        && !matches!(
+            record,
+            TemporalObject::Instant(_) | TemporalObject::Duration(_)
+        )
+    {
+        return Err(type_error(
+            machine,
+            "argument must not be a Temporal object",
+        ));
+    }
+    for name in ["calendar", "timeZone"] {
+        let property = machine.get_named_property(value, name)?;
+        if property != Value::UNDEFINED {
+            return Err(type_error(
+                machine,
+                format!("argument must not have a {name} property"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reads and validates the options of a `from` whose argument needs no fields,
+/// discarding the value: the read itself is the observable part.
+fn read_overflow<H: Host>(machine: &mut Machine<'_, H>, options: Value) -> Result<(), EvalFailure> {
+    let resolved = get_options_object(machine, options)?;
+    overflow_option(machine, resolved)?;
+    Ok(())
+}
+
+/// ToTemporalTime.
+pub(super) fn to_temporal_time<H: Host>(
+    machine: &mut Machine<'_, H>,
+    item: Value,
+    options: Value,
+) -> Result<PlainTime, EvalFailure> {
+    if is_object(machine, item)? {
+        match temporal_record(machine, item)? {
+            Some(TemporalObject::PlainTime(value)) => {
+                read_overflow(machine, options)?;
+                return Ok(value);
+            }
+            Some(TemporalObject::PlainDateTime { value, .. }) => {
+                read_overflow(machine, options)?;
+                return Ok(value.time);
+            }
+            Some(TemporalObject::ZonedDateTime(zoned)) => {
+                let time = zoned
+                    .to_plain_time(&FixedOffsetTimeZones)
+                    .or_throw(machine)?;
+                read_overflow(machine, options)?;
+                return Ok(time);
+            }
+            _ => {}
+        }
+        let fields = prepare_partial_fields(machine, item, FieldNames::TIME)?;
+        let resolved = get_options_object(machine, options)?;
+        let overflow = overflow_option(machine, resolved)?;
+        return time_from_fields(machine, &fields, overflow);
+    }
+    let text = require_string(machine, item, "time")?;
+    let time = PlainTime::parse(&text).or_throw(machine)?;
+    read_overflow(machine, options)?;
+    Ok(time)
 }
 
 /// How `offset` information in the input applies to a wall-clock time.

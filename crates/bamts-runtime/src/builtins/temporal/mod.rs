@@ -8,6 +8,7 @@ mod duration;
 mod fields;
 mod instant;
 mod options;
+mod plain_time;
 
 use std::collections::BTreeMap;
 
@@ -99,6 +100,7 @@ pub(super) fn install<H: Host>(
     }
     duration::install(heap, builtins, namespace);
     instant::install(heap, builtins, namespace);
+    plain_time::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Temporal"), namespace);
 }
 

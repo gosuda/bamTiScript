@@ -6,7 +6,7 @@ use bamts_native::{Decoded, Value};
 
 use super::{OrThrow, is_object, range_error, type_error};
 use crate::temporal::instant_duration::{
-    RoundingMode, Unit, UnitCategory, validate_rounding_increment,
+    Overflow, RoundingMode, Unit, UnitCategory, validate_rounding_increment,
 };
 use crate::temporal::now_rounding::{FractionalSecondDigits, SecondsStringPrecision};
 use crate::{EvalFailure, Host, Machine};
@@ -60,6 +60,18 @@ fn string_option<H: Host>(
             format!("{text} is not a valid value for {name}"),
         ))
     }
+}
+
+/// GetTemporalOverflowOption.
+pub(super) fn overflow_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<Overflow, EvalFailure> {
+    let value = string_option(machine, options, "overflow", &["constrain", "reject"])?;
+    Ok(value
+        .as_deref()
+        .and_then(Overflow::from_name)
+        .unwrap_or_default())
 }
 
 /// GetRoundingModeOption.
