@@ -9894,13 +9894,15 @@ impl<'a, H: Host> Machine<'a, H> {
                             0
                         }
                     }
+                    // An environment variable is always configurable, so this
+                    // succeeds whether or not the variable was set, as in Node.
                     HeapEntry::ProcessEnv { .. } => {
-                        let PropertyKey::Named(name) = key else {
-                            return Ok(true);
-                        };
-                        return Ok(name
-                            .to_utf8_strict()
-                            .is_ok_and(|name| self.host.delete_env(&name)));
+                        if let PropertyKey::Named(name) = key
+                            && let Ok(name) = name.to_utf8_strict()
+                        {
+                            self.host.delete_env(&name);
+                        }
+                        return Ok(true);
                     }
                     HeapEntry::String(_)
                     | HeapEntry::BigInt(_)
