@@ -332,6 +332,43 @@ fn weak_ref_target_is_kept_alive_for_exactly_one_job() {
 }
 
 #[test]
+fn collections_follow_survivors_without_revisiting_vacant_slots() {
+    let program = blank_program();
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    let mut stress = GcStress::new(&mut machine);
+
+    let early = stress.object();
+    stress.root("early", early);
+    let early_garbage = stress.object();
+    stress.collect();
+    stress.assert_live(early);
+    stress.assert_dead(early_garbage);
+    let vacant_after_first = stress.machine.vacant_count;
+
+    // A slot from before the last sweep stays tracked, and a later one is
+    // picked up, whichever way each one goes.
+    let late = stress.object();
+    stress.root("late", late);
+    let late_garbage = stress.object();
+    stress.collect();
+    stress.assert_live(early);
+    stress.assert_live(late);
+    stress.assert_dead(late_garbage);
+    assert_eq!(stress.machine.vacant_count, vacant_after_first + 1);
+
+    stress.unroot("early");
+    stress.collect();
+    stress.assert_dead(early);
+    stress.assert_live(late);
+    assert_eq!(stress.machine.vacant_count, vacant_after_first + 2);
+
+    // Nothing is reclaimed twice once it has gone.
+    stress.collect();
+    assert_eq!(stress.machine.vacant_count, vacant_after_first + 2);
+}
+
+#[test]
 fn allocation_pressure_requests_collection_and_recomputes_watermarks() {
     let program = blank_program();
     let mut host = TestHost;
