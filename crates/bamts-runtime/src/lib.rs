@@ -1464,10 +1464,14 @@ impl HeapEntry {
                 )
                 .saturating_add(properties.charge_bytes())
                 .saturating_add(1),
-            Self::NativeFunction { callable, .. } => match callable {
+            Self::NativeFunction {
+                callable,
+                properties,
+                ..
+            } => properties.charge_bytes().saturating_add(match callable {
                 NativeCallable::Builtin(_) => 1,
                 NativeCallable::Bound(bound) => bound.arguments.len().saturating_add(1),
-            },
+            }),
             Self::Proxy { .. } => 1,
             Self::ProxyRevoker { properties, .. } => properties.charge_bytes().saturating_add(1),
             Self::Generator { state, .. } => match state {

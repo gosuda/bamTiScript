@@ -869,6 +869,17 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_builtin_function_name_refunds_what_it_was_charged() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = machine.intrinsics.global("parseInt").unwrap();
+        let bound = call_method(&mut machine, target, "bind", &[]).unwrap();
+        assert!(machine.internal_delete(bound, &named("name")).unwrap());
+        assert!(machine.internal_delete(bound, &named("length")).unwrap());
+    }
+
+    #[test]
     fn function_prototype_is_a_function_without_construct() {
         let module = blank_program("<test>");
         let mut host = TestHost;
