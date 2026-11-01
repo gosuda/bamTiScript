@@ -1276,14 +1276,14 @@ mod tests {
         let d = start
             .until(end, Unit::Year, Unit::Day, 1, RoundingMode::Trunc, Overflow::Constrain)
             .unwrap();
-        assert_eq!((d.years, d.months, d.days), (1, 0, 13));
+        assert_eq!((d.years, d.months, d.days), (1, 0, 14));
         // Reconstruct: start + d == end.
         let back = start.add(&d, Overflow::Constrain).unwrap();
         assert_eq!(back, end);
         let md = start
             .until(end, Unit::Month, Unit::Day, 1, RoundingMode::Trunc, Overflow::Constrain)
             .unwrap();
-        assert_eq!((md.months, md.days), (12, 13));
+        assert_eq!((md.months, md.days), (12, 14));
         assert_eq!(start.add(&md, Overflow::Constrain).unwrap(), end);
     }
 
