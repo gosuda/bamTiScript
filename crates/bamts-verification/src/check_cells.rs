@@ -1815,9 +1815,10 @@ fn resolve_stem_baseline(
 pub fn check_types(
     snapshot: &(impl SnapshotAssets + ?Sized),
     case: &CheckedCase,
+    logical_path: &str,
     baseline_path: &str,
 ) -> Result<TypesOutcome> {
-    let emitted = emit_types_baseline(case, &case.entry);
+    let emitted = emit_types_baseline(case, logical_path);
     let bytes = read_verified_snapshot_asset(snapshot, baseline_path)?;
     let expected = String::from_utf8_lossy(&bytes).into_owned();
     let verdict = compare_types(&expected, &emitted);
@@ -1877,16 +1878,17 @@ pub(crate) fn observe_types(
                     artifact: None,
                 };
             };
-            let outcome = match check_types(snapshot, &case, &baseline_path) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    return CompilerCheckObservation {
-                        class: FailureClass::HarnessError,
-                        detail: error.to_string(),
-                        artifact: None,
-                    };
-                }
-            };
+            let outcome =
+                match check_types(snapshot, &case, &index_entry.logical_path, &baseline_path) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return CompilerCheckObservation {
+                            class: FailureClass::HarnessError,
+                            detail: error.to_string(),
+                            artifact: None,
+                        };
+                    }
+                };
             match outcome.verdict {
                 FacetVerdict::Pass => CompilerCheckObservation {
                     class: FailureClass::Pass,
@@ -3642,9 +3644,10 @@ pub fn resolve_symbols_baseline(groups: &BaselineGroups, logical_path: &str) -> 
 pub fn check_symbols(
     snapshot: &(impl SnapshotAssets + ?Sized),
     case: &CheckedCase,
+    logical_path: &str,
     baseline_path: &str,
 ) -> Result<SymbolsOutcome> {
-    let emitted = emit_symbols_baseline(case, &case.entry);
+    let emitted = emit_symbols_baseline(case, logical_path);
     let bytes = read_verified_snapshot_asset(snapshot, baseline_path)?;
     let expected = String::from_utf8_lossy(&bytes).into_owned();
     let verdict = compare_symbols(&expected, &emitted);
@@ -3710,16 +3713,17 @@ pub(crate) fn observe_symbols(
                     artifact: None,
                 };
             };
-            let outcome = match check_symbols(snapshot, &case, &baseline_path) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    return CompilerCheckObservation {
-                        class: FailureClass::HarnessError,
-                        detail: error.to_string(),
-                        artifact: None,
-                    };
-                }
-            };
+            let outcome =
+                match check_symbols(snapshot, &case, &index_entry.logical_path, &baseline_path) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return CompilerCheckObservation {
+                            class: FailureClass::HarnessError,
+                            detail: error.to_string(),
+                            artifact: None,
+                        };
+                    }
+                };
             match outcome.verdict {
                 FacetVerdict::Pass => CompilerCheckObservation {
                     class: FailureClass::Pass,
