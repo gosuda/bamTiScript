@@ -24,8 +24,6 @@ pub(super) fn install<H: Host>(
         ("isSafeInteger", 1, is_safe_integer::<H>),
         ("isFinite", 1, is_finite::<H>),
         ("isNaN", 1, is_nan::<H>),
-        ("parseFloat", 1, parse_float::<H>),
-        ("parseInt", 2, parse_int::<H>),
     ] {
         let f = install_function(heap, builtins, name, length, handler);
         define_static(heap, constructor, name, f)
