@@ -111,6 +111,7 @@ mod options;
 mod plain_date;
 mod plain_date_time;
 mod plain_time;
+mod plain_year_month;
 
 use std::collections::BTreeMap;
 
@@ -205,6 +206,7 @@ pub(super) fn install<H: Host>(
     plain_time::install(heap, builtins, namespace);
     plain_date::install(heap, builtins, namespace);
     plain_date_time::install(heap, builtins, namespace);
+    plain_year_month::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Temporal"), namespace);
 }
 
