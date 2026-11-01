@@ -107,6 +107,7 @@ macro_rules! date_getter_table {
 mod duration;
 mod fields;
 mod instant;
+mod now;
 mod options;
 mod plain_date;
 mod plain_date_time;
@@ -211,6 +212,7 @@ pub(super) fn install<H: Host>(
     plain_year_month::install(heap, builtins, namespace);
     plain_month_day::install(heap, builtins, namespace);
     zoned_date_time::install(heap, builtins, namespace);
+    now::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Temporal"), namespace);
 }
 
