@@ -245,7 +245,7 @@ mod tests {
     use crate::PropertyMap;
     use crate::ThrowOrigin;
     use crate::intrinsics::{BuiltinDef, BuiltinOutcome, BuiltinTable, native_function};
-    use bamts_bytecode::{FunctionId, ModuleId};
+    use bamts_bytecode::{FunctionId, ModuleId, UnaryOp};
 
     fn well_known_symbol_builtin(builtins: &BuiltinTable<TestHost>, name: &str) -> Option<Value> {
         match name {
@@ -315,6 +315,33 @@ mod tests {
                 "expected hint {hint}"
             );
         }
+    }
+
+    fn return_seven(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(Value::int32(7)))
+    }
+
+    #[test]
+    fn unary_plus_coerces_an_object_through_to_primitive() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "return seven",
+            length: 0,
+            handler: return_seven,
+        });
+        let method = native_function(&mut machine.heap, id, "return seven", 0);
+        let object = with_to_primitive(&mut machine, method);
+        assert_eq!(
+            machine.eval_unary(UnaryOp::Plus, object).unwrap(),
+            Value::int32(7)
+        );
     }
 
     #[test]

@@ -12579,7 +12579,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 self.allocate(HeapEntry::String(text))
                     .map_err(EvalFailure::Runtime)
             }
-            UnaryOp::Plus => self.to_number(operand),
+            UnaryOp::Plus => self.coerce_number_observable(operand),
             UnaryOp::Negate => {
                 if let Some(value) = intrinsics::builtins::bigint::unary_minus(self, operand)? {
                     return Ok(value);
