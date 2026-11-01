@@ -836,10 +836,19 @@ fn error_to_string<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_object(this) {
+        return Err(type_error("Error.prototype.toString requires an object"));
+    }
     let name_value = machine.get_named_property(this, "name")?;
-    let name = machine.to_string(name_value)?;
+    let name = match name_value {
+        Value::UNDEFINED => EcmaString::encode("Error"),
+        value => machine.coerce_string_observable(value)?,
+    };
     let message_value = machine.get_named_property(this, "message")?;
-    let message = machine.to_string(message_value)?;
+    let message = match message_value {
+        Value::UNDEFINED => EcmaString::encode(""),
+        value => machine.coerce_string_observable(value)?,
+    };
     let text = if name.is_empty() {
         message
     } else if message.is_empty() {

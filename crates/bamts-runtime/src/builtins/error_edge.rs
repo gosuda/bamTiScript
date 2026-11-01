@@ -649,6 +649,23 @@ mod tests {
     }
 
     #[test]
+    fn error_to_string_defaults_missing_fields_and_requires_an_object() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let error = machine.intrinsics.global("Error").unwrap();
+        let prototype = machine.get_named_property(error, "prototype").unwrap();
+        let to_string = machine.get_named_property(prototype, "toString").unwrap();
+        assert!(matches!(
+            machine.call_value(to_string, Value::UNDEFINED, &[]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        let plain = ordinary_object(&mut machine);
+        let text = machine.call_value(to_string, plain, &[]).unwrap();
+        assert!(machine.string_value(text).unwrap().eq_ascii("Error"));
+    }
+
+    #[test]
     fn cause_distinguishes_absence_from_present_undefined() {
         machine!(machine);
         let absent = call_error(&mut machine, "Error", &[]);
