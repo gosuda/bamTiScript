@@ -132,6 +132,8 @@ status-report receipts="target/evidence-local/merged" out="target/evidence-local
 
 nightly: ci ci-accounting ci-formal
     just sweep typescript-7.0.2 compiler
+    just sweep typescript-6.0.2 compiler
+    just sweep typescript-5.9.3 compiler
     just sweep test262 interpreter
     just sweep test262 jit
     just sweep test262 aot

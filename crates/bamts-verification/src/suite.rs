@@ -2608,7 +2608,7 @@ pub fn materialize_from_extracted(
     })
 }
 
-const COMPILER_CATALOG: &str = "typescript-7.0.2";
+pub(crate) const COMPILER_CATALOG: &str = "typescript-7.0.2";
 
 /// Exact compiler-lane observation of one catalog key through BamTS check cells.
 #[derive(Debug, Clone, PartialEq, Eq)]

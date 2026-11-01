@@ -9,6 +9,7 @@ use bamts_verification::{
     ErrorCode, Result, VerificationError,
     check_cells::{CheckContext, baseline_groups},
     facets::load_diagnostic_code_map,
+    historical::{is_historical, observe_historical_lane},
     lane::{LANE_WORKER_REQUEST, LaneOutcome, LaneRequest, LaneResponse},
     suite::{DEFAULT_SNAPSHOT_REL, load_bound_compiler_snapshot, observe_compiler_lane},
 };
@@ -48,7 +49,7 @@ fn run() -> Result<()> {
         }
     } else {
         match observe_from_workspace(&workspace, &snapshot_root, &request) {
-            Ok(observation) => observation.lane_outcome(),
+            Ok(outcome) => outcome,
             Err(error) => LaneOutcome::BlockingFail {
                 detail: error.to_string(),
             },
@@ -71,13 +72,17 @@ fn observe_from_workspace(
     workspace: &Path,
     snapshot_root: &Path,
     request: &LaneRequest,
-) -> Result<bamts_verification::suite::CompilerLaneObservation> {
+) -> Result<LaneOutcome> {
     let snapshot = load_bound_compiler_snapshot(snapshot_root, request.binding())?;
     let ctx = CheckContext {
         code_map: load_diagnostic_code_map(workspace)?,
         baseline_groups: baseline_groups(&snapshot.index),
     };
-    Ok(observe_compiler_lane(&snapshot, &ctx, request))
+    if is_historical(request.key().catalog()) {
+        observe_historical_lane(workspace, &snapshot, &ctx, request)
+    } else {
+        Ok(observe_compiler_lane(&snapshot, &ctx, request).lane_outcome())
+    }
 }
 
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {

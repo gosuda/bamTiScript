@@ -267,6 +267,19 @@ pub struct LaneRequest {
 }
 
 impl LaneRequest {
+    /// The same request for another key, keeping its run binding and identity.
+    pub fn with_key(&self, key: ObligationKey) -> Result<Self> {
+        Self::new(
+            self.binding.clone(),
+            self.request_id,
+            key,
+            self.observables.clone(),
+            self.argv.clone(),
+            self.working_directory,
+            self.timeout_ms,
+        )
+    }
+
     pub fn new(
         binding: LaneBinding,
         request_id: u64,
@@ -349,6 +362,12 @@ impl LaneRequest {
 pub enum LaneOutcome {
     Completed {
         artifacts: BTreeMap<String, String>,
+    },
+    /// Completed, with the result measured on another cell. Derives the same
+    /// row as [`Self::Completed`], and the row records `source`.
+    Reused {
+        artifacts: BTreeMap<String, String>,
+        source: String,
     },
     BlockingFail {
         detail: String,
@@ -655,6 +674,26 @@ fn parse_response(body: Option<&[u8]>) -> std::result::Result<LaneResponse, Stri
     Ok(response)
 }
 
+fn derive_pass(
+    request: &LaneRequest,
+    artifacts: BTreeMap<String, String>,
+    detail: String,
+) -> (TerminalState, BTreeMap<String, String>, String) {
+    let declared = request.observables();
+    let observed: BTreeSet<String> = artifacts.keys().cloned().collect();
+    if &observed != declared {
+        return (
+            TerminalState::ProtocolError,
+            BTreeMap::new(),
+            format!(
+                "observable set mismatch for `{}`: declared {declared:?}, observed {observed:?}",
+                request.key()
+            ),
+        );
+    }
+    (TerminalState::Pass, artifacts, detail)
+}
+
 fn derive_from_response(
     request: &LaneRequest,
     response: LaneResponse,
@@ -689,20 +728,9 @@ fn derive_from_response(
         );
     }
     match response.outcome {
-        LaneOutcome::Completed { artifacts } => {
-            let declared = request.observables();
-            let observed: BTreeSet<String> = artifacts.keys().cloned().collect();
-            if &observed != declared {
-                return (
-                    TerminalState::ProtocolError,
-                    BTreeMap::new(),
-                    format!(
-                        "observable set mismatch for `{}`: declared {declared:?}, observed {observed:?}",
-                        request.key()
-                    ),
-                );
-            }
-            (TerminalState::Pass, artifacts, String::new())
+        LaneOutcome::Completed { artifacts } => derive_pass(request, artifacts, String::new()),
+        LaneOutcome::Reused { artifacts, source } => {
+            derive_pass(request, artifacts, format!("reused {source}"))
         }
         LaneOutcome::BlockingFail { detail } => {
             (TerminalState::BlockingFail, BTreeMap::new(), detail)
@@ -736,7 +764,12 @@ fn derive_from_response(
 
 fn ignore_pass_attempt(body: Option<&[u8]>, cause: &str) -> String {
     match parse_response(body) {
-        Ok(response) if matches!(response.outcome(), LaneOutcome::Completed { .. }) => {
+        Ok(response)
+            if matches!(
+                response.outcome(),
+                LaneOutcome::Completed { .. } | LaneOutcome::Reused { .. }
+            ) =>
+        {
             format!("{cause}: ignoring completed/PASS attempt from a failed worker")
         }
         _ => cause.to_string(),
@@ -824,6 +857,53 @@ mod tests {
             duration_ms: 3,
             detail: String::new(),
         }
+    }
+
+    fn reused(
+        observation: ProcessObservation,
+        key: &ObligationKey,
+        artifacts: BTreeMap<String, String>,
+    ) -> LaneProcessResult {
+        let outcome = LaneOutcome::Reused {
+            artifacts,
+            source: "a twin cell".to_owned(),
+        };
+        let response =
+            LaneResponse::new(test_binding(), 7, key.clone(), outcome).expect("response");
+        LaneProcessResult {
+            observation,
+            response_body: Some(serde_json::to_vec(&response).expect("encode")),
+            duration_ms: 3,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_reused_result_passes_and_its_row_names_the_source() {
+        let good_key = key(ExecutionMode::Aot, "x86_64-unknown-linux-gnu", "case-0001");
+        let request = request(7, good_key.clone());
+        let exited = ProcessObservation::Exited { code: 0 };
+
+        let row =
+            derive_row(&request, reused(exited.clone(), &good_key, stdout_ok())).expect("derive");
+        assert_eq!(row.state(), TerminalState::Pass);
+        assert_eq!(row.detail(), "reused a twin cell");
+
+        let row = derive_row(&request, reused(exited, &good_key, BTreeMap::new())).expect("derive");
+        assert_eq!(
+            row.state(),
+            TerminalState::ProtocolError,
+            "observables still bind"
+        );
+
+        let late = reused(ProcessObservation::TimedOut, &good_key, stdout_ok());
+        let row = derive_row(&request, late).expect("derive");
+        assert_eq!(
+            row.state(),
+            TerminalState::Timeout,
+            "a late pass is not a pass"
+        );
+        assert!(row.detail().contains("ignoring"), "{}", row.detail());
     }
 
     #[test]
