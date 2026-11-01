@@ -3851,6 +3851,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 },
             );
         }
+        properties.insert(self.intrinsics.builtins.error_brand_key(), error_brand());
         self.allocate(HeapEntry::Object {
             properties,
             prototype: Some(self.intrinsics.error_prototype(id)),
@@ -7718,6 +7719,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 configurable: true,
             },
         );
+        properties.insert(self.intrinsics.builtins.error_brand_key(), error_brand());
         match self.allocate(HeapEntry::Object {
             properties,
             prototype: Some(self.intrinsics.error_prototype(id)),
@@ -13370,6 +13372,16 @@ fn numeric_f64(value: Value) -> Option<f64> {
         Decoded::Number(number) => Some(number),
         Decoded::Int32(raw) => Some(f64::from(raw as i32)),
         _ => None,
+    }
+}
+
+/// What an error object stores under the `[[ErrorData]]` brand key.
+fn error_brand() -> Property {
+    Property::Data {
+        value: Value::TRUE,
+        writable: false,
+        enumerable: false,
+        configurable: false,
     }
 }
 

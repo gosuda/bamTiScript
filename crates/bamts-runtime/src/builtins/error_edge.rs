@@ -33,6 +33,13 @@ pub(super) fn install<H: Host>(
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
+    let brand = crate::intrinsics::push(
+        heap,
+        HeapEntry::PrivateName {
+            description: EcmaString::encode("[[ErrorData]]"),
+        },
+    );
+    builtins.set_error_brand(brand);
     let error_prototype = prototype_of(heap, globals, "Error");
     let stack_getter = install_function(heap, builtins, "get stack", 0, stack_get::<H>);
     let stack_setter = install_function(heap, builtins, "set stack", 1, stack_set::<H>);
@@ -54,6 +61,8 @@ pub(super) fn install<H: Host>(
                 capture_stack_trace::<H>,
             );
             define_static(heap, constructor, "captureStackTrace", capture);
+            let is_error = install_function(heap, builtins, "isError", 1, is_error::<H>);
+            define_static(heap, constructor, "isError", is_error);
         }
         globals.insert(EcmaString::encode(name), constructor);
     }
@@ -127,6 +136,29 @@ fn define_own<H: Host>(
     )
 }
 
+/// `Error.isError`: true only for objects an Error constructor made. The brand
+/// is a private key, so a proxy for an error or an object that merely inherits
+/// from `Error.prototype` does not have it.
+fn is_error<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let value = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let brand = machine.intrinsics.builtins.error_brand_key();
+    let branded = machine
+        .runtime_slot(value)
+        .map_err(EvalFailure::Runtime)?
+        .is_some_and(|index| {
+            matches!(
+                &machine.heap[index],
+                HeapEntry::Object { properties, .. } if properties.contains_key(&brand)
+            )
+        });
+    Ok(BuiltinOutcome::Value(Value::boolean(branded)))
+}
+
 pub(super) fn error_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -161,6 +193,9 @@ pub(super) fn error_constructor<H: Host>(
             })
             .map_err(EvalFailure::Runtime)?
     };
+
+    let brand = machine.intrinsics.builtins.error_brand_key();
+    machine.define_descriptor(object, brand, crate::error_brand())?;
 
     let (message_index, options_index) = match name {
         "AggregateError" => (1, 2),
@@ -429,6 +464,75 @@ fn capture_stack_trace<H: Host>(
     }
     install_stack(machine, target, "Error", None, skip)?;
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
+
+#[cfg(test)]
+mod is_error_tests {
+    use super::super::test_support::{TestHost, blank_program, ordinary_object};
+    use super::*;
+    use crate::{Limits, ThrowOrigin};
+
+    fn is_error_of(machine: &mut Machine<'_, TestHost>, value: Value) -> Value {
+        let error = machine.intrinsics.global("Error").unwrap();
+        let method = machine.get_named_property(error, "isError").unwrap();
+        machine.call_value(method, error, &[value]).unwrap()
+    }
+
+    #[test]
+    fn the_brand_decides_rather_than_the_prototype_chain() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("RangeError").unwrap();
+        let real = machine.construct_value(constructor, &[]).unwrap();
+        assert_eq!(is_error_of(&mut machine, real), Value::TRUE);
+
+        let engine = machine
+            .materialize_engine_origin(ThrowOrigin::TypeError { operation: "test" })
+            .unwrap();
+        assert_eq!(
+            is_error_of(&mut machine, engine),
+            Value::TRUE,
+            "errors the engine throws carry the brand too"
+        );
+
+        let prototype = machine
+            .get_named_property(constructor, "prototype")
+            .unwrap();
+        assert_eq!(is_error_of(&mut machine, prototype), Value::FALSE);
+        let fake = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .unwrap();
+        assert_eq!(
+            is_error_of(&mut machine, fake),
+            Value::FALSE,
+            "inheriting from an error prototype does not make an error"
+        );
+        let handler = ordinary_object(&mut machine);
+        let proxy = super::super::proxy::create(&mut machine, real, handler).unwrap();
+        assert_eq!(is_error_of(&mut machine, proxy), Value::FALSE);
+        assert_eq!(is_error_of(&mut machine, Value::int32(1)), Value::FALSE);
+    }
+
+    #[test]
+    fn the_brand_is_invisible_to_reflection() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Error").unwrap();
+        let error = machine.construct_value(constructor, &[]).unwrap();
+        let keys = machine.internal_own_property_keys(error).unwrap();
+        assert!(
+            !keys
+                .iter()
+                .any(|key| matches!(key, PropertyKey::Private(_)))
+        );
+    }
 }
 
 #[cfg(test)]
