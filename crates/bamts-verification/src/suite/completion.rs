@@ -736,12 +736,12 @@ fn classified_outcome(state: NonPassState, key: &ObligationKey) -> LaneOutcome {
 ///
 /// Abort error (manifest, adapter, digests, writer) leaves no receipt
 /// behind; per-obligation blocking outcomes never abort the loop.
-pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> {
-    let runner = resolve_runner(&request.catalog, &request.runner)?;
-    let platform = if request.platform.is_empty() {
+/// The requested platform, or the host's when none is given.
+fn canonical_platform(requested: &str) -> Result<String> {
+    let platform = if requested.is_empty() {
         bamts_platform::host_triple()
     } else {
-        request.platform.clone()
+        requested.to_owned()
     };
     if platform.trim() != platform || platform.is_empty() {
         return Err(VerificationError::new(
@@ -749,6 +749,23 @@ pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> 
             "suite platform must be a nonempty canonical token",
         ));
     }
+    Ok(platform)
+}
+
+/// A fresh run identity; the compiler lane also binds the verified snapshot.
+fn fresh_lane_binding(root: &Path, runner: SuiteRunner) -> Result<LaneBinding> {
+    let run = LaneBinding::fresh()?;
+    if runner == SuiteRunner::Compiler {
+        let verified = verify_snapshot(&root.join(DEFAULT_SNAPSHOT_REL))?;
+        verified.bind_compiler_lane(run)
+    } else {
+        Ok(run)
+    }
+}
+
+pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> {
+    let runner = resolve_runner(&request.catalog, &request.runner)?;
+    let platform = canonical_platform(&request.platform)?;
     let catalog = load_catalog_manifest(root, &request.catalog)?;
     let obligations =
         materialize_obligations(&request.catalog, &catalog.identifiers, runner, &platform)?;
@@ -764,15 +781,7 @@ pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> 
     let binding = current_run_binding(root, &request.catalog)?;
     let header = EvidenceHeader::new(shard.clone(), binding, request.execution.clone())?;
     let members: Vec<usize> = request.shard.member_indices(keys.len()).collect();
-    let lane_binding = {
-        let run = LaneBinding::fresh()?;
-        if runner == SuiteRunner::Compiler {
-            let verified = verify_snapshot(&root.join(DEFAULT_SNAPSHOT_REL))?;
-            verified.bind_compiler_lane(run)?
-        } else {
-            run
-        }
-    };
+    let lane_binding = fresh_lane_binding(root, runner)?;
 
     let executor = SuiteExecutor {
         adapter,
