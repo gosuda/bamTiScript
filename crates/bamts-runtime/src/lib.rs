@@ -5793,6 +5793,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     };
                     match self.internal_set(object, key, value, object) {
                         Ok(true) => self.frames[frame_index].pc = pc + 1,
+                        Ok(false) if self.is_sloppy(module_id, function_index) => {
+                            self.frames[frame_index].pc = pc + 1;
+                        }
                         Ok(false) => {
                             self.resolve_failure(
                                 EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -5814,7 +5817,10 @@ impl<'a, H: Host> Machine<'a, H> {
                             continue;
                         }
                     };
-                    match self.internal_delete(object, &key) {
+                    let deleted = self.internal_delete(object, &key).and_then(|deleted| {
+                        self.deletion_result(module_id, function_index, deleted)
+                    });
+                    match deleted {
                         Ok(deleted) => {
                             self.write_register(frame_index, dst.get(), Value::boolean(deleted));
                             self.frames[frame_index].pc = pc + 1;
@@ -5987,9 +5993,15 @@ impl<'a, H: Host> Machine<'a, H> {
                     }
                 }
                 Instruction::LoadThis { dst } => {
-                    let value = self.frames[frame_index].this_value;
-                    self.write_register(frame_index, dst.get(), value);
-                    self.frames[frame_index].pc = pc + 1;
+                    let this_value = self.frames[frame_index].this_value;
+                    match self.bind_this(module_id, function_index, this_value) {
+                        Ok(value) => {
+                            self.frames[frame_index].this_value = value;
+                            self.write_register(frame_index, dst.get(), value);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
                 }
                 Instruction::LoadArguments { dst } => {
                     let value = self.materialize_arguments(frame_index, function_index, pc)?;
@@ -6712,6 +6724,48 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         self.missing_global = Some(name);
         Ok(None)
+    }
+
+    /// Whether a function is non-strict ECMAScript code.
+    pub(crate) fn is_sloppy(&self, module: ModuleId, function: usize) -> bool {
+        self.module_code(module).functions()[function]
+            .flags()
+            .is_sloppy
+    }
+
+    /// `OrdinaryCallBindThis` for the running function: a sloppy function sees
+    /// the global object for a missing receiver and a wrapper for a primitive.
+    /// Callers keep the result so a wrapper keeps its identity. Doing this at
+    /// the first read cannot be observed, because `ToObject` runs no user code.
+    pub(crate) fn bind_this(
+        &mut self,
+        module: ModuleId,
+        function: usize,
+        this_value: Value,
+    ) -> Result<Value, EvalFailure> {
+        if !self.is_sloppy(module, function) {
+            return Ok(this_value);
+        }
+        if this_value == Value::UNDEFINED || this_value == Value::NULL {
+            return Ok(self.context_global.unwrap_or(self.global_object));
+        }
+        self.value_to_object(this_value)
+    }
+
+    /// The value of a `delete` the running function performed. Strict code
+    /// must not silently keep a property it asked to remove.
+    pub(crate) fn deletion_result(
+        &self,
+        module: ModuleId,
+        function: usize,
+        deleted: bool,
+    ) -> Result<bool, EvalFailure> {
+        if deleted || self.is_sloppy(module, function) {
+            return Ok(deleted);
+        }
+        Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "delete of an unconfigurable property",
+        }))
     }
 
     pub(crate) fn store_global(
@@ -8956,6 +9010,10 @@ impl<'a, H: Host> Machine<'a, H> {
         value: Value,
         receiver: Value,
     ) -> Result<bool, EvalFailure> {
+        let wrapper = self.value_to_object(object)?;
+        if wrapper != object {
+            return self.resolve_set(wrapper, key, value, receiver);
+        }
         let index = match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => index,
             None => {
@@ -8965,9 +9023,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
         };
         if matches!(self.heap[index], HeapEntry::ModuleNamespace { .. }) {
-            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "assign to module namespace",
-            }));
+            return Ok(false);
         }
         if matches!(self.heap[index], HeapEntry::ProcessEnv { .. }) {
             let PropertyKey::Named(name) = &key else {
@@ -9065,12 +9121,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     )
                     .map(|_| true);
             }
-            let index = self
-                .runtime_slot(receiver)
-                .map_err(EvalFailure::Runtime)?
-                .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "set property on primitive",
-                }))?;
+            let Some(index) = self.object_slot(receiver)? else {
+                return Ok(false);
+            };
             self.set_own_data(index, key, value)?;
             return Ok(true);
         };
@@ -9095,14 +9148,23 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         // Ordinary receiver: the stored-property fast path keeps the exact
         // attributes and handles Array element / TypedArray virtual writes.
-        let index = self
-            .runtime_slot(receiver)
-            .map_err(EvalFailure::Runtime)?
-            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "set property on primitive",
-            }))?;
+        let Some(index) = self.object_slot(receiver)? else {
+            return Ok(false);
+        };
         self.set_own_data(index, key, value)?;
         Ok(true)
+    }
+
+    /// The heap slot of `value` when it is an object. A primitive receiver is
+    /// valid in `[[Set]]`, but it can hold nothing.
+    fn object_slot(&self, value: Value) -> Result<Option<usize>, EvalFailure> {
+        let slot = self.runtime_slot(value).map_err(EvalFailure::Runtime)?;
+        Ok(slot.filter(|index| {
+            !matches!(
+                self.heap[*index],
+                HeapEntry::String(_) | HeapEntry::BigInt(_) | HeapEntry::Symbol { .. }
+            )
+        }))
     }
 
     pub(crate) fn set_super(
@@ -13561,6 +13623,7 @@ mod tests {
                 is_async: false,
                 is_generator: true,
                 is_constructable: false,
+                ..FunctionFlags::default()
             },
             code,
             handlers,
@@ -13582,6 +13645,7 @@ mod tests {
                 is_async: true,
                 is_generator: false,
                 is_constructable: false,
+                ..FunctionFlags::default()
             },
             code,
             handlers,
@@ -13603,6 +13667,7 @@ mod tests {
                 is_async: true,
                 is_generator: true,
                 is_constructable: false,
+                ..FunctionFlags::default()
             },
             code,
             handlers,

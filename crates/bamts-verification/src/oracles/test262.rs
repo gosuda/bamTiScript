@@ -1375,13 +1375,31 @@ function $ERROR(message) {\n\
         sources: &[HarnessSource],
         variant: &ExecutionVariant,
     ) -> Result<(), OracleError> {
+        run_variant_in(
+            ExecutionMode::Interpreter,
+            runner,
+            parsed,
+            plan,
+            sources,
+            variant,
+        )
+    }
+
+    fn run_variant_in(
+        mode: ExecutionMode,
+        runner: &InterpreterRunner,
+        parsed: &ParsedTest,
+        plan: &ExecutionPlan,
+        sources: &[HarnessSource],
+        variant: &ExecutionVariant,
+    ) -> Result<(), OracleError> {
         // These real-engine fixtures check completion/error classification,
         // not host scheduling latency. Deadline policy is tested below with
         // explicit timestamps; retain a finite budget under parallel CI load.
         const SEMANTIC_FIXTURE_DEADLINE: Duration = Duration::from_secs(10);
         let script = compose_script(parsed, plan, variant, sources)?;
         let request = RunRequest {
-            mode: ExecutionMode::Interpreter,
+            mode,
             variant: variant.clone(),
             script,
             negative: plan.negative.clone(),
@@ -1938,6 +1956,10 @@ function $ERROR(message) {\n\
 
     /// Runs every variant of `source` against the small fixture harness.
     fn run_fixture(label: &str, source: &str) -> Result<(), OracleError> {
+        run_fixture_in(ExecutionMode::Interpreter, label, source)
+    }
+
+    fn run_fixture_in(mode: ExecutionMode, label: &str, source: &str) -> Result<(), OracleError> {
         let harness = runner_scratch(&format!("{label}-harness"));
         let scratch = runner_scratch(&format!("{label}-scratch"));
         write_harness(&harness, "assert.js", ASSERT_JS);
@@ -1945,11 +1967,109 @@ function $ERROR(message) {\n\
         let parsed = parse_test(source).unwrap();
         let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
         let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
-        let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
+        let runner = backend_runner(mode, &scratch).unwrap();
         for variant in &plan.variants {
-            run_variant(&runner, &parsed, &plan, &sources, variant)?;
+            run_variant_in(mode, &runner, &parsed, &plan, &sources, variant)?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn strict_and_sloppy_code_differ_the_same_way_in_every_tier() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [(&str, &str); 18] = [
+            (
+                "noStrict",
+                "assert.sameValue((function () { return this; })(), globalThis);",
+            ),
+            (
+                "onlyStrict",
+                "assert.sameValue((function () { return this; })(), undefined);",
+            ),
+            (
+                "noStrict",
+                "assert.sameValue((function () { return this; }).call(null), globalThis);",
+            ),
+            (
+                "noStrict",
+                "assert.sameValue(typeof (function () { return this; }).call(1), 'object');",
+            ),
+            (
+                "noStrict",
+                "var f = function () { return this === this; }; assert.sameValue(f.call(1), true);",
+            ),
+            (
+                "onlyStrict",
+                "assert.sameValue((function () { return this; }).call(1), 1);",
+            ),
+            (
+                "noStrict",
+                "assert.sameValue((function () { return (() => this)(); })(), globalThis);",
+            ),
+            (
+                "noStrict",
+                "function *g() { yield this; } assert.sameValue(g().next().value, globalThis);",
+            ),
+            (
+                "noStrict",
+                "function f() { 'use strict'; return this; } assert.sameValue(f(), undefined);",
+            ),
+            (
+                "noStrict",
+                "class C { m() { return this; } } var m = new C().m; assert.sameValue(m(), undefined);",
+            ),
+            (
+                "noStrict",
+                "var o = Object.freeze({ a: 1 }); o.a = 2; assert.sameValue(o.a, 1);",
+            ),
+            (
+                "onlyStrict",
+                "var o = Object.freeze({ a: 1 }); assert.sameValue(throws(TypeError, function () { o.a = 2; }), true);",
+            ),
+            (
+                "noStrict",
+                "'text'.x = 1; (1).x = 1; assert.sameValue((1).x, undefined);",
+            ),
+            (
+                "onlyStrict",
+                "assert.sameValue(throws(TypeError, function () { 'text'.x = 1; }), true);",
+            ),
+            (
+                "noStrict",
+                "undeclared = 1; assert.sameValue(undeclared, 1);",
+            ),
+            (
+                "onlyStrict",
+                "assert.sameValue(throws(ReferenceError, function () { undeclared = 1; }), true);",
+            ),
+            (
+                "noStrict",
+                "assert.sameValue(delete Object.prototype, false);",
+            ),
+            (
+                "onlyStrict",
+                "assert.sameValue(throws(TypeError, function () { delete Object.prototype; }), true);",
+            ),
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, (flag, body)) in CASES.iter().enumerate() {
+                let source = wrap(
+                    &format!("description: strictness\nflags: [{flag}]"),
+                    &format!("{THROWS}{body}"),
+                );
+                let label = format!("strictness-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} [{flag}] {body}: {error:?}");
+                }
+            }
+        }
     }
 
     #[test]

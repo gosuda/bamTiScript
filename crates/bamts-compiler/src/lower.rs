@@ -370,6 +370,14 @@ fn assemble_with_linkage_strings(
         .collect();
     Ok(Module::new(builder.constants, functions, entry))
 }
+/// Whether code at the top of `file` is strict.
+fn source_is_strict(file: &SourceFile) -> bool {
+    !matches!(
+        file.script_kind(),
+        ScriptKind::JavaScript | ScriptKind::JavaScriptReact
+    ) || crate::early_errors::is_module(file)
+        || crate::early_errors::has_use_strict(file, file.statements())
+}
 fn validate_script_kind(file: &SourceFile, options: LowerOptions) -> Result<(), LowerError> {
     let kind = match file.script_kind() {
         ScriptKind::TypeScript | ScriptKind::TypeScriptReact => return Ok(()),
@@ -786,6 +794,8 @@ struct FunctionContext<'a> {
     parent_constructor_capture: Option<Register>,
     class_elements: Option<Register>,
     arguments_source: ArgumentsSource,
+    /// Whether this code is strict. Everything but a JavaScript script is.
+    strict: bool,
 }
 impl<'a> FunctionContext<'a> {
     fn new_top_level(
@@ -832,6 +842,7 @@ impl<'a> FunctionContext<'a> {
             parent_constructor_capture: None,
             class_elements: None,
             arguments_source: ArgumentsSource::None,
+            strict: source_is_strict(file),
         }
     }
     /// Whether `await`, `await using`, or async disposal awaits are legal here.
@@ -840,12 +851,13 @@ impl<'a> FunctionContext<'a> {
         self.is_async || (self.top_level && self.goal != LoweringGoal::ClassicScript)
     }
     fn into_function(self, name: Option<ConstantId>, flags: FunctionFlags) -> Function {
+        let is_sloppy = !self.strict;
         Function::new(
             name,
             self.capture_count,
             self.parameter_count,
             self.registers,
-            flags,
+            FunctionFlags { is_sloppy, ..flags },
             self.code,
             self.handlers,
         )
@@ -1522,6 +1534,12 @@ impl<'a> FunctionContext<'a> {
             };
         }
         let id = builder.intern(Constant::String(EcmaString::encode(name)), range)?;
+        if self.strict {
+            // Strict code cannot create a global by assigning to it. The value
+            // is already computed here, which is when the specification checks.
+            let dst = self.alloc_register(range)?;
+            self.emit(range, Instruction::LoadGlobal { dst, name: id })?;
+        }
         self.emit(range, Instruction::StoreGlobal { name: id, value })?;
         Ok(())
     }
@@ -6756,7 +6774,7 @@ impl<'a> FunctionContext<'a> {
         let flags = FunctionFlags {
             is_async: arrow.is_async,
             is_generator: false,
-            is_constructable: false,
+            ..FunctionFlags::default()
         };
         let captures =
             self.compute_captures(&arrow.parameters, LoweredBody::Arrow(&arrow.body), true);
@@ -6785,6 +6803,7 @@ impl<'a> FunctionContext<'a> {
             is_async: function.is_async,
             is_generator: function.is_generator,
             is_constructable: !function.is_async && !function.is_generator,
+            ..FunctionFlags::default()
         };
         let closure =
             self.build_function_value_with_flags(builder, range, name, function, flags)?;
@@ -6823,7 +6842,7 @@ impl<'a> FunctionContext<'a> {
         let flags = FunctionFlags {
             is_async: function.is_async,
             is_generator: function.is_generator,
-            is_constructable: false,
+            ..FunctionFlags::default()
         };
         self.build_function_value_with_flags(builder, range, name, function, flags)
     }
@@ -6910,6 +6929,7 @@ impl<'a> FunctionContext<'a> {
             } else {
                 ArgumentsSource::Own
             },
+            strict: self.strict || body.has_use_strict(self.file),
         };
         // Leading capture registers.
         for capture in captures {
@@ -7041,6 +7061,7 @@ impl<'a> FunctionContext<'a> {
             parent_constructor_capture: None,
             class_elements: None,
             arguments_source: ArgumentsSource::Own,
+            strict: self.strict,
         };
         // Leading capture registers, in the same order the materialized
         // captures array pushes them.
@@ -7782,7 +7803,22 @@ impl<'a> FunctionContext<'a> {
             }
         }
     }
+    /// Lowers a class, every part of which is strict code.
     fn lower_class_value(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        class: &ClassDeclaration,
+        declaration_name: Option<&str>,
+        expression_name: Option<(&str, BindingSite)>,
+    ) -> Result<Register, LowerError> {
+        let strict = std::mem::replace(&mut self.strict, true);
+        let value =
+            self.lower_strict_class_value(builder, range, class, declaration_name, expression_name);
+        self.strict = strict;
+        value
+    }
+    fn lower_strict_class_value(
         &mut self,
         builder: &mut ModuleBuilder,
         range: TextRange,
@@ -8524,6 +8560,7 @@ impl<'a> FunctionContext<'a> {
             parent_constructor_capture: None,
             class_elements: None,
             arguments_source: ArgumentsSource::Own,
+            strict: true,
         };
         for capture in captures {
             let register = inner.alloc_register(range)?;
@@ -9274,6 +9311,18 @@ enum LoweredBody<'a> {
     Function(&'a FunctionBody),
     Arrow(&'a FunctionBody),
     Block(&'a BlockNode),
+}
+impl LoweredBody<'_> {
+    /// Whether this body's own directive prologue asks for strict code.
+    fn has_use_strict(self, file: &SourceFile) -> bool {
+        let block = match self {
+            Self::Function(FunctionBody::Block(block))
+            | Self::Arrow(FunctionBody::Block(block))
+            | Self::Block(block) => block,
+            _ => return false,
+        };
+        crate::early_errors::has_use_strict(file, &block.data().statements)
+    }
 }
 #[derive(Clone)]
 struct ScannedBinding {

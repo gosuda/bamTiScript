@@ -3216,6 +3216,45 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         }
     }
 
+    /// The function the innermost activation runs.
+    fn running_function(&self) -> crate::RuntimeFunction {
+        self.activations
+            .borrow()
+            .last()
+            .expect("a helper runs inside an activation")
+            .target
+    }
+
+    fn running_is_sloppy(&self) -> bool {
+        let target = self.running_function();
+        self.machine
+            .borrow()
+            .is_sloppy(target.module, target.function.get() as usize)
+    }
+
+    fn load_this(&self) -> HelperResult {
+        let target = self.running_function();
+        let this_value = self
+            .activations
+            .borrow()
+            .last()
+            .map_or(Value::UNDEFINED, |activation| activation.this_value);
+        let bound = self.machine.borrow_mut().bind_this(
+            target.module,
+            target.function.get() as usize,
+            this_value,
+        );
+        match bound {
+            Ok(value) => {
+                if let Some(activation) = self.activations.borrow_mut().last_mut() {
+                    activation.this_value = value;
+                }
+                HelperResult::normal(value)
+            }
+            Err(failure) => self.fail(failure),
+        }
+    }
+
     fn fail(&self, failure: EvalFailure) -> HelperResult {
         match failure {
             EvalFailure::Throw(origin) => {
@@ -3978,6 +4017,9 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         .internal_set(object, key, value, object);
                     match outcome {
                         Ok(true) => HelperResult::normal(Value::UNDEFINED),
+                        Ok(false) if self.running_is_sloppy() => {
+                            HelperResult::normal(Value::UNDEFINED)
+                        }
                         Ok(false) => {
                             self.pending_throw.set(Some(PendingThrow {
                                 value: Value::UNDEFINED,
@@ -3999,6 +4041,14 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         }
                     };
                     let deleted = self.machine.borrow_mut().internal_delete(object, &key);
+                    let target = self.running_function();
+                    let deleted = deleted.and_then(|deleted| {
+                        self.machine.borrow().deletion_result(
+                            target.module,
+                            target.function.get() as usize,
+                            deleted,
+                        )
+                    });
                     match deleted {
                         Ok(deleted) => HelperResult::normal(Value::boolean(deleted)),
                         Err(failure) => self.fail(failure),
@@ -4331,12 +4381,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     };
                     self.allocated(HeapEntry::String(text))
                 }
-                HelperCall::LoadThis => HelperResult::normal(
-                    self.activations
-                        .borrow()
-                        .last()
-                        .map_or(Value::UNDEFINED, |activation| activation.this_value),
-                ),
+                HelperCall::LoadThis => self.load_this(),
                 HelperCall::LoadArguments => self.load_arguments(),
                 HelperCall::LoadNewTarget => HelperResult::normal(
                     self.activations
@@ -5545,6 +5590,7 @@ mod tests {
                 is_async: true,
                 is_generator: false,
                 is_constructable: false,
+                ..FunctionFlags::default()
             },
             code,
             Vec::new(),
@@ -8764,6 +8810,7 @@ mod tests {
                 is_async: false,
                 is_generator: true,
                 is_constructable: false,
+                ..FunctionFlags::default()
             },
             code,
             Vec::new(),

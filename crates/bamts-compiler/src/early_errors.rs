@@ -43,12 +43,7 @@ const STRICT_RESERVED: [&str; 9] = [
 /// Reports every early error in `file`.
 #[must_use]
 pub fn check(file: &SourceFile) -> Vec<Diagnostic> {
-    let module = file.statements().iter().any(|statement| {
-        matches!(
-            statement.data(),
-            Statement::Import(_) | Statement::Export(_)
-        )
-    });
+    let module = is_module(file);
     let context = Context {
         strict: module || has_use_strict(file, file.statements()),
         module,
@@ -120,7 +115,17 @@ struct Walker<'a> {
     private_scopes: Vec<PrivateScope>,
 }
 
-fn has_use_strict(file: &SourceFile, statements: &[Stmt]) -> bool {
+/// Whether `file` has the module goal, which only its own syntax can tell.
+pub(crate) fn is_module(file: &SourceFile) -> bool {
+    file.statements().iter().any(|statement| {
+        matches!(
+            statement.data(),
+            Statement::Import(_) | Statement::Export(_)
+        )
+    })
+}
+
+pub(crate) fn has_use_strict(file: &SourceFile, statements: &[Stmt]) -> bool {
     directives(statements).any(|token| {
         file.token_text(token)
             .is_some_and(|text| text == "'use strict'" || text == "\"use strict\"")

@@ -1430,13 +1430,16 @@ pub struct FunctionFlags {
     pub is_async: bool,
     pub is_generator: bool,
     pub is_constructable: bool,
+    /// Non-strict ECMAScript code, which only a JavaScript script can contain.
+    pub is_sloppy: bool,
 }
 
 impl FunctionFlags {
     const ASYNC: u8 = 0b001;
     const GENERATOR: u8 = 0b010;
     const CONSTRUCTABLE: u8 = 0b100;
-    const KNOWN: u8 = Self::ASYNC | Self::GENERATOR | Self::CONSTRUCTABLE;
+    const SLOPPY: u8 = 0b1000;
+    const KNOWN: u8 = Self::ASYNC | Self::GENERATOR | Self::CONSTRUCTABLE | Self::SLOPPY;
 
     const fn to_bits(self) -> u8 {
         let mut bits = 0;
@@ -1449,6 +1452,9 @@ impl FunctionFlags {
         if self.is_constructable {
             bits |= Self::CONSTRUCTABLE;
         }
+        if self.is_sloppy {
+            bits |= Self::SLOPPY;
+        }
         bits
     }
 
@@ -1460,6 +1466,7 @@ impl FunctionFlags {
             is_async: bits & Self::ASYNC != 0,
             is_generator: bits & Self::GENERATOR != 0,
             is_constructable: bits & Self::CONSTRUCTABLE != 0,
+            is_sloppy: bits & Self::SLOPPY != 0,
         })
     }
 }
@@ -4151,6 +4158,7 @@ mod tests {
                     is_async: true,
                     is_generator: false,
                     is_constructable: true,
+                    is_sloppy: true,
                 },
                 code,
                 handlers,
@@ -4894,11 +4902,11 @@ mod tests {
         write_u32(0, &mut bad_flags); // capture count
         write_u32(0, &mut bad_flags); // params
         write_u32(1, &mut bad_flags); // registers
-        bad_flags.push(0b1000); // unknown flag bit
+        bad_flags.push(0b1_0000); // unknown flag bit
         assert!(matches!(
             decode(&bad_flags, &DecodeLimits::default()),
             Err(DecodeError {
-                kind: DecodeErrorKind::InvalidFunctionFlags { bits: 0b1000 },
+                kind: DecodeErrorKind::InvalidFunctionFlags { bits: 0b1_0000 },
                 ..
             })
         ));
@@ -6175,7 +6183,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<Register>(), 4);
         assert_eq!(std::mem::size_of::<Pc>(), 4);
         assert_eq!(std::mem::size_of::<NumberBits>(), 8);
-        assert_eq!(std::mem::size_of::<FunctionFlags>(), 3);
+        assert_eq!(std::mem::size_of::<FunctionFlags>(), 4);
     }
 
     #[test]
