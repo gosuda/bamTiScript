@@ -5,6 +5,7 @@
 //! receiver checks, and the shape of the installed objects.
 
 mod collator;
+mod display_names;
 mod list_format;
 mod locale;
 mod number_format;
@@ -125,6 +126,7 @@ pub(super) fn install<H: Host>(
     plural_rules::install(heap, builtins, namespace);
     list_format::install(heap, builtins, namespace);
     relative_time_format::install(heap, builtins, namespace);
+    display_names::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Intl"), namespace);
 }
 
