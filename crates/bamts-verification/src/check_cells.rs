@@ -1124,7 +1124,8 @@ pub fn compile_case_frontend(
             .map_err(|error| CaseCompileError::Load(format!("config: {error}")))?;
         let options = config.options().clone();
         let loader = ProgramLoader::new(&root, config.options())
-            .map_err(|error| CaseCompileError::Load(format!("loader: {error}")))?;
+            .map_err(|error| CaseCompileError::Load(format!("loader: {error}")))?
+            .tolerating_unresolved_imports();
         let program = loader
             .load(Path::new(ENTRY))
             .map_err(|error| CaseCompileError::Load(error.to_string()))?;
