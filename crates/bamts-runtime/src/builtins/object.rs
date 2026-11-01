@@ -83,6 +83,7 @@ pub(super) fn install<H: Host>(
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, builtins.function_prototype(), name, function);
     }
+    install_restricted_function_properties(heap, builtins);
     let has_instance = install_function(
         heap,
         builtins,
@@ -101,6 +102,62 @@ pub(super) fn install<H: Host>(
             configurable: false,
         },
     );
+}
+
+/// `AddRestrictedFunctionProperties` for %Function.prototype%, around a frozen
+/// %ThrowTypeError%.
+fn install_restricted_function_properties<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    builtins: &mut BuiltinTable<H>,
+) {
+    let thrower = install_function(heap, builtins, "", 0, throw_type_error::<H>);
+    builtins.set_throw_type_error(thrower);
+    let HeapEntry::NativeFunction {
+        properties,
+        extensible,
+        ..
+    } = &mut heap[heap_index(thrower)]
+    else {
+        panic!("%ThrowTypeError% must be native");
+    };
+    *extensible = false;
+    for (_, property) in &mut properties.0 {
+        if let Property::Data { configurable, .. } = property {
+            *configurable = false;
+        }
+    }
+    let HeapEntry::NativeFunction { properties, .. } =
+        &mut heap[heap_index(builtins.function_prototype())]
+    else {
+        panic!("%Function.prototype% must be native");
+    };
+    for name in ["caller", "arguments"] {
+        properties.insert(
+            PropertyKey::Named(EcmaString::encode(name)),
+            Property::Accessor {
+                getter: Some(thrower),
+                setter: Some(thrower),
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+}
+
+/// %ThrowTypeError%. A non-strict `function` has no call-stack introspection here,
+/// so it reads `caller` and `arguments` as null instead of throwing.
+fn throw_type_error<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if machine.is_sloppy_ordinary_function(this)? {
+        return Ok(BuiltinOutcome::Value(Value::NULL));
+    }
+    Err(type_error(
+        "caller and arguments are restricted function properties",
+    ))
 }
 
 /// Whether `text` can follow `function` in the `NativeFunction` syntax:
@@ -892,6 +949,41 @@ mod tests {
         let target = ordinary_object(&mut machine);
         call_object(&mut machine, "assign", &[target, text]).unwrap();
         assert!(machine.has_own_property_key(target, &named("1")).unwrap());
+    }
+
+    #[test]
+    fn function_prototype_poisons_caller_and_arguments_for_strict_receivers() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.function_prototype;
+        let thrower = machine.intrinsics.builtins.throw_type_error();
+        for name in ["caller", "arguments"] {
+            assert!(matches!(
+                machine.own_descriptor(prototype, &named(name)).unwrap(),
+                Some(Property::Accessor {
+                    getter: Some(getter),
+                    setter: Some(setter),
+                    enumerable: false,
+                    configurable: true,
+                }) if getter == thrower && setter == thrower
+            ));
+            assert!(machine.get_named_property(prototype, name).is_err());
+        }
+        assert!(matches!(
+            machine.own_descriptor(thrower, &named("length")).unwrap(),
+            Some(Property::Data {
+                configurable: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            machine.heap[heap_index(thrower)],
+            HeapEntry::NativeFunction {
+                extensible: false,
+                ..
+            }
+        ));
     }
 
     #[test]

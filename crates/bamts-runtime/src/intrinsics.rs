@@ -66,6 +66,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     boolean_prototype: Value,
     error_prototypes: Vec<(BuiltinId, Value)>,
     error_brand: Option<Value>,
+    throw_type_error: Option<Value>,
     symbol_iterator: Option<Value>,
     symbol_async_iterator: Option<Value>,
     symbol_to_string_tag: Option<Value>,
@@ -149,6 +150,7 @@ impl<H: Host> BuiltinTable<H> {
             boolean_prototype,
             error_prototypes: Vec::new(),
             error_brand: None,
+            throw_type_error: None,
             symbol_iterator: None,
             symbol_async_iterator: None,
             symbol_to_string_tag: None,
@@ -770,6 +772,15 @@ impl<H: Host> BuiltinTable<H> {
         };
         self.error_prototypes.push((id, prototype));
     }
+    pub(crate) fn set_throw_type_error(&mut self, thrower: Value) {
+        self.throw_type_error = Some(thrower);
+    }
+
+    pub(crate) fn throw_type_error(&self) -> Value {
+        self.throw_type_error
+            .expect("Object builtins install %ThrowTypeError%")
+    }
+
     pub(crate) fn set_error_brand(&mut self, brand: Value) {
         self.error_brand = Some(brand);
     }
@@ -797,6 +808,7 @@ impl<H: Host> BuiltinTable<H> {
             boolean_prototype,
             error_prototypes,
             error_brand,
+            throw_type_error,
             symbol_iterator,
             symbol_async_iterator,
             symbol_to_string_tag,
@@ -878,6 +890,7 @@ impl<H: Host> BuiltinTable<H> {
         }
         for value in [
             *error_brand,
+            *throw_type_error,
             *symbol_iterator,
             *symbol_async_iterator,
             *symbol_to_string_tag,

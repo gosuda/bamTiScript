@@ -3340,9 +3340,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             return HelperResult::normal(existing);
         }
         let prototype = self.machine.borrow().intrinsics.array_prototype;
+        let properties = self
+            .machine
+            .borrow()
+            .arguments_properties(self.running_is_sloppy());
         let allocated = self.machine.borrow_mut().allocate(HeapEntry::Array {
             elements: args,
-            properties: PropertyMap::default(),
+            properties,
             prototype: Some(prototype),
             extensible: true,
             length_writable: true,

@@ -7045,6 +7045,25 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// A strict arguments object poisons `callee`; a sloppy one would name the
+    /// function, which a frame does not hold.
+    pub(crate) fn arguments_properties(&self, sloppy: bool) -> PropertyMap {
+        let mut properties = PropertyMap::default();
+        if !sloppy {
+            let thrower = self.intrinsics.builtins.throw_type_error();
+            properties.insert(
+                PropertyKey::Named(EcmaString::encode("callee")),
+                Property::Accessor {
+                    getter: Some(thrower),
+                    setter: Some(thrower),
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+        properties
+    }
+
     pub(crate) fn materialize_arguments(
         &mut self,
         frame: usize,
@@ -7055,10 +7074,12 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(existing);
         }
         let args = self.frames[frame].args.clone();
+        let properties =
+            self.arguments_properties(self.is_sloppy(self.frames[frame].module, function));
         let value = self
             .allocate(HeapEntry::Array {
                 elements: args,
-                properties: PropertyMap::default(),
+                properties,
                 prototype: Some(self.intrinsics.array_prototype),
                 extensible: true,
                 length_writable: true,
@@ -7213,6 +7234,22 @@ impl<'a, H: Host> Machine<'a, H> {
     /// callees recurse into their target, runtime closures consult the
     /// compiler-emitted `FunctionFlags::is_constructable` bit, and proxies
     /// answer from the snapshot `ProxyCreate` took of their target.
+    /// Whether `value` is a non-strict `function`, the one kind of function that
+    /// the specification lets an implementation give `caller` and `arguments`.
+    pub(crate) fn is_sloppy_ordinary_function(&self, value: Value) -> Result<bool, EvalFailure> {
+        let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
+            return Ok(false);
+        };
+        let HeapEntry::Function {
+            module, function, ..
+        } = &self.heap[index]
+        else {
+            return Ok(false);
+        };
+        let flags = self.module_code(*module).functions()[function.get() as usize].flags();
+        Ok(flags.is_sloppy && flags.is_constructable && !flags.is_async && !flags.is_generator)
+    }
+
     pub(crate) fn is_constructor(&self, value: Value) -> Result<bool, EvalFailure> {
         let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
             return Ok(false);
