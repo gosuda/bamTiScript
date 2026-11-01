@@ -2987,6 +2987,11 @@ impl<'a> FunctionContext<'a> {
             let range = declarator.range();
             let data = declarator.data();
             self.predeclare_captured_pattern(&data.binding, declaration_scope)?;
+            // `var x;` only declares, and hoisting has done that. The name keeps
+            // whatever it holds, which may be a global of the same name.
+            if declaration.kind == VariableKind::Var && data.initializer.is_none() {
+                continue;
+            }
             let value = match &data.initializer {
                 Some(initializer) => self.lower_expression(builder, initializer)?,
                 None => {
