@@ -4,6 +4,7 @@
 //! observe: argument conversion, the order options and properties are read in,
 //! receiver checks, and the shape of the installed objects.
 
+mod case_mapping;
 mod collator;
 mod date_time_format;
 mod display_names;
@@ -17,6 +18,7 @@ mod plural_rules;
 mod relative_time_format;
 mod segmenter;
 
+pub(super) use case_mapping::{TargetCase, transform_case};
 pub(super) use integration::{
     bigint_to_locale_string, date_to_locale_string, duration_to_locale_string,
     number_to_locale_string, temporal_to_locale_string,

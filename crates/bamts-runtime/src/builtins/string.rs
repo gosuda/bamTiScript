@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
+use super::intl::{TargetCase, transform_case};
 use super::{
     allocate_array, allocate_string, define_data, install_constructor_function, install_function,
     range_error, to_integer_or_infinity, type_error, uri_error, value_number,
@@ -48,6 +49,8 @@ pub(super) fn install<H: Host>(
         ("trimEnd", 0, trim_end::<H>),
         ("toUpperCase", 0, to_upper::<H>),
         ("toLowerCase", 0, to_lower::<H>),
+        ("toLocaleUpperCase", 0, to_locale_upper::<H>),
+        ("toLocaleLowerCase", 0, to_locale_lower::<H>),
         ("padStart", 1, pad_start::<H>),
         ("padEnd", 1, pad_end::<H>),
         ("repeat", 1, repeat::<H>),
@@ -696,6 +699,32 @@ fn to_upper<H: Host>(
         machine,
         output.finish(),
     )?))
+}
+fn to_locale_upper<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if matches!(this.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+        return Err(type_error("String method called on null or undefined"));
+    }
+    let source = machine.coerce_string_observable(this)?;
+    let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
+    transform_case(machine, &source, locales, TargetCase::Upper)
+}
+fn to_locale_lower<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if matches!(this.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+        return Err(type_error("String method called on null or undefined"));
+    }
+    let source = machine.coerce_string_observable(this)?;
+    let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
+    transform_case(machine, &source, locales, TargetCase::Lower)
 }
 fn to_lower<H: Host>(
     machine: &mut Machine<'_, H>,
