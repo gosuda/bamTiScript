@@ -932,6 +932,7 @@ const fn descriptor_slot_selector(slot: DescriptorSlot) -> i64 {
         DescriptorSlot::Value => 0,
         DescriptorSlot::Getter => 1,
         DescriptorSlot::Setter => 2,
+        DescriptorSlot::Entire => 4,
     }
 }
 

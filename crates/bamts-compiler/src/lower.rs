@@ -5427,6 +5427,17 @@ impl<'a> FunctionContext<'a> {
                     let name = self.property_name_text(&property.name)?;
                     let value =
                         self.lower_maybe_named(builder, &property.value, name.as_deref())?;
+                    if sets_prototype(property, name.as_deref()) {
+                        self.emit(
+                            member.range(),
+                            Instruction::SetProperty {
+                                object: dst,
+                                key,
+                                value,
+                            },
+                        )?;
+                        continue;
+                    }
                     self.install_property(
                         builder,
                         member.range(),
@@ -5477,7 +5488,15 @@ impl<'a> FunctionContext<'a> {
     ) -> Result<(), LowerError> {
         match modifier {
             PropertyModifier::None => {
-                self.emit(range, Instruction::SetProperty { object, key, value })?;
+                self.emit(
+                    range,
+                    Instruction::DefineOwnDescriptorSlot {
+                        object,
+                        key,
+                        src: value,
+                        slot: DescriptorSlot::Entire,
+                    },
+                )?;
             }
             PropertyModifier::Get => {
                 self.emit(
@@ -10953,6 +10972,14 @@ fn split_regex(lexeme: &str) -> Option<(String, String)> {
     let flags = &lexeme[last_slash + 1..];
     Some((pattern.to_owned(), flags.to_owned()))
 }
+/// Whether a property initializes the literal's prototype instead of naming a
+/// property of it. Only `__proto__: value` does, not a computed or shorthand key.
+fn sets_prototype(property: &crate::syntax::ObjectProperty, name: Option<&str>) -> bool {
+    name == Some("__proto__")
+        && !property.shorthand
+        && !matches!(property.name, PropertyName::Computed(_))
+}
+
 fn number_constant(value: f64) -> Constant {
     if value.fract() == 0.0
         && value.is_finite()

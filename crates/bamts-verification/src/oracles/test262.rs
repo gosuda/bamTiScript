@@ -2227,6 +2227,41 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn an_object_literal_defines_its_own_properties() {
+        const CASES: [&str; 5] = [
+            "Object.defineProperty(Object.prototype, 'x', { set() { throw new Error('set'); }, \
+             configurable: true }); \
+             var o = { x: 1 }; delete Object.prototype.x; \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             assert.sameValue(d.value, 1); assert.sameValue(d.enumerable, true); \
+             assert.sameValue(d.writable, true); assert.sameValue(d.configurable, true);",
+            "Object.defineProperty(Object.prototype, '0', { value: 9, writable: false, \
+             configurable: true }); var o = { 0: true }; delete Object.prototype[0]; \
+             assert.sameValue(o[0], true);",
+            "var o = { get a() { return 1; }, a: 2 }; assert.sameValue(o.a, 2); \
+             assert.sameValue(Object.getOwnPropertyDescriptor(o, 'a').writable, true);",
+            "var p = {}; var o = { __proto__: p }; assert.sameValue(Object.getPrototypeOf(o), p); \
+             assert.sameValue(Object.keys(o).length, 0);",
+            "var p = {}; var o = { ['__proto__']: p }; \
+             assert.sameValue(Object.getPrototypeOf(o), Object.prototype); \
+             assert.sameValue(Object.keys(o)[0], '__proto__');",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: object literal definition", body);
+                let label = format!("object-literal-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn local_time_works_in_the_host() {
         let source = wrap(
             "description: local time",

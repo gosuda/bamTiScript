@@ -628,13 +628,16 @@ impl AccessorKind {
 /// [`Instruction::LoadOwnDescriptorSlot`] /
 /// [`Instruction::DefineOwnDescriptorSlot`] addresses.
 ///
-/// Wire tags are `0` = value, `1` = getter, `2` = setter. These opcodes never
-/// invoke accessors and never walk the prototype chain.
+/// Wire tags are `0` = value, `1` = getter, `2` = setter, `3` = entire. These
+/// opcodes never invoke accessors and never walk the prototype chain.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DescriptorSlot {
     Value,
     Getter,
     Setter,
+    /// The whole property, replaced by a writable, enumerable, configurable
+    /// data property: ECMAScript `CreateDataProperty`. It reads as `undefined`.
+    Entire,
 }
 
 impl DescriptorSlot {
@@ -643,6 +646,7 @@ impl DescriptorSlot {
             Self::Value => 0,
             Self::Getter => 1,
             Self::Setter => 2,
+            Self::Entire => 3,
         }
     }
 
@@ -651,6 +655,7 @@ impl DescriptorSlot {
             0 => Some(Self::Value),
             1 => Some(Self::Getter),
             2 => Some(Self::Setter),
+            3 => Some(Self::Entire),
             _ => None,
         }
     }

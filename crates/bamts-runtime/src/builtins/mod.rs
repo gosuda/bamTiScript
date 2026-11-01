@@ -1850,6 +1850,15 @@ impl<'a, H: Host> Machine<'a, H> {
         slot: DescriptorSlot,
     ) -> Result<(), EvalFailure> {
         let key = self.observable_property_key(key)?;
+        if slot == DescriptorSlot::Entire {
+            let property = Property::Data {
+                value: src,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            };
+            return self.define_descriptor(object, key, property);
+        }
         let half = (src != Value::UNDEFINED).then_some(src);
         let updated = match (self.own_descriptor(object, &key)?, slot) {
             (None, DescriptorSlot::Value) => Property::Data {

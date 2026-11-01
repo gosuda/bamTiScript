@@ -161,6 +161,7 @@ fn descriptor_slot_to_selector(slot: bamts_bytecode::DescriptorSlot) -> u32 {
         DescriptorSlot::Value => 0,
         DescriptorSlot::Getter => 1,
         DescriptorSlot::Setter => 2,
+        DescriptorSlot::Entire => 4,
     }
 }
 
@@ -170,6 +171,7 @@ fn descriptor_slot_from_selector(selector: u32) -> Option<bamts_bytecode::Descri
         0 => Some(DescriptorSlot::Value),
         1 => Some(DescriptorSlot::Getter),
         2 => Some(DescriptorSlot::Setter),
+        4 => Some(DescriptorSlot::Entire),
         _ => None,
     }
 }
