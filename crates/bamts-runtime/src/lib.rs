@@ -5694,7 +5694,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Instruction::GetProperty { dst, object, key } => {
                     let object = self.read_register(frame_index, object.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.observable_property_key(key_value) {
+                    let key = match self.computed_property_key(object, key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5713,7 +5713,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let object = self.read_register(frame_index, object.get());
                     let value = self.read_register(frame_index, value.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.observable_property_key(key_value) {
+                    let key = match self.computed_property_key(object, key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5739,7 +5739,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Instruction::DeleteProperty { dst, object, key } => {
                     let object = self.read_register(frame_index, object.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.observable_property_key(key_value) {
+                    let key = match self.computed_property_key(object, key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -6657,6 +6657,19 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     /// Whether a function is non-strict ECMAScript code.
+    /// `ToPropertyKey` for a computed access. A null or undefined base fails
+    /// before the key converts, so that conversion runs no user code.
+    pub(crate) fn computed_property_key(
+        &mut self,
+        object: Value,
+        key: Value,
+    ) -> Result<PropertyKey, EvalFailure> {
+        if matches!(object.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            return self.to_property_key(key);
+        }
+        self.observable_property_key(key)
+    }
+
     /// The `[[Prototype]]` a new closure starts with, which depends on its kind.
     pub(crate) fn closure_prototype(&self, module: ModuleId, function: FunctionId) -> Value {
         let flags = self.module_code(module).functions()[function.get() as usize].flags();
