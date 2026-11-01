@@ -26,8 +26,6 @@ use super::test262::{
 pub enum Capability {
     /// `$262.createRealm`: the machine exposes no realm factory.
     CreateRealm,
-    /// `$262.detachArrayBuffer`: `ArrayBuffer` is not implemented.
-    DetachArrayBuffer,
     /// `$262.agent.start`: the host exposes no agent scheduler.
     AgentStart,
     /// `$262.agent.broadcast`: requires a started agent.
@@ -44,7 +42,6 @@ impl Capability {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CreateRealm => "$262.createRealm",
-            Self::DetachArrayBuffer => "$262.detachArrayBuffer",
             Self::AgentStart => "$262.agent.start",
             Self::AgentBroadcast => "$262.agent.broadcast",
             Self::AgentGetReport => "$262.agent.getReport",
@@ -844,10 +841,6 @@ mod tests {
     #[test]
     fn unsupported_capabilities_name_their_262_member() {
         assert_eq!(Capability::CreateRealm.as_str(), "$262.createRealm");
-        assert_eq!(
-            Capability::DetachArrayBuffer.as_str(),
-            "$262.detachArrayBuffer"
-        );
         assert_eq!(Capability::AgentSleep.as_str(), "$262.agent.sleep");
     }
 

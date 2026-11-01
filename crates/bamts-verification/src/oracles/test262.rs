@@ -29,6 +29,25 @@ const HARNESS_DONE: &str = "doneprintHandle.js";
 /// What names a file a test may import from its own directory.
 const FIXTURE_MARKER: &str = "_FIXTURE";
 const STRICT_PREFIX: &str = "\"use strict\";\n";
+/// The host's `$262`, for every test that gets a harness. A member exists only
+/// where the engine truly does the work, so a test of a missing facility fails.
+/// `INTERPRETING.md` makes it a writable, configurable, non-enumerable global,
+/// and the methods capture what they use because tests replace builtins.
+const HOST_PRELUDE: &str = "(function (global) {\n\
+    var apply = Reflect.apply;\n\
+    var transfer = ArrayBuffer.prototype.transfer;\n\
+    var evaluate = global.eval;\n\
+    Object.defineProperty(global, '$262', {\n\
+    value: {\n\
+    global: global,\n\
+    detachArrayBuffer: function (buffer) { apply(transfer, buffer, []); return null; },\n\
+    evalScript: function (source) { return evaluate(source); },\n\
+    },\n\
+    writable: true,\n\
+    enumerable: false,\n\
+    configurable: true,\n\
+    });\n\
+    })(globalThis);\n";
 /// Ends a module case. The compiler reads the goal from the tree, as `tsc` does,
 /// so this is what makes a test with no `import` or `export` of its own a module.
 /// It exports no name, so it cannot collide with one the test declares.
@@ -594,6 +613,7 @@ pub fn compose_script(
         .as_ref()
         .is_some_and(|negative| negative.phase.is_early());
     if !early && let HarnessPlan::Canonical { files, .. } = &plan.harness {
+        bytes.extend_from_slice(HOST_PRELUDE.as_bytes());
         for file in files {
             let source = harness_sources
                 .iter()
@@ -2108,6 +2128,34 @@ function $ERROR(message) {\n\
                     &format!("{THROWS}{body}"),
                 );
                 let label = format!("generator-parameters-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_host_object_does_real_work() {
+        const CASES: [&str; 5] = [
+            "var b = new ArrayBuffer(8); assert.sameValue($262.detachArrayBuffer(b), null); \
+             assert.sameValue(b.detached, true); assert.sameValue(b.byteLength, 0);",
+            "var view = new Uint8Array(4); $262.detachArrayBuffer(view.buffer); \
+             assert.sameValue(view.length, 0);",
+            "assert.sameValue($262.global, globalThis);",
+            "assert.sameValue($262.evalScript('1 + 2'), 3);",
+            "var d = Object.getOwnPropertyDescriptor(globalThis, '$262'); \
+             assert.sameValue(d.enumerable, false); assert.sameValue(d.writable, true); \
+             assert.sameValue(d.configurable, true);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: the host object", body);
+                let label = format!("host-object-{mode:?}-{index}");
                 if let Err(error) = run_fixture_in(mode, &label, &source) {
                     panic!("{mode:?} {body}: {error:?}");
                 }
