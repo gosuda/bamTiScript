@@ -880,6 +880,21 @@ mod tests {
     }
 
     #[test]
+    fn enumerable_own_listing_boxes_a_primitive_source() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let text = allocate_string(&mut machine, EcmaString::encode("ab")).unwrap();
+        for name in ["keys", "values", "entries"] {
+            let listed = call_object(&mut machine, name, &[text]).unwrap();
+            assert_eq!(machine.array_length(listed).unwrap(), 2, "{name}");
+        }
+        let target = ordinary_object(&mut machine);
+        call_object(&mut machine, "assign", &[target, text]).unwrap();
+        assert!(machine.has_own_property_key(target, &named("1")).unwrap());
+    }
+
+    #[test]
     fn function_prototype_is_a_function_without_construct() {
         let module = blank_program("<test>");
         let mut host = TestHost;

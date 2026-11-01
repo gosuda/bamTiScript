@@ -4,7 +4,7 @@ use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::property_descriptor::{PropertyDescriptor, from_property_descriptor, same_value};
-use super::{allocate_array, allocate_string, install_function, type_error};
+use super::{allocate_array, allocate_string, install_function, keep_root, type_error, with_roots};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
 
@@ -191,22 +191,33 @@ fn own_descriptor<H: Host>(
     machine.internal_get_own_property(object, key)
 }
 
-fn enumerable_string_keys<H: Host>(
+/// `EnumerableOwnProperties`, reading each key's descriptor immediately before
+/// its value. `item` builds the list entry from the name and that value.
+fn enumerable_own_properties<H: Host>(
     machine: &mut Machine<'_, H>,
-    object: Value,
-) -> Result<Vec<EcmaString>, EvalFailure> {
-    let mut names = Vec::new();
-    for key in machine.internal_own_property_keys(object)? {
-        let PropertyKey::Named(name) = key else {
-            continue;
-        };
-        if own_descriptor(machine, object, &PropertyKey::Named(name.clone()))?
-            .is_some_and(|descriptor| descriptor.enumerable == Some(true))
-        {
-            names.push(name);
+    source: Value,
+    item: impl Fn(&mut Machine<'_, H>, EcmaString, Value) -> Result<Value, EvalFailure>,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    require_object_coercible(source, "Cannot convert undefined or null to object")?;
+    let object = machine.value_to_object(source)?;
+    with_roots(machine, &[object], |machine, depth| {
+        let mut items = Vec::new();
+        for key in machine.internal_own_property_keys(object)? {
+            let PropertyKey::Named(name) = &key else {
+                continue;
+            };
+            if !own_descriptor(machine, object, &key)?
+                .is_some_and(|descriptor| descriptor.enumerable == Some(true))
+            {
+                continue;
+            }
+            let value = machine.get_property_key(object, &key)?;
+            let entry = item(machine, name.clone(), value)?;
+            keep_root(machine, depth, entry);
+            items.push(entry);
         }
-    }
-    Ok(names)
+        allocate_array(machine, items).map(BuiltinOutcome::Value)
+    })
 }
 
 fn assign<H: Host>(
@@ -224,6 +235,7 @@ fn assign<H: Host>(
         if matches!(source.decode(), Some(Decoded::Undefined | Decoded::Null)) {
             continue;
         }
+        let source = machine.value_to_object(source)?;
         for key in machine.internal_own_property_keys(source)? {
             if !machine
                 .internal_get_own_property(source, &key)?
@@ -244,13 +256,23 @@ fn keys<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let source = argument(args, 0);
-    require_object_coercible(source, "Cannot convert undefined or null to object")?;
-    let values = enumerable_string_keys(machine, source)?
-        .into_iter()
-        .map(|name| allocate_string(machine, name))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(BuiltinOutcome::Value(allocate_array(machine, values)?))
+    let object = argument(args, 0);
+    require_object_coercible(object, "Cannot convert undefined or null to object")?;
+    let object = machine.value_to_object(object)?;
+    with_roots(machine, &[object], |machine, depth| {
+        let mut names = Vec::new();
+        for key in machine.internal_own_property_keys(object)? {
+            if let PropertyKey::Named(name) = &key
+                && own_descriptor(machine, object, &key)?
+                    .is_some_and(|descriptor| descriptor.enumerable == Some(true))
+            {
+                let name = allocate_string(machine, name.clone())?;
+                keep_root(machine, depth, name);
+                names.push(name);
+            }
+        }
+        allocate_array(machine, names).map(BuiltinOutcome::Value)
+    })
 }
 
 fn values<H: Host>(
@@ -259,13 +281,7 @@ fn values<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let source = argument(args, 0);
-    require_object_coercible(source, "Cannot convert undefined or null to object")?;
-    let mut output = Vec::new();
-    for name in enumerable_string_keys(machine, source)? {
-        output.push(machine.get_property_key(source, &PropertyKey::Named(name))?);
-    }
-    Ok(BuiltinOutcome::Value(allocate_array(machine, output)?))
+    enumerable_own_properties(machine, argument(args, 0), |_, _, value| Ok(value))
 }
 
 fn entries<H: Host>(
@@ -274,15 +290,10 @@ fn entries<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let source = argument(args, 0);
-    require_object_coercible(source, "Cannot convert undefined or null to object")?;
-    let mut output = Vec::new();
-    for name in enumerable_string_keys(machine, source)? {
-        let value = machine.get_property_key(source, &PropertyKey::Named(name.clone()))?;
+    enumerable_own_properties(machine, argument(args, 0), |machine, name, value| {
         let key = allocate_string(machine, name)?;
-        output.push(allocate_array(machine, vec![key, value])?);
-    }
-    Ok(BuiltinOutcome::Value(allocate_array(machine, output)?))
+        allocate_array(machine, vec![key, value])
+    })
 }
 
 fn get_own_property_descriptor<H: Host>(
