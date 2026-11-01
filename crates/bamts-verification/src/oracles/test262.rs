@@ -10,7 +10,8 @@
 
 use bamts_bytecode::EcmaString;
 use bamts_compiler::diagnostic::Diagnostic;
-use bamts_runtime::{RuntimeErrorKind, ThrowOrigin, run_linked_program};
+use bamts_compiler::lint::{LintLevel, LintOverride, LintProfile, LintTable};
+use bamts_runtime::{CancellationToken, RuntimeErrorKind, ThrowOrigin, run_linked_program};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -982,7 +983,12 @@ impl Test262Runner for InterpreterRunner {
             }
         };
 
-        let executable = match bamts::compile_source_file(&script) {
+        let compiled = bamts::compile_source_file_with_lints(
+            &script,
+            &conformance_lints(),
+            &CancellationToken::new(),
+        );
+        let executable = match compiled {
             Ok(executable) => executable,
             Err(bamts::Error::Diagnostics { diagnostics }) => {
                 return parse_phase_outcome(&diagnostics);
@@ -1102,6 +1108,16 @@ fn synthetic_runtime_error(error: bamts_runtime::NativeError) -> bamts_runtime::
 /// JavaScript parse errors. Any other diagnostic means the oracle pipeline
 /// rejected source that Test262 considers valid, which is an observation
 /// failure and never a Test262 verdict.
+/// The lints a conformance run compiles under. A lint is project policy, so
+/// one must not refuse a program the language allows.
+fn conformance_lints() -> LintTable {
+    let mut lints = LintTable::new(LintProfile::Default);
+    lints
+        .apply_cli([LintOverride::new("no-with", LintLevel::Allow, "test262")])
+        .expect("the default profile forbids no rule");
+    lints
+}
+
 fn parse_phase_outcome(diagnostics: &[Diagnostic]) -> RunOutcome {
     let parse_shaped = diagnostics.iter().any(|diagnostic| {
         let code = diagnostic.code().as_str();
@@ -1972,6 +1988,21 @@ function $ERROR(message) {\n\
             run_variant_in(mode, &runner, &parsed, &plan, &sources, variant)?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn a_lint_cannot_refuse_a_valid_program() {
+        let source = wrap(
+            "description: a with statement is valid in sloppy code\nflags: [noStrict]",
+            "with ({ a: 1 }) { assert.sameValue(a, 1); }",
+        );
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            run_fixture_in(mode, &format!("with-{mode:?}"), &source).unwrap();
+        }
     }
 
     #[test]

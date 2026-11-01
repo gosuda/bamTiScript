@@ -189,6 +189,15 @@ pub fn compile_source_file_with_cancel(
     path: impl AsRef<Path>,
     cancel: &CancellationToken,
 ) -> Result<bamts_compiler::program::ExecutableProgram> {
+    compile_source_file_with_lints(path, &LintTable::new(LintProfile::Default), cancel)
+}
+
+/// Compiles an entrypoint and its complete local module graph under `lints`.
+pub fn compile_source_file_with_lints(
+    path: impl AsRef<Path>,
+    lints: &LintTable,
+    cancel: &CancellationToken,
+) -> Result<bamts_compiler::program::ExecutableProgram> {
     let path = canonical_entrypoint_with_cancel(path.as_ref(), cancel)?;
     let fallback_root = path.parent().map(Path::to_path_buf).ok_or_else(|| {
         Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
@@ -200,7 +209,7 @@ pub fn compile_source_file_with_cancel(
     let frontend = compile_program_frontend_with_cancel(
         &resolved.program,
         FrontendMode::Check,
-        &LintTable::new(LintProfile::Default),
+        lints,
         cancel,
     )?;
     let diagnostics = frontend
