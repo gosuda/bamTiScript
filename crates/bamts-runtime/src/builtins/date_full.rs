@@ -563,7 +563,56 @@ pub(super) fn install<H: Host>(
         "toGMTString",
         utc_string_function.expect("toUTCString is installed"),
     );
+    let to_primitive = install_function(
+        heap,
+        builtins,
+        "[Symbol.toPrimitive]",
+        1,
+        date_to_primitive::<H>,
+    );
+    super::define_symbol_property(
+        heap,
+        prototype,
+        builtins.symbol_to_primitive(),
+        Property::Data {
+            value: to_primitive,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        },
+    );
     globals.insert(EcmaString::encode("Date"), constructor);
+}
+
+/// `Date.prototype[@@toPrimitive]`: unlike every other object, a Date reads
+/// the `default` hint as `string`.
+fn date_to_primitive<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_object(this) {
+        return Err(type_error(
+            "Date.prototype[Symbol.toPrimitive] requires an object receiver",
+        ));
+    }
+    let hint = args
+        .first()
+        .and_then(|value| machine.string_value(*value))
+        .ok_or_else(|| type_error("Invalid Date.prototype[Symbol.toPrimitive] hint"))?;
+    let prefer_string = if hint.eq_ascii("string") || hint.eq_ascii("default") {
+        true
+    } else if hint.eq_ascii("number") {
+        false
+    } else {
+        return Err(type_error(
+            "Invalid Date.prototype[Symbol.toPrimitive] hint",
+        ));
+    };
+    Ok(BuiltinOutcome::Value(
+        machine.ordinary_to_primitive(this, prefer_string)?,
+    ))
 }
 
 fn named(name: &str) -> PropertyKey {
@@ -1306,6 +1355,68 @@ fn parse_local_output(text: &str, zone: &TimeZoneRule) -> Option<f64> {
         return Some(time_clip(zone.utc_time(local)));
     };
     Some(time_clip(local - f64::from(offset) * MS_PER_SECOND))
+}
+
+#[cfg(test)]
+mod to_primitive_tests {
+    use super::super::test_support::{TestHost, blank_program, ordinary_object};
+    use super::*;
+    use crate::{Limits, ThrowOrigin};
+
+    fn hint(machine: &mut Machine<'_, TestHost>, text: &str) -> Value {
+        machine
+            .allocate(HeapEntry::String(EcmaString::encode(text)))
+            .unwrap()
+    }
+
+    #[test]
+    fn to_primitive_reads_each_hint_and_rejects_the_rest() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let date_constructor = machine.intrinsics.global("Date").unwrap();
+        let prototype = machine
+            .get_named_property(date_constructor, "prototype")
+            .unwrap();
+        let key = machine
+            .to_property_key(machine.intrinsics.builtins.symbol_to_primitive())
+            .unwrap();
+        let method = machine.get_property_key(prototype, &key).unwrap();
+
+        let object = ordinary_object(&mut machine);
+        let to_string = hint(&mut machine, "from toString");
+        let to_string_fn = machine
+            .get_named_property(machine.intrinsics.object_prototype, "valueOf")
+            .unwrap();
+        machine
+            .set_data_property(object, "toString", to_string_fn)
+            .unwrap();
+        machine.set_data_property(object, "tag", to_string).unwrap();
+
+        for valid in ["string", "default", "number"] {
+            let argument = hint(&mut machine, valid);
+            assert!(matches!(
+                machine.call_value(method, object, &[argument]),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        }
+        for invalid in [hint(&mut machine, "bogus"), Value::UNDEFINED] {
+            let failure = machine.call_value(method, object, &[invalid]);
+            assert!(matches!(
+                failure,
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Invalid Date.prototype[Symbol.toPrimitive] hint"
+                }))
+            ));
+        }
+        let number_hint = hint(&mut machine, "number");
+        assert!(matches!(
+            machine.call_value(method, Value::int32(1), &[number_hint]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Date.prototype[Symbol.toPrimitive] requires an object receiver"
+            }))
+        ));
+    }
 }
 
 #[cfg(test)]

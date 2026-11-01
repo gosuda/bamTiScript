@@ -12668,11 +12668,7 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn coerce_primitive_default(&mut self, value: Value) -> Result<Value, EvalFailure> {
-        let prefer_string = self
-            .runtime_slot(value)
-            .map_err(EvalFailure::Runtime)?
-            .is_some_and(|index| matches!(self.heap[index], HeapEntry::Date { .. }));
-        self.coerce_primitive_with_hint(value, "default", prefer_string)
+        self.coerce_primitive_with_hint(value, "default", false)
     }
 
     pub(crate) fn coerce_primitive_observable(
@@ -12714,6 +12710,15 @@ impl<'a, H: Host> Machine<'a, H> {
                 operation: "Symbol.toPrimitive returned an object",
             }));
         }
+        self.ordinary_to_primitive(value, prefer_string)
+    }
+
+    /// `OrdinaryToPrimitive`: the two ordinary methods, in hint order.
+    pub(crate) fn ordinary_to_primitive(
+        &mut self,
+        value: Value,
+        prefer_string: bool,
+    ) -> Result<Value, EvalFailure> {
         let methods = if prefer_string {
             ["toString", "valueOf"]
         } else {
