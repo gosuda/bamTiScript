@@ -614,12 +614,8 @@ impl ClassItem {
             Self::NotDigit => !(value <= 0x7f && (value as u8).is_ascii_digit()),
             Self::Word => is_word(value, ignore_case, unicode),
             Self::NotWord => !is_word(value, ignore_case, unicode),
-            Self::Space => {
-                char::from_u32(value).is_some_and(char::is_whitespace) || value == 0xfeff
-            }
-            Self::NotSpace => {
-                !(char::from_u32(value).is_some_and(char::is_whitespace) || value == 0xfeff)
-            }
+            Self::Space => is_space(value),
+            Self::NotSpace => !is_space(value),
         }
     }
 }
@@ -784,6 +780,11 @@ fn is_word(value: u32, ignore_case: bool, unicode: bool) -> bool {
         value
     };
     value <= 0x7f && ((value as u8).is_ascii_alphanumeric() || value == u32::from(b'_'))
+}
+
+/// `WhiteSpace` and `LineTerminator`. Rust's own set adds U+0085 and omits U+FEFF.
+fn is_space(value: u32) -> bool {
+    value != 0x85 && (value == 0xfeff || char::from_u32(value).is_some_and(char::is_whitespace))
 }
 
 fn is_line_terminator(value: u32) -> bool {
@@ -1908,6 +1909,12 @@ mod tests {
                 "{pattern}"
             );
         }
+    }
+
+    #[test]
+    fn whitespace_follows_the_ecmascript_set() {
+        assert_eq!(ranges("\\s", "", "\u{feff}"), [Some(0..1)]);
+        assert!(regex("\\s", "").exec(&text("\u{85}"), 0).unwrap().is_none());
     }
 
     #[test]
