@@ -1106,25 +1106,25 @@ pub(crate) fn native_function_properties(
     length: u32,
 ) -> PropertyMap {
     let name_value = push(heap, HeapEntry::String(EcmaString::encode(name)));
+    function_properties(length, name_value)
+}
+/// `length` then `name`, the order a built-in function creates them in.
+pub(crate) fn function_properties(length: u32, name: Value) -> PropertyMap {
     let mut properties = PropertyMap::default();
-    properties.insert(
-        crate::PropertyKey::Named(EcmaString::encode("length")),
-        crate::Property::Data {
-            value: crate::number_value(f64::from(length)),
-            writable: false,
-            enumerable: false,
-            configurable: true,
-        },
-    );
-    properties.insert(
-        crate::PropertyKey::Named(EcmaString::encode("name")),
-        crate::Property::Data {
-            value: name_value,
-            writable: false,
-            enumerable: false,
-            configurable: true,
-        },
-    );
+    for (key, value) in [
+        ("length", crate::number_value(f64::from(length))),
+        ("name", name),
+    ] {
+        properties.insert(
+            crate::PropertyKey::Named(EcmaString::encode(key)),
+            crate::Property::Data {
+                value,
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
     properties
 }
 pub(crate) fn native_function(

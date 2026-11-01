@@ -3433,13 +3433,16 @@ impl<'a, H: Host> Machine<'a, H> {
         target: Value,
         record: Value,
     ) -> Result<Value, EvalFailure> {
+        let name = self
+            .allocate(HeapEntry::String(EcmaString::encode("")))
+            .map_err(EvalFailure::Runtime)?;
         self.allocate(HeapEntry::native_function(
             NativeCallable::Bound(Box::new(BoundCallable {
                 target,
                 this_value: Value::UNDEFINED,
                 arguments: vec![record],
             })),
-            PropertyMap::default(),
+            intrinsics::function_properties(1, name),
             None,
         ))
         .map_err(EvalFailure::Runtime)
