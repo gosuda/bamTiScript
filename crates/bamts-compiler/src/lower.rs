@@ -6748,6 +6748,10 @@ impl<'a> FunctionContext<'a> {
         property: &AssignmentObjectProperty,
         taken: &mut Vec<Register>,
     ) -> Result<(), LowerError> {
+        if property.rest {
+            let rest = self.rest_object(builder, range, source, taken)?;
+            return self.assign_target(builder, &property.target, rest);
+        }
         let key = self.property_key(builder, &property.name)?;
         taken.push(key);
         let element = self.alloc_register(range)?;

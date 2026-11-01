@@ -3597,6 +3597,11 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_assignment_object_property(&mut self, property: &AssignmentObjectProperty) {
+        if property.rest {
+            self.raw("...");
+            self.emit_assignment_target(&property.target);
+            return;
+        }
         let shorthand = property.initializer.is_none()
             && self.target_matches_name(&property.name, &property.target);
         if shorthand {

@@ -5513,9 +5513,19 @@ impl Parser {
                         name: property.name,
                         target,
                         initializer,
+                        rest: false,
                     });
                 }
-                ObjectMember::Spread(_) | ObjectMember::Method(_) | ObjectMember::Missing(_) => {
+                ObjectMember::Spread(spread) => {
+                    let target = self.expression_to_target(*spread.argument);
+                    properties.push(AssignmentObjectProperty {
+                        name: PropertyName::Missing(MissingNode::new(NodeKind::Identifier)),
+                        target,
+                        initializer: None,
+                        rest: true,
+                    });
+                }
+                ObjectMember::Method(_) | ObjectMember::Missing(_) => {
                     properties.push(AssignmentObjectProperty {
                         name: PropertyName::Missing(MissingNode::new(NodeKind::Identifier)),
                         target: self.node_at(
@@ -5525,6 +5535,7 @@ impl Parser {
                             )),
                         ),
                         initializer: None,
+                        rest: false,
                     });
                 }
             }

@@ -1991,6 +1991,28 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn an_object_pattern_collects_what_is_left() {
+        let source = wrap(
+            "description: object rest in an assignment pattern",
+            "var a, rest, holder = {};\n\
+             ({ a, ...rest } = { a: 1, b: 2, c: 3 });\n\
+             assert.sameValue(a, 1);\n\
+             assert.sameValue(rest.a, undefined);\n\
+             assert.sameValue(rest.b, 2);\n\
+             assert.sameValue(rest.c, 3);\n\
+             ({ ...holder.rest } = { d: 4 });\n\
+             assert.sameValue(holder.rest.d, 4);",
+        );
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            run_fixture_in(mode, &format!("object-rest-{mode:?}"), &source).unwrap();
+        }
+    }
+
+    #[test]
     fn a_lint_cannot_refuse_a_valid_program() {
         let source = wrap(
             "description: a with statement is valid in sloppy code\nflags: [noStrict]",

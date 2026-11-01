@@ -904,6 +904,9 @@ pub struct AssignmentObjectProperty {
     pub name: PropertyName,
     pub target: AssignmentTargetNode,
     pub initializer: Option<Box<Expr>>,
+    /// `...target`, which collects the properties the others left. It has no
+    /// name, and kept here it is visited with the targets around it.
+    pub rest: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

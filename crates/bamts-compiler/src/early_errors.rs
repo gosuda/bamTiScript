@@ -1141,7 +1141,22 @@ impl Walker<'_> {
                 if !patterns_allowed {
                     self.error(target.range(), "this operator cannot assign to a pattern");
                 }
-                for property in &object.properties {
+                let last = object.properties.len().saturating_sub(1);
+                for (position, property) in object.properties.iter().enumerate() {
+                    if property.rest && position != last {
+                        self.error(property.target.range(), "a rest property must come last");
+                    }
+                    if property.rest
+                        && matches!(
+                            property.target.data(),
+                            AssignmentTarget::Object(_) | AssignmentTarget::Array(_)
+                        )
+                    {
+                        self.error(
+                            property.target.range(),
+                            "a rest property cannot be a pattern",
+                        );
+                    }
                     if let PropertyName::Computed(key) = &property.name {
                         self.expression(key, context);
                     }
@@ -1184,7 +1199,11 @@ impl Walker<'_> {
                 }
                 self.expression(expression, context);
             }
-            AssignmentTarget::Missing(_) => {}
+            // A method or accessor folds to this, and reaching the walker means
+            // the parser reported nothing else here.
+            AssignmentTarget::Missing(_) => {
+                self.error(target.range(), "this cannot be assigned to")
+            }
         }
     }
 
@@ -1569,6 +1588,26 @@ mod tests {
             "async function f() { () => 1; }",
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn an_object_pattern_keeps_its_rest_rules() {
+        for source in [
+            "({ ...a, b } = c);",
+            "({ ...{ a } } = b);",
+            "({ ...[a] } = b);",
+            "({ get a() {} } = b);",
+            "[{ m() {} }] = a;",
+        ] {
+            assert!(!errors(source).is_empty(), "{source} must be rejected");
+        }
+        for source in [
+            "({ a, ...b } = c);",
+            "({ ...a.b } = c);",
+            "({ ...a[0] } = c);",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
     }
 
