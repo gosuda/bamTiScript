@@ -87,6 +87,18 @@ fn parsed_calendar<H: Host>(
     parsed.calendar_id().or_throw(machine)
 }
 
+/// The `calendar` constructor argument: a string naming a calendar exactly.
+pub(super) fn calendar_argument<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<CalendarId, EvalFailure> {
+    if value == Value::UNDEFINED {
+        return Ok(CalendarId::iso8601());
+    }
+    let text = require_string(machine, value, "calendar")?;
+    CalendarId::canonicalize(&text).or_throw(machine)
+}
+
 /// ToTemporalCalendarIdentifier.
 pub(super) fn to_calendar_identifier<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -189,6 +201,16 @@ pub(super) struct CalendarFields {
 }
 
 impl CalendarFields {
+    /// ISODateToFields of type `date`.
+    pub(super) fn from_date(date: PlainDate) -> Self {
+        Self {
+            year: Some(f64::from(date.year)),
+            month_code: Some(format!("M{:02}", date.month)),
+            day: Some(f64::from(date.day)),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn with_time(mut self, time: PlainTime) -> Self {
         self.hour = Some(f64::from(time.hour));
         self.minute = Some(f64::from(time.minute));
@@ -487,6 +509,46 @@ fn read_overflow<H: Host>(machine: &mut Machine<'_, H>, options: Value) -> Resul
     let resolved = get_options_object(machine, options)?;
     overflow_option(machine, resolved)?;
     Ok(())
+}
+
+/// ToTemporalDate. `options` is `undefined` when the caller has none.
+pub(super) fn to_temporal_date<H: Host>(
+    machine: &mut Machine<'_, H>,
+    item: Value,
+    options: Value,
+) -> Result<(PlainDate, CalendarId), EvalFailure> {
+    if is_object(machine, item)? {
+        match temporal_record(machine, item)? {
+            Some(TemporalObject::PlainDate { value, calendar }) => {
+                read_overflow(machine, options)?;
+                return Ok((value, calendar));
+            }
+            Some(TemporalObject::ZonedDateTime(zoned)) => {
+                let local = zoned
+                    .to_plain_date_time(&FixedOffsetTimeZones)
+                    .or_throw(machine)?;
+                read_overflow(machine, options)?;
+                return Ok((local.date, zoned.calendar_id().clone()));
+            }
+            Some(TemporalObject::PlainDateTime { value, calendar }) => {
+                read_overflow(machine, options)?;
+                return Ok((value.date, calendar));
+            }
+            _ => {}
+        }
+        let calendar = calendar_with_iso_default(machine, item)?;
+        let fields = prepare_calendar_fields(machine, item, FieldNames::DATE, FieldNames::NONE)?;
+        let resolved = get_options_object(machine, options)?;
+        let overflow = overflow_option(machine, resolved)?;
+        let date = date_from_fields(machine, &fields, overflow)?;
+        return Ok((date, calendar));
+    }
+    let text = require_string(machine, item, "date")?;
+    let parsed = parse_date_time_string(&text, false).or_throw(machine)?;
+    let calendar = parsed_calendar(machine, &parsed)?;
+    read_overflow(machine, options)?;
+    let date = PlainDate::from_parsed(&parsed).or_throw(machine)?;
+    Ok((date, calendar))
 }
 
 /// ToTemporalTime.

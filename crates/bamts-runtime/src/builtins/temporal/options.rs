@@ -8,7 +8,7 @@ use super::{OrThrow, is_object, range_error, type_error};
 use crate::temporal::instant_duration::{
     Overflow, RoundingMode, Unit, UnitCategory, validate_rounding_increment,
 };
-use crate::temporal::now_rounding::{FractionalSecondDigits, SecondsStringPrecision};
+use crate::temporal::now_rounding::{FractionalSecondDigits, SecondsStringPrecision, ShowCalendar};
 use crate::{EvalFailure, Host, Machine};
 
 /// A resolved options argument. `None` stands for the empty null-prototype
@@ -72,6 +72,25 @@ pub(super) fn overflow_option<H: Host>(
         .as_deref()
         .and_then(Overflow::from_name)
         .unwrap_or_default())
+}
+
+/// GetTemporalShowCalendarNameOption.
+pub(super) fn show_calendar_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<ShowCalendar, EvalFailure> {
+    let value = string_option(
+        machine,
+        options,
+        "calendarName",
+        &["auto", "always", "never", "critical"],
+    )?;
+    Ok(match value.as_deref() {
+        Some("always") => ShowCalendar::Always,
+        Some("never") => ShowCalendar::Never,
+        Some("critical") => ShowCalendar::Critical,
+        _ => ShowCalendar::Auto,
+    })
 }
 
 /// GetRoundingModeOption.
@@ -274,6 +293,7 @@ impl UnitArgument {
 
 /// The units an option may name: one category, or both.
 pub(super) type UnitGroup = Option<UnitCategory>;
+pub(super) const DATE_UNITS: UnitGroup = Some(UnitCategory::Date);
 pub(super) const TIME_UNITS: UnitGroup = Some(UnitCategory::Time);
 pub(super) const ALL_UNITS: UnitGroup = None;
 

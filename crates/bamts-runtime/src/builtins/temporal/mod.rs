@@ -4,10 +4,111 @@
 //! can observe: argument conversion, the order options and properties are read
 //! in, receiver checks, and the shape of the installed objects.
 
+/// Defines the calendar accessors shared by the classes that hold a date.
+/// `$this` reads the receiver's date and calendar, and is the brand check.
+macro_rules! date_accessors {
+    ($this:ident) => {
+        fn calendar_id<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            let (_, calendar) = $this(machine, this)?;
+            string_outcome(machine, calendar.as_str())
+        }
+
+        /// The ISO calendar has no eras.
+        fn no_era<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            $this(machine, this)?;
+            Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+        }
+
+        fn month_code<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            let (date, _) = $this(machine, this)?;
+            string_outcome(machine, &format!("M{:02}", date.month))
+        }
+
+        fn in_leap_year<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            let (date, _) = $this(machine, this)?;
+            Ok(BuiltinOutcome::Value(Value::boolean(date.in_leap_year())))
+        }
+
+        date_number_accessors! {
+            $this,
+            year: |date| f64::from(date.year),
+            month: |date| f64::from(date.month),
+            day: |date| f64::from(date.day),
+            day_of_week: |date| f64::from(date.day_of_week()),
+            day_of_year: |date| f64::from(date.day_of_year()),
+            week_of_year: |date| f64::from(date.week_of_year().1),
+            year_of_week: |date| f64::from(date.week_of_year().0),
+            days_in_week: |_date| 7.0,
+            days_in_month: |date| f64::from(date.days_in_month()),
+            days_in_year: |date| f64::from(date.days_in_year()),
+            months_in_year: |date| f64::from(date.months_in_year()),
+        }
+    };
+}
+
+macro_rules! date_number_accessors {
+    ($this:ident, $($name:ident: |$date:ident| $value:expr),+ $(,)?) => {
+        $(fn $name<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            let ($date, _) = $this(machine, this)?;
+            number_outcome($value)
+        })+
+    };
+}
+
+/// The accessor table `date_accessors!` defines the functions for.
+macro_rules! date_getter_table {
+    ($H:ident) => {
+        [
+            ("calendarId", "get calendarId", calendar_id::<$H>),
+            ("era", "get era", no_era::<$H>),
+            ("eraYear", "get eraYear", no_era::<$H>),
+            ("year", "get year", year::<$H>),
+            ("month", "get month", month::<$H>),
+            ("monthCode", "get monthCode", month_code::<$H>),
+            ("day", "get day", day::<$H>),
+            ("dayOfWeek", "get dayOfWeek", day_of_week::<$H>),
+            ("dayOfYear", "get dayOfYear", day_of_year::<$H>),
+            ("weekOfYear", "get weekOfYear", week_of_year::<$H>),
+            ("yearOfWeek", "get yearOfWeek", year_of_week::<$H>),
+            ("daysInWeek", "get daysInWeek", days_in_week::<$H>),
+            ("daysInMonth", "get daysInMonth", days_in_month::<$H>),
+            ("daysInYear", "get daysInYear", days_in_year::<$H>),
+            ("monthsInYear", "get monthsInYear", months_in_year::<$H>),
+            ("inLeapYear", "get inLeapYear", in_leap_year::<$H>),
+        ]
+    };
+}
+
 mod duration;
 mod fields;
 mod instant;
 mod options;
+mod plain_date;
 mod plain_time;
 
 use std::collections::BTreeMap;
@@ -101,6 +202,7 @@ pub(super) fn install<H: Host>(
     duration::install(heap, builtins, namespace);
     instant::install(heap, builtins, namespace);
     plain_time::install(heap, builtins, namespace);
+    plain_date::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Temporal"), namespace);
 }
 
