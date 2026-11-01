@@ -1358,7 +1358,12 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Timeout { properties, .. }
             | HeapEntry::ArrayBuffer { properties, .. }
             | HeapEntry::SharedArrayBuffer { properties, .. }
-            | HeapEntry::DataView { properties, .. } => properties,
+            | HeapEntry::DataView { properties, .. }
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::AsyncFromSync { properties, .. }
+            | HeapEntry::ProxyRevoker { properties, .. } => properties,
             _ => return Ok(None),
         };
         Ok(properties.get(key).cloned())
