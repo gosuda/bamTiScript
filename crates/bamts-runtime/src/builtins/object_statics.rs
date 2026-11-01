@@ -307,6 +307,7 @@ fn get_own_property_descriptor<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let source = argument(args, 0);
     require_object_coercible(source, "Cannot convert undefined or null to object")?;
+    let source = machine.value_to_object(source)?;
     let key = machine.observable_property_key(argument(args, 1))?;
     let descriptor = own_descriptor(machine, source, &key)?;
     Ok(BuiltinOutcome::Value(from_property_descriptor(
@@ -322,6 +323,7 @@ fn get_own_property_descriptors<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let source = argument(args, 0);
     require_object_coercible(source, "Cannot convert undefined or null to object")?;
+    let source = machine.value_to_object(source)?;
     let keys = machine.internal_own_property_keys(source)?;
     let result = ordinary_object(machine, Some(machine.intrinsics.object_prototype))?;
     for key in keys {
