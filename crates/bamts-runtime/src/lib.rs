@@ -13420,16 +13420,7 @@ fn parse_number(text: &EcmaString) -> f64 {
     let Ok(text) = text.to_utf8_strict() else {
         return f64::NAN;
     };
-    parse_number_utf8(&text)
-}
-
-fn parse_number_utf8(text: &str) -> f64 {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        0.0
-    } else {
-        trimmed.parse::<f64>().unwrap_or(f64::NAN)
-    }
+    intrinsics::builtins::string_to_number(&text)
 }
 
 fn to_uint32(number: f64) -> u32 {

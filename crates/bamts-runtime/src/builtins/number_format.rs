@@ -616,6 +616,50 @@ pub fn parse_int(text: &str, mut radix: i32) -> f64 {
     if negative { -magnitude } else { magnitude }
 }
 
+/// `StringToNumber`. Only a decimal literal takes a sign, and this grammar has no
+/// numeric separators.
+#[must_use]
+pub(crate) fn string_to_number(text: &str) -> f64 {
+    let trimmed = text.trim_matches(is_js_whitespace);
+    if trimmed.is_empty() {
+        return 0.0;
+    }
+    for (prefixes, radix) in [(["0x", "0X"], 16), (["0o", "0O"], 8), (["0b", "0B"], 2)] {
+        let Some(digits) = prefixes
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix))
+        else {
+            continue;
+        };
+        let valid = !digits.is_empty()
+            && digits
+                .chars()
+                .all(|digit| digit_value(digit).is_some_and(|value| value < radix as u32));
+        return if valid {
+            parse_int(digits, radix)
+        } else {
+            f64::NAN
+        };
+    }
+    let unsigned = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+    if unsigned == "Infinity" {
+        return if trimmed.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    // Rust's own grammar also takes `inf`, `infinity` and `nan` in any case.
+    if unsigned
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b'e' | b'E' | b'+' | b'-'))
+    {
+        trimmed.parse().unwrap_or(f64::NAN)
+    } else {
+        f64::NAN
+    }
+}
+
 fn decimal_prefix_len(text: &str) -> usize {
     if text.starts_with("Infinity") {
         return "Infinity".len();
@@ -834,6 +878,35 @@ mod tests {
         assert!(to_fixed(1.0, 100.0).is_ok());
         for invalid in [1.0, 37.0, f64::NAN, f64::INFINITY] {
             assert_eq!(to_string_radix(1.0, invalid), Err(NumberFormatError::Radix));
+        }
+    }
+
+    #[test]
+    fn string_to_number_follows_the_string_numeric_literal_grammar() {
+        for (text, expected) in [
+            ("", 0.0),
+            ("\u{feff} \u{2029}12\t", 12.0),
+            ("0x10", 16.0),
+            ("0XfF", 255.0),
+            ("0o17", 15.0),
+            ("0b101", 5.0),
+            ("1e3", 1000.0),
+            (".5", 0.5),
+            ("5.", 5.0),
+            ("Infinity", f64::INFINITY),
+            ("+Infinity", f64::INFINITY),
+            ("-Infinity", f64::NEG_INFINITY),
+            // Rounding after each digit loses the low bits and gives 2^57.
+            ("0x200000000000011", 144_115_188_075_855_904.0),
+        ] {
+            assert_eq!(string_to_number(text), expected, "{text:?}");
+        }
+        assert!(string_to_number("-0").is_sign_negative());
+        for text in [
+            "-0x10", "+0b1", "0x", "0xg", "0b2", "0o8", "1_000", "infinity", "inf", "nan", "NaN",
+            "INFINITY", "e5", ".", "+", "\u{85}1",
+        ] {
+            assert!(string_to_number(text).is_nan(), "{text:?}");
         }
     }
 

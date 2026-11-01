@@ -32,6 +32,7 @@ mod error_edge;
 mod map_set_edge;
 mod math_edge;
 mod number_format;
+pub(crate) use number_format::string_to_number;
 mod regexp_protocol;
 pub(crate) mod regexp_v;
 mod set_methods;
