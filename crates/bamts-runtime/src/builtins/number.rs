@@ -93,7 +93,8 @@ fn constructor<H: Host>(
         Value::int32(0)
     };
     if constructing {
-        Ok(BuiltinOutcome::Value(machine.box_primitive(value)?))
+        let prototype = machine.intrinsics.number_prototype;
+        super::wrap_for_new_target(machine, value, prototype)
     } else {
         Ok(BuiltinOutcome::Value(value))
     }

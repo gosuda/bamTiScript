@@ -724,17 +724,7 @@ fn constructor<H: Host>(
         components_to_time(&values, &timezone(machine)?, true)
     };
     let default_prototype = machine.intrinsics.builtins.date_prototype();
-    let new_target = machine.current_new_target();
-    let prototype = if new_target == Value::UNDEFINED {
-        default_prototype
-    } else {
-        let prototype = machine.get_named_property(new_target, "prototype")?;
-        if machine.is_object(prototype) {
-            prototype
-        } else {
-            default_prototype
-        }
-    };
+    let prototype = super::prototype_from_new_target(machine, default_prototype)?;
     let object = machine
         .allocate(HeapEntry::Date {
             time: milliseconds,

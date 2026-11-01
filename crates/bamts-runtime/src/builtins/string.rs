@@ -89,12 +89,15 @@ fn constructor<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let text = if args.is_empty() {
         EcmaString::default()
+    } else if constructing {
+        machine.coerce_string_observable(args[0])?
     } else {
         machine.string_constructor_text(args[0])?
     };
     let value = allocate_string(machine, text)?;
     if constructing {
-        Ok(BuiltinOutcome::Value(machine.box_primitive(value)?))
+        let prototype = machine.intrinsics.string_prototype;
+        super::wrap_for_new_target(machine, value, prototype)
     } else {
         Ok(BuiltinOutcome::Value(value))
     }

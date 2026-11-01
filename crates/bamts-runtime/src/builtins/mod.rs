@@ -304,6 +304,40 @@ fn to_uint8_from_f64(number: f64) -> u8 {
     }
 }
 
+/// `GetPrototypeFromConstructor` for the running built-in constructor.
+fn prototype_from_new_target<H: Host>(
+    machine: &mut Machine<'_, H>,
+    default_prototype: Value,
+) -> Result<Value, EvalFailure> {
+    let new_target = machine.current_new_target();
+    if new_target == Value::UNDEFINED {
+        return Ok(default_prototype);
+    }
+    let prototype = machine.get_named_property(new_target, "prototype")?;
+    Ok(if machine.is_object(prototype) {
+        prototype
+    } else {
+        default_prototype
+    })
+}
+/// The wrapper object a primitive-wrapping constructor returns.
+fn wrap_for_new_target<H: Host>(
+    machine: &mut Machine<'_, H>,
+    primitive: Value,
+    default_prototype: Value,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let prototype = with_roots(machine, &[primitive], |machine, _| {
+        prototype_from_new_target(machine, default_prototype)
+    })?;
+    let wrapper = machine.box_primitive(primitive)?;
+    if let HeapEntry::Object {
+        prototype: slot, ..
+    } = &mut machine.heap[heap_index(wrapper)]
+    {
+        *slot = Some(prototype);
+    }
+    Ok(BuiltinOutcome::Value(wrapper))
+}
 fn to_integer_or_infinity<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
@@ -363,7 +397,8 @@ fn boolean_constructor<H: Host>(
     let value =
         Value::boolean(machine.to_boolean(args.first().copied().unwrap_or(Value::UNDEFINED)));
     if constructing {
-        return machine.box_primitive(value).map(BuiltinOutcome::Value);
+        let prototype = machine.intrinsics.boolean_prototype;
+        return wrap_for_new_target(machine, value, prototype);
     }
     Ok(BuiltinOutcome::Value(value))
 }
