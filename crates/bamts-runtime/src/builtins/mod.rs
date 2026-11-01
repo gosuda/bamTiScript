@@ -417,6 +417,22 @@ unary_math!(math_ceil, f64::ceil);
 unary_math!(math_trunc, f64::trunc);
 unary_math!(math_sqrt, f64::sqrt);
 unary_math!(math_log2, f64::log2);
+/// The integer nearest `x`, ties toward positive infinity. Comparing the
+/// distance from the floor avoids `x + 0.5`, which itself rounds: the largest
+/// double below 0.5 would come back as 1. A negative `x` that rounds to zero
+/// gives negative zero.
+fn round_half_up(x: f64) -> f64 {
+    if x.fract() == 0.0 || !x.is_finite() {
+        return x;
+    }
+    let floor = x.floor();
+    let rounded = if x - floor >= 0.5 { floor + 1.0 } else { floor };
+    if rounded == 0.0 && x < 0.0 {
+        -0.0
+    } else {
+        rounded
+    }
+}
 fn math_round<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
@@ -424,12 +440,7 @@ fn math_round<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let x = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
-    let rounded = if (-0.5..0.0).contains(&x) {
-        -0.0
-    } else {
-        (x + 0.5).floor()
-    };
-    Ok(BuiltinOutcome::Value(crate::number_value(rounded)))
+    Ok(BuiltinOutcome::Value(crate::number_value(round_half_up(x))))
 }
 fn math_sign<H: Host>(
     machine: &mut Machine<'_, H>,

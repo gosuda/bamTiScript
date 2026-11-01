@@ -13391,10 +13391,12 @@ fn numeric_f64(value: Value) -> Option<f64> {
 }
 
 fn number_value(number: f64) -> Value {
+    // An int32 has no negative zero, so that one integral value stays a double.
     if number.is_finite()
         && number.fract() == 0.0
         && number >= f64::from(i32::MIN)
         && number <= f64::from(i32::MAX)
+        && !(number == 0.0 && number.is_sign_negative())
     {
         Value::int32(number as i32 as u32)
     } else {

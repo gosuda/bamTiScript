@@ -2295,6 +2295,38 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn negative_zero_survives_in_every_tier() {
+        const CASES: [&str; 12] = [
+            "assert.sameValue(1 / Math.round(-0), -Infinity);",
+            "assert.sameValue(Math.round(0.49999999999999994), 0);",
+            "assert.sameValue(Math.round(-0.5) === 0, true); assert.sameValue(Math.round(2.5), 3); \
+             assert.sameValue(Math.round(-2.5), -2); assert.sameValue(Math.round(4503599627370495.5), 4503599627370496);",
+            "assert.sameValue(1 / -0, -Infinity);",
+            "assert.sameValue(Object.is(-0, 0), false);",
+            "var z = 0; assert.sameValue(1 / -z, -Infinity);",
+            "var z = 0; assert.sameValue(1 / (z * -1), -Infinity);",
+            "var a = -1; var b = 0; assert.sameValue(1 / (a * b), -Infinity);",
+            "assert.sameValue(1 / Math.round(-0.4), -Infinity);",
+            "assert.sameValue(Object.is(Number('-0'), -0), true);",
+            "assert.sameValue(String(-0), '0'); assert.sameValue(-0 === 0, true);",
+            "var o = {}; o[-0] = 1; assert.sameValue(o['0'], 1);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: negative zero", body);
+                let label = format!("negative-zero-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn indirect_eval_runs_in_the_global_scope() {
         const THROWS: &str = "function throws(kind, body) {\n\
             try { body(); } catch (error) { return error instanceof kind; }\n\
