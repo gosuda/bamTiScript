@@ -29,8 +29,11 @@ use bamts_verification::{
     rebuild::{RebuildMode, discover_receipts, rebuild_ledger},
     shard::ShardSpec,
     source_fetch::{CommandBackend, materialize_named},
-    suite::completion::{SuiteMergeRequest, SuiteRunRequest, merge_suite, run_suite},
-    sweep_report::{DiffRequest, FamiliesRequest, diff as diff_receipts, families},
+    suite::completion::{
+        SuiteMergeRequest, SuiteRecountRequest, SuiteRunRequest, merge_suite, recount_suite,
+        run_suite,
+    },
+    sweep_report::{DiffRequest, FamiliesRequest, diff as diff_receipts, families, render_recount},
     toolchain_schema::{
         blocking_obligations, catalog_identifiers, emit_probe_object, load_target_cells,
     },
@@ -110,6 +113,11 @@ enum Command {
     SuiteMerge(SuiteMergeRequest),
     SuiteFamilies(FamiliesRequest),
     SuiteDiff(DiffRequest),
+    SuiteRecount {
+        request: SuiteRecountRequest,
+        limit: usize,
+        fail_on_regression: bool,
+    },
 }
 
 fn main() {
@@ -176,15 +184,30 @@ fn dispatch(root: &Path, command: Command) -> Result<()> {
         Command::SuiteDiff(request) => {
             let (report, regressions) = diff_receipts(&request)?;
             print_report(&report)?;
-            if request.fail_on_regression && regressions > 0 {
-                return Err(VerificationError::new(
-                    ErrorCode::Transition,
-                    format!("{regressions} row(s) regressed from PASS"),
-                ));
-            }
-            Ok(())
+            fail_on_regressions(request.fail_on_regression, regressions)
+        }
+        Command::SuiteRecount {
+            request,
+            limit,
+            fail_on_regression,
+        } => {
+            let recount = recount_suite(root, &request)?;
+            let (report, regressions) =
+                render_recount(&request.family, &recount.before, &recount.after, limit);
+            print_report(&report)?;
+            fail_on_regressions(fail_on_regression, regressions)
         }
     }
+}
+
+fn fail_on_regressions(enabled: bool, regressions: usize) -> Result<()> {
+    if enabled && regressions > 0 {
+        return Err(VerificationError::new(
+            ErrorCode::Transition,
+            format!("{regressions} row(s) regressed from PASS"),
+        ));
+    }
+    Ok(())
 }
 
 fn print_report(report: &str) -> Result<()> {
@@ -318,6 +341,27 @@ fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result
                 limit: count_flag(&flags.values, "--limit", 20)?,
                 fail_on_regression: flags.switches.contains("--fail-on-regression"),
             }))
+        }
+        "recount" => {
+            let flags = parse_flags(
+                arguments,
+                &["--catalog", "--runner", "--baseline", "--family", "--limit"],
+                &["--fail-on-regression"],
+            )?;
+            Ok(Command::SuiteRecount {
+                request: SuiteRecountRequest {
+                    catalog: required_flag(&flags.values, "--catalog", "suite recount")?,
+                    runner: required_flag(&flags.values, "--runner", "suite recount")?,
+                    baseline: PathBuf::from(required_flag(
+                        &flags.values,
+                        "--baseline",
+                        "suite recount",
+                    )?),
+                    family: required_flag(&flags.values, "--family", "suite recount")?,
+                },
+                limit: count_flag(&flags.values, "--limit", 20)?,
+                fail_on_regression: flags.switches.contains("--fail-on-regression"),
+            })
         }
         _ if subcommand.starts_with("--") => Err(usage(format!("unknown flag `{subcommand}`"))),
         _ => Err(usage(format!("unknown suite subcommand `{subcommand}`"))),
@@ -1481,6 +1525,55 @@ mod tests {
         };
         assert_eq!(defaults.limit, 20);
         assert!(!defaults.fail_on_regression);
+    }
+
+    #[test]
+    fn parses_suite_recount_with_its_required_and_optional_flags() {
+        let Command::SuiteRecount {
+            request,
+            limit,
+            fail_on_regression,
+        } = parse(&[
+            "bamts-verification",
+            "suite",
+            "recount",
+            "--catalog",
+            "typescript-7.0.2",
+            "--runner",
+            "compiler",
+            "--baseline",
+            "merged.jsonl",
+            "--family",
+            "types/mismatch",
+            "--limit",
+            "4",
+            "--fail-on-regression",
+        ])
+        .expect("recount")
+        else {
+            panic!("suite recount variant")
+        };
+        assert_eq!(request.catalog, "typescript-7.0.2");
+        assert_eq!(request.runner, "compiler");
+        assert_eq!(request.baseline, PathBuf::from("merged.jsonl"));
+        assert_eq!(request.family, "types/mismatch");
+        assert_eq!(limit, 4);
+        assert!(fail_on_regression);
+
+        let missing = parse(&[
+            "bamts-verification",
+            "suite",
+            "recount",
+            "--catalog",
+            "test262",
+            "--runner",
+            "jit",
+            "--baseline",
+            "m.jsonl",
+        ])
+        .expect_err("a family is required");
+        assert_eq!(missing.code(), ErrorCode::Usage);
+        assert!(missing.to_string().contains("--family"));
     }
 
     #[test]

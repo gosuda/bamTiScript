@@ -49,6 +49,7 @@ use crate::{
     schema,
     shard::{ObligationKey, ShardIdentity, ShardSpec, validate_catalog},
     suite::{DEFAULT_SNAPSHOT_REL, verify_snapshot},
+    sweep_report::{ReportRow, read_receipt},
     toolchain_schema::load_target_cells,
 };
 
@@ -856,6 +857,109 @@ pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> 
             Err(error)
         }
     }
+}
+
+/// Reruns the obligations of one failure family named by an earlier receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuiteRecountRequest {
+    pub catalog: String,
+    pub runner: String,
+    pub baseline: PathBuf,
+    pub family: String,
+}
+
+/// The family's rows before and after the rerun, in the same order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuiteRecount {
+    pub before: Vec<ReportRow>,
+    pub after: Vec<ReportRow>,
+}
+
+/// Reruns only the rows of `family`, on the platform the baseline recorded.
+///
+/// This answers one question for a repair loop: did the fix convert rows and
+/// regress none. It writes no receipt. Every state comes from the same lane
+/// executor and `derive_row` as a sweep, so a rerun cannot mint a `PASS` that a
+/// sweep could not.
+pub fn recount_suite(root: &Path, request: &SuiteRecountRequest) -> Result<SuiteRecount> {
+    let before: Vec<ReportRow> = read_receipt(&request.baseline)?
+        .into_iter()
+        .filter(|row| row.family().as_deref() == Some(request.family.as_str()))
+        .collect();
+    let Some(first) = before.first() else {
+        return Err(VerificationError::new(
+            ErrorCode::Usage,
+            format!(
+                "{}: no row belongs to family `{}`",
+                request.baseline.display(),
+                request.family
+            ),
+        ));
+    };
+    let platform = canonical_platform(first.key().platform())?;
+    if before.iter().any(|row| row.key().platform() != platform) {
+        return Err(VerificationError::new(
+            ErrorCode::Usage,
+            format!("family `{}` spans more than one platform", request.family),
+        ));
+    }
+    let runner = resolve_runner(&request.catalog, &request.runner)?;
+    let catalog = load_catalog_manifest(root, &request.catalog)?;
+    let obligations =
+        materialize_obligations(&request.catalog, &catalog.identifiers, runner, &platform)?;
+    let classifications = load_obligation_classifications(
+        root,
+        &request.catalog,
+        &catalog.identifiers,
+        &obligations,
+    )?;
+    let adapter = SuiteAdapter::build(root, &request.catalog, runner)?;
+    let lane_binding = fresh_lane_binding(root, runner)?;
+    let mut executor = SuiteExecutor {
+        adapter,
+        classifications,
+    };
+    let mut after = Vec::with_capacity(before.len());
+    for (ordinal, row) in before.iter().enumerate() {
+        // The catalog is strictly increasing by key, so a search finds the row.
+        let Ok(index) = obligations.binary_search_by(|entry| entry.key.cmp(row.key())) else {
+            return Err(VerificationError::new(
+                ErrorCode::SetMismatch,
+                format!(
+                    "the baseline names `{}`, which the `{}` catalog does not contain",
+                    row.key(),
+                    request.catalog
+                ),
+            ));
+        };
+        let obligation = &obligations[index];
+        let lane_request = LaneRequest::new(
+            lane_binding.clone(),
+            (ordinal + 1) as u64,
+            obligation.key.clone(),
+            obligation.observables.clone(),
+            vec![
+                "bamts-verification::suite::worker".to_owned(),
+                obligation.key.to_string(),
+            ],
+            WorkingDirectoryPolicy::RepositoryRoot,
+            CASE_TIMEOUT_MS,
+        )?;
+        let process = match executor.run(&lane_request) {
+            Ok(process) => process,
+            Err(error) => LaneProcessResult {
+                observation: ProcessObservation::Exited { code: 1 },
+                response_body: None,
+                duration_ms: 0,
+                detail: error.to_string(),
+            },
+        };
+        after.push(ReportRow::from_evidence(&derive_row(
+            &lane_request,
+            process,
+        )?));
+    }
+    Ok(SuiteRecount { before, after })
 }
 
 /// Merges every shard document below `receipts_root` for the catalog.
@@ -2688,6 +2792,115 @@ mod tests {
         }
         assert_eq!(reader.finish().expect("footer").row_count(), rows);
         assert_eq!(rows, 2);
+    }
+
+    /// A baseline from a run with no adapter, with the detail of the middle row
+    /// changed so the rows fall into two failure families.
+    fn two_family_baseline(identifiers: &[&str]) -> (Scratch, PathBuf, String, String) {
+        let (scratch, _) = manifest_root("recount", identifiers);
+        let baseline = scratch.root.join("baseline.jsonl");
+        run_suite(
+            &scratch.root,
+            &SuiteRunRequest {
+                catalog: "benchmarks".to_owned(),
+                shard: ShardSpec::unsharded(),
+                receipt: baseline.clone(),
+                runner: "perf".to_owned(),
+                platform: "ubuntu-latest".to_owned(),
+                execution: ExecutionBinding::local_for_tests(),
+            },
+        )
+        .expect("baseline run");
+        // Every benchmark names its own observable, which would give each row a
+        // facet, and so a family, of its own. Share one so rows can group.
+        let mut text = fs::read_to_string(&baseline).expect("baseline text");
+        for identifier in identifiers {
+            text = text.replace(
+                &format!("\"observables\":[\"{identifier}\"]"),
+                "\"observables\":[\"perf\"]",
+            );
+        }
+        let detail = text
+            .lines()
+            .find_map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).ok()?;
+                value["body"]["detail"].as_str().map(str::to_owned)
+            })
+            .expect("a row detail");
+        let first = text.find(&detail).expect("first detail");
+        let second = first
+            + text[first + detail.len()..]
+                .find(&detail)
+                .expect("second detail")
+            + detail.len();
+        let edited = format!(
+            "{}beta failure{}",
+            &text[..second],
+            &text[second + detail.len()..]
+        );
+        fs::write(&baseline, edited).expect("edited baseline");
+        let rows = crate::sweep_report::read_receipt(&baseline).expect("readable baseline");
+        let family_of = |index: usize| rows[index].family().expect("failing row");
+        let (alpha, beta) = (family_of(0), family_of(1));
+        assert_ne!(alpha, beta);
+        assert_eq!(family_of(2), alpha);
+        (scratch, baseline, alpha, beta)
+    }
+
+    fn recount_request(baseline: &Path, family: &str) -> SuiteRecountRequest {
+        SuiteRecountRequest {
+            catalog: "benchmarks".to_owned(),
+            runner: "perf".to_owned(),
+            baseline: baseline.to_owned(),
+            family: family.to_owned(),
+        }
+    }
+
+    #[test]
+    fn recount_reruns_only_the_rows_of_the_named_family() {
+        let (scratch, baseline, alpha, beta) = two_family_baseline(&["jit.a", "jit.b", "jit.c"]);
+
+        let one = recount_suite(&scratch.root, &recount_request(&baseline, &beta))
+            .expect("recount of the one-row family");
+        assert_eq!(one.before.len(), 1);
+        assert_eq!(one.after.len(), 1);
+        assert_eq!(one.before[0].key(), one.after[0].key());
+        assert!(
+            one.before[0].key().case().ends_with("jit.b"),
+            "{:?}",
+            one.before[0].key()
+        );
+        assert_eq!(one.after[0].key().platform(), "ubuntu-latest");
+
+        let two = recount_suite(&scratch.root, &recount_request(&baseline, &alpha))
+            .expect("recount of the two-row family");
+        let cases: Vec<&str> = two.after.iter().map(|row| row.key().case()).collect();
+        assert_eq!(cases.len(), 2, "{cases:?}");
+        assert!(
+            cases[0].ends_with("jit.a") && cases[1].ends_with("jit.c"),
+            "{cases:?}"
+        );
+        assert!(two.after.iter().all(|row| !row.state().is_pass()));
+    }
+
+    #[test]
+    fn recount_of_an_unknown_family_is_a_usage_error() {
+        let (scratch, baseline, ..) = two_family_baseline(&["jit.a", "jit.b", "jit.c"]);
+        let error = recount_suite(
+            &scratch.root,
+            &recount_request(&baseline, "perf/no-such-family"),
+        )
+        .expect_err("unknown family");
+        assert_eq!(error.code(), ErrorCode::Usage);
+    }
+
+    #[test]
+    fn recount_refuses_a_baseline_the_catalog_no_longer_contains() {
+        let (_scratch, baseline, _, beta) = two_family_baseline(&["jit.a", "jit.b", "jit.c"]);
+        let (smaller, _) = manifest_root("recount-smaller", &["jit.a", "jit.c"]);
+        let error = recount_suite(&smaller.root, &recount_request(&baseline, &beta))
+            .expect_err("jit.b is gone from the catalog");
+        assert_eq!(error.code(), ErrorCode::SetMismatch);
     }
 
     /// `fourslash/…` obligations are language-service authority cases: the

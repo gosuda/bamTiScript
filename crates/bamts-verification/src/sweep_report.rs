@@ -433,6 +433,23 @@ pub fn render_diff(a: &str, b: &str, diff: &Diff, limit: usize) -> String {
     out
 }
 
+/// The report of a family rerun, and how many of its rows stopped passing.
+#[must_use]
+pub fn render_recount(
+    family: &str,
+    before: &[ReportRow],
+    after: &[ReportRow],
+    limit: usize,
+) -> (String, usize) {
+    let diff = diff_rows(before, after);
+    let mut report = format!(
+        "recount of family `{family}`: {} row(s) rerun\n",
+        after.len()
+    );
+    report.push_str(&render_diff("before", "after", &diff, limit));
+    (report, diff.regressions().len())
+}
+
 /// `suite families`: the status report, or the cases of one family.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FamiliesRequest {
@@ -724,6 +741,21 @@ mod tests {
         let diff = diff_rows(&before, &after);
         assert_eq!(diff.changed.len(), 1);
         assert!(diff.regressions().is_empty() && diff.conversions().is_empty());
+    }
+
+    #[test]
+    fn a_recount_report_names_the_family_and_counts_regressions() {
+        let before = vec![failing("a", "x"), passing("b")];
+        let after = vec![passing("a"), failing("b", "x")];
+        let (report, regressions) = render_recount("diagnostics/x", &before, &after, 5);
+        assert_eq!(regressions, 1, "{report}");
+        assert!(report.contains("family `diagnostics/x`"), "{report}");
+        assert!(report.contains("2 row(s) rerun"), "{report}");
+        assert!(report.contains("conversions to PASS: 1"), "{report}");
+
+        let (clean, none) = render_recount("diagnostics/x", &before, &before, 5);
+        assert_eq!(none, 0, "{clean}");
+        assert!(clean.contains("changed: 0"), "{clean}");
     }
 
     #[test]
