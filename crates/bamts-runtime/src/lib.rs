@@ -7802,9 +7802,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 let object = self.allocate_constructed_receiver(new_target)?;
                 let stop_depth = self.frames.len();
-                let return_to = self.frames.last().map(|frame| ReturnTo {
+                // Native code calling back has no interpreter frame here, and
+                // the construction still has to answer with `object`.
+                let return_to = Some(ReturnTo {
                     destination: None,
-                    call_pc: frame.pc,
+                    call_pc: self.frames.last().map_or(0, |frame| frame.pc),
                     constructed: Some(object),
                 });
                 self.push_frame(ActivationRequest {

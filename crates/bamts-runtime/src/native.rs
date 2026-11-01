@@ -3460,7 +3460,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     let handle = self.code_ref(target.module);
                     handle.code(target.module).functions()[target.function.get() as usize].flags()
                 };
-                if flags.is_async && !flags.is_generator {
+                if !flags.is_constructable {
                     self.pending_throw.set(Some(PendingThrow {
                         value: Value::UNDEFINED,
                         origin: ThrowOrigin::TypeError {

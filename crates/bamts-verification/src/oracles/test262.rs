@@ -2227,6 +2227,43 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn construction_behaves_the_same_in_every_tier() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [&str; 7] = [
+            "assert.sameValue(throws(TypeError, function () { new (() => {}); }), true);",
+            "function* g() {} assert.sameValue(throws(TypeError, function () { new g(); }), true);",
+            "var o = { m() {} }; assert.sameValue(throws(TypeError, function () { new o.m(); }), true);",
+            "function F() { this.args = arguments; } \
+             var r = Reflect.construct(F, [1, 2, 3]); \
+             assert.sameValue(r instanceof F, true); assert.sameValue(r.args.length, 3);",
+            "function F() { return { x: 1 }; } \
+             assert.sameValue(Reflect.construct(F, []).x, 1);",
+            "function F() { this.x = 1; } var B = F.bind(null); \
+             assert.sameValue(new B().x, 1); \
+             assert.sameValue(Reflect.construct(B, []).x, 1);",
+            "function F() { throw new RangeError('no'); } \
+             assert.sameValue(throws(RangeError, function () { \
+             Reflect.construct(F, []); }), true);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: construction", &format!("{THROWS}{body}"));
+                let label = format!("construction-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn an_object_literal_defines_its_own_properties() {
         const CASES: [&str; 5] = [
             "Object.defineProperty(Object.prototype, 'x', { set() { throw new Error('set'); }, \
