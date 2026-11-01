@@ -2220,6 +2220,46 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn an_anonymous_function_takes_the_name_it_initializes() {
+        const CASES: [&str; 20] = [
+            "var f = function () {}; assert.sameValue(f.name, 'f');",
+            "var a = () => {}; assert.sameValue(a.name, 'a');",
+            "var c = class {}; assert.sameValue(c.name, 'c');",
+            "var g = function* () {}; assert.sameValue(g.name, 'g');",
+            "var { x = function () {} } = {}; assert.sameValue(x.name, 'x');",
+            "var [y = () => {}] = []; assert.sameValue(y.name, 'y');",
+            "function p(z = class {}) { return z; } assert.sameValue(p().name, 'z');",
+            "var h; h = function () {}; assert.sameValue(h.name, 'h');",
+            "var i; i ??= function () {}; assert.sameValue(i.name, 'i');",
+            "var j; j ||= () => {}; assert.sameValue(j.name, 'j');",
+            "var u; [u = function () {}] = []; assert.sameValue(u.name, 'u');",
+            "var v; ({ v = function () {} } = {}); assert.sameValue(v.name, 'v');",
+            "var o = { m: function () {}, 'n': () => {} }; assert.sameValue(o.m.name, 'm'); \
+             assert.sameValue(o.n.name, 'n');",
+            "var paren = (function () {}); assert.sameValue(paren.name, 'paren');",
+            "var kept = function other() {}; assert.sameValue(kept.name, 'other');",
+            "var cover = (0, function () {}); assert.sameValue(cover.name, '');",
+            "var q; (q) = function () {}; assert.sameValue(q.name, '');",
+            "var s = class { static name() {} }; assert.sameValue(typeof s.name, 'function');",
+            "var inner = class { static c = class {}; }; assert.sameValue(inner.c.name, 'c');",
+            "var calls = 0; var [w = (calls += 1, undefined)] = []; assert.sameValue(calls, 1);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: function names", body);
+                let label = format!("function-names-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn indirect_eval_runs_in_the_global_scope() {
         const THROWS: &str = "function throws(kind, body) {\n\
             try { body(); } catch (error) { return error instanceof kind; }\n\

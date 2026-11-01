@@ -255,6 +255,26 @@ const fn is_iteration(statement: &Statement) -> bool {
     )
 }
 
+/// The significant token at or after `position`.
+fn next_token(file: &SourceFile, position: Utf16Pos) -> Option<&Token> {
+    let tokens = file.tokens();
+    let start = tokens.partition_point(|token| token.range().start() < position);
+    tokens[start..].iter().find(|token| !is_trivia(token))
+}
+
+/// The last significant token before `position`.
+fn previous_token(file: &SourceFile, position: Utf16Pos) -> Option<&Token> {
+    let tokens = file.tokens();
+    let end = tokens.partition_point(|token| token.range().start() < position);
+    tokens[..end].iter().rev().find(|token| !is_trivia(token))
+}
+
+/// Whether parentheses wrap `range`, which the tree drops from a target.
+pub(crate) fn is_parenthesized(file: &SourceFile, range: TextRange) -> bool {
+    previous_token(file, range.start()).is_some_and(|token| token.kind() == TokenKind::LParen)
+        && next_token(file, range.end()).is_some_and(|token| token.kind() == TokenKind::RParen)
+}
+
 fn is_trivia(token: &Token) -> bool {
     matches!(
         token.kind(),
@@ -319,42 +339,18 @@ impl Walker<'_> {
         ));
     }
 
-    /// The significant token at or after `position`.
-    fn next_token(&self, position: Utf16Pos) -> Option<&Token> {
-        let tokens = self.file.tokens();
-        let start = tokens.partition_point(|token| token.range().start() < position);
-        tokens[start..].iter().find(|token| !is_trivia(token))
-    }
-
     /// Whether a comma follows `range`, which a rest element cannot have.
     fn comma_follows(&self, range: TextRange) -> bool {
-        self.next_token(range.end())
-            .is_some_and(|token| token.kind() == TokenKind::Comma)
-    }
-
-    /// Whether parentheses wrap `range`, which a pattern cannot have.
-    fn is_parenthesized(&self, range: TextRange) -> bool {
-        self.previous_token(range.start())
-            .is_some_and(|token| token.kind() == TokenKind::LParen)
-            && self
-                .next_token(range.end())
-                .is_some_and(|token| token.kind() == TokenKind::RParen)
+        next_token(self.file, range.end()).is_some_and(|token| token.kind() == TokenKind::Comma)
     }
 
     fn token_of(&self, token: &Token) -> &str {
         self.file.token_text(token).unwrap_or_default()
     }
 
-    /// The last significant token before `position`.
-    fn previous_token(&self, position: Utf16Pos) -> Option<&Token> {
-        let tokens = self.file.tokens();
-        let end = tokens.partition_point(|token| token.range().start() < position);
-        tokens[..end].iter().rev().find(|token| !is_trivia(token))
-    }
-
     /// The word after `import.` or `new.`, exactly as written.
     fn meta_word(&self, expression: &Expr) -> &str {
-        self.previous_token(expression.range().end())
+        previous_token(self.file, expression.range().end())
             .and_then(|token| self.file.token_text(token))
             .unwrap_or_default()
     }
@@ -1427,7 +1423,7 @@ impl Walker<'_> {
                 self.member(&member.object, &member.property, context);
             }
             AssignmentTarget::Object(object) => {
-                if !patterns_allowed || self.is_parenthesized(target.range()) {
+                if !patterns_allowed || is_parenthesized(self.file, target.range()) {
                     self.error(target.range(), "this operator cannot assign to a pattern");
                 }
                 let last = object.properties.len().saturating_sub(1);
@@ -1456,7 +1452,7 @@ impl Walker<'_> {
                 }
             }
             AssignmentTarget::Array(array) => {
-                if !patterns_allowed || self.is_parenthesized(target.range()) {
+                if !patterns_allowed || is_parenthesized(self.file, target.range()) {
                     self.error(target.range(), "this operator cannot assign to a pattern");
                 }
                 let last = array.elements.len().saturating_sub(1);

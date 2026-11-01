@@ -75,15 +75,6 @@ pub fn compile_classic_script(
         });
     }
 
-    if let Some(diagnostic) = crate::early_errors::check_script(parsed.product()).first() {
-        let (line, column) = line_column(&source, diagnostic.range().start());
-        return Err(ScriptCompileError::Syntax {
-            message: diagnostic.message().to_owned(),
-            line,
-            column,
-        });
-    }
-
     let module_name = normalized_module_name(resource_name).unwrap_or(DEFAULT_MODULE_NAME);
     let options = LowerOptions {
         javascript_compatibility: true,
@@ -99,6 +90,15 @@ pub fn compile_classic_script(
         &namespace_facts,
     )
     .map_err(|error| map_lower_error(&source, error))?;
+    // Lowering reports the structural errors first; these are the rest.
+    if let Some(diagnostic) = crate::early_errors::check_script(parsed.product()).first() {
+        let (line, column) = line_column(&source, diagnostic.range().start());
+        return Err(ScriptCompileError::Syntax {
+            message: diagnostic.message().to_owned(),
+            line,
+            column,
+        });
+    }
     let encoded_name = EcmaString::encode(module_name);
     let name = assembled
         .constants()

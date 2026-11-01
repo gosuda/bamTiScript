@@ -387,6 +387,12 @@ fn has_simple_parameters(parameters: &[ParameterNode]) -> bool {
             )
     })
 }
+fn strip_parentheses(expression: &Expr) -> &Expr {
+    match expression.data() {
+        Expression::Parenthesized(inner) => strip_parentheses(inner),
+        _ => expression,
+    }
+}
 /// Whether code at the top of `file` is strict.
 fn source_is_strict(file: &SourceFile) -> bool {
     !matches!(
@@ -813,6 +819,8 @@ struct FunctionContext<'a> {
     arguments_source: ArgumentsSource,
     /// Whether this code is strict. Everything but a JavaScript script is.
     strict: bool,
+    /// The name an anonymous class about to be lowered takes from its context.
+    inferred_class_name: Option<String>,
 }
 impl<'a> FunctionContext<'a> {
     fn new_top_level(
@@ -860,6 +868,7 @@ impl<'a> FunctionContext<'a> {
             class_elements: None,
             arguments_source: ArgumentsSource::None,
             strict: source_is_strict(file),
+            inferred_class_name: None,
         }
     }
     /// Whether `await`, `await using`, or async disposal awaits are legal here.
@@ -3069,7 +3078,10 @@ impl<'a> FunctionContext<'a> {
                 continue;
             }
             let value = match &data.initializer {
-                Some(initializer) => self.lower_expression(builder, initializer)?,
+                Some(initializer) => {
+                    let name = self.binding_name(&data.binding)?;
+                    self.lower_maybe_named(builder, initializer, name.as_deref())?
+                }
                 None => {
                     // A bare declaration (`let x;`) binds undefined.
                     self.undefined(builder, range)?
@@ -3709,6 +3721,77 @@ impl<'a> FunctionContext<'a> {
     // ------------------------------------------------------------------
     // Expressions
     // ------------------------------------------------------------------
+    /// `NamedEvaluation`: an anonymous function or class directly initializing
+    /// a name takes that name. Parentheses do not matter; a comma does, because
+    /// then the value is no longer a function definition.
+    fn lower_named_expression(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        expression: &Expr,
+        name: &str,
+    ) -> Result<Register, LowerError> {
+        let range = expression.range();
+        match strip_parentheses(expression).data() {
+            Expression::Function(function) if function.function.name.is_none() => self
+                .build_constructible_function_value(
+                    builder,
+                    range,
+                    Some(name.to_owned()),
+                    &function.function,
+                ),
+            Expression::Arrow(arrow) => {
+                self.lower_arrow_named(builder, range, arrow, Some(name.to_owned()))
+            }
+            Expression::Class(class) if class.class.name.is_none() => {
+                self.inferred_class_name = Some(name.to_owned());
+                self.lower_class_value(builder, range, &class.class, None, None)
+            }
+            _ => self.lower_expression(builder, expression),
+        }
+    }
+    /// Lowers `value`, naming it after `name` when one applies.
+    fn lower_maybe_named(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        value: &Expr,
+        name: Option<&str>,
+    ) -> Result<Register, LowerError> {
+        match name {
+            Some(name) => self.lower_named_expression(builder, value, name),
+            None => self.lower_expression(builder, value),
+        }
+    }
+    /// The name a binding gives its initializer, when it is a plain identifier.
+    fn binding_name(&self, pattern: &Pattern) -> Result<Option<String>, LowerError> {
+        match pattern.data() {
+            BindingPattern::Identifier(identifier) => self.identifier_text(identifier).map(Some),
+            _ => Ok(None),
+        }
+    }
+    /// The name an assignment target gives its value. `(x) = f` names nothing:
+    /// the target must be the bare identifier.
+    fn target_name(&self, target: &AssignmentTargetNode) -> Result<Option<String>, LowerError> {
+        match target.data() {
+            AssignmentTarget::Identifier(identifier)
+                if !crate::early_errors::is_parenthesized(self.file, target.range()) =>
+            {
+                self.identifier_text(identifier).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+    /// The name a property key gives a value, when it is known here.
+    fn property_name_text(&self, name: &PropertyName) -> Result<Option<String>, LowerError> {
+        match name {
+            PropertyName::Identifier(identifier) => self.identifier_text(identifier).map(Some),
+            PropertyName::String(literal) => Ok(self
+                .file
+                .token_text(literal.data().token())
+                .map(|text| text.trim_matches(['\'', '"']).to_owned())),
+            PropertyName::Private(private) => self.private_text(private).map(Some),
+            _ => Ok(None),
+        }
+    }
     fn lower_expression(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -3779,7 +3862,13 @@ impl<'a> FunctionContext<'a> {
             Expression::Array(array) => self.lower_array(builder, range, array),
             Expression::Object(object) => self.lower_object(builder, range, object),
             Expression::Function(function) => {
-                self.build_constructible_function_value(builder, range, None, &function.function)
+                let name = function
+                    .function
+                    .name
+                    .as_ref()
+                    .map(|identifier| self.identifier_text(identifier))
+                    .transpose()?;
+                self.build_constructible_function_value(builder, range, name, &function.function)
             }
             Expression::Class(class) => {
                 let name = class
@@ -4229,7 +4318,9 @@ impl<'a> FunctionContext<'a> {
         // assign_name so each performs a fresh membership walk.
         match compound_operator(assignment.operator) {
             None => {
-                let value = self.lower_expression(builder, &assignment.right)?;
+                let inferred = self.target_name(&assignment.left)?;
+                let value =
+                    self.lower_maybe_named(builder, &assignment.right, inferred.as_deref())?;
                 self.assign_name(builder, name, value, range)?;
                 Ok(value)
             }
@@ -4254,7 +4345,9 @@ impl<'a> FunctionContext<'a> {
                 let current = self.read_name(builder, name, range)?;
                 self.move_to(range, result, current)?;
                 let skip = self.branch_on_short_circuit(builder, range, op, current)?;
-                let value = self.lower_expression(builder, &assignment.right)?;
+                let inferred = self.target_name(&assignment.left)?;
+                let value =
+                    self.lower_maybe_named(builder, &assignment.right, inferred.as_deref())?;
                 self.assign_name(builder, name, value, range)?;
                 self.move_to(range, result, value)?;
                 let end = self.next_pc();
@@ -5301,7 +5394,9 @@ impl<'a> FunctionContext<'a> {
             match member.data() {
                 ObjectMember::Property(property) => {
                     let key = self.property_key(builder, &property.name)?;
-                    let value = self.lower_expression(builder, &property.value)?;
+                    let name = self.property_name_text(&property.name)?;
+                    let value =
+                        self.lower_maybe_named(builder, &property.value, name.as_deref())?;
                     self.install_property(
                         builder,
                         member.range(),
@@ -6542,7 +6637,10 @@ impl<'a> FunctionContext<'a> {
                         },
                     )?;
                     let element = match &property.initializer {
-                        Some(default) => self.apply_default(builder, range, element, default)?,
+                        Some(default) => {
+                            let name = self.binding_name(&property.binding)?;
+                            self.apply_default(builder, range, element, default, name.as_deref())?
+                        }
                         None => element,
                     };
                     self.bind_pattern(builder, &property.binding, element, declaration_scope)?;
@@ -6578,12 +6676,23 @@ impl<'a> FunctionContext<'a> {
                                 let value = self.iterator_step_value(builder, range, iterator)?;
                                 let value = match default {
                                     Some(default) => {
-                                        self.apply_default(builder, range, value, default)?
+                                        let name = self.binding_name(element_value)?;
+                                        self.apply_default(
+                                            builder,
+                                            range,
+                                            value,
+                                            default,
+                                            name.as_deref(),
+                                        )?
                                     }
                                     None => value,
                                 };
-                                let _ = element_value;
-                                self.bind_pattern(builder, inner, value, declaration_scope)?;
+                                self.bind_pattern(
+                                    builder,
+                                    element_value,
+                                    value,
+                                    declaration_scope,
+                                )?;
                             }
                         }
                         ArrayBindingElement::Missing(missing) => {
@@ -6594,7 +6703,9 @@ impl<'a> FunctionContext<'a> {
                 Ok(())
             }
             BindingPattern::Assignment(assignment) => {
-                let value = self.apply_default(builder, range, value, &assignment.right)?;
+                let name = self.binding_name(&assignment.left)?;
+                let value =
+                    self.apply_default(builder, range, value, &assignment.right, name.as_deref())?;
                 self.bind_pattern(builder, &assignment.left, value, declaration_scope)
             }
             BindingPattern::Rest(rest) => {
@@ -6616,6 +6727,7 @@ impl<'a> FunctionContext<'a> {
         range: TextRange,
         value: Register,
         default: &Expr,
+        name: Option<&str>,
     ) -> Result<Register, LowerError> {
         let result = self.alloc_register(range)?;
         self.move_to(range, result, value)?;
@@ -6637,7 +6749,7 @@ impl<'a> FunctionContext<'a> {
                 target: Pc::new(0),
             },
         )?;
-        let default_value = self.lower_expression(builder, default)?;
+        let default_value = self.lower_maybe_named(builder, default, name)?;
         self.move_to(range, result, default_value)?;
         let end = self.next_pc();
         self.patch_jump(skip, end);
@@ -6840,7 +6952,14 @@ impl<'a> FunctionContext<'a> {
             && let Expression::Assignment(assignment) = operand.data()
             && assignment.operator == AssignmentOperator::Assign
         {
-            let value = self.apply_default(builder, target.range(), value, &assignment.right)?;
+            let name = self.target_name(&assignment.left)?;
+            let value = self.apply_default(
+                builder,
+                target.range(),
+                value,
+                &assignment.right,
+                name.as_deref(),
+            )?;
             return self.assign_target(builder, &assignment.left, value);
         }
         self.assign_target(builder, target, value)
@@ -6869,7 +6988,10 @@ impl<'a> FunctionContext<'a> {
             },
         )?;
         let element = match &property.initializer {
-            Some(default) => self.apply_default(builder, range, element, default)?,
+            Some(default) => {
+                let name = self.target_name(&property.target)?;
+                self.apply_default(builder, range, element, default, name.as_deref())?
+            }
             None => element,
         };
         self.assign_target(builder, &property.target, element)
@@ -6879,6 +7001,15 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         range: TextRange,
         arrow: &ArrowFunction,
+    ) -> Result<Register, LowerError> {
+        self.lower_arrow_named(builder, range, arrow, None)
+    }
+    fn lower_arrow_named(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        arrow: &ArrowFunction,
+        name: Option<String>,
     ) -> Result<Register, LowerError> {
         let flags = FunctionFlags {
             is_async: arrow.is_async,
@@ -6892,7 +7023,7 @@ impl<'a> FunctionContext<'a> {
             builder,
             id,
             range,
-            None,
+            name,
             &arrow.parameters,
             LoweredBody::Arrow(&arrow.body),
             flags,
@@ -7039,6 +7170,7 @@ impl<'a> FunctionContext<'a> {
                 ArgumentsSource::Own
             },
             strict: self.strict || body.has_use_strict(self.file),
+            inferred_class_name: None,
         };
         // Leading capture registers.
         for capture in captures {
@@ -7182,6 +7314,7 @@ impl<'a> FunctionContext<'a> {
             class_elements: None,
             arguments_source: ArgumentsSource::Own,
             strict: self.strict,
+            inferred_class_name: None,
         };
         // Leading capture registers, in the same order the materialized
         // captures array pushes them.
@@ -7306,7 +7439,10 @@ impl<'a> FunctionContext<'a> {
             let data = parameter.data();
             let slot = slots[index];
             let value = match &data.initializer {
-                Some(default) => self.apply_default(builder, parameter.range(), slot, default)?,
+                Some(default) => {
+                    let name = self.binding_name(&data.binding)?;
+                    self.apply_default(builder, parameter.range(), slot, default, name.as_deref())?
+                }
                 None => slot,
             };
             self.bind_pattern(builder, &data.binding, value, DeclarationScope::Function)?;
@@ -7873,7 +8009,10 @@ impl<'a> FunctionContext<'a> {
                 extra_inits,
             } => {
                 let raw = match &property.initializer {
-                    Some(initializer) => self.lower_expression(builder, initializer)?,
+                    Some(initializer) => {
+                        let name = self.property_name_text(&property.name)?;
+                        self.lower_maybe_named(builder, initializer, name.as_deref())?
+                    }
                     None => self.undefined(builder, range)?,
                 };
                 let value =
@@ -7946,6 +8085,7 @@ impl<'a> FunctionContext<'a> {
         declaration_name: Option<&str>,
         expression_name: Option<(&str, BindingSite)>,
     ) -> Result<Register, LowerError> {
+        let inferred_name = self.inferred_class_name.take();
         let class_decorators = class
             .decorators
             .iter()
@@ -8026,7 +8166,10 @@ impl<'a> FunctionContext<'a> {
             Some(identifier) => Some(self.identifier_text(identifier)?),
             None => None,
         };
-        let source_name = owned_class_name.as_deref().or(declaration_name);
+        let source_name = owned_class_name
+            .as_deref()
+            .or(declaration_name)
+            .or(inferred_name.as_deref());
         let ctor = self.build_constructor(
             builder,
             range,
@@ -8681,6 +8824,7 @@ impl<'a> FunctionContext<'a> {
             class_elements: None,
             arguments_source: ArgumentsSource::Own,
             strict: true,
+            inferred_class_name: None,
         };
         for capture in captures {
             let register = inner.alloc_register(range)?;
@@ -11731,13 +11875,21 @@ mod tests {
                 .any(|function| function_has_name(&module, function, "C")),
             "named class constructor metadata uses the source class name"
         );
-        let anonymous = lower_js("const C = class {};");
+        let anonymous = lower_js("(0, class {});");
         assert!(
             anonymous
                 .functions()
                 .iter()
                 .all(|function| function.name().is_none()),
-            "anonymous class constructors keep empty function metadata"
+            "a class with nothing to name it keeps empty function metadata"
+        );
+        let inferred = lower_js("const C = class {};");
+        assert!(
+            inferred
+                .functions()
+                .iter()
+                .any(|function| function_has_name(&inferred, function, "C")),
+            "a class initializing a binding takes the binding's name"
         );
         let expression = lower_js("const C = class Named {};");
         assert!(
