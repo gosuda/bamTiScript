@@ -706,7 +706,7 @@ fn constructor<H: Host>(
         if let Some(time) = copied {
             time
         } else {
-            let primitive = machine.coerce_primitive_observable(value, false)?;
+            let primitive = machine.coerce_primitive_default(value)?;
             if let Some(text) = machine.string_value(primitive) {
                 let text = text.to_utf8_lossy();
                 let zone = if date_text_uses_local_zone(&text) {
@@ -723,11 +723,23 @@ fn constructor<H: Host>(
         let values = numbers(machine, &args[..args.len().min(7)])?;
         components_to_time(&values, &timezone(machine)?, true)
     };
+    let default_prototype = machine.intrinsics.builtins.date_prototype();
+    let new_target = machine.current_new_target();
+    let prototype = if new_target == Value::UNDEFINED {
+        default_prototype
+    } else {
+        let prototype = machine.get_named_property(new_target, "prototype")?;
+        if machine.is_object(prototype) {
+            prototype
+        } else {
+            default_prototype
+        }
+    };
     let object = machine
         .allocate(HeapEntry::Date {
             time: milliseconds,
             properties: PropertyMap::default(),
-            prototype: Some(machine.intrinsics.builtins.date_prototype()),
+            prototype: Some(prototype),
             extensible: true,
         })
         .map_err(EvalFailure::Runtime)?;
