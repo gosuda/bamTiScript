@@ -33,7 +33,10 @@ use bamts_verification::{
         SuiteMergeRequest, SuiteRecountRequest, SuiteRunRequest, merge_suite, recount_suite,
         run_suite,
     },
-    sweep_report::{DiffRequest, FamiliesRequest, diff as diff_receipts, families, render_recount},
+    sweep_report::{
+        DiffRequest, FamiliesRequest, StatusRequest, diff as diff_receipts, families,
+        render_recount, status_report,
+    },
     toolchain_schema::{
         blocking_obligations, catalog_identifiers, emit_probe_object, load_target_cells,
     },
@@ -113,6 +116,7 @@ enum Command {
     SuiteMerge(SuiteMergeRequest),
     SuiteFamilies(FamiliesRequest),
     SuiteDiff(DiffRequest),
+    SuiteStatus(StatusRequest),
     SuiteRecount {
         request: SuiteRecountRequest,
         limit: usize,
@@ -186,6 +190,7 @@ fn dispatch(root: &Path, command: Command) -> Result<()> {
             print_report(&report)?;
             fail_on_regressions(request.fail_on_regression, regressions)
         }
+        Command::SuiteStatus(request) => print_report(&format!("{}\n", status_report(&request)?)),
         Command::SuiteRecount {
             request,
             limit,
@@ -340,6 +345,17 @@ fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result
                 b,
                 limit: count_flag(&flags.values, "--limit", 20)?,
                 fail_on_regression: flags.switches.contains("--fail-on-regression"),
+            }))
+        }
+        "status" => {
+            let flags = parse_flags(arguments, &["--receipts", "--out"], &[])?;
+            Ok(Command::SuiteStatus(StatusRequest {
+                receipts: PathBuf::from(required_flag(
+                    &flags.values,
+                    "--receipts",
+                    "suite status",
+                )?),
+                out: PathBuf::from(required_flag(&flags.values, "--out", "suite status")?),
             }))
         }
         "recount" => {
@@ -1574,6 +1590,41 @@ mod tests {
         .expect_err("a family is required");
         assert_eq!(missing.code(), ErrorCode::Usage);
         assert!(missing.to_string().contains("--family"));
+    }
+
+    #[test]
+    fn parses_suite_status_with_both_paths_and_requires_each() {
+        let Command::SuiteStatus(request) = parse(&[
+            "bamts-verification",
+            "suite",
+            "status",
+            "--receipts",
+            "target/evidence-local/merged",
+            "--out",
+            "target/evidence-local/status.md",
+        ])
+        .expect("status") else {
+            panic!("suite status variant")
+        };
+        assert_eq!(
+            request.receipts,
+            PathBuf::from("target/evidence-local/merged")
+        );
+        assert_eq!(
+            request.out,
+            PathBuf::from("target/evidence-local/status.md")
+        );
+
+        for (missing, arguments) in [
+            ("--out", vec!["--receipts", "merged"]),
+            ("--receipts", vec!["--out", "status.md"]),
+        ] {
+            let mut command = vec!["bamts-verification", "suite", "status"];
+            command.extend(arguments);
+            let error = parse(&command).expect_err("a required flag is missing");
+            assert_eq!(error.code(), ErrorCode::Usage);
+            assert!(error.to_string().contains(missing), "{error}");
+        }
     }
 
     #[test]

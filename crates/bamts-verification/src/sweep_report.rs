@@ -6,16 +6,19 @@
 //! receipt or decides a state.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
+    process,
 };
+
+use serde::{Deserialize, Serialize};
 
 use crate::{
     ErrorCode, Result, VerificationError,
     evidence::{EvidenceReader, EvidenceRow, TerminalState},
-    shard::ObligationKey,
+    shard::{ObligationKey, ShardSpec},
 };
 
 /// Characters of a quoted span that still count toward a family. The rest of a
@@ -448,6 +451,287 @@ pub fn render_recount(
     );
     report.push_str(&render_diff("before", "after", &diff, limit));
     (report, diff.regressions().len())
+}
+
+const STATUS_SCHEMA: &str = "bamti.status/v1";
+
+/// One receipt's place in the status report: which lane it measures, at which
+/// commit, and how its rows fall across the states.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaneStatus {
+    pub file: String,
+    pub catalog: String,
+    pub mode: String,
+    pub platform: String,
+    /// `merged` for a complete receipt, otherwise `<index>/<count>`.
+    pub shard: String,
+    pub commit: String,
+    pub rows: usize,
+    pub states: BTreeMap<String, usize>,
+}
+
+impl LaneStatus {
+    fn identity(&self) -> (&str, &str, &str, &str) {
+        (&self.catalog, &self.mode, &self.platform, &self.shard)
+    }
+
+    fn count(&self, state: &str) -> usize {
+        self.states.get(state).copied().unwrap_or(0)
+    }
+}
+
+/// What the status report keeps beside the Markdown, so the next report can say
+/// what changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusFile {
+    pub schema: String,
+    pub lanes: Vec<LaneStatus>,
+}
+
+/// Reads one receipt end to end and reduces it to a lane.
+pub fn read_lane_status(path: &Path) -> Result<LaneStatus> {
+    let mut reader = EvidenceReader::open(path)?;
+    let commit = reader.header().execution().source_sha().to_owned();
+    let spec = reader.header().shard().spec();
+    let shard = if spec == ShardSpec::unsharded() {
+        "merged".to_owned()
+    } else {
+        format!("{}/{}", spec.index(), spec.count())
+    };
+    let mut lane: Option<(String, String, String)> = None;
+    let mut states: BTreeMap<String, usize> = BTreeMap::new();
+    let mut rows = 0;
+    while let Some(row) = reader.next_row()? {
+        let key = row.key();
+        let this = (
+            key.catalog().to_owned(),
+            key.mode().as_str().to_owned(),
+            key.platform().to_owned(),
+        );
+        match &lane {
+            None => lane = Some(this),
+            Some(first) if *first != this => {
+                return Err(VerificationError::new(
+                    ErrorCode::Schema,
+                    format!(
+                        "{}: one receipt mixes catalogs, modes or platforms",
+                        path.display()
+                    ),
+                ));
+            }
+            Some(_) => {}
+        }
+        *states.entry(row.state().as_str().to_owned()).or_default() += 1;
+        rows += 1;
+    }
+    let Some((catalog, mode, platform)) = lane else {
+        return Err(VerificationError::new(
+            ErrorCode::Schema,
+            format!("{}: receipt carries no rows", path.display()),
+        ));
+    };
+    Ok(LaneStatus {
+        file: path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+        catalog,
+        mode,
+        platform,
+        shard,
+        commit,
+        rows,
+        states,
+    })
+}
+
+fn short(commit: &str) -> &str {
+    commit.get(..12).unwrap_or(commit)
+}
+
+/// `+n`, `-n` or `0`.
+fn signed_change(now: usize, before: usize) -> String {
+    match now.cmp(&before) {
+        std::cmp::Ordering::Greater => format!("+{}", now - before),
+        std::cmp::Ordering::Less => format!("-{}", before - now),
+        std::cmp::Ordering::Equal => "0".to_owned(),
+    }
+}
+
+/// The Markdown report: one summary table, then each lane's counts and what
+/// changed since the previous report for the same lane. It is a function of the
+/// receipts and the previous report alone, so it carries no timestamp.
+#[must_use]
+pub fn render_status_report(lanes: &[LaneStatus], previous: &[LaneStatus]) -> String {
+    let before: BTreeMap<(&str, &str, &str, &str), &LaneStatus> = previous
+        .iter()
+        .map(|lane| (lane.identity(), lane))
+        .collect();
+    let mut out = String::from("# Sweep status\n\n");
+    let _ = writeln!(
+        out,
+        "{} receipt(s). Counts come from the receipts alone; Change compares with the previous report for the same lane.\n",
+        lanes.len()
+    );
+    out.push_str(
+        "| Catalog | Mode | Platform | Shard | Commit | Rows | PASS | Not PASS |\n|---|---|---|---|---|---:|---:|---:|\n",
+    );
+    for lane in lanes {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | `{}` | {} | {} | {} |",
+            lane.catalog,
+            lane.mode,
+            lane.platform,
+            lane.shard,
+            short(&lane.commit),
+            lane.rows,
+            lane.count("PASS"),
+            lane.rows - lane.count("PASS")
+        );
+    }
+    for lane in lanes {
+        let _ = writeln!(
+            out,
+            "\n## {} / {} / {} / shard {}\n",
+            lane.catalog, lane.mode, lane.platform, lane.shard
+        );
+        let prior = before.get(&lane.identity()).copied();
+        let _ = writeln!(
+            out,
+            "Commit `{}`, receipt `{}`, {} rows, {} PASS ({}).",
+            short(&lane.commit),
+            lane.file,
+            lane.rows,
+            lane.count("PASS"),
+            percent(lane.count("PASS"), lane.rows)
+        );
+        let _ = match prior {
+            None => writeln!(out, "Previous report: none for this lane.\n"),
+            Some(prior) => writeln!(out, "Previous report: commit `{}`.\n", short(&prior.commit)),
+        };
+        out.push_str("| State | Rows | Change |\n|---|---:|---:|\n");
+        let mut names: BTreeSet<&str> = lane.states.keys().map(String::as_str).collect();
+        if let Some(prior) = prior {
+            names.extend(prior.states.keys().map(String::as_str));
+        }
+        let mut ordered: Vec<&str> = names.into_iter().collect();
+        ordered.sort_by_key(|name| (*name != "PASS", *name));
+        for name in ordered {
+            let change = prior.map_or_else(
+                || "new".to_owned(),
+                |prior| signed_change(lane.count(name), prior.count(name)),
+            );
+            let _ = writeln!(out, "| {name} | {} | {change} |", lane.count(name));
+        }
+    }
+    out
+}
+
+/// `suite status`: write the report for every receipt in a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusRequest {
+    pub receipts: PathBuf,
+    pub out: PathBuf,
+}
+
+/// Writes `out` and a `.json` sidecar beside it, and returns a one-line summary.
+///
+/// An empty directory, an unreadable receipt, or two receipts for one lane is
+/// an error, and nothing is written: a report must not read as complete when it
+/// is not.
+pub fn status_report(request: &StatusRequest) -> Result<String> {
+    let io_error = |path: &Path, error: io::Error| {
+        VerificationError::new(ErrorCode::Io, format!("{}: {error}", path.display()))
+    };
+    let mut paths: Vec<PathBuf> = fs::read_dir(&request.receipts)
+        .map_err(|error| io_error(&request.receipts, error))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect();
+    paths.sort();
+    if paths.is_empty() {
+        return Err(VerificationError::new(
+            ErrorCode::Usage,
+            format!(
+                "{}: no `.jsonl` receipts to report on",
+                request.receipts.display()
+            ),
+        ));
+    }
+    let mut lanes = paths
+        .iter()
+        .map(|path| read_lane_status(path))
+        .collect::<Result<Vec<_>>>()?;
+    lanes.sort_by(|left, right| {
+        left.identity()
+            .cmp(&right.identity())
+            .then_with(|| left.file.cmp(&right.file))
+    });
+    if let Some(pair) = lanes
+        .windows(2)
+        .find(|pair| pair[0].identity() == pair[1].identity())
+    {
+        return Err(VerificationError::new(
+            ErrorCode::Duplicate,
+            format!(
+                "`{}` and `{}` are receipts for the same lane",
+                pair[0].file, pair[1].file
+            ),
+        ));
+    }
+
+    let sidecar = request.out.with_extension("json");
+    let previous = match fs::read_to_string(&sidecar) {
+        Ok(text) => {
+            serde_json::from_str::<StatusFile>(&text)
+                .map_err(|error| {
+                    VerificationError::new(
+                        ErrorCode::Json,
+                        format!("{}: {error}", sidecar.display()),
+                    )
+                })?
+                .lanes
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(io_error(&sidecar, error)),
+    };
+    let report = render_status_report(&lanes, &previous);
+    let file = StatusFile {
+        schema: STATUS_SCHEMA.to_owned(),
+        lanes,
+    };
+    let json = serde_json::to_string_pretty(&file)
+        .map_err(|error| VerificationError::new(ErrorCode::Json, error.to_string()))?;
+    write_atomically(&request.out, report.as_bytes())?;
+    write_atomically(&sidecar, format!("{json}\n").as_bytes())?;
+    Ok(format!(
+        "STATUS REPORT {} from {} receipt(s)",
+        request.out.display(),
+        file.lanes.len()
+    ))
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let io_error = |path: &Path, error: io::Error| {
+        VerificationError::new(ErrorCode::Io, format!("{}: {error}", path.display()))
+    };
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
+    }
+    let temp = path.with_extension(format!("tmp-{}", process::id()));
+    fs::write(&temp, bytes).map_err(|error| io_error(&temp, error))?;
+    fs::rename(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        io_error(path, error)
+    })
 }
 
 /// `suite families`: the status report, or the cases of one family.
@@ -888,6 +1172,226 @@ mod tests {
         assert_eq!(text.matches("\"row_count\":2").count(), 1, "{text}");
         fs::write(&path, text.replace("\"row_count\":2", "\"row_count\":9")).unwrap();
         assert!(read_receipt(&path).is_err());
+    }
+
+    /// A receipt for one lane. `shard` is `(index, count)`; only that shard's
+    /// members of the four-case catalog are written, as a real run does.
+    fn write_lane(path: &Path, commit: &str, shard: (u32, u32), states: [TerminalState; 4]) {
+        let cases = ["c0", "c1", "c2", "c3"];
+        let catalog: Vec<ObligationKey> = cases.iter().map(|case| key(case)).collect();
+        let spec = ShardSpec::new(shard.0, shard.1).unwrap();
+        let identity = ShardIdentity::plan(spec, &catalog).unwrap();
+        let pin = ToolchainPin::new("rustc-1.97.1", DIGEST).unwrap();
+        let binding = RunBinding::new(DIGEST, DIGEST, DIGEST, DIGEST, pin).unwrap();
+        let execution =
+            ExecutionBinding::new("Justfile", "run", 1, commit, "job", "Darwin-arm64", "rust")
+                .unwrap();
+        let header = EvidenceHeader::new(identity, binding, execution).unwrap();
+        let rows: Vec<EvidenceRow> = spec
+            .member_indices(catalog.len())
+            .map(|index| evidence_row(cases[index], states[index], "x"))
+            .collect();
+        publish_evidence(path, header, &rows, PublishMode::Replace).unwrap();
+    }
+
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    use TerminalState::{BlockingFail as Fail, Pass};
+
+    #[test]
+    fn a_lane_status_reads_its_commit_shard_and_counts_from_the_receipt() {
+        let scratch = Scratch::new();
+        let merged = scratch.0.join("merged.jsonl");
+        let shard = scratch.0.join("shard.jsonl");
+        write_lane(&merged, SHA_A, (0, 1), [Pass, Pass, Fail, Fail]);
+        write_lane(&shard, SHA_B, (0, 2), [Pass, Pass, Fail, Fail]);
+
+        let whole = read_lane_status(&merged).unwrap();
+        assert_eq!(whole.commit, SHA_A);
+        assert_eq!(whole.shard, "merged");
+        assert_eq!(
+            (whole.catalog.as_str(), whole.mode.as_str()),
+            ("typescript-7.0.2", "aot")
+        );
+        assert_eq!(whole.platform, "aarch64-apple-darwin");
+        assert_eq!(whole.rows, 4);
+        assert_eq!(whole.states.get("PASS"), Some(&2));
+        assert_eq!(whole.states.get("BLOCKING_FAIL"), Some(&2));
+
+        let half = read_lane_status(&shard).unwrap();
+        assert_eq!(half.shard, "0/2");
+        assert_eq!(half.rows, 2, "shard 0/2 holds cases c0 and c2");
+        assert_eq!(half.states.get("PASS"), Some(&1));
+    }
+
+    #[test]
+    fn the_report_covers_every_receipt_in_the_directory() {
+        let scratch = Scratch::new();
+        let receipts = scratch.0.join("merged");
+        fs::create_dir_all(&receipts).unwrap();
+        write_lane(
+            &receipts.join("a.jsonl"),
+            SHA_A,
+            (0, 1),
+            [Pass, Pass, Pass, Fail],
+        );
+        write_lane(
+            &receipts.join("b.jsonl"),
+            SHA_A,
+            (1, 2),
+            [Pass, Fail, Fail, Fail],
+        );
+        fs::write(receipts.join("notes.txt"), "not a receipt").unwrap();
+        let out = scratch.0.join("status.md");
+
+        let summary = status_report(&StatusRequest {
+            receipts,
+            out: out.clone(),
+        })
+        .unwrap();
+        assert!(summary.contains("2 receipt(s)"), "{summary}");
+        let report = fs::read_to_string(&out).unwrap();
+        assert!(report.contains("shard merged"), "{report}");
+        assert!(report.contains("shard 1/2"), "{report}");
+        assert!(report.contains(&SHA_A[..12]), "{report}");
+        let sidecar = fs::read_to_string(scratch.0.join("status.json")).unwrap();
+        let lanes: StatusFile = serde_json::from_str(&sidecar).unwrap();
+        assert_eq!(lanes.lanes.len(), 2);
+    }
+
+    #[test]
+    fn a_later_report_shows_the_change_since_the_previous_one() {
+        let scratch = Scratch::new();
+        let receipts = scratch.0.join("merged");
+        fs::create_dir_all(&receipts).unwrap();
+        let out = scratch.0.join("status.md");
+        let request = StatusRequest {
+            receipts: receipts.clone(),
+            out: out.clone(),
+        };
+
+        write_lane(
+            &receipts.join("a.jsonl"),
+            SHA_A,
+            (0, 1),
+            [Pass, Fail, Fail, Fail],
+        );
+        status_report(&request).unwrap();
+        let first = fs::read_to_string(&out).unwrap();
+        assert!(
+            first.contains("new"),
+            "a first report marks the lane new: {first}"
+        );
+
+        write_lane(
+            &receipts.join("a.jsonl"),
+            SHA_B,
+            (0, 1),
+            [Pass, Pass, Pass, Fail],
+        );
+        status_report(&request).unwrap();
+        let second = fs::read_to_string(&out).unwrap();
+        assert!(
+            second.contains(&SHA_A[..12]),
+            "names the previous commit: {second}"
+        );
+        assert!(second.contains("| PASS | 3 | +2 |"), "{second}");
+        assert!(second.contains("| BLOCKING_FAIL | 1 | -2 |"), "{second}");
+
+        status_report(&request).unwrap();
+        let third = fs::read_to_string(&out).unwrap();
+        assert!(
+            third.contains("| PASS | 3 | 0 |"),
+            "an unchanged lane shows no change: {third}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_receipt_is_refused_by_the_status_report() {
+        let scratch = Scratch::new();
+        let receipts = scratch.0.join("merged");
+        fs::create_dir_all(&receipts).unwrap();
+        let path = receipts.join("a.jsonl");
+        write_lane(&path, SHA_A, (0, 1), [Pass, Pass, Fail, Fail]);
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        fs::write(&path, lines[..lines.len() - 1].join("\n")).unwrap();
+        let out = scratch.0.join("status.md");
+        assert!(
+            status_report(&StatusRequest {
+                receipts,
+                out: out.clone()
+            })
+            .is_err()
+        );
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn one_receipt_that_mixes_modes_is_refused() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("mixed.jsonl");
+        let aot = key("c0");
+        let jit = ObligationKey::new(
+            "typescript-7.0.2",
+            "c1",
+            "default#diagnostics",
+            ExecutionMode::Jit,
+            "aarch64-apple-darwin",
+        )
+        .unwrap();
+        let catalog = vec![aot.clone(), jit.clone()];
+        let shard = ShardIdentity::plan(ShardSpec::unsharded(), &catalog).unwrap();
+        let pin = ToolchainPin::new("rustc-1.97.1", DIGEST).unwrap();
+        let binding = RunBinding::new(DIGEST, DIGEST, DIGEST, DIGEST, pin).unwrap();
+        let header =
+            EvidenceHeader::new(shard, binding, ExecutionBinding::local_for_tests()).unwrap();
+        let rows: Vec<EvidenceRow> = [aot, jit]
+            .into_iter()
+            .map(|key| {
+                EvidenceRow::new(
+                    key,
+                    vec!["run".to_owned()],
+                    WorkingDirectoryPolicy::RepositoryRoot,
+                    BTreeSet::from(["diagnostics".to_owned()]),
+                    BTreeMap::new(),
+                    TerminalState::BlockingFail,
+                    1,
+                    "x",
+                )
+                .unwrap()
+            })
+            .collect();
+        publish_evidence(&path, header, &rows, PublishMode::Replace).unwrap();
+        assert!(read_lane_status(&path).is_err());
+    }
+
+    #[test]
+    fn a_receipt_directory_with_no_receipts_or_a_bad_one_is_an_error() {
+        let scratch = Scratch::new();
+        let empty = scratch.0.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let out = scratch.0.join("status.md");
+        let none = status_report(&StatusRequest {
+            receipts: empty,
+            out: out.clone(),
+        });
+        assert!(
+            none.is_err(),
+            "an empty directory must not yield an empty report"
+        );
+
+        let bad = scratch.0.join("bad");
+        fs::create_dir_all(&bad).unwrap();
+        fs::write(bad.join("x.jsonl"), "{\"not\":\"a receipt\"}\n").unwrap();
+        assert!(
+            status_report(&StatusRequest {
+                receipts: bad,
+                out: out.clone()
+            })
+            .is_err()
+        );
+        assert!(!out.exists(), "a failed report must not leave a file");
     }
 
     #[test]
