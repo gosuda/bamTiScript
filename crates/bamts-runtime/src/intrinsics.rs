@@ -963,12 +963,12 @@ fn ordinary_prototype(heap: &mut Vec<HeapEntry>, object_prototype: Value) -> Val
         },
     )
 }
-pub(crate) fn native_function(
+/// The `length` and `name` every built-in function owns, in that order.
+pub(crate) fn native_function_properties(
     heap: &mut Vec<HeapEntry>,
-    id: BuiltinId,
     name: &'static str,
     length: u32,
-) -> Value {
+) -> PropertyMap {
     let name_value = push(heap, HeapEntry::String(EcmaString::encode(name)));
     let mut properties = PropertyMap::default();
     properties.insert(
@@ -989,6 +989,15 @@ pub(crate) fn native_function(
             configurable: true,
         },
     );
+    properties
+}
+pub(crate) fn native_function(
+    heap: &mut Vec<HeapEntry>,
+    id: BuiltinId,
+    name: &'static str,
+    length: u32,
+) -> Value {
+    let properties = native_function_properties(heap, name, length);
     push(
         heap,
         HeapEntry::native_function(NativeCallable::Builtin(id), properties, None),

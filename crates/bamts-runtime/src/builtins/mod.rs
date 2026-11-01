@@ -51,6 +51,7 @@ pub(crate) fn install<H: Host>(
     timers_available: bool,
     script_compiler: bool,
 ) {
+    object::install_function_prototype(heap, builtins);
     symbol::install(heap, globals, builtins);
     let bigint_prototype = bigint::install(heap, globals, builtins);
     builtins.set_bigint_prototype(bigint_prototype);

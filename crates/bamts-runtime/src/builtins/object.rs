@@ -9,14 +9,45 @@ use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
 use super::{
-    allocate_string, define_data, install_constructor_function, install_function, range_error,
-    to_integer_or_infinity, type_error, value_number,
+    allocate_string, define_data, heap_index, install_constructor_function, install_function,
+    range_error, to_integer_or_infinity, type_error, value_number,
 };
-use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
+use crate::intrinsics::{
+    BuiltinDef, BuiltinHandler, BuiltinOutcome, BuiltinTable, native_function_properties,
+};
 use crate::{
     BoundCallable, EvalFailure, HeapEntry, Host, Machine, NativeCallable, Property, PropertyKey,
     PropertyMap, RuntimeErrorKind,
 };
+
+/// `%Function.prototype%` is itself a function, so this replaces the ordinary
+/// object that had to exist before the builtin table could. Its prototype is
+/// stated explicitly: a native function without one falls back to this object.
+pub(super) fn install_function_prototype<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    builtins: &mut BuiltinTable<H>,
+) {
+    let id = builtins.register(BuiltinDef {
+        name: "",
+        length: 0,
+        handler: function_prototype_call::<H>,
+    });
+    let properties = native_function_properties(heap, "", 0);
+    heap[heap_index(builtins.function_prototype())] = HeapEntry::native_function(
+        NativeCallable::Builtin(id),
+        properties,
+        Some(builtins.object_prototype()),
+    );
+}
+
+fn function_prototype_call<H: Host>(
+    _machine: &mut Machine<'_, H>,
+    _this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -578,6 +609,37 @@ mod tests {
     use super::*;
     use crate::{Limits, RuntimeErrorKind, ThrowOrigin};
     use bamts_bytecode::{FunctionId, ModuleId};
+
+    #[test]
+    fn function_prototype_is_a_function_without_construct() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.function_prototype;
+        assert!(machine.is_callable(prototype).unwrap());
+        assert!(!machine.is_constructor(prototype).unwrap());
+        assert_eq!(
+            machine
+                .call_value(prototype, Value::UNDEFINED, &[Value::int32(1)])
+                .unwrap(),
+            Value::UNDEFINED
+        );
+        assert_eq!(
+            machine.internal_get_prototype_of(prototype).unwrap(),
+            Some(machine.intrinsics.object_prototype),
+            "the chain must not loop back to Function.prototype"
+        );
+        assert_eq!(
+            machine.get_named_property(prototype, "length").unwrap(),
+            Value::int32(0)
+        );
+        let name = machine.get_named_property(prototype, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.is_empty())
+        );
+    }
 
     #[test]
     fn native_function_names_exclude_engine_labels() {
