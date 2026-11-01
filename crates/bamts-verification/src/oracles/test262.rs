@@ -285,6 +285,8 @@ pub struct ExecutionPlan {
     pub harness: HarnessPlan,
     pub negative: Option<Negative>,
     pub async_done: bool,
+    /// The `[[CanBlock]]` of the agent that must run the test.
+    pub can_block: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +310,7 @@ pub struct RunRequest {
     pub script: ComposedScript,
     pub negative: Option<Negative>,
     pub async_done: bool,
+    pub can_block: bool,
     pub deadline: Duration,
 }
 
@@ -584,6 +587,7 @@ pub fn plan_execution(
         harness,
         negative: frontmatter.negative.clone(),
         async_done,
+        can_block: !frontmatter.has(Flag::CanBlockIsFalse),
     })
 }
 
@@ -813,6 +817,7 @@ pub fn evaluate_in_all_modes<R: Test262Runner>(
                 script,
                 negative: plan.negative.clone(),
                 async_done: plan.async_done,
+                can_block: plan.can_block,
                 deadline,
             };
             let outcome = runner.run(&request);
@@ -862,6 +867,7 @@ pub fn evaluate_in_mode<R: Test262Runner>(
             script,
             negative: plan.negative.clone(),
             async_done: plan.async_done,
+            can_block: plan.can_block,
             deadline,
         };
         let outcome = runner.run(&request);
@@ -1022,7 +1028,10 @@ impl Test262Runner for InterpreterRunner {
             }
         };
 
-        let limits = interpreter_fuel(request.deadline);
+        let limits = bamts_runtime::Limits {
+            agent_can_suspend: request.can_block,
+            ..interpreter_fuel(request.deadline)
+        };
         let started = Instant::now();
         let mut host = bamts_node::NodeHost::new();
         // Dynamic `Function(...)` synthesis needs a compile provider; the
@@ -1442,6 +1451,7 @@ function $ERROR(message) {\n\
             script,
             negative: plan.negative.clone(),
             async_done: plan.async_done,
+            can_block: plan.can_block,
             deadline: SEMANTIC_FIXTURE_DEADLINE,
         };
         let outcome = runner.run(&request);
@@ -1477,6 +1487,7 @@ function $ERROR(message) {\n\
             },
             negative: None,
             async_done: false,
+            can_block: true,
             deadline: Duration::from_secs(10),
         };
         let outcome = runner.run(&request);
@@ -1737,6 +1748,7 @@ function $ERROR(message) {\n\
                 script,
                 negative: plan.negative.clone(),
                 async_done: plan.async_done,
+                can_block: plan.can_block,
                 deadline: DEFAULT_ASYNC_DEADLINE,
             };
             let outcome = PassRunner.run(&request);
@@ -2011,6 +2023,29 @@ function $ERROR(message) {\n\
             run_variant_in(mode, &runner, &parsed, &plan, &sources, variant)?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn can_block_is_false_runs_on_an_agent_that_cannot_suspend() {
+        let body = "var view = new Int32Array(new SharedArrayBuffer(8));\n\
+                    var threw = false;\n\
+                    try { Atomics.wait(view, 0, 0, 0); } catch (e) { threw = e instanceof TypeError; }\n\
+                    assert.sameValue(threw, true);\n";
+        let source = wrap(
+            "description: agent cannot block\nflags: [CanBlockIsFalse]",
+            body,
+        );
+        for mode in ExecutionMode::ALL {
+            run_fixture_in(mode, "can-block-false", &source).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_case_with_no_can_block_flag_runs_on_an_agent_that_can_suspend() {
+        let body = "var view = new Int32Array(new SharedArrayBuffer(8));\n\
+                    assert.sameValue(Atomics.wait(view, 0, 0, 0), 'timed-out');\n";
+        let source = wrap("description: agent can block", body);
+        run_fixture("can-block-default", &source).unwrap();
     }
 
     #[test]
@@ -2606,6 +2641,7 @@ function $ERROR(message) {\n\
             },
             negative,
             async_done: true,
+            can_block: true,
             deadline: Duration::from_millis(100),
         }
     }
@@ -2982,6 +3018,7 @@ function $ERROR(message) {\n\
                 script,
                 negative: plan.negative.clone(),
                 async_done: plan.async_done,
+                can_block: plan.can_block,
                 deadline: Duration::from_millis(1),
             };
             let outcome = runner.run(&request);
@@ -3014,6 +3051,7 @@ function $ERROR(message) {\n\
                 },
                 negative: None,
                 async_done: false,
+                can_block: true,
                 deadline: Duration::from_millis(100),
             });
         }

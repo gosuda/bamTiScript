@@ -506,6 +506,7 @@ mod tests {
             },
             negative,
             async_done: false,
+            can_block: true,
             deadline: DEADLINE,
         }
     }
