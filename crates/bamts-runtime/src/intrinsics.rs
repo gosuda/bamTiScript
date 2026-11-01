@@ -84,6 +84,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     arraybuffer_constructor: Option<Value>,
     arraybuffer_prototype: Option<Value>,
     dataview_prototype: Option<Value>,
+    sharedarraybuffer_constructor: Option<Value>,
     sharedarraybuffer_prototype: Option<Value>,
     disposable_stack_prototype: Option<Value>,
     async_disposable_stack_prototype: Option<Value>,
@@ -151,6 +152,7 @@ impl<H: Host> BuiltinTable<H> {
             arraybuffer_constructor: None,
             arraybuffer_prototype: None,
             dataview_prototype: None,
+            sharedarraybuffer_constructor: None,
             sharedarraybuffer_prototype: None,
             disposable_stack_prototype: None,
             async_disposable_stack_prototype: None,
@@ -407,6 +409,20 @@ impl<H: Host> BuiltinTable<H> {
     }
     pub(crate) fn set_arraybuffer_prototype(&mut self, prototype: Value) {
         self.arraybuffer_prototype = Some(prototype);
+    }
+    pub(crate) fn set_sharedarraybuffer_constructor(&mut self, constructor: Value) {
+        self.sharedarraybuffer_constructor = Some(constructor);
+    }
+    pub(crate) fn sharedarraybuffer_constructor(&self) -> Value {
+        self.sharedarraybuffer_constructor
+            .expect("SharedArrayBuffer installs before runtime execution")
+    }
+    pub(crate) fn set_sharedarraybuffer_prototype(&mut self, prototype: Value) {
+        self.sharedarraybuffer_prototype = Some(prototype);
+    }
+    pub(crate) fn sharedarraybuffer_prototype(&self) -> Value {
+        self.sharedarraybuffer_prototype
+            .expect("SharedArrayBuffer installs before runtime execution")
     }
     pub(crate) fn arraybuffer_prototype(&self) -> Value {
         self.arraybuffer_prototype
@@ -665,6 +681,7 @@ impl<H: Host> BuiltinTable<H> {
             arraybuffer_constructor,
             arraybuffer_prototype,
             dataview_prototype,
+            sharedarraybuffer_constructor,
             sharedarraybuffer_prototype,
             disposable_stack_prototype,
             async_disposable_stack_prototype,
@@ -724,6 +741,7 @@ impl<H: Host> BuiltinTable<H> {
             *arraybuffer_constructor,
             *arraybuffer_prototype,
             *dataview_prototype,
+            *sharedarraybuffer_constructor,
             *sharedarraybuffer_prototype,
             *disposable_stack_prototype,
             *async_disposable_stack_prototype,
@@ -1249,7 +1267,7 @@ mod tests {
             Value::int32(5),
             Value::int32(6),
         );
-        let roots: Vec<Value> = (101..=145).map(Value::int32).collect();
+        let roots: Vec<Value> = (101..=146).map(Value::int32).collect();
         table.typedarray_constructor = Some(roots[0]);
         table.promise_capability_executor = Some(roots[1]);
         table.promise_finally_value = Some(roots[2]);
@@ -1275,6 +1293,7 @@ mod tests {
             table.typedarray_constructors[offset] = Some(roots[21 + offset]);
             table.typedarray_prototypes[offset] = Some(roots[33 + offset]);
         }
+        table.sharedarraybuffer_constructor = Some(roots[45]);
         let mut visited = Vec::new();
         table.for_each_value(|value| visited.push(value));
         for root in roots {
@@ -1805,8 +1824,8 @@ mod tests {
             "ArrayBuffer is installed before globals"
         );
         assert!(
-            machine.intrinsics.global("SharedArrayBuffer").is_none(),
-            "SharedArrayBuffer waits for atomics install"
+            machine.intrinsics.global("SharedArrayBuffer").is_some(),
+            "SharedArrayBuffer is installed by the atomics surface"
         );
         let _ = machine.intrinsics.builtins.arraybuffer_constructor();
         let _ = machine.intrinsics.builtins.arraybuffer_prototype();

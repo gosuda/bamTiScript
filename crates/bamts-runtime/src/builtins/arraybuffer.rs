@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
-#[cfg(test)]
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
@@ -27,7 +25,6 @@ struct SharedBlockState {
 }
 
 impl SharedBlock {
-    #[cfg(test)]
     pub(crate) fn new(bytes: Vec<u8>, max_byte_length: Option<usize>) -> Self {
         Self {
             state: Mutex::new(SharedBlockState {
@@ -45,7 +42,6 @@ impl SharedBlock {
             .len()
     }
 
-    #[cfg(test)]
     pub(crate) fn max_byte_length(&self) -> usize {
         let state = self
             .state
@@ -84,7 +80,6 @@ impl SharedBlock {
 
     /// Mutates the shared backing store after the caller has charged the owning
     /// heap slot. Length validation belongs to [`grow_shared_array_buffer`].
-    #[cfg(test)]
     fn resize_backing(&self, new_length: usize) -> Result<(), ()> {
         let mut state = self
             .state
@@ -112,7 +107,6 @@ impl SharedBlock {
 /// Grows a SharedArrayBuffer through its owning runtime slot so the byte delta
 /// is charged exactly once, even when other heap entries alias the same
 /// `Arc<SharedBlock>`.
-#[cfg(test)]
 pub(crate) fn grow_shared_array_buffer<H: Host>(
     machine: &mut Machine<'_, H>,
     buffer: Value,
@@ -748,7 +742,7 @@ fn clamp_index(relative: f64, length: usize) -> usize {
         relative.min(length as f64) as usize
     }
 }
-fn to_clamped_index<H: Host>(
+pub(super) fn to_clamped_index<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
     length: usize,
@@ -766,11 +760,11 @@ fn to_clamped_index<H: Host>(
     Ok(clamp_index(integer, length))
 }
 
-fn species_constructor<H: Host>(
+pub(super) fn species_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
+    default: Value,
 ) -> Result<Value, EvalFailure> {
-    let default = machine.intrinsics.builtins.arraybuffer_constructor();
     let constructor = machine.get_named_property(object, "constructor")?;
     if constructor == Value::UNDEFINED {
         return Ok(default);
@@ -810,7 +804,8 @@ fn slice<H: Host>(
         Some(value) => to_clamped_index(machine, value, source_length)?,
     };
     let new_length = end.saturating_sub(start);
-    let constructor = species_constructor(machine, this)?;
+    let default = machine.intrinsics.builtins.arraybuffer_constructor();
+    let constructor = species_constructor(machine, this, default)?;
     let target_value =
         machine.construct_value(constructor, &[crate::number_value(new_length as f64)])?;
     let target = handle(machine, target_value)?;

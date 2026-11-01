@@ -24,6 +24,7 @@ pub(crate) use regexp::{canonical_source, initial_regexp_properties};
 mod annex_b;
 mod array_es2023;
 pub(crate) mod arraybuffer;
+mod atomics;
 pub(crate) mod dataview;
 mod disposable_stack;
 mod error_edge;
@@ -76,6 +77,7 @@ pub(crate) fn install<H: Host>(
     annex_b::install(heap, globals, builtins);
     weakref_finalization::install(heap, globals, builtins);
     arraybuffer::install(heap, globals, builtins);
+    atomics::install(heap, globals, builtins);
     typedarray_all::install(heap, globals, builtins);
     dataview::install(heap, globals, builtins);
     install_globals(heap, globals, builtins);
