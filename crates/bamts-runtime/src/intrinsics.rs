@@ -305,6 +305,10 @@ impl<H: Host> BuiltinTable<H> {
         self.symbol_has_instance
             .expect("Symbol builtins install first")
     }
+    pub(crate) fn symbol_is_concat_spreadable(&self) -> Value {
+        self.symbol_is_concat_spreadable
+            .expect("Symbol builtins install first")
+    }
     pub(crate) fn symbol_match_all(&self) -> Value {
         self.symbol_match_all
             .expect("Symbol builtins install first")

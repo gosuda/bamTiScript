@@ -117,7 +117,7 @@ pub(super) fn index_key(index: usize) -> PropertyKey {
 /// `ArrayCreate(length)` with a preflight before Rust allocates the backing
 /// vector. Copy-by-change methods always create the intrinsic Array, never a
 /// species-derived result.
-fn array_create<H: Host>(
+pub(super) fn array_create<H: Host>(
     machine: &mut Machine<'_, H>,
     length: usize,
 ) -> Result<Value, EvalFailure> {
@@ -148,7 +148,7 @@ fn array_create<H: Host>(
     allocate_array(machine, elements)
 }
 
-fn create_data_property<H: Host>(
+pub(super) fn create_data_property<H: Host>(
     machine: &mut Machine<'_, H>,
     array: Value,
     index: usize,

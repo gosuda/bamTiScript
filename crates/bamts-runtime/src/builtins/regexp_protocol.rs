@@ -805,7 +805,7 @@ pub(super) fn flags_getter<H: Host>(
     )?))
 }
 
-fn species_getter<H: Host>(
+pub(super) fn species_getter<H: Host>(
     _machine: &mut Machine<'_, H>,
     this: Value,
     _args: &[Value],

@@ -7,6 +7,7 @@ use bamts_bytecode::{DescriptorSlot, EcmaString};
 use bamts_native::{Decoded, Value};
 use std::collections::BTreeMap;
 mod array;
+mod array_generic;
 pub(crate) mod bigint;
 mod collections;
 mod date_full;

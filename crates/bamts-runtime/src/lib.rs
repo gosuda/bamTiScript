@@ -1808,6 +1808,9 @@ pub struct Machine<'a, H: Host> {
     native_roots: Vec<Vec<Value>>,
     /// Recently compiled patterns. `exec` runs once per match of a global search,
     /// so recompiling on every call would make it cost a parse per match.
+    /// Objects being joined, innermost last. A cycle passes through native code
+    /// on every level, so no activation limit would stop it.
+    array_join_stack: Vec<Value>,
     regexp_cache: Vec<(
         EcmaString,
         EcmaString,
@@ -2187,6 +2190,7 @@ impl<'a, H: Host> Machine<'a, H> {
             limits,
             native_roots: Vec::new(),
             regexp_cache: Vec::new(),
+            array_join_stack: Vec::new(),
             kept_alive: Vec::new(),
             fuel,
             frames: vec![frame],
