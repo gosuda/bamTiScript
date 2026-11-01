@@ -336,7 +336,7 @@ fn is_pattern_syntax_character(value: u16) -> bool {
 /// A compiled pattern under the full flag set: the engine regex, plus the
 /// public-to-internal capture-name mapping that duplicate named groups need.
 #[derive(Clone, Debug)]
-pub(super) struct CompiledV {
+pub(crate) struct CompiledV {
     regex: Regex,
     flags: VFlags,
     /// Public name in source order, paired with the internal names the lowered
@@ -347,10 +347,6 @@ pub(super) struct CompiledV {
 }
 
 impl CompiledV {
-    pub(super) fn flags(&self) -> VFlags {
-        self.flags
-    }
-
     pub(super) fn engine_regex(&self) -> &Regex {
         &self.regex
     }
@@ -444,21 +440,7 @@ pub(super) fn compile<H: Host>(
     })
 }
 
-fn last_index_value<H: Host>(machine: &Machine<'_, H>, value: Value) -> Result<usize, EvalFailure> {
-    let numeric = machine.to_number(value)?;
-    let number = match numeric.decode() {
-        Some(bamts_native::Decoded::Int32(value)) => f64::from(value as i32),
-        Some(bamts_native::Decoded::Number(value)) => value,
-        _ => f64::NAN,
-    };
-    if number.is_nan() || number <= 0.0 {
-        return Ok(0);
-    }
-    let upper = (usize::MAX as f64).min(9_007_199_254_740_991.0);
-    Ok(number.floor().min(upper) as usize)
-}
-
-fn execution_failure(error: RegexError) -> EvalFailure {
+pub(super) fn execution_failure(error: RegexError) -> EvalFailure {
     match error.kind() {
         RegexErrorKind::BudgetExhausted => {
             EvalFailure::Runtime(crate::RuntimeErrorKind::RegexpStepBudgetExceeded {
@@ -471,47 +453,16 @@ fn execution_failure(error: RegexError) -> EvalFailure {
     }
 }
 
-/// Executes the compiled matcher and performs the observable lastIndex
-/// transitions required by RegExpBuiltinExec.
-pub(super) fn execute<H: Host>(
+/// `CreateDataProperty`: the result of a match is built with own properties, so
+/// a setter on `Array.prototype` cannot observe it.
+pub(super) fn create_result_property<H: Host>(
     machine: &mut Machine<'_, H>,
-    regexp: Value,
-    pattern: &EcmaString,
-    flags: &EcmaString,
-    input: &EcmaString,
-) -> Result<(CompiledV, Option<Match>), EvalFailure> {
-    let compiled = compile(machine, pattern, flags)?;
-    let uses_last_index = compiled.flags().global || compiled.flags().sticky;
-    let start = if uses_last_index {
-        let last_index = machine.get_named_property(regexp, "lastIndex")?;
-        last_index_value(machine, last_index)?
-    } else {
-        0
-    };
-    let matched = compiled.exec(input, start).map_err(execution_failure)?;
-    if uses_last_index {
-        let next = matched.as_ref().map_or(0, |matched| matched.range.end);
-        machine.set_data_property(regexp, "lastIndex", crate::number_value(next as f64))?;
-    }
-    Ok((compiled, matched))
-}
-
-/// Implements the dynamic RegExpExec protocol. None asks the caller to use
-/// RegExpBuiltinExec after checking the receiver's RegExp internal state.
-pub(super) fn call_exec_override<H: Host>(
-    machine: &mut Machine<'_, H>,
-    regexp: Value,
-    input: Value,
-) -> Result<Option<Value>, EvalFailure> {
-    let exec = machine.get_named_property(regexp, "exec")?;
-    if !machine.is_callable(exec)? {
-        return Ok(None);
-    }
-    let result = machine.call_value(exec, regexp, &[input])?;
-    if result == Value::NULL || machine.is_object(result) {
-        return Ok(Some(result));
-    }
-    Err(super::type_error("RegExp exec method returned non-object"))
+    array: Value,
+    name: &str,
+    value: Value,
+) -> Result<(), EvalFailure> {
+    let key = crate::PropertyKey::Named(EcmaString::encode(name));
+    machine.create_data_property_key(array, key, value)
 }
 
 pub(super) fn plain_object<H: Host>(machine: &mut Machine<'_, H>) -> Result<Value, EvalFailure> {
@@ -559,13 +510,14 @@ pub(super) fn match_array<H: Host>(
         });
     }
     let array = allocate_array(machine, values)?;
-    machine.set_data_property(
+    create_result_property(
+        machine,
         array,
         "index",
         crate::number_value(matched.range.start as f64),
     )?;
     let input_value = allocate_string(machine, input.clone())?;
-    machine.set_data_property(array, "input", input_value)?;
+    create_result_property(machine, array, "input", input_value)?;
 
     let resolved = compiled.public_named(matched);
     let groups = if resolved.is_empty() {
@@ -579,15 +531,15 @@ pub(super) fn match_array<H: Host>(
                 }
                 None => Value::UNDEFINED,
             };
-            machine.set_data_property(groups, name, value)?;
+            create_result_property(machine, groups, name, value)?;
         }
         groups
     };
-    machine.set_data_property(array, "groups", groups)?;
+    create_result_property(machine, array, "groups", groups)?;
 
     if compiled.flags.has_indices {
         let indices = build_indices(machine, matched, &resolved)?;
-        machine.set_data_property(array, "indices", indices)?;
+        create_result_property(machine, array, "indices", indices)?;
     }
     Ok(array)
 }
@@ -608,11 +560,11 @@ fn build_indices<H: Host>(
         let groups = plain_object(machine)?;
         for (name, range) in resolved {
             let value = range_pair(machine, range.as_ref())?;
-            machine.set_data_property(groups, name, value)?;
+            create_result_property(machine, groups, name, value)?;
         }
         groups
     };
-    machine.set_data_property(indices, "groups", groups)?;
+    create_result_property(machine, indices, "groups", groups)?;
     Ok(indices)
 }
 

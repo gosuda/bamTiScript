@@ -441,6 +441,11 @@ fn iterator_next<H: Host>(
                         IterationKind::Key => key,
                         IterationKind::Value => item_value,
                         IterationKind::Entry => allocate_array(machine, vec![key, item_value])?,
+                        IterationKind::RegExpString => {
+                            return Err(type_error(
+                                "iterator next called on incompatible receiver",
+                            ));
+                        }
                     };
                     (false, value, Some(next))
                 }

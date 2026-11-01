@@ -77,6 +77,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     object_to_string: Option<Value>,
     regexp_prototype: Option<Value>,
     iterator_prototype: Option<Value>,
+    regexp_string_iterator_prototype: Option<Value>,
     async_iterator_prototype: Option<Value>,
     generator_prototype: Option<Value>,
     generator_function_prototype: Option<Value>,
@@ -156,6 +157,7 @@ impl<H: Host> BuiltinTable<H> {
             object_to_string: None,
             regexp_prototype: None,
             iterator_prototype: None,
+            regexp_string_iterator_prototype: None,
             async_iterator_prototype: None,
             generator_prototype: None,
             generator_function_prototype: None,
@@ -287,6 +289,16 @@ impl<H: Host> BuiltinTable<H> {
         self.symbol_has_instance
             .expect("Symbol builtins install first")
     }
+    pub(crate) fn symbol_match_all(&self) -> Value {
+        self.symbol_match_all
+            .expect("Symbol builtins install first")
+    }
+    pub(crate) fn symbol_search(&self) -> Value {
+        self.symbol_search.expect("Symbol builtins install first")
+    }
+    pub(crate) fn symbol_split(&self) -> Value {
+        self.symbol_split.expect("Symbol builtins install first")
+    }
     pub(crate) fn set_symbol_dispose(&mut self, symbol: Value) {
         self.symbol_dispose = Some(symbol);
     }
@@ -362,6 +374,13 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn regexp_prototype(&self) -> Value {
         self.regexp_prototype
             .expect("RegExp builtins install their prototype")
+    }
+    pub(crate) fn set_regexp_string_iterator_prototype(&mut self, prototype: Value) {
+        self.regexp_string_iterator_prototype = Some(prototype);
+    }
+    pub(crate) fn regexp_string_iterator_prototype(&self) -> Value {
+        self.regexp_string_iterator_prototype
+            .expect("RegExp builtins install the string iterator prototype")
     }
     pub(crate) fn set_iterator_prototype(&mut self, prototype: Value) {
         self.iterator_prototype = Some(prototype);
@@ -760,6 +779,7 @@ impl<H: Host> BuiltinTable<H> {
             object_to_string,
             regexp_prototype,
             iterator_prototype,
+            regexp_string_iterator_prototype,
             async_iterator_prototype,
             generator_prototype,
             generator_function_prototype,
@@ -834,6 +854,7 @@ impl<H: Host> BuiltinTable<H> {
             *object_to_string,
             *regexp_prototype,
             *iterator_prototype,
+            *regexp_string_iterator_prototype,
             *async_iterator_prototype,
             *generator_prototype,
             *generator_function_prototype,

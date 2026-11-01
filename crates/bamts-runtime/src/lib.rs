@@ -690,6 +690,8 @@ enum IterationKind {
     Key,
     Value,
     Entry,
+    /// A `%RegExpStringIteratorPrototype%` instance; `source` is its hidden state.
+    RegExpString,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1798,6 +1800,13 @@ pub struct Machine<'a, H: Host> {
     limits: Limits,
     gc: gc::GcState,
     native_roots: Vec<Vec<Value>>,
+    /// Recently compiled patterns. `exec` runs once per match of a global search,
+    /// so recompiling on every call would make it cost a parse per match.
+    regexp_cache: Vec<(
+        EcmaString,
+        EcmaString,
+        std::rc::Rc<intrinsics::builtins::regexp_v::CompiledV>,
+    )>,
     /// Values kept strongly reachable for the current ECMAScript job by
     /// WeakRef construction/deref. Cleared exactly once at the outer job seam.
     kept_alive: Vec<Value>,
@@ -2171,6 +2180,7 @@ impl<'a, H: Host> Machine<'a, H> {
             gc: gc::GcState::new(&limits),
             limits,
             native_roots: Vec::new(),
+            regexp_cache: Vec::new(),
             kept_alive: Vec::new(),
             fuel,
             frames: vec![frame],

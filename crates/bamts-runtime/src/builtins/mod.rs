@@ -32,7 +32,7 @@ mod map_set_edge;
 mod math_edge;
 mod number_format;
 mod regexp_protocol;
-mod regexp_v;
+pub(crate) mod regexp_v;
 mod set_methods;
 mod string;
 mod string_edge;
@@ -93,6 +93,22 @@ pub(crate) fn install<H: Host>(
     reflect::install(heap, globals, builtins);
     uri::install(heap, globals, builtins);
     disposable_stack::install(heap, globals, builtins);
+}
+/// Runs `body` with `roots` kept alive across any user code it reaches. The
+/// frame's depth is passed in, so `keep_root` can add values found along the way.
+fn with_roots<H: Host, T>(
+    machine: &mut Machine<'_, H>,
+    roots: &[Value],
+    body: impl FnOnce(&mut Machine<'_, H>, usize) -> Result<T, EvalFailure>,
+) -> Result<T, EvalFailure> {
+    let depth = machine.native_roots.len();
+    machine.push_native_roots(depth, roots);
+    let result = body(machine, depth);
+    machine.pop_native_roots(depth);
+    result
+}
+fn keep_root<H: Host>(machine: &mut Machine<'_, H>, depth: usize, value: Value) {
+    machine.native_roots[depth].push(value);
 }
 fn install_function<H: Host>(
     heap: &mut Vec<HeapEntry>,

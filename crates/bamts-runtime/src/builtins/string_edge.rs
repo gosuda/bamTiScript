@@ -378,7 +378,7 @@ fn replace_all<H: Host>(
     let search = args.first().copied().unwrap_or(Value::UNDEFINED);
     let replacement = args.get(1).copied().unwrap_or(Value::UNDEFINED);
 
-    if !matches!(search.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+    if machine.is_object(search) {
         if is_regexp(machine, search)? {
             let flags = machine.get_named_property(search, "flags")?;
             require_coercible(flags)?;
