@@ -4,6 +4,7 @@
 //! observe: argument conversion, the order options and properties are read in,
 //! receiver checks, and the shape of the installed objects.
 
+mod collator;
 mod locale;
 mod options;
 
@@ -17,16 +18,33 @@ use super::{
 };
 use crate::intl::canonical_locales;
 use crate::intl::locale_data::DATA;
-use crate::intl::locale_negotiation::LanguageTag;
+use crate::intl::locale_negotiation::{LanguageTag, supported_locales};
 use crate::intl::{IntlKind, IntlObject};
-use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey, PropertyMap};
+use crate::intrinsics::{BuiltinDef, BuiltinHandler, BuiltinOutcome, BuiltinTable};
+use crate::{
+    BoundCallable, EvalFailure, HeapEntry, Host, Machine, NativeCallable, Property, PropertyKey,
+    PropertyMap,
+};
 
 /// Name, `length`, and implementation of one installed function.
 pub(super) type Method<H> = (&'static str, u32, BuiltinHandler<H>);
 
 /// Property name, function name, and implementation of one accessor.
 pub(super) type Getter<H> = (&'static str, &'static str, BuiltinHandler<H>);
+
+/// A function the runtime hands out but never installs, found again by `name`.
+pub(super) fn register_hidden<H: Host>(
+    builtins: &mut BuiltinTable<H>,
+    name: &'static str,
+    length: u32,
+    handler: BuiltinHandler<H>,
+) {
+    builtins.register(BuiltinDef {
+        name,
+        length,
+        handler,
+    });
+}
 
 /// The installed shape of one Intl class.
 struct Class<'a, H: Host> {
@@ -90,6 +108,7 @@ pub(super) fn install<H: Host>(
         define_data(heap, namespace, name, function);
     }
     locale::install(heap, builtins, namespace);
+    collator::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Intl"), namespace);
 }
 
@@ -176,6 +195,100 @@ pub(super) fn locale_record<'a, H: Host>(
     })
 }
 
+/// The prototype OrdinaryCreateFromConstructor picks. The service constructors
+/// read it first, before their arguments; a plain call has no `new.target`.
+pub(super) fn instance_prototype<H: Host>(
+    machine: &mut Machine<'_, H>,
+    kind: IntlKind,
+    constructing: bool,
+) -> Result<Value, EvalFailure> {
+    if constructing {
+        let new_target = machine.current_new_target();
+        let prototype = machine.get_named_property(new_target, "prototype")?;
+        if is_object(machine, prototype)? {
+            return Ok(prototype);
+        }
+    }
+    Ok(machine.intrinsics.builtins.intl_prototype(kind))
+}
+
+/// The cached function of a `format` or `compare` getter. The bound receiver
+/// is what makes one function per instance, as those getters promise.
+pub(super) fn bound_function<H: Host>(
+    machine: &mut Machine<'_, H>,
+    instance: Value,
+    builtin: &str,
+    length: u32,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let index = machine
+        .runtime_slot(instance)
+        .map_err(EvalFailure::Runtime)?
+        .expect("the getter checked its receiver");
+    if let HeapEntry::Intl {
+        bound: Some(function),
+        ..
+    } = &machine.heap[index]
+    {
+        return Ok(BuiltinOutcome::Value(*function));
+    }
+    let id = machine
+        .intrinsics
+        .builtins
+        .id_named(builtin)
+        .expect("Intl registers its hidden functions");
+    let target = machine
+        .allocate(HeapEntry::native_function(
+            NativeCallable::Builtin(id),
+            PropertyMap::default(),
+            None,
+        ))
+        .map_err(EvalFailure::Runtime)?;
+    let function = machine
+        .allocate(HeapEntry::native_function(
+            NativeCallable::Bound(Box::new(BoundCallable {
+                target,
+                this_value: instance,
+                arguments: Vec::new(),
+            })),
+            PropertyMap::default(),
+            None,
+        ))
+        .map_err(EvalFailure::Runtime)?;
+    let name = string_value(machine, "")?;
+    for (key, value) in [
+        ("length", crate::number_value(f64::from(length))),
+        ("name", name),
+    ] {
+        machine.define_descriptor(
+            function,
+            PropertyKey::Named(EcmaString::encode(key)),
+            Property::Data {
+                value,
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        )?;
+    }
+    if let HeapEntry::Intl { bound, .. } = &mut machine.heap[index] {
+        *bound = Some(function);
+    }
+    Ok(BuiltinOutcome::Value(function))
+}
+
+/// `supportedLocalesOf` of every service.
+pub(super) fn supported_locales_outcome<H: Host>(
+    machine: &mut Machine<'_, H>,
+    args: &[Value],
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let requested = options::canonicalize_locale_list(machine, arg(args, 0))?;
+    let options = options::coerce_options_to_object(machine, arg(args, 1))?;
+    let matcher = options::locale_matcher_option(machine, options)?;
+    let supported = supported_locales(&requested, matcher, &*DATA)
+        .map_err(|error| range_error(machine, error.to_string()))?;
+    string_array_outcome(machine, &supported)
+}
+
 /// Allocates an instance with the class's own prototype.
 pub(super) fn create<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -203,7 +316,7 @@ pub(super) fn construct<H: Host>(
     allocate(machine, value, prototype).map(BuiltinOutcome::Value)
 }
 
-fn allocate<H: Host>(
+pub(super) fn allocate<H: Host>(
     machine: &mut Machine<'_, H>,
     value: IntlObject,
     prototype: Value,

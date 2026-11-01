@@ -6,7 +6,7 @@ use bamts_native::Value;
 
 use super::{is_object, locale_record, range_error, type_error};
 use crate::intl::locale_data::DATA;
-use crate::intl::locale_negotiation::canonicalize_unicode_locale_id;
+use crate::intl::locale_negotiation::{LocaleMatcher, canonicalize_unicode_locale_id};
 use crate::intrinsics::builtins::array_es2023::{index_key, length_of_array_like};
 use crate::{EvalFailure, Host, Machine};
 
@@ -73,6 +73,19 @@ pub(super) fn boolean_option<H: Host>(
     } else {
         Ok(Some(machine.to_boolean(value)))
     }
+}
+
+/// The `localeMatcher` option every constructor reads.
+pub(super) fn locale_matcher_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<LocaleMatcher, EvalFailure> {
+    let value = string_option(machine, options, "localeMatcher", &["lookup", "best fit"])?;
+    Ok(if value.as_deref() == Some("lookup") {
+        LocaleMatcher::Lookup
+    } else {
+        LocaleMatcher::BestFit
+    })
 }
 
 /// CanonicalizeLocaleList. Elements are read and validated one at a time, so

@@ -3,6 +3,7 @@
 use std::fmt;
 
 pub mod canonical_locales;
+mod collation;
 pub mod collator;
 pub mod date_time_format;
 mod locale_aliases;

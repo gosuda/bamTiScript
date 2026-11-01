@@ -1033,6 +1033,15 @@ fn best_fit_available(
     provider: &dyn LocaleDataProvider,
 ) -> Result<Option<MatchResult>, LocaleError> {
     let requested_tag = LanguageTag::parse(requested_locale)?;
+    if let Some(locale) = best_available_locale(
+        provider.available_locales(),
+        &requested_tag.without_unicode().render(),
+    ) {
+        return Ok(Some(MatchResult {
+            locale,
+            extension: requested_tag.unicode,
+        }));
+    }
     if let Some(max_requested) = provider.add_likely_subtags(&requested_tag.id) {
         let mut best: Option<(u8, String)> = None;
         for available in provider.available_locales() {

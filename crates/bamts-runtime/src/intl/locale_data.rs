@@ -6,9 +6,15 @@
 //! locales. A locale outside that set is reported as unsupported through the
 //! ordinary `supportedLocalesOf` and fallback paths.
 
+use std::cmp::Ordering;
 use std::sync::LazyLock;
 
 use super::canonical_locales::SupportedValuesInventory;
+use super::collation;
+use super::collator::{
+    CollatorCompareRequest, CollatorDataProvider, CollatorLocaleDefaults, CollatorSensitivity,
+    CollatorUsage,
+};
 use super::locale_aliases::{
     COMPLEX_REGION_ALIASES, LANGUAGE_ALIASES, REGION_ALIASES, TAG_ALIASES, TRANSFORM_TYPE_ALIASES,
     UNICODE_TYPE_ALIASES, VARIANT_ALIASES, VariantAlias,
@@ -394,6 +400,19 @@ pub fn numbering_system_digits(name: &str) -> Option<[char; 10]> {
     Some(std::array::from_fn(|digit| {
         char::from_u32(u32::from(zero) + digit as u32).expect("digits are assigned code points")
     }))
+}
+
+/// The value of a decimal digit of any numbering system this runtime knows.
+#[must_use]
+pub fn decimal_digit_value(character: char) -> Option<u32> {
+    if let Some(digit) = character.to_digit(10) {
+        return Some(digit);
+    }
+    let code = u32::from(character);
+    CONTIGUOUS_NUMBERING_SYSTEMS.iter().find_map(|(_, zero)| {
+        code.checked_sub(u32::from(*zero))
+            .filter(|digit| *digit < 10)
+    })
 }
 
 /// ISO 4217 codes.
@@ -807,6 +826,9 @@ pub struct IntlData {
     numbering_systems: Vec<String>,
     time_zones: Vec<String>,
     units: Vec<String>,
+    collation_keywords: Vec<String>,
+    case_first_keywords: Vec<String>,
+    numeric_keywords: Vec<String>,
 }
 
 /// The one instance services hold a reference to.
@@ -829,6 +851,11 @@ pub static DATA: LazyLock<IntlData> = LazyLock::new(|| {
             .map(|(name, _)| (*name).to_owned())
             .collect(),
         units: owned(&SANCTIONED_UNITS),
+        collation_keywords: std::iter::once(String::new())
+            .chain(COLLATIONS.iter().map(|value| (*value).to_owned()))
+            .collect(),
+        case_first_keywords: owned(&["false", "lower", "upper"]),
+        numeric_keywords: owned(&["false", "true"]),
     }
 });
 
@@ -850,6 +877,18 @@ impl SupportedValuesInventory for IntlData {
     }
     fn supported_units(&self) -> &[String] {
         &self.units
+    }
+}
+
+impl CollatorDataProvider for IntlData {
+    fn locale_defaults(&self, _data_locale: &str, _usage: CollatorUsage) -> CollatorLocaleDefaults {
+        CollatorLocaleDefaults {
+            sensitivity: CollatorSensitivity::Variant,
+            ignore_punctuation: false,
+        }
+    }
+    fn compare(&self, request: CollatorCompareRequest<'_>) -> Option<Ordering> {
+        Some(collation::compare(&request))
     }
 }
 
@@ -906,6 +945,14 @@ impl LocaleDataProvider for IntlData {
     }
     fn transform_type_alias(&self, key: &str, value: &str) -> Option<&str> {
         triple(TRANSFORM_TYPE_ALIASES, key, value)
+    }
+    fn key_values(&self, _data_locale: &str, key: &str) -> &[String] {
+        match key {
+            "co" => &self.collation_keywords,
+            "kf" => &self.case_first_keywords,
+            "kn" => &self.numeric_keywords,
+            _ => &[],
+        }
     }
     fn add_likely_subtags(&self, locale: &LanguageId) -> Option<LanguageId> {
         add_likely_subtags(locale)
