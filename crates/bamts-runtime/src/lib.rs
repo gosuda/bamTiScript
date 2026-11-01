@@ -12896,7 +12896,7 @@ impl<'a, H: Host> Machine<'a, H> {
             BinaryOp::Multiply => number_value(left * right),
             BinaryOp::Divide => Value::number(left / right),
             BinaryOp::Remainder => Value::number(left % right),
-            BinaryOp::Exponent => Value::number(left.powf(right)),
+            BinaryOp::Exponent => Value::number(number_exponentiate(left, right)),
             BinaryOp::BitAnd => Value::int32((to_int32(left) & to_int32(right)) as u32),
             BinaryOp::BitOr => Value::int32((to_int32(left) | to_int32(right)) as u32),
             BinaryOp::BitXor => Value::int32((to_int32(left) ^ to_int32(right)) as u32),
@@ -13651,6 +13651,16 @@ fn number_value(number: f64) -> Value {
         Value::int32(number as i32 as u32)
     } else {
         Value::number(number)
+    }
+}
+
+/// `Number::exponentiate`, which differs from `powf` for a base of 1 or -1 and a
+/// NaN or infinite exponent.
+pub(crate) fn number_exponentiate(base: f64, exponent: f64) -> f64 {
+    if exponent.is_nan() || (base.abs() == 1.0 && exponent.is_infinite()) {
+        f64::NAN
+    } else {
+        base.powf(exponent)
     }
 }
 

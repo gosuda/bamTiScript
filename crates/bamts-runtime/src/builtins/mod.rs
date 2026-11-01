@@ -586,7 +586,9 @@ fn math_pow<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let x = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
     let y = value_number(machine.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))?);
-    Ok(BuiltinOutcome::Value(crate::number_value(x.powf(y))))
+    Ok(BuiltinOutcome::Value(crate::number_value(
+        crate::number_exponentiate(x, y),
+    )))
 }
 fn math_random<H: Host>(
     machine: &mut Machine<'_, H>,

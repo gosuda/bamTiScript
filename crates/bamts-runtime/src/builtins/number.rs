@@ -362,6 +362,15 @@ mod tests {
     use crate::Limits;
 
     #[test]
+    fn exponentiation_differs_from_powf_for_a_unit_base() {
+        assert!(crate::number_exponentiate(1.0, f64::INFINITY).is_nan());
+        assert!(crate::number_exponentiate(-1.0, f64::NEG_INFINITY).is_nan());
+        assert!(crate::number_exponentiate(1.0, f64::NAN).is_nan());
+        assert_eq!(crate::number_exponentiate(f64::NAN, 0.0), 1.0);
+        assert_eq!(crate::number_exponentiate(2.0, 10.0), 1024.0);
+    }
+
+    #[test]
     fn number_parsers_are_the_global_functions() {
         let program = blank_program("<test>");
         let mut host = TestHost;
