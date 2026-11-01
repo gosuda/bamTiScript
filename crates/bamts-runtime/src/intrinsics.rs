@@ -987,9 +987,10 @@ impl<H: Host> Intrinsics<H> {
                 length_writable: true,
             },
         );
-        let string_prototype = ordinary_prototype(heap, object_prototype);
-        let number_prototype = ordinary_prototype(heap, object_prototype);
-        let boolean_prototype = ordinary_prototype(heap, object_prototype);
+        let empty_string = push(heap, HeapEntry::String(EcmaString::encode("")));
+        let string_prototype = wrapper_prototype(heap, object_prototype, empty_string);
+        let number_prototype = wrapper_prototype(heap, object_prototype, Value::int32(0));
+        let boolean_prototype = wrapper_prototype(heap, object_prototype, Value::FALSE);
         let mut globals = BTreeMap::new();
         let mut builtins = BuiltinTable::new(
             object_prototype,
@@ -1066,6 +1067,22 @@ impl<H: Host> Intrinsics<H> {
         }
         builtins.for_each_value(visit);
     }
+}
+/// A prototype that is itself a wrapper around `primitive`.
+fn wrapper_prototype(
+    heap: &mut Vec<HeapEntry>,
+    object_prototype: Value,
+    primitive: Value,
+) -> Value {
+    push(
+        heap,
+        HeapEntry::Object {
+            properties: PropertyMap::default(),
+            prototype: Some(object_prototype),
+            extensible: true,
+            boxed_primitive: Some(primitive),
+        },
+    )
 }
 fn ordinary_prototype(heap: &mut Vec<HeapEntry>, object_prototype: Value) -> Value {
     push(
@@ -1393,6 +1410,29 @@ mod tests {
     #[derive(Default)]
     struct TestHost;
     impl Host for TestHost {}
+    #[test]
+    fn wrapper_prototypes_hold_their_default_primitive() {
+        let program = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let (number, boolean, string) = (
+            machine.intrinsics.number_prototype,
+            machine.intrinsics.boolean_prototype,
+            machine.intrinsics.string_prototype,
+        );
+        assert_eq!(
+            machine.unbox_primitive_or_self(number).unwrap(),
+            Value::int32(0)
+        );
+        assert_eq!(
+            machine.unbox_primitive_or_self(boolean).unwrap(),
+            Value::FALSE
+        );
+        assert_eq!(
+            machine.get_named_property(string, "length").unwrap(),
+            Value::int32(0)
+        );
+    }
     fn module() -> Program<Verified> {
         let code = Module::new(
             vec![Constant::String(EcmaString::encode("<test>"))],
