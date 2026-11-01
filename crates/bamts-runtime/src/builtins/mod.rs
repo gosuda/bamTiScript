@@ -1005,7 +1005,10 @@ impl<'a, H: Host> Machine<'a, H> {
         if self.same_value(proposed, current) {
             return Ok(true);
         }
-        if !property_descriptor::is_extensible(self, object)? {
+        // %Object.prototype% is an immutable prototype exotic object.
+        if object == self.intrinsics.object_prototype
+            || !property_descriptor::is_extensible(self, object)?
+        {
             return Ok(false);
         }
         let mut node = proposed;

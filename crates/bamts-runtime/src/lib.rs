@@ -8523,10 +8523,6 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn own_get_ascii(&self, index: usize, name: &str) -> Option<Found> {
         debug_assert!(name.is_ascii());
-        let slot = |value| self.runtime_slot(value).ok().flatten();
-        if slot(self.intrinsics.object_prototype) == Some(index) && name == "toString" {
-            return Some(Found::Value(self.intrinsics.object_to_string()));
-        }
         match &self.heap[index] {
             HeapEntry::Object {
                 properties,
@@ -8660,12 +8656,6 @@ impl<'a, H: Host> Machine<'a, H> {
     /// Looks up an own property of the heap entry at `index`, returning `None`
     /// when the key is absent so the caller may continue up the prototype chain.
     fn own_get(&self, index: usize, key: &PropertyKey) -> Option<Found> {
-        if let PropertyKey::Named(name) = key {
-            let slot = |value| self.runtime_slot(value).ok().flatten();
-            if slot(self.intrinsics.object_prototype) == Some(index) && name.eq_ascii("toString") {
-                return Some(Found::Value(self.intrinsics.object_to_string()));
-            }
-        }
         match &self.heap[index] {
             HeapEntry::Object {
                 properties,

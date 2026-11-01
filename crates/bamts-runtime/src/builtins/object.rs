@@ -360,7 +360,8 @@ fn prototype_to_string<H: Host>(
         Some(Decoded::Undefined) => EcmaString::encode("Undefined"),
         Some(Decoded::Null) => EcmaString::encode("Null"),
         _ => {
-            let fallback = machine.object_to_string_tag(this)?;
+            let object = machine.value_to_object(this)?;
+            let fallback = machine.object_to_string_tag(object)?;
             let symbol = machine.intrinsics.builtins.symbol_to_string_tag();
             let key = PropertyKey::Symbol(
                 machine
@@ -368,7 +369,7 @@ fn prototype_to_string<H: Host>(
                     .map_err(EvalFailure::Runtime)?
                     .expect("well-known symbol belongs to the runtime heap") as u32,
             );
-            let tag_value = machine.get_property_key(this, &key)?;
+            let tag_value = machine.get_property_key(object, &key)?;
             machine
                 .string_value(tag_value)
                 .unwrap_or_else(|| EcmaString::encode(fallback))
@@ -393,10 +394,10 @@ fn has_own_property<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let key = machine.to_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    Ok(BuiltinOutcome::Value(Value::boolean(
-        machine.has_own_property_key(this, &key)?,
-    )))
+    let key = machine.observable_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let object = machine.value_to_object(this)?;
+    let own = machine.internal_get_own_property(object, &key)?.is_some();
+    Ok(BuiltinOutcome::Value(Value::boolean(own)))
 }
 
 fn is_prototype_of<H: Host>(
@@ -406,8 +407,12 @@ fn is_prototype_of<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let mut value = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if !machine.is_object(value) {
+        return Ok(BuiltinOutcome::Value(Value::FALSE));
+    }
+    let object = machine.value_to_object(this)?;
     while let Some(prototype) = machine.internal_get_prototype_of(value)? {
-        if prototype == this {
+        if prototype == object {
             return Ok(BuiltinOutcome::Value(Value::TRUE));
         }
         value = prototype;
@@ -416,12 +421,12 @@ fn is_prototype_of<H: Host>(
 }
 
 fn value_of<H: Host>(
-    _machine: &mut Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     this: Value,
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    Ok(BuiltinOutcome::Value(this))
+    machine.value_to_object(this).map(BuiltinOutcome::Value)
 }
 
 fn property_is_enumerable<H: Host>(
@@ -430,10 +435,11 @@ fn property_is_enumerable<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let key = machine.to_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let key = machine.observable_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let object = machine.value_to_object(this)?;
     let enumerable = machine
-        .own_descriptor(this, &key)?
-        .is_some_and(|property| property.enumerable());
+        .internal_get_own_property(object, &key)?
+        .is_some_and(|descriptor| descriptor.enumerable == Some(true));
     Ok(BuiltinOutcome::Value(Value::boolean(enumerable)))
 }
 
@@ -768,6 +774,77 @@ mod tests {
         call_object(&mut machine, "freeze", &[wrapper]).unwrap();
         let frozen = call_object(&mut machine, "isFrozen", &[wrapper]).unwrap();
         assert_eq!(frozen, Value::TRUE);
+    }
+
+    #[test]
+    fn object_prototype_methods_convert_their_receiver_after_the_key() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.object_prototype;
+        for name in ["hasOwnProperty", "propertyIsEnumerable"] {
+            let method = machine.get_named_property(prototype, name).unwrap();
+            assert!(matches!(
+                machine.call_value(method, Value::UNDEFINED, &[Value::int32(0)]),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        }
+        let value_of = machine.get_named_property(prototype, "valueOf").unwrap();
+        assert!(machine.call_value(value_of, Value::NULL, &[]).is_err());
+        let boxed = machine.call_value(value_of, Value::TRUE, &[]).unwrap();
+        assert!(machine.is_object(boxed));
+        let is_prototype_of = machine
+            .get_named_property(prototype, "isPrototypeOf")
+            .unwrap();
+        assert_eq!(
+            machine
+                .call_value(is_prototype_of, Value::UNDEFINED, &[Value::int32(1)])
+                .unwrap(),
+            Value::FALSE,
+            "a primitive argument answers before the receiver is converted"
+        );
+    }
+
+    #[test]
+    fn object_prototype_to_string_is_an_ordinary_property() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.object_prototype;
+        assert!(matches!(
+            machine
+                .own_descriptor(prototype, &named("toString"))
+                .unwrap(),
+            Some(Property::Data {
+                writable: true,
+                configurable: true,
+                ..
+            })
+        ));
+        assert!(
+            machine
+                .internal_delete(prototype, &named("toString"))
+                .unwrap()
+        );
+        assert_eq!(
+            machine.get_named_property(prototype, "toString").unwrap(),
+            Value::UNDEFINED
+        );
+    }
+
+    #[test]
+    fn object_prototype_has_an_immutable_prototype() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.object_prototype;
+        let parent = ordinary_object(&mut machine);
+        assert!(
+            !machine
+                .internal_set_prototype_of(prototype, Some(parent))
+                .unwrap()
+        );
+        assert!(machine.internal_set_prototype_of(prototype, None).unwrap());
     }
 
     #[test]
