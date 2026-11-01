@@ -231,6 +231,7 @@ pub struct ResolvedProgram {
     strict_property_initialization: bool,
     always_strict: bool,
     no_emit_helpers: bool,
+    remove_comments: bool,
     use_define_for_class_fields: Option<bool>,
     import_helpers: Option<bool>,
     target: crate::emitter::ScriptTarget,
@@ -353,6 +354,7 @@ impl ResolvedProgram {
         .with_strict_property_initialization(self.strict_property_initialization)
         .with_always_strict(self.always_strict)
         .with_no_emit_helpers(self.no_emit_helpers)
+        .with_remove_comments(self.remove_comments)
         .with_script_target(self.target)
         .with_libs(self.libs)
         .with_check_js(self.check_js)
@@ -743,6 +745,7 @@ impl ProgramLoader {
             strict_property_initialization: self.options.strict_property_initialization(),
             always_strict: self.options.always_strict(),
             no_emit_helpers: self.options.no_emit_helpers(),
+            remove_comments: self.options.remove_comments(),
             use_define_for_class_fields: self.options.use_define_for_class_fields(),
             import_helpers: self.options.import_helpers(),
             target,

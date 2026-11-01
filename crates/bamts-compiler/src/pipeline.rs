@@ -227,6 +227,7 @@ fn program_emit_options(program: &ResolvedProgram, mode: FrontendMode) -> Option
         program.import_helpers(),
     );
     options.no_emit_helpers = check.no_emit_helpers();
+    options.remove_comments = check.remove_comments();
 
     // JSX routing is JavaScript-specific and already shared with the CLI path,
     // which applies the same overrides from `program.jsx()` after its base

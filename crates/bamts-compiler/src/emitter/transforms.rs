@@ -158,6 +158,8 @@ pub struct TransformOptions {
     pub inline_source_map: bool,
     /// Whether JavaScript source maps include the original source text.
     pub inline_sources: bool,
+    /// Leave authored comments out of the output.
+    pub remove_comments: bool,
 }
 
 /// Features found in a file, helpers they require, and diagnostics they produce.
@@ -304,6 +306,7 @@ pub fn emit_transformed(
             source_map: options.source_map,
             inline_source_map: options.inline_source_map,
             inline_sources: options.inline_sources,
+            remove_comments: options.remove_comments,
         },
         names,
         Surface::JavaScript,

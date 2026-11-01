@@ -987,6 +987,7 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             | "resolvejsonmodule"
             | "noemit"
             | "noemithelpers"
+            | "removecomments"
             | "declaration"
             | "alwaysstrict"
             | "exactoptionalpropertytypes"
@@ -1019,6 +1020,7 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             "resolvejsonmodule" => "resolveJsonModule",
             "moduleresolution" => "moduleResolution",
             "noemithelpers" => "noEmitHelpers",
+            "removecomments" => "removeComments",
             "noemit" => "noEmit",
             "alwaysstrict" => "alwaysStrict",
             "usedefineforclassfields" => "useDefineForClassFields",
@@ -2498,6 +2500,7 @@ pub fn emit_source_map_baseline(
             prog.import_helpers(),
         );
         options.no_emit_helpers = check.no_emit_helpers();
+        options.remove_comments = check.remove_comments();
         match prog.jsx_routing_decision(ProgramOutputKind::JavaScript) {
             JsxRoutingDecision::Emit | JsxRoutingDecision::TransformAndEmit => {
                 options.jsx = prog.jsx();

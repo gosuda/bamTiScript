@@ -968,6 +968,7 @@ pub struct CompilerOptions {
     inline_source_map: bool,
     inline_sources: bool,
     no_emit_helpers: bool,
+    remove_comments: bool,
     map_root: Option<Arc<str>>,
     source_root: Option<Arc<str>>,
     no_emit: bool,
@@ -1048,6 +1049,11 @@ impl CompilerOptions {
     #[must_use]
     pub const fn always_strict(&self) -> bool {
         self.always_strict
+    }
+
+    #[must_use]
+    pub const fn remove_comments(&self) -> bool {
+        self.remove_comments
     }
 
     #[must_use]
@@ -1266,6 +1272,7 @@ impl ProjectConfig {
             inline_source_map: optional_bool(compiler, "inlineSourceMap")?.unwrap_or(false),
             inline_sources: optional_bool(compiler, "inlineSources")?.unwrap_or(false),
             no_emit_helpers: optional_bool(compiler, "noEmitHelpers")?.unwrap_or(false),
+            remove_comments: optional_bool(compiler, "removeComments")?.unwrap_or(false),
             map_root: optional_nested_string(compiler, "mapRoot")?,
             source_root: optional_nested_string(compiler, "sourceRoot")?,
             no_emit: optional_bool(compiler, "noEmit")?.unwrap_or(false),

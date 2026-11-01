@@ -704,6 +704,7 @@ fn emit_options(options: &CompilerOptions, source_id: SourceId) -> (EmitOptions,
         ("inlineSources", options.inline_sources()),
         ("alwaysStrict", options.always_strict()),
         ("noEmitHelpers", options.no_emit_helpers()),
+        ("removeComments", options.remove_comments()),
     ] {
         if enabled {
             directives.insert(name.to_owned(), String::from("true"));

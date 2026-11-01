@@ -118,6 +118,8 @@ pub struct EmitOptions {
     /// Assume downleveling helpers exist globally; emit no helper prelude
     /// (`noEmitHelpers`, tsc's noEmitHelpers).
     pub no_emit_helpers: bool,
+    /// Leave authored comments out of the output (`removeComments`).
+    pub remove_comments: bool,
     pub use_define_for_class_fields: Option<bool>,
     pub declaration: bool,
     pub emit_declaration_only: bool,
@@ -148,6 +150,7 @@ impl Default for EmitOptions {
             always_strict: false,
             import_helpers: false,
             no_emit_helpers: false,
+            remove_comments: false,
             use_define_for_class_fields: None,
             declaration: false,
             emit_declaration_only: false,
@@ -253,6 +256,12 @@ impl EmitOptions {
                     return Some(invalid());
                 };
                 self.no_emit_helpers = no_emit_helpers;
+            }
+            "removecomments" => {
+                let Some(remove_comments) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.remove_comments = remove_comments;
             }
             "module" => {
                 let Some(module) = parse_module(value) else {
@@ -392,6 +401,7 @@ impl EmitOptions {
             source_map: self.source_map,
             inline_source_map: self.inline_source_map,
             inline_sources: self.inline_sources,
+            remove_comments: self.remove_comments,
         }
     }
 
@@ -487,6 +497,7 @@ pub(crate) struct PrintOptions {
     pub(crate) source_map: bool,
     pub(crate) inline_source_map: bool,
     pub(crate) inline_sources: bool,
+    pub(crate) remove_comments: bool,
 }
 
 pub(crate) struct PrintSource<'a> {
@@ -640,6 +651,8 @@ pub(crate) fn print_with_jsx_plan(
             .map(|token| token.range())
             .collect(),
         tokens: file.tokens(),
+        pending_comments: Vec::new(),
+        comment_cursor: Utf16Pos::ZERO,
         source: file.source_text(),
         source_name: mapped_source_name,
         source_id: file.source_id(),
@@ -822,6 +835,12 @@ struct Emitter<'a> {
     /// The full authored token stream, sorted by start. Backs authored-form
     /// lookups (arrow parameter parens) that the AST does not retain.
     tokens: &'a [Token],
+    /// Comments waiting for the next write. A statement that erases never
+    /// writes, so its comments go with it, as they do in `tsc`.
+    pending_comments: Vec<TextRange>,
+    /// Comments before this position are already spoken for, so rewritten
+    /// statements cannot print one twice.
+    comment_cursor: Utf16Pos,
     source_id: SourceId,
     model: &'a SemanticModel,
     enum_facts: &'a EnumFacts,
@@ -895,18 +914,168 @@ impl Emitter<'_> {
         self.source.as_str().get(start..end)
     }
 
-    /// Prints a statement list with tsc's default comment preservation: each
-    /// statement that emits is followed by its same-line trailing comment
-    /// before the newline. Single-line-preserved bodies do not route here —
-    /// tsc expands a body whose statement carries a trailing comment, a
-    /// rule queued separately.
+    fn is_comment(token: &Token) -> bool {
+        matches!(
+            token.kind(),
+            TokenKind::LineComment | TokenKind::BlockComment
+        )
+    }
+
+    fn is_trivia(token: &Token) -> bool {
+        Self::is_comment(token) || token.kind() == TokenKind::Whitespace
+    }
+
+    /// The comments before `position` back to the previous code token, which
+    /// comes with them. That token still exists for code that erased, which is
+    /// what keeps a comment from reaching past the declaration it belongs to.
+    fn comments_after_previous_token(
+        &self,
+        position: Utf16Pos,
+    ) -> (Vec<TextRange>, Option<&Token>) {
+        let end = self
+            .tokens
+            .partition_point(|token| token.range().start() < position);
+        let previous = self.tokens[..end]
+            .iter()
+            .rposition(|token| !Self::is_trivia(token));
+        let first = previous.map_or(0, |index| index + 1);
+        let comments = self.tokens[first..end]
+            .iter()
+            .filter(|token| Self::is_comment(token) && token.range().start() >= self.comment_cursor)
+            .map(|token| token.range())
+            .collect();
+        (comments, previous.map(|index| &self.tokens[index]))
+    }
+
+    fn source_line(&self, position: Utf16Pos) -> Option<usize> {
+        self.source.line_column(position).ok().map(|(line, _)| line)
+    }
+
+    /// The comments that lead the code at `position`. One on the line of the
+    /// previous token trails that token instead, unless that token opens a block.
+    fn leading_comments(&self, position: Utf16Pos) -> Vec<TextRange> {
+        let (comments, previous) = self.comments_after_previous_token(position);
+        let trailing_line = previous
+            .filter(|token| token.kind() != TokenKind::LBrace)
+            .and_then(|token| self.source_line(token.range().end()));
+        comments
+            .into_iter()
+            .filter(|comment| {
+                trailing_line.is_none() || self.source_line(comment.start()) != trailing_line
+            })
+            .collect()
+    }
+
+    /// Queues the comments before a statement. They print on its first write.
+    fn queue_leading_comments(&mut self, start: Utf16Pos) {
+        if self.options.remove_comments || start > self.authored_len {
+            return;
+        }
+        self.pending_comments = self.leading_comments(start);
+        self.comment_cursor = self.comment_cursor.max(start);
+    }
+
+    /// Prints the comments that close a file.
+    fn write_closing_comments(&mut self) {
+        self.queue_leading_comments(self.authored_len);
+        self.flush_comments();
+    }
+
+    /// The start of the first code in the file, or its end if there is none.
+    fn first_code_position(&self) -> Utf16Pos {
+        self.tokens
+            .iter()
+            .find(|token| !Self::is_trivia(token))
+            .map_or(self.authored_len, |token| token.range().start())
+    }
+
+    /// Prints the comment header of a file: a run with no blank line inside it
+    /// and a blank line after it survives whatever the first statement does.
+    fn write_detached_comments(&mut self) {
+        if self.options.remove_comments {
+            return;
+        }
+        let first_code = self.first_code_position();
+        let (comments, _) = self.comments_after_previous_token(first_code);
+        let starts_after = |emitter: &Self, index: usize| {
+            let next = comments
+                .get(index + 1)
+                .map_or(first_code, |next| next.start());
+            emitter
+                .source_line(next)
+                .zip(emitter.source_line(comments[index].end()))
+                .is_some_and(|(next, end)| next >= end + 2)
+        };
+        let Some(last) = (0..comments.len()).find(|&index| starts_after(self, index)) else {
+            return;
+        };
+        self.comment_cursor = comments[last].end();
+        self.pending_comments = comments[..=last].to_vec();
+        self.flush_comments();
+    }
+
+    fn flush_comments(&mut self) {
+        for comment in std::mem::take(&mut self.pending_comments) {
+            self.write_comment(comment);
+            if self.comment_ends_its_line(comment) {
+                self.newline();
+            } else {
+                self.raw(" ");
+            }
+        }
+    }
+
+    /// Whether code follows a comment on its own last line.
+    fn comment_ends_its_line(&self, comment: TextRange) -> bool {
+        let start = self
+            .tokens
+            .partition_point(|token| token.range().start() < comment.end());
+        let next = self.tokens[start..]
+            .iter()
+            .find(|token| !Self::is_trivia(token));
+        next.is_none_or(|token| {
+            self.source_line(token.range().start()) != self.source_line(comment.end())
+        })
+    }
+
+    /// Writes a comment at the current indentation. The lines of a block comment
+    /// keep their shape relative to where the comment began.
+    fn write_comment(&mut self, comment: TextRange) {
+        let Some(text) = self.source_slice(comment).map(str::to_owned) else {
+            return;
+        };
+        let column = self
+            .source
+            .line_column(comment.start())
+            .map_or(0, |(_, column)| column);
+        for (index, line) in text.split('\n').enumerate() {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if index > 0 {
+                self.newline();
+            }
+            let indent = line.len() - line.trim_start().len();
+            self.raw(&line[if index == 0 { 0 } else { indent.min(column) }..]);
+        }
+    }
+
+    /// Prints a statement list with tsc's default comment preservation: a
+    /// comment above a statement prints above it, and its same-line trailing
+    /// comment follows it before the newline. Single-line-preserved bodies do
+    /// not route here: tsc expands a body whose
+    /// statement carries a trailing comment, a rule queued separately.
     fn emit_statement_list(&mut self, statements: &[Stmt]) {
         for (index, statement) in statements.iter().enumerate() {
-            if self.emit_statement(statement) {
+            self.queue_leading_comments(statement.range().start());
+            let emitted = self.emit_statement(statement);
+            self.pending_comments.clear();
+            if emitted {
                 let limit = statements
                     .get(index + 1)
                     .map_or_else(|| Utf16Pos::new(usize::MAX), |next| next.range().start());
-                if let Some(comment) = self.trailing_line_comment(statement.range().end(), limit) {
+                if !self.options.remove_comments
+                    && let Some(comment) =
+                        self.trailing_line_comment(statement.range().end(), limit)
+                {
                     self.raw(" ");
                     if let Some(text) = self.source_slice(comment) {
                         let text = text.to_owned();
@@ -1195,6 +1364,9 @@ impl<'a> Emitter<'a> {
 
     /// Flushes pending indentation, updating `generated_column`.
     fn flush_indent(&mut self) {
+        if !self.pending_comments.is_empty() {
+            self.flush_comments();
+        }
         if self.pending_indent {
             let spaces = self.indent * self.options.indent_width as usize;
             for _ in 0..spaces {
@@ -1323,7 +1495,9 @@ impl<'a> Emitter<'a> {
     // ---- module drivers ---------------------------------------------------
 
     fn emit_module_js(&mut self, statements: &[Stmt]) {
+        self.write_detached_comments();
         self.emit_statement_list(statements);
+        self.write_closing_comments();
     }
 
     fn emit_module_decl(&mut self, statements: &[Stmt]) {
@@ -6305,6 +6479,66 @@ export default answer;
             declaration(&output).code,
             "export default interface Foo {\n}\n"
         );
+    }
+
+    #[test]
+    fn comments_above_statements_survive_in_javascript() {
+        let emit = |input: &str, remove_comments: bool| {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+            ));
+            assert!(parsed.diagnostics().is_empty());
+            let options = EmitOptions {
+                remove_comments,
+                ..EmitOptions::default()
+            };
+            javascript(&emit_output(parsed.product(), &options))
+                .code
+                .clone()
+        };
+        assert_eq!(
+            emit("// above\nvar x = 1;\n// next\nvar y = 2;\n", false),
+            "// above\nvar x = 1;\n// next\nvar y = 2;\n"
+        );
+        assert_eq!(
+            emit("/* one */ var x = 1;\n", false),
+            "/* one */ var x = 1;\n"
+        );
+        assert_eq!(
+            emit("function f() {\n    // inner\n    return 1;\n}\n", false),
+            "function f() {\n    // inner\n    return 1;\n}\n"
+        );
+        assert_eq!(
+            emit("var x; // t\n// next\nvar y;\n", false),
+            "var x; // t\n// next\nvar y;\n"
+        );
+        // A comment on an erased declaration goes with it.
+        assert_eq!(
+            emit("// gone\ninterface I {}\n// kept\nvar x;\n", false),
+            "// kept\nvar x;\n"
+        );
+        // A header stays even when the first statement erases.
+        assert_eq!(
+            emit("// header\n\n// gone\ninterface I {}\nvar x;\n", false),
+            "// header\nvar x;\n"
+        );
+        assert_eq!(emit("var x;\n// end\n", false), "var x;\n// end\n");
+        // The rewriter removes a `declare` from the list, but its comment stays
+        // with it rather than moving to the next statement that prints.
+        assert_eq!(
+            emit(
+                "// one\ndeclare var a;\n\n// two\ndeclare var b;\nc();\n",
+                false
+            ),
+            "c();\n"
+        );
+        assert_eq!(
+            emit("if (a) {\n    /* a\n       b */\n    f();\n}\n", false),
+            "if (a) {\n    /* a\n       b */\n    f();\n}\n"
+        );
+        assert_eq!(emit("// above\nvar x; // t\n// end\n", true), "var x;\n");
     }
 
     #[test]
