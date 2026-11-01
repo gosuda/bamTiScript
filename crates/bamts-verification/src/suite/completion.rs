@@ -50,7 +50,7 @@ use crate::{
     shard::{ObligationKey, ShardIdentity, ShardSpec, validate_catalog},
     suite::{DEFAULT_SNAPSHOT_REL, verify_snapshot},
     sweep_report::{ReportRow, read_receipt},
-    toolchain_schema::load_target_cells,
+    toolchain_schema::load_committed_cells,
 };
 
 /// Per-obligation wall-clock bound handed to the lane.
@@ -535,7 +535,7 @@ fn lane_program(root: &Path, runner: SuiteRunner) -> Option<PathBuf> {
 impl SuiteAdapter {
     fn build(root: &Path, catalog: &str, runner: SuiteRunner) -> Result<Self> {
         if runner == SuiteRunner::Aot && catalog == "target-cells" {
-            return Ok(Self::TargetCells(load_target_cells(root)?));
+            return Ok(Self::TargetCells(load_committed_cells(root)?));
         }
 
         let variable = lane_adapter_variable(runner);
@@ -569,16 +569,14 @@ impl SuiteAdapter {
     fn evaluate(&self, request: &LaneRequest) -> Result<LaneOutcome> {
         match self {
             Self::TargetCells(cells) => {
-                let record = cells.get(request.key().case()).ok_or_else(|| {
-                    VerificationError::new(
-                        ErrorCode::Schema,
-                        format!(
-                            "no target-cell record for `{}` obligation `{}`",
-                            request.key().case(),
-                            request.key()
+                let Some(record) = cells.get(request.key().case()) else {
+                    return Ok(LaneOutcome::BlockingFail {
+                        detail: format!(
+                            "target cell `{}` has not been measured; no committed record",
+                            request.key().case()
                         ),
-                    )
-                })?;
+                    });
+                };
                 let obligation = record
                     .obligations()
                     .get(request.key().configuration())
@@ -2354,6 +2352,39 @@ mod tests {
             head.expected_count() + tail.expected_count() + 3,
             keys.len() + 1
         );
+    }
+
+    #[test]
+    fn an_unmeasured_target_cell_is_a_row_not_a_lane_abort() {
+        let key = ObligationKey::new(
+            "target-cells",
+            "x86_64-pc-windows-msvc",
+            "target-object",
+            ExecutionMode::Aot,
+            "ubuntu-latest",
+        )
+        .expect("key");
+        let binding = LaneBinding::unbound(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("binding");
+        let request = LaneRequest::new(
+            binding,
+            7,
+            key,
+            BTreeSet::from(["target-object".to_owned()]),
+            vec!["bamts-verification::suite::worker".to_owned()],
+            WorkingDirectoryPolicy::RepositoryRoot,
+            CASE_TIMEOUT_MS,
+        )
+        .expect("request");
+        let outcome = SuiteAdapter::TargetCells(BTreeMap::new())
+            .evaluate(&request)
+            .expect("an unmeasured cell is an outcome");
+        assert!(matches!(
+            outcome,
+            LaneOutcome::BlockingFail { detail } if detail.contains("has not been measured")
+        ));
     }
 
     #[test]

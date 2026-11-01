@@ -248714,7 +248714,7 @@
         "pin": "catalog-inputs/v1",
         "url": "local://verification/catalog-inputs.json",
         "digest_algorithm": "sha256",
-        "digest": "327c86e28f1e613d9b9079a2ba4f6eb9babf55d72508b7415339682f54d27301"
+        "digest": "32a653282f3f65fb10bea9b096363458856525d8e8908557481910d13e5bdbb0"
       }
     },
     {
@@ -248830,7 +248830,7 @@
         "pin": "catalog-inputs/v1",
         "url": "local://verification/catalog-inputs.json",
         "digest_algorithm": "sha256",
-        "digest": "327c86e28f1e613d9b9079a2ba4f6eb9babf55d72508b7415339682f54d27301"
+        "digest": "32a653282f3f65fb10bea9b096363458856525d8e8908557481910d13e5bdbb0"
       }
     },
     {
@@ -249016,7 +249016,7 @@
         "pin": "catalog-inputs/v1",
         "url": "local://verification/catalog-inputs.json",
         "digest_algorithm": "sha256",
-        "digest": "327c86e28f1e613d9b9079a2ba4f6eb9babf55d72508b7415339682f54d27301"
+        "digest": "32a653282f3f65fb10bea9b096363458856525d8e8908557481910d13e5bdbb0"
       }
     },
     {
@@ -249024,9 +249024,9 @@
         "kind": "cross-product",
         "obligations": [
           "toolchain-manifest",
-          "elf-object",
+          "target-object",
           "hardened-link",
-          "qemu-functional",
+          "target-functional",
           "native-runtime",
           "execmem-guard",
           "reproducible-build"
@@ -249035,47 +249035,71 @@
           "x86_64-unknown-linux-gnu",
           "aarch64-unknown-linux-gnu",
           "s390x-unknown-linux-gnu",
-          "riscv64gc-unknown-linux-gnu"
+          "riscv64gc-unknown-linux-gnu",
+          "aarch64-apple-darwin",
+          "x86_64-apple-darwin",
+          "x86_64-pc-windows-msvc"
         ]
       },
       "id": "target-cells",
-      "identifier_count": 28,
+      "identifier_count": 49,
       "identifiers": [
-        "aarch64-unknown-linux-gnu::elf-object",
+        "aarch64-apple-darwin::execmem-guard",
+        "aarch64-apple-darwin::hardened-link",
+        "aarch64-apple-darwin::native-runtime",
+        "aarch64-apple-darwin::reproducible-build",
+        "aarch64-apple-darwin::target-functional",
+        "aarch64-apple-darwin::target-object",
+        "aarch64-apple-darwin::toolchain-manifest",
         "aarch64-unknown-linux-gnu::execmem-guard",
         "aarch64-unknown-linux-gnu::hardened-link",
         "aarch64-unknown-linux-gnu::native-runtime",
-        "aarch64-unknown-linux-gnu::qemu-functional",
         "aarch64-unknown-linux-gnu::reproducible-build",
+        "aarch64-unknown-linux-gnu::target-functional",
+        "aarch64-unknown-linux-gnu::target-object",
         "aarch64-unknown-linux-gnu::toolchain-manifest",
-        "riscv64gc-unknown-linux-gnu::elf-object",
         "riscv64gc-unknown-linux-gnu::execmem-guard",
         "riscv64gc-unknown-linux-gnu::hardened-link",
         "riscv64gc-unknown-linux-gnu::native-runtime",
-        "riscv64gc-unknown-linux-gnu::qemu-functional",
         "riscv64gc-unknown-linux-gnu::reproducible-build",
+        "riscv64gc-unknown-linux-gnu::target-functional",
+        "riscv64gc-unknown-linux-gnu::target-object",
         "riscv64gc-unknown-linux-gnu::toolchain-manifest",
-        "s390x-unknown-linux-gnu::elf-object",
         "s390x-unknown-linux-gnu::execmem-guard",
         "s390x-unknown-linux-gnu::hardened-link",
         "s390x-unknown-linux-gnu::native-runtime",
-        "s390x-unknown-linux-gnu::qemu-functional",
         "s390x-unknown-linux-gnu::reproducible-build",
+        "s390x-unknown-linux-gnu::target-functional",
+        "s390x-unknown-linux-gnu::target-object",
         "s390x-unknown-linux-gnu::toolchain-manifest",
-        "x86_64-unknown-linux-gnu::elf-object",
+        "x86_64-apple-darwin::execmem-guard",
+        "x86_64-apple-darwin::hardened-link",
+        "x86_64-apple-darwin::native-runtime",
+        "x86_64-apple-darwin::reproducible-build",
+        "x86_64-apple-darwin::target-functional",
+        "x86_64-apple-darwin::target-object",
+        "x86_64-apple-darwin::toolchain-manifest",
+        "x86_64-pc-windows-msvc::execmem-guard",
+        "x86_64-pc-windows-msvc::hardened-link",
+        "x86_64-pc-windows-msvc::native-runtime",
+        "x86_64-pc-windows-msvc::reproducible-build",
+        "x86_64-pc-windows-msvc::target-functional",
+        "x86_64-pc-windows-msvc::target-object",
+        "x86_64-pc-windows-msvc::toolchain-manifest",
         "x86_64-unknown-linux-gnu::execmem-guard",
         "x86_64-unknown-linux-gnu::hardened-link",
         "x86_64-unknown-linux-gnu::native-runtime",
-        "x86_64-unknown-linux-gnu::qemu-functional",
         "x86_64-unknown-linux-gnu::reproducible-build",
+        "x86_64-unknown-linux-gnu::target-functional",
+        "x86_64-unknown-linux-gnu::target-object",
         "x86_64-unknown-linux-gnu::toolchain-manifest"
       ],
-      "identifiers_sha256": "7fbd77c7414e1b2236482fb16264991ab4a6c59c1e7a80e77d1a10112711e1a9",
+      "identifiers_sha256": "c3b77261401443fd5bf6f9a3ad0f9d63f8087128259e958b23db8d32d3d7826f",
       "source": {
         "pin": "catalog-inputs/v1",
         "url": "local://verification/catalog-inputs.json",
         "digest_algorithm": "sha256",
-        "digest": "327c86e28f1e613d9b9079a2ba4f6eb9babf55d72508b7415339682f54d27301"
+        "digest": "32a653282f3f65fb10bea9b096363458856525d8e8908557481910d13e5bdbb0"
       }
     },
     {
@@ -249101,7 +249125,7 @@
         "pin": "catalog-inputs/v1",
         "url": "local://verification/catalog-inputs.json",
         "digest_algorithm": "sha256",
-        "digest": "327c86e28f1e613d9b9079a2ba4f6eb9babf55d72508b7415339682f54d27301"
+        "digest": "32a653282f3f65fb10bea9b096363458856525d8e8908557481910d13e5bdbb0"
       }
     }
   ]

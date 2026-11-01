@@ -1,14 +1,20 @@
 //! Target-cell evidence schema and `verification/toolchains/<triple>.json` generator.
 //!
-//! The `target-cells` catalog is the cross-product of four triples and seven
+//! The `target-cells` catalog is the cross-product of seven triples and seven
 //! obligations.  Each record on disk is one triple.  Every obligation is named,
 //! classified, and either observed or explicitly missing: a cell cannot skip an
 //! obligation it never looked for, and `PASS` cannot be written over a gap.
+//!
+//! An obligation means the same thing on every target, and what proves it
+//! depends on the target's object format: a hardened link is RELRO on ELF, an
+//! ad-hoc signed PIE on Mach-O, and ASLR with DEP on COFF.
 //!
 //! Committed E4 records are stricter than intermediate generator values: every
 //! obligation must be `PASS`, content-addressed, and backed by an explicit
 //! replay command. `BLOCKING_FAIL` and `EXTERNAL_BLOCKED` remain available only
 //! while collecting observations and are rejected by the committed-record loader.
+//! A cell with no record has not been measured. It is reported as such and is
+//! never closed, so [`load_target_cells`] refuses until all seven exist.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -32,34 +38,43 @@ use bamts_codegen::{TargetDescriptor, emit_for_target};
 pub const TOOLCHAIN_DIR: &str = "verification/toolchains";
 
 /// Schema tag bound into every target-cell record.
-pub const TARGET_CELL_SCHEMA: &str = "bamti.target-cell/v1";
+pub const TARGET_CELL_SCHEMA: &str = "bamti.target-cell/v2";
 
 /// Target cells closed by the E4 leaves, in catalog target order.
-pub const TARGET_TRIPLES: [&str; 4] = [
+pub const TARGET_TRIPLES: [&str; 7] = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
     "s390x-unknown-linux-gnu",
     "riscv64gc-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
 ];
 
 /// Catalog obligations for every target cell, in extractor order.
 pub const CELL_OBLIGATIONS: [&str; 7] = [
     "toolchain-manifest",
-    "elf-object",
+    "target-object",
     "hardened-link",
-    "qemu-functional",
+    "target-functional",
     "native-runtime",
     "execmem-guard",
     "reproducible-build",
 ];
 
-const ENVIRONMENT_ARTIFACTS: [&str; 2] = ["cross-linker", "qemu-user"];
+const ENVIRONMENT_ARTIFACTS: [&str; 3] = ["cross-linker", "qemu-user", "rosetta"];
+
+/// The pairs of hashes two independent builds must agree on.
+const REPRODUCED_HASHES: [(&str, &str); 2] = [
+    ("first_object_sha256", "second_object_sha256"),
+    ("first_executable_sha256", "second_executable_sha256"),
+];
 
 /// Schema tag bound into every target-cell record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TargetCellSchema {
-    #[serde(rename = "bamti.target-cell/v1")]
-    V1,
+    #[serde(rename = "bamti.target-cell/v2")]
+    V2,
 }
 
 impl TargetCellSchema {
@@ -75,6 +90,55 @@ impl TargetCellSchema {
 pub enum CellClass {
     NativeHost,
     CrossQemu,
+    CrossRosetta,
+}
+
+impl CellClass {
+    /// The environment artifact that runs this cell's images, unless the host does.
+    const fn emulator(self) -> Option<&'static str> {
+        match self {
+            Self::NativeHost => None,
+            Self::CrossQemu => Some("qemu-user"),
+            Self::CrossRosetta => Some("rosetta"),
+        }
+    }
+}
+
+/// The object format a target links, which decides what proves its obligations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectFormat {
+    Elf,
+    MachO,
+    Coff,
+}
+
+impl ObjectFormat {
+    fn of(triple: &str) -> Self {
+        if triple.ends_with("-apple-darwin") {
+            Self::MachO
+        } else if triple.ends_with("-pc-windows-msvc") {
+            Self::Coff
+        } else {
+            Self::Elf
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Elf => "elf",
+            Self::MachO => "macho",
+            Self::Coff => "coff",
+        }
+    }
+
+    /// The evidence that shows a linked image is hardened on this format.
+    const fn hardening(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Elf => &[("relro", "true"), ("now", "true"), ("noexecstack", "true")],
+            Self::MachO => &[("pie", "true"), ("signature", "adhoc")],
+            Self::Coff => &[("aslr", "true"), ("dep", "true")],
+        }
+    }
 }
 
 /// The compiler identity a cell was evaluated against.
@@ -271,26 +335,15 @@ impl TargetCellRecord {
             ));
         }
         self.rustc.validate(path)?;
-        match self.cell_class {
-            CellClass::NativeHost if self.rustc.host != self.triple => {
-                return Err(schema_error(
-                    path,
-                    format!(
-                        "native-host cell `{}` was evaluated by a rustc hosted on `{}`",
-                        self.triple, self.rustc.host
-                    ),
-                ));
-            }
-            CellClass::CrossQemu if self.rustc.host == self.triple => {
-                return Err(schema_error(
-                    path,
-                    format!(
-                        "cross-qemu cell `{}` is the rustc host and must be native_host",
-                        self.triple
-                    ),
-                ));
-            }
-            _ => {}
+        let measured_as = cell_class_for(&self.triple, &self.rustc.host)?;
+        if self.cell_class != measured_as {
+            return Err(schema_error(
+                path,
+                format!(
+                    "cell `{}` evaluated by a rustc hosted on `{}` is {measured_as:?}, not {:?}",
+                    self.triple, self.rustc.host, self.cell_class
+                ),
+            ));
         }
 
         let expected = obligation_set();
@@ -365,46 +418,44 @@ impl TargetCellRecord {
 
     /// What one obligation's evidence must state for this cell.
     fn evidence_rules(&self, obligation: &str) -> EvidenceRules {
-        let machine = match self.triple.as_str() {
-            "x86_64-unknown-linux-gnu" => "Advanced Micro Devices X86-64",
-            "aarch64-unknown-linux-gnu" => "AArch64",
-            "s390x-unknown-linux-gnu" => "IBM S/390",
-            "riscv64gc-unknown-linux-gnu" => "RISC-V",
-            _ => unreachable!("target set was validated"),
+        let format = ObjectFormat::of(&self.triple);
+        let image = |object_type| {
+            vec![
+                ("object_format", format.name()),
+                ("object_type", object_type),
+                ("machine", machine_name(&self.triple)),
+            ]
         };
         match obligation {
             "toolchain-manifest" => EvidenceRules::fields(&["rustc_version", "rustc_sha256"]),
-            "elf-object" => EvidenceRules {
-                fields: vec![
-                    "object_sha256",
-                    "elf_type",
-                    "elf_machine",
-                    "entry",
-                    "helpers",
-                ],
-                values: vec![("elf_type", "REL"), ("elf_machine", machine)],
+            "target-object" => EvidenceRules {
+                fields: vec!["object_sha256", "entry", "helpers"],
+                values: image("relocatable"),
             },
-            "hardened-link" => EvidenceRules {
-                fields: vec![
-                    "executable_sha256",
-                    "elf_type",
-                    "elf_machine",
-                    "linker_version",
-                    "linker_sha256",
-                ],
-                values: vec![("elf_type", "EXEC"), ("elf_machine", machine)],
-            },
-            "qemu-functional" | "native-runtime" => self.execution_rules(),
-            "execmem-guard" => EvidenceRules {
-                fields: vec!["executable_sha256", "readelf_sha256"],
-                values: vec![
-                    ("writable_executable_load_segments", "0"),
-                    ("gnu_stack", "RW"),
-                    ("dynamic_section", "absent"),
-                ],
-            },
+            "hardened-link" => {
+                let mut values = image("executable");
+                values.extend_from_slice(format.hardening());
+                EvidenceRules {
+                    fields: vec!["executable_sha256", "linker_version", "linker_sha256"],
+                    values,
+                }
+            }
+            "target-functional" | "native-runtime" => self.execution_rules(),
+            "execmem-guard" => {
+                let mut values = vec![("writable_executable_regions", "0")];
+                if format == ObjectFormat::Elf {
+                    values.extend([("gnu_stack", "RW"), ("dynamic_section", "absent")]);
+                }
+                EvidenceRules {
+                    fields: vec!["executable_sha256", "inspector_sha256"],
+                    values,
+                }
+            }
             "reproducible-build" => EvidenceRules {
-                fields: vec!["first_object_sha256", "second_object_sha256"],
+                fields: REPRODUCED_HASHES
+                    .iter()
+                    .flat_map(|(first, second)| [*first, *second])
+                    .collect(),
                 values: vec![("byte_identical", "true")],
             },
             _ => unreachable!("obligation set was validated"),
@@ -413,24 +464,29 @@ impl TargetCellRecord {
 
     /// Rules shared by the two obligations that run a linked image.
     fn execution_rules(&self) -> EvidenceRules {
-        let mut rules = EvidenceRules {
-            fields: vec!["executable_sha256", "execution", "fuel"],
-            values: vec![("exit", "0"), ("result", "int32:42")],
+        let execution = match self.cell_class {
+            CellClass::NativeHost => "native",
+            CellClass::CrossRosetta => "rosetta",
+            CellClass::CrossQemu => match self.triple.as_str() {
+                "aarch64-unknown-linux-gnu" => "qemu-aarch64",
+                "s390x-unknown-linux-gnu" => "qemu-s390x",
+                "riscv64gc-unknown-linux-gnu" => "qemu-riscv64",
+                _ => unreachable!("cross target set was validated"),
+            },
         };
-        match self.cell_class {
-            CellClass::NativeHost => rules.values.push(("execution", "native")),
-            CellClass::CrossQemu => {
-                rules.fields.extend(["emulator_version", "emulator_sha256"]);
-                let execution = match self.triple.as_str() {
-                    "aarch64-unknown-linux-gnu" => "qemu-aarch64",
-                    "s390x-unknown-linux-gnu" => "qemu-s390x",
-                    "riscv64gc-unknown-linux-gnu" => "qemu-riscv64",
-                    _ => unreachable!("cross target set was validated"),
-                };
-                rules.values.push(("execution", execution));
-            }
+        let mut fields = vec!["executable_sha256"];
+        if self.cell_class.emulator().is_some() {
+            fields.extend(["emulator_version", "emulator_sha256"]);
         }
-        rules
+        EvidenceRules {
+            fields,
+            values: vec![
+                ("execution", execution),
+                ("exit", "0"),
+                ("result", "int32:42"),
+                ("fuel", "positive"),
+            ],
+        }
     }
 }
 
@@ -446,6 +502,17 @@ impl EvidenceRules {
             fields: fields.to_vec(),
             values: Vec::new(),
         }
+    }
+}
+
+/// The architecture a linked image must declare, named the same on every format.
+fn machine_name(triple: &str) -> &'static str {
+    match triple.split('-').next() {
+        Some("x86_64") => "x86_64",
+        Some("aarch64") => "aarch64",
+        Some("s390x") => "s390x",
+        Some("riscv64gc") => "riscv64",
+        _ => unreachable!("target set was validated"),
     }
 }
 
@@ -499,16 +566,15 @@ fn require_evidence_value(
 }
 
 fn require_equal_hashes(path: &Path, triple: &str, obligation: &str, evidence: &str) -> Result<()> {
-    let first = evidence_value(evidence, "first_object_sha256").expect("required");
-    let second = evidence_value(evidence, "second_object_sha256").expect("required");
-    if first == second {
-        Ok(())
-    } else {
-        Err(schema_error(
-            path,
-            format!("{triple}::{obligation} claims byte identity for unequal object hashes"),
-        ))
+    for (first, second) in REPRODUCED_HASHES {
+        if evidence_value(evidence, first) != evidence_value(evidence, second) {
+            return Err(schema_error(
+                path,
+                format!("{triple}::{obligation} claims byte identity for unequal `{first}`"),
+            ));
+        }
     }
+    Ok(())
 }
 
 fn validate_evidence_hashes(
@@ -550,13 +616,13 @@ fn validate_evidence_hashes(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostObservation {
     rustc: RustcPin,
-    elf_objects: BTreeMap<String, String>,
+    emulators: BTreeMap<String, String>,
     execmem_guards: BTreeMap<String, String>,
     hardened_links: BTreeMap<String, String>,
     linkers: BTreeMap<String, String>,
     native_executions: BTreeMap<String, String>,
-    qemu_user: BTreeMap<String, String>,
     reproducible_builds: BTreeMap<String, String>,
+    target_objects: BTreeMap<String, String>,
 }
 
 impl HostObservation {
@@ -564,13 +630,13 @@ impl HostObservation {
     pub fn new(rustc: RustcPin) -> Self {
         Self {
             rustc,
-            elf_objects: BTreeMap::new(),
+            emulators: BTreeMap::new(),
             execmem_guards: BTreeMap::new(),
             hardened_links: BTreeMap::new(),
             linkers: BTreeMap::new(),
             native_executions: BTreeMap::new(),
-            qemu_user: BTreeMap::new(),
             reproducible_builds: BTreeMap::new(),
+            target_objects: BTreeMap::new(),
         }
     }
 
@@ -581,22 +647,18 @@ impl HostObservation {
     }
 
     #[must_use]
-    pub fn with_qemu_user(
-        mut self,
-        triple: impl Into<String>,
-        identity: impl Into<String>,
-    ) -> Self {
-        self.qemu_user.insert(triple.into(), identity.into());
+    pub fn with_emulator(mut self, triple: impl Into<String>, identity: impl Into<String>) -> Self {
+        self.emulators.insert(triple.into(), identity.into());
         self
     }
 
     #[must_use]
-    pub fn with_elf_object(
+    pub fn with_target_object(
         mut self,
         triple: impl Into<String>,
         identity: impl Into<String>,
     ) -> Self {
-        self.elf_objects.insert(triple.into(), identity.into());
+        self.target_objects.insert(triple.into(), identity.into());
         self
     }
 
@@ -654,7 +716,7 @@ pub fn catalog_identifier(triple: &str, obligation: &str) -> String {
     format!("{triple}::{obligation}")
 }
 
-/// The 28 catalog identifiers in sorted order.
+/// The 49 catalog identifiers in sorted order.
 #[must_use]
 pub fn catalog_identifiers() -> Vec<String> {
     let mut identifiers = Vec::with_capacity(TARGET_TRIPLES.len() * CELL_OBLIGATIONS.len());
@@ -669,9 +731,14 @@ pub fn catalog_identifiers() -> Vec<String> {
 
 /// Class for `triple` given the rustc that evaluated it.
 ///
+/// Every cell can be measured on its own host. The other routes are the ones that
+/// can run its images: `qemu-user` on a Linux host for the three cross Linux cells,
+/// and Rosetta on Apple Silicon for Intel macOS.
+///
 /// # Errors
 ///
-/// Returns [`ErrorCode::Schema`] when `triple` is not a declared target cell.
+/// Returns [`ErrorCode::Schema`] when `triple` is not a declared target cell, or
+/// when a rustc on `rustc_host` has no way to run this cell's images.
 pub fn cell_class_for(triple: &str, rustc_host: &str) -> Result<CellClass> {
     if !TARGET_TRIPLES.contains(&triple) {
         return Err(VerificationError::new(
@@ -679,10 +746,17 @@ pub fn cell_class_for(triple: &str, rustc_host: &str) -> Result<CellClass> {
             format!("`{triple}` is not a declared target cell"),
         ));
     }
-    if triple == rustc_host {
-        Ok(CellClass::NativeHost)
-    } else {
-        Ok(CellClass::CrossQemu)
+    match (triple, rustc_host) {
+        _ if triple == rustc_host => Ok(CellClass::NativeHost),
+        ("x86_64-apple-darwin", "aarch64-apple-darwin") => Ok(CellClass::CrossRosetta),
+        (
+            "aarch64-unknown-linux-gnu" | "s390x-unknown-linux-gnu" | "riscv64gc-unknown-linux-gnu",
+            _,
+        ) if rustc_host.ends_with("-unknown-linux-gnu") => Ok(CellClass::CrossQemu),
+        _ => Err(VerificationError::new(
+            ErrorCode::Schema,
+            format!("cell `{triple}` cannot be measured from a rustc hosted on `{rustc_host}`"),
+        )),
     }
 }
 
@@ -705,22 +779,25 @@ pub fn generate_cell(triple: &str, observation: &HostObservation) -> Result<Targ
         cell_class: class,
         obligations,
         rustc: observation.rustc.clone(),
-        schema: TargetCellSchema::V1,
+        schema: TargetCellSchema::V2,
         triple: triple.to_owned(),
     };
     record.validate(Path::new("<generated>"))?;
     Ok(record)
 }
 
-/// Build every declared target cell from one observation.
+/// Build every target cell this observation's host can measure.
 ///
 /// # Errors
 ///
 /// Returns the first [`generate_cell`] failure.
 pub fn generate_cells(observation: &HostObservation) -> Result<BTreeMap<String, TargetCellRecord>> {
+    let host = observation.rustc.host();
     let mut cells = BTreeMap::new();
     for triple in TARGET_TRIPLES {
-        cells.insert(triple.to_owned(), generate_cell(triple, observation)?);
+        if cell_class_for(triple, host).is_ok() {
+            cells.insert(triple.to_owned(), generate_cell(triple, observation)?);
+        }
     }
     Ok(cells)
 }
@@ -850,10 +927,37 @@ pub fn emit_probe_object(target: &str, output: &Path) -> Result<ProbeObject> {
 
 /// Load every target cell.  A missing file is an error, never an empty cell.
 pub fn load_target_cells(root: &Path) -> Result<BTreeMap<String, TargetCellRecord>> {
+    let cells = load_committed_cells(root)?;
+    let unmeasured = unmeasured_cells(&cells);
+    if unmeasured.is_empty() {
+        Ok(cells)
+    } else {
+        Err(VerificationError::new(
+            ErrorCode::Io,
+            format!(
+                "{} target cells have no committed record: {}",
+                unmeasured.len(),
+                unmeasured.join(", ")
+            ),
+        ))
+    }
+}
+
+/// Load the target cells that have a record, each held to the committed rules.
+/// A record that exists and fails is an error; only an absent file is unmeasured.
+pub fn load_committed_cells(root: &Path) -> Result<BTreeMap<String, TargetCellRecord>> {
     let directory = root.join(TOOLCHAIN_DIR);
     let mut cells = BTreeMap::new();
     for triple in TARGET_TRIPLES {
         let path = directory.join(format!("{triple}.json"));
+        if !path.try_exists().map_err(|error| {
+            VerificationError::new(
+                ErrorCode::Io,
+                format!("cannot read {}: {error}", path.display()),
+            )
+        })? {
+            continue;
+        }
         let bytes = read_bytes(&path)?;
         let record = parse_record(&path, &bytes)?;
         record.validate_committed_evidence(&path)?;
@@ -865,22 +969,16 @@ pub fn load_target_cells(root: &Path) -> Result<BTreeMap<String, TargetCellRecor
         }
         cells.insert(triple.to_owned(), record);
     }
-
-    let native: Vec<&str> = cells
-        .values()
-        .filter(|record| matches!(record.cell_class, CellClass::NativeHost))
-        .map(TargetCellRecord::triple)
-        .collect();
-    if native.len() != 1 {
-        return Err(schema_error(
-            &directory,
-            format!(
-                "expected exactly one native-host cell, found {}",
-                native.len()
-            ),
-        ));
-    }
     Ok(cells)
+}
+
+/// Declared cells with no record in `cells`, in catalog target order.
+#[must_use]
+pub fn unmeasured_cells(cells: &BTreeMap<String, TargetCellRecord>) -> Vec<&'static str> {
+    TARGET_TRIPLES
+        .into_iter()
+        .filter(|triple| !cells.contains_key(*triple))
+        .collect()
 }
 
 /// Obligations that are not `PASS`, in catalog-identifier order.
@@ -913,13 +1011,13 @@ fn generate_obligation(
             observation.rustc.identity(),
             "Recorded from rustc -vV on this host.",
         ),
-        "elf-object" => match observation.elf_objects.get(triple) {
+        "target-object" => match observation.target_objects.get(triple) {
             Some(identity) => pass(
                 identity.clone(),
                 "Stored relocatable AOT object for this triple.",
             ),
             None => blocking(
-                "elf-object",
+                "target-object",
                 "",
                 "No relocatable AOT object is stored for this triple.",
                 "Emit a BamTS AOT object for this triple and record its content hash.",
@@ -931,14 +1029,12 @@ fn generate_obligation(
                     identity.clone(),
                     "Stored hardened link artifact for this triple.",
                 )
-            } else if matches!(class, CellClass::CrossQemu)
-                && !observation.linkers.contains_key(triple)
-            {
+            } else if class.emulator().is_some() && !observation.linkers.contains_key(triple) {
                 blocked_external(
                     "cross-linker",
                     "",
-                    "No cross GNU linker for this triple is installed.",
-                    "Install the matching *-linux-gnu-gcc linker, perform a hardened link, and record the binary identity.",
+                    "No cross linker for this triple is installed.",
+                    "Install the linker for this triple, perform a hardened link, and record the binary identity.",
                 )
             } else {
                 let evidence = observation.linkers.get(triple).cloned().unwrap_or_default();
@@ -950,34 +1046,34 @@ fn generate_obligation(
                 )
             }
         }
-        "qemu-functional" => match class {
-            CellClass::NativeHost => match observation.native_executions.get(triple) {
+        "target-functional" => match class.emulator() {
+            None => match observation.native_executions.get(triple) {
                 Some(identity) => pass(
                     identity.clone(),
                     "Native-host functional execution completed without emulation.",
                 ),
                 None => blocking(
-                    "qemu-functional",
+                    "target-functional",
                     "",
                     "No native functional execution is stored for this host triple.",
                     "Execute the linked BamTS image natively and record the functional result.",
                 ),
             },
-            CellClass::CrossQemu => match observation.qemu_user.get(triple) {
+            Some(emulator) => match observation.emulators.get(triple) {
                 Some(identity) => pass(
                     identity.clone(),
-                    "qemu-user executed a linked image for this triple.",
+                    "An emulator executed a linked image for this triple.",
                 ),
                 None => blocked_external(
-                    "qemu-user",
+                    emulator,
                     "",
-                    "qemu-user for this triple is not installed.",
-                    "Install qemu-user for this triple, execute the linked image, and record qemu version and the run identity.",
+                    "The emulator for this triple is not installed.",
+                    "Install the emulator for this triple, execute the linked image, and record its version and the run identity.",
                 ),
             },
         },
-        "native-runtime" => match class {
-            CellClass::NativeHost => match observation.native_executions.get(triple) {
+        "native-runtime" => match class.emulator() {
+            None => match observation.native_executions.get(triple) {
                 Some(identity) => pass(
                     identity.clone(),
                     "This process runs natively on the cell triple.",
@@ -989,16 +1085,16 @@ fn generate_obligation(
                     "Execute a linked BamTS image natively on this host and record the run identity.",
                 ),
             },
-            CellClass::CrossQemu => match observation.qemu_user.get(triple) {
+            Some(emulator) => match observation.emulators.get(triple) {
                 Some(identity) => pass(
                     identity.clone(),
-                    "qemu-user executed the target runtime image for this triple.",
+                    "An emulator executed the target runtime image for this triple.",
                 ),
                 None => blocked_external(
-                    "qemu-user",
+                    emulator,
                     "",
-                    "qemu-user for this triple is not installed.",
-                    "Install qemu-user for this triple, execute the target runtime image, and record the run identity.",
+                    "The emulator for this triple is not installed.",
+                    "Install the emulator for this triple, execute the target runtime image, and record the run identity.",
                 ),
             },
         },
@@ -1145,10 +1241,10 @@ mod tests {
     #[test]
     fn catalog_identifiers_match_the_target_cells_cross_product() {
         let identifiers = catalog_identifiers();
-        assert_eq!(identifiers.len(), 28);
-        assert_eq!(identifiers[0], "aarch64-unknown-linux-gnu::elf-object");
+        assert_eq!(identifiers.len(), 49);
+        assert_eq!(identifiers[0], "aarch64-apple-darwin::execmem-guard");
         assert_eq!(
-            identifiers[27],
+            identifiers[48],
             "x86_64-unknown-linux-gnu::toolchain-manifest"
         );
         let expected: BTreeSet<String> = TARGET_TRIPLES
@@ -1177,11 +1273,11 @@ mod tests {
             TerminalState::Pass
         );
         assert_eq!(
-            native.obligations()["qemu-functional"].status(),
+            native.obligations()["target-functional"].status(),
             TerminalState::Pass
         );
         assert_eq!(
-            native.obligations()["elf-object"].status(),
+            native.obligations()["target-object"].status(),
             TerminalState::BlockingFail
         );
         assert_eq!(
@@ -1192,11 +1288,11 @@ mod tests {
         let aarch64 = cells.get("aarch64-unknown-linux-gnu").expect("cross cell");
         assert_eq!(aarch64.cell_class(), CellClass::CrossQemu);
         assert_eq!(
-            aarch64.obligations()["qemu-functional"].status(),
+            aarch64.obligations()["target-functional"].status(),
             TerminalState::ExternalBlocked
         );
         assert_eq!(
-            aarch64.obligations()["qemu-functional"].missing_artifact(),
+            aarch64.obligations()["target-functional"].missing_artifact(),
             "qemu-user"
         );
         assert_eq!(
@@ -1208,19 +1304,19 @@ mod tests {
             TerminalState::ExternalBlocked
         );
         assert_eq!(
-            aarch64.obligations()["elf-object"].status(),
+            aarch64.obligations()["target-object"].status(),
             TerminalState::BlockingFail
         );
     }
 
     #[test]
-    fn pass_cannot_be_claimed_for_a_missing_elf_object() {
+    fn pass_cannot_be_claimed_for_a_missing_target_object() {
         let cell = generate_cell("x86_64-unknown-linux-gnu", &hosted()).expect("native generates");
         let mut json = serde_json::to_value(&cell).expect("serialize");
-        json["obligations"]["elf-object"]["status"] = serde_json::json!("PASS");
-        json["obligations"]["elf-object"]["missing_artifact"] = serde_json::json!("");
-        json["obligations"]["elf-object"]["unblock_condition"] = serde_json::json!("");
-        json["obligations"]["elf-object"]["evidence"] = serde_json::json!("");
+        json["obligations"]["target-object"]["status"] = serde_json::json!("PASS");
+        json["obligations"]["target-object"]["missing_artifact"] = serde_json::json!("");
+        json["obligations"]["target-object"]["unblock_condition"] = serde_json::json!("");
+        json["obligations"]["target-object"]["evidence"] = serde_json::json!("");
         let bytes = serde_json::to_vec(&json).expect("bytes");
         let error = parse_record(Path::new("cell.json"), &bytes)
             .expect_err("PASS requires evidence and forbids a gap");
@@ -1231,10 +1327,10 @@ mod tests {
     fn in_repository_gap_cannot_be_external_blocked() {
         let cell = generate_cell("x86_64-unknown-linux-gnu", &hosted()).expect("native generates");
         let mut json = serde_json::to_value(&cell).expect("serialize");
-        json["obligations"]["elf-object"]["status"] = serde_json::json!("EXTERNAL_BLOCKED");
+        json["obligations"]["target-object"]["status"] = serde_json::json!("EXTERNAL_BLOCKED");
         let bytes = serde_json::to_vec(&json).expect("bytes");
         let error = parse_record(Path::new("cell.json"), &bytes)
-            .expect_err("elf-object is not an environment artifact");
+            .expect_err("target-object is not an environment artifact");
         assert_eq!(error.code(), ErrorCode::Schema);
     }
 
@@ -1242,7 +1338,7 @@ mod tests {
     fn missing_qemu_on_a_cross_cell_must_be_external_blocked() {
         let cell = generate_cell("s390x-unknown-linux-gnu", &hosted()).expect("cross generates");
         let mut json = serde_json::to_value(&cell).expect("serialize");
-        json["obligations"]["qemu-functional"]["status"] = serde_json::json!("BLOCKING_FAIL");
+        json["obligations"]["target-functional"]["status"] = serde_json::json!("BLOCKING_FAIL");
         let bytes = serde_json::to_vec(&json).expect("bytes");
         let error = parse_record(Path::new("cell.json"), &bytes)
             .expect_err("missing qemu-user is external");
@@ -1264,7 +1360,7 @@ mod tests {
     #[test]
     fn complete_native_cell_closes_only_with_every_hosted_artifact() {
         let observation = hosted()
-            .with_elf_object("x86_64-unknown-linux-gnu", "elf:1")
+            .with_target_object("x86_64-unknown-linux-gnu", "object:1")
             .with_hardened_link("x86_64-unknown-linux-gnu", "link:1")
             .with_execmem_guard("x86_64-unknown-linux-gnu", "guard:1")
             .with_reproducible_build("x86_64-unknown-linux-gnu", "repro:1");
@@ -1272,7 +1368,7 @@ mod tests {
             generate_cell("x86_64-unknown-linux-gnu", &observation).expect("complete native");
         assert!(cell.is_closed());
         assert_eq!(
-            cell.obligations()["qemu-functional"].status(),
+            cell.obligations()["target-functional"].status(),
             TerminalState::Pass
         );
     }
@@ -1309,9 +1405,372 @@ mod tests {
     #[test]
     fn committed_records_are_content_addressed_and_closed() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let cells = load_target_cells(&root).expect("committed cells load");
-        assert_eq!(cells.len(), TARGET_TRIPLES.len());
+        let cells = load_committed_cells(&root).expect("committed cells load");
+        assert_eq!(
+            cells.len() + unmeasured_cells(&cells).len(),
+            TARGET_TRIPLES.len()
+        );
         assert!(cells.values().all(TargetCellRecord::is_closed));
         assert!(blocking_obligations(&cells).is_empty());
+    }
+
+    /// Triple, rustc host, machine, and how images run, for every route to a cell.
+    const ROUTES: [(&str, &str, &str, &str); 9] = [
+        (
+            "x86_64-unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu",
+            "x86_64",
+            "native",
+        ),
+        (
+            "aarch64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "aarch64",
+            "native",
+        ),
+        (
+            "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu",
+            "aarch64",
+            "qemu-aarch64",
+        ),
+        (
+            "s390x-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "s390x",
+            "qemu-s390x",
+        ),
+        (
+            "riscv64gc-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "riscv64",
+            "qemu-riscv64",
+        ),
+        (
+            "aarch64-apple-darwin",
+            "aarch64-apple-darwin",
+            "aarch64",
+            "native",
+        ),
+        (
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+            "x86_64",
+            "rosetta",
+        ),
+        (
+            "x86_64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64",
+            "native",
+        ),
+        (
+            "x86_64-pc-windows-msvc",
+            "x86_64-pc-windows-msvc",
+            "x86_64",
+            "native",
+        ),
+    ];
+
+    /// Evidence values no rule fixes, so a changed one is still valid evidence.
+    const FREE_FORM_FIELDS: [&str; 6] = [
+        "command",
+        "emulator_version",
+        "entry",
+        "helpers",
+        "linker_version",
+        "rustc_version",
+    ];
+
+    fn pin(host: &str) -> RustcPin {
+        RustcPin::new(
+            "8bab26f4f68e0e26f0bb7960be334d5b520ea452",
+            "2026-07-14",
+            host,
+            "22.1.6",
+            "1.97.1",
+        )
+        .expect("test rustc pin")
+    }
+
+    /// Closed evidence written out per format, not read back from the rules it tests.
+    fn closed_evidence(route: (&str, &str, &str, &str), obligation: &str) -> String {
+        let (triple, _, machine, execution) = route;
+        let hash = "a".repeat(64);
+        let (format, hardening, guard) = if triple.ends_with("-apple-darwin") {
+            ("macho", "pie=true; signature=adhoc", "")
+        } else if triple.ends_with("-pc-windows-msvc") {
+            ("coff", "aslr=true; dep=true", "")
+        } else {
+            (
+                "elf",
+                "relro=true; now=true; noexecstack=true",
+                "; gnu_stack=RW; dynamic_section=absent",
+            )
+        };
+        let emulator = if execution == "native" {
+            String::new()
+        } else {
+            format!("; emulator_version=1.0; emulator_sha256={hash}")
+        };
+        match obligation {
+            "toolchain-manifest" => {
+                format!("command=rustc -vV; rustc_version=1.97.1; rustc_sha256={hash}")
+            }
+            "target-object" => format!(
+                "command=emit; object_sha256={hash}; object_format={format}; object_type=relocatable; machine={machine}; entry=bamts_m0_fn_0; helpers=bamts_load_constant"
+            ),
+            "hardened-link" => format!(
+                "command=link; executable_sha256={hash}; object_format={format}; object_type=executable; machine={machine}; linker_version=1.0; linker_sha256={hash}; {hardening}"
+            ),
+            "target-functional" | "native-runtime" => format!(
+                "command=run; executable_sha256={hash}; execution={execution}; exit=0; result=int32:42; fuel=positive{emulator}"
+            ),
+            "execmem-guard" => format!(
+                "command=inspect; executable_sha256={hash}; inspector_sha256={hash}; writable_executable_regions=0{guard}"
+            ),
+            "reproducible-build" => format!(
+                "command=build twice; first_object_sha256={hash}; second_object_sha256={hash}; first_executable_sha256={hash}; second_executable_sha256={hash}; byte_identical=true"
+            ),
+            other => panic!("no fixture for {other}"),
+        }
+    }
+
+    fn closed_cell(route: (&str, &str, &str, &str)) -> TargetCellRecord {
+        let (triple, host, _, _) = route;
+        let obligations = CELL_OBLIGATIONS
+            .iter()
+            .map(|obligation| {
+                let evidence = closed_evidence(route, obligation);
+                ((*obligation).to_owned(), pass(evidence, "observed"))
+            })
+            .collect();
+        TargetCellRecord {
+            cell_class: cell_class_for(triple, host).expect("route is measurable"),
+            obligations,
+            rustc: pin(host),
+            schema: TargetCellSchema::V2,
+            triple: triple.to_owned(),
+        }
+    }
+
+    fn committed_check(
+        mut cell: TargetCellRecord,
+        obligation: &str,
+        evidence: String,
+    ) -> Result<()> {
+        cell.obligations
+            .get_mut(obligation)
+            .expect("declared obligation")
+            .evidence = evidence;
+        let path = Path::new("cell.json");
+        cell.validate(path)?;
+        cell.validate_committed_evidence(path)
+    }
+
+    #[test]
+    fn every_route_closes_on_the_evidence_its_format_states() {
+        for route in ROUTES {
+            let cell = closed_cell(route);
+            cell.validate(Path::new("cell.json")).expect("valid record");
+            cell.validate_committed_evidence(Path::new("cell.json"))
+                .unwrap_or_else(|error| panic!("{route:?}: {error}"));
+        }
+    }
+
+    #[test]
+    fn dropping_any_evidence_field_rejects_the_record() {
+        for route in ROUTES {
+            for obligation in CELL_OBLIGATIONS {
+                let evidence = closed_evidence(route, obligation);
+                for field in evidence.split("; ") {
+                    let kept: Vec<&str> = evidence
+                        .split("; ")
+                        .filter(|other| *other != field)
+                        .collect();
+                    committed_check(closed_cell(route), obligation, kept.join("; "))
+                        .expect_err(&format!("{route:?} {obligation} must require `{field}`"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn changing_any_fixed_evidence_value_rejects_the_record() {
+        for route in ROUTES {
+            for obligation in CELL_OBLIGATIONS {
+                let evidence = closed_evidence(route, obligation);
+                for field in evidence.split("; ") {
+                    let (name, _) = field.split_once('=').expect("key=value");
+                    if FREE_FORM_FIELDS.contains(&name) {
+                        continue;
+                    }
+                    let changed = evidence.replace(field, &format!("{name}=wrong"));
+                    committed_check(closed_cell(route), obligation, changed)
+                        .expect_err(&format!("{route:?} {obligation} must fix `{name}`"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_builds_that_differ_are_not_reproducible() {
+        let route = ROUTES[5];
+        let evidence = closed_evidence(route, "reproducible-build");
+        for second in ["second_object_sha256", "second_executable_sha256"] {
+            let changed = evidence.replace(
+                &format!("{second}={}", "a".repeat(64)),
+                &format!("{second}={}", "b".repeat(64)),
+            );
+            assert_ne!(changed, evidence);
+            committed_check(closed_cell(route), "reproducible-build", changed)
+                .expect_err("byte identity needs equal hashes");
+        }
+    }
+
+    #[test]
+    fn a_cell_is_measured_only_from_a_host_that_can_run_its_images() {
+        let linux_arm = "aarch64-unknown-linux-gnu";
+        let linux_x64 = "x86_64-unknown-linux-gnu";
+        let mac_arm = "aarch64-apple-darwin";
+        let mac_x64 = "x86_64-apple-darwin";
+        let windows = "x86_64-pc-windows-msvc";
+        for triple in TARGET_TRIPLES {
+            assert_eq!(
+                cell_class_for(triple, triple).ok(),
+                Some(CellClass::NativeHost)
+            );
+        }
+        assert_eq!(
+            cell_class_for(mac_x64, mac_arm).ok(),
+            Some(CellClass::CrossRosetta)
+        );
+        assert_eq!(
+            cell_class_for(linux_arm, linux_x64).ok(),
+            Some(CellClass::CrossQemu)
+        );
+        assert_eq!(
+            cell_class_for("s390x-unknown-linux-gnu", linux_arm).ok(),
+            Some(CellClass::CrossQemu)
+        );
+        for (triple, host) in [
+            (linux_x64, linux_arm),
+            (linux_arm, mac_arm),
+            (mac_arm, mac_x64),
+            (mac_arm, linux_x64),
+            (windows, mac_arm),
+            (windows, linux_x64),
+        ] {
+            assert_eq!(
+                cell_class_for(triple, host)
+                    .map_err(|error| error.code())
+                    .err(),
+                Some(ErrorCode::Schema),
+                "{triple} from {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_cannot_claim_a_route_its_host_does_not_have() {
+        let mut cell = closed_cell(ROUTES[6]);
+        cell.cell_class = CellClass::CrossQemu;
+        assert_eq!(
+            cell.validate(Path::new("cell.json"))
+                .map_err(|error| error.code()),
+            Err(ErrorCode::Schema)
+        );
+
+        let mut cell = closed_cell(ROUTES[8]);
+        cell.rustc = pin("x86_64-unknown-linux-gnu");
+        cell.validate(Path::new("cell.json"))
+            .expect_err("Windows has no cross route");
+    }
+
+    #[test]
+    fn missing_rosetta_blocks_an_intel_mac_cell_on_the_environment() {
+        let observation = HostObservation::new(pin("aarch64-apple-darwin"));
+        let cell = generate_cell("x86_64-apple-darwin", &observation).expect("rosetta route");
+        assert_eq!(cell.cell_class(), CellClass::CrossRosetta);
+        for obligation in ["target-functional", "native-runtime"] {
+            assert_eq!(
+                cell.obligations()[obligation].status(),
+                TerminalState::ExternalBlocked
+            );
+            assert_eq!(cell.obligations()[obligation].missing_artifact(), "rosetta");
+        }
+    }
+
+    #[test]
+    fn a_host_generates_only_the_cells_it_can_measure() {
+        let linux = generate_cells(&hosted()).expect("cells generate");
+        assert_eq!(
+            linux.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "aarch64-unknown-linux-gnu",
+                "riscv64gc-unknown-linux-gnu",
+                "s390x-unknown-linux-gnu",
+                "x86_64-unknown-linux-gnu",
+            ]
+        );
+        let mac = generate_cells(&HostObservation::new(pin("aarch64-apple-darwin")))
+            .expect("cells generate");
+        assert_eq!(
+            mac.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+        );
+    }
+
+    fn scratch_root(name: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("bamts-target-cells-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(TOOLCHAIN_DIR)).expect("scratch directory");
+        root
+    }
+
+    fn write_record(root: &Path, file_triple: &str, bytes: &[u8]) {
+        let path = root.join(TOOLCHAIN_DIR).join(format!("{file_triple}.json"));
+        std::fs::write(path, bytes).expect("write record");
+    }
+
+    #[test]
+    fn an_absent_record_is_unmeasured_and_never_closed() {
+        let root = scratch_root("absent");
+        let cell = closed_cell(ROUTES[5]);
+        write_record(&root, cell.triple(), &encode_record(&cell).expect("encode"));
+
+        let cells = load_committed_cells(&root).expect("one record loads");
+        assert_eq!(cells.keys().collect::<Vec<_>>(), [cell.triple()]);
+        assert_eq!(unmeasured_cells(&cells).len(), 6);
+        assert!(unmeasured_cells(&cells).contains(&"x86_64-pc-windows-msvc"));
+
+        let error = load_target_cells(&root).expect_err("six cells are unmeasured");
+        assert_eq!(error.code(), ErrorCode::Io);
+        assert!(error.to_string().contains("x86_64-pc-windows-msvc"));
+        std::fs::remove_dir_all(root).expect("remove scratch");
+    }
+
+    #[test]
+    fn a_present_record_that_fails_is_not_read_as_unmeasured() {
+        let closed = closed_cell(ROUTES[5]);
+        let encoded = String::from_utf8(encode_record(&closed).expect("encode")).expect("utf8");
+
+        let stale = scratch_root("stale");
+        let v1 = encoded.replace("bamti.target-cell/v2", "bamti.target-cell/v1");
+        write_record(&stale, closed.triple(), v1.as_bytes());
+        load_committed_cells(&stale).expect_err("an old schema is not an absent record");
+        std::fs::remove_dir_all(stale).expect("remove scratch");
+
+        let open = scratch_root("open");
+        let cell = generate_cell("x86_64-unknown-linux-gnu", &hosted()).expect("open cell");
+        write_record(&open, cell.triple(), &encode_record(&cell).expect("encode"));
+        load_committed_cells(&open).expect_err("committed records must be closed");
+        std::fs::remove_dir_all(open).expect("remove scratch");
+
+        let renamed = scratch_root("renamed");
+        write_record(&renamed, "x86_64-apple-darwin", encoded.as_bytes());
+        load_committed_cells(&renamed).expect_err("a record sits under its own name");
+        std::fs::remove_dir_all(renamed).expect("remove scratch");
     }
 }
