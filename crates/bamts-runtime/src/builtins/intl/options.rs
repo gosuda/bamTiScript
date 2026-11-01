@@ -14,6 +14,20 @@ use crate::{EvalFailure, Host, Machine};
 /// object of `undefined`, which no read can observe.
 pub(super) type Options = Option<Value>;
 
+/// GetOptionsObject.
+pub(super) fn get_options_object<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<Options, EvalFailure> {
+    if value == Value::UNDEFINED {
+        Ok(None)
+    } else if is_object(machine, value)? {
+        Ok(Some(value))
+    } else {
+        Err(type_error(machine, "options must be an object"))
+    }
+}
+
 /// CoerceOptionsToObject.
 pub(super) fn coerce_options_to_object<H: Host>(
     machine: &mut Machine<'_, H>,

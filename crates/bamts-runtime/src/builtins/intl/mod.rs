@@ -5,6 +5,7 @@
 //! receiver checks, and the shape of the installed objects.
 
 mod collator;
+mod list_format;
 mod locale;
 mod number_format;
 mod options;
@@ -121,6 +122,7 @@ pub(super) fn install<H: Host>(
     collator::install(heap, builtins, namespace);
     number_format::install(heap, builtins, namespace);
     plural_rules::install(heap, builtins, namespace);
+    list_format::install(heap, builtins, namespace);
     globals.insert(EcmaString::encode("Intl"), namespace);
 }
 
@@ -529,6 +531,47 @@ pub(super) fn is_type_sequence(value: &str) -> bool {
         && value.split('-').all(|part| {
             (3..=8).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
         })
+}
+
+/// StringListFromIterable.
+pub(super) fn string_iterable_to_list<H: Host>(
+    machine: &mut Machine<'_, H>,
+    iterable: Value,
+) -> Result<Vec<String>, EvalFailure> {
+    let mut list = Vec::new();
+    if iterable == Value::UNDEFINED {
+        return Ok(list);
+    }
+    let key = machine.to_property_key(machine.intrinsics.builtins.symbol_iterator())?;
+    let object = machine.value_to_object(iterable)?;
+    let method = machine.get_property_key(object, &key)?;
+    if !machine.is_callable(method)? {
+        return Err(type_error(machine, "value is not iterable"));
+    }
+    let target = machine.call_value(method, iterable, &[])?;
+    if !is_object(machine, target)? {
+        return Err(type_error(machine, "iterator method returned a non-object"));
+    }
+    let next = machine.get_named_property(target, "next")?;
+    let iterator = machine.create_protocol_iterator(target, next)?;
+    let depth = machine.native_roots.len();
+    machine.push_native_roots(depth, &[iterator]);
+    let result = (|| loop {
+        let step = machine.iterator_step(iterator)?;
+        let (done, value) = machine.iterator_result_parts(step)?;
+        if done {
+            return Ok(());
+        }
+        let Some(text) = machine.string_value(value) else {
+            let failure = type_error(machine, "a list element must be a string");
+            let _ = machine.close_iterator_raw(iterator);
+            return Err(failure);
+        };
+        list.push(text.to_utf8_lossy());
+    })();
+    machine.pop_native_roots(depth);
+    result?;
+    Ok(list)
 }
 
 /// StrWhiteSpaceChar.
