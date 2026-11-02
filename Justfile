@@ -111,8 +111,9 @@ family-show family catalog="typescript-7.0.2" runner="compiler" receipt="":
     receipt="${receipt:-target/evidence-local/merged/{{catalog}}-{{runner}}-{{host_triple}}.jsonl}"
     cargo run --locked -q -p bamts-verification --bin bamts-verification -- suite families "$receipt" --family "{{family}}" --root "$root"
 
-# Rebuilds the lane workers, reruns only the rows of one family, and fails if any row
-# that passed in the receipt no longer does. A fix must convert a row and regress none.
+# Rebuilds the lane workers, reruns one family plus a sample of the passing rows, and
+# fails if a sampled row no longer passes. A fix must convert a row and regress none.
+# The sample catches a broad regression between sweeps; only a sweep proves none.
 recount family catalog="typescript-7.0.2" runner="compiler" receipt="":
     #!/usr/bin/env bash
     set -euo pipefail

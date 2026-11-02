@@ -874,26 +874,45 @@ pub struct SuiteRecountRequest {
     pub runner: String,
     pub baseline: PathBuf,
     pub family: String,
+    /// How many passing rows to rerun beside the family. A family holds only
+    /// failing rows, so these are the rows a fix can regress.
+    pub guard: usize,
 }
 
-/// The family's rows before and after the rerun, in the same order.
+/// The rerun rows before and after, in the same order: the family, then the
+/// passing rows that guard against a regression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuiteRecount {
     pub before: Vec<ReportRow>,
     pub after: Vec<ReportRow>,
 }
 
-/// Reruns only the rows of `family`, on the platform the baseline recorded.
+/// `count` of `rows`, spread evenly so a sample reaches every part of a catalog
+/// and the same receipt always gives the same sample.
+fn evenly_spaced(rows: Vec<ReportRow>, count: usize) -> Vec<ReportRow> {
+    let total = rows.len();
+    if count >= total {
+        return rows;
+    }
+    rows.into_iter()
+        .enumerate()
+        .filter(|(index, _)| (index + 1) * count / total != index * count / total)
+        .map(|(_, row)| row)
+        .collect()
+}
+
+/// Reruns the rows of `family` and a sample of the passing rows, on the
+/// platform the baseline recorded.
 ///
 /// This answers one question for a repair loop: did the fix convert rows and
-/// regress none. It writes no receipt. Every state comes from the same lane
-/// executor and `derive_row` as a sweep, so a rerun cannot mint a `PASS` that a
-/// sweep could not.
+/// regress none. Only a full sweep proves none regressed; the sample catches a
+/// broad regression between sweeps. It writes no receipt. Every state comes from
+/// the same lane executor and `derive_row` as a sweep, so a rerun cannot mint a
+/// `PASS` that a sweep could not.
 pub fn recount_suite(root: &Path, request: &SuiteRecountRequest) -> Result<SuiteRecount> {
-    let before: Vec<ReportRow> = read_receipt(&request.baseline)?
+    let (mut before, others): (Vec<ReportRow>, Vec<ReportRow>) = read_receipt(&request.baseline)?
         .into_iter()
-        .filter(|row| row.family().as_deref() == Some(request.family.as_str()))
-        .collect();
+        .partition(|row| row.family().as_deref() == Some(request.family.as_str()));
     let Some(first) = before.first() else {
         return Err(VerificationError::new(
             ErrorCode::Usage,
@@ -911,6 +930,11 @@ pub fn recount_suite(root: &Path, request: &SuiteRecountRequest) -> Result<Suite
             format!("family `{}` spans more than one platform", request.family),
         ));
     }
+    let passing = others
+        .into_iter()
+        .filter(|row| row.state().is_pass() && row.key().platform() == platform)
+        .collect();
+    before.extend(evenly_spaced(passing, request.guard));
     let runner = resolve_runner(&request.catalog, &request.runner)?;
     let catalog = load_catalog_manifest(root, &request.catalog)?;
     let obligations =
@@ -2926,6 +2950,7 @@ mod tests {
             runner: "perf".to_owned(),
             baseline: baseline.to_owned(),
             family: family.to_owned(),
+            guard: 0,
         }
     }
 
@@ -2954,6 +2979,66 @@ mod tests {
             "{cases:?}"
         );
         assert!(two.after.iter().all(|row| !row.state().is_pass()));
+    }
+
+    #[test]
+    fn recount_reruns_passing_rows_so_a_regression_can_be_seen() {
+        let (scratch, baseline, _, beta) = two_family_baseline(&["jit.a", "jit.b", "jit.c"]);
+        // These lanes fail every row, so a row recorded as passing regresses.
+        let edited: Vec<String> = fs::read_to_string(&baseline)
+            .expect("baseline text")
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).expect("json line");
+                let is_row = value["body"]["key"].to_string().contains("jit.c");
+                if is_row {
+                    value["body"]["state"] = serde_json::Value::from("PASS");
+                    value["body"]["artifacts"] = serde_json::json!({"perf": "0".repeat(64)});
+                }
+                value.to_string()
+            })
+            .collect();
+        fs::write(&baseline, edited.join("\n") + "\n").expect("edited baseline");
+
+        let mut request = recount_request(&baseline, &beta);
+        let unguarded = recount_suite(&scratch.root, &request).expect("recount without a guard");
+        let (_, regressions) =
+            crate::sweep_report::render_recount(&beta, &unguarded.before, &unguarded.after, 5);
+        assert_eq!(unguarded.after.len(), 1);
+        assert_eq!(regressions, 0);
+
+        request.guard = 5;
+        let guarded = recount_suite(&scratch.root, &request).expect("recount with a guard");
+        let (report, regressions) =
+            crate::sweep_report::render_recount(&beta, &guarded.before, &guarded.after, 5);
+        assert_eq!(guarded.after.len(), 2, "{report}");
+        assert_eq!(regressions, 1, "{report}");
+    }
+
+    #[test]
+    fn an_even_sample_has_the_exact_size_and_reaches_both_halves() {
+        let rows: Vec<ReportRow> = (0..10)
+            .map(|index| {
+                let key = ObligationKey::new(
+                    "benchmarks",
+                    format!("case-{index}"),
+                    "default",
+                    ExecutionMode::Interpreter,
+                    "ubuntu-latest",
+                )
+                .expect("key");
+                ReportRow::new(key, "perf", TerminalState::Pass, "")
+            })
+            .collect();
+        for count in 0..=12 {
+            let sample = evenly_spaced(rows.clone(), count);
+            assert_eq!(sample.len(), count.min(10));
+        }
+        let cases: Vec<String> = evenly_spaced(rows, 2)
+            .iter()
+            .map(|row| row.key().case().to_owned())
+            .collect();
+        assert_eq!(cases, ["case-4", "case-9"]);
     }
 
     #[test]

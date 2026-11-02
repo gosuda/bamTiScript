@@ -368,9 +368,23 @@ fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result
         "recount" => {
             let flags = parse_flags(
                 arguments,
-                &["--catalog", "--runner", "--baseline", "--family", "--limit"],
+                &[
+                    "--catalog",
+                    "--runner",
+                    "--baseline",
+                    "--family",
+                    "--limit",
+                    "--guard",
+                ],
                 &["--fail-on-regression"],
             )?;
+            let guard = count_flag(&flags.values, "--guard", 500)?;
+            let fail_on_regression = flags.switches.contains("--fail-on-regression");
+            if fail_on_regression && guard == 0 {
+                return Err(usage(
+                    "`--fail-on-regression` needs passing rows to watch, so `--guard` cannot be 0",
+                ));
+            }
             Ok(Command::SuiteRecount {
                 request: SuiteRecountRequest {
                     catalog: required_flag(&flags.values, "--catalog", "suite recount")?,
@@ -381,9 +395,10 @@ fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result
                         "suite recount",
                     )?),
                     family: required_flag(&flags.values, "--family", "suite recount")?,
+                    guard,
                 },
                 limit: count_flag(&flags.values, "--limit", 20)?,
-                fail_on_regression: flags.switches.contains("--fail-on-regression"),
+                fail_on_regression,
             })
         }
         _ if subcommand.starts_with("--") => Err(usage(format!("unknown flag `{subcommand}`"))),
@@ -1614,8 +1629,30 @@ mod tests {
         assert_eq!(request.runner, "compiler");
         assert_eq!(request.baseline, PathBuf::from("merged.jsonl"));
         assert_eq!(request.family, "types/mismatch");
+        assert_eq!(request.guard, 500);
         assert_eq!(limit, 4);
         assert!(fail_on_regression);
+
+        let unguarded = parse(&[
+            "bamts-verification",
+            "suite",
+            "recount",
+            "--catalog",
+            "test262",
+            "--runner",
+            "jit",
+            "--baseline",
+            "merged.jsonl",
+            "--family",
+            "types/mismatch",
+            "--guard",
+            "0",
+            "--fail-on-regression",
+        ]);
+        assert!(
+            unguarded.is_err_and(|error| error.code() == ErrorCode::Usage),
+            "a regression check with nothing to watch"
+        );
 
         let missing = parse(&[
             "bamts-verification",

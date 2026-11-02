@@ -445,8 +445,10 @@ pub fn render_recount(
     limit: usize,
 ) -> (String, usize) {
     let diff = diff_rows(before, after);
+    let guard = before.iter().filter(|row| row.state.is_pass()).count();
     let mut report = format!(
-        "recount of family `{family}`: {} row(s) rerun\n",
+        "recount of family `{family}`: {} row(s) rerun, {guard} of them passing rows kept as a \
+         regression guard\n",
         after.len()
     );
     report.push_str(&render_diff("before", "after", &diff, limit));
