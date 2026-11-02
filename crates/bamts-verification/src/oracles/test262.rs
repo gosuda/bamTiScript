@@ -2422,9 +2422,20 @@ function $ERROR(message) {\n\
             function source() { log.push('source'); return { get p() { log.push('get'); } }; }\n\
             function target() { log.push('target'); return { set q(v) { log.push('set'); } }; }\n\
             function key() { log.push('key'); return 'q'; }\n\
+            function sourceKey() { log.push('source-key'); \
+            return { toString() { log.push('source-string'); return 'p'; } }; }\n\
             var empty = { [Symbol.iterator]() { return { next() { log.push('next'); \
             return { done: true }; } }; } };\n";
-        const CASES: [(&str, &str); 5] = [
+        const CASES: [(&str, &str); 7] = [
+            (
+                "({ [sourceKey()]: target()[key()] } = source());",
+                "source,source-key,source-string,target,key,get,set",
+            ),
+            (
+                "var hits = 0, rest; var k = { toString() { hits++; return 'p'; } }; \
+                 ({ [k]: target().q, ...rest } = { p: 1, r: 2 }); log.push(hits, rest.r, rest.p);",
+                "target,set,1,2,",
+            ),
             (
                 "({ p: target()[key()] } = source());",
                 "source,target,key,get,set",

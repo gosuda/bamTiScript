@@ -6843,7 +6843,7 @@ impl<'a> FunctionContext<'a> {
                         self.bind_pattern(builder, &rest.argument, rest_value, declaration_scope)?;
                         continue;
                     }
-                    let key = self.property_key(builder, &property.name)?;
+                    let key = self.converted_property_key(builder, range, &property.name)?;
                     taken.push(key);
                     let element = self.alloc_register(range)?;
                     self.emit(
@@ -7235,7 +7235,8 @@ impl<'a> FunctionContext<'a> {
             let rest = self.rest_object(builder, range, source, taken)?;
             return self.assign_reference(builder, &property.target, reference, rest);
         }
-        let key = self.property_key(builder, &property.name)?;
+        // Converted now: the key must not convert again for the target or `rest`.
+        let key = self.converted_property_key(builder, range, &property.name)?;
         taken.push(key);
         let reference = self.target_reference(builder, &property.target)?;
         let element = self.alloc_register(range)?;
