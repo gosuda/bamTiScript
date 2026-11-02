@@ -7,7 +7,9 @@ doctor:
     [[ "$(node -v)" == "v24.18.0" ]]
     [[ "$(rustc -V)" == *"1.97.1"* ]]
     [[ "$(racket --version)" == *"9.2"* ]]
-    command -v ld.lld llvm-readelf lake
+    command -v ld.lld
+    command -v llvm-readelf
+    command -v lake
     test -x formal/quint/node_modules/.bin/quint
     printf '%s\n' 'DOCTOR PASS'
 
