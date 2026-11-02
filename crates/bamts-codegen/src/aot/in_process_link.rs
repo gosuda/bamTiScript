@@ -288,12 +288,10 @@ pub fn link_aot_in_process(
             }
         }
     }
-    let got_size = got_symbols.len() * 8;
-
     // Total mapping size: text region (page-aligned) + data region (page-aligned)
     // + GOT region (8 bytes per entry, 8-aligned).
     let text_region_size = align_up(text_end, page_size);
-    let data_region_size = align_up(data_end + got_size, page_size);
+    let (got_offset, data_region_size) = got_layout(data_end, got_symbols.len(), page_size);
     let total_size = text_region_size + data_region_size;
     if total_size == 0 {
         return Err(InProcessLinkError::Map("object has no sections".into()));
@@ -362,7 +360,7 @@ pub fn link_aot_in_process(
     // Each entry is 8 bytes containing the resolved symbol address.
     let mut got_entry_addresses: HashMap<SymbolIndex, usize> = HashMap::new();
     if !got_symbols.is_empty() {
-        let got_base = unsafe { data_base.add(data_end) };
+        let got_base = unsafe { data_base.add(got_offset) };
         for (i, sym_idx) in got_symbols.iter().enumerate() {
             let sym = file
                 .symbol_by_index(*sym_idx)
@@ -551,6 +549,14 @@ fn collect_sections(file: &File<'_>) -> Vec<CollectedSection> {
         });
     }
     sections
+}
+
+/// Where the GOT starts in the data region, and the region's mapped size. An
+/// AArch64 `ldr` can only reach an 8-aligned entry, and the last data section
+/// can end anywhere.
+fn got_layout(data_end: usize, entries: usize, page_size: usize) -> (usize, usize) {
+    let offset = align_up(data_end, 8);
+    (offset, align_up(offset + entries * 8, page_size))
 }
 
 fn align_up(value: usize, alignment: usize) -> usize {
@@ -909,6 +915,19 @@ mod tests {
     /// assembling `adrp x16, #N` and `ldr x17, [x16, #N]` with clang.
     const ADRP_X16: u32 = 0x9000_0010;
     const LDR_X17_FROM_X16: u32 = 0xF940_0211;
+
+    #[test]
+    fn the_got_starts_aligned_and_fits_its_region() {
+        for data_end in 0..32 {
+            for entries in 0..4 {
+                let (offset, size) = got_layout(data_end, entries, 16);
+                assert_eq!(offset % 8, 0);
+                assert!(offset >= data_end);
+                assert!(offset + entries * 8 <= size);
+                assert_eq!(size % 16, 0);
+            }
+        }
+    }
 
     #[test]
     fn adrp_patch_matches_assembler_output() {
