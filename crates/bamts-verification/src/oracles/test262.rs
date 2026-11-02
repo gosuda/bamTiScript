@@ -2331,12 +2331,19 @@ function $ERROR(message) {\n\
     #[test]
     fn super_called_in_an_arrow_finishes_the_constructor() {
         const SETUP: &str = "var fields = 0;\n\
-            class A {}\n\
+            class A { m() { return 7; } }\n\
             function refused(body) {\n\
             try { body(); } catch (error) { return error instanceof ReferenceError; }\n\
             return false;\n\
             }\n";
-        const CASES: [&str; 6] = [
+        const CASES: [&str; 8] = [
+            "class B extends A { f = () => { return super.m(); }; g = () => { return; }; \
+             h = () => { return 3; }; }\n\
+             var b = new B; assert.sameValue(b.f(), 7); assert.sameValue(b.g(), undefined); \
+             assert.sameValue(b.h(), 3);",
+            "class B extends A { constructor() { const init = () => { super(); return 5; }; \
+             assert.sameValue(init(), 5); } }\n\
+             new B;",
             "function m() { const y = 1; class B extends A { v = y; #p = y + 1; \
              get p() { return this.#p; } constructor() { (() => super())(); } } return new B; }\n\
              var b = m(); assert.sameValue(b.v, 1); assert.sameValue(b.p, 2);",

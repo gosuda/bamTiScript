@@ -868,6 +868,9 @@ struct FunctionContext<'a> {
     this_capture: Option<Register>,
     this_cell: Option<Register>,
     derived_super_guard: Option<SuperGuard>,
+    /// A derived constructor's `return` checks its value. An arrow that captured
+    /// the same state returns normally.
+    derived_constructor: bool,
     /// The outer names field initializers read, by captured cell and the
     /// `with` sites that precede each one.
     field_scope: BTreeMap<String, (Register, Vec<BindingSite>)>,
@@ -925,6 +928,7 @@ impl<'a> FunctionContext<'a> {
             this_capture: None,
             this_cell: None,
             derived_super_guard: None,
+            derived_constructor: false,
             field_scope: BTreeMap::new(),
             instance_steps: Vec::new(),
             new_target_capture: None,
@@ -7416,6 +7420,7 @@ impl<'a> FunctionContext<'a> {
             this_capture: None,
             this_cell: None,
             derived_super_guard: None,
+            derived_constructor: false,
             field_scope: BTreeMap::new(),
             // A `super(...)` in an arrow initializes the fields.
             instance_steps: if is_arrow {
@@ -7581,6 +7586,7 @@ impl<'a> FunctionContext<'a> {
             this_capture: None,
             this_cell: None,
             derived_super_guard: None,
+            derived_constructor: false,
             field_scope: BTreeMap::new(),
             instance_steps: Vec::new(),
             new_target_capture: None,
@@ -7780,7 +7786,7 @@ impl<'a> FunctionContext<'a> {
         range: TextRange,
         value: Register,
     ) -> Result<(), LowerError> {
-        if self.this_cell.is_none() || self.parent_constructor_capture.is_none() {
+        if !self.derived_constructor {
             self.emit(range, Instruction::Return { value })?;
             return Ok(());
         }
@@ -7985,7 +7991,7 @@ impl<'a> FunctionContext<'a> {
         scanner.scan_function(parameters, body, is_arrow);
         // `super(...)` in an arrow finishes the enclosing constructor's work.
         let calls_parent =
-            is_arrow && scanner.uses_super && self.parent_constructor_capture.is_some();
+            is_arrow && scanner.calls_super && self.parent_constructor_capture.is_some();
         let mut captures = Vec::new();
         for name in &scanner.free {
             if matches!(self.resolve(name), Some(Binding::ConstEnum(_))) {
@@ -9171,6 +9177,7 @@ impl<'a> FunctionContext<'a> {
             this_capture: None,
             this_cell: None,
             derived_super_guard: None,
+            derived_constructor: false,
             field_scope: BTreeMap::new(),
             instance_steps: instance_steps.to_vec(),
             new_target_capture: None,
@@ -9230,12 +9237,13 @@ impl<'a> FunctionContext<'a> {
             let cell = inner.alloc_register(range)?;
             inner.emit(range, Instruction::CreateCell { dst: cell })?;
             inner.this_cell = Some(cell);
+            inner.derived_constructor = true;
             if body.is_some() {
                 let mut scanner = FreeVarScanner::new(inner.file, inner.jsx_plan);
                 scan_constructor(&mut scanner, parameters, body);
                 let guard = inner.alloc_register(range)?;
                 let pending = inner.load_constant(builder, Constant::Boolean(false), range)?;
-                inner.derived_super_guard = Some(if scanner.arrow_uses_super {
+                inner.derived_super_guard = Some(if scanner.arrow_calls_super {
                     inner.emit(range, Instruction::CreateCell { dst: guard })?;
                     inner.store_cell(builder, guard, pending, range)?;
                     SuperGuard::Cell(guard)
@@ -9983,7 +9991,8 @@ struct FreeVarScanner<'a> {
     uses_arguments: bool,
     uses_new_target: bool,
     uses_super: bool,
-    arrow_uses_super: bool,
+    calls_super: bool,
+    arrow_calls_super: bool,
     fn_boundary: u32,
     function_depth: u32,
 }
@@ -10058,7 +10067,8 @@ impl<'a> FreeVarScanner<'a> {
             uses_arguments: false,
             uses_new_target: false,
             uses_super: false,
-            arrow_uses_super: false,
+            calls_super: false,
+            arrow_calls_super: false,
             fn_boundary: 0,
             function_depth: 0,
         }
@@ -10707,7 +10717,6 @@ impl<'a> FreeVarScanner<'a> {
                 if self.fn_boundary == 0 {
                     self.uses_super = true;
                     self.uses_this = true;
-                    self.arrow_uses_super |= self.function_depth > 0;
                 }
             }
             Expression::Meta(MetaProperty::NewTarget) => {
@@ -10764,6 +10773,10 @@ impl<'a> FreeVarScanner<'a> {
             }
             Expression::Arrow(arrow) => self.scan_arrow(arrow),
             Expression::Call(call) => {
+                if self.fn_boundary == 0 && matches!(call.callee.data(), Expression::Super) {
+                    self.calls_super = true;
+                    self.arrow_calls_super |= self.function_depth > 0;
+                }
                 self.scan_expression(&call.callee);
                 for argument in &call.arguments {
                     match argument {
