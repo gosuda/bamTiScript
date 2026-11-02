@@ -475,11 +475,11 @@ fn install_math<H: Host>(
     math_edge::install(heap, builtins, math);
 }
 fn numeric_args<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     args: &[Value],
 ) -> Result<Vec<f64>, EvalFailure> {
     args.iter()
-        .map(|value| machine.to_number(*value).map(value_number))
+        .map(|value| machine.coerce_number_observable(*value).map(value_number))
         .collect()
 }
 macro_rules! unary_math {
@@ -490,9 +490,10 @@ macro_rules! unary_math {
             args: &[Value],
             _constructing: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
-            let x =
-                value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?)
-                    as f64;
+            let x = value_number(
+                machine
+                    .coerce_number_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+            ) as f64;
             Ok(BuiltinOutcome::Value(crate::number_value(($body)(x))))
         }
     };
@@ -535,7 +536,9 @@ fn math_sign<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let x = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
+    let x = value_number(
+        machine.coerce_number_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+    );
     let sign = if x == 0.0 || x.is_nan() {
         x
     } else {
@@ -593,8 +596,12 @@ fn math_pow<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let x = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
-    let y = value_number(machine.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))?);
+    let x = value_number(
+        machine.coerce_number_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+    );
+    let y = value_number(
+        machine.coerce_number_observable(args.get(1).copied().unwrap_or(Value::UNDEFINED))?,
+    );
     Ok(BuiltinOutcome::Value(crate::number_value(
         crate::number_exponentiate(x, y),
     )))
@@ -634,10 +641,12 @@ fn math_imul<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let a =
-        value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?) as u32;
-    let b =
-        value_number(machine.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))?) as u32;
+    let a = value_number(
+        machine.coerce_number_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+    ) as u32;
+    let b = value_number(
+        machine.coerce_number_observable(args.get(1).copied().unwrap_or(Value::UNDEFINED))?,
+    ) as u32;
     Ok(BuiltinOutcome::Value(Value::int32(a.wrapping_mul(b))))
 }
 fn install_globals<H: Host>(
