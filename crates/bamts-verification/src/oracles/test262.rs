@@ -2417,6 +2417,43 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn a_collection_during_a_callback_keeps_what_native_code_holds() {
+        const SETUP: &str = "var sink; var warm = false;\n\
+            function gc() { var n = warm ? 12 : 44; warm = true; \
+            for (var i = 0; i < n; i++) { sink = 'x'.repeat(1 << 20) + i; } }\n\
+            gc();\n\
+            function* items() { yield { x: 1 }; gc(); yield { x: 2 }; }\n";
+        const CASES: [&str; 7] = [
+            "var seen = 0; Promise.resolve(1).then(() => { gc(); return { a: 1 }; })\
+             .then((v) => { seen = v.a; });",
+            "var sorted = [{ a: 3 }, { a: 1 }].toSorted((p, q) => { gc(); return p.a - q.a; }); \
+             assert.sameValue(sorted[0].a, 1);",
+            "var groups = Object.groupBy(items(), (v) => { gc(); return 'k' + v.x; }); \
+             assert.sameValue(groups.k2[0].x, 2);",
+            "var spread = [...items()]; assert.sameValue(spread[1].x, 2);",
+            "function add(a, b) { return a.x + b.x; } \
+             assert.sameValue(add(...items()), 3);",
+            "var parsed = JSON.parse('{\"a\":{\"b\":1},\"c\":2}', function (k, v) { \
+             gc(); return v; }); assert.sameValue(parsed.a.b, 1);",
+            "var proxy = new Proxy({}, { get(t, k) { gc(); return { key: k }; } }); \
+             assert.sameValue(proxy.a.key, 'a');",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: native roots", &format!("{SETUP}{body}"));
+                let label = format!("native-roots-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_destructuring_target_is_evaluated_before_its_value() {
         const LOG: &str = "var log = [];\n\
             function source() { log.push('source'); return { get p() { log.push('get'); } }; }\n\

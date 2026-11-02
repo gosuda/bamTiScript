@@ -175,6 +175,7 @@ impl GcState {
         }
         self.mark_value(&machine.heap, machine.current_new_target);
         self.mark_values(&machine.heap, &machine.kept_alive);
+        self.mark_values(&machine.heap, &machine.builtin_temporaries);
         if let Some(resume) = &machine.pending_generator_resume {
             trace_generator_resume(resume, &machine.heap, &mut self.marks, &mut self.work);
         }
@@ -184,6 +185,9 @@ impl GcState {
         }
         for job in &machine.microtasks {
             trace_microtask(&job.job, &machine.heap, &mut self.marks, &mut self.work);
+        }
+        for job in &machine.running_jobs {
+            trace_microtask(job, &machine.heap, &mut self.marks, &mut self.work);
         }
         for &registry in &machine.finalization_cleanup_queue {
             self.mark_value(&machine.heap, registry);

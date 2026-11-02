@@ -2418,11 +2418,23 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     }
 
     fn array_extend_active(&self, array: Value, iterable: Value) -> InvokeOutcome {
+        // The iteration runs user code, and only these locals hold its operands.
+        let mark = self
+            .machine
+            .borrow_mut()
+            .hold_temporaries(&[array, iterable]);
+        let outcome = self.drain_iterable_into(array, iterable);
+        self.machine.borrow_mut().release_temporaries(mark);
+        outcome
+    }
+
+    fn drain_iterable_into(&self, array: Value, iterable: Value) -> InvokeOutcome {
         let iterator = match self.get_iterator_active(iterable, bamts_bytecode::IteratorKind::Sync)
         {
             InvokeOutcome::Value(iterator) => iterator,
             other => return other,
         };
+        self.machine.borrow_mut().hold_temporaries(&[iterator]);
         loop {
             let (done, value) = match self.iterator_next_active(iterator) {
                 Ok(step) => step,

@@ -1241,9 +1241,14 @@ impl<'a, H: Host> Machine<'a, H> {
         let handler = self.intrinsics.builtins.get(id).handler;
         let previous_id = self.current_builtin_id.replace(id);
         let previous_new_target = std::mem::replace(&mut self.current_new_target, new_target);
-        let outcome = handler(self, this_value, arguments, constructing);
+        let outcome =
+            self.with_temporaries(|machine| handler(machine, this_value, arguments, constructing));
         self.current_builtin_id = previous_id;
         self.current_new_target = previous_new_target;
+        // A builtin calling this one holds the result in a Rust local.
+        if let Ok(BuiltinOutcome::Value(value)) = &outcome {
+            self.keep_temporary(*value);
+        }
         outcome
     }
     fn object_to_string_tag(&self, value: Value) -> Result<&'static str, EvalFailure> {

@@ -1845,6 +1845,14 @@ pub struct Machine<'a, H: Host> {
     /// Values kept strongly reachable for the current ECMAScript job by
     /// WeakRef construction/deref. Cleared exactly once at the outer job seam.
     kept_alive: Vec<Value>,
+    /// What running builtins hold in Rust locals: everything they allocated or
+    /// got back from user code. Calling user code can reach a collection, so
+    /// these stay rooted until the builtin that took them returns.
+    builtin_temporaries: Vec<Value>,
+    /// A builtin is running, and not user code it called.
+    in_builtin: bool,
+    /// Microtask jobs that have left the queue and are still running.
+    running_jobs: Vec<MicrotaskJob>,
     frames: Vec<Frame>,
     heap: Vec<HeapEntry>,
     slot_bytes: Vec<usize>,
@@ -2218,6 +2226,9 @@ impl<'a, H: Host> Machine<'a, H> {
             regexp_cache: Vec::new(),
             array_join_stack: Vec::new(),
             kept_alive: Vec::new(),
+            builtin_temporaries: Vec::new(),
+            in_builtin: false,
+            running_jobs: Vec::new(),
             fuel,
             frames: vec![frame],
             heap,
@@ -2927,7 +2938,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 report.executed = report.executed.saturating_add(1);
                 let is_finalization_cleanup =
                     matches!(&queued.job, MicrotaskJob::FinalizationCleanup { .. });
+                self.running_jobs.push(queued.job.clone());
                 let job_result = self.execute_microtask_job(queued.job);
+                self.running_jobs.pop();
                 self.clear_kept_alive_for_job();
                 let Some(exception) = job_result.map_err(|kind| self.checkpoint_error(kind))?
                 else {
@@ -6485,7 +6498,11 @@ impl<'a, H: Host> Machine<'a, H> {
         let id = SlotId::from_parts(RUNTIME_HEAP_SEGMENT, slot)
             .expect("runtime segment and one-based slot are nonzero");
         self.request_garbage_collection();
-        Ok(Value::heap_ref(id))
+        let value = Value::heap_ref(id);
+        if self.in_builtin {
+            self.builtin_temporaries.push(value);
+        }
+        Ok(value)
     }
 
     fn live_runtime_slots(&self) -> usize {
@@ -7315,8 +7332,56 @@ impl<'a, H: Host> Machine<'a, H> {
         f: impl FnOnce(&mut Machine<'a, H>) -> Result<T, EvalFailure>,
     ) -> Result<T, EvalFailure> {
         self.enter_proxy_dispatch()?;
-        let result = f(self);
+        let result = self.with_temporaries(f);
         self.leave_proxy_dispatch();
+        result
+    }
+
+    /// Runs native code that holds values in Rust locals across user code,
+    /// keeping what it allocates and what user code returns to it rooted.
+    pub(crate) fn with_temporaries<T>(&mut self, body: impl FnOnce(&mut Machine<'a, H>) -> T) -> T {
+        let outer = std::mem::replace(&mut self.in_builtin, true);
+        let mark = self.builtin_temporaries.len();
+        let result = body(self);
+        self.builtin_temporaries.truncate(mark);
+        self.in_builtin = outer;
+        result
+    }
+
+    /// Roots values for native code outside a builtin; `release_temporaries`
+    /// with the returned mark ends that.
+    pub(crate) fn hold_temporaries(&mut self, values: &[Value]) -> usize {
+        let mark = self.builtin_temporaries.len();
+        self.builtin_temporaries.extend_from_slice(values);
+        mark
+    }
+
+    pub(crate) fn release_temporaries(&mut self, mark: usize) {
+        self.builtin_temporaries.truncate(mark);
+    }
+
+    /// Keeps a value a builtin just received until that builtin returns.
+    pub(crate) fn keep_temporary(&mut self, value: Value) {
+        if self.in_builtin && matches!(value.decode(), Some(Decoded::HeapRef(_))) {
+            self.builtin_temporaries.push(value);
+        }
+    }
+
+    /// Runs user code for a builtin, which holds the result in a Rust local.
+    fn call_user_code(
+        &mut self,
+        call: impl FnOnce(&mut Machine<'a, H>) -> Result<Value, EvalFailure>,
+    ) -> Result<Value, EvalFailure> {
+        let in_builtin = std::mem::replace(&mut self.in_builtin, false);
+        let result = call(self);
+        self.in_builtin = in_builtin;
+        match &result {
+            Ok(value)
+            | Err(EvalFailure::ThrowValue(value) | EvalFailure::ThrowValueOrigin { value, .. }) => {
+                self.keep_temporary(*value)
+            }
+            Err(_) => {}
+        }
         result
     }
 
@@ -8011,6 +8076,15 @@ impl<'a, H: Host> Machine<'a, H> {
         arguments: &[Value],
         new_target: Value,
     ) -> Result<Value, EvalFailure> {
+        self.call_user_code(|machine| machine.dispatch_construct(callee, arguments, new_target))
+    }
+
+    fn dispatch_construct(
+        &mut self,
+        callee: Value,
+        arguments: &[Value],
+        new_target: Value,
+    ) -> Result<Value, EvalFailure> {
         match self.callee_kind(callee).map_err(EvalFailure::Runtime)? {
             CalleeKind::Builtin { id } => {
                 match self.call_builtin_with_new_target(
@@ -8111,6 +8185,15 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn call_value(
+        &mut self,
+        callee: Value,
+        this_value: Value,
+        arguments: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        self.call_user_code(|machine| machine.dispatch_call(callee, this_value, arguments))
+    }
+
+    fn dispatch_call(
         &mut self,
         callee: Value,
         this_value: Value,
@@ -10297,17 +10380,23 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn array_extend(&mut self, array: Value, iterable: Value) -> Result<(), EvalFailure> {
-        let iterator = self.create_iterator(iterable, IteratorKind::Sync)?;
-        loop {
-            let (done, value) = self.iterator_next(iterator)?;
-            if done {
-                return Ok(());
+        self.with_temporaries(|machine| {
+            let iterator = machine.create_iterator(iterable, IteratorKind::Sync)?;
+            loop {
+                let (done, value) = machine.iterator_next(iterator)?;
+                if done {
+                    return Ok(());
+                }
+                machine.array_push(array, value)?;
             }
-            self.array_push(array, value)?;
-        }
+        })
     }
 
     fn object_spread(&mut self, target: Value, source: Value) -> Result<(), EvalFailure> {
+        self.with_temporaries(|machine| machine.spread_properties(target, source))
+    }
+
+    fn spread_properties(&mut self, target: Value, source: Value) -> Result<(), EvalFailure> {
         let target_index = match self.runtime_slot(target).map_err(EvalFailure::Runtime)? {
             Some(index)
                 if matches!(
