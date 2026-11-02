@@ -270,8 +270,8 @@ pub fn link_aot_in_process(
     }
     // Pre-scan relocations to find symbols that need GOT entries
     // (GotRelative relocations reference a GOT entry, not the symbol directly).
-    let mut got_symbols: Vec<SymbolIndex> = Vec::new();
-    let mut got_seen: std::collections::HashSet<SymbolIndex> = std::collections::HashSet::new();
+    let mut got_entries: Vec<GotEntry> = Vec::new();
+    let mut got_seen: std::collections::HashSet<GotEntry> = std::collections::HashSet::new();
     for section in &sections {
         if section.data.is_empty() {
             continue;
@@ -282,16 +282,16 @@ pub fn link_aot_in_process(
         for (_offset, reloc) in original_section.relocations() {
             if needs_got_entry(&reloc)
                 && let RelocationTarget::Symbol(idx) = reloc.target()
-                && got_seen.insert(idx)
+                && got_seen.insert((idx, got_entry_addend(&reloc)))
             {
-                got_symbols.push(idx);
+                got_entries.push((idx, got_entry_addend(&reloc)));
             }
         }
     }
     // Total mapping size: text region (page-aligned) + data region (page-aligned)
     // + GOT region (8 bytes per entry, 8-aligned).
     let text_region_size = align_up(text_end, page_size);
-    let (got_offset, data_region_size) = got_layout(data_end, got_symbols.len(), page_size);
+    let (got_offset, data_region_size) = got_layout(data_end, got_entries.len(), page_size);
     let total_size = text_region_size + data_region_size;
     if total_size == 0 {
         return Err(InProcessLinkError::Map("object has no sections".into()));
@@ -358,10 +358,11 @@ pub fn link_aot_in_process(
     // -- 5b. Populate GOT entries -------------------------------------------
     // The GOT lives at the end of the data region, after all data sections.
     // Each entry is 8 bytes containing the resolved symbol address.
-    let mut got_entry_addresses: HashMap<SymbolIndex, usize> = HashMap::new();
-    if !got_symbols.is_empty() {
+    let mut got_entry_addresses: HashMap<GotEntry, usize> = HashMap::new();
+    if !got_entries.is_empty() {
         let got_base = unsafe { data_base.add(got_offset) };
-        for (i, sym_idx) in got_symbols.iter().enumerate() {
+        for (i, entry) in got_entries.iter().enumerate() {
+            let (sym_idx, addend) = entry;
             let sym = file
                 .symbol_by_index(*sym_idx)
                 .map_err(|e| InProcessLinkError::Parse(e.to_string()))?;
@@ -381,9 +382,9 @@ pub fn link_aot_in_process(
             };
             let got_entry = unsafe { got_base.add(i * 8) };
             unsafe {
-                (got_entry as *mut u64).write_unaligned(addr as u64);
+                (got_entry as *mut u64).write_unaligned((addr as u64).wrapping_add_signed(*addend));
             }
-            got_entry_addresses.insert(*sym_idx, got_entry as usize);
+            got_entry_addresses.insert(*entry, got_entry as usize);
         }
     }
     // -- 6. Apply relocations -----------------------------------------------
@@ -413,7 +414,8 @@ pub fn link_aot_in_process(
                         relocation.target()
                     )));
                 };
-                *got_entry_addresses.get(&sym_idx).ok_or_else(|| {
+                let entry = (sym_idx, got_entry_addend(&relocation));
+                *got_entry_addresses.get(&entry).ok_or_else(|| {
                     InProcessLinkError::MissingSymbol(format!("GOT entry for symbol {sym_idx:?}"))
                 })?
             } else {
@@ -683,6 +685,19 @@ fn elf_relocation_type(relocation: &Relocation) -> Option<u32> {
 
 /// Whether the relocation reads its symbol through a GOT entry instead of
 /// addressing the symbol directly.
+/// A GOT slot: the symbol and the addend its stored address includes.
+type GotEntry = (SymbolIndex, i64);
+
+/// The addend a relocation's GOT slot stores. The AArch64 forms load
+/// `GDAT(S + A)`, so slots differ by addend. x86-64 `GOTPCREL` applies its addend
+/// to the displacement instead, where it reads `-4`.
+fn got_entry_addend(relocation: &Relocation) -> i64 {
+    match elf_relocation_type(relocation) {
+        Some(elf::R_AARCH64_ADR_GOT_PAGE | elf::R_AARCH64_LD64_GOT_LO12_NC) => relocation.addend(),
+        _ => 0,
+    }
+}
+
 fn needs_got_entry(relocation: &Relocation) -> bool {
     relocation.kind() == RelocationKind::GotRelative
         || matches!(
@@ -915,6 +930,56 @@ mod tests {
     /// assembling `adrp x16, #N` and `ldr x17, [x16, #N]` with clang.
     const ADRP_X16: u32 = 0x9000_0010;
     const LDR_X17_FROM_X16: u32 = 0xF940_0211;
+
+    #[test]
+    fn a_got_slot_keeps_the_addend_only_where_the_entry_holds_it() {
+        use cranelift_object::object::write;
+        use cranelift_object::object::{
+            Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope,
+        };
+
+        let parsed_addend = |architecture, r_type, addend| {
+            let mut object =
+                write::Object::new(BinaryFormat::Elf, architecture, Endianness::Little);
+            let text = object.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+            object.append_section_data(text, &[0; 8], 4);
+            let symbol = object.add_symbol(write::Symbol {
+                name: b"target".to_vec(),
+                value: 0,
+                size: 0,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Linkage,
+                weak: false,
+                section: write::SymbolSection::Undefined,
+                flags: SymbolFlags::None,
+            });
+            object
+                .add_relocation(
+                    text,
+                    write::Relocation {
+                        offset: 0,
+                        symbol,
+                        addend,
+                        flags: RelocationFlags::Elf { r_type },
+                    },
+                )
+                .expect("relocation records");
+            let bytes = object.write().expect("object writes");
+            let file = File::parse(&*bytes).expect("object parses");
+            let section = file.section_by_name(".text").expect("text section");
+            let (_, relocation) = section.relocations().next().expect("one relocation");
+            assert!(needs_got_entry(&relocation));
+            got_entry_addend(&relocation)
+        };
+
+        for r_type in [elf::R_AARCH64_ADR_GOT_PAGE, elf::R_AARCH64_LD64_GOT_LO12_NC] {
+            assert_eq!(parsed_addend(Architecture::Aarch64, r_type, 16), 16);
+        }
+        assert_eq!(
+            parsed_addend(Architecture::X86_64, elf::R_X86_64_GOTPCREL, -4),
+            0
+        );
+    }
 
     #[test]
     fn the_got_starts_aligned_and_fits_its_region() {
