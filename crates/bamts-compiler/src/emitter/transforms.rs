@@ -652,6 +652,8 @@ struct CjsPlan {
     /// `(exported, local)` for functions. They hoist, so their assignments run
     /// before any require, which also keeps a star export off those names.
     hoisted_exports: Vec<(String, String)>,
+    /// Exported names an import's own lines publish.
+    import_exports: BTreeSet<String>,
     /// Require-local names whose member calls become `(0, m.p)()`.
     require_roots: BTreeSet<String>,
 }
@@ -771,6 +773,7 @@ impl<'a> Rewriter<'a> {
         let hoisted_functions = hoisted_function_names(file);
         let type_imports = type_import_names(file);
         let reads = import_reads(file, options);
+        let exported_locals = exported_locals(file);
         for statement in file.statements() {
             match statement.data() {
                 Statement::Import(import) => {
@@ -808,6 +811,11 @@ impl<'a> Rewriter<'a> {
                     plan.require_roots.insert(local.clone());
                     if let Some(default) = &clause.default {
                         let text = identifier_text(file, default);
+                        for exported in exported_locals.get(&text).into_iter().flatten() {
+                            plan.import_exports.insert(exported.clone());
+                            plan.requires
+                                .push(format!("{} = {local}.default;", exports_member(exported)));
+                        }
                         if let Some(symbol) = symbol_of(&text) {
                             plan.imports.insert(
                                 symbol,
@@ -821,6 +829,11 @@ impl<'a> Rewriter<'a> {
                     match &clause.binding {
                         Some(ImportBinding::Namespace(name)) => {
                             let text = identifier_text(file, name);
+                            for exported in exported_locals.get(&text).into_iter().flatten() {
+                                plan.import_exports.insert(exported.clone());
+                                plan.requires
+                                    .push(format!("{} = {local};", exports_member(exported)));
+                            }
                             if let Some(symbol) = symbol_of(&text) {
                                 plan.imports.insert(
                                     symbol,
@@ -847,6 +860,10 @@ impl<'a> Rewriter<'a> {
                                     continue;
                                 };
                                 let text = identifier_text(file, &specifier.local);
+                                for exported in exported_locals.get(&text).into_iter().flatten() {
+                                    plan.import_exports.insert(exported.clone());
+                                    plan.requires.push(live_export(exported, &local, &property));
+                                }
                                 if let Some(symbol) = symbol_of(&text) {
                                     plan.imports.insert(
                                         symbol,
@@ -968,7 +985,13 @@ impl<'a> Rewriter<'a> {
     fn cjs_export_target(&mut self, exported: &str, range: TextRange) -> AssignmentTargetNode {
         let exports_ident = self.ident("exports");
         let object = self.syn_node(range, Expression::Identifier(exports_ident));
-        let property = MemberProperty::Named(self.ident(exported));
+        let property = if is_identifier_name(exported) {
+            MemberProperty::Named(self.ident(exported))
+        } else {
+            let literal = self.string_literal(exported);
+            let key = self.syn_node(range, Expression::Literal(Literal::String(literal)));
+            MemberProperty::Computed(Box::new(key))
+        };
         self.syn_node(
             range,
             AssignmentTarget::Member(AssignmentMemberTarget {
@@ -1044,22 +1067,22 @@ impl<'a> Rewriter<'a> {
                 ModuleExportName::Identifier(local) => local.range(),
                 _ => continue,
             };
-            let (local, exported) = match (&specifier.local, &specifier.exported) {
-                (ModuleExportName::Identifier(local), ModuleExportName::Identifier(exported)) => (
-                    self.token_text(local.data().token()).to_owned(),
-                    self.token_text(exported.data().token()).to_owned(),
-                ),
-                _ => continue,
+            let ModuleExportName::Identifier(local) = &specifier.local else {
+                continue;
             };
+            let local = self.token_text(local.data().token()).to_owned();
+            let exported = module_export_text(self.file, &specifier.exported);
             if self.exports_only_a_type(&local) {
                 continue;
             }
-            let hoisted = self.cjs.as_ref().is_some_and(|plan| {
-                plan.hoisted_exports
-                    .iter()
-                    .any(|(name, value)| *name == exported && *value == local)
+            let published = self.cjs.as_ref().is_some_and(|plan| {
+                plan.import_exports.contains(&exported)
+                    || plan
+                        .hoisted_exports
+                        .iter()
+                        .any(|(name, value)| *name == exported && *value == local)
             });
-            if hoisted {
+            if published {
                 continue;
             }
             let value = self.cjs_local_value(&local, local_range);
@@ -1299,17 +1322,12 @@ impl<'a> Rewriter<'a> {
         names.sort();
         names.dedup();
         if !names.is_empty() {
-            prelude.push_str("exports.");
-            for (index, name) in names.iter().enumerate() {
-                if index > 0 {
-                    prelude.push_str(" = exports.");
-                }
-                prelude.push_str(name);
-            }
+            let members: Vec<String> = names.iter().map(|name| exports_member(name)).collect();
+            prelude.push_str(&members.join(" = "));
             prelude.push_str(" = void 0;\n");
         }
         for (exported, local) in &plan.hoisted_exports {
-            prelude.push_str(&format!("exports.{exported} = {local};\n"));
+            prelude.push_str(&format!("{} = {local};\n", exports_member(exported)));
         }
         prelude
     }
@@ -9281,6 +9299,75 @@ fn identifier_text(file: &SourceFile, ident: &IdentifierNode) -> String {
     raw_token_text(file, ident.data().token())
 }
 
+fn is_identifier_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_alphabetic() || first == '_' || first == '$')
+        && characters.all(|rest| rest.is_alphanumeric() || rest == '_' || rest == '$')
+}
+
+/// `exports.name`, or `exports["a b"]` for a name that is no identifier.
+fn exports_member(name: &str) -> String {
+    if is_identifier_name(name) {
+        format!("exports.{name}")
+    } else {
+        format!("exports[{}]", quote_module_specifier(name))
+    }
+}
+
+/// A getter on `exports` that reads through to a module, so it stays live.
+fn live_export(exported: &str, module: &str, imported: &str) -> String {
+    let read = if is_identifier_name(imported) {
+        format!("{module}.{imported}")
+    } else {
+        format!("{module}[{}]", quote_module_specifier(imported))
+    };
+    format!(
+        "Object.defineProperty(exports, {}, {{ enumerable: true, \
+         get: function () {{ return {read}; }} }});",
+        quote_module_specifier(exported)
+    )
+}
+
+fn module_export_text(file: &SourceFile, name: &ModuleExportName) -> String {
+    match name {
+        ModuleExportName::Identifier(ident) => identifier_text(file, ident),
+        ModuleExportName::String(literal) => raw_token_text(file, literal.data().token())
+            .trim_matches(['"', '\''])
+            .to_owned(),
+        ModuleExportName::Missing(_) => String::new(),
+    }
+}
+
+/// What each local is exported as through `export { local as name }`.
+fn exported_locals(file: &SourceFile) -> BTreeMap<String, Vec<String>> {
+    let mut locals: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for statement in file.statements() {
+        let Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+            type_only: false,
+            specifiers,
+            source: None,
+            ..
+        })) = statement.data()
+        else {
+            continue;
+        };
+        for specifier in specifiers {
+            let specifier = specifier.data();
+            if let (ExportSpecifierMode::Value, ModuleExportName::Identifier(local)) =
+                (&specifier.mode, &specifier.local)
+            {
+                locals
+                    .entry(identifier_text(file, local))
+                    .or_default()
+                    .push(module_export_text(file, &specifier.exported));
+            }
+        }
+    }
+    locals
+}
+
 /// Plans a re-export's lines: a star export copies the module's names, and a named one reads through to the
 /// module, so it stays a live binding.
 fn plan_cjs_reexport(
@@ -9293,22 +9380,17 @@ fn plan_cjs_reexport(
         let raw = raw_token_text(file, source.data().token());
         quote_module_specifier(raw.trim_matches(['"', '\'']))
     };
-    let export_name = |name: &ModuleExportName| match name {
-        ModuleExportName::Identifier(ident) => identifier_text(file, ident),
-        ModuleExportName::String(literal) => raw_token_text(file, literal.data().token())
-            .trim_matches(['"', '\''])
-            .to_owned(),
-        ModuleExportName::Missing(_) => String::new(),
-    };
     match export {
         ExportDeclaration::All(all) if !all.type_only => {
             let module = quoted(&all.source);
             match &all.exported {
                 Some(name) => {
-                    let name = export_name(name);
+                    let name = module_export_text(file, name);
                     plan.helpers.insert(HelperKind::ImportStar);
-                    plan.requires
-                        .push(format!("exports.{name} = __importStar(require({module}));"));
+                    plan.requires.push(format!(
+                        "{} = __importStar(require({module}));",
+                        exports_member(&name)
+                    ));
                     plan.void_0.push(name);
                 }
                 None => {
@@ -9333,12 +9415,10 @@ fn plan_cjs_reexport(
                 if !matches!(specifier.mode, ExportSpecifierMode::Value) {
                     continue;
                 }
-                let imported = export_name(&specifier.local);
-                let exported = export_name(&specifier.exported);
-                plan.requires.push(format!(
-                    "Object.defineProperty(exports, \"{exported}\", {{ enumerable: true, \
-                     get: function () {{ return {local}.{imported}; }} }});"
-                ));
+                let imported = module_export_text(file, &specifier.local);
+                let exported = module_export_text(file, &specifier.exported);
+                plan.requires
+                    .push(live_export(&exported, &local, &imported));
                 plan.void_0.push(exported);
             }
         }
@@ -9532,16 +9612,14 @@ fn plan_cjs_local_exports(
         }) => {
             for specifier in specifiers {
                 let specifier = specifier.data();
-                let (ModuleExportName::Identifier(local), ModuleExportName::Identifier(exported)) =
-                    (&specifier.local, &specifier.exported)
-                else {
+                let ModuleExportName::Identifier(local) = &specifier.local else {
                     continue;
                 };
                 let local = identifier_text(file, local);
                 if matches!(specifier.mode, ExportSpecifierMode::TypeOnly) || binds_type(&local) {
                     continue;
                 }
-                let exported = identifier_text(file, exported);
+                let exported = module_export_text(file, &specifier.exported);
                 if hoisted_functions.contains(&local) {
                     plan.hoisted_exports.push((exported, local));
                 } else {
@@ -11565,7 +11643,8 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         let code = javascript(&output);
         for expected in [
             "exports.b = exports.a;",
-            "exports.x = m_1.x;",
+            "Object.defineProperty(exports, \"x\", { enumerable: true, get: function () { return m_1.x; } });",
+            "exports.y = n_1.default;",
             "exports.local = local;",
         ] {
             assert!(code.contains(expected), "missing {expected}: {code}");
