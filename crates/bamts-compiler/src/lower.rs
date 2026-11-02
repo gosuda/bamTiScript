@@ -20,10 +20,11 @@ use crate::syntax::{
     ExportDefaultValue, ExportNamedDeclaration, ExportSpecifierMode, Expr, Expression, ForBinding,
     ForInStatement, ForInitializer, ForOfMode, ForOfStatement, ForStatement, FunctionBody,
     FunctionLike, IdentifierNode, IfStatement, ImportBinding, ImportDeclaration,
-    ImportSpecifierMode, LabeledStatement, Literal, LogicalExpression, LogicalOperator,
-    MemberExpression, MemberProperty, MetaProperty, ModuleExportName, NamespaceDeclaration,
-    NamespaceName, NewExpression, NodeId, NodeKind, NumericLiteralNode, ObjectLiteral,
-    ObjectMember, ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier, PropertyName,
+    ImportSpecifierMode, JsxAttributeInitializer, JsxAttributeItem, JsxChild, JsxElementName,
+    LabeledStatement, Literal, LogicalExpression, LogicalOperator, MemberExpression,
+    MemberProperty, MetaProperty, ModuleExportName, NamespaceDeclaration, NamespaceName,
+    NewExpression, NodeId, NodeKind, NumericLiteralNode, ObjectLiteral, ObjectMember,
+    ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier, PropertyName,
     RegexLiteralNode, SourceFile, Statement, Stmt, StringLiteralNode, SwitchStatement,
     TemplateElementNode, TemplateLiteral, TokenKind, UnaryOperator, UpdateExpression,
     UpdateOperator, VariableDeclaration, VariableKind, WhileStatement, WithStatement,
@@ -486,6 +487,15 @@ enum BindingIdentity {
 struct CapturePlan {
     captured: HashSet<BindingIdentity>,
     runtime_cells: HashSet<BindingIdentity>,
+}
+/// The names a file reads as values at any depth, which is what keeps an import.
+pub(crate) fn value_read_names(file: &SourceFile) -> BTreeSet<String> {
+    let mut scanner = FreeVarScanner::new(file, None);
+    scanner.scans_jsx = true;
+    for statement in file.statements() {
+        scanner.scan_statement(statement);
+    }
+    scanner.free
 }
 fn scan_constructor(
     scanner: &mut FreeVarScanner<'_>,
@@ -10050,6 +10060,9 @@ struct FreeVarScanner<'a> {
     uses_arguments: bool,
     uses_new_target: bool,
     uses_super: bool,
+    /// Walks source the way it is written, including JSX and decorators, which
+    /// lowering reaches some other way.
+    scans_jsx: bool,
     calls_super: bool,
     arrow_calls_super: bool,
     fn_boundary: u32,
@@ -10126,6 +10139,7 @@ impl<'a> FreeVarScanner<'a> {
             uses_arguments: false,
             uses_new_target: false,
             uses_super: false,
+            scans_jsx: false,
             calls_super: false,
             arrow_calls_super: false,
             fn_boundary: 0,
@@ -10471,6 +10485,7 @@ impl<'a> FreeVarScanner<'a> {
                     self.push();
                     if let Some(binding) = &handler.data().binding {
                         self.bind_pattern(binding, DeclarationScope::Lexical);
+                        self.scan_pattern_effects(binding);
                         self.initialize_pattern(binding, DeclarationScope::Lexical);
                     }
                     self.predeclare_immediate(&handler.data().body.data().statements, false);
@@ -10624,12 +10639,85 @@ impl<'a> FreeVarScanner<'a> {
         self.pop();
         self.function_depth -= 1;
     }
+    /// A lowercase tag names an intrinsic, not a value in scope.
+    fn scan_jsx_name(&mut self, name: &JsxElementName) {
+        match name {
+            JsxElementName::Identifier(identifier) => {
+                if let Some(text) = identifier_name(self.file, identifier)
+                    && !text.starts_with(|c: char| c.is_ascii_lowercase())
+                {
+                    self.use_name(&text);
+                }
+            }
+            JsxElementName::Member(member) => {
+                let mut root = &*member.object;
+                while let JsxElementName::Member(inner) = root {
+                    root = &inner.object;
+                }
+                if let JsxElementName::Identifier(identifier) = root
+                    && let Some(text) = identifier_name(self.file, identifier)
+                {
+                    self.use_name(&text);
+                }
+            }
+            JsxElementName::Namespace(_) => {}
+        }
+    }
+    fn scan_jsx_attributes(&mut self, attributes: &[JsxAttributeItem]) {
+        for item in attributes {
+            match item {
+                JsxAttributeItem::Attribute(attribute) => {
+                    if let Some(JsxAttributeInitializer::Expression(container)) =
+                        &attribute.data().initializer
+                        && let Some(expression) = &container.data().expression
+                    {
+                        self.scan_expression(expression);
+                    }
+                }
+                JsxAttributeItem::Spread(spread) => {
+                    self.scan_expression(&spread.data().expression);
+                }
+            }
+        }
+    }
+    fn scan_jsx_children(&mut self, children: &[JsxChild]) {
+        for child in children {
+            match child {
+                JsxChild::Text(_) => {}
+                JsxChild::ExpressionContainer(container) => {
+                    if let Some(expression) = &container.data().expression {
+                        self.scan_expression(expression);
+                    }
+                }
+                JsxChild::Spread(spread) => self.scan_expression(&spread.data().expression),
+                JsxChild::Element(element) => self.scan_expression(element),
+            }
+        }
+    }
     fn scan_class_heritage(&mut self, class: &ClassDeclaration) {
         if let Some(heritage) = &class.extends {
             self.scan_expression(&heritage.expression);
         }
     }
+    /// Decorators run where the class is defined. Lowering reaches them there,
+    /// so only the source scan walks them here.
+    fn scan_decorators(&mut self, decorators: &[DecoratorNode]) {
+        if self.scans_jsx {
+            for decorator in decorators {
+                self.scan_expression(&decorator.data().expression);
+            }
+        }
+    }
     fn scan_class(&mut self, class: &ClassDeclaration) {
+        self.scan_decorators(&class.decorators);
+        for member in &class.members {
+            match member.data() {
+                ClassMember::Method(method) => self.scan_decorators(&method.function.decorators),
+                ClassMember::Property(property) => self.scan_decorators(&property.decorators),
+                ClassMember::AutoAccessor(accessor) => self.scan_decorators(&accessor.decorators),
+                _ => {}
+            }
+        }
         self.push();
         let mut seen_private = HashSet::new();
         for member in &class.members {
@@ -10754,6 +10842,18 @@ impl<'a> FreeVarScanner<'a> {
             return;
         }
         match expression.data() {
+            Expression::JsxElement(element) if self.scans_jsx => {
+                self.scan_jsx_name(&element.opening.data().name);
+                self.scan_jsx_attributes(&element.opening.data().attributes);
+                self.scan_jsx_children(&element.children);
+            }
+            Expression::JsxSelfClosingElement(element) if self.scans_jsx => {
+                self.scan_jsx_name(&element.name);
+                self.scan_jsx_attributes(&element.attributes);
+            }
+            Expression::JsxFragment(fragment) if self.scans_jsx => {
+                self.scan_jsx_children(&fragment.children);
+            }
             Expression::JsxElement(_)
             | Expression::JsxFragment(_)
             | Expression::JsxSelfClosingElement(_) => {}

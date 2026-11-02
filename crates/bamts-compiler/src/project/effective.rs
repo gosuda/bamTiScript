@@ -405,6 +405,7 @@ pub fn compile_project<F: FileSystem + Clone>(
             emit_options(project.options(), module.source_file().source_id());
         emit_options.declaration = selection.declaration;
         emit_options.emit_declaration_only = selection.declaration && !selection.javascript;
+        emit_options.verbatim_module_syntax = project.options().verbatim_module_syntax();
         if emit_options.module == Some(ModuleKind::Node) {
             emit_options.module = Some(node_module_format(project, source_path, fs));
         }

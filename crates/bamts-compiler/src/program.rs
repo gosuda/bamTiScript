@@ -234,6 +234,7 @@ pub struct ResolvedProgram {
     remove_comments: bool,
     use_define_for_class_fields: Option<bool>,
     import_helpers: Option<bool>,
+    verbatim_module_syntax: bool,
     target: crate::emitter::ScriptTarget,
     libs: crate::checker::intrinsic_environment::LibSet,
     check_js: bool,
@@ -257,6 +258,11 @@ impl ResolvedProgram {
     #[must_use]
     pub const fn import_helpers(&self) -> Option<bool> {
         self.import_helpers
+    }
+
+    #[must_use]
+    pub const fn verbatim_module_syntax(&self) -> bool {
+        self.verbatim_module_syntax
     }
 
     #[must_use]
@@ -748,6 +754,7 @@ impl ProgramLoader {
             remove_comments: self.options.remove_comments(),
             use_define_for_class_fields: self.options.use_define_for_class_fields(),
             import_helpers: self.options.import_helpers(),
+            verbatim_module_syntax: self.options.verbatim_module_syntax(),
             target,
             libs,
             check_js: self.options.check_js(),

@@ -123,6 +123,8 @@ pub struct EmitOptions {
     pub no_emit_helpers: bool,
     /// Leave authored comments out of the output (`removeComments`).
     pub remove_comments: bool,
+    /// Keeps every import and export as written instead of eliding by use.
+    pub verbatim_module_syntax: bool,
     pub use_define_for_class_fields: Option<bool>,
     pub declaration: bool,
     pub emit_declaration_only: bool,
@@ -154,6 +156,7 @@ impl Default for EmitOptions {
             import_helpers: false,
             no_emit_helpers: false,
             remove_comments: false,
+            verbatim_module_syntax: false,
             use_define_for_class_fields: None,
             declaration: false,
             emit_declaration_only: false,
@@ -405,6 +408,7 @@ impl EmitOptions {
             inline_source_map: self.inline_source_map,
             inline_sources: self.inline_sources,
             remove_comments: self.remove_comments,
+            verbatim_module_syntax: self.verbatim_module_syntax,
         }
     }
 

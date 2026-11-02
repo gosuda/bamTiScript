@@ -1039,6 +1039,7 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             "alwaysstrict" => "alwaysStrict",
             "usedefineforclassfields" => "useDefineForClassFields",
             "importhelpers" => "importHelpers",
+            "verbatimmodulesyntax" => "verbatimModuleSyntax",
             "exactoptionalpropertytypes" => "exactOptionalPropertyTypes",
             "nouncheckedindexedaccess" => "noUncheckedIndexedAccess",
             "strictpropertyinitialization" => "strictPropertyInitialization",
@@ -2519,6 +2520,7 @@ pub fn emit_source_map_baseline(
         );
         options.no_emit_helpers = check.no_emit_helpers();
         options.remove_comments = check.remove_comments();
+        options.verbatim_module_syntax = prog.verbatim_module_syntax();
         match prog.jsx_routing_decision(ProgramOutputKind::JavaScript) {
             JsxRoutingDecision::Emit | JsxRoutingDecision::TransformAndEmit => {
                 options.jsx = prog.jsx();

@@ -137,6 +137,8 @@ impl ScriptTarget {
 pub struct TransformOptions {
     /// Language target that drives downlevel decisions.
     pub target: ScriptTarget,
+    /// Keeps every import as written instead of eliding by use.
+    pub verbatim_module_syntax: bool,
     /// Whether the emitted file begins with a `"use strict"` prologue.
     pub always_strict: bool,
     /// When true, class fields that survive downlevel use `define` semantics.
@@ -607,6 +609,8 @@ struct Rewriter<'a> {
     cjs: Option<CjsPlan>,
     /// Names `import type` binds, which an `export { name }` cannot publish.
     type_imports: BTreeSet<String>,
+    /// Names the file reads as values, or `None` when imports stay as written.
+    import_reads: Option<BTreeSet<String>>,
     /// Raw lines for marker statements, keyed by the marker's node.
     inline_lines: HashMap<NodeId, String>,
     synthesized_ids: BTreeSet<NodeId>,
@@ -741,6 +745,7 @@ impl<'a> Rewriter<'a> {
             parameter_initializer_depths: Vec::new(),
             cjs,
             type_imports: type_import_names(file),
+            import_reads: import_reads(file, options),
             inline_lines: HashMap::new(),
             synthesized_ids: BTreeSet::new(),
             file,
@@ -765,6 +770,7 @@ impl<'a> Rewriter<'a> {
         let symbol_of = |name: &str| model.scope(module_scope).value(name);
         let hoisted_functions = hoisted_function_names(file);
         let type_imports = type_import_names(file);
+        let reads = import_reads(file, options);
         for statement in file.statements() {
             match statement.data() {
                 Statement::Import(import) => {
@@ -780,6 +786,13 @@ impl<'a> Rewriter<'a> {
                     let Some(clause) = &import.clause else {
                         plan.statement_lines
                             .insert(statement.id(), format!("require({quoted});"));
+                        continue;
+                    };
+                    let clause = match &reads {
+                        Some(reads) => kept_import_clause(file, clause, reads),
+                        None => Some(clause.clone()),
+                    };
+                    let Some(clause) = &clause else {
                         continue;
                     };
                     let local = names.allocate(module);
@@ -1067,6 +1080,29 @@ impl<'a> Rewriter<'a> {
             ));
         }
         out
+    }
+
+    /// An ES import keeps only the bindings something reads as a value, and
+    /// goes away with the last one: naming a type would fail at load.
+    fn rewrite_esm_import(&mut self, statement: &Stmt, import: &ImportDeclaration) -> Vec<Stmt> {
+        let (Some(reads), Some(clause), false) =
+            (&self.import_reads, &import.clause, import.type_only)
+        else {
+            return vec![statement.clone()];
+        };
+        let Some(kept) = kept_import_clause(self.file, clause, reads) else {
+            return Vec::new();
+        };
+        if kept == *clause {
+            return vec![statement.clone()];
+        }
+        vec![self.node(
+            statement.range(),
+            Statement::Import(ImportDeclaration {
+                clause: Some(kept),
+                ..import.clone()
+            }),
+        )]
     }
 
     fn exports_only_a_type(&self, local: &str) -> bool {
@@ -1543,7 +1579,7 @@ impl<'a> Rewriter<'a> {
             }
             Statement::Import(import) => {
                 if self.cjs.is_none() {
-                    return vec![statement.clone()];
+                    return self.rewrite_esm_import(statement, import);
                 }
                 if import.type_only {
                     // Type-only imports carry no runtime form.
@@ -9312,6 +9348,87 @@ fn is_type_only_export(model: &SemanticModel, name: &str) -> bool {
     scope.value(name).is_none() && scope.type_binding(name).is_some()
 }
 
+/// The names that keep an import in this file. JavaScript keeps every import,
+/// as does `verbatimModuleSyntax`, so those files have no answer.
+fn import_reads(file: &SourceFile, options: &TransformOptions) -> Option<BTreeSet<String>> {
+    if options.verbatim_module_syntax
+        || matches!(
+            file.script_kind(),
+            crate::source::ScriptKind::JavaScript | crate::source::ScriptKind::JavaScriptReact
+        )
+    {
+        return None;
+    }
+    let mut reads = crate::lower::value_read_names(file);
+    for statement in file.statements() {
+        match statement.data() {
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+                type_only: false,
+                specifiers,
+                source: None,
+                ..
+            })) => {
+                reads.extend(specifiers.iter().filter_map(|specifier| {
+                    let specifier = specifier.data();
+                    match (&specifier.mode, &specifier.local) {
+                        (ExportSpecifierMode::Value, ModuleExportName::Identifier(local)) => {
+                            Some(identifier_text(file, local))
+                        }
+                        _ => None,
+                    }
+                }));
+            }
+            Statement::ImportEquals(ImportEqualsDeclaration {
+                reference: ExternalModuleReference::Qualified(name),
+                ..
+            }) => {
+                let mut root = name;
+                while let EntityName::Qualified { left, .. } = root {
+                    root = left;
+                }
+                if let EntityName::Identifier(identifier) = root {
+                    reads.insert(identifier_text(file, identifier));
+                }
+            }
+            _ => {}
+        }
+    }
+    // The classic JSX factories read a name the source never spells.
+    if matches!(options.jsx, Some(JsxEmit::React)) {
+        for factory in [&options.jsx_factory, &options.jsx_fragment_factory] {
+            let factory = factory.as_deref().unwrap_or("React");
+            reads.extend(factory.split('.').next().map(str::to_owned));
+        }
+    }
+    Some(reads)
+}
+
+/// An import clause without the bindings nothing reads, or `None` if none remain.
+fn kept_import_clause(
+    file: &SourceFile,
+    clause: &ImportClause,
+    reads: &BTreeSet<String>,
+) -> Option<ImportClause> {
+    let read = |name: &IdentifierNode| reads.contains(&identifier_text(file, name));
+    let default = clause.default.clone().filter(read);
+    let binding = match &clause.binding {
+        Some(ImportBinding::Namespace(name)) if read(name) => clause.binding.clone(),
+        Some(ImportBinding::Named(specifiers)) => {
+            let kept: Vec<_> = specifiers
+                .iter()
+                .filter(|specifier| {
+                    let specifier = specifier.data();
+                    matches!(specifier.mode, ImportSpecifierMode::Value) && read(&specifier.local)
+                })
+                .cloned()
+                .collect();
+            (!kept.is_empty()).then_some(ImportBinding::Named(kept))
+        }
+        _ => None,
+    };
+    (default.is_some() || binding.is_some()).then_some(ImportClause { default, binding })
+}
+
 fn type_import_names(file: &SourceFile) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for statement in file.statements() {
@@ -11582,6 +11699,65 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             },
         );
         assert!(!javascript(&commonjs).contains("export {}"));
+    }
+
+    #[test]
+    fn an_import_survives_only_through_a_value_read() {
+        let esm = EmitOptions {
+            target: ScriptTarget::Es2022,
+            module: Some(crate::emitter::ModuleKind::EsNext),
+            ..EmitOptions::default()
+        };
+        for (source, expected) in [
+            (
+                "import { I, v } from './m';\nlet a: I;\nv;\n",
+                "import { v } from './m';",
+            ),
+            ("import { unused } from './m';\n", "export {};"),
+            ("import d from './m';\nlet a: d;\n", "export {};"),
+            ("import * as n from './m';\nlet a: n.T;\n", "export {};"),
+            ("import {} from './m';\n", "export {};"),
+            (
+                "import { x } from './m';\nexport { x };\n",
+                "import { x } from './m';",
+            ),
+            (
+                "import { d } from './m';\n@d class C {}\n",
+                "import { d } from './m';",
+            ),
+            (
+                "import { d } from './m';\nclass C { @d m() {} }\n",
+                "import { d } from './m';",
+            ),
+            (
+                "import { c } from './m';\ntry {} catch ({ a = c }) {}\n",
+                "import { c } from './m';",
+            ),
+            ("import './m';\n", "import './m';"),
+        ] {
+            let output = emit_with_options(source, esm.clone());
+            let code = javascript(&output);
+            assert!(code.contains(expected), "{source}: {code}");
+            if expected == "export {};" {
+                assert!(!code.contains("import"), "{source}: {code}");
+            }
+        }
+        let verbatim = emit_with_options(
+            "import { unused } from './m';\n",
+            EmitOptions {
+                verbatim_module_syntax: true,
+                ..esm.clone()
+            },
+        );
+        assert!(javascript(&verbatim).contains("import { unused }"));
+        let commonjs = emit_with_options(
+            "import { I } from './m';\nlet a: I;\nexport { a };\n",
+            EmitOptions {
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..esm
+            },
+        );
+        assert!(!javascript(&commonjs).contains("require"));
     }
 
     #[test]

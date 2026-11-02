@@ -958,6 +958,7 @@ pub struct CompilerOptions {
     always_strict: bool,
     use_define_for_class_fields: Option<bool>,
     import_helpers: Option<bool>,
+    verbatim_module_syntax: bool,
     allow_js: bool,
     check_js: bool,
     resolve_json_module: bool,
@@ -1068,6 +1069,11 @@ impl CompilerOptions {
     #[must_use]
     pub const fn import_helpers(&self) -> Option<bool> {
         self.import_helpers
+    }
+
+    #[must_use]
+    pub const fn verbatim_module_syntax(&self) -> bool {
+        self.verbatim_module_syntax
     }
 
     #[must_use]
@@ -1261,6 +1267,8 @@ impl ProjectConfig {
             .unwrap_or(strict),
             always_strict: optional_bool(compiler, "alwaysStrict")?.unwrap_or(strict),
             use_define_for_class_fields: optional_bool(compiler, "useDefineForClassFields")?,
+            verbatim_module_syntax: optional_bool(compiler, "verbatimModuleSyntax")?
+                .unwrap_or(false),
             import_helpers: optional_bool(compiler, "importHelpers")?,
             allow_js: optional_bool(compiler, "allowJs")?.unwrap_or(false),
             check_js: optional_bool(compiler, "checkJs")?.unwrap_or(false),
