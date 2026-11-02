@@ -24,7 +24,7 @@ pub mod transforms;
 pub mod transpile;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
     sync::Arc,
 };
@@ -513,6 +513,8 @@ pub(crate) struct PrintSource<'a> {
     /// parser tree and any JSX-desugar consumption). Ids below it are
     /// parser-assigned and must carry ranges within the authored text.
     pub(crate) synthesized_floor: u32,
+    /// Raw lines that print in place of a marker statement.
+    pub(crate) inline_lines: Option<&'a HashMap<NodeId, String>>,
 }
 
 /// Print context for a braced block. Carries two tsc behaviors that split on
@@ -597,6 +599,7 @@ pub(crate) fn print(
             // No rewriter ran: every id is parser-assigned, so the mint
             // gate's range check applies universally.
             synthesized_floor: u32::MAX,
+            inline_lines: None,
         },
         model,
         options,
@@ -622,6 +625,7 @@ pub(crate) fn print_with_jsx_plan(
         original_content,
         synthesized,
         synthesized_floor,
+        inline_lines,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
         let mut builder = SourceMapBuilder::new()
@@ -685,6 +689,7 @@ pub(crate) fn print_with_jsx_plan(
         synthesized,
         synthesized_floor,
         emitted_module_syntax: false,
+        inline_lines,
     };
     if let Some(prelude) = prelude.filter(|prelude| !prelude.is_empty()) {
         let has_trailing_newline = prelude.ends_with('\n');
@@ -891,6 +896,7 @@ struct Emitter<'a> {
     synthesized_floor: u32,
     /// An import or export reached the output.
     emitted_module_syntax: bool,
+    inline_lines: Option<&'a HashMap<NodeId, String>>,
 }
 
 /// The source text of an enum's numeric value.
@@ -1559,6 +1565,18 @@ impl<'a> Emitter<'a> {
     // =======================================================================
 
     fn emit_statement(&mut self, statement: &Stmt) -> bool {
+        if let Some(lines) = self
+            .inline_lines
+            .and_then(|lines| lines.get(&statement.id()))
+        {
+            for (index, line) in lines.lines().enumerate() {
+                if index > 0 {
+                    self.newline();
+                }
+                self.raw(line);
+            }
+            return true;
+        }
         let previous = self.anchor;
         self.anchor = statement.range();
         let stmt_range = self.anchor;

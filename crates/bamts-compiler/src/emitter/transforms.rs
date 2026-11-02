@@ -15,7 +15,7 @@
 //!   ES2015, and generators below ES2015 produce typed diagnostics instead of
 //!   silently emitting later syntax.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::checker::SemanticModel;
@@ -288,12 +288,11 @@ pub fn emit_transformed(
     let helper_emit =
         helpers::emit_helpers_for_source(&used_helpers, &options.helpers, &rewritten, is_module);
     let cjs_marker = rewriter.cjs_marker_prelude(!runtime_prelude.is_empty());
-    let cjs_requires = rewriter.cjs_require_prelude();
     let prelude = join_preludes(
         &strict_prelude(file, options, is_module),
         &join_preludes(
             &helper_emit.prelude,
-            &join_preludes(&cjs_marker, &join_preludes(&runtime_prelude, &cjs_requires)),
+            &join_preludes(&cjs_marker, &runtime_prelude),
         ),
     );
     let mut output = print_with_jsx_plan(
@@ -302,6 +301,7 @@ pub fn emit_transformed(
             original_content: file.source_text().as_str(),
             synthesized: Some(&rewriter.synthesized_ids),
             synthesized_floor: rewriter.synthesized_floor,
+            inline_lines: Some(&rewriter.inline_lines),
         },
         model,
         PrintOptions {
@@ -607,6 +607,8 @@ struct Rewriter<'a> {
     cjs: Option<CjsPlan>,
     /// Names `import type` binds, which an `export { name }` cannot publish.
     type_imports: BTreeSet<String>,
+    /// Raw lines for marker statements, keyed by the marker's node.
+    inline_lines: HashMap<NodeId, String>,
     synthesized_ids: BTreeSet<NodeId>,
     file: &'a SourceFile,
     /// Namespace bodies being lowered, innermost last.
@@ -632,8 +634,11 @@ struct CjsPlan {
     is_module: bool,
     /// Exported names needing `exports.<name> = void 0;` in the prelude.
     void_0: Vec<String>,
-    /// `require` prelude lines in import-statement order.
+    /// The CommonJS lines of the statement being planned.
     requires: Vec<String>,
+    /// Each import or re-export's lines, printed where the statement stood:
+    /// upstream keeps them in source order among the other statements.
+    statement_lines: HashMap<NodeId, String>,
     /// Import binding replacement by resolved module-scope symbol.
     imports: BTreeMap<crate::checker::SymbolId, CjsImportRef>,
     /// Exported `var`/`let` bindings, which live only on `exports`.
@@ -729,6 +734,7 @@ impl<'a> Rewriter<'a> {
             parameter_initializer_depths: Vec::new(),
             cjs,
             type_imports: type_import_names(file),
+            inline_lines: HashMap::new(),
             synthesized_ids: BTreeSet::new(),
             file,
             namespace_frames: Vec::new(),
@@ -765,7 +771,8 @@ impl<'a> Rewriter<'a> {
                     // quotes in every require form.
                     let quoted = quote_module_specifier(module);
                     let Some(clause) = &import.clause else {
-                        plan.requires.push(format!("require({quoted});"));
+                        plan.statement_lines
+                            .insert(statement.id(), format!("require({quoted});"));
                         continue;
                     };
                     let local = names.allocate(module);
@@ -886,6 +893,10 @@ impl<'a> Rewriter<'a> {
                     }
                 }
                 _ => {}
+            }
+            if !plan.requires.is_empty() {
+                let lines = std::mem::take(&mut plan.requires).join("\n");
+                plan.statement_lines.insert(statement.id(), lines);
             }
         }
         // Script files keep the plan too: the marker stays off until a
@@ -1260,16 +1271,18 @@ impl<'a> Rewriter<'a> {
         prelude
     }
 
-    fn cjs_require_prelude(&self) -> String {
-        let Some(plan) = &self.cjs else {
-            return String::new();
+    /// An import or re-export's lines, as a statement the printer fills in.
+    fn cjs_statement_lines(&mut self, statement: &Stmt) -> Vec<Stmt> {
+        let lines = self
+            .cjs
+            .as_mut()
+            .and_then(|plan| plan.statement_lines.remove(&statement.id()));
+        let Some(lines) = lines else {
+            return Vec::new();
         };
-        let mut prelude = String::new();
-        for line in &plan.requires {
-            prelude.push_str(line);
-            prelude.push('\n');
-        }
-        prelude
+        let marker = self.node(statement.range(), Statement::Empty);
+        self.inline_lines.insert(marker.id(), lines);
+        vec![marker]
     }
 
     /// Raw source text of a token, with escapes kept verbatim.
@@ -1515,10 +1528,12 @@ impl<'a> Rewriter<'a> {
                 if source.is_none() && !*type_only {
                     return self.cjs_export_specifiers(specifiers);
                 }
-                // A re-export is in the prelude, and a type-only one is gone.
-                Vec::new()
+                // A type-only re-export has no lines, so it is gone.
+                self.cjs_statement_lines(statement)
             }
-            Statement::Export(ExportDeclaration::All(_)) if self.cjs.is_some() => Vec::new(),
+            Statement::Export(ExportDeclaration::All(_)) if self.cjs.is_some() => {
+                self.cjs_statement_lines(statement)
+            }
             Statement::Import(import) => {
                 if self.cjs.is_none() {
                     return vec![statement.clone()];
@@ -1527,8 +1542,7 @@ impl<'a> Rewriter<'a> {
                     // Type-only imports carry no runtime form.
                     return Vec::new();
                 }
-                // Every import is a prelude line, in source order.
-                Vec::new()
+                self.cjs_statement_lines(statement)
             }
             Statement::Block(block) => {
                 let statements = self.rewrite_statements(&block.data().statements);
@@ -9221,8 +9235,7 @@ fn identifier_text(file: &SourceFile, ident: &IdentifierNode) -> String {
     raw_token_text(file, ident.data().token())
 }
 
-/// Plans a re-export as prelude lines, in order with the file's imports: a
-/// star export copies the module's names, and a named one reads through to the
+/// Plans a re-export's lines: a star export copies the module's names, and a named one reads through to the
 /// module, so it stays a live binding.
 fn plan_cjs_reexport(
     file: &SourceFile,
@@ -11447,6 +11460,39 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         let code = javascript(&output);
         assert!(code.contains("exports.b = a.x;"), "{code}");
         assert!(code.contains("exports.c = exports.b;"), "{code}");
+    }
+
+    #[test]
+    fn commonjs_imports_stay_in_source_order_among_statements() {
+        let output = emit_with_options(
+            "// leading\n\
+             import './s';\n\
+             globalThis.a = 1;\n\
+             import { q } from './m';\n\
+             console.log(q);\n\
+             export * from './n';\n\
+             import './t';\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        let order = [
+            "// leading",
+            "require(\"./s\");",
+            "globalThis.a = 1;",
+            "const m_1 = require(\"./m\");",
+            "console.log(m_1.q);",
+            "__exportStar(require(\"./n\"), exports);",
+            "require(\"./t\");",
+        ];
+        let positions: Vec<usize> = order
+            .iter()
+            .map(|line| code.find(line).unwrap_or_else(|| panic!("{line}: {code}")))
+            .collect();
+        assert!(positions.is_sorted(), "{code}");
     }
 
     #[test]
