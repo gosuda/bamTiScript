@@ -13386,6 +13386,7 @@ impl<'src> Binder<'src> {
                             self.complex_catch_scopes.insert(catch_scope);
                         }
                         self.bind_pattern(binding, VariableKind::Let, catch_scope, handler.id());
+                        self.resolve_pattern_expressions(binding, catch_scope);
                     }
                     // Body declarations live in a child block like the try
                     // body above, so `function e` shadows the parameter

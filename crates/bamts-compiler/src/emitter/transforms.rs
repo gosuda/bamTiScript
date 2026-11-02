@@ -1830,14 +1830,13 @@ impl<'a> Rewriter<'a> {
             Statement::Try(value) => {
                 let block = self.rewrite_block(&value.block);
                 let handler = value.handler.as_ref().map(|handler| {
+                    let binding = handler
+                        .data()
+                        .binding
+                        .as_ref()
+                        .map(|binding| self.rewrite_pattern(binding));
                     let body = self.rewrite_block(&handler.data().body);
-                    self.node(
-                        handler.range(),
-                        CatchClause {
-                            binding: handler.data().binding.clone(),
-                            body,
-                        },
-                    )
+                    self.node(handler.range(), CatchClause { binding, body })
                 });
                 let finalizer = value
                     .finalizer
@@ -11924,6 +11923,22 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             },
         );
         assert!(!javascript(&commonjs).contains("require"));
+    }
+
+    #[test]
+    fn a_catch_pattern_reads_through_its_namespace() {
+        let output = emit_with_options(
+            "namespace N {\n\
+             export var n = 3;\n\
+             try { throw {}; } catch ({ a = n }) { a; }\n\
+             }\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(code.contains("catch ({ a = N.n })"), "{code}");
     }
 
     #[test]
