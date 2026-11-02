@@ -614,6 +614,8 @@ struct Rewriter<'a> {
     read_aliases: Option<BTreeSet<Utf16Pos>>,
     /// Temporaries taken outside any namespace body.
     module_temps: usize,
+    /// The parameter holding each alias a namespace body publishes.
+    published_aliases: BTreeMap<crate::checker::SymbolId, String>,
 }
 
 /// Per-file CommonJS lowering plan built before the rewrite walk.
@@ -719,6 +721,7 @@ impl<'a> Rewriter<'a> {
             value_symbol_ranges: None,
             read_aliases: None,
             module_temps: 0,
+            published_aliases: BTreeMap::new(),
         }
     }
     /// Scans top-level module syntax into a CommonJS lowering plan.
@@ -831,7 +834,9 @@ impl<'a> Rewriter<'a> {
                             | Statement::Interface(_)
                             | Statement::TypeAlias(_) => {}
                             Statement::ImportEquals(import) if is_qualified_alias(import) => {
-                                plan.void_0.push(identifier_text(file, &import.local));
+                                let name = identifier_text(file, &import.local);
+                                plan.exported_variables.extend(symbol_of(&name));
+                                plan.void_0.push(name);
                             }
                             Statement::Namespace(namespace) => {
                                 if let NamespaceName::Identifier { name, .. } = &namespace.name
@@ -10989,6 +10994,19 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
     }
 
     #[test]
+    fn a_published_alias_is_read_from_its_container() {
+        let output = emit_at(
+            "namespace A { export var x = 1; }\n\
+             namespace C { export var v = b; export import b = A.x; export var w = b; }\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        for expected in ["C.v = C.b;", "C.b = A.x;", "C.w = C.b;"] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+    }
+
+    #[test]
     fn a_namespace_without_a_value_emits_nothing() {
         let output = emit_at(
             "namespace T { export interface I {} }\n\
@@ -11129,6 +11147,23 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             let preamble = code.split("void 0;").next().expect("split yields a head");
             assert!(preamble.contains(name), "{code}");
         }
+    }
+
+    #[test]
+    fn commonjs_reads_a_published_alias_from_exports() {
+        let output = emit_with_options(
+            "export namespace a { export var x = 10; }\n\
+             export import b = a.x;\n\
+             export var c = b;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(code.contains("exports.b = a.x;"), "{code}");
+        assert!(code.contains("exports.c = exports.b;"), "{code}");
     }
 
     #[test]

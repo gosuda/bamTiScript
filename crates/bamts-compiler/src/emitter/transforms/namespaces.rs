@@ -318,6 +318,7 @@ impl Rewriter<'_> {
         });
         self.declared_names.push(BTreeSet::new());
         self.expression_temp_scopes.push(Vec::new());
+        self.publish_aliases(namespace, parameter);
         let mut body = Vec::new();
         for member in &namespace.body.data().statements {
             self.record_declaration(member);
@@ -330,6 +331,31 @@ impl Rewriter<'_> {
         self.declared_names.pop();
         self.namespace_frames.pop();
         body
+    }
+
+    /// An exported alias has no local, so every read goes through the
+    /// container, including one above the declaration.
+    fn publish_aliases(&mut self, namespace: &NamespaceDeclaration, parameter: &str) {
+        let Some(model) = self.model else {
+            return;
+        };
+        for member in &namespace.body.data().statements {
+            let Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) = member.data()
+            else {
+                continue;
+            };
+            let aliased = matches!(inner.data(), Statement::ImportEquals(import)
+                if is_qualified_alias(import));
+            let position = model.symbols().iter().position(|symbol| {
+                symbol.kind() == SymbolKind::Import && symbol.range() == inner.range()
+            });
+            if let (true, Some(position)) = (aliased, position) {
+                self.published_aliases
+                    .insert(SymbolId::new(position as u32), parameter.to_owned());
+            }
+        }
     }
 
     fn rewrite_namespace_member(&mut self, member: &Stmt, parameter: &str) -> Vec<Stmt> {
@@ -602,7 +628,14 @@ impl Rewriter<'_> {
     /// The name of the parameter holding the container a use resolved to,
     /// when `reference` reads a namespace member rather than a local.
     pub(super) fn namespace_member_parameter(&self, reference: NodeId) -> Option<String> {
-        let member = self.model?.namespace_facts().member_use(reference)?;
+        let model = self.model?;
+        if let Some(parameter) = model
+            .reference(reference)
+            .and_then(|symbol| self.published_aliases.get(&symbol))
+        {
+            return Some(parameter.clone());
+        }
+        let member = model.namespace_facts().member_use(reference)?;
         self.namespace_frames
             .iter()
             .rev()
