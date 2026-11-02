@@ -1035,9 +1035,45 @@ impl<'a> Rewriter<'a> {
                 ),
                 _ => continue,
             };
-            out.push(self.cjs_export_assignment(&exported, &local, local_range));
+            let value = self.cjs_local_value(&local, local_range);
+            let left = self.cjs_export_target(&exported, local_range);
+            let assignment = self.syn_node(
+                local_range,
+                Expression::Assignment(AssignmentExpression {
+                    operator: AssignmentOperator::Assign,
+                    left,
+                    right: Box::new(value),
+                }),
+            );
+            out.push(self.syn_node(
+                local_range,
+                Statement::Expression(ExpressionStatement {
+                    expression: Box::new(assignment),
+                }),
+            ));
         }
         out
+    }
+
+    /// What a module-scope name reads under CommonJS, where an exported
+    /// variable lives on `exports` and an import on its required module.
+    fn cjs_local_value(&mut self, local: &str, range: TextRange) -> Expr {
+        let symbol = self
+            .model
+            .and_then(|model| model.scope(model.module_scope()).value(local));
+        let reference = symbol.and_then(|symbol| {
+            let plan = self.cjs.as_ref()?;
+            if plan.exported_variables.contains(&symbol) {
+                return Some(("exports".to_owned(), Some(local.to_owned())));
+            }
+            let import = plan.imports.get(&symbol)?;
+            Some((import.root.clone(), import.property.clone()))
+        });
+        match reference {
+            Some((root, Some(property))) => self.namespace_member(&root, &property, range),
+            Some((root, None)) => self.ident_expr(&root),
+            None => self.ident_expr(local),
+        }
     }
 
     /// Declared value names of a statement, via the rewrite text.
@@ -11146,6 +11182,30 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         for name in ["exports.a", "exports.b", "exports.c"] {
             let preamble = code.split("void 0;").next().expect("split yields a head");
             assert!(preamble.contains(name), "{code}");
+        }
+    }
+
+    #[test]
+    fn commonjs_export_specifiers_read_what_the_name_became() {
+        let output = emit_with_options(
+            "import { x } from './m';\n\
+             import y from './n';\n\
+             export var a = 1;\n\
+             const local = 2;\n\
+             export { a as b, x, y, local };\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        for expected in [
+            "exports.b = exports.a;",
+            "exports.x = m_1.x;",
+            "exports.local = local;",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
         }
     }
 
