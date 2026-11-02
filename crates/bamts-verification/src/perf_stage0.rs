@@ -923,11 +923,15 @@ mod tests {
             return;
         }
         let conditions = conditions.unwrap();
-        let facts = bamts_platform::machine_facts().unwrap();
-        let placement = bamts_platform::thread_placement().unwrap();
-        assert_eq!(conditions.governor, facts.governor);
-        assert_eq!(conditions.swap_total_kib, facts.swap_total_kib);
-        assert_eq!(conditions.cpu_affinity, placement.cpu_affinity);
+        assert_eq!(conditions.governor, bamts_platform::cpu_governor().unwrap());
+        assert_eq!(
+            conditions.swap_total_kib,
+            bamts_platform::swap_total_kib().unwrap()
+        );
+        assert_eq!(
+            conditions.cpu_affinity,
+            bamts_platform::cpu_affinity().unwrap()
+        );
         assert_eq!(
             conditions.mempolicy_mode,
             bamts_platform::numa_policy_mode()

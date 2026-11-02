@@ -555,14 +555,20 @@ mod tests {
     #[test]
     fn conditions_come_from_the_platform_crate() {
         let conditions = Conditions::capture().unwrap();
-        let facts = bamts_platform::machine_facts().unwrap();
-        let placement = bamts_platform::thread_placement().unwrap();
+        // The same readers the harness uses: `thread_placement` also asks for the
+        // NUMA policy, which a sandbox that blocks `get_mempolicy` refuses.
         assert_eq!(
             conditions.governors,
             bamts_platform::cpu_governors().unwrap()
         );
-        assert_eq!(conditions.swap_total_kb, facts.swap_total_kib);
-        assert_eq!(conditions.cpus_allowed_list, placement.cpu_affinity);
+        assert_eq!(
+            conditions.swap_total_kb,
+            bamts_platform::swap_total_kib().unwrap()
+        );
+        assert_eq!(
+            conditions.cpus_allowed_list,
+            bamts_platform::cpu_affinity().unwrap()
+        );
         assert_eq!(
             conditions.cpus_online,
             bamts_platform::online_cpu_list().unwrap()
