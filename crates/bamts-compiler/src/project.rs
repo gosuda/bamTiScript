@@ -959,6 +959,9 @@ pub struct CompilerOptions {
     use_define_for_class_fields: Option<bool>,
     import_helpers: Option<bool>,
     verbatim_module_syntax: bool,
+    /// `emitDecoratorMetadata` and `reactNamespace` read imports the source scan
+    /// cannot see, so emit cannot prove one unused.
+    keeps_imports: bool,
     allow_js: bool,
     check_js: bool,
     resolve_json_module: bool,
@@ -1074,6 +1077,11 @@ impl CompilerOptions {
     #[must_use]
     pub const fn verbatim_module_syntax(&self) -> bool {
         self.verbatim_module_syntax
+    }
+
+    #[must_use]
+    pub const fn keeps_imports(&self) -> bool {
+        self.keeps_imports
     }
 
     #[must_use]
@@ -1269,6 +1277,8 @@ impl ProjectConfig {
             use_define_for_class_fields: optional_bool(compiler, "useDefineForClassFields")?,
             verbatim_module_syntax: optional_bool(compiler, "verbatimModuleSyntax")?
                 .unwrap_or(false),
+            keeps_imports: optional_bool(compiler, "emitDecoratorMetadata")?.unwrap_or(false)
+                || compiler.is_some_and(|options| options.get("reactNamespace").is_some()),
             import_helpers: optional_bool(compiler, "importHelpers")?,
             allow_js: optional_bool(compiler, "allowJs")?.unwrap_or(false),
             check_js: optional_bool(compiler, "checkJs")?.unwrap_or(false),

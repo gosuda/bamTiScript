@@ -489,11 +489,30 @@ struct CapturePlan {
     runtime_cells: HashSet<BindingIdentity>,
 }
 /// The names a file reads as values at any depth, which is what keeps an import.
-pub(crate) fn value_read_names(file: &SourceFile) -> BTreeSet<String> {
+/// `export default x` and `export = x` are left to the caller: unlike a read, they
+/// are legal for a type, so the name alone does not make it a value.
+pub(crate) fn value_read_names(
+    file: &SourceFile,
+    enum_facts: Option<&'_ crate::enum_plan::EnumFacts>,
+) -> BTreeSet<String> {
     let mut scanner = FreeVarScanner::new(file, None);
     scanner.scans_jsx = true;
+    scanner.inlined_enums = enum_facts;
     for statement in file.statements() {
-        scanner.scan_statement(statement);
+        let exports_a_name = match statement.data() {
+            Statement::Export(ExportDeclaration::Default(default)) => matches!(
+                &default.value,
+                ExportDefaultValue::Expression(value)
+                    if matches!(value.data(), Expression::Identifier(_))
+            ),
+            Statement::Export(ExportDeclaration::Assignment(value)) => {
+                matches!(value.data(), Expression::Identifier(_))
+            }
+            _ => false,
+        };
+        if !exports_a_name {
+            scanner.scan_statement(statement);
+        }
     }
     scanner.reads
 }
@@ -10085,6 +10104,8 @@ struct FreeVarScanner<'a> {
     /// Every name read as a value, shadowed or not. Keeping an import a shadowed
     /// read did not need costs nothing; dropping one that was read would throw.
     reads: BTreeSet<String>,
+    /// Const enum uses the source scan skips, because emit inlines them.
+    inlined_enums: Option<&'a crate::enum_plan::EnumFacts>,
     calls_super: bool,
     arrow_calls_super: bool,
     fn_boundary: u32,
@@ -10163,6 +10184,7 @@ impl<'a> FreeVarScanner<'a> {
             uses_super: false,
             scans_jsx: false,
             reads: BTreeSet::new(),
+            inlined_enums: None,
             calls_super: false,
             arrow_calls_super: false,
             fn_boundary: 0,
@@ -10872,6 +10894,12 @@ impl<'a> FreeVarScanner<'a> {
         self.pop();
     }
     fn scan_expression(&mut self, expression: &Expr) {
+        if self
+            .inlined_enums
+            .is_some_and(|facts| facts.const_use(expression.id()).is_some())
+        {
+            return;
+        }
         if let Some(replacement) = self
             .jsx_plan
             .and_then(|plan| plan.expression_desugars.get(&expression.id()))

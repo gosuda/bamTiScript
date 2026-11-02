@@ -428,11 +428,22 @@ impl ProgramFrontendOutput {
                     .contains(&imported)
             {
                 names.insert(exported);
+            } else {
+                // An explicit export outranks a local type of the same name.
+                names.remove(&exported);
             }
         }
+        let mut star_values = BTreeSet::new();
         for specifier in exports.stars {
             if let Some(target) = local_dependency(program, source_id, &specifier) {
                 let starred = self.resolve_erased_exports(program, target, erased, visiting);
+                if let Some(module) = self.module(target) {
+                    let exports = emitter::transforms::module_exports(
+                        module.source_file(),
+                        module.semantic_model(),
+                    );
+                    star_values.extend(exports.values);
+                }
                 // An explicit export of the same name shadows what a star brings.
                 names.extend(
                     starred
@@ -441,7 +452,8 @@ impl ProgramFrontendOutput {
                 );
             }
         }
-        names.retain(|name| !exports.values.contains(name));
+        // A name stays if any star brings it as a value.
+        names.retain(|name| !exports.values.contains(name) && !star_values.contains(name));
         erased.insert(source_id, names.clone());
         names
     }

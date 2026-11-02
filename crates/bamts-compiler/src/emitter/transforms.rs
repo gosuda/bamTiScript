@@ -141,6 +141,8 @@ pub struct TransformOptions {
     pub verbatim_module_syntax: bool,
     /// `(specifier, name)` pairs the program knows have no runtime form.
     pub erased_imports: std::sync::Arc<BTreeSet<(String, String)>>,
+    /// Something outside the source reads imports, so none can be proven unused.
+    pub keeps_imports: bool,
     /// Whether the emitted file begins with a `"use strict"` prologue.
     pub always_strict: bool,
     /// When true, class fields that survive downlevel use `define` semantics.
@@ -763,7 +765,7 @@ impl<'a> Rewriter<'a> {
             parameter_initializer_depths: Vec::new(),
             cjs,
             type_imports: type_import_names(file, options),
-            import_reads: import_reads(file, options),
+            import_reads: import_reads(file, options, model),
             inline_lines: HashMap::new(),
             statement_expression: None,
             export_assignment: None,
@@ -790,7 +792,7 @@ impl<'a> Rewriter<'a> {
         let symbol_of = |name: &str| model.scope(module_scope).value(name);
         let hoisted_functions = hoisted_function_names(file);
         let type_imports = type_import_names(file, options);
-        let reads = import_reads(file, options);
+        let reads = import_reads(file, options, Some(model));
         let exported_locals = exported_locals(file);
         for statement in file.statements() {
             match statement.data() {
@@ -916,6 +918,20 @@ impl<'a> Rewriter<'a> {
                                 let name = identifier_text(file, &import.local);
                                 plan.exported_variables.extend(symbol_of(&name));
                                 plan.void_0.push(name);
+                            }
+                            Statement::ImportEquals(ImportEqualsDeclaration {
+                                is_type_only: false,
+                                local,
+                                reference: ExternalModuleReference::Require(source),
+                                ..
+                            }) => {
+                                let name = identifier_text(file, local);
+                                plan.exported_variables.extend(symbol_of(&name));
+                                plan.requires.push(format!(
+                                    "{} = require({});",
+                                    exports_member(&name),
+                                    quote_module_specifier(&module_specifier(file, source))
+                                ));
                             }
                             Statement::Namespace(namespace) => {
                                 if let NamespaceName::Identifier { name, .. } = &namespace.name
@@ -1218,6 +1234,13 @@ impl<'a> Rewriter<'a> {
 
     /// Declared value names of a statement, via the rewrite text.
     fn rewrite_export_named_declaration(&mut self, statement: &Stmt, inner: &Stmt) -> Vec<Stmt> {
+        if self
+            .cjs
+            .as_ref()
+            .is_some_and(|plan| plan.statement_lines.contains_key(&statement.id()))
+        {
+            return self.cjs_statement_lines(statement);
+        }
         let binding = if self.cjs.is_some() {
             ContainerBinding::CommonJs
         } else {
@@ -9773,8 +9796,14 @@ fn is_type_only_export(model: &SemanticModel, name: &str) -> bool {
 
 /// The names that keep an import in this file. JavaScript keeps every import,
 /// as does `verbatimModuleSyntax`, so those files have no answer.
-fn import_reads(file: &SourceFile, options: &TransformOptions) -> Option<BTreeSet<String>> {
+fn import_reads(
+    file: &SourceFile,
+    options: &TransformOptions,
+    model: Option<&SemanticModel>,
+) -> Option<BTreeSet<String>> {
     if options.verbatim_module_syntax
+        || options.keeps_imports
+        || file.source_text().as_str().contains("@jsx")
         || matches!(
             file.script_kind(),
             crate::source::ScriptKind::JavaScript | crate::source::ScriptKind::JavaScriptReact
@@ -9782,9 +9811,15 @@ fn import_reads(file: &SourceFile, options: &TransformOptions) -> Option<BTreeSe
     {
         return None;
     }
-    let mut reads = crate::lower::value_read_names(file);
+    // tsc rejects reading a type as a value, so a read proves the name is one,
+    // whatever another file's exports appear to say. Only an export of the name
+    // is legal for a type, so only exports ask.
+    let mut reads = crate::lower::value_read_names(file, model.map(SemanticModel::enum_facts));
     let erased = erased_import_locals(file, options);
-    reads.extend(exported_locals(file).into_keys());
+    let exported = exported_locals(file)
+        .into_keys()
+        .chain(default_export_name(file));
+    reads.extend(exported.filter(|name| !erased.contains(name)));
     // The classic JSX factories read a name the source never spells.
     if matches!(
         options.jsx,
@@ -9795,8 +9830,26 @@ fn import_reads(file: &SourceFile, options: &TransformOptions) -> Option<BTreeSe
             reads.extend(factory.split('.').next().map(str::to_owned));
         }
     }
-    reads.retain(|name| !erased.contains(name));
     Some(reads)
+}
+
+/// The name in `export default x` or `export = x`.
+fn default_export_name(file: &SourceFile) -> Vec<String> {
+    file.statements()
+        .iter()
+        .filter_map(|statement| match statement.data() {
+            Statement::Export(ExportDeclaration::Default(default)) => match &default.value {
+                ExportDefaultValue::Expression(value) => Some(value),
+                _ => None,
+            },
+            Statement::Export(ExportDeclaration::Assignment(value)) => Some(value),
+            _ => None,
+        })
+        .filter_map(|value| match value.data() {
+            Expression::Identifier(identifier) => Some(identifier_text(file, identifier)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// An import clause without the bindings nothing reads, or `None` if none remain.
@@ -12576,6 +12629,66 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         );
         let code = javascript(&output);
         assert!(code.contains("catch ({ a = N.n })"), "{code}");
+    }
+
+    #[test]
+    fn a_value_read_keeps_an_import_whatever_another_file_seems_to_say() {
+        let output = emit_with_options(
+            "import { Foo, Bar } from './m';\nconsole.log(Foo);\nexport { Bar };\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::EsNext),
+                erased_imports: std::sync::Arc::new(
+                    [
+                        ("./m".to_owned(), "Foo".to_owned()),
+                        ("./m".to_owned(), "Bar".to_owned()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(code.contains("import { Foo } from './m';"), "{code}");
+        assert!(!code.contains("Bar"), "{code}");
+    }
+
+    #[test]
+    fn something_reading_imports_unseen_keeps_them_all() {
+        let options = EmitOptions {
+            target: ScriptTarget::Es2022,
+            module: Some(crate::emitter::ModuleKind::EsNext),
+            ..EmitOptions::default()
+        };
+        let pragma = emit_with_options(
+            "/** @jsx h */\nimport { h } from './m';\nexport {};\n",
+            options.clone(),
+        );
+        assert!(javascript(&pragma).contains("import { h }"));
+        let metadata = emit_with_options(
+            "import { T } from './m';\nlet a: T;\n",
+            EmitOptions {
+                keeps_imports: true,
+                ..options
+            },
+        );
+        assert!(javascript(&metadata).contains("import { T }"));
+    }
+
+    #[test]
+    fn commonjs_export_import_require_lives_on_exports() {
+        let output = emit_with_options(
+            "export import ns = require('./m');\nconsole.log(ns);\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(code.contains("exports.ns = require(\"./m\");"), "{code}");
+        assert!(code.contains("console.log(exports.ns);"), "{code}");
     }
 
     #[test]
