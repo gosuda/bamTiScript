@@ -112,6 +112,7 @@ pub fn emit_declarations(
             inline_source_map: false,
             inline_sources: false,
             remove_comments: false,
+            module_marker: false,
         },
         names,
         Surface::Declaration,

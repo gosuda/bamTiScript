@@ -498,6 +498,8 @@ pub(crate) struct PrintOptions {
     pub(crate) inline_source_map: bool,
     pub(crate) inline_sources: bool,
     pub(crate) remove_comments: bool,
+    /// An ES module whose output has no module syntax left ends in `export {};`.
+    pub(crate) module_marker: bool,
 }
 
 pub(crate) struct PrintSource<'a> {
@@ -679,6 +681,7 @@ pub(crate) fn print_with_jsx_plan(
         authored_len: Utf16Pos::new(utf16_len(original_content)),
         synthesized,
         synthesized_floor,
+        emitted_module_syntax: false,
     };
     if let Some(prelude) = prelude.filter(|prelude| !prelude.is_empty()) {
         let has_trailing_newline = prelude.ends_with('\n');
@@ -882,6 +885,8 @@ struct Emitter<'a> {
     /// First rewriter-minted id for this file; ids below it are
     /// parser-assigned and must carry ranges within the authored text.
     synthesized_floor: u32,
+    /// An import or export reached the output.
+    emitted_module_syntax: bool,
 }
 
 /// The source text of an enum's numeric value.
@@ -1529,6 +1534,10 @@ impl<'a> Emitter<'a> {
     fn emit_module_js(&mut self, statements: &[Stmt]) {
         self.write_detached_comments();
         self.emit_statement_list(statements);
+        if self.options.module_marker && !self.emitted_module_syntax {
+            self.raw("export {};");
+            self.newline();
+        }
         self.write_closing_comments();
     }
 
@@ -1550,16 +1559,25 @@ impl<'a> Emitter<'a> {
         self.anchor = statement.range();
         let stmt_range = self.anchor;
         let emitted = match statement.data() {
-            Statement::Import(import) => self.emit_import(import, false),
+            Statement::Import(import) => {
+                let emitted = self.emit_import(import, false);
+                self.emitted_module_syntax |= emitted;
+                emitted
+            }
             Statement::ImportEquals(import) => {
                 if import.is_type_only {
                     false
                 } else {
                     self.emit_import_equals_js(import);
+                    self.emitted_module_syntax = true;
                     true
                 }
             }
-            Statement::Export(export) => self.emit_export_js(export),
+            Statement::Export(export) => {
+                let emitted = self.emit_export_js(export);
+                self.emitted_module_syntax |= emitted;
+                emitted
+            }
             Statement::Variable(declaration) => {
                 self.emit_variable_head(declaration);
                 let semi_start = Utf16Pos::new(stmt_range.end().get().saturating_sub(1));

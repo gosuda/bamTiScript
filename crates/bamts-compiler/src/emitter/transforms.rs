@@ -311,6 +311,11 @@ pub fn emit_transformed(
             inline_source_map: options.inline_source_map,
             inline_sources: options.inline_sources,
             remove_comments: options.remove_comments,
+            module_marker: is_module
+                && matches!(
+                    options.module_kind,
+                    Some(ModuleKind::Es2015 | ModuleKind::EsNext)
+                ),
         },
         names,
         Surface::JavaScript,
@@ -11478,6 +11483,38 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             .collect();
         assert!(positions.is_sorted(), "{code}");
         assert!(!code.contains("ambient"), "{code}");
+    }
+
+    #[test]
+    fn an_es_module_with_nothing_left_stays_a_module() {
+        let esm = EmitOptions {
+            target: ScriptTarget::Es2015,
+            module: Some(crate::emitter::ModuleKind::EsNext),
+            ..EmitOptions::default()
+        };
+        for source in [
+            "export interface I {}\n",
+            "interface I {}\nexport { I };\n",
+            "export {};\n",
+            "import type { T } from './t';\nconst x = 1;\nexport type { T };\n",
+        ] {
+            let output = emit_with_options(source, esm.clone());
+            let code = javascript(&output);
+            assert!(code.ends_with("export {};\n"), "{source}: {code}");
+        }
+        for source in ["export const x = 1;\n", "import './a';\n", "const x = 1;\n"] {
+            let output = emit_with_options(source, esm.clone());
+            assert!(!javascript(&output).contains("export {}"), "{source}");
+        }
+        let commonjs = emit_with_options(
+            "export interface I {}\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        assert!(!javascript(&commonjs).contains("export {}"));
     }
 
     #[test]
