@@ -1165,7 +1165,7 @@ impl<'a, H: Host> Machine<'a, H> {
         this_value: Value,
         arguments: &[Value],
     ) -> Result<bool, EvalFailure> {
-        let result = self.call_value(callee, this_value, arguments)?;
+        let result = self.call_callback(callee, this_value, arguments)?;
         Ok(self.to_boolean(result))
     }
     #[cfg(test)]

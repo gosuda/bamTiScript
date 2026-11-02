@@ -227,7 +227,7 @@ fn call_closing<H: Host>(
     callback: Value,
     arguments: &[Value],
 ) -> Result<Value, EvalFailure> {
-    match machine.call_value(callback, Value::UNDEFINED, arguments) {
+    match machine.call_callback(callback, Value::UNDEFINED, arguments) {
         Ok(value) => Ok(value),
         Err(failure) => Err(close_after(machine, iterator, failure)),
     }
