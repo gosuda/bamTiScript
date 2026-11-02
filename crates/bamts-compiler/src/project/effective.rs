@@ -2515,6 +2515,60 @@ mod tests {
             javascript,
             "const T = 1;\nexport default T;\nexport { T };\n"
         );
+
+        // A module importing that value keeps its import.
+        fixture.write(
+            "user.ts",
+            "import D, { T } from './main.js';\nconsole.log(D, T);\n",
+        );
+        fixture.write(
+            "ambient.d.ts",
+            "export declare namespace N { function f(): number; }\n",
+        );
+        fixture.write(
+            "values.ts",
+            "import type { V } from './t.js';\nconst V = 1;\n\
+             namespace W { export const a = 1; }\nexport { V, W };\n",
+        );
+        fixture.write(
+            "user2.ts",
+            "import { N } from './ambient.js';\nimport { V, W } from './values.js';\n\
+             console.log(N, V, W);\n",
+        );
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["user.ts","user2.ts"],"compilerOptions":{"module":"esnext","target":"es2022","outDir":"dist"}}"#,
+        );
+        let project =
+            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
+        let report =
+            compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+        let output = |name: &str| {
+            String::from_utf8(
+                report
+                    .outputs
+                    .files
+                    .get(&fixture.0.join(name))
+                    .expect("project JavaScript output")
+                    .clone(),
+            )
+            .unwrap()
+        };
+        let first = output("dist/user.js");
+        assert!(
+            first.contains("import D, { T } from './main.js';"),
+            "{first}"
+        );
+        let second = output("dist/user2.js");
+        assert!(
+            second.contains("import { N } from './ambient.js';"),
+            "{second}"
+        );
+        assert!(
+            second.contains("import { V, W } from './values.js';"),
+            "{second}"
+        );
+        assert!(output("dist/values.js").contains("export { V, W };"));
     }
 
     #[test]

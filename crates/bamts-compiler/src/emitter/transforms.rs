@@ -9626,7 +9626,11 @@ fn plan_cjs_declared_exports(
     for statement in file.statements() {
         // An ambient declaration has nothing to publish; its `void 0` stands.
         if let Statement::Declare(inner) = statement.data() {
-            for local in declared_binding_names(file, inner) {
+            let mut locals = declared_binding_names(file, inner);
+            if let Statement::Class(class) = inner.data() {
+                locals.extend(class.name.iter().map(|name| identifier_text(file, name)));
+            }
+            for local in locals {
                 let names = exported_locals.get(&local).into_iter().flatten();
                 plan.published_locals.extend(names.cloned());
             }
@@ -9845,6 +9849,7 @@ pub(crate) fn module_exports(file: &SourceFile, model: &SemanticModel) -> Module
     };
     let imports = imported_bindings(file);
     let type_imports = declared_type_imports(file);
+    let local_values = local_value_names(file);
     let mut exports = ModuleExports::default();
     for statement in file.statements() {
         let Statement::Export(export) = statement.data() else {
@@ -9852,9 +9857,9 @@ pub(crate) fn module_exports(file: &SourceFile, model: &SemanticModel) -> Module
         };
         match export {
             ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) => {
-                let inner = match inner.data() {
-                    Statement::Declare(declared) => declared,
-                    _ => inner,
+                let (inner, ambient) = match inner.data() {
+                    Statement::Declare(declared) => (declared, true),
+                    _ => (inner, false),
                 };
                 match inner.data() {
                     Statement::Interface(declaration) => {
@@ -9877,10 +9882,12 @@ pub(crate) fn module_exports(file: &SourceFile, model: &SemanticModel) -> Module
                     }
                     Statement::Namespace(declaration) => {
                         if let NamespaceName::Identifier { name, .. } = &declaration.name {
-                            let bearing = model
-                                .namespace_facts()
-                                .declaration(inner.id())
-                                .is_some_and(|plan| plan.is_value_bearing());
+                            // An ambient namespace can declare values too.
+                            let bearing = ambient
+                                || model
+                                    .namespace_facts()
+                                    .declaration(inner.id())
+                                    .is_some_and(|plan| plan.is_value_bearing());
                             let name = identifier_text(file, name);
                             if bearing {
                                 exports.values.insert(name);
@@ -9921,6 +9928,8 @@ pub(crate) fn module_exports(file: &SourceFile, model: &SemanticModel) -> Module
                     } else if let Some(source) = source {
                         let module = module_specifier(file, source);
                         exports.forwards.push((exported, module, local));
+                    } else if local_values.contains(&local) {
+                        exports.values.insert(exported);
                     } else if type_imports.contains(&local) {
                         exports.types.insert(exported);
                     } else if let Some((module, imported)) = imports.get(&local) {
@@ -9951,6 +9960,7 @@ pub(crate) fn module_exports(file: &SourceFile, model: &SemanticModel) -> Module
                     },
                     _ => None,
                 };
+                let read = read.filter(|name| !local_values.contains(name));
                 if let Some((module, imported)) = read.as_ref().and_then(|name| imports.get(name)) {
                     let default = String::from("default");
                     exports
@@ -10037,10 +10047,10 @@ fn module_specifier(file: &SourceFile, source: &StringLiteralNode) -> String {
 fn type_import_names(file: &SourceFile, options: &TransformOptions) -> BTreeSet<String> {
     let mut names: BTreeSet<String> = const_enum_names(file).into_iter().collect();
     names.extend(erased_import_locals(file, options));
+    names.extend(declared_type_imports(file));
     // A local value of the same name is the one an export means.
     let values = local_value_names(file);
     names.retain(|name| !values.contains(name));
-    names.extend(declared_type_imports(file));
     names
 }
 
@@ -10064,8 +10074,17 @@ fn local_value_names(file: &SourceFile) -> BTreeSet<String> {
             _ => statement,
         };
         names.extend(declared_binding_names(file, statement));
-        if let Statement::Class(class) = statement.data() {
-            names.extend(class.name.iter().map(|name| identifier_text(file, name)));
+        match statement.data() {
+            Statement::Class(class) => {
+                names.extend(class.name.iter().map(|name| identifier_text(file, name)));
+            }
+            Statement::Namespace(NamespaceDeclaration {
+                name: NamespaceName::Identifier { name, .. },
+                ..
+            }) => {
+                names.insert(identifier_text(file, name));
+            }
+            _ => {}
         }
     }
     names
