@@ -2329,6 +2329,48 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn a_destructuring_target_is_evaluated_before_its_value() {
+        const LOG: &str = "var log = [];\n\
+            function source() { log.push('source'); return { get p() { log.push('get'); } }; }\n\
+            function target() { log.push('target'); return { set q(v) { log.push('set'); } }; }\n\
+            function key() { log.push('key'); return 'q'; }\n\
+            var empty = { [Symbol.iterator]() { return { next() { log.push('next'); \
+            return { done: true }; } }; } };\n";
+        const CASES: [(&str, &str); 5] = [
+            (
+                "({ p: target()[key()] } = source());",
+                "source,target,key,get,set",
+            ),
+            (
+                "({ p: target()[key()] = log.push('default') } = source());",
+                "source,target,key,get,default,set",
+            ),
+            (
+                "({ ...target()[key()] } = source());",
+                "source,target,key,get,set",
+            ),
+            ("[target()[key()]] = empty;", "target,key,next,set"),
+            ("[...target()[key()]] = empty;", "target,key,next,set"),
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, (body, expected)) in CASES.iter().enumerate() {
+                let source = wrap(
+                    "description: target before value",
+                    &format!("{LOG}{body}\nassert.sameValue(log.join(), '{expected}');"),
+                );
+                let label = format!("target-order-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_computed_literal_key_converts_before_its_value() {
         let source = wrap(
             "description: key order",

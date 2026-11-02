@@ -7061,11 +7061,7 @@ impl<'a> FunctionContext<'a> {
                 self.assign_name(builder, &name, value, range)
             }
             AssignmentTarget::Member(member) => {
-                if self.is_const_enum_member_target(target, &member.object)? {
-                    return Err(self.const_enum_operation(range, ConstEnumOperation::Write));
-                }
-                let base = self.member_base(builder, range, &member.object)?;
-                let key = self.member_key(builder, &member.property)?;
+                let (base, key) = self.member_reference(builder, target, member)?;
                 self.set_member(range, base, key, value)
             }
             AssignmentTarget::Object(object) => {
@@ -7092,12 +7088,12 @@ impl<'a> FunctionContext<'a> {
                             self.iterator_step_discard(range, iterator)?;
                         }
                         AssignmentArrayElement::Target(inner) => {
-                            let element = self.iterator_step_value(builder, range, iterator)?;
-                            self.assign_array_element(builder, inner, element)?;
+                            self.assign_array_element(builder, range, inner, iterator)?;
                         }
                         AssignmentArrayElement::Rest(inner) => {
+                            let reference = self.target_reference(builder, inner)?;
                             let rest = self.rest_array(builder, range, iterator)?;
-                            self.assign_target(builder, inner, rest)?;
+                            self.assign_reference(builder, inner, reference, rest)?;
                         }
                         AssignmentArrayElement::Missing(missing) => {
                             return Err(self.missing(range, missing.expected()));
@@ -7112,18 +7108,61 @@ impl<'a> FunctionContext<'a> {
             }
         }
     }
+    fn member_reference(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        target: &AssignmentTargetNode,
+        member: &AssignmentMemberTarget,
+    ) -> Result<(MemberBase, Register), LowerError> {
+        let range = target.range();
+        if self.is_const_enum_member_target(target, &member.object)? {
+            return Err(self.const_enum_operation(range, ConstEnumOperation::Write));
+        }
+        let base = self.member_base(builder, range, &member.object)?;
+        let key = self.member_key(builder, &member.property)?;
+        Ok((base, key))
+    }
+    /// A destructuring target's reference comes before the value it receives,
+    /// so reading that value can observe the target's side effects.
+    fn target_reference(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        target: &AssignmentTargetNode,
+    ) -> Result<Option<(MemberBase, Register)>, LowerError> {
+        match target.data() {
+            AssignmentTarget::Member(member) => {
+                self.member_reference(builder, target, member).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+    fn assign_reference(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        target: &AssignmentTargetNode,
+        reference: Option<(MemberBase, Register)>,
+        value: Register,
+    ) -> Result<(), LowerError> {
+        match reference {
+            Some((base, key)) => self.set_member(target.range(), base, key, value),
+            None => self.assign_target(builder, target, value),
+        }
+    }
     /// Assigns one array element. The parser keeps `[a = 1]`'s element as the
     /// assignment it read, so a default arrives as that expression.
     fn assign_array_element(
         &mut self,
         builder: &mut ModuleBuilder,
+        range: TextRange,
         target: &AssignmentTargetNode,
-        value: Register,
+        iterator: Register,
     ) -> Result<(), LowerError> {
         if let AssignmentTarget::Invalid(operand) = target.data()
             && let Expression::Assignment(assignment) = operand.data()
             && assignment.operator == AssignmentOperator::Assign
         {
+            let reference = self.target_reference(builder, &assignment.left)?;
+            let value = self.iterator_step_value(builder, range, iterator)?;
             let name = self.target_name(&assignment.left)?;
             let value = self.apply_default(
                 builder,
@@ -7132,9 +7171,11 @@ impl<'a> FunctionContext<'a> {
                 &assignment.right,
                 name.as_deref(),
             )?;
-            return self.assign_target(builder, &assignment.left, value);
+            return self.assign_reference(builder, &assignment.left, reference, value);
         }
-        self.assign_target(builder, target, value)
+        let reference = self.target_reference(builder, target)?;
+        let value = self.iterator_step_value(builder, range, iterator)?;
+        self.assign_reference(builder, target, reference, value)
     }
     fn assign_object_property(
         &mut self,
@@ -7145,11 +7186,13 @@ impl<'a> FunctionContext<'a> {
         taken: &mut Vec<Register>,
     ) -> Result<(), LowerError> {
         if property.rest {
+            let reference = self.target_reference(builder, &property.target)?;
             let rest = self.rest_object(builder, range, source, taken)?;
-            return self.assign_target(builder, &property.target, rest);
+            return self.assign_reference(builder, &property.target, reference, rest);
         }
         let key = self.property_key(builder, &property.name)?;
         taken.push(key);
+        let reference = self.target_reference(builder, &property.target)?;
         let element = self.alloc_register(range)?;
         self.emit(
             range,
@@ -7166,7 +7209,7 @@ impl<'a> FunctionContext<'a> {
             }
             None => element,
         };
-        self.assign_target(builder, &property.target, element)
+        self.assign_reference(builder, &property.target, reference, element)
     }
     fn lower_arrow(
         &mut self,
