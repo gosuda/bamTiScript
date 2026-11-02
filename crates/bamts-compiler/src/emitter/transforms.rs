@@ -615,6 +615,9 @@ struct Rewriter<'a> {
     import_reads: Option<BTreeSet<String>>,
     /// Raw lines for marker statements, keyed by the marker's node.
     inline_lines: HashMap<NodeId, String>,
+    /// The expression of the expression statement being rewritten, whose value
+    /// nothing reads.
+    statement_expression: Option<NodeId>,
     synthesized_ids: BTreeSet<NodeId>,
     file: &'a SourceFile,
     /// Namespace bodies being lowered, innermost last.
@@ -656,6 +659,14 @@ struct CjsPlan {
     hoisted_exports: Vec<(String, String)>,
     /// Exported names an import's own lines publish.
     import_exports: BTreeSet<String>,
+    /// `(exported, local)` to publish right after a statement declares them.
+    declared_exports: HashMap<NodeId, Vec<(String, String)>>,
+    /// Exported names a declaration publishes.
+    published_locals: BTreeSet<String>,
+    /// Exported names of a local, which every write to it must update.
+    live_locals: BTreeMap<crate::checker::SymbolId, Vec<String>>,
+    /// `export =` replaces `exports`, so the file is no ES module interop.
+    export_assignment: bool,
     /// Require-local names whose member calls become `(0, m.p)()`.
     require_roots: BTreeSet<String>,
 }
@@ -751,6 +762,7 @@ impl<'a> Rewriter<'a> {
             type_imports: type_import_names(file, options),
             import_reads: import_reads(file, options),
             inline_lines: HashMap::new(),
+            statement_expression: None,
             synthesized_ids: BTreeSet::new(),
             file,
             namespace_frames: Vec::new(),
@@ -886,6 +898,7 @@ impl<'a> Rewriter<'a> {
                 }
                 Statement::Export(export) => {
                     plan.is_module = true;
+                    plan.export_assignment |= matches!(export, ExportDeclaration::Assignment(_));
                     plan_cjs_reexport(file, export, &mut names, &mut plan, &options.erased_imports);
                     let binds_type = |name: &str| {
                         type_imports.contains(name) || is_type_only_export(model, name)
@@ -938,6 +951,7 @@ impl<'a> Rewriter<'a> {
                 plan.statement_lines.insert(statement.id(), lines);
             }
         }
+        plan_cjs_declared_exports(file, model, &exported_locals, &mut plan);
         // Script files keep the plan too: the marker stays off until a
         // require prelude (for example the JSX runtime) forces module form.
         plan.void_0.sort();
@@ -1079,6 +1093,7 @@ impl<'a> Rewriter<'a> {
             }
             let published = self.cjs.as_ref().is_some_and(|plan| {
                 plan.import_exports.contains(&exported)
+                    || plan.published_locals.contains(&exported)
                     || plan
                         .hoisted_exports
                         .iter()
@@ -1338,8 +1353,11 @@ impl<'a> Rewriter<'a> {
         if !(plan.is_module || force_module) {
             return String::new();
         }
-        let mut prelude =
-            String::from("Object.defineProperty(exports, \"__esModule\", { value: true });\n");
+        let mut prelude = if plan.export_assignment {
+            String::new()
+        } else {
+            String::from("Object.defineProperty(exports, \"__esModule\", { value: true });\n")
+        };
         let mut names = plan.void_0.clone();
         names.sort();
         names.dedup();
@@ -1352,6 +1370,148 @@ impl<'a> Rewriter<'a> {
             prelude.push_str(&format!("{} = {local};\n", exports_member(exported)));
         }
         prelude
+    }
+
+    /// `module.exports = value;`, which `export =` means under CommonJS.
+    fn cjs_export_assignment_statement(&mut self, range: TextRange, value: &Expr) -> Stmt {
+        let value = self.rewrite_expr(value);
+        let module = self.ident("module");
+        let object = self.syn_node(range, Expression::Identifier(module));
+        let property = MemberProperty::Named(self.ident("exports"));
+        let left = self.syn_node(
+            range,
+            AssignmentTarget::Member(AssignmentMemberTarget {
+                object: Box::new(object),
+                property,
+            }),
+        );
+        let assignment = self.syn_node(
+            range,
+            Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left,
+                right: Box::new(value),
+            }),
+        );
+        self.syn_node(
+            range,
+            Statement::Expression(ExpressionStatement {
+                expression: Box::new(assignment),
+            }),
+        )
+    }
+
+    /// `exports.name = local;` for what a statement just declared.
+    fn cjs_publish_declared(&mut self, statement: &Stmt) -> Vec<Stmt> {
+        let pairs = self
+            .cjs
+            .as_mut()
+            .and_then(|plan| plan.declared_exports.remove(&statement.id()))
+            .unwrap_or_default();
+        pairs
+            .iter()
+            .map(|(exported, local)| self.cjs_export_assignment(exported, local, statement.range()))
+            .collect()
+    }
+
+    /// Exported names of what an assignment target writes, as `(local, names)`.
+    fn live_exports_of(&self, target: &AssignmentTargetNode) -> Vec<(String, Vec<String>)> {
+        let (Some(plan), Some(model)) = (&self.cjs, self.model) else {
+            return Vec::new();
+        };
+        let mut identifiers = Vec::new();
+        collect_target_identifiers(target, &mut identifiers);
+        identifiers
+            .into_iter()
+            .filter_map(|identifier| {
+                let names = plan.live_locals.get(&model.reference(identifier.id())?)?;
+                Some((identifier_text(self.file, identifier), names.clone()))
+            })
+            .collect()
+    }
+
+    /// `exports.a = exports.b = value`.
+    fn cjs_assign_exports(&mut self, names: &[String], value: Expr, range: TextRange) -> Expr {
+        names.iter().fold(value, |value, name| {
+            let left = self.cjs_export_target(name, range);
+            self.syn_node(
+                range,
+                Expression::Assignment(AssignmentExpression {
+                    operator: AssignmentOperator::Assign,
+                    left,
+                    right: Box::new(value),
+                }),
+            )
+        })
+    }
+
+    fn sequence(&mut self, expressions: Vec<Expr>, range: TextRange) -> Expr {
+        self.syn_node(
+            range,
+            Expression::Sequence(SequenceExpression { expressions }),
+        )
+    }
+
+    /// `temp = value`.
+    fn store_temp(&mut self, temp: &IdentifierNode, value: Expr, range: TextRange) -> Expr {
+        let left = self.syn_node(range, AssignmentTarget::Identifier(temp.clone()));
+        self.syn_node(
+            range,
+            Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left,
+                right: Box::new(value),
+            }),
+        )
+    }
+
+    /// Under CommonJS a local exported by `export { x }` has a copy on `exports`,
+    /// so a write to it also writes there, in the forms upstream prints.
+    fn publish_local_writes(&mut self, source: &Expr, rewritten: Expr) -> Expr {
+        let range = source.range();
+        match source.data() {
+            Expression::Assignment(assignment) => {
+                let written = self.live_exports_of(&assignment.left);
+                if let AssignmentTarget::Identifier(_) = assignment.left.data() {
+                    return match written.into_iter().next() {
+                        Some((_, names)) => self.cjs_assign_exports(&names, rewritten, range),
+                        None => rewritten,
+                    };
+                }
+                if written.is_empty() {
+                    return rewritten;
+                }
+                let temp = self.expression_temp();
+                let mut steps = vec![self.store_temp(&temp, rewritten, range)];
+                for (local, names) in written {
+                    let value = self.ident_expr(&local);
+                    steps.push(self.cjs_assign_exports(&names, value, range));
+                }
+                let result = self.node(range, Expression::Identifier(temp));
+                steps.push(result);
+                self.sequence(steps, range)
+            }
+            Expression::Update(update) => {
+                let Some((local, names)) = self.live_exports_of(&update.argument).pop() else {
+                    return rewritten;
+                };
+                if update.prefix {
+                    return self.cjs_assign_exports(&names, rewritten, range);
+                }
+                let current = self.ident_expr(&local);
+                if self.statement_expression == Some(source.id()) {
+                    let value = self.sequence(vec![rewritten, current], range);
+                    return self.cjs_assign_exports(&names, value, range);
+                }
+                let temp = self.expression_temp();
+                let store = self.store_temp(&temp, rewritten, range);
+                let value = self.sequence(vec![store, current], range);
+                let publish = self.cjs_assign_exports(&names, value, range);
+                let result = self.node(range, Expression::Identifier(temp));
+                self.sequence(vec![publish, result], range)
+            }
+            _ => rewritten,
+        }
     }
 
     /// An import or re-export's lines, as a statement the printer fills in.
@@ -1545,6 +1705,7 @@ impl<'a> Rewriter<'a> {
         for statement in statements {
             self.record_declaration(statement);
             out.extend(self.rewrite_statement(statement));
+            out.extend(self.cjs_publish_declared(statement));
         }
         self.declared_names.pop();
         out
@@ -1623,6 +1784,9 @@ impl<'a> Rewriter<'a> {
             Statement::Export(ExportDeclaration::All(_)) if self.cjs.is_some() => {
                 self.cjs_statement_lines(statement)
             }
+            Statement::Export(ExportDeclaration::Assignment(value)) if self.cjs.is_some() => {
+                vec![self.cjs_export_assignment_statement(statement.range(), value)]
+            }
             Statement::Import(import) => {
                 if self.cjs.is_none() {
                     return self.rewrite_esm_import(statement, import);
@@ -1649,6 +1813,7 @@ impl<'a> Rewriter<'a> {
                 )]
             }
             Statement::Expression(expr) => {
+                self.statement_expression = Some(expr.expression.id());
                 let mut candidate = &*expr.expression;
                 while let Expression::Parenthesized(value) = candidate.data() {
                     candidate = value;
@@ -7009,6 +7174,18 @@ impl<'a> Rewriter<'a> {
             .collect()
     }
     fn rewrite_expr(&mut self, expression: &Expr) -> Expr {
+        let rewritten = self.rewrite_expression(expression);
+        if self
+            .cjs
+            .as_ref()
+            .is_some_and(|plan| !plan.live_locals.is_empty())
+        {
+            return self.publish_local_writes(expression, rewritten);
+        }
+        rewritten
+    }
+
+    fn rewrite_expression(&mut self, expression: &Expr) -> Expr {
         if self.replace_await
             && let Expression::Await(awaited) = expression.data()
         {
@@ -9393,6 +9570,78 @@ fn exported_locals(file: &SourceFile) -> BTreeMap<String, Vec<String>> {
         }
     }
     locals
+}
+
+/// Plans `export { local }` of the file's own declarations: each publishes
+/// right after its statement, and writes to it stay in step.
+fn plan_cjs_declared_exports(
+    file: &SourceFile,
+    model: &SemanticModel,
+    exported_locals: &BTreeMap<String, Vec<String>>,
+    plan: &mut CjsPlan,
+) {
+    let scope = model.scope(model.module_scope());
+    let imports = imported_bindings(file);
+    for (local, names) in exported_locals {
+        if !imports.contains_key(local)
+            && let Some(symbol) = scope.value(local)
+            && !plan.exported_variables.contains(&symbol)
+        {
+            plan.live_locals.insert(symbol, names.clone());
+        }
+    }
+    for statement in file.statements() {
+        let declared = match statement.data() {
+            Statement::Class(class) => class
+                .name
+                .iter()
+                .map(|name| identifier_text(file, name))
+                .collect(),
+            _ => declared_binding_names(file, statement),
+        };
+        let pairs: Vec<(String, String)> = declared
+            .iter()
+            .flat_map(|local| {
+                let names = exported_locals.get(local).into_iter().flatten();
+                names.map(|name| (name.clone(), local.clone()))
+            })
+            .collect();
+        if !pairs.is_empty() {
+            plan.published_locals
+                .extend(pairs.iter().map(|(name, _)| name.clone()));
+            plan.declared_exports.insert(statement.id(), pairs);
+        }
+    }
+}
+
+/// The identifiers an assignment target writes, through any destructuring.
+fn collect_target_identifiers<'t>(
+    target: &'t AssignmentTargetNode,
+    identifiers: &mut Vec<&'t IdentifierNode>,
+) {
+    match target.data() {
+        AssignmentTarget::Identifier(identifier) => identifiers.push(identifier),
+        AssignmentTarget::Object(object) => {
+            for property in &object.properties {
+                collect_target_identifiers(&property.target, identifiers);
+            }
+        }
+        AssignmentTarget::Array(array) => {
+            for element in &array.elements {
+                if let AssignmentArrayElement::Target(inner) | AssignmentArrayElement::Rest(inner) =
+                    element
+                {
+                    collect_target_identifiers(inner, identifiers);
+                }
+            }
+        }
+        AssignmentTarget::Invalid(operand) => {
+            if let Expression::Assignment(assignment) = operand.data() {
+                collect_target_identifiers(&assignment.left, identifiers);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Whether `export { name } from` still has something to publish.
@@ -11920,6 +12169,58 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             .map(|line| code.find(line).unwrap_or_else(|| panic!("{line}: {code}")))
             .collect();
         assert!(positions.is_sorted(), "{code}");
+    }
+
+    #[test]
+    fn commonjs_keeps_an_exported_local_in_step_with_exports() {
+        let output = emit_with_options(
+            "export { x };\n\
+             let x = 1, y = 2, z = 3;\n\
+             export { y as w, z };\n\
+             x = 5;\n\
+             y += 1;\n\
+             ++z;\n\
+             z++;\n\
+             const old = z--;\n\
+             [x] = [7];\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        let declared = code.find("let x = 1").expect("declaration");
+        for line in ["exports.x = x;", "exports.w = y;", "exports.z = z;"] {
+            let published = code.find(line).unwrap_or_else(|| panic!("{line}: {code}"));
+            assert!(published > declared, "{line}: {code}");
+        }
+        for line in [
+            "exports.x = x = 5;",
+            "exports.w = y += 1;",
+            "exports.z = ++z;",
+            "exports.z = (z++, z);",
+            ", exports.x = x, ",
+        ] {
+            assert!(code.contains(line), "{line}: {code}");
+        }
+        assert!(code.contains("exports.z = (_"), "{code}");
+    }
+
+    #[test]
+    fn export_assignment_replaces_commonjs_exports() {
+        let output = emit_with_options(
+            "const K = 1;\nexport = K;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        assert_eq!(
+            javascript(&output),
+            "\"use strict\";\nconst K = 1;\nmodule.exports = K;\n"
+        );
     }
 
     #[test]
