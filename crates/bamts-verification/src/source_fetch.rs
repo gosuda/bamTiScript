@@ -594,6 +594,9 @@ fn select_payload(extracted: &Path) -> Result<PathBuf> {
         .map_err(|error| io_error(extracted, error))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|error| io_error(extracted, error))?;
+    // macOS can write this into any new directory, which must not hide the
+    // archive's single root and change the layout of the whole tree.
+    entries.retain(|entry| entry.file_name() != ".DS_Store");
     if entries.is_empty() {
         return Err(VerificationError::new(
             ErrorCode::Schema,
@@ -848,6 +851,16 @@ mod tests {
             .expect_err("changed tree");
         assert_eq!(error.code(), ErrorCode::Digest);
         assert_eq!(backend.fetches.get(), 1);
+    }
+
+    #[test]
+    fn a_finder_file_does_not_hide_the_archive_root() {
+        let root = std::env::temp_dir().join(format!("select-payload-{}", std::process::id()));
+        let payload = root.join("source-1234");
+        fs::create_dir_all(&payload).expect("payload");
+        fs::write(root.join(".DS_Store"), b"finder").expect("finder file");
+        assert_eq!(select_payload(&root).expect("payload"), payload);
+        fs::remove_dir_all(&root).expect("remove root");
     }
 
     #[test]
