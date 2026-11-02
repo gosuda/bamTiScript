@@ -1580,7 +1580,9 @@ impl<'a> Rewriter<'a> {
                     ForBinding::Target(target) => {
                         ForBinding::Target(self.rewrite_assignment_target(target))
                     }
-                    binding @ ForBinding::Variable(_) => binding.clone(),
+                    ForBinding::Variable(declaration) => {
+                        ForBinding::Variable(self.rewrite_for_declaration(declaration))
+                    }
                 };
                 let iterable = self.rewrite_expr(&for_of.iterable);
                 let body = self.rewrite_single_statement(&for_of.body);
@@ -1599,7 +1601,7 @@ impl<'a> Rewriter<'a> {
                 // const/let binding needs var conversion there.
                 let binding = match &for_in.binding {
                     ForBinding::Variable(declaration) => {
-                        let mut declaration = declaration.clone();
+                        let mut declaration = self.rewrite_for_declaration(declaration);
                         if self.options.target <= ScriptTarget::Es5 {
                             declaration.kind = VariableKind::Var;
                         }
@@ -1629,7 +1631,7 @@ impl<'a> Rewriter<'a> {
                             ForInitializer::Expression(Box::new(self.rewrite_expr(expression)))
                         }
                         ForInitializer::Variable(declaration) => {
-                            ForInitializer::Variable(declaration.clone())
+                            ForInitializer::Variable(self.rewrite_for_declaration(declaration))
                         }
                     });
                 let test = value
@@ -2038,13 +2040,73 @@ impl<'a> Rewriter<'a> {
             };
             Box::new(rewritten)
         });
+        let binding = self.rewrite_pattern(&declarator.data().binding);
         self.node(
             declarator.range(),
             VariableDeclarator {
+                binding,
                 initializer,
                 ..declarator.data().clone()
             },
         )
+    }
+
+    fn rewrite_for_declaration(
+        &mut self,
+        declaration: &VariableDeclaration,
+    ) -> VariableDeclaration {
+        let declarations = declaration
+            .declarations
+            .iter()
+            .map(|declarator| self.rewrite_declarator_initializer(declarator))
+            .collect();
+        VariableDeclaration {
+            declarations,
+            ..declaration.clone()
+        }
+    }
+
+    /// A binding pattern with its defaults and computed keys rewritten.
+    fn rewrite_pattern(&mut self, pattern: &Pattern) -> Pattern {
+        let rewritten = match pattern.data() {
+            BindingPattern::Object(object) => BindingPattern::Object(ObjectBindingPattern {
+                properties: object
+                    .properties
+                    .iter()
+                    .map(|property| ObjectBindingProperty {
+                        name: self.rewrite_property_name(&property.name),
+                        binding: self.rewrite_pattern(&property.binding),
+                        initializer: property
+                            .initializer
+                            .as_deref()
+                            .map(|value| Box::new(self.rewrite_expr(value))),
+                    })
+                    .collect(),
+            }),
+            BindingPattern::Array(array) => BindingPattern::Array(ArrayBindingPattern {
+                elements: array
+                    .elements
+                    .iter()
+                    .map(|element| match element {
+                        ArrayBindingElement::Binding(binding) => {
+                            ArrayBindingElement::Binding(self.rewrite_pattern(binding))
+                        }
+                        other => other.clone(),
+                    })
+                    .collect(),
+            }),
+            BindingPattern::Rest(rest) => BindingPattern::Rest(RestBindingPattern {
+                argument: Box::new(self.rewrite_pattern(&rest.argument)),
+            }),
+            BindingPattern::Assignment(assignment) => {
+                BindingPattern::Assignment(AssignmentBindingPattern {
+                    left: Box::new(self.rewrite_pattern(&assignment.left)),
+                    right: Box::new(self.rewrite_expr(&assignment.right)),
+                })
+            }
+            BindingPattern::Identifier(_) | BindingPattern::Missing(_) => return pattern.clone(),
+        };
+        self.node(pattern.range(), rewritten)
     }
     /// Lowers a declaration whose binding carries suspensions (yield in
     /// a default or computed key). Every bound name hoists first; reads
@@ -4742,9 +4804,15 @@ impl<'a> Rewriter<'a> {
                     debug_assert_eq!(popped, Some(depth));
                     Box::new(rewritten)
                 });
+                let depth = self.expression_temp_scopes.len();
+                self.parameter_initializer_depths.push(depth);
+                let binding = self.rewrite_pattern(&parameter.data().binding);
+                let popped = self.parameter_initializer_depths.pop();
+                debug_assert_eq!(popped, Some(depth));
                 self.node(
                     parameter.range(),
                     Parameter {
+                        binding,
                         initializer,
                         ..parameter.data().clone()
                     },
@@ -10859,6 +10927,31 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             "for (N.x of [1])",
             "for (N.x in {})",
             "function shadowed(x) { return x; }",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+    }
+
+    #[test]
+    fn a_name_is_rewritten_in_loop_heads_and_binding_patterns() {
+        let output = emit_at(
+            "namespace N {\n\
+             \x20   export var n = 3;\n\
+             \x20   for (let i = n; i > 0; i--) {}\n\
+             \x20   for (const { a = n } of []) {}\n\
+             \x20   for (const k in { [n]: 1 }) {}\n\
+             \x20   function f({ a = n }, [b = n]) {}\n\
+             \x20   const { c = n, [n]: d } = {};\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        for expected in [
+            "for (let i = N.n; i > 0; i--)",
+            "for (const { a = N.n } of [])",
+            "[N.n]: 1",
+            "function f({ a = N.n }, [b = N.n])",
+            "const { c = N.n, [N.n]: d } = {};",
         ] {
             assert!(code.contains(expected), "missing {expected}: {code}");
         }
