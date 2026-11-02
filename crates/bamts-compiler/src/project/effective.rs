@@ -753,15 +753,11 @@ fn node_module_format(
         _ => {}
     }
     let root = project.root();
-    let package = source
-        .ancestors()
-        .skip(1)
-        .take_while(|directory| directory.starts_with(root.path()))
-        .find_map(|directory| {
-            let path = directory.join("package.json");
-            let text = fs.read(&path).ok()?;
-            PackageJson::parse(root, &path, &text).ok()
-        });
+    let package = source.ancestors().skip(1).find_map(|directory| {
+        let path = directory.join("package.json");
+        let text = fs.read(&path).ok()?;
+        PackageJson::parse(root, &path, &text).ok()
+    });
     if package.as_ref().and_then(PackageJson::package_type) == Some("module") {
         ModuleKind::EsNext
     } else {
@@ -2456,6 +2452,31 @@ mod tests {
              console.log(Foo, Config, 1);\n\
              export { Foo };\n"
         );
+    }
+
+    #[test]
+    fn a_node_module_format_reads_the_package_above_the_project() {
+        let fixture = Fixture::new();
+        fixture.write("package.json", r#"{"type":"module"}"#);
+        fixture.write("app/main.ts", "export const a = 1;\n");
+        fixture.write(
+            "app/tsconfig.json",
+            r#"{"files":["main.ts"],"compilerOptions":{"module":"nodenext","outDir":"dist"}}"#,
+        );
+        let filesystem = fixture.filesystem();
+        let project =
+            EffectiveProject::load(&fixture.request("app/tsconfig.json"), &filesystem).unwrap();
+        let report =
+            compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+        let javascript = std::str::from_utf8(
+            report
+                .outputs
+                .files
+                .get(&fixture.0.join("app/dist/main.js"))
+                .expect("project JavaScript output"),
+        )
+        .unwrap();
+        assert!(javascript.contains("export const a"), "{javascript}");
     }
 
     #[test]
