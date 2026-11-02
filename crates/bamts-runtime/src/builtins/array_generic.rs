@@ -678,7 +678,7 @@ fn iterate<H: Host>(
             let value = get_index(machine, object, index)?;
             machine.refresh_native_roots(depth, &[object, callback, this_arg, target, value]);
             let position = crate::number_value(index as f64);
-            let result = machine.call_value(callback, this_arg, &[value, position, object])?;
+            let result = machine.call_callback(callback, this_arg, &[value, position, object])?;
             match iteration {
                 Iteration::ForEach => {}
                 Iteration::Map => create_index(machine, target, index, result)?,
@@ -772,7 +772,7 @@ fn find_from<H: Host>(
             let value = get_index(machine, object, index)?;
             machine.refresh_native_roots(depth, &[object, callback, this_arg, value]);
             let position = crate::number_value(index as f64);
-            let result = machine.call_value(callback, this_arg, &[value, position, object])?;
+            let result = machine.call_callback(callback, this_arg, &[value, position, object])?;
             if machine.to_boolean(result) {
                 return Ok(if want_index { position } else { value });
             }
@@ -837,7 +837,7 @@ fn reduce_from<H: Host>(
             if has_index(machine, object, index)? {
                 let value = get_index(machine, object, index)?;
                 let position = crate::number_value(index as f64);
-                accumulator = machine.call_value(
+                accumulator = machine.call_callback(
                     callback,
                     Value::UNDEFINED,
                     &[accumulator, value, position, object],

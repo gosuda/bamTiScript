@@ -1847,18 +1847,16 @@ pub struct Machine<'a, H: Host> {
     /// Values kept strongly reachable for the current ECMAScript job by
     /// WeakRef construction/deref. Cleared exactly once at the outer job seam.
     kept_alive: Vec<Value>,
-    /// What running builtins hold in Rust locals: everything they allocated, and
-    /// what they read through a getter, a trap or an iterator. Calling user code
-    /// can reach a collection, so these stay rooted until the builtin returns.
+    /// What running builtins hold in Rust locals: everything they allocated or
+    /// got back from user code. Calling user code can reach a collection, so
+    /// these stay rooted until the builtin returns.
     builtin_temporaries: Vec<Value>,
-    /// The latest results of callbacks. Only these are kept: `reduce` holds one
-    /// result at a time, and keeping them all would hold every intermediate.
+    /// The latest results of `call_callback`, for loops that use each result
+    /// once: `reduce` holds one at a time, and keeping them all would hold every
+    /// intermediate.
     callback_results: Vec<Value>,
     /// Where the running builtin's results start in `callback_results`.
     results_floor: usize,
-    /// Calls into user code so far, which tells a read that ran a getter or a
-    /// trap from a plain data read.
-    user_code_calls: u64,
     /// A builtin is running, and not user code it called.
     in_builtin: bool,
     /// Microtask jobs that have left the queue and are still running.
@@ -2239,7 +2237,6 @@ impl<'a, H: Host> Machine<'a, H> {
             builtin_temporaries: Vec::new(),
             callback_results: Vec::new(),
             results_floor: 0,
-            user_code_calls: 0,
             in_builtin: false,
             running_jobs: Vec::new(),
             fuel,
@@ -7400,19 +7397,34 @@ impl<'a, H: Host> Machine<'a, H> {
     fn call_user_code(
         &mut self,
         call: impl FnOnce(&mut Machine<'a, H>) -> Result<Value, EvalFailure>,
+        keep: fn(&mut Self, Value),
     ) -> Result<Value, EvalFailure> {
         let in_builtin = std::mem::replace(&mut self.in_builtin, false);
-        self.user_code_calls += 1;
         let result = call(self);
         self.in_builtin = in_builtin;
         match &result {
             Ok(value)
             | Err(EvalFailure::ThrowValue(value) | EvalFailure::ThrowValueOrigin { value, .. }) => {
-                self.keep_callback_result(*value)
+                keep(self, *value);
             }
             Err(_) => {}
         }
         result
+    }
+
+    /// `call_value` for a loop over a user callback that is done with each result
+    /// before the next call: `forEach`, `map`, `reduce` and their like. Only
+    /// such a loop may use this; anything collecting results needs `call_value`.
+    pub(crate) fn call_callback(
+        &mut self,
+        callee: Value,
+        this_value: Value,
+        arguments: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        self.call_user_code(
+            |machine| machine.dispatch_call(callee, this_value, arguments),
+            Self::keep_callback_result,
+        )
     }
 
     /// Answers whether `value` has `[[Construct]]`. Builtin callees consult the
@@ -8106,7 +8118,10 @@ impl<'a, H: Host> Machine<'a, H> {
         arguments: &[Value],
         new_target: Value,
     ) -> Result<Value, EvalFailure> {
-        self.call_user_code(|machine| machine.dispatch_construct(callee, arguments, new_target))
+        self.call_user_code(
+            |machine| machine.dispatch_construct(callee, arguments, new_target),
+            Self::keep_temporary,
+        )
     }
 
     fn dispatch_construct(
@@ -8220,7 +8235,10 @@ impl<'a, H: Host> Machine<'a, H> {
         this_value: Value,
         arguments: &[Value],
     ) -> Result<Value, EvalFailure> {
-        self.call_user_code(|machine| machine.dispatch_call(callee, this_value, arguments))
+        self.call_user_code(
+            |machine| machine.dispatch_call(callee, this_value, arguments),
+            Self::keep_temporary,
+        )
     }
 
     fn dispatch_call(

@@ -2423,7 +2423,13 @@ function $ERROR(message) {\n\
             for (var i = 0; i < n; i++) { sink = 'x'.repeat(1 << 20) + i; } }\n\
             gc();\n\
             function* items() { yield { x: 1 }; gc(); yield { x: 2 }; }\n";
-        const CASES: [&str; 10] = [
+        const CASES: [&str; 12] = [
+            "var many = []; for (var i = 0; i < 64; i++) { many.push({ toJSON() { \
+             if (i === 63) { gc(); } return { v: 'a' + 'b' }; } }); } \
+             assert.sameValue(JSON.stringify(many).length > 64, true);",
+            "var strings = []; for (var i = 0; i < 64; i++) { strings.push(i); } \
+             var doubled = Float64Array.from(strings, (v) => { if (v === 63) { gc(); } \
+             return String(v) + '0'; }); assert.sameValue(doubled[1], 10);",
             "var text = ''; for (var i = 0; i < 2000; i++) { text += 'a line of text\\n'; } \
              var lines = text.split('\\n'); \
              var joined = lines.reduce((sum, line) => sum + line + '\\n', ''); \

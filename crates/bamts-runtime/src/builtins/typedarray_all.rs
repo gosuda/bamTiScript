@@ -2023,7 +2023,7 @@ fn for_each<H: Host>(
     let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
     for index in 0..length {
         let value = read_element(machine, this, index)?;
-        machine.call_value(
+        machine.call_callback(
             callback,
             this_arg,
             &[value, crate::number_value(index as f64), this],
@@ -2198,7 +2198,7 @@ fn reduce_impl<H: Host, I: Iterator<Item = usize>>(
     };
     for index in indices {
         let value = read_element(machine, this, index)?;
-        accumulator = machine.call_value(
+        accumulator = machine.call_callback(
             callback,
             Value::UNDEFINED,
             &[accumulator, value, crate::number_value(index as f64), this],

@@ -1016,7 +1016,7 @@ fn map_for_each<H: Host>(
         collection_next(machine, this, CollectionKind::Map, cursor)?
     {
         cursor = next;
-        machine.call_value(
+        machine.call_callback(
             callback,
             args.get(1).copied().unwrap_or(Value::UNDEFINED),
             &[value, key, this],
@@ -1144,7 +1144,7 @@ fn set_for_each<H: Host>(
     while let Some((next, _, value)) = collection_next(machine, this, CollectionKind::Set, cursor)?
     {
         cursor = next;
-        machine.call_value(
+        machine.call_callback(
             callback,
             args.get(1).copied().unwrap_or(Value::UNDEFINED),
             &[value, value, this],
