@@ -495,7 +495,7 @@ pub(crate) fn value_read_names(file: &SourceFile) -> BTreeSet<String> {
     for statement in file.statements() {
         scanner.scan_statement(statement);
     }
-    scanner.free
+    scanner.reads
 }
 fn scan_constructor(
     scanner: &mut FreeVarScanner<'_>,
@@ -10063,6 +10063,9 @@ struct FreeVarScanner<'a> {
     /// Walks source the way it is written, including JSX and decorators, which
     /// lowering reaches some other way.
     scans_jsx: bool,
+    /// Every name read as a value, shadowed or not. Keeping an import a shadowed
+    /// read did not need costs nothing; dropping one that was read would throw.
+    reads: BTreeSet<String>,
     calls_super: bool,
     arrow_calls_super: bool,
     fn_boundary: u32,
@@ -10140,6 +10143,7 @@ impl<'a> FreeVarScanner<'a> {
             uses_new_target: false,
             uses_super: false,
             scans_jsx: false,
+            reads: BTreeSet::new(),
             calls_super: false,
             arrow_calls_super: false,
             fn_boundary: 0,
@@ -10225,6 +10229,9 @@ impl<'a> FreeVarScanner<'a> {
                 self.uses_arguments = true;
             }
             return;
+        }
+        if self.scans_jsx {
+            self.reads.insert(name.to_owned());
         }
         if let Some(binding) = self.resolve_binding(name).cloned() {
             if binding.owner_depth == 0 && !self.initialized.contains(&binding.identity) {
@@ -10543,6 +10550,19 @@ impl<'a> FreeVarScanner<'a> {
                 for member in &declaration.members {
                     if let Some(initializer) = &member.data().initializer {
                         self.scan_expression(initializer);
+                    }
+                }
+            }
+            Statement::ImportEquals(import) if self.scans_jsx => {
+                if let crate::syntax::ExternalModuleReference::Qualified(name) = &import.reference {
+                    let mut root = name;
+                    while let crate::syntax::EntityName::Qualified { left, .. } = root {
+                        root = left;
+                    }
+                    if let crate::syntax::EntityName::Identifier(identifier) = root
+                        && let Some(text) = identifier_name(self.file, identifier)
+                    {
+                        self.use_name(&text);
                     }
                 }
             }

@@ -391,6 +391,7 @@ pub fn compile_project<F: FileSystem + Clone>(
             .insert(artifact.kind, artifact.path.clone());
     }
     let jsx_route = program.jsx_routing_decision(ProgramOutputKind::JavaScript);
+    let erased_exports = checked.erased_exports(&program);
     let mut outputs = BuildOutputs::default();
     for module in checked.modules() {
         let source_path = sources
@@ -406,8 +407,11 @@ pub fn compile_project<F: FileSystem + Clone>(
         emit_options.declaration = selection.declaration;
         emit_options.emit_declaration_only = selection.declaration && !selection.javascript;
         emit_options.verbatim_module_syntax = project.options().verbatim_module_syntax();
-        emit_options.erased_imports =
-            Arc::new(checked.erased_imports(&program, module.source_file().source_id()));
+        emit_options.erased_imports = Arc::new(checked.erased_imports(
+            &program,
+            &erased_exports,
+            module.source_file().source_id(),
+        ));
         if emit_options.module == Some(ModuleKind::Node) {
             emit_options.module = Some(node_module_format(project, source_path, fs));
         }
@@ -2393,6 +2397,64 @@ mod tests {
         assert_eq!(
             javascript,
             "import { v } from './t.js';\nconsole.log(1);\nexport { v };\n"
+        );
+    }
+
+    #[test]
+    fn exports_decide_what_is_erased_through_any_barrel() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "t.ts",
+            "export const value = 2;\n\
+             interface Foo {}\n\
+             export { value as Foo };\n\
+             export interface Real {}\n\
+             export default interface Dflt {}\n\
+             export const enum CE { A = 1 }\n",
+        );
+        fixture.write(
+            "barrel.ts",
+            "export * from './t.js';\n\
+             export { Real as Renamed } from './t.js';\n\
+             export { default as Props } from './t.js';\n",
+        );
+        fixture.write("impl.ts", "export const Config = 5;\n");
+        fixture.write(
+            "mid.ts",
+            "type Config = 1;\nexport { Config } from './impl.js';\n",
+        );
+        fixture.write(
+            "main.ts",
+            "import { Foo, Real, CE } from './barrel.js';\n\
+             import { Renamed, Props } from './barrel.js';\n\
+             import { Config } from './mid.js';\n\
+             console.log(Foo, Config, CE.A);\n\
+             export { Real, Renamed, Props, Foo };\n\
+             export { Real as R2 } from './barrel.js';\n",
+        );
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["main.ts"],"compilerOptions":{"module":"esnext","target":"es2022","outDir":"dist"}}"#,
+        );
+        let filesystem = fixture.filesystem();
+        let project =
+            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
+        let report =
+            compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+        let javascript = std::str::from_utf8(
+            report
+                .outputs
+                .files
+                .get(&fixture.0.join("dist/main.js"))
+                .expect("project JavaScript output"),
+        )
+        .unwrap();
+        assert_eq!(
+            javascript,
+            "import { Foo } from './barrel.js';\n\
+             import { Config } from './mid.js';\n\
+             console.log(Foo, Config, 1);\n\
+             export { Foo };\n"
         );
     }
 

@@ -10,6 +10,7 @@
 //! composes the existing scanner, parser, checker, and emitter surfaces.
 
 use bamts_cancel::{CancellationToken, Cancelled};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::checker::diagnostic_messages::{Args, by_u32};
@@ -19,7 +20,8 @@ use crate::emitter::{self, EmitFileNames, EmitOptions, EmitOutput, ModuleKind};
 use crate::lint::{LintProfile, LintTable};
 use crate::parser;
 use crate::program::{
-    JsxRoutingDecision, ModuleTarget, ProgramOutputKind, ResolvedModule, ResolvedProgram,
+    JsxRoutingDecision, ModuleEdge, ModuleTarget, ProgramOutputKind, ResolvedModule,
+    ResolvedProgram,
 };
 use crate::scanner;
 use crate::source::{ScriptKind, SourceId, SourceText};
@@ -207,6 +209,32 @@ impl FrontendMode {
     }
 }
 
+fn dependencies_of(program: &ResolvedProgram, source_id: SourceId) -> &[ModuleEdge] {
+    program
+        .modules()
+        .iter()
+        .find(|module| module.source_id() == source_id)
+        .map_or(&[], |module| module.dependencies())
+}
+
+/// The local module an edge's names come from; types may resolve apart.
+fn edge_target(edge: &ModuleEdge) -> Option<SourceId> {
+    edge.type_target()
+        .unwrap_or_else(|| edge.target())
+        .local_source_id()
+}
+
+fn local_dependency(
+    program: &ResolvedProgram,
+    source_id: SourceId,
+    specifier: &str,
+) -> Option<SourceId> {
+    dependencies_of(program, source_id)
+        .iter()
+        .find(|edge| edge.specifier() == specifier)
+        .and_then(edge_target)
+}
+
 fn program_emit_options(program: &ResolvedProgram, mode: FrontendMode) -> Option<EmitOptions> {
     let mut options = mode.emit_options()?;
 
@@ -356,35 +384,76 @@ impl ProgramFrontendOutput {
         &self.modules
     }
 
+    /// Each module's export names with no runtime form. A name forwarded from
+    /// another module, by a re-export or `export *`, takes that module's answer.
+    #[must_use]
+    pub fn erased_exports(&self, program: &ResolvedProgram) -> HashMap<SourceId, BTreeSet<String>> {
+        let mut erased = HashMap::new();
+        for module in &self.modules {
+            let source_id = module.source_file().source_id();
+            self.resolve_erased_exports(program, source_id, &mut erased, &mut HashSet::new());
+        }
+        erased
+    }
+
+    fn resolve_erased_exports(
+        &self,
+        program: &ResolvedProgram,
+        source_id: SourceId,
+        erased: &mut HashMap<SourceId, BTreeSet<String>>,
+        visiting: &mut HashSet<SourceId>,
+    ) -> BTreeSet<String> {
+        if let Some(names) = erased.get(&source_id) {
+            return names.clone();
+        }
+        let Some(module) = self.module(source_id) else {
+            return BTreeSet::new();
+        };
+        // A cycle decides nothing: a name stays until something proves it erased.
+        if !visiting.insert(source_id) {
+            return BTreeSet::new();
+        }
+        let exports =
+            emitter::transforms::module_exports(module.source_file(), module.semantic_model());
+        let mut names = exports.types;
+        for (exported, specifier, imported) in exports.forwards {
+            if let Some(target) = local_dependency(program, source_id, &specifier)
+                && self
+                    .resolve_erased_exports(program, target, erased, visiting)
+                    .contains(&imported)
+            {
+                names.insert(exported);
+            }
+        }
+        for specifier in exports.stars {
+            if let Some(target) = local_dependency(program, source_id, &specifier) {
+                let forwarded = self.resolve_erased_exports(program, target, erased, visiting);
+                names.extend(forwarded.into_iter().filter(|name| name != "default"));
+            }
+        }
+        names.retain(|name| !exports.values.contains(name));
+        erased.insert(source_id, names.clone());
+        names
+    }
+
     /// `(specifier, name)` for what the module's imports can name that has no
-    /// runtime form: its dependency declares the name only as a type, or as a
-    /// const enum. Emit cannot see other files, and an ES module naming one of
-    /// these fails at load.
+    /// runtime form. Emit cannot see other files, and an ES module naming one
+    /// of these fails at load.
     #[must_use]
     pub fn erased_imports(
         &self,
         program: &ResolvedProgram,
+        erased: &HashMap<SourceId, BTreeSet<String>>,
         source_id: SourceId,
-    ) -> std::collections::BTreeSet<(String, String)> {
-        let mut erased = std::collections::BTreeSet::new();
-        let dependencies = program
-            .modules()
-            .iter()
-            .find(|module| module.source_id() == source_id)
-            .map_or(&[][..], |module| module.dependencies());
-        for edge in dependencies {
-            let target = edge.type_target().unwrap_or_else(|| edge.target());
-            let Some(target) = target.local_source_id().and_then(|id| self.module(id)) else {
-                continue;
-            };
-            let model = target.semantic_model();
-            let names = model.scope(model.module_scope()).type_only_names();
-            let const_enums = emitter::transforms::const_enum_names(target.source_file());
-            for name in names.map(str::to_owned).chain(const_enums) {
-                erased.insert((edge.specifier().to_owned(), name));
+    ) -> BTreeSet<(String, String)> {
+        let mut pairs = BTreeSet::new();
+        for edge in dependencies_of(program, source_id) {
+            let names = edge_target(edge).and_then(|target| erased.get(&target));
+            for name in names.into_iter().flatten() {
+                pairs.insert((edge.specifier().to_owned(), name.clone()));
             }
         }
-        erased
+        pairs
     }
 
     #[must_use]

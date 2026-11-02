@@ -1580,6 +1580,12 @@ impl<'a> Rewriter<'a> {
                     vec![statement.clone()]
                 }
                 ExportDefaultValue::Expression(value) => {
+                    // `export default T` of a type has no runtime form.
+                    if let Expression::Identifier(identifier) = value.data()
+                        && self.exports_only_a_type(self.token_text(identifier.data().token()))
+                    {
+                        return Vec::new();
+                    }
                     if self.cjs.is_some() {
                         let value = self.rewrite_expr(value);
                         return vec![self.cjs_export_default_assignment(statement.range(), value)];
@@ -9484,41 +9490,12 @@ fn import_reads(file: &SourceFile, options: &TransformOptions) -> Option<BTreeSe
     }
     let mut reads = crate::lower::value_read_names(file);
     let erased = type_import_names(file, options);
-    for statement in file.statements() {
-        match statement.data() {
-            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
-                type_only: false,
-                specifiers,
-                source: None,
-                ..
-            })) => {
-                reads.extend(specifiers.iter().filter_map(|specifier| {
-                    let specifier = specifier.data();
-                    match (&specifier.mode, &specifier.local) {
-                        (ExportSpecifierMode::Value, ModuleExportName::Identifier(local)) => {
-                            Some(identifier_text(file, local))
-                        }
-                        _ => None,
-                    }
-                }));
-            }
-            Statement::ImportEquals(ImportEqualsDeclaration {
-                reference: ExternalModuleReference::Qualified(name),
-                ..
-            }) => {
-                let mut root = name;
-                while let EntityName::Qualified { left, .. } = root {
-                    root = left;
-                }
-                if let EntityName::Identifier(identifier) = root {
-                    reads.insert(identifier_text(file, identifier));
-                }
-            }
-            _ => {}
-        }
-    }
+    reads.extend(exported_locals(file).into_keys());
     // The classic JSX factories read a name the source never spells.
-    if matches!(options.jsx, Some(JsxEmit::React)) {
+    if matches!(
+        options.jsx,
+        Some(JsxEmit::React | JsxEmit::Preserve | JsxEmit::ReactNative)
+    ) {
         for factory in [&options.jsx_factory, &options.jsx_fragment_factory] {
             let factory = factory.as_deref().unwrap_or("React");
             reads.extend(factory.split('.').next().map(str::to_owned));
@@ -9554,6 +9531,174 @@ fn kept_import_clause(
     (default.is_some() || binding.is_some()).then_some(ImportClause { default, binding })
 }
 
+/// What a module's own text exports.
+#[derive(Default)]
+pub(crate) struct ModuleExports {
+    /// Names with no runtime form: types and const enums.
+    pub(crate) types: BTreeSet<String>,
+    /// Names with a runtime value.
+    pub(crate) values: BTreeSet<String>,
+    /// Specifiers of `export * from`.
+    pub(crate) stars: Vec<String>,
+    /// `(exported, module, imported)`: a name whose kind another module decides.
+    pub(crate) forwards: Vec<(String, String, String)>,
+}
+
+/// Reads exports rather than declarations: `interface Foo {}` beside
+/// `export { value as Foo }` exports a value.
+pub(crate) fn module_exports(file: &SourceFile, model: &SemanticModel) -> ModuleExports {
+    let scope = model.scope(model.module_scope());
+    let const_enums: BTreeSet<String> = const_enum_names(file).into_iter().collect();
+    let erased_local = |name: &str| {
+        const_enums.contains(name)
+            || (scope.value(name).is_none() && scope.type_binding(name).is_some())
+    };
+    let imports = imported_bindings(file);
+    let mut exports = ModuleExports::default();
+    for statement in file.statements() {
+        let Statement::Export(export) = statement.data() else {
+            continue;
+        };
+        match export {
+            ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) => {
+                match inner.data() {
+                    Statement::Interface(declaration) => {
+                        exports
+                            .types
+                            .insert(identifier_text(file, &declaration.name));
+                    }
+                    Statement::TypeAlias(declaration) => {
+                        exports
+                            .types
+                            .insert(identifier_text(file, &declaration.name));
+                    }
+                    Statement::Enum(declaration) => {
+                        let name = raw_token_text(file, declaration.name.data().token());
+                        if declaration.is_const {
+                            exports.types.insert(name);
+                        } else {
+                            exports.values.insert(name);
+                        }
+                    }
+                    Statement::Namespace(declaration) => {
+                        if let NamespaceName::Identifier { name, .. } = &declaration.name {
+                            let bearing = model
+                                .namespace_facts()
+                                .declaration(inner.id())
+                                .is_some_and(|plan| plan.is_value_bearing());
+                            let name = identifier_text(file, name);
+                            if bearing {
+                                exports.values.insert(name);
+                            } else {
+                                exports.types.insert(name);
+                            }
+                        }
+                    }
+                    Statement::Class(class) => {
+                        exports
+                            .values
+                            .extend(class.name.iter().map(|name| identifier_text(file, name)));
+                    }
+                    Statement::Function(declaration) => {
+                        exports.values.extend(
+                            declaration
+                                .function
+                                .name
+                                .iter()
+                                .map(|name| identifier_text(file, name)),
+                        );
+                    }
+                    _ => exports.values.extend(declared_binding_names(file, inner)),
+                }
+            }
+            ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+                type_only,
+                specifiers,
+                source,
+                ..
+            }) => {
+                for specifier in specifiers {
+                    let specifier = specifier.data();
+                    let local = module_export_text(file, &specifier.local);
+                    let exported = module_export_text(file, &specifier.exported);
+                    if *type_only || !matches!(specifier.mode, ExportSpecifierMode::Value) {
+                        exports.types.insert(exported);
+                    } else if let Some(source) = source {
+                        let module = module_specifier(file, source);
+                        exports.forwards.push((exported, module, local));
+                    } else if let Some((module, imported)) = imports.get(&local) {
+                        exports
+                            .forwards
+                            .push((exported, module.clone(), imported.clone()));
+                    } else if erased_local(&local) {
+                        exports.types.insert(exported);
+                    } else {
+                        exports.values.insert(exported);
+                    }
+                }
+            }
+            ExportDeclaration::All(all) => match &all.exported {
+                _ if all.type_only => {}
+                Some(name) => {
+                    exports.values.insert(module_export_text(file, name));
+                }
+                None => exports.stars.push(module_specifier(file, &all.source)),
+            },
+            ExportDeclaration::Default(default) => {
+                let erased = match &default.value {
+                    ExportDefaultValue::Interface(_) => true,
+                    ExportDefaultValue::Expression(value) => {
+                        matches!(value.data(), Expression::Identifier(identifier)
+                            if erased_local(&identifier_text(file, identifier)))
+                    }
+                    _ => false,
+                };
+                let names = if erased {
+                    &mut exports.types
+                } else {
+                    &mut exports.values
+                };
+                names.insert(String::from("default"));
+            }
+            _ => {}
+        }
+    }
+    exports
+}
+
+/// Each imported local, by the module and name it comes from.
+fn imported_bindings(file: &SourceFile) -> BTreeMap<String, (String, String)> {
+    let mut bindings = BTreeMap::new();
+    for statement in file.statements() {
+        let Statement::Import(import) = statement.data() else {
+            continue;
+        };
+        let Some(clause) = &import.clause else {
+            continue;
+        };
+        let module = module_specifier(file, &import.source);
+        if let Some(default) = &clause.default {
+            bindings.insert(
+                identifier_text(file, default),
+                (module.clone(), String::from("default")),
+            );
+        }
+        if let Some(ImportBinding::Named(specifiers)) = &clause.binding {
+            for specifier in specifiers {
+                let specifier = specifier.data();
+                bindings.insert(
+                    identifier_text(file, &specifier.local),
+                    (
+                        module.clone(),
+                        module_export_text(file, &specifier.imported),
+                    ),
+                );
+            }
+        }
+    }
+    bindings
+}
+
 /// The file's const enums, which emit erases.
 #[must_use]
 pub(crate) fn const_enum_names(file: &SourceFile) -> Vec<String> {
@@ -9584,6 +9729,12 @@ fn module_specifier(file: &SourceFile, source: &StringLiteralNode) -> String {
 /// name its module erases, and const enums.
 fn type_import_names(file: &SourceFile, options: &TransformOptions) -> BTreeSet<String> {
     let mut names: BTreeSet<String> = const_enum_names(file).into_iter().collect();
+    names.extend(
+        imported_bindings(file)
+            .into_iter()
+            .filter(|(_, binding)| options.erased_imports.contains(binding))
+            .map(|(local, _)| local),
+    );
     for statement in file.statements() {
         let Statement::Import(import) = statement.data() else {
             continue;
@@ -9591,19 +9742,6 @@ fn type_import_names(file: &SourceFile, options: &TransformOptions) -> BTreeSet<
         let Some(clause) = &import.clause else {
             continue;
         };
-        if let Some(ImportBinding::Named(specifiers)) = &clause.binding {
-            let module = module_specifier(file, &import.source);
-            for specifier in specifiers {
-                let specifier = specifier.data();
-                if let ModuleExportName::Identifier(imported) = &specifier.imported
-                    && options
-                        .erased_imports
-                        .contains(&(module.clone(), identifier_text(file, imported)))
-                {
-                    names.insert(identifier_text(file, &specifier.local));
-                }
-            }
-        }
         if import.type_only {
             names.extend(
                 clause
@@ -11897,6 +12035,22 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             (
                 "import { c } from './m';\ntry {} catch ({ a = c }) {}\n",
                 "import { c } from './m';",
+            ),
+            (
+                "import { x } from './m';\nfunction f(a = x) { var x = 2; return a; }\n",
+                "import { x } from './m';",
+            ),
+            (
+                "import { x } from './m';\n{ function x() {} }\nconsole.log(x);\n",
+                "import { x } from './m';",
+            ),
+            (
+                "import { x } from './m';\nnamespace N { import q = x.v; export const w = q; }\n",
+                "import { x } from './m';",
+            ),
+            (
+                "import { x } from './m';\nexport import w = x.v;\n",
+                "import { x } from './m';",
             ),
             ("import './m';\n", "import './m';"),
         ] {
