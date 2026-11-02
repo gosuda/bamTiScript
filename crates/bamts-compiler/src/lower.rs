@@ -37,7 +37,7 @@ use bamts_bytecode::{
     UnaryOp, Verified, VerifyError,
 };
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 fn zero_range() -> TextRange {
@@ -633,9 +633,21 @@ enum CaptureKey {
     Home(Register),
     /// The cell recording that a derived constructor's `super(...)` has run.
     SuperGuard(Register),
+    /// A name only field initializers read. They see the class's scope, so it
+    /// stays out of the constructor's own.
+    FieldName {
+        name: String,
+        sites: Vec<BindingSite>,
+        cell: Register,
+    },
     Cell(Register),
     Container(crate::checker::SymbolId, ContainerKind, Register),
     WithObject(BindingSite, Register),
+}
+/// The names a function resolves through, set aside while initializers lower.
+struct NameView {
+    scopes: Vec<HashMap<String, Binding>>,
+    captured_names: HashMap<String, Vec<BindingSite>>,
 }
 /// Whether `super(...)` has run. An arrow can reach `super` from outside the
 /// constructor's registers, so a constructor with such an arrow keeps a cell.
@@ -856,6 +868,9 @@ struct FunctionContext<'a> {
     this_capture: Option<Register>,
     this_cell: Option<Register>,
     derived_super_guard: Option<SuperGuard>,
+    /// The outer names field initializers read, by captured cell and the
+    /// `with` sites that precede each one.
+    field_scope: BTreeMap<String, (Register, Vec<BindingSite>)>,
     instance_steps: Vec<InstanceInit>,
     new_target_capture: Option<Register>,
     parent_constructor_capture: Option<Register>,
@@ -910,6 +925,7 @@ impl<'a> FunctionContext<'a> {
             this_capture: None,
             this_cell: None,
             derived_super_guard: None,
+            field_scope: BTreeMap::new(),
             instance_steps: Vec::new(),
             new_target_capture: None,
             parent_constructor_capture: None,
@@ -7400,6 +7416,7 @@ impl<'a> FunctionContext<'a> {
             this_capture: None,
             this_cell: None,
             derived_super_guard: None,
+            field_scope: BTreeMap::new(),
             // A `super(...)` in an arrow initializes the fields.
             instance_steps: if is_arrow {
                 self.instance_steps.clone()
@@ -7443,6 +7460,11 @@ impl<'a> FunctionContext<'a> {
                 CaptureKey::Home(_) => inner.home_object = Some(register),
                 CaptureKey::SuperGuard(_) => {
                     inner.derived_super_guard = Some(SuperGuard::Cell(register));
+                }
+                CaptureKey::FieldName { name, sites, .. } => {
+                    inner
+                        .field_scope
+                        .insert(name.clone(), (register, sites.clone()));
                 }
                 CaptureKey::Cell(_) => {}
                 CaptureKey::Container(symbol, kind, _) => inner.containers.push(Container {
@@ -7559,6 +7581,7 @@ impl<'a> FunctionContext<'a> {
             this_capture: None,
             this_cell: None,
             derived_super_guard: None,
+            field_scope: BTreeMap::new(),
             instance_steps: Vec::new(),
             new_target_capture: None,
             parent_constructor_capture: None,
@@ -7594,6 +7617,11 @@ impl<'a> FunctionContext<'a> {
                 CaptureKey::Home(_) => inner.home_object = Some(register),
                 CaptureKey::SuperGuard(_) => {
                     inner.derived_super_guard = Some(SuperGuard::Cell(register));
+                }
+                CaptureKey::FieldName { name, sites, .. } => {
+                    inner
+                        .field_scope
+                        .insert(name.clone(), (register, sites.clone()));
                 }
                 CaptureKey::Cell(_) => {}
                 CaptureKey::Container(symbol, kind, _) => inner.containers.push(Container {
@@ -7942,6 +7970,7 @@ impl<'a> FunctionContext<'a> {
             CaptureKey::ClassElements(table) => Ok(*table),
             CaptureKey::Home(home) => Ok(*home),
             CaptureKey::SuperGuard(guard) => Ok(*guard),
+            CaptureKey::FieldName { cell, .. } => Ok(*cell),
             CaptureKey::Cell(cell) => Ok(*cell),
             CaptureKey::Container(_, _, object) | CaptureKey::WithObject(_, object) => Ok(*object),
         }
@@ -7954,13 +7983,9 @@ impl<'a> FunctionContext<'a> {
     ) -> Vec<CaptureKey> {
         let mut scanner = FreeVarScanner::new(self.file, self.jsx_plan);
         scanner.scan_function(parameters, body, is_arrow);
-        // `super(...)` in an arrow finishes the enclosing constructor's work,
-        // which runs the field initializers there.
+        // `super(...)` in an arrow finishes the enclosing constructor's work.
         let calls_parent =
             is_arrow && scanner.uses_super && self.parent_constructor_capture.is_some();
-        if calls_parent {
-            scan_instance_init_free_vars(&mut scanner, &self.instance_steps);
-        }
         let mut captures = Vec::new();
         for name in &scanner.free {
             if matches!(self.resolve(name), Some(Binding::ConstEnum(_))) {
@@ -7993,6 +8018,14 @@ impl<'a> FunctionContext<'a> {
                 if let Some(SuperGuard::Cell(guard)) = self.derived_super_guard {
                     captures.push(CaptureKey::SuperGuard(guard));
                 }
+                // The arrow runs the field initializers there.
+                captures.extend(self.field_scope.iter().map(|(name, (cell, sites))| {
+                    CaptureKey::FieldName {
+                        name: name.clone(),
+                        sites: sites.clone(),
+                        cell: *cell,
+                    }
+                }));
             }
         }
         // An arrow's `super` is the enclosing method's.
@@ -8782,17 +8815,25 @@ impl<'a> FunctionContext<'a> {
     ) -> Vec<CaptureKey> {
         let mut scanner = FreeVarScanner::new(self.file, self.jsx_plan);
         scan_constructor(&mut scanner, parameters, body);
-        scan_instance_init_free_vars(&mut scanner, instance_steps);
+        // Initializers scan alone: a constructor binding does not shadow them.
+        let mut fields = FreeVarScanner::new(self.file, self.jsx_plan);
+        scan_instance_init_free_vars(&mut fields, instance_steps);
         let mut captures = Vec::new();
-        for name in &scanner.free {
-            if matches!(self.resolve(name), Some(Binding::ConstEnum(_))) {
-                continue;
-            }
-            if self.resolve(name).is_some() {
-                captures.push(CaptureKey::Name(
+        for name in scanner.free.union(&fields.free) {
+            match self.resolve(name) {
+                Some(Binding::ConstEnum(_)) | None => {}
+                Some(_) if scanner.free.contains(name) => captures.push(CaptureKey::Name(
                     name.clone(),
                     self.preceding_with_sites(name),
-                ));
+                )),
+                Some(Binding::Cell(cell)) => captures.push(CaptureKey::FieldName {
+                    name: name.clone(),
+                    sites: self.preceding_with_sites(name),
+                    cell,
+                }),
+                Some(Binding::Local(_)) => {
+                    panic!("capture plan resolved field capture `{name}` to Local")
+                }
             }
         }
         if let Some(parent) = parent {
@@ -8801,7 +8842,7 @@ impl<'a> FunctionContext<'a> {
         if let Some(table) = class_elements {
             captures.push(CaptureKey::ClassElements(table));
         }
-        if scanner.uses_super {
+        if scanner.uses_super || fields.uses_super {
             captures.push(CaptureKey::Home(home));
         }
         for container in &self.containers {
@@ -8811,12 +8852,29 @@ impl<'a> FunctionContext<'a> {
                 container.object,
             ));
         }
-        if !scanner.free.is_empty() {
+        if !scanner.free.is_empty() || !fields.free.is_empty() {
             for region in &self.with_regions {
                 captures.push(CaptureKey::WithObject(region.site, region.object));
             }
         }
         captures
+    }
+    /// Swaps in what field initializers see, returning what to restore.
+    fn enter_field_scope(&mut self) -> NameView {
+        let bindings = self
+            .field_scope
+            .iter()
+            .map(|(name, (cell, _))| (name.clone(), Binding::Cell(*cell)))
+            .collect();
+        let sites = self
+            .field_scope
+            .iter()
+            .map(|(name, (_, sites))| (name.clone(), sites.clone()))
+            .collect();
+        NameView {
+            scopes: std::mem::replace(&mut self.scopes, vec![bindings]),
+            captured_names: std::mem::replace(&mut self.captured_names, sites),
+        }
     }
     fn initialize_instance_fields(
         &mut self,
@@ -8829,6 +8887,7 @@ impl<'a> FunctionContext<'a> {
         if steps.is_empty() {
             return Ok(());
         }
+        let outer = self.enter_field_scope();
         let table = self.class_elements;
         // Method/getter/setter extras are Decorated { initializer: None }.
         // Drain them as a prefix; field/auto-accessor steps keep source order.
@@ -8899,6 +8958,8 @@ impl<'a> FunctionContext<'a> {
                 }
             }
         }
+        self.scopes = outer.scopes;
+        self.captured_names = outer.captured_names;
         self.instance_steps = steps;
         Ok(())
     }
@@ -9110,6 +9171,7 @@ impl<'a> FunctionContext<'a> {
             this_capture: None,
             this_cell: None,
             derived_super_guard: None,
+            field_scope: BTreeMap::new(),
             instance_steps: instance_steps.to_vec(),
             new_target_capture: None,
             parent_constructor_capture: None,
@@ -9131,6 +9193,14 @@ impl<'a> FunctionContext<'a> {
                         DeclarationScope::Function,
                     );
                     inner.captured_names.insert(name.clone(), sites.clone());
+                    inner
+                        .field_scope
+                        .insert(name.clone(), (register, sites.clone()));
+                }
+                CaptureKey::FieldName { name, sites, .. } => {
+                    inner
+                        .field_scope
+                        .insert(name.clone(), (register, sites.clone()));
                 }
                 CaptureKey::Parent(_) => inner.parent_constructor_capture = Some(register),
                 CaptureKey::ClassElements(_) => inner.class_elements = Some(register),
@@ -10529,6 +10599,11 @@ impl<'a> FreeVarScanner<'a> {
                 self.scan_statement(statement);
             }
         }
+        // Field initializers run in the constructor but see the class's scope.
+        self.function_roots.pop();
+        self.pop();
+        self.push();
+        self.function_roots.push(self.bound.len() - 1);
         for member in &class.members {
             match member.data() {
                 ClassMember::Property(property)

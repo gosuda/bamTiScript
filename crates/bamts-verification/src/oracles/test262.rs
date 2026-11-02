@@ -2373,6 +2373,43 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn a_field_initializer_sees_the_class_scope() {
+        const SETUP: &str = "function run() {\n\
+            const y = 10;\n\
+            class A {}\n";
+        const CASES: [&str; 6] = [
+            "class C { v = y; constructor(y) { assert.sameValue(this.v, 10); \
+             assert.sameValue(y, 3); } } new C(3);",
+            "class C { v = y; constructor() { var y = 2; assert.sameValue(this.v, 10); \
+             assert.sameValue(y, 2); } } new C;",
+            "class B extends A { v = y; constructor() { const y = 2; super(); \
+             assert.sameValue(this.v, 10); assert.sameValue(y, 2); } } new B;",
+            "class B extends A { v = y; constructor() { const y = 2; ((y) => super())(3); \
+             assert.sameValue(this.v, 10); assert.sameValue(y, 2); } } new B;",
+            "class B extends A { v = () => y; constructor(y) { super(); \
+             assert.sameValue(this.v(), 10); assert.sameValue(y, 3); } } new B(3);",
+            "class C { v = y; w = class { m() { return y; } }; constructor() { \
+             assert.sameValue(new this.w().m(), 10); } } new C;",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap(
+                    "description: field scope",
+                    &format!("{SETUP}{body}\n}}\nrun();"),
+                );
+                let label = format!("field-scope-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_destructuring_target_is_evaluated_before_its_value() {
         const LOG: &str = "var log = [];\n\
             function source() { log.push('source'); return { get p() { log.push('get'); } }; }\n\
