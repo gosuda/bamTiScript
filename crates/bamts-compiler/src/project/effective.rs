@@ -406,6 +406,8 @@ pub fn compile_project<F: FileSystem + Clone>(
         emit_options.declaration = selection.declaration;
         emit_options.emit_declaration_only = selection.declaration && !selection.javascript;
         emit_options.verbatim_module_syntax = project.options().verbatim_module_syntax();
+        emit_options.erased_imports =
+            Arc::new(checked.erased_imports(&program, module.source_file().source_id()));
         if emit_options.module == Some(ModuleKind::Node) {
             emit_options.module = Some(node_module_format(project, source_path, fs));
         }
@@ -2353,6 +2355,45 @@ mod tests {
         .unwrap();
         assert!(javascript.contains("./runtime/jsx-runtime"));
         assert!(!javascript.contains("<div"));
+    }
+
+    #[test]
+    fn a_name_another_file_erases_leaves_no_trace_in_javascript() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "t.ts",
+            "export interface I {}\nexport const v = 1;\nexport const enum K { A = 1 }\n",
+        );
+        fixture.write("only.d.ts", "export interface D {}\n");
+        fixture.write(
+            "main.ts",
+            "import { I, v, K } from './t.js';\n\
+             console.log(K.A);\n\
+             export { I, v, K };\n\
+             export { I as J } from './t.js';\n\
+             export { D } from './only.js';\n",
+        );
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["main.ts"],"compilerOptions":{"module":"esnext","target":"es2022","outDir":"dist"}}"#,
+        );
+        let filesystem = fixture.filesystem();
+        let project =
+            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
+        let report =
+            compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+        let javascript = std::str::from_utf8(
+            report
+                .outputs
+                .files
+                .get(&fixture.0.join("dist/main.js"))
+                .expect("project JavaScript output"),
+        )
+        .unwrap();
+        assert_eq!(
+            javascript,
+            "import { v } from './t.js';\nconsole.log(1);\nexport { v };\n"
+        );
     }
 
     #[test]

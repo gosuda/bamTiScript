@@ -139,6 +139,8 @@ pub struct TransformOptions {
     pub target: ScriptTarget,
     /// Keeps every import as written instead of eliding by use.
     pub verbatim_module_syntax: bool,
+    /// `(specifier, name)` pairs the program knows have no runtime form.
+    pub erased_imports: std::sync::Arc<BTreeSet<(String, String)>>,
     /// Whether the emitted file begins with a `"use strict"` prologue.
     pub always_strict: bool,
     /// When true, class fields that survive downlevel use `define` semantics.
@@ -746,7 +748,7 @@ impl<'a> Rewriter<'a> {
             expression_temp_scopes: Vec::new(),
             parameter_initializer_depths: Vec::new(),
             cjs,
-            type_imports: type_import_names(file),
+            type_imports: type_import_names(file, options),
             import_reads: import_reads(file, options),
             inline_lines: HashMap::new(),
             synthesized_ids: BTreeSet::new(),
@@ -771,7 +773,7 @@ impl<'a> Rewriter<'a> {
         let module_scope = model.module_scope();
         let symbol_of = |name: &str| model.scope(module_scope).value(name);
         let hoisted_functions = hoisted_function_names(file);
-        let type_imports = type_import_names(file);
+        let type_imports = type_import_names(file, options);
         let reads = import_reads(file, options);
         let exported_locals = exported_locals(file);
         for statement in file.statements() {
@@ -884,7 +886,7 @@ impl<'a> Rewriter<'a> {
                 }
                 Statement::Export(export) => {
                     plan.is_module = true;
-                    plan_cjs_reexport(file, export, &mut names, &mut plan);
+                    plan_cjs_reexport(file, export, &mut names, &mut plan, &options.erased_imports);
                     let binds_type = |name: &str| {
                         type_imports.contains(name) || is_type_only_export(model, name)
                     };
@@ -1136,36 +1138,56 @@ impl<'a> Rewriter<'a> {
     }
 
     /// `export { I }` of an interface or alias has no runtime form, so an ES
-    /// module must not name it. `export {}` still marks the file a module.
+    /// module must not name it, and a re-export with nothing left goes away.
     fn rewrite_esm_export_specifiers(
         &mut self,
         statement: &Stmt,
         specifiers: &[ExportSpecifierNode],
-    ) -> Stmt {
+        source: &Option<StringLiteralNode>,
+    ) -> Vec<Stmt> {
+        let module = source
+            .as_ref()
+            .map(|source| module_specifier(self.file, source));
         let kept: Vec<ExportSpecifierNode> = specifiers
             .iter()
-            .filter(|specifier| match &specifier.data().local {
-                ModuleExportName::Identifier(local) => {
+            .filter(|specifier| match (&module, &specifier.data().local) {
+                (Some(module), _) => reexport_survives(
+                    self.file,
+                    specifier.data(),
+                    module,
+                    &self.options.erased_imports,
+                ),
+                (None, ModuleExportName::Identifier(local)) => {
                     !self.exports_only_a_type(self.token_text(local.data().token()))
                 }
-                _ => true,
+                (None, _) => true,
             })
             .cloned()
             .collect();
         if kept.len() == specifiers.len() {
-            return statement.clone();
+            return vec![statement.clone()];
         }
-        self.node(
+        if kept.is_empty() && module.is_some() {
+            return Vec::new();
+        }
+        let Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+            attributes,
+            ..
+        })) = statement.data()
+        else {
+            return vec![statement.clone()];
+        };
+        vec![self.node(
             statement.range(),
             Statement::Export(ExportDeclaration::Named(
                 ExportNamedDeclaration::Specifiers {
                     type_only: false,
                     specifiers: kept,
-                    source: None,
-                    attributes: None,
+                    source: source.clone(),
+                    attributes: attributes.clone(),
                 },
             )),
-        )
+        )]
     }
 
     /// What a module-scope name reads under CommonJS, where an exported
@@ -1581,10 +1603,10 @@ impl<'a> Rewriter<'a> {
                 ..
             })) => {
                 if self.cjs.is_none() {
-                    if source.is_none() && !*type_only {
-                        return vec![self.rewrite_esm_export_specifiers(statement, specifiers)];
+                    if *type_only {
+                        return vec![statement.clone()];
                     }
-                    return vec![statement.clone()];
+                    return self.rewrite_esm_export_specifiers(statement, specifiers, source);
                 }
                 if source.is_none() && !*type_only {
                     return self.cjs_export_specifiers(specifiers);
@@ -9368,6 +9390,20 @@ fn exported_locals(file: &SourceFile) -> BTreeMap<String, Vec<String>> {
     locals
 }
 
+/// Whether `export { name } from` still has something to publish.
+fn reexport_survives(
+    file: &SourceFile,
+    specifier: &ExportSpecifier,
+    module: &str,
+    erased: &BTreeSet<(String, String)>,
+) -> bool {
+    matches!(specifier.mode, ExportSpecifierMode::Value)
+        && !erased.contains(&(
+            module.to_owned(),
+            module_export_text(file, &specifier.local),
+        ))
+}
+
 /// Plans a re-export's lines: a star export copies the module's names, and a named one reads through to the
 /// module, so it stays a live binding.
 fn plan_cjs_reexport(
@@ -9375,6 +9411,7 @@ fn plan_cjs_reexport(
     export: &ExportDeclaration,
     names: &mut RequireNames,
     plan: &mut CjsPlan,
+    erased: &BTreeSet<(String, String)>,
 ) {
     let quoted = |source: &StringLiteralNode| {
         let raw = raw_token_text(file, source.data().token());
@@ -9406,15 +9443,19 @@ fn plan_cjs_reexport(
             source: Some(source),
             ..
         }) => {
-            let raw = raw_token_text(file, source.data().token());
-            let local = names.allocate(raw.trim_matches(['"', '\'']));
+            let module = module_specifier(file, source);
+            let kept: Vec<_> = specifiers
+                .iter()
+                .map(|specifier| specifier.data())
+                .filter(|specifier| reexport_survives(file, specifier, &module, erased))
+                .collect();
+            if kept.is_empty() {
+                return;
+            }
+            let local = names.allocate(&module);
             plan.requires
                 .push(format!("var {local} = require({});", quoted(source)));
-            for specifier in specifiers {
-                let specifier = specifier.data();
-                if !matches!(specifier.mode, ExportSpecifierMode::Value) {
-                    continue;
-                }
+            for specifier in kept {
                 let imported = module_export_text(file, &specifier.local);
                 let exported = module_export_text(file, &specifier.exported);
                 plan.requires
@@ -9443,6 +9484,7 @@ fn import_reads(file: &SourceFile, options: &TransformOptions) -> Option<BTreeSe
         return None;
     }
     let mut reads = crate::lower::value_read_names(file);
+    let erased = type_import_names(file, options);
     for statement in file.statements() {
         match statement.data() {
             Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
@@ -9483,6 +9525,7 @@ fn import_reads(file: &SourceFile, options: &TransformOptions) -> Option<BTreeSe
             reads.extend(factory.split('.').next().map(str::to_owned));
         }
     }
+    reads.retain(|name| !erased.contains(name));
     Some(reads)
 }
 
@@ -9512,8 +9555,36 @@ fn kept_import_clause(
     (default.is_some() || binding.is_some()).then_some(ImportClause { default, binding })
 }
 
-fn type_import_names(file: &SourceFile) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
+/// The file's const enums, which emit erases.
+#[must_use]
+pub(crate) fn const_enum_names(file: &SourceFile) -> Vec<String> {
+    file.statements()
+        .iter()
+        .filter_map(|statement| match statement.data() {
+            Statement::Enum(declaration) => Some(declaration),
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => match inner.data() {
+                Statement::Enum(declaration) => Some(declaration),
+                _ => None,
+            },
+            _ => None,
+        })
+        .filter(|declaration| declaration.is_const)
+        .map(|declaration| raw_token_text(file, declaration.name.data().token()))
+        .collect()
+}
+
+fn module_specifier(file: &SourceFile, source: &StringLiteralNode) -> String {
+    raw_token_text(file, source.data().token())
+        .trim_matches(['"', '\''])
+        .to_owned()
+}
+
+/// Local names with no runtime value: `import type` bindings, imports of a
+/// name its module erases, and const enums.
+fn type_import_names(file: &SourceFile, options: &TransformOptions) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = const_enum_names(file).into_iter().collect();
     for statement in file.statements() {
         let Statement::Import(import) = statement.data() else {
             continue;
@@ -9521,6 +9592,19 @@ fn type_import_names(file: &SourceFile) -> BTreeSet<String> {
         let Some(clause) = &import.clause else {
             continue;
         };
+        if let Some(ImportBinding::Named(specifiers)) = &clause.binding {
+            let module = module_specifier(file, &import.source);
+            for specifier in specifiers {
+                let specifier = specifier.data();
+                if let ModuleExportName::Identifier(imported) = &specifier.imported
+                    && options
+                        .erased_imports
+                        .contains(&(module.clone(), identifier_text(file, imported)))
+                {
+                    names.insert(identifier_text(file, &specifier.local));
+                }
+            }
+        }
         if import.type_only {
             names.extend(
                 clause

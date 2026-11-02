@@ -241,6 +241,14 @@ impl Scope {
     pub fn type_binding(&self, name: &str) -> Option<SymbolId> {
         self.types.get(name).copied()
     }
+
+    /// The names this scope declares only as types.
+    pub fn type_only_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.types
+            .keys()
+            .map(AsRef::as_ref)
+            .filter(|name: &&str| !self.values.contains_key(*name))
+    }
 }
 
 /// Resolves a value name from `scope` outward through its ancestors. Class

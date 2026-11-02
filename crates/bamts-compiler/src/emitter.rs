@@ -125,6 +125,8 @@ pub struct EmitOptions {
     pub remove_comments: bool,
     /// Keeps every import and export as written instead of eliding by use.
     pub verbatim_module_syntax: bool,
+    /// `(specifier, name)` pairs the program knows have no runtime form.
+    pub erased_imports: Arc<BTreeSet<(String, String)>>,
     pub use_define_for_class_fields: Option<bool>,
     pub declaration: bool,
     pub emit_declaration_only: bool,
@@ -157,6 +159,7 @@ impl Default for EmitOptions {
             no_emit_helpers: false,
             remove_comments: false,
             verbatim_module_syntax: false,
+            erased_imports: Arc::default(),
             use_define_for_class_fields: None,
             declaration: false,
             emit_declaration_only: false,
@@ -409,6 +412,7 @@ impl EmitOptions {
             inline_sources: self.inline_sources,
             remove_comments: self.remove_comments,
             verbatim_module_syntax: self.verbatim_module_syntax,
+            erased_imports: Arc::clone(&self.erased_imports),
         }
     }
 

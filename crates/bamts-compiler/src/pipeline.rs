@@ -356,6 +356,37 @@ impl ProgramFrontendOutput {
         &self.modules
     }
 
+    /// `(specifier, name)` for what the module's imports can name that has no
+    /// runtime form: its dependency declares the name only as a type, or as a
+    /// const enum. Emit cannot see other files, and an ES module naming one of
+    /// these fails at load.
+    #[must_use]
+    pub fn erased_imports(
+        &self,
+        program: &ResolvedProgram,
+        source_id: SourceId,
+    ) -> std::collections::BTreeSet<(String, String)> {
+        let mut erased = std::collections::BTreeSet::new();
+        let dependencies = program
+            .modules()
+            .iter()
+            .find(|module| module.source_id() == source_id)
+            .map_or(&[][..], |module| module.dependencies());
+        for edge in dependencies {
+            let target = edge.type_target().unwrap_or_else(|| edge.target());
+            let Some(target) = target.local_source_id().and_then(|id| self.module(id)) else {
+                continue;
+            };
+            let model = target.semantic_model();
+            let names = model.scope(model.module_scope()).type_only_names();
+            let const_enums = emitter::transforms::const_enum_names(target.source_file());
+            for name in names.map(str::to_owned).chain(const_enums) {
+                erased.insert((edge.specifier().to_owned(), name));
+            }
+        }
+        erased
+    }
+
     #[must_use]
     pub fn module(&self, source_id: SourceId) -> Option<&FrontendOutput> {
         self.modules
