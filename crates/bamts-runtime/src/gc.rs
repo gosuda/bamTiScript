@@ -176,6 +176,7 @@ impl GcState {
         self.mark_value(&machine.heap, machine.current_new_target);
         self.mark_values(&machine.heap, &machine.kept_alive);
         self.mark_values(&machine.heap, &machine.builtin_temporaries);
+        self.mark_values(&machine.heap, &machine.callback_results);
         if let Some(resume) = &machine.pending_generator_resume {
             trace_generator_resume(resume, &machine.heap, &mut self.marks, &mut self.work);
         }

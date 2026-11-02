@@ -1245,10 +1245,6 @@ impl<'a, H: Host> Machine<'a, H> {
             self.with_temporaries(|machine| handler(machine, this_value, arguments, constructing));
         self.current_builtin_id = previous_id;
         self.current_new_target = previous_new_target;
-        // A builtin calling this one holds the result in a Rust local.
-        if let Ok(BuiltinOutcome::Value(value)) = &outcome {
-            self.keep_temporary(*value);
-        }
         outcome
     }
     fn object_to_string_tag(&self, value: Value) -> Result<&'static str, EvalFailure> {

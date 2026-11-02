@@ -343,6 +343,10 @@ fn stable_sort<H: Host>(
     values: &mut [Value],
     comparator: Option<Value>,
 ) -> Result<(), EvalFailure> {
+    // The comparator can remove these from wherever they came from.
+    for value in values.iter() {
+        machine.keep_temporary(*value);
+    }
     for end in 1..values.len() {
         let mut index = end;
         while index > 0

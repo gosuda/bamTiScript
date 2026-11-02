@@ -945,6 +945,20 @@ impl<'a, H: Host> Machine<'a, H> {
         key: &PropertyKey,
         receiver: Value,
     ) -> Result<Value, EvalFailure> {
+        let calls = self.user_code_calls;
+        let value = self.dispatch_get(object, key, receiver)?;
+        if self.user_code_calls != calls {
+            self.keep_temporary(value);
+        }
+        Ok(value)
+    }
+
+    fn dispatch_get(
+        &mut self,
+        object: Value,
+        key: &PropertyKey,
+        receiver: Value,
+    ) -> Result<Value, EvalFailure> {
         if !matches!(key, PropertyKey::Private(_)) && self.heap_entry_is_proxy_value(object) {
             return self.with_proxy_dispatch(|machine| proxy::get(machine, object, key, receiver));
         }

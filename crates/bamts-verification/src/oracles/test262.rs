@@ -2423,7 +2423,18 @@ function $ERROR(message) {\n\
             for (var i = 0; i < n; i++) { sink = 'x'.repeat(1 << 20) + i; } }\n\
             gc();\n\
             function* items() { yield { x: 1 }; gc(); yield { x: 2 }; }\n";
-        const CASES: [&str; 7] = [
+        const CASES: [&str; 10] = [
+            "var text = ''; for (var i = 0; i < 2000; i++) { text += 'a line of text\\n'; } \
+             var lines = text.split('\\n'); \
+             var joined = lines.reduce((sum, line) => sum + line + '\\n', ''); \
+             assert.sameValue(joined.length > 2000, true);",
+            "var left = { valueOf() { return 'a' + 'b'; } }; \
+             var right = { valueOf() { gc(); return 'y'; } }; \
+             assert.sameValue(left + right, 'aby'); assert.sameValue(left < right, true);",
+            "var list = new Proxy([{ a: 3 }, { a: 1 }], { get(t, k) { gc(); \
+             var v = t[k]; return typeof v === 'object' ? { a: v.a } : v; } }); \
+             var ordered = Array.prototype.toSorted.call(list, (p, q) => { gc(); \
+             return p.a - q.a; }); assert.sameValue(ordered[0].a, 1);",
             "var seen = 0; Promise.resolve(1).then(() => { gc(); return { a: 1 }; })\
              .then((v) => { seen = v.a; });",
             "var sorted = [{ a: 3 }, { a: 1 }].toSorted((p, q) => { gc(); return p.a - q.a; }); \

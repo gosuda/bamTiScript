@@ -57,6 +57,8 @@ pub use native::{
     run_linked_program_tiered, run_linked_program_with_cancel,
 };
 
+/// Callback results a builtin keeps rooted, for the locals it still holds.
+const RECENT_CALLBACK_RESULTS: usize = 32;
 const RUNTIME_HEAP_SEGMENT: u16 = 1;
 
 /// The observable result of a terminated execution.
@@ -1845,10 +1847,18 @@ pub struct Machine<'a, H: Host> {
     /// Values kept strongly reachable for the current ECMAScript job by
     /// WeakRef construction/deref. Cleared exactly once at the outer job seam.
     kept_alive: Vec<Value>,
-    /// What running builtins hold in Rust locals: everything they allocated or
-    /// got back from user code. Calling user code can reach a collection, so
-    /// these stay rooted until the builtin that took them returns.
+    /// What running builtins hold in Rust locals: everything they allocated, and
+    /// what they read through a getter, a trap or an iterator. Calling user code
+    /// can reach a collection, so these stay rooted until the builtin returns.
     builtin_temporaries: Vec<Value>,
+    /// The latest results of callbacks. Only these are kept: `reduce` holds one
+    /// result at a time, and keeping them all would hold every intermediate.
+    callback_results: Vec<Value>,
+    /// Where the running builtin's results start in `callback_results`.
+    results_floor: usize,
+    /// Calls into user code so far, which tells a read that ran a getter or a
+    /// trap from a plain data read.
+    user_code_calls: u64,
     /// A builtin is running, and not user code it called.
     in_builtin: bool,
     /// Microtask jobs that have left the queue and are still running.
@@ -2227,6 +2237,9 @@ impl<'a, H: Host> Machine<'a, H> {
             array_join_stack: Vec::new(),
             kept_alive: Vec::new(),
             builtin_temporaries: Vec::new(),
+            callback_results: Vec::new(),
+            results_floor: 0,
+            user_code_calls: 0,
             in_builtin: false,
             running_jobs: Vec::new(),
             fuel,
@@ -7340,11 +7353,17 @@ impl<'a, H: Host> Machine<'a, H> {
     /// Runs native code that holds values in Rust locals across user code,
     /// keeping what it allocates and what user code returns to it rooted.
     pub(crate) fn with_temporaries<T>(&mut self, body: impl FnOnce(&mut Machine<'a, H>) -> T) -> T {
-        let outer = std::mem::replace(&mut self.in_builtin, true);
+        if self.in_builtin {
+            return body(self);
+        }
+        self.in_builtin = true;
         let mark = self.builtin_temporaries.len();
+        let floor = std::mem::replace(&mut self.results_floor, self.callback_results.len());
         let result = body(self);
+        self.callback_results.truncate(self.results_floor);
+        self.results_floor = floor;
         self.builtin_temporaries.truncate(mark);
-        self.in_builtin = outer;
+        self.in_builtin = false;
         result
     }
 
@@ -7367,18 +7386,29 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    fn keep_callback_result(&mut self, value: Value) {
+        if !self.in_builtin || !matches!(value.decode(), Some(Decoded::HeapRef(_))) {
+            return;
+        }
+        if self.callback_results.len() - self.results_floor == RECENT_CALLBACK_RESULTS {
+            self.callback_results.remove(self.results_floor);
+        }
+        self.callback_results.push(value);
+    }
+
     /// Runs user code for a builtin, which holds the result in a Rust local.
     fn call_user_code(
         &mut self,
         call: impl FnOnce(&mut Machine<'a, H>) -> Result<Value, EvalFailure>,
     ) -> Result<Value, EvalFailure> {
         let in_builtin = std::mem::replace(&mut self.in_builtin, false);
+        self.user_code_calls += 1;
         let result = call(self);
         self.in_builtin = in_builtin;
         match &result {
             Ok(value)
             | Err(EvalFailure::ThrowValue(value) | EvalFailure::ThrowValueOrigin { value, .. }) => {
-                self.keep_temporary(*value)
+                self.keep_callback_result(*value)
             }
             Err(_) => {}
         }
@@ -12620,6 +12650,7 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok((true, Value::UNDEFINED));
         }
         let value = self.get_named_property(result, "value")?;
+        self.keep_temporary(value);
         Ok((false, value))
     }
 
@@ -12955,6 +12986,20 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn eval_binary(
+        &mut self,
+        op: BinaryOp,
+        left: Value,
+        right: Value,
+    ) -> Result<Value, EvalFailure> {
+        // Converting one operand can run user code while the other's primitive
+        // is only a Rust local.
+        if self.is_object(left) || self.is_object(right) {
+            return self.with_temporaries(|machine| machine.binary_values(op, left, right));
+        }
+        self.binary_values(op, left, right)
+    }
+
+    fn binary_values(
         &mut self,
         op: BinaryOp,
         left: Value,
