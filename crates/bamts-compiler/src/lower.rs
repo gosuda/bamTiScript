@@ -5491,7 +5491,7 @@ impl<'a> FunctionContext<'a> {
         for member in &object.members {
             match member.data() {
                 ObjectMember::Property(property) => {
-                    let key = self.property_key(builder, &property.name)?;
+                    let key = self.converted_property_key(builder, range, &property.name)?;
                     let name = self.property_name_text(&property.name)?;
                     let value =
                         self.lower_maybe_named(builder, &property.value, name.as_deref())?;
@@ -5516,7 +5516,7 @@ impl<'a> FunctionContext<'a> {
                     )?;
                 }
                 ObjectMember::Method(method) => {
-                    let key = self.property_key(builder, &method.name)?;
+                    let key = self.converted_property_key(builder, range, &method.name)?;
                     self.method_home = Some(dst);
                     let value =
                         self.build_function_value(builder, member.range(), None, &method.function);
@@ -5546,6 +5546,28 @@ impl<'a> FunctionContext<'a> {
                 }
             }
         }
+        Ok(dst)
+    }
+    /// A literal's key, converted before its value runs.
+    fn converted_property_key(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        name: &PropertyName,
+    ) -> Result<Register, LowerError> {
+        let operand = self.property_key(builder, name)?;
+        if !matches!(name, PropertyName::Computed(_)) {
+            return Ok(operand);
+        }
+        let dst = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::Unary {
+                dst,
+                op: UnaryOp::ToPropertyKey,
+                operand,
+            },
+        )?;
         Ok(dst)
     }
     fn install_property(

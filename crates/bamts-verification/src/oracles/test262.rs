@@ -2308,6 +2308,27 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn a_computed_literal_key_converts_before_its_value() {
+        let source = wrap(
+            "description: key order",
+            "var log = []; var key = { toString() { log.push('key'); return 'k'; } }; \
+             function value() { log.push('value'); return 1; } \
+             var o = { [key]: value() }; \
+             assert.sameValue(log.join(), 'key,value'); assert.sameValue(o.k, 1);",
+        );
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            let label = format!("key-order-{mode:?}");
+            if let Err(error) = run_fixture_in(mode, &label, &source) {
+                panic!("{label}: {error:?}");
+            }
+        }
+    }
+
+    #[test]
     fn closing_an_iterator_checks_its_return_method() {
         const THROWS: &str = "function throws(kind, body) {\n\
             try { body(); } catch (error) { return error instanceof kind; }\n\
