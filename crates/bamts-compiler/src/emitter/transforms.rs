@@ -10865,6 +10865,18 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
     }
 
     #[test]
+    fn an_unknown_name_in_a_binding_pattern_is_reported() {
+        let source = "const { a = missing } = {};\nconst [b = alsoMissing] = [];\n";
+        let checked = checker::check(&Recovered::clean(parse(source)));
+        let unknown = checked
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == crate::checker::CANNOT_FIND_NAME)
+            .count();
+        assert_eq!(unknown, 2, "{:?}", checked.diagnostics());
+    }
+
+    #[test]
     fn a_namespace_without_a_value_emits_nothing() {
         let output = emit_at(
             "namespace T { export interface I {} }\n\

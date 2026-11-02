@@ -13711,6 +13711,7 @@ impl<'src> Binder<'src> {
         let key_type = self.types.intersection(vec![object_key, string]);
         let keep_literal = variable.kind == VariableKind::Const;
         for declarator in &variable.declarations {
+            self.resolve_pattern_expressions(&declarator.data().binding, scope);
             if declarator.data().type_annotation.is_none() {
                 self.assign_binding_pattern_types(
                     &declarator.data().binding,
@@ -13733,6 +13734,7 @@ impl<'src> Binder<'src> {
                 self.bind_variable(variable, scope, NodeId::default());
                 for declarator_node in &variable.declarations {
                     let declarator = declarator_node.data();
+                    self.resolve_pattern_expressions(&declarator.binding, scope);
                     if matches!(
                         variable.kind,
                         VariableKind::Using | VariableKind::AwaitUsing
@@ -13803,6 +13805,7 @@ impl<'src> Binder<'src> {
             if let Some(initializer) = &declarator.initializer {
                 self.resolve_expr(initializer, scope);
             }
+            self.resolve_pattern_expressions(&declarator.binding, scope);
             if let Some(symbols) = self.declarator_symbols.get(&declarator_node.id())
                 && declarator.initializer.is_some()
             {
@@ -13970,6 +13973,40 @@ impl<'src> Binder<'src> {
                 Self::is_fresh_literal_array(parenthesized.as_ref())
             }
             _ => false,
+        }
+    }
+
+    /// Resolves the defaults and computed keys a binding pattern carries.
+    fn resolve_pattern_expressions(
+        &mut self,
+        pattern: &'src crate::syntax::Pattern,
+        scope: ScopeId,
+    ) {
+        match pattern.data() {
+            BindingPattern::Object(object) => {
+                for property in &object.properties {
+                    self.resolve_property_name(&property.name, scope);
+                    if let Some(initializer) = &property.initializer {
+                        self.resolve_expr(initializer, scope);
+                    }
+                    self.resolve_pattern_expressions(&property.binding, scope);
+                }
+            }
+            BindingPattern::Array(array) => {
+                for element in &array.elements {
+                    if let crate::syntax::ArrayBindingElement::Binding(inner) = element {
+                        self.resolve_pattern_expressions(inner, scope);
+                    }
+                }
+            }
+            BindingPattern::Rest(rest) => {
+                self.resolve_pattern_expressions(&rest.argument, scope);
+            }
+            BindingPattern::Assignment(assignment) => {
+                self.resolve_expr(&assignment.right, scope);
+                self.resolve_pattern_expressions(&assignment.left, scope);
+            }
+            BindingPattern::Identifier(_) | BindingPattern::Missing(_) => {}
         }
     }
 
@@ -14418,6 +14455,7 @@ impl<'src> Binder<'src> {
         if let Some(initializer) = &data.initializer {
             self.resolve_expr(initializer, scope);
         }
+        self.resolve_pattern_expressions(&data.binding, scope);
         let initializer_type = data
             .initializer
             .as_ref()
