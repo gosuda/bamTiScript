@@ -677,21 +677,28 @@ impl RequireNames {
     }
 
     fn allocate(&mut self, module: &str) -> String {
-        let base = module.rsplit('/').next().unwrap_or(module);
-        let counter = self.counters.entry(base.to_owned()).or_insert(0);
-        // tsc binds require locals as `<slug>_<n>` when the path's last
-        // segment can start an identifier (`enum_1`) and sanitizes with a
-        // leading underscore only when it cannot (`_10_lib_1`).
-        let starts_identifier = base
+        // tsc binds require locals as `<slug>_<n>`, where the path's last segment
+        // becomes an identifier: other characters turn into `_` (`m_js_1`) and a
+        // leading digit gets a `_` (`_10_lib_1`).
+        let segment = module.rsplit('/').next().unwrap_or(module);
+        let slug: String = segment
             .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$');
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let counter = self.counters.entry(slug.clone()).or_insert(0);
+        let leading_digit = slug.starts_with(|c: char| c.is_ascii_digit());
         loop {
             *counter += 1;
-            let candidate = if starts_identifier {
-                format!("{base}_{}", *counter)
+            let candidate = if leading_digit {
+                format!("_{slug}_{}", *counter)
             } else {
-                format!("_{base}_{}", *counter)
+                format!("{slug}_{}", *counter)
             };
             if self.occupied.insert(candidate.clone()) {
                 return candidate;
@@ -11493,6 +11500,20 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             .map(|line| code.find(line).unwrap_or_else(|| panic!("{line}: {code}")))
             .collect();
         assert!(positions.is_sorted(), "{code}");
+    }
+
+    #[test]
+    fn a_require_local_is_always_an_identifier() {
+        let mut names = super::RequireNames::new(std::collections::BTreeSet::new());
+        for (module, expected) in [
+            ("./m.js", "m_js_1"),
+            ("./m.js", "m_js_2"),
+            ("@scope/my-lib", "my_lib_1"),
+            ("./10-lib", "_10_lib_1"),
+            ("enum", "enum_1"),
+        ] {
+            assert_eq!(names.allocate(module), expected);
+        }
     }
 
     #[test]
