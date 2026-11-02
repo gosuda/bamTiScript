@@ -113,6 +113,7 @@ pub fn emit_declarations(
             inline_sources: false,
             remove_comments: false,
             module_marker: false,
+            verbatim_module_syntax: false,
         },
         names,
         Surface::Declaration,

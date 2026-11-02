@@ -315,6 +315,7 @@ pub fn emit_transformed(
             inline_source_map: options.inline_source_map,
             inline_sources: options.inline_sources,
             remove_comments: options.remove_comments,
+            verbatim_module_syntax: options.verbatim_module_syntax,
             module_marker: is_module
                 && matches!(
                     options.module_kind,
@@ -1767,7 +1768,7 @@ impl<'a> Rewriter<'a> {
                 ..
             })) => {
                 if self.cjs.is_none() {
-                    if *type_only {
+                    if *type_only || self.options.verbatim_module_syntax {
                         return vec![statement.clone()];
                     }
                     return self.rewrite_esm_export_specifiers(statement, specifiers, source);
@@ -12263,6 +12264,29 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             "exports[\"back\\\\slash\"] = v;",
             "exports[\"x²\"] = v;",
             "Object.defineProperty(exports, \"c d\", {",
+        ] {
+            assert!(code.contains(line), "{line}: {code}");
+        }
+    }
+
+    #[test]
+    fn verbatim_module_syntax_keeps_type_only_imports_loading() {
+        let output = emit_with_options(
+            "import { type I } from './a';\n\
+             import {} from './b';\n\
+             export { type T } from './c';\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::EsNext),
+                verbatim_module_syntax: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        for line in [
+            "import {} from './a';",
+            "import {} from './b';",
+            "export {} from './c';",
         ] {
             assert!(code.contains(line), "{line}: {code}");
         }

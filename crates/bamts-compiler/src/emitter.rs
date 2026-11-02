@@ -511,6 +511,8 @@ pub(crate) struct PrintOptions {
     pub(crate) remove_comments: bool,
     /// An ES module whose output has no module syntax left ends in `export {};`.
     pub(crate) module_marker: bool,
+    /// An import or re-export of only types still loads its module.
+    pub(crate) verbatim_module_syntax: bool,
 }
 
 pub(crate) struct PrintSource<'a> {
@@ -2128,7 +2130,10 @@ impl<'a> Emitter<'a> {
         // A clause that resolves to no value bindings is fully type-only and is
         // erased in JavaScript (a bare side-effect import keeps its clause-less
         // form below).
-        if !keep_types && let Some(clause) = &import.clause {
+        if !keep_types
+            && !self.options.verbatim_module_syntax
+            && let Some(clause) = &import.clause
+        {
             let has_value = clause.default.is_some()
                 || matches!(&clause.binding, Some(ImportBinding::Namespace(_)))
                 || matches!(
@@ -2276,17 +2281,22 @@ impl<'a> Emitter<'a> {
                     .iter()
                     .filter(|s| matches!(s.data().mode, ExportSpecifierMode::Value))
                     .collect();
-                if visible.is_empty() {
+                let loads_module = self.options.verbatim_module_syntax && source.is_some();
+                if visible.is_empty() && !loads_module {
                     return false;
                 }
-                self.raw("export { ");
-                for (index, specifier) in visible.iter().enumerate() {
-                    if index > 0 {
-                        self.raw(", ");
+                if visible.is_empty() {
+                    self.raw("export {}");
+                } else {
+                    self.raw("export { ");
+                    for (index, specifier) in visible.iter().enumerate() {
+                        if index > 0 {
+                            self.raw(", ");
+                        }
+                        self.emit_export_specifier(specifier.data(), false);
                     }
-                    self.emit_export_specifier(specifier.data(), false);
+                    self.raw(" }");
                 }
-                self.raw(" }");
                 if let Some(source) = source {
                     self.raw(" from ");
                     self.emit_string(source);
