@@ -600,6 +600,8 @@ struct Rewriter<'a> {
     expression_temp_scopes: Vec<Vec<IdentifierNode>>,
     parameter_initializer_depths: Vec<usize>,
     cjs: Option<CjsPlan>,
+    /// Names `import type` binds, which an `export { name }` cannot publish.
+    type_imports: BTreeSet<String>,
     synthesized_ids: BTreeSet<NodeId>,
     file: &'a SourceFile,
     /// Namespace bodies being lowered, innermost last.
@@ -721,6 +723,7 @@ impl<'a> Rewriter<'a> {
             expression_temp_scopes: Vec::new(),
             parameter_initializer_depths: Vec::new(),
             cjs,
+            type_imports: type_import_names(file),
             synthesized_ids: BTreeSet::new(),
             file,
             namespace_frames: Vec::new(),
@@ -743,6 +746,7 @@ impl<'a> Rewriter<'a> {
         let module_scope = model.module_scope();
         let symbol_of = |name: &str| model.scope(module_scope).value(name);
         let hoisted_functions = hoisted_function_names(file);
+        let type_imports = type_import_names(file);
         for statement in file.statements() {
             match statement.data() {
                 Statement::Import(import) => {
@@ -832,7 +836,10 @@ impl<'a> Rewriter<'a> {
                 Statement::Export(export) => {
                     plan.is_module = true;
                     plan_cjs_reexport(file, export, &mut names, &mut plan);
-                    plan_cjs_local_exports(file, export, &hoisted_functions, &mut plan);
+                    let binds_type = |name: &str| {
+                        type_imports.contains(name) || is_type_only_export(model, name)
+                    };
+                    plan_cjs_local_exports(file, export, &hoisted_functions, binds_type, &mut plan);
                     if let ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) =
                         export
                     {
@@ -1008,6 +1015,9 @@ impl<'a> Rewriter<'a> {
                 ),
                 _ => continue,
             };
+            if self.exports_only_a_type(&local) {
+                continue;
+            }
             let hoisted = self.cjs.as_ref().is_some_and(|plan| {
                 plan.hoisted_exports
                     .iter()
@@ -1034,6 +1044,46 @@ impl<'a> Rewriter<'a> {
             ));
         }
         out
+    }
+
+    fn exports_only_a_type(&self, local: &str) -> bool {
+        self.type_imports.contains(local)
+            || self
+                .model
+                .is_some_and(|model| is_type_only_export(model, local))
+    }
+
+    /// `export { I }` of an interface or alias has no runtime form, so an ES
+    /// module must not name it. `export {}` still marks the file a module.
+    fn rewrite_esm_export_specifiers(
+        &mut self,
+        statement: &Stmt,
+        specifiers: &[ExportSpecifierNode],
+    ) -> Stmt {
+        let kept: Vec<ExportSpecifierNode> = specifiers
+            .iter()
+            .filter(|specifier| match &specifier.data().local {
+                ModuleExportName::Identifier(local) => {
+                    !self.exports_only_a_type(self.token_text(local.data().token()))
+                }
+                _ => true,
+            })
+            .cloned()
+            .collect();
+        if kept.len() == specifiers.len() {
+            return statement.clone();
+        }
+        self.node(
+            statement.range(),
+            Statement::Export(ExportDeclaration::Named(
+                ExportNamedDeclaration::Specifiers {
+                    type_only: false,
+                    specifiers: kept,
+                    source: None,
+                    attributes: None,
+                },
+            )),
+        )
     }
 
     /// What a module-scope name reads under CommonJS, where an exported
@@ -1452,6 +1502,9 @@ impl<'a> Rewriter<'a> {
                 ..
             })) => {
                 if self.cjs.is_none() {
+                    if source.is_none() && !*type_only {
+                        return vec![self.rewrite_esm_export_specifiers(statement, specifiers)];
+                    }
                     return vec![statement.clone()];
                 }
                 if source.is_none() && !*type_only {
@@ -9229,6 +9282,50 @@ fn plan_cjs_reexport(
     }
 }
 
+fn is_type_only_export(model: &SemanticModel, name: &str) -> bool {
+    let scope = model.scope(model.module_scope());
+    scope.value(name).is_none() && scope.type_binding(name).is_some()
+}
+
+fn type_import_names(file: &SourceFile) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for statement in file.statements() {
+        let Statement::Import(import) = statement.data() else {
+            continue;
+        };
+        let Some(clause) = &import.clause else {
+            continue;
+        };
+        if import.type_only {
+            names.extend(
+                clause
+                    .default
+                    .iter()
+                    .map(|name| identifier_text(file, name)),
+            );
+        }
+        match &clause.binding {
+            Some(ImportBinding::Namespace(name)) if import.type_only => {
+                names.insert(identifier_text(file, name));
+            }
+            Some(ImportBinding::Named(specifiers)) => {
+                names.extend(
+                    specifiers
+                        .iter()
+                        .map(|specifier| specifier.data())
+                        .filter(|specifier| {
+                            import.type_only
+                                || matches!(specifier.mode, ImportSpecifierMode::TypeOnly)
+                        })
+                        .map(|specifier| identifier_text(file, &specifier.local)),
+                );
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
 /// A function declaration with a body hoists; a signature is not a binding.
 fn hoisted_function_name(file: &SourceFile, function: &FunctionLike) -> Option<String> {
     function.body.as_ref()?;
@@ -9264,6 +9361,7 @@ fn plan_cjs_local_exports(
     file: &SourceFile,
     export: &ExportDeclaration,
     hoisted_functions: &BTreeSet<String>,
+    binds_type: impl Fn(&str) -> bool,
     plan: &mut CjsPlan,
 ) {
     match export {
@@ -9295,7 +9393,7 @@ fn plan_cjs_local_exports(
                     continue;
                 };
                 let local = identifier_text(file, local);
-                if matches!(specifier.mode, ExportSpecifierMode::TypeOnly) {
+                if matches!(specifier.mode, ExportSpecifierMode::TypeOnly) || binds_type(&local) {
                     continue;
                 }
                 let exported = identifier_text(file, exported);
@@ -11380,6 +11478,40 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             .collect();
         assert!(positions.is_sorted(), "{code}");
         assert!(!code.contains("ambient"), "{code}");
+    }
+
+    #[test]
+    fn a_type_has_no_runtime_export() {
+        const SOURCE: &str = "import type { Q } from './types';\n\
+             import { type R } from './types';\n\
+             interface I {}\n\
+             type T = 1;\n\
+             const v = 1;\n\
+             export { I, T, Q, R, v };\n";
+        let commonjs_output = emit_with_options(
+            SOURCE,
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let commonjs = javascript(&commonjs_output);
+        assert!(commonjs.contains("exports.v = void 0;"), "{commonjs}");
+        assert!(commonjs.contains("exports.v = v;"), "{commonjs}");
+        for name in ["I", "T", "Q", "R"] {
+            assert!(!commonjs.contains(&format!("exports.{name}")), "{commonjs}");
+        }
+        let module_output = emit_with_options(
+            SOURCE,
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::EsNext),
+                ..EmitOptions::default()
+            },
+        );
+        let module = javascript(&module_output);
+        assert!(module.contains("export { v };"), "{module}");
     }
 
     #[test]
