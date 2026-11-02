@@ -463,6 +463,18 @@ impl Rewriter<'_> {
                         }
                         continue;
                     }
+                    if let (true, PropertyName::Computed(key)) = (collects_rest, &property.name) {
+                        let key = self.rewrite_expr(key);
+                        let held = self.hold_in_temp(key, range, out);
+                        if let Expression::Identifier(temp) = held.data() {
+                            keys.push(RestExcludeKey::Computed(temp.clone()));
+                        }
+                        let member = MemberProperty::Computed(Box::new(held));
+                        let read = self.member_expr(&source, member, range);
+                        let read = self.with_default(read, property.initializer.as_deref(), out);
+                        self.flatten_export(&property.binding, read, parameter, out);
+                        continue;
+                    }
                     keys.extend(property_key_text(self, property).map(RestExcludeKey::Static));
                     let name = self.rewrite_property_name(&property.name);
                     let read = self.property_read(&source, name, range);
