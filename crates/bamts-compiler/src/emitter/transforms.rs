@@ -864,15 +864,7 @@ impl<'a> Rewriter<'a> {
                                 if !matches!(specifier.mode, ImportSpecifierMode::Value) {
                                     continue;
                                 }
-                                let imported = match &specifier.imported {
-                                    ModuleExportName::Identifier(ident) => {
-                                        Some(identifier_text(file, ident))
-                                    }
-                                    _ => None,
-                                };
-                                let Some(property) = imported else {
-                                    continue;
-                                };
+                                let property = module_export_text(file, &specifier.imported);
                                 let text = identifier_text(file, &specifier.local);
                                 for exported in exported_locals.get(&text).into_iter().flatten() {
                                     plan.import_exports.insert(exported.clone());
@@ -1001,13 +993,7 @@ impl<'a> Rewriter<'a> {
     fn cjs_export_target(&mut self, exported: &str, range: TextRange) -> AssignmentTargetNode {
         let exports_ident = self.ident("exports");
         let object = self.syn_node(range, Expression::Identifier(exports_ident));
-        let property = if is_identifier_name(exported) {
-            MemberProperty::Named(self.ident(exported))
-        } else {
-            let literal = self.string_literal(exported);
-            let key = self.syn_node(range, Expression::Literal(Literal::String(literal)));
-            MemberProperty::Computed(Box::new(key))
-        };
+        let property = self.named_or_computed(exported, range);
         self.syn_node(
             range,
             AssignmentTarget::Member(AssignmentMemberTarget {
@@ -1303,12 +1289,12 @@ impl<'a> Rewriter<'a> {
         let Some(property) = property else {
             return Some(object);
         };
-        let property = self.ident(&property);
+        let property = self.named_or_computed(&property, range);
         Some(self.node(
             range,
             Expression::Member(MemberExpression {
                 object: Box::new(object),
-                property: MemberProperty::Named(property),
+                property,
                 optional: false,
             }),
         ))
@@ -1370,6 +1356,17 @@ impl<'a> Rewriter<'a> {
             prelude.push_str(&format!("{} = {local};\n", exports_member(exported)));
         }
         prelude
+    }
+
+    /// `.name`, or `["a b"]` for a name that is no identifier.
+    fn named_or_computed(&mut self, name: &str, range: TextRange) -> MemberProperty {
+        if is_identifier_name(name) {
+            return MemberProperty::Named(self.ident(name));
+        }
+        let quoted = quote_string(name);
+        let literal = self.string_literal(&quoted[1..quoted.len() - 1]);
+        let key = self.syn_node(range, Expression::Literal(Literal::String(literal)));
+        MemberProperty::Computed(Box::new(key))
     }
 
     /// `module.exports = value;`, which `export =` means under CommonJS.
@@ -9503,12 +9500,33 @@ fn identifier_text(file: &SourceFile, ident: &IdentifierNode) -> String {
     raw_token_text(file, ident.data().token())
 }
 
+/// Plain ASCII only: `exports["é"]` means the same as `exports.é`, while
+/// telling `x²` from a real identifier would take the Unicode tables.
 fn is_identifier_name(name: &str) -> bool {
     let mut characters = name.chars();
     characters
         .next()
-        .is_some_and(|first| first.is_alphabetic() || first == '_' || first == '$')
-        && characters.all(|rest| rest.is_alphanumeric() || rest == '_' || rest == '$')
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && characters.all(|rest| rest.is_ascii_alphanumeric() || rest == '_' || rest == '$')
+}
+
+/// A double-quoted JavaScript string for already decoded text.
+fn quote_string(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\u{2028}' => quoted.push_str("\\u2028"),
+            '\u{2029}' => quoted.push_str("\\u2029"),
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// `exports.name`, or `exports["a b"]` for a name that is no identifier.
@@ -9516,7 +9534,7 @@ fn exports_member(name: &str) -> String {
     if is_identifier_name(name) {
         format!("exports.{name}")
     } else {
-        format!("exports[{}]", quote_module_specifier(name))
+        format!("exports[{}]", quote_string(name))
     }
 }
 
@@ -9525,21 +9543,23 @@ fn live_export(exported: &str, module: &str, imported: &str) -> String {
     let read = if is_identifier_name(imported) {
         format!("{module}.{imported}")
     } else {
-        format!("{module}[{}]", quote_module_specifier(imported))
+        format!("{module}[{}]", quote_string(imported))
     };
     format!(
         "Object.defineProperty(exports, {}, {{ enumerable: true, \
          get: function () {{ return {read}; }} }});",
-        quote_module_specifier(exported)
+        quote_string(exported)
     )
 }
 
 fn module_export_text(file: &SourceFile, name: &ModuleExportName) -> String {
     match name {
         ModuleExportName::Identifier(ident) => identifier_text(file, ident),
-        ModuleExportName::String(literal) => raw_token_text(file, literal.data().token())
-            .trim_matches(['"', '\''])
-            .to_owned(),
+        ModuleExportName::String(literal) => {
+            let raw = raw_token_text(file, literal.data().token());
+            crate::literal::string_value(&raw)
+                .map_or_else(|| raw.clone(), |text| text.to_utf8_lossy())
+        }
         ModuleExportName::Missing(_) => String::new(),
     }
 }
@@ -12221,6 +12241,31 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             javascript(&output),
             "\"use strict\";\nconst K = 1;\nmodule.exports = K;\n"
         );
+    }
+
+    #[test]
+    fn string_export_names_quote_their_decoded_text() {
+        let output = emit_with_options(
+            "import { \"a b\" as ab } from './m';\n\
+             const v = ab;\n\
+             export { v as 'quo\"te', v as \"back\\\\slash\", v as \"x²\" };\n\
+             export { q as \"c d\" } from './n';\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        for line in [
+            "const v = m_1[\"a b\"];",
+            "exports[\"quo\\\"te\"] = v;",
+            "exports[\"back\\\\slash\"] = v;",
+            "exports[\"x²\"] = v;",
+            "Object.defineProperty(exports, \"c d\", {",
+        ] {
+            assert!(code.contains(line), "{line}: {code}");
+        }
     }
 
     #[test]
