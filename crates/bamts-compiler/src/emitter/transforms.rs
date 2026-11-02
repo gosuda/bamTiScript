@@ -619,6 +619,8 @@ struct Rewriter<'a> {
     /// The expression of the expression statement being rewritten, whose value
     /// nothing reads.
     statement_expression: Option<NodeId>,
+    /// `module.exports = value;`, which closes the module.
+    export_assignment: Option<Stmt>,
     synthesized_ids: BTreeSet<NodeId>,
     file: &'a SourceFile,
     /// Namespace bodies being lowered, innermost last.
@@ -764,6 +766,7 @@ impl<'a> Rewriter<'a> {
             import_reads: import_reads(file, options),
             inline_lines: HashMap::new(),
             statement_expression: None,
+            export_assignment: None,
             synthesized_ids: BTreeSet::new(),
             file,
             namespace_frames: Vec::new(),
@@ -1645,6 +1648,7 @@ impl<'a> Rewriter<'a> {
     fn rewrite_root_statements(&mut self, statements: &[Stmt], range: TextRange) -> Vec<Stmt> {
         self.expression_temp_scopes.push(Vec::new());
         let mut rewritten = self.rewrite_statements(statements);
+        rewritten.extend(self.export_assignment.take());
         let temps = self.expression_temp_scopes.pop().unwrap_or_default();
         if let Some(declaration) = self.temp_declaration(temps, range) {
             rewritten.insert(0, declaration);
@@ -1783,7 +1787,14 @@ impl<'a> Rewriter<'a> {
                 self.cjs_statement_lines(statement)
             }
             Statement::Export(ExportDeclaration::Assignment(value)) if self.cjs.is_some() => {
-                vec![self.cjs_export_assignment_statement(statement.range(), value)]
+                // Upstream runs it after the module body, whatever its position.
+                let erased = matches!(value.data(), Expression::Identifier(identifier)
+                    if self.exports_only_a_type(self.token_text(identifier.data().token())));
+                if !erased {
+                    self.export_assignment =
+                        Some(self.cjs_export_assignment_statement(statement.range(), value));
+                }
+                Vec::new()
             }
             Statement::Import(import) => {
                 if self.cjs.is_none() {
@@ -3539,6 +3550,7 @@ impl<'a> Rewriter<'a> {
             match member.data() {
                 ClassMember::Constructor(ctor) => {
                     let mut ctor = ctor.clone();
+                    ctor.parameters = self.rewrite_parameters(&ctor.parameters);
                     let statements = self.rewrite_statements(&ctor.body.data().statements);
                     ctor.body = self.node(ctor.body.range(), Block { statements });
                     constructor = Some(self.node(member.range(), ClassMember::Constructor(ctor)));
@@ -9612,6 +9624,14 @@ fn plan_cjs_declared_exports(
         }
     }
     for statement in file.statements() {
+        // An ambient declaration has nothing to publish; its `void 0` stands.
+        if let Statement::Declare(inner) = statement.data() {
+            for local in declared_binding_names(file, inner) {
+                let names = exported_locals.get(&local).into_iter().flatten();
+                plan.published_locals.extend(names.cloned());
+            }
+            continue;
+        }
         let declared = match statement.data() {
             Statement::Class(class) => class
                 .name
@@ -9759,7 +9779,7 @@ fn import_reads(file: &SourceFile, options: &TransformOptions) -> Option<BTreeSe
         return None;
     }
     let mut reads = crate::lower::value_read_names(file);
-    let erased = type_import_names(file, options);
+    let erased = erased_import_locals(file, options);
     reads.extend(exported_locals(file).into_keys());
     // The classic JSX factories read a name the source never spells.
     if matches!(
@@ -9824,6 +9844,7 @@ pub(crate) fn module_exports(file: &SourceFile, model: &SemanticModel) -> Module
             || (scope.value(name).is_none() && scope.type_binding(name).is_some())
     };
     let imports = imported_bindings(file);
+    let type_imports = declared_type_imports(file);
     let mut exports = ModuleExports::default();
     for statement in file.statements() {
         let Statement::Export(export) = statement.data() else {
@@ -9831,6 +9852,10 @@ pub(crate) fn module_exports(file: &SourceFile, model: &SemanticModel) -> Module
         };
         match export {
             ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) => {
+                let inner = match inner.data() {
+                    Statement::Declare(declared) => declared,
+                    _ => inner,
+                };
                 match inner.data() {
                     Statement::Interface(declaration) => {
                         exports
@@ -9896,6 +9921,8 @@ pub(crate) fn module_exports(file: &SourceFile, model: &SemanticModel) -> Module
                     } else if let Some(source) = source {
                         let module = module_specifier(file, source);
                         exports.forwards.push((exported, module, local));
+                    } else if type_imports.contains(&local) {
+                        exports.types.insert(exported);
                     } else if let Some((module, imported)) = imports.get(&local) {
                         exports
                             .forwards
@@ -9915,14 +9942,24 @@ pub(crate) fn module_exports(file: &SourceFile, model: &SemanticModel) -> Module
                 None => exports.stars.push(module_specifier(file, &all.source)),
             },
             ExportDeclaration::Default(default) => {
-                let erased = match &default.value {
-                    ExportDefaultValue::Interface(_) => true,
-                    ExportDefaultValue::Expression(value) => {
-                        matches!(value.data(), Expression::Identifier(identifier)
-                            if erased_local(&identifier_text(file, identifier)))
-                    }
-                    _ => false,
+                let read = match &default.value {
+                    ExportDefaultValue::Expression(value) => match value.data() {
+                        Expression::Identifier(identifier) => {
+                            Some(identifier_text(file, identifier))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
                 };
+                if let Some((module, imported)) = read.as_ref().and_then(|name| imports.get(name)) {
+                    let default = String::from("default");
+                    exports
+                        .forwards
+                        .push((default, module.clone(), imported.clone()));
+                    continue;
+                }
+                let erased = matches!(default.value, ExportDefaultValue::Interface(_))
+                    || read.is_some_and(|name| erased_local(&name) || type_imports.contains(&name));
                 let names = if erased {
                     &mut exports.types
                 } else {
@@ -9999,12 +10036,44 @@ fn module_specifier(file: &SourceFile, source: &StringLiteralNode) -> String {
 /// name its module erases, and const enums.
 fn type_import_names(file: &SourceFile, options: &TransformOptions) -> BTreeSet<String> {
     let mut names: BTreeSet<String> = const_enum_names(file).into_iter().collect();
-    names.extend(
-        imported_bindings(file)
-            .into_iter()
-            .filter(|(_, binding)| options.erased_imports.contains(binding))
-            .map(|(local, _)| local),
-    );
+    names.extend(erased_import_locals(file, options));
+    // A local value of the same name is the one an export means.
+    let values = local_value_names(file);
+    names.retain(|name| !values.contains(name));
+    names.extend(declared_type_imports(file));
+    names
+}
+
+/// Locals bound to what the imported module erases.
+fn erased_import_locals(file: &SourceFile, options: &TransformOptions) -> BTreeSet<String> {
+    imported_bindings(file)
+        .into_iter()
+        .filter(|(_, binding)| options.erased_imports.contains(binding))
+        .map(|(local, _)| local)
+        .collect()
+}
+
+/// What the file's own top-level statements declare as values.
+fn local_value_names(file: &SourceFile) -> BTreeSet<String> {
+    let mut names = hoisted_function_names(file);
+    for statement in file.statements() {
+        let statement = match statement.data() {
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => inner,
+            _ => statement,
+        };
+        names.extend(declared_binding_names(file, statement));
+        if let Statement::Class(class) = statement.data() {
+            names.extend(class.name.iter().map(|name| identifier_text(file, name)));
+        }
+    }
+    names
+}
+
+/// The names `import type` and `import { type x }` bind.
+fn declared_type_imports(file: &SourceFile) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
     for statement in file.statements() {
         let Statement::Import(import) = statement.data() else {
             continue;
@@ -12226,6 +12295,31 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             assert!(code.contains(line), "{line}: {code}");
         }
         assert!(code.contains("exports.z = (_"), "{code}");
+    }
+
+    #[test]
+    fn export_assignment_closes_the_module_and_an_ambient_publishes_nothing() {
+        let commonjs = EmitOptions {
+            target: ScriptTarget::Es2022,
+            module: Some(crate::emitter::ModuleKind::CommonJs),
+            ..EmitOptions::default()
+        };
+        let output = emit_with_options("export = C;\nclass C {}\n", commonjs.clone());
+        let code = javascript(&output);
+        assert!(code.ends_with("module.exports = C;\n"), "{code}");
+        let ambient = emit_with_options(
+            "declare const q: number;\nexport { q };\n",
+            commonjs.clone(),
+        );
+        let code = javascript(&ambient);
+        assert!(code.contains("exports.q = void 0;"), "{code}");
+        assert!(!code.contains("exports.q = q"), "{code}");
+        let parameter = emit_with_options(
+            "import { x } from './m';\nclass C { constructor(public a = x) {} }\nnew C();\n",
+            commonjs,
+        );
+        let code = javascript(&parameter);
+        assert!(code.contains("a = m_1.x"), "{code}");
     }
 
     #[test]

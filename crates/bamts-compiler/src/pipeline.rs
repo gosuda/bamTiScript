@@ -416,6 +416,11 @@ impl ProgramFrontendOutput {
         let exports =
             emitter::transforms::module_exports(module.source_file(), module.semantic_model());
         let mut names = exports.types;
+        let forwarded: BTreeSet<String> = exports
+            .forwards
+            .iter()
+            .map(|(exported, ..)| exported.clone())
+            .collect();
         for (exported, specifier, imported) in exports.forwards {
             if let Some(target) = local_dependency(program, source_id, &specifier)
                 && self
@@ -427,8 +432,13 @@ impl ProgramFrontendOutput {
         }
         for specifier in exports.stars {
             if let Some(target) = local_dependency(program, source_id, &specifier) {
-                let forwarded = self.resolve_erased_exports(program, target, erased, visiting);
-                names.extend(forwarded.into_iter().filter(|name| name != "default"));
+                let starred = self.resolve_erased_exports(program, target, erased, visiting);
+                // An explicit export of the same name shadows what a star brings.
+                names.extend(
+                    starred
+                        .into_iter()
+                        .filter(|name| name != "default" && !forwarded.contains(name)),
+                );
             }
         }
         names.retain(|name| !exports.values.contains(name));

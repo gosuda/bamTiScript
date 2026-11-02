@@ -2417,16 +2417,23 @@ mod tests {
         fixture.write("impl.ts", "export const Config = 5;\n");
         fixture.write(
             "mid.ts",
-            "type Config = 1;\nexport { Config } from './impl.js';\n",
+            "type Config = 1;\n\
+             export { Config } from './impl.js';\n\
+             export { Shadow } from './impl2.js';\n\
+             export * from './shadowed.js';\n",
         );
+        fixture.write("impl2.ts", "export const Shadow = 6;\n");
+        fixture.write("shadowed.ts", "export interface Shadow {}\n");
+        fixture.write("lib.d.ts", "export declare type Declared = 1;\n");
         fixture.write(
             "main.ts",
             "import { Foo, Real, CE } from './barrel.js';\n\
              import { Renamed, Props } from './barrel.js';\n\
-             import { Config } from './mid.js';\n\
-             console.log(Foo, Config, CE.A);\n\
+             import { Config, Shadow } from './mid.js';\n\
+             console.log(Foo, Config, CE.A, Shadow);\n\
              export { Real, Renamed, Props, Foo };\n\
-             export { Real as R2 } from './barrel.js';\n",
+             export { Real as R2 } from './barrel.js';\n\
+             export { Declared } from './lib.js';\n",
         );
         fixture.write(
             "tsconfig.json",
@@ -2448,8 +2455,8 @@ mod tests {
         assert_eq!(
             javascript,
             "import { Foo } from './barrel.js';\n\
-             import { Config } from './mid.js';\n\
-             console.log(Foo, Config, 1);\n\
+             import { Config, Shadow } from './mid.js';\n\
+             console.log(Foo, Config, 1, Shadow);\n\
              export { Foo };\n"
         );
     }
@@ -2477,6 +2484,37 @@ mod tests {
         )
         .unwrap();
         assert!(javascript.contains("export const a"), "{javascript}");
+    }
+
+    #[test]
+    fn a_local_value_outranks_an_erased_import_of_its_name() {
+        let fixture = Fixture::new();
+        fixture.write("t.ts", "export interface T {}\n");
+        fixture.write(
+            "main.ts",
+            "import { T } from './t.js';\nconst T = 1;\nexport default T;\nexport { T };\n",
+        );
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["main.ts"],"compilerOptions":{"module":"esnext","target":"es2022","outDir":"dist"}}"#,
+        );
+        let filesystem = fixture.filesystem();
+        let project =
+            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
+        let report =
+            compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+        let javascript = std::str::from_utf8(
+            report
+                .outputs
+                .files
+                .get(&fixture.0.join("dist/main.js"))
+                .expect("project JavaScript output"),
+        )
+        .unwrap();
+        assert_eq!(
+            javascript,
+            "const T = 1;\nexport default T;\nexport { T };\n"
+        );
     }
 
     #[test]
