@@ -1096,6 +1096,11 @@ impl<'a> Rewriter<'a> {
         out
     }
 
+    fn is_const_enum_use(&self, reference: NodeId) -> bool {
+        self.model
+            .is_some_and(|model| model.enum_facts().const_use(reference).is_some())
+    }
+
     /// Whether a use resolved to a binding that lives only on `exports`.
     fn cjs_reads_exported_variable(&self, reference: NodeId) -> bool {
         self.cjs.as_ref().is_some_and(|plan| {
@@ -6840,6 +6845,8 @@ impl<'a> Rewriter<'a> {
             );
         }
         match expression.data() {
+            // The printer inlines this value by the node's identity.
+            Expression::Member(_) if self.is_const_enum_use(expression.id()) => expression.clone(),
             Expression::Class(class) => {
                 let previous = self.replace_await;
                 self.replace_await = false;
@@ -10967,6 +10974,18 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             .filter(|diagnostic| diagnostic.code() == crate::checker::CANNOT_FIND_NAME)
             .count();
         assert_eq!(unknown, 2, "{:?}", checked.diagnostics());
+    }
+
+    #[test]
+    fn a_const_enum_member_is_inlined() {
+        let output = emit_at(
+            "const enum K { A = 1 }\nconsole.log(K.A);\nconsole.log(K['A']);\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(!code.contains("K.A)"), "{code}");
+        assert!(!code.contains("K['A']"), "{code}");
+        assert!(code.contains("console.log(1"), "{code}");
     }
 
     #[test]
