@@ -2454,6 +2454,41 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn a_class_is_constructed_only_with_new_and_defines_its_static_fields() {
+        const SETUP: &str = "function refused(body) {\n\
+            try { body(); } catch (error) { return error instanceof TypeError; }\n\
+            return false;\n\
+            }\n\
+            class A {}\n\
+            class B extends A {}\n\
+            class C extends A { constructor() { super(); } }\n";
+        const CASES: [&str; 5] = [
+            "assert.sameValue(refused(() => A()), true);",
+            "assert.sameValue(refused(() => B()), true);",
+            "assert.sameValue(refused(() => C.call({})), true);",
+            "class D { static name = 'x'; static length = 2; #p = 1; static #q = 3; \
+             static q() { return D.#q; } get p() { return this.#p; } }\n\
+             assert.sameValue(D.name, 'x'); assert.sameValue(D.length, 2); \
+             assert.sameValue(D.q(), 3); assert.sameValue(new D().p, 1);",
+            "assert.sameValue(Math.abs(new Number(-1)), 1); \
+             assert.sameValue(Math.pow({ valueOf() { return 2; } }, 3), 8);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: class calls", &format!("{SETUP}{body}"));
+                let label = format!("class-call-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_destructuring_target_is_evaluated_before_its_value() {
         const LOG: &str = "var log = [];\n\
             function source() { log.push('source'); return { get p() { log.push('get'); } }; }\n\

@@ -810,6 +810,8 @@ enum StaticInit {
         key: Register,
         init_chain: Register,
         extra_inits: Register,
+        /// Fields of an undecorated class define; decorated ones still assign.
+        defines: bool,
     },
     AutoAccessor {
         initializer: Option<Box<Expr>>,
@@ -5041,16 +5043,51 @@ impl<'a> FunctionContext<'a> {
         }
         Ok(MemberBase::Object(self.lower_expression(builder, object)?))
     }
+    /// A class constructor runs only through `new`.
+    fn reject_plain_call(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+    ) -> Result<(), LowerError> {
+        let new_target = self.new_target_value(range)?;
+        let undefined = self.undefined(builder, range)?;
+        let called = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::Binary {
+                dst: called,
+                op: BinaryOp::StrictEqual,
+                left: new_target,
+                right: undefined,
+            },
+        )?;
+        let constructed = self.emit(
+            range,
+            Instruction::JumpIfFalse {
+                condition: called,
+                target: Pc::new(0),
+            },
+        )?;
+        self.throw_error(builder, range, "TypeError")?;
+        self.patch_jump(constructed, self.next_pc());
+        Ok(())
+    }
     /// Throws a `ReferenceError`, which is what deleting through `super` does.
     fn throw_reference_error(
         &mut self,
         builder: &mut ModuleBuilder,
         range: TextRange,
     ) -> Result<Register, LowerError> {
-        let name = builder.intern(
-            Constant::String(EcmaString::encode("ReferenceError")),
-            range,
-        )?;
+        self.throw_error(builder, range, "ReferenceError")?;
+        self.undefined(builder, range)
+    }
+    fn throw_error(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        kind: &str,
+    ) -> Result<(), LowerError> {
+        let name = builder.intern(Constant::String(EcmaString::encode(kind)), range)?;
         let callee = self.alloc_register(range)?;
         self.emit(range, Instruction::LoadGlobal { dst: callee, name })?;
         let arguments = self.alloc_register(range)?;
@@ -5065,7 +5102,7 @@ impl<'a> FunctionContext<'a> {
             },
         )?;
         self.emit(range, Instruction::Throw { value })?;
-        self.undefined(builder, range)
+        Ok(())
     }
     /// The key of a reference that is read and then written, converted now so
     /// user conversion runs once. A reference through nothing still fails first.
@@ -8329,6 +8366,7 @@ impl<'a> FunctionContext<'a> {
                 key,
                 init_chain,
                 extra_inits,
+                defines,
             } => {
                 let raw = match &property.initializer {
                     Some(initializer) => {
@@ -8339,14 +8377,24 @@ impl<'a> FunctionContext<'a> {
                 };
                 let value =
                     self.run_initializer_chain(builder, range, final_class, *init_chain, raw)?;
-                self.emit(
-                    range,
+                // A field defines its property, so `static name` replaces the
+                // function's own read-only one. A private name has none to define.
+                let instruction = if *defines && !matches!(property.name, PropertyName::Private(_))
+                {
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: raw_ctor,
+                        key: *key,
+                        src: value,
+                        slot: DescriptorSlot::Entire,
+                    }
+                } else {
                     Instruction::SetProperty {
                         object: raw_ctor,
                         key: *key,
                         value,
-                    },
-                )?;
+                    }
+                };
+                self.emit(range, instruction)?;
                 self.run_extra_initializers(builder, range, final_class, *extra_inits)?;
                 Ok(())
             }
@@ -8562,6 +8610,13 @@ impl<'a> FunctionContext<'a> {
                 &mut next_instance_slot,
                 &mut static_inits,
             )?;
+        }
+        if !class.decorators.is_empty() {
+            for init in &mut static_inits {
+                if let StaticInit::Field { defines, .. } = init {
+                    *defines = false;
+                }
+            }
         }
         self.apply_member_decoration_stages(builder, stages)?;
         let class_extra_inits = self.alloc_register(range)?;
@@ -9254,6 +9309,7 @@ impl<'a> FunctionContext<'a> {
                 });
             }
         }
+        inner.reject_plain_call(builder, range)?;
         inner.bind_parameters(builder, parameters, range, &parameter_slots, rest_index)?;
         if let Some(block) = body {
             inner.hoist_vars(builder, &block.statements, range)?;
@@ -9788,6 +9844,7 @@ impl<'a> FunctionContext<'a> {
                             key: lowered.key,
                             init_chain,
                             extra_inits,
+                            defines: true,
                         });
                     } else {
                         let slot = *next_instance_slot;
@@ -9829,6 +9886,7 @@ impl<'a> FunctionContext<'a> {
                         key: lowered.key,
                         init_chain,
                         extra_inits,
+                        defines: false,
                     });
                 } else {
                     stages.instance_fields.push(decoration);
