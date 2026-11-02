@@ -755,12 +755,10 @@ fn node_module_format(
             let text = fs.read(&path).ok()?;
             PackageJson::parse(root, &path, &text).ok()
         });
-    match package
-        .as_ref()
-        .and_then(|package| package.raw().get("type"))
-    {
-        Some(JsonValue::String(kind)) if kind.as_ref() == "module" => ModuleKind::EsNext,
-        _ => ModuleKind::CommonJs,
+    if package.as_ref().and_then(PackageJson::package_type) == Some("module") {
+        ModuleKind::EsNext
+    } else {
+        ModuleKind::CommonJs
     }
 }
 
