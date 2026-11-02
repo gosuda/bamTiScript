@@ -487,6 +487,22 @@ struct CapturePlan {
     captured: HashSet<BindingIdentity>,
     runtime_cells: HashSet<BindingIdentity>,
 }
+fn scan_constructor(
+    scanner: &mut FreeVarScanner<'_>,
+    parameters: &[ParameterNode],
+    body: Option<&Block>,
+) {
+    scanner.preseed_parameters(parameters);
+    if let Some(block) = body {
+        scanner.preseed_vars(&block.statements);
+    }
+    scanner.scan_parameter_initializers(parameters);
+    if let Some(block) = body {
+        for statement in &block.statements {
+            scanner.scan_statement(statement);
+        }
+    }
+}
 fn scan_instance_init_free_vars(scanner: &mut FreeVarScanner<'_>, instance_steps: &[InstanceInit]) {
     for step in instance_steps {
         match step {
@@ -615,9 +631,18 @@ enum CaptureKey {
     ClassElements(Register),
     /// The object a method was defined on, which `super` starts above.
     Home(Register),
+    /// The cell recording that a derived constructor's `super(...)` has run.
+    SuperGuard(Register),
     Cell(Register),
     Container(crate::checker::SymbolId, ContainerKind, Register),
     WithObject(BindingSite, Register),
+}
+/// Whether `super(...)` has run. An arrow can reach `super` from outside the
+/// constructor's registers, so a constructor with such an arrow keeps a cell.
+#[derive(Clone, Copy)]
+enum SuperGuard {
+    Register(Register),
+    Cell(Register),
 }
 #[derive(Clone, Copy)]
 enum ArgumentsSource {
@@ -830,7 +855,7 @@ struct FunctionContext<'a> {
     completion_depth: usize,
     this_capture: Option<Register>,
     this_cell: Option<Register>,
-    derived_super_guard: Option<Register>,
+    derived_super_guard: Option<SuperGuard>,
     instance_steps: Vec<InstanceInit>,
     new_target_capture: Option<Register>,
     parent_constructor_capture: Option<Register>,
@@ -7416,6 +7441,9 @@ impl<'a> FunctionContext<'a> {
                 CaptureKey::Parent(_) => inner.parent_constructor_capture = Some(register),
                 CaptureKey::ClassElements(_) => inner.class_elements = Some(register),
                 CaptureKey::Home(_) => inner.home_object = Some(register),
+                CaptureKey::SuperGuard(_) => {
+                    inner.derived_super_guard = Some(SuperGuard::Cell(register));
+                }
                 CaptureKey::Cell(_) => {}
                 CaptureKey::Container(symbol, kind, _) => inner.containers.push(Container {
                     symbol: *symbol,
@@ -7564,6 +7592,9 @@ impl<'a> FunctionContext<'a> {
                 CaptureKey::Parent(_) => inner.parent_constructor_capture = Some(register),
                 CaptureKey::ClassElements(_) => inner.class_elements = Some(register),
                 CaptureKey::Home(_) => inner.home_object = Some(register),
+                CaptureKey::SuperGuard(_) => {
+                    inner.derived_super_guard = Some(SuperGuard::Cell(register));
+                }
                 CaptureKey::Cell(_) => {}
                 CaptureKey::Container(symbol, kind, _) => inner.containers.push(Container {
                     symbol: *symbol,
@@ -7910,6 +7941,7 @@ impl<'a> FunctionContext<'a> {
             CaptureKey::Parent(parent) => Ok(*parent),
             CaptureKey::ClassElements(table) => Ok(*table),
             CaptureKey::Home(home) => Ok(*home),
+            CaptureKey::SuperGuard(guard) => Ok(*guard),
             CaptureKey::Cell(cell) => Ok(*cell),
             CaptureKey::Container(_, _, object) | CaptureKey::WithObject(_, object) => Ok(*object),
         }
@@ -7922,6 +7954,13 @@ impl<'a> FunctionContext<'a> {
     ) -> Vec<CaptureKey> {
         let mut scanner = FreeVarScanner::new(self.file, self.jsx_plan);
         scanner.scan_function(parameters, body, is_arrow);
+        // `super(...)` in an arrow finishes the enclosing constructor's work,
+        // which runs the field initializers there.
+        let calls_parent =
+            is_arrow && scanner.uses_super && self.parent_constructor_capture.is_some();
+        if calls_parent {
+            scan_instance_init_free_vars(&mut scanner, &self.instance_steps);
+        }
         let mut captures = Vec::new();
         for name in &scanner.free {
             if matches!(self.resolve(name), Some(Binding::ConstEnum(_))) {
@@ -7945,14 +7984,15 @@ impl<'a> FunctionContext<'a> {
             if scanner.uses_arguments {
                 captures.push(CaptureKey::Arguments);
             }
-            // `super(...)` in an arrow finishes the enclosing constructor's work.
-            let calls_parent = scanner.uses_super && self.parent_constructor_capture.is_some();
             if scanner.uses_new_target || calls_parent {
                 captures.push(CaptureKey::NewTarget);
             }
             if calls_parent {
                 captures.extend(self.parent_constructor_capture.map(CaptureKey::Parent));
                 captures.extend(self.class_elements.map(CaptureKey::ClassElements));
+                if let Some(SuperGuard::Cell(guard)) = self.derived_super_guard {
+                    captures.push(CaptureKey::SuperGuard(guard));
+                }
             }
         }
         // An arrow's `super` is the enclosing method's.
@@ -8741,16 +8781,7 @@ impl<'a> FunctionContext<'a> {
         home: Register,
     ) -> Vec<CaptureKey> {
         let mut scanner = FreeVarScanner::new(self.file, self.jsx_plan);
-        scanner.preseed_parameters(parameters);
-        if let Some(block) = body {
-            scanner.preseed_vars(&block.statements);
-        }
-        scanner.scan_parameter_initializers(parameters);
-        if let Some(block) = body {
-            for statement in &block.statements {
-                scanner.scan_statement(statement);
-            }
-        }
+        scan_constructor(&mut scanner, parameters, body);
         scan_instance_init_free_vars(&mut scanner, instance_steps);
         let mut captures = Vec::new();
         for name in &scanner.free {
@@ -8792,7 +8823,9 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         range: TextRange,
     ) -> Result<(), LowerError> {
-        let steps = self.instance_steps.clone();
+        // Taken so an initializer's own arrows carry no steps: only a
+        // diagnosed source has `super(...)` there, and it must still lower.
+        let steps = std::mem::take(&mut self.instance_steps);
         if steps.is_empty() {
             return Ok(());
         }
@@ -8866,6 +8899,7 @@ impl<'a> FunctionContext<'a> {
                 }
             }
         }
+        self.instance_steps = steps;
         Ok(())
     }
     fn read_table_slot(
@@ -8911,13 +8945,15 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         range: TextRange,
     ) -> Result<(), LowerError> {
-        let Some(guard) = self.derived_super_guard else {
-            return Ok(());
+        let initialized = match self.derived_super_guard {
+            Some(SuperGuard::Register(guard)) => guard,
+            Some(SuperGuard::Cell(guard)) => self.cell_value(builder, guard, range)?,
+            None => return Ok(()),
         };
         let first_call = self.emit(
             range,
             Instruction::JumpIfFalse {
-                condition: guard,
+                condition: initialized,
                 target: Pc::new(0),
             },
         )?;
@@ -8932,9 +8968,13 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         range: TextRange,
     ) -> Result<(), LowerError> {
-        if let Some(guard) = self.derived_super_guard {
-            let initialized = self.load_constant(builder, Constant::Boolean(true), range)?;
-            self.move_to(range, guard, initialized)?;
+        let Some(guard) = self.derived_super_guard else {
+            return Ok(());
+        };
+        let initialized = self.load_constant(builder, Constant::Boolean(true), range)?;
+        match guard {
+            SuperGuard::Register(guard) => self.move_to(range, guard, initialized)?,
+            SuperGuard::Cell(guard) => self.store_cell(builder, guard, initialized, range)?,
         }
         Ok(())
     }
@@ -9109,7 +9149,8 @@ impl<'a> FunctionContext<'a> {
                 CaptureKey::This
                 | CaptureKey::ThisCell
                 | CaptureKey::Arguments
-                | CaptureKey::NewTarget => {
+                | CaptureKey::NewTarget
+                | CaptureKey::SuperGuard(_) => {
                     unreachable!("constructors do not capture arrow-only bindings")
                 }
             }
@@ -9120,10 +9161,18 @@ impl<'a> FunctionContext<'a> {
             inner.emit(range, Instruction::CreateCell { dst: cell })?;
             inner.this_cell = Some(cell);
             if body.is_some() {
+                let mut scanner = FreeVarScanner::new(inner.file, inner.jsx_plan);
+                scan_constructor(&mut scanner, parameters, body);
                 let guard = inner.alloc_register(range)?;
                 let pending = inner.load_constant(builder, Constant::Boolean(false), range)?;
-                inner.move_to(range, guard, pending)?;
-                inner.derived_super_guard = Some(guard);
+                inner.derived_super_guard = Some(if scanner.arrow_uses_super {
+                    inner.emit(range, Instruction::CreateCell { dst: guard })?;
+                    inner.store_cell(builder, guard, pending, range)?;
+                    SuperGuard::Cell(guard)
+                } else {
+                    inner.move_to(range, guard, pending)?;
+                    SuperGuard::Register(guard)
+                });
             }
         }
         inner.bind_parameters(builder, parameters, range, &parameter_slots, rest_index)?;
@@ -9864,6 +9913,7 @@ struct FreeVarScanner<'a> {
     uses_arguments: bool,
     uses_new_target: bool,
     uses_super: bool,
+    arrow_uses_super: bool,
     fn_boundary: u32,
     function_depth: u32,
 }
@@ -9938,6 +9988,7 @@ impl<'a> FreeVarScanner<'a> {
             uses_arguments: false,
             uses_new_target: false,
             uses_super: false,
+            arrow_uses_super: false,
             fn_boundary: 0,
             function_depth: 0,
         }
@@ -10581,6 +10632,7 @@ impl<'a> FreeVarScanner<'a> {
                 if self.fn_boundary == 0 {
                     self.uses_super = true;
                     self.uses_this = true;
+                    self.arrow_uses_super |= self.function_depth > 0;
                 }
             }
             Expression::Meta(MetaProperty::NewTarget) => {
@@ -11450,6 +11502,7 @@ mod tests {
             "class A { constructor() { super(); } }",
             "class A extends Object { constructor() { super(); const g = () => super(); } }",
             "class A extends Object { m() { super(); } }",
+            "class A extends Object { f = () => super(); constructor() { super(); } }",
         ] {
             lower_js(src);
         }

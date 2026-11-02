@@ -2329,6 +2329,50 @@ function $ERROR(message) {\n\
     }
 
     #[test]
+    fn super_called_in_an_arrow_finishes_the_constructor() {
+        const SETUP: &str = "var fields = 0;\n\
+            class A {}\n\
+            function refused(body) {\n\
+            try { body(); } catch (error) { return error instanceof ReferenceError; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [&str; 6] = [
+            "function m() { const y = 1; class B extends A { v = y; #p = y + 1; \
+             get p() { return this.#p; } constructor() { (() => super())(); } } return new B; }\n\
+             var b = m(); assert.sameValue(b.v, 1); assert.sameValue(b.p, 2);",
+            "class B extends A { v = fields++; constructor() { super(); \
+             assert.sameValue(refused(() => super()), true); } }\n\
+             new B; assert.sameValue(fields, 1);",
+            "class B extends A { v = fields++; constructor() { const init = () => super(); \
+             init(); assert.sameValue(refused(init), true); } }\n\
+             new B; assert.sameValue(fields, 1);",
+            "var later; class B extends A { v = fields++; \
+             constructor() { super(); later = () => super(); } }\n\
+             new B; assert.sameValue(refused(later), true); assert.sameValue(fields, 1);",
+            "class B extends A { constructor(a = (() => super())()) { \
+             assert.sameValue(this instanceof A, true); } }\n\
+             new B;",
+            "class B extends A { v = fields++; constructor() { (() => super())(); \
+             var caught; try { super(); } catch (error) { caught = error; } \
+             assert.sameValue(caught instanceof ReferenceError, true); } }\n\
+             new B; assert.sameValue(fields, 1);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: arrow super", &format!("{SETUP}{body}"));
+                let label = format!("arrow-super-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_destructuring_target_is_evaluated_before_its_value() {
         const LOG: &str = "var log = [];\n\
             function source() { log.push('source'); return { get p() { log.push('get'); } }; }\n\
