@@ -633,6 +633,9 @@ struct CjsPlan {
     exported_variables: BTreeSet<crate::checker::SymbolId>,
     /// Helpers the prelude's re-exports call.
     helpers: BTreeSet<HelperKind>,
+    /// `(exported, local)` for functions. They hoist, so their assignments run
+    /// before any require, which also keeps a star export off those names.
+    hoisted_exports: Vec<(String, String)>,
     /// Require-local names whose member calls become `(0, m.p)()`.
     require_roots: BTreeSet<String>,
 }
@@ -739,6 +742,7 @@ impl<'a> Rewriter<'a> {
         let mut plan = CjsPlan::default();
         let module_scope = model.module_scope();
         let symbol_of = |name: &str| model.scope(module_scope).value(name);
+        let hoisted_functions = hoisted_function_names(file);
         for statement in file.statements() {
             match statement.data() {
                 Statement::Import(import) => {
@@ -746,15 +750,16 @@ impl<'a> Rewriter<'a> {
                         continue;
                     }
                     plan.is_module = true;
-                    let Some(clause) = &import.clause else {
-                        continue;
-                    };
                     let raw = raw_token_text(file, import.source.data().token());
                     let module = raw.trim_matches(['"', '\'']);
-                    let local = names.allocate(module);
                     // Upstream re-quotes module specifiers with double
                     // quotes in every require form.
                     let quoted = quote_module_specifier(module);
+                    let Some(clause) = &import.clause else {
+                        plan.requires.push(format!("require({quoted});"));
+                        continue;
+                    };
+                    let local = names.allocate(module);
                     let line = format!(
                         "{} {local} = require({quoted});",
                         if options.target <= ScriptTarget::Es5 {
@@ -827,6 +832,7 @@ impl<'a> Rewriter<'a> {
                 Statement::Export(export) => {
                     plan.is_module = true;
                     plan_cjs_reexport(file, export, &mut names, &mut plan);
+                    plan_cjs_local_exports(file, export, &hoisted_functions, &mut plan);
                     if let ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) =
                         export
                     {
@@ -929,51 +935,12 @@ impl<'a> Rewriter<'a> {
         )
     }
 
-    /// `require("./m");` for a side-effect import, with the specifier
-    /// re-quoted the way upstream prints module text.
-    fn cjs_require_statement(&mut self, source: &StringLiteralNode) -> Stmt {
-        let range = source.range();
-        let raw = self.token_text(source.data().token()).to_owned();
-        let module = raw.trim_matches(['"', '\'']);
-        let require = self.ident("require");
-        let callee = self.syn_node(range, Expression::Identifier(require));
-        let literal = self.string_literal(module);
-        let module = self.syn_node(range, Expression::Literal(Literal::String(literal)));
-        let call = self.syn_node(
-            range,
-            Expression::Call(CallExpression {
-                callee: Box::new(callee),
-                optional: false,
-                type_arguments: None,
-                arguments: vec![CallArgument::Expression(Box::new(module))],
-            }),
-        );
-        self.syn_node(
-            range,
-            Statement::Expression(ExpressionStatement {
-                expression: Box::new(call),
-            }),
-        )
-    }
-
     /// Replaces `export <declaration>` with assignments around the
-    /// declaration. Functions hoist, so the export assignment precedes them;
+    /// declaration. A function's assignment is hoisted into the prelude;
     /// classes and variables receive the `void 0` preamble instead.
     fn cjs_export_declaration(&mut self, range: TextRange, inner: &Stmt) -> Vec<Stmt> {
         match inner.data() {
-            Statement::Function(function) => {
-                let Some(name) = function
-                    .function
-                    .name
-                    .as_ref()
-                    .map(|ident| self.token_text(ident.data().token()).to_owned())
-                else {
-                    return self.rewrite_statement(inner);
-                };
-                let mut out = vec![self.cjs_export_assignment(&name, &name, range)];
-                out.extend(self.rewrite_statement(inner));
-                out
-            }
+            Statement::Function(_) => self.rewrite_statement(inner),
             Statement::Class(class) => {
                 let Some(name) = class
                     .name
@@ -1041,6 +1008,14 @@ impl<'a> Rewriter<'a> {
                 ),
                 _ => continue,
             };
+            let hoisted = self.cjs.as_ref().is_some_and(|plan| {
+                plan.hoisted_exports
+                    .iter()
+                    .any(|(name, value)| *name == exported && *value == local)
+            });
+            if hoisted {
+                continue;
+            }
             let value = self.cjs_local_value(&local, local_range);
             let left = self.cjs_export_target(&exported, local_range);
             let assignment = self.syn_node(
@@ -1123,24 +1098,12 @@ impl<'a> Rewriter<'a> {
     }
     /// `export default function f() {}` / anonymous `default_1` renaming.
     fn cjs_default_function(&mut self, range: TextRange, function: &FunctionLike) -> Vec<Stmt> {
-        let (function, name) = match &function.name {
-            Some(ident) => (
-                function.clone(),
-                self.token_text(ident.data().token()).to_owned(),
-            ),
-            None => {
-                let ident = self.ident("default_1");
-                let mut renamed = function.clone();
-                renamed.name = Some(ident);
-                (renamed, String::from("default_1"))
-            }
-        };
+        let mut function = function.clone();
+        if function.name.is_none() {
+            function.name = Some(self.ident("default_1"));
+        }
         let function = self.rewrite_function_like(&function, range);
-        let statement = self.node(range, Statement::Function(FunctionDeclaration { function }));
-        let mut out = vec![statement];
-        let default_value = self.ident_expr(&name);
-        out.push(self.cjs_export_default_assignment(range, default_value));
-        out
+        vec![self.node(range, Statement::Function(FunctionDeclaration { function }))]
     }
 
     fn is_const_enum_use(&self, reference: NodeId) -> bool {
@@ -1235,6 +1198,9 @@ impl<'a> Rewriter<'a> {
                 prelude.push_str(name);
             }
             prelude.push_str(" = void 0;\n");
+        }
+        for (exported, local) in &plan.hoisted_exports {
+            prelude.push_str(&format!("exports.{exported} = {local};\n"));
         }
         prelude
     }
@@ -1503,12 +1469,8 @@ impl<'a> Rewriter<'a> {
                     // Type-only imports carry no runtime form.
                     return Vec::new();
                 }
-                match &import.clause {
-                    // A side-effect import stays at its position as a bare
-                    // require; clause imports move into the prelude.
-                    None => vec![self.cjs_require_statement(&import.source)],
-                    Some(_) => Vec::new(),
-                }
+                // Every import is a prelude line, in source order.
+                Vec::new()
             }
             Statement::Block(block) => {
                 let statements = self.rewrite_statements(&block.data().statements);
@@ -9267,6 +9229,87 @@ fn plan_cjs_reexport(
     }
 }
 
+/// A function declaration with a body hoists; a signature is not a binding.
+fn hoisted_function_name(file: &SourceFile, function: &FunctionLike) -> Option<String> {
+    function.body.as_ref()?;
+    function
+        .name
+        .as_ref()
+        .map(|name| identifier_text(file, name))
+}
+
+/// The module's top-level functions, which `export { f }` hoists like
+/// `export function f`.
+fn hoisted_function_names(file: &SourceFile) -> BTreeSet<String> {
+    file.statements()
+        .iter()
+        .filter_map(|statement| match statement.data() {
+            Statement::Function(declaration) => hoisted_function_name(file, &declaration.function),
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => match inner.data() {
+                Statement::Function(declaration) => {
+                    hoisted_function_name(file, &declaration.function)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Plans a local export's prelude line: a function's assignment, or the
+/// `void 0` that claims a specifier's name before any star export runs.
+fn plan_cjs_local_exports(
+    file: &SourceFile,
+    export: &ExportDeclaration,
+    hoisted_functions: &BTreeSet<String>,
+    plan: &mut CjsPlan,
+) {
+    match export {
+        ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) => {
+            if let Statement::Function(declaration) = inner.data()
+                && let Some(name) = hoisted_function_name(file, &declaration.function)
+            {
+                plan.hoisted_exports.push((name.clone(), name));
+            }
+        }
+        ExportDeclaration::Default(ExportDefaultDeclaration {
+            value: ExportDefaultValue::Function(function),
+        }) if function.body.is_some() => {
+            let local =
+                hoisted_function_name(file, function).unwrap_or_else(|| String::from("default_1"));
+            plan.hoisted_exports.push((String::from("default"), local));
+        }
+        ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+            type_only: false,
+            specifiers,
+            source: None,
+            ..
+        }) => {
+            for specifier in specifiers {
+                let specifier = specifier.data();
+                let (ModuleExportName::Identifier(local), ModuleExportName::Identifier(exported)) =
+                    (&specifier.local, &specifier.exported)
+                else {
+                    continue;
+                };
+                let local = identifier_text(file, local);
+                if matches!(specifier.mode, ExportSpecifierMode::TypeOnly) {
+                    continue;
+                }
+                let exported = identifier_text(file, exported);
+                if hoisted_functions.contains(&local) {
+                    plan.hoisted_exports.push((exported, local));
+                } else {
+                    plan.void_0.push(exported);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Whether a declaration's bindings can change after it runs.
 fn is_reassignable(declaration: &VariableDeclaration) -> bool {
     matches!(declaration.kind, VariableKind::Var | VariableKind::Let)
@@ -11301,6 +11344,42 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         let code = javascript(&output);
         assert!(code.contains("exports.b = a.x;"), "{code}");
         assert!(code.contains("exports.c = exports.b;"), "{code}");
+    }
+
+    #[test]
+    fn commonjs_function_exports_precede_every_require() {
+        let output = emit_with_options(
+            "import './setup';\n\
+             export * from './lib';\n\
+             export function f() {}\n\
+             function g() {}\n\
+             export { g as h };\n\
+             const c = 1;\n\
+             export { c };\n\
+             export default function d() {}\n\
+             export declare function ambient(): void;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        let order = [
+            "exports.c = void 0;",
+            "exports.f = f;",
+            "exports.h = g;",
+            "exports.default = d;",
+            "require(\"./setup\");",
+            "__exportStar(require(\"./lib\"), exports);",
+            "function f() { }",
+        ];
+        let positions: Vec<usize> = order
+            .iter()
+            .map(|line| code.find(line).unwrap_or_else(|| panic!("{line}: {code}")))
+            .collect();
+        assert!(positions.is_sorted(), "{code}");
+        assert!(!code.contains("ambient"), "{code}");
     }
 
     #[test]
