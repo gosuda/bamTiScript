@@ -497,6 +497,23 @@ pub(crate) fn value_read_names(file: &SourceFile) -> BTreeSet<String> {
     }
     scanner.reads
 }
+/// A `this` parameter types the receiver and takes no argument.
+fn runtime_parameters<'p>(
+    file: &SourceFile,
+    parameters: &'p [ParameterNode],
+) -> &'p [ParameterNode] {
+    match parameters
+        .first()
+        .map(|parameter| parameter.data().binding.data())
+    {
+        Some(BindingPattern::Identifier(identifier))
+            if identifier_name(file, identifier).as_deref() == Some("this") =>
+        {
+            &parameters[1..]
+        }
+        _ => parameters,
+    }
+}
 fn scan_constructor(
     scanner: &mut FreeVarScanner<'_>,
     parameters: &[ParameterNode],
@@ -7712,6 +7729,7 @@ impl<'a> FunctionContext<'a> {
         parameters: &[ParameterNode],
         range: TextRange,
     ) -> Result<(Vec<Register>, Option<usize>), LowerError> {
+        let parameters = runtime_parameters(self.file, parameters);
         let rest_index = parameters.iter().position(|parameter| {
             matches!(parameter.data().binding.data(), BindingPattern::Rest(_))
         });
@@ -7731,6 +7749,7 @@ impl<'a> FunctionContext<'a> {
         slots: &[Register],
         rest_index: Option<usize>,
     ) -> Result<(), LowerError> {
+        let parameters = runtime_parameters(self.file, parameters);
         let fixed = slots.len();
         let mut undefined_seed = None;
         for (index, parameter) in parameters.iter().enumerate() {
@@ -11756,6 +11775,16 @@ mod tests {
             )),
             "the class keeps its TDZ cell"
         );
+    }
+    #[test]
+    fn a_this_parameter_takes_no_argument() {
+        let module = lower_js("function f(this: any, a: number) { return a; }");
+        let function = module
+            .functions()
+            .iter()
+            .find(|function| function.parameter_count() > 0)
+            .expect("the function has a parameter");
+        assert_eq!(function.parameter_count(), 1);
     }
     #[test]
     fn checker_diagnosed_super_misuse_lowers_to_inert_values() {
