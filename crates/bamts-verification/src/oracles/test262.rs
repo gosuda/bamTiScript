@@ -2228,7 +2228,28 @@ function $ERROR(message) {\n\
 
     #[test]
     fn super_reads_above_the_home_object() {
-        const CASES: [&str; 10] = [
+        const CASES: [&str; 17] = [
+            "class A { m() { return this.v; } } \
+             class B extends A { v = 1; f() { return (() => super.m())(); } } \
+             assert.sameValue(new B().f(), 1);",
+            "class A { static s() { return 'A'; } static t = 1; } \
+             class B extends A { static s() { return 'B'; } static x = super.s(); \
+             static y = super.t; static z; static { this.z = super.s(); } } \
+             assert.sameValue(B.x, 'A'); assert.sameValue(B.y, 1); assert.sameValue(B.z, 'A');",
+            "class A {} class B extends A { m() { [super.x] = [1]; return this.x; } } \
+             assert.sameValue(new B().m(), 1);",
+            "class A {} class B extends A { m() { for (super.x of [2]); return this.x; } } \
+             assert.sameValue(new B().m(), 2);",
+            "class A {} class B extends A { m() { delete super.x; } } \
+             var caught; try { new B().m(); } catch (error) { caught = error; } \
+             assert.sameValue(caught instanceof ReferenceError, true);",
+            "class A { constructor() { this.a = 1; } } \
+             class B extends A { f = 2; constructor() { (() => super())(); this.c = 3; } } \
+             var b = new B(); assert.sameValue(b.a, 1); assert.sameValue(b.f, 2); \
+             assert.sameValue(b.c, 3);",
+            "class A { m() { return 1; } } \
+             class B extends A { *g() { yield super.m(); } async a() { return super.m(); } } \
+             assert.sameValue(new B().g().next().value, 1);",
             "var o = { m() { return super.x; } }; Object.setPrototypeOf(o, null); \
              var caught; try { o.m(); } catch (error) { caught = error; } \
              assert.sameValue(caught instanceof TypeError, true);",

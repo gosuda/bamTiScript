@@ -4100,6 +4100,11 @@ impl<'a> FunctionContext<'a> {
                 if Self::has_optional_chain(argument) {
                     return self.lower_optional_delete(builder, range, member);
                 }
+                if matches!(member.object.data(), Expression::Super) {
+                    self.this_value(builder, range)?;
+                    self.member_key(builder, &member.property)?;
+                    return self.throw_reference_error(builder, range);
+                }
                 let object = self.lower_expression(builder, &member.object)?;
                 let key = self.member_key(builder, &member.property)?;
                 let dst = self.alloc_register(range)?;
@@ -4990,6 +4995,32 @@ impl<'a> FunctionContext<'a> {
             return Ok(MemberBase::Super { home, receiver });
         }
         Ok(MemberBase::Object(self.lower_expression(builder, object)?))
+    }
+    /// Throws a `ReferenceError`, which is what deleting through `super` does.
+    fn throw_reference_error(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+    ) -> Result<Register, LowerError> {
+        let name = builder.intern(
+            Constant::String(EcmaString::encode("ReferenceError")),
+            range,
+        )?;
+        let callee = self.alloc_register(range)?;
+        self.emit(range, Instruction::LoadGlobal { dst: callee, name })?;
+        let arguments = self.alloc_register(range)?;
+        self.emit(range, Instruction::CreateArray { dst: arguments })?;
+        let value = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::Construct {
+                dst: value,
+                callee,
+                arguments,
+            },
+        )?;
+        self.emit(range, Instruction::Throw { value })?;
+        self.undefined(builder, range)
     }
     /// The key of a reference that is read and then written, converted now so
     /// user conversion runs once. A reference through nothing still fails first.
@@ -7033,10 +7064,9 @@ impl<'a> FunctionContext<'a> {
                 if self.is_const_enum_member_target(target, &member.object)? {
                     return Err(self.const_enum_operation(range, ConstEnumOperation::Write));
                 }
-                let object = self.lower_expression(builder, &member.object)?;
+                let base = self.member_base(builder, range, &member.object)?;
                 let key = self.member_key(builder, &member.property)?;
-                self.emit(range, Instruction::SetProperty { object, key, value })?;
-                Ok(())
+                self.set_member(range, base, key, value)
             }
             AssignmentTarget::Object(object) => {
                 self.require_object_coercible(range, value)?;
@@ -7302,7 +7332,12 @@ impl<'a> FunctionContext<'a> {
             this_capture: None,
             this_cell: None,
             derived_super_guard: None,
-            instance_steps: Vec::new(),
+            // A `super(...)` in an arrow initializes the fields.
+            instance_steps: if is_arrow {
+                self.instance_steps.clone()
+            } else {
+                Vec::new()
+            },
             new_target_capture: None,
             parent_constructor_capture: None,
             class_elements: None,
@@ -7867,8 +7902,14 @@ impl<'a> FunctionContext<'a> {
             if scanner.uses_arguments {
                 captures.push(CaptureKey::Arguments);
             }
-            if scanner.uses_new_target {
+            // `super(...)` in an arrow finishes the enclosing constructor's work.
+            let calls_parent = scanner.uses_super && self.parent_constructor_capture.is_some();
+            if scanner.uses_new_target || calls_parent {
                 captures.push(CaptureKey::NewTarget);
+            }
+            if calls_parent {
+                captures.extend(self.parent_constructor_capture.map(CaptureKey::Parent));
+                captures.extend(self.class_elements.map(CaptureKey::ClassElements));
             }
         }
         // An arrow's `super` is the enclosing method's.
@@ -8435,6 +8476,7 @@ impl<'a> FunctionContext<'a> {
         // on `final_class`, then the remaining static timeline.
         let previous_this = self.this_capture;
         self.this_capture = Some(final_class);
+        let previous_home = self.home_object.replace(ctor);
         let mut static_result = Ok(());
         let static_order = static_inits
             .iter()
@@ -8451,6 +8493,7 @@ impl<'a> FunctionContext<'a> {
             }
         }
         self.this_capture = previous_this;
+        self.home_object = previous_home;
         static_result?;
         self.run_extra_initializers(builder, range, final_class, class_extra_inits)?;
         if let Some(name) = declaration_name {
@@ -10494,6 +10537,7 @@ impl<'a> FreeVarScanner<'a> {
             Expression::Super => {
                 if self.fn_boundary == 0 {
                     self.uses_super = true;
+                    self.uses_this = true;
                 }
             }
             Expression::Meta(MetaProperty::NewTarget) => {
