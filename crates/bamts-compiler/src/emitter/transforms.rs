@@ -631,6 +631,8 @@ struct CjsPlan {
     imports: BTreeMap<crate::checker::SymbolId, CjsImportRef>,
     /// Exported `var`/`let` bindings, which live only on `exports`.
     exported_variables: BTreeSet<crate::checker::SymbolId>,
+    /// Helpers the prelude's re-exports call.
+    helpers: BTreeSet<HelperKind>,
     /// Require-local names whose member calls become `(0, m.p)()`.
     require_roots: BTreeSet<String>,
 }
@@ -695,6 +697,9 @@ impl<'a> Rewriter<'a> {
         } else {
             None
         };
+        let used_helpers = cjs
+            .as_ref()
+            .map_or_else(BTreeSet::new, |plan| plan.helpers.clone());
         let synthesized_floor = ids.position();
         Self {
             options,
@@ -708,7 +713,7 @@ impl<'a> Rewriter<'a> {
             next_temp: 0,
             diagnostics: Vec::new(),
             replace_await: false,
-            used_helpers: BTreeSet::new(),
+            used_helpers,
             key_prelude: Vec::new(),
             expression_temp_scopes: Vec::new(),
             parameter_initializer_depths: Vec::new(),
@@ -821,6 +826,7 @@ impl<'a> Rewriter<'a> {
                 }
                 Statement::Export(export) => {
                     plan.is_module = true;
+                    plan_cjs_reexport(file, export, &mut names, &mut plan);
                     if let ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) =
                         export
                     {
@@ -1479,11 +1485,16 @@ impl<'a> Rewriter<'a> {
                 source,
                 ..
             })) => {
-                if self.cjs.is_some() && source.is_none() && !*type_only {
+                if self.cjs.is_none() {
+                    return vec![statement.clone()];
+                }
+                if source.is_none() && !*type_only {
                     return self.cjs_export_specifiers(specifiers);
                 }
-                vec![statement.clone()]
+                // A re-export is in the prelude, and a type-only one is gone.
+                Vec::new()
             }
+            Statement::Export(ExportDeclaration::All(_)) if self.cjs.is_some() => Vec::new(),
             Statement::Import(import) => {
                 if self.cjs.is_none() {
                     return vec![statement.clone()];
@@ -9190,6 +9201,72 @@ fn identifier_text(file: &SourceFile, ident: &IdentifierNode) -> String {
     raw_token_text(file, ident.data().token())
 }
 
+/// Plans a re-export as prelude lines, in order with the file's imports: a
+/// star export copies the module's names, and a named one reads through to the
+/// module, so it stays a live binding.
+fn plan_cjs_reexport(
+    file: &SourceFile,
+    export: &ExportDeclaration,
+    names: &mut RequireNames,
+    plan: &mut CjsPlan,
+) {
+    let quoted = |source: &StringLiteralNode| {
+        let raw = raw_token_text(file, source.data().token());
+        quote_module_specifier(raw.trim_matches(['"', '\'']))
+    };
+    let export_name = |name: &ModuleExportName| match name {
+        ModuleExportName::Identifier(ident) => identifier_text(file, ident),
+        ModuleExportName::String(literal) => raw_token_text(file, literal.data().token())
+            .trim_matches(['"', '\''])
+            .to_owned(),
+        ModuleExportName::Missing(_) => String::new(),
+    };
+    match export {
+        ExportDeclaration::All(all) if !all.type_only => {
+            let module = quoted(&all.source);
+            match &all.exported {
+                Some(name) => {
+                    let name = export_name(name);
+                    plan.helpers.insert(HelperKind::ImportStar);
+                    plan.requires
+                        .push(format!("exports.{name} = __importStar(require({module}));"));
+                    plan.void_0.push(name);
+                }
+                None => {
+                    plan.helpers.insert(HelperKind::ExportStar);
+                    plan.requires
+                        .push(format!("__exportStar(require({module}), exports);"));
+                }
+            }
+        }
+        ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+            type_only: false,
+            specifiers,
+            source: Some(source),
+            ..
+        }) => {
+            let raw = raw_token_text(file, source.data().token());
+            let local = names.allocate(raw.trim_matches(['"', '\'']));
+            plan.requires
+                .push(format!("var {local} = require({});", quoted(source)));
+            for specifier in specifiers {
+                let specifier = specifier.data();
+                if !matches!(specifier.mode, ExportSpecifierMode::Value) {
+                    continue;
+                }
+                let imported = export_name(&specifier.local);
+                let exported = export_name(&specifier.exported);
+                plan.requires.push(format!(
+                    "Object.defineProperty(exports, \"{exported}\", {{ enumerable: true, \
+                     get: function () {{ return {local}.{imported}; }} }});"
+                ));
+                plan.void_0.push(exported);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Whether a declaration's bindings can change after it runs.
 fn is_reassignable(declaration: &VariableDeclaration) -> bool {
     matches!(declaration.kind, VariableKind::Var | VariableKind::Let)
@@ -11224,6 +11301,35 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         let code = javascript(&output);
         assert!(code.contains("exports.b = a.x;"), "{code}");
         assert!(code.contains("exports.c = exports.b;"), "{code}");
+    }
+
+    #[test]
+    fn commonjs_reexports_are_not_left_as_module_syntax() {
+        let output = emit_with_options(
+            "export * from './a';\n\
+             export * as ns from './b';\n\
+             export { x, y as z } from './c';\n\
+             export type { T } from './d';\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(!code.contains("export "), "{code}");
+        assert!(!code.contains("./d"), "{code}");
+        for expected in [
+            "__exportStar(require(\"./a\"), exports);",
+            "exports.ns = __importStar(require(\"./b\"));",
+            "var c_1 = require(\"./c\");",
+            "Object.defineProperty(exports, \"x\", { enumerable: true, get: function () { return c_1.x; } });",
+            "Object.defineProperty(exports, \"z\", { enumerable: true, get: function () { return c_1.y; } });",
+            "function __exportStar(",
+            "function __importStar(",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
     }
 
     #[test]
