@@ -3431,7 +3431,10 @@ impl<'a> Rewriter<'a> {
             }
         }
         debug_assert!(
-            !has_computed || class.extends.is_none() || !prelude.is_empty(),
+            matches!(mode, FieldMode::Native)
+                || !has_computed
+                || class.extends.is_none()
+                || !prelude.is_empty(),
             "heritage must be captured before computed keys"
         );
         if matches!(mode, FieldMode::Native) {
