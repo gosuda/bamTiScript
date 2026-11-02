@@ -98,6 +98,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_frame_read_after_stop_still_earns_its_response() {
+        let control = Control::new();
+        control.stop();
+        let request: Request =
+            serde_json::from_str(r#"{"id":7,"method":"compiler/version"}"#).expect("request");
+        assert!(matches!(control.offer(request, 32), Admission::Halt));
+        assert_eq!(control.drain().len(), 1, "the drain answers it");
+
+        let notification: Request =
+            serde_json::from_str(r#"{"method":"compiler/version"}"#).expect("notification");
+        assert!(matches!(control.offer(notification, 32), Admission::Halt));
+        assert!(control.drain().is_empty(), "a notification owes no answer");
+    }
+
+    #[test]
     fn reader_guard_reports_panics() {
         let control = Arc::new(Control::new());
         let thread_control = Arc::clone(&control);
