@@ -87,6 +87,9 @@ pub enum ModuleKind {
     System,
     Es2015,
     EsNext,
+    /// A Node mode, where each file is CommonJS or an ES module. The project
+    /// resolves it per file before emit.
+    Node,
 }
 
 /// The structural line terminator the emitter inserts between lines.
@@ -753,7 +756,8 @@ pub(crate) fn parse_module(value: &str) -> Option<ModuleKind> {
         "umd" => Some(ModuleKind::Umd),
         "system" => Some(ModuleKind::System),
         "es6" | "es2015" => Some(ModuleKind::Es2015),
-        "esnext" => Some(ModuleKind::EsNext),
+        "es2020" | "es2022" | "esnext" | "preserve" => Some(ModuleKind::EsNext),
+        "node16" | "node18" | "node20" | "nodenext" => Some(ModuleKind::Node),
         _ => None,
     }
 }

@@ -1,5 +1,5 @@
 use super::{
-    CompilerOptions, JsonObject, JsonValue, PathError, ProjectRoot,
+    CompilerOptions, JsonObject, JsonValue, PackageJson, PathError, ProjectRoot,
     build_mode::{
         BUILD_INFO_SCHEMA, BuildInfo, BuildOutputs, is_project_up_to_date, options_signature,
         project_signature, source_signature,
@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     diagnostic::Diagnostic,
-    emitter::{self, EmitFileNames, EmitOptions},
+    emitter::{self, EmitFileNames, EmitOptions, ModuleKind},
     lint::{LintProfile, LintTable},
     pipeline::{FrontendMode, compile_program_frontend_with_lints},
     program::{JsxRoutingDecision, ProgramLoader, ProgramOutputKind},
@@ -405,6 +405,9 @@ pub fn compile_project<F: FileSystem + Clone>(
             emit_options(project.options(), module.source_file().source_id());
         emit_options.declaration = selection.declaration;
         emit_options.emit_declaration_only = selection.declaration && !selection.javascript;
+        if emit_options.module == Some(ModuleKind::Node) {
+            emit_options.module = Some(node_module_format(project, source_path, fs));
+        }
         diagnostics.extend(option_diagnostics);
         match jsx_route {
             JsxRoutingDecision::Emit | JsxRoutingDecision::TransformAndEmit => {
@@ -728,6 +731,37 @@ fn emit_options(options: &CompilerOptions, source_id: SourceId) -> (EmitOptions,
     );
 
     (emit_options, diagnostics)
+}
+
+/// What a Node module mode emits for one file: the extension decides, then the
+/// `type` of the nearest `package.json`, and a file with neither is CommonJS.
+fn node_module_format(
+    project: &EffectiveProject,
+    source: &Path,
+    fs: &dyn FileSystem,
+) -> ModuleKind {
+    match source.extension().and_then(|extension| extension.to_str()) {
+        Some("mts" | "mjs") => return ModuleKind::EsNext,
+        Some("cts" | "cjs") => return ModuleKind::CommonJs,
+        _ => {}
+    }
+    let root = project.root();
+    let package = source
+        .ancestors()
+        .skip(1)
+        .take_while(|directory| directory.starts_with(root.path()))
+        .find_map(|directory| {
+            let path = directory.join("package.json");
+            let text = fs.read(&path).ok()?;
+            PackageJson::parse(root, &path, &text).ok()
+        });
+    match package
+        .as_ref()
+        .and_then(|package| package.raw().get("type"))
+    {
+        Some(JsonValue::String(kind)) if kind.as_ref() == "module" => ModuleKind::EsNext,
+        _ => ModuleKind::CommonJs,
+    }
 }
 
 fn single_project_graph(project: &EffectiveProject) -> Result<ReferenceGraph, ProjectCompileError> {
@@ -2320,6 +2354,63 @@ mod tests {
         .unwrap();
         assert!(javascript.contains("./runtime/jsx-runtime"));
         assert!(!javascript.contains("<div"));
+    }
+
+    #[test]
+    fn every_es_and_node_module_kind_emits() {
+        for (module, package, source, expected) in [
+            ("es2020", None, "main.ts", "export const a"),
+            ("es2022", None, "main.ts", "export const a"),
+            ("preserve", None, "main.ts", "export const a"),
+            ("node16", None, "main.ts", "exports.a"),
+            (
+                "nodenext",
+                Some(r#"{"type":"commonjs"}"#),
+                "main.ts",
+                "exports.a",
+            ),
+            (
+                "nodenext",
+                Some(r#"{"type":"module"}"#),
+                "main.ts",
+                "export const a",
+            ),
+            (
+                "node20",
+                Some(r#"{"type":"module"}"#),
+                "main.ts",
+                "export const a",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            fixture.write(source, "export const a = 1;\n");
+            if let Some(package) = package {
+                fixture.write("package.json", package);
+            }
+            fixture.write(
+                "tsconfig.json",
+                &format!(
+                    r#"{{"files":["{source}"],"compilerOptions":{{"module":"{module}","outDir":"dist"}}}}"#
+                ),
+            );
+            let filesystem = fixture.filesystem();
+            let project =
+                EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
+            let report =
+                compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+            let javascript = std::str::from_utf8(
+                report
+                    .outputs
+                    .files
+                    .get(&fixture.0.join("dist/main.js"))
+                    .expect("project JavaScript output"),
+            )
+            .unwrap();
+            assert!(
+                javascript.contains(expected),
+                "{module} {package:?}: {javascript}"
+            );
+        }
     }
 
     #[test]
