@@ -644,6 +644,16 @@ pub struct StatusRequest {
 /// an error, and nothing is written: a report must not read as complete when it
 /// is not.
 pub fn status_report(request: &StatusRequest) -> Result<String> {
+    let sidecar = request.out.with_extension("json");
+    if sidecar == request.out {
+        return Err(VerificationError::new(
+            ErrorCode::Usage,
+            format!(
+                "{}: the report cannot share a path with its `.json` sidecar",
+                request.out.display()
+            ),
+        ));
+    }
     let io_error = |path: &Path, error: io::Error| {
         VerificationError::new(ErrorCode::Io, format!("{}: {error}", path.display()))
     };
@@ -687,7 +697,6 @@ pub fn status_report(request: &StatusRequest) -> Result<String> {
         ));
     }
 
-    let sidecar = request.out.with_extension("json");
     let previous = match fs::read_to_string(&sidecar) {
         Ok(text) => {
             serde_json::from_str::<StatusFile>(&text)
@@ -1306,6 +1315,28 @@ mod tests {
             third.contains("| PASS | 3 | 0 |"),
             "an unchanged lane shows no change: {third}"
         );
+    }
+
+    #[test]
+    fn a_report_cannot_take_the_path_of_its_own_sidecar() {
+        let scratch = Scratch::new();
+        let receipts = scratch.0.join("merged");
+        fs::create_dir_all(&receipts).unwrap();
+        write_lane(
+            &receipts.join("a.jsonl"),
+            SHA_A,
+            (0, 1),
+            [Pass, Pass, Fail, Fail],
+        );
+        let out = scratch.0.join("status.json");
+        fs::write(&out, "previous").unwrap();
+        let error = status_report(&StatusRequest {
+            receipts,
+            out: out.clone(),
+        })
+        .expect_err("the report and sidecar share a path");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert_eq!(fs::read_to_string(&out).unwrap(), "previous");
     }
 
     #[test]
