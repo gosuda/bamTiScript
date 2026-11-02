@@ -102,12 +102,10 @@ pub struct ConditionsRecord {
 
 impl Conditions {
     pub fn capture() -> Result<Self> {
-        let facts = bamts_platform::machine_facts()?;
-        let placement = bamts_platform::thread_placement()?;
         Ok(Self {
             governors: bamts_platform::cpu_governors()?,
-            swap_total_kb: facts.swap_total_kib,
-            cpus_allowed_list: placement.cpu_affinity,
+            swap_total_kb: bamts_platform::swap_total_kib()?,
+            cpus_allowed_list: bamts_platform::cpu_affinity()?,
             cpus_online: bamts_platform::online_cpu_list()?,
         })
     }

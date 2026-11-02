@@ -418,14 +418,11 @@ fn read_memory_policy() -> Result<(String, String)> {
 pub(crate) fn machine_facts() -> Result<MachineFacts> {
     let version = read_evidence("/proc/version")?;
     let cpuinfo = read_evidence("/proc/cpuinfo")?;
-    let meminfo = read_evidence("/proc/meminfo")?;
-    let governor = read_evidence(crate::LINUX_GOVERNOR_SOURCE)
-        .map(|text| text.trim().to_owned())
-        .unwrap_or_else(|_| "unknown".to_owned());
+    let governor = cpu_governor().unwrap_or_else(|_| "unknown".to_owned());
 
     let (kernel_release, kernel_version) = parse_proc_version(&version)?;
     let (cpu_model, sockets, cores_per_socket, microcode) = cpu_identity(&cpuinfo, read_topology)?;
-    let swap_total_kib = parse_proc_meminfo_swap(&meminfo)?;
+    let swap_total_kib = swap_total_kib()?;
 
     Ok(MachineFacts {
         kernel_release,
@@ -440,9 +437,23 @@ pub(crate) fn machine_facts() -> Result<MachineFacts> {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn cpu_governor() -> Result<String> {
+    read_evidence(crate::LINUX_GOVERNOR_SOURCE).map(|text| text.trim().to_owned())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn swap_total_kib() -> Result<u64> {
+    parse_proc_meminfo_swap(&read_evidence("/proc/meminfo")?)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn cpu_affinity() -> Result<String> {
+    parse_cpu_affinity(&read_evidence("/proc/thread-self/status")?)
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn thread_placement() -> Result<ThreadPlacement> {
-    let status = read_evidence("/proc/thread-self/status")?;
-    let cpu_affinity = parse_cpu_affinity(&status)?;
+    let cpu_affinity = cpu_affinity()?;
     let (memory_policy, memory_nodes) = read_memory_policy()?;
     Ok(ThreadPlacement {
         cpu_affinity,

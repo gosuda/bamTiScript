@@ -42,12 +42,10 @@ pub struct HostConditions {
 
 impl HostConditions {
     fn new() -> Result<Self> {
-        let facts = bamts_platform::machine_facts()?;
-        let placement = bamts_platform::thread_placement()?;
         Ok(Self {
-            governor: facts.governor,
-            swap_total_kib: facts.swap_total_kib,
-            cpu_affinity: placement.cpu_affinity,
+            governor: bamts_platform::cpu_governor()?,
+            swap_total_kib: bamts_platform::swap_total_kib()?,
+            cpu_affinity: bamts_platform::cpu_affinity()?,
             mempolicy_mode: bamts_platform::numa_policy_mode(),
             memory_nodes: bamts_platform::numa_memory_nodes()?,
         })
@@ -917,7 +915,14 @@ mod tests {
     /// read them too. The old readers opened `/sys` and `/proc` directly.
     #[test]
     fn host_conditions_come_from_the_platform_crate() {
-        let conditions = HostConditions::new().unwrap();
+        let conditions = HostConditions::new();
+        // A Linux host without cpufreq has no governor, which stage 0 refuses
+        // rather than recording a stand-in.
+        if bamts_platform::cpu_governor().is_err() {
+            assert!(conditions.is_err());
+            return;
+        }
+        let conditions = conditions.unwrap();
         let facts = bamts_platform::machine_facts().unwrap();
         let placement = bamts_platform::thread_placement().unwrap();
         assert_eq!(conditions.governor, facts.governor);

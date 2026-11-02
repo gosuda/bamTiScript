@@ -124,6 +124,68 @@ pub fn thread_placement() -> Result<ThreadPlacement, PlatformError> {
     }
 }
 
+/// The governor of CPU 0, or [`UNAVAILABLE`] on a host without one. A Linux host
+/// that cannot say fails here, unlike [`MachineFacts::governor`], which identifies
+/// a machine and tolerates the gap.
+///
+/// # Errors
+/// Returns [`PlatformError`] when this host has no implementation or the host
+/// fails the read.
+pub fn cpu_governor() -> Result<String, PlatformError> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::cpu_governor()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(UNAVAILABLE.to_owned())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(PlatformError::Unsupported("cpu governor"))
+    }
+}
+
+/// Total swap in KiB.
+///
+/// # Errors
+/// Returns [`PlatformError`] when this host has no implementation or the host
+/// answers in a shape the reader does not accept.
+pub fn swap_total_kib() -> Result<u64, PlatformError> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::swap_total_kib()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::swap_total_kib()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(PlatformError::Unsupported("swap total"))
+    }
+}
+
+/// The CPUs the calling thread may run on, such as `0-19`, or [`UNAVAILABLE`].
+///
+/// # Errors
+/// Returns [`PlatformError`] when this host has no implementation or the host
+/// answers in a shape the reader does not accept.
+pub fn cpu_affinity() -> Result<String, PlatformError> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::cpu_affinity()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(UNAVAILABLE.to_owned())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(PlatformError::Unsupported("cpu affinity"))
+    }
+}
+
 /// The CPUs that are online, as a kernel CPU list such as `0-19`.
 ///
 /// # Errors

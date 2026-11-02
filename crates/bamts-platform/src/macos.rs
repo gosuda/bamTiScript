@@ -102,8 +102,13 @@ pub(crate) fn machine_facts() -> Result<MachineFacts> {
         cores_per_socket: physical / packages,
         microcode: UNAVAILABLE.to_owned(),
         governor: UNAVAILABLE.to_owned(),
-        swap_total_kib: parse_swap_total_kib(&sysctl("vm.swapusage")?)?,
+        swap_total_kib: swap_total_kib()?,
     })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn swap_total_kib() -> Result<u64> {
+    parse_swap_total_kib(&sysctl("vm.swapusage")?)
 }
 
 #[cfg(target_os = "macos")]
