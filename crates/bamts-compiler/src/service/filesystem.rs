@@ -163,12 +163,7 @@ fn normalize_lexically(path: &Path) -> Result<PathBuf, FileSystemError> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::Prefix(_) => {
-                return Err(FileSystemError::new(
-                    io::ErrorKind::InvalidInput,
-                    "platform path prefix is unsupported",
-                ));
-            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
             Component::RootDir => normalized.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
@@ -187,11 +182,7 @@ fn normalize_lexically(path: &Path) -> Result<PathBuf, FileSystemError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs, io,
-        path::Path,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{fs, io, path::Path};
 
     use super::{FileSystem, OsFileSystem};
 
@@ -232,6 +223,52 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("remove temporary root");
+    }
+
+    #[test]
+    fn absolute_paths_are_accepted_inside_the_root_and_confined_outside_it() {
+        let root = temporary_root();
+        fs::write(root.join("a.ts"), "const a = 1;").expect("write source");
+        let filesystem = OsFileSystem::new(&root).expect("filesystem");
+
+        let inside = filesystem.root().join("a.ts");
+        assert_eq!(filesystem.normalize(&inside).expect("inside"), inside);
+        assert_eq!(filesystem.read(&inside).expect("read"), "const a = 1;");
+
+        let outside = filesystem.root().parent().expect("root has a parent");
+        assert_eq!(
+            filesystem
+                .normalize(outside)
+                .expect_err("outside the root")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        fs::remove_dir_all(root).expect("remove temporary root");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn lexical_normalization_keeps_drive_and_verbatim_prefixes() {
+        use super::normalize_lexically;
+
+        for (input, expected) in [
+            (r"C:\a\.\b\..\c", r"C:\a\c"),
+            (r"\\?\C:\a\..\b", r"\\?\C:\b"),
+            (r"\\server\share\a\..\b", r"\\server\share\b"),
+        ] {
+            assert_eq!(
+                normalize_lexically(Path::new(input)).expect(input),
+                Path::new(expected),
+                "{input}"
+            );
+        }
+        assert_eq!(
+            normalize_lexically(Path::new(r"C:\.."))
+                .expect_err("above the drive root")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
@@ -317,7 +354,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn read_dir_rejects_escaping_symlink() {
-        use std::os::unix::fs::symlink;
+        use std::{
+            os::unix::fs::symlink,
+            time::{SystemTime, UNIX_EPOCH},
+        };
 
         let root = temporary_root();
         let outside = root.parent().unwrap().join(format!("bamts-outside-{}", {
