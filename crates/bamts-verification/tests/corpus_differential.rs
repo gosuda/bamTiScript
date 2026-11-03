@@ -7,6 +7,14 @@ use bamts_verification::corpus::{
 };
 use sha2::{Digest, Sha256};
 
+/// The repository's pinned `tsc`, launched through `node` because the
+/// `node_modules/.bin/tsc` shim is a shell script that Windows cannot run.
+fn tsc_command(root: &Path) -> process::Command {
+    let mut command = process::Command::new("node");
+    command.arg(root.join("node_modules/typescript/bin/tsc"));
+    command
+}
+
 fn local_test_provenance(root: &Path, source_dir: &str) -> Provenance {
     fn collect(dir: &Path, prefix: &str, records: &mut Vec<(String, Vec<u8>)>) {
         for entry in fs::read_dir(dir).expect("read source_dir") {
@@ -1357,7 +1365,7 @@ console.log(trace.join('\n'));
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -1455,7 +1463,7 @@ console.log(trace.join('\n'));
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -1541,7 +1549,7 @@ try {
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -1635,7 +1643,7 @@ try {
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -1861,7 +1869,7 @@ console.log(`fn:${Item(5)};ns:${Item.label};tag:${Item.tag()}`);
         "--outDir".into(),
         format!("{source_dir}/oracles"),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -2014,7 +2022,7 @@ console.log(trace.join('\n'));
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -2119,7 +2127,7 @@ console.log(trace.join('\n'));
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -2225,7 +2233,7 @@ console.log(trace.join('\n'));
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -2331,7 +2339,7 @@ console.log(trace.join('\n'));
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -2440,7 +2448,7 @@ console.log(trace.join('\n'));
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -2559,7 +2567,7 @@ console.log(trace.join('\n'));
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -2642,7 +2650,7 @@ console.log(trace.join('\n'));
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -2750,7 +2758,7 @@ console.log(trace.join('\n'));
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -2843,7 +2851,7 @@ console.log(trace.join('\n'));
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -2942,7 +2950,7 @@ console.log(trace.join('\n'));
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -3070,7 +3078,7 @@ console.log(trace.join('\n'));
         "--checkJs".into(),
         "false".into(),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -3180,7 +3188,7 @@ fn sync_explicit_resource_management_matches_tsc_oracle_in_every_execution_mode(
         "--outDir".into(),
         format!("{source_dir}/oracles"),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -3315,7 +3323,7 @@ fn async_explicit_resource_management_matches_tsc_oracle_in_every_execution_mode
         "--outDir".into(),
         format!("{source_dir}/oracles"),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -3414,7 +3422,7 @@ fn sync_explicit_resource_management_suppression_matches_tsc_oracle_in_every_exe
         "--outDir".into(),
         format!("{source_dir}/oracles"),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -3583,7 +3591,7 @@ fn resource_management_abrupt_completion_matches_tsc_oracle_in_every_execution_m
         "--outDir".into(),
         format!("{source_dir}/oracles"),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
@@ -3686,7 +3694,7 @@ fn async_explicit_resource_management_suppression_matches_tsc_oracle_in_every_ex
         "--outDir".into(),
         format!("{source_dir}/oracles"),
     ];
-    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+    let status = tsc_command(&root)
         .arg(&source_path)
         .args(&tsc_args)
         .current_dir(&root)
