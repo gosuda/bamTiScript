@@ -590,6 +590,16 @@ impl Process {
             .then(|| String::from_utf16_lossy(&buffer[..written]))
     }
 
+    /// Why a walk found no region at all: the process has ended, or it has no
+    /// address space right now.
+    fn without_regions(&self) -> Result<PlatformError> {
+        Ok(if self.has_exited()? {
+            PlatformError::ProcessGone(self.pid)
+        } else {
+            PlatformError::NoAddressSpace(self.pid)
+        })
+    }
+
     fn memory_counters(&self) -> std::result::Result<ffi::ProcessMemoryCounters, std::io::Error> {
         counters_of(self.handle)
     }
@@ -722,11 +732,7 @@ pub(crate) fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>> {
         });
     }
     if regions.is_empty() {
-        return Err(if process.has_exited()? {
-            PlatformError::ProcessGone(pid)
-        } else {
-            PlatformError::NoAddressSpace(pid)
-        });
+        return Err(process.without_regions()?);
     }
     Ok(regions)
 }
@@ -1458,6 +1464,24 @@ mod tests {
             assert_eq!(
                 gone.failure("read", &denied),
                 PlatformError::ProcessGone(gone.pid)
+            );
+        }
+
+        #[test]
+        fn a_walk_without_regions_is_classified_by_whether_the_process_lives() {
+            let own = Process::open(std::process::id()).expect("own process");
+            assert_eq!(
+                own.without_regions(),
+                Ok(PlatformError::NoAddressSpace(own.pid))
+            );
+
+            let mut child = waiting_child();
+            let gone = Process::open(child.id()).expect("child process");
+            drop(child.stdin.take());
+            child.wait().expect("child exits");
+            assert_eq!(
+                gone.without_regions(),
+                Ok(PlatformError::ProcessGone(gone.pid))
             );
         }
 
