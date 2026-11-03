@@ -9,6 +9,8 @@ use std::fmt;
 mod linux;
 #[cfg(any(target_os = "macos", test))]
 mod macos;
+#[cfg(any(target_os = "windows", test))]
+mod windows;
 
 /// Recorded for a fact this host does not have, such as a CPU governor on macOS.
 pub const UNAVAILABLE: &str = "unavailable";
@@ -287,6 +289,11 @@ pub struct MemoryRegion {
 /// from one read, and do not block on it: after `NoAddressSpace` it may still be
 /// running. Returns another [`PlatformError`] when this host has no
 /// implementation or the host fails the read.
+///
+/// On Windows a region is a run of committed pages with one protection. Reserved
+/// and free address space is left out, and a copy-on-write page counts as
+/// writable. A file-backed region names its file as a DOS path, or as an NT path
+/// when its device has no drive letter.
 pub fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>, PlatformError> {
     #[cfg(target_os = "linux")]
     {
@@ -296,7 +303,11 @@ pub fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>, PlatformError> {
     {
         macos::process_regions(pid)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::process_regions(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = pid;
         Err(PlatformError::Unsupported("process regions"))
@@ -307,12 +318,14 @@ pub fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>, PlatformError> {
 use linux::Window as WindowImpl;
 #[cfg(target_os = "macos")]
 use macos::Window as WindowImpl;
+#[cfg(target_os = "windows")]
+use windows::Window as WindowImpl;
 
 /// A host with no peak-memory window cannot construct one.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 enum WindowImpl {}
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 impl WindowImpl {
     fn start() -> Result<Self, PlatformError> {
         Err(PlatformError::Unsupported("peak memory window"))
@@ -325,8 +338,8 @@ impl WindowImpl {
 
 /// Peak memory of a process since it started or last execed, in bytes.
 ///
-/// This is the resident-set peak on Linux and the physical-footprint peak on
-/// macOS.
+/// This is the resident-set peak on Linux, the physical-footprint peak on macOS
+/// and the peak working set on Windows.
 ///
 /// # Errors
 /// Returns [`PlatformError::ProcessGone`] when the host cannot find the process
@@ -338,7 +351,9 @@ impl WindowImpl {
 /// comes only after the reap, and keep polling through `NoAddressSpace`. Linux
 /// reads the main thread, so it reports that during an exit and for a process
 /// running on after its main thread exited. macOS keeps answering with the
-/// final peak until the reap.
+/// final peak until the reap. Windows answers [PlatformError::ProcessGone] as soon
+/// as the process has exited, even while its parent still holds a handle to it,
+/// because the host would otherwise keep answering until that handle closed.
 pub fn peak_memory_bytes(pid: u32) -> Result<u64, PlatformError> {
     #[cfg(target_os = "linux")]
     {
@@ -348,7 +363,11 @@ pub fn peak_memory_bytes(pid: u32) -> Result<u64, PlatformError> {
     {
         macos::peak_memory_bytes(pid)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::peak_memory_bytes(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = pid;
         Err(PlatformError::Unsupported("peak memory"))
@@ -362,6 +381,9 @@ pub fn peak_memory_bytes(pid: u32) -> Result<u64, PlatformError> {
 /// window samples the process footprint every millisecond and a spike shorter
 /// than that can be missed. Treat the macOS value as functional evidence, not
 /// as a benchmark measurement.
+///
+/// Windows has no way to reset its peak working set either, so the window samples
+/// it the same way and the same caveat applies.
 ///
 /// Windows cannot overlap on Linux. Starting one resets a mark shared by the
 /// whole process, which would lower the result of a window already open.
@@ -410,7 +432,7 @@ mod tests {
 
     /// On Linux a window resets a mark shared by the whole process, so tests that
     /// open one run one at a time.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     static WINDOW_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(target_os = "linux")]
@@ -430,7 +452,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn a_touched_allocation_raises_the_peak_window() {
         const BYTES: usize = 64 * 1024 * 1024;
@@ -457,7 +479,7 @@ mod tests {
         assert!(peak >= BYTES as u64, "peak {peak} is below the allocation");
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn the_process_peak_covers_its_current_footprint() {
         assert!(peak_memory_bytes(std::process::id()).unwrap() > 0);
