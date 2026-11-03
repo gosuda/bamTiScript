@@ -45,7 +45,17 @@ impl std::error::Error for FileSystemError {}
 
 impl From<io::Error> for FileSystemError {
     fn from(error: io::Error) -> Self {
-        Self::new(error.kind(), error.to_string())
+        Self::new(absent_aware_kind(&error), error.to_string())
+    }
+}
+
+/// Windows answers `InvalidFilename` for a name it cannot hold, such as
+/// `engine:clock`, where Unix answers `NotFound`. No file can carry such a name,
+/// so both platforms report the file as absent.
+fn absent_aware_kind(error: &io::Error) -> io::ErrorKind {
+    match error.kind() {
+        io::ErrorKind::InvalidFilename => io::ErrorKind::NotFound,
+        kind => kind,
     }
 }
 
@@ -105,7 +115,7 @@ impl FileSystem for OsFileSystem {
         loop {
             match fs::symlink_metadata(ancestor) {
                 Ok(_) => break,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Err(error) if absent_aware_kind(&error) == io::ErrorKind::NotFound => {
                     ancestor = ancestor.parent().ok_or_else(|| {
                         FileSystemError::new(
                             io::ErrorKind::NotFound,
@@ -271,6 +281,26 @@ mod tests {
                 .kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn names_the_platform_cannot_hold_are_absent_not_invalid() {
+        let root = temporary_root();
+        let filesystem = OsFileSystem::new(&root).expect("filesystem");
+        let scheme = Path::new("node_modules/engine:clock/package.json");
+
+        let normalized = filesystem.normalize(scheme).expect("normalize is lexical");
+        assert_eq!(normalized, filesystem.root().join(scheme));
+        assert_eq!(
+            filesystem.metadata(scheme).expect_err("absent").kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            filesystem.read(scheme).expect_err("absent").kind(),
+            io::ErrorKind::NotFound
+        );
+
+        fs::remove_dir_all(root).expect("remove temporary root");
     }
 
     #[test]
