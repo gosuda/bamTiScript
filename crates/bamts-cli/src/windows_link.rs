@@ -17,7 +17,7 @@
 //!
 //! The pure parts build on every host, so their tests run on Linux and macOS too.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 #[cfg(target_env = "msvc")]
@@ -36,7 +36,6 @@ use crate::context::ExecutionContext;
 use crate::driver::{DriverError, capture_process_with_cancel};
 
 /// The text the Microsoft linker prints first, whatever it is asked.
-#[cfg(any(target_env = "msvc", test))]
 const BANNER: &str = "Microsoft (R) Incremental Linker";
 
 /// The component that a Visual Studio installation needs for `link.exe`.
@@ -44,21 +43,18 @@ const BANNER: &str = "Microsoft (R) Incremental Linker";
 const CPP_TOOLS_COMPONENT: &str = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64";
 
 /// Whether what a program printed is the banner of the Microsoft linker.
-#[cfg(any(target_env = "msvc", test))]
 fn is_microsoft_linker(stdout: &str, stderr: &str) -> bool {
     stdout.contains(BANNER) || stderr.contains(BANNER)
 }
 
 /// The numeric parts of a version-like directory name, such as `14.44.35207` or
 /// `10.0.26100.0`. A name with any other part is not a version.
-#[cfg(any(target_env = "msvc", test))]
 fn version_key(name: &str) -> Option<Vec<u64>> {
     name.split('.').map(|part| part.parse().ok()).collect()
 }
 
 /// The newest of the names that are versions, compared part by part, so `14.9` is
 /// older than `14.44`.
-#[cfg(any(target_env = "msvc", test))]
 fn newest_version<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     names
         .into_iter()
@@ -69,7 +65,6 @@ fn newest_version<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<&'a st
 
 /// The install path in what `vswhere -property installationPath` printed: its
 /// first non-empty line.
-#[cfg(any(target_env = "msvc", test))]
 fn installation_path(vswhere_output: &str) -> Option<PathBuf> {
     vswhere_output
         .lines()
@@ -80,7 +75,6 @@ fn installation_path(vswhere_output: &str) -> Option<PathBuf> {
 
 /// The toolset directory of a `link.exe` that sits where Visual Studio puts it,
 /// `...\VC\Tools\MSVC\<version>\bin\Host<arch>\<arch>\link.exe`.
-#[cfg(any(target_env = "msvc", test))]
 fn toolset_of(linker: &Path) -> Option<PathBuf> {
     let host = linker.parent()?.parent()?;
     let binaries = host.parent()?;
@@ -94,7 +88,6 @@ fn toolset_of(linker: &Path) -> Option<PathBuf> {
 
 /// The library directories of a toolset and a Windows SDK, in the order that the
 /// Visual Studio command prompt puts them in `LIB`.
-#[cfg(any(target_env = "msvc", test))]
 fn library_directories(toolset: &Path, sdk_lib: &Path, sdk_version: &str) -> Vec<PathBuf> {
     let versioned = sdk_lib.join(sdk_version);
     vec![
@@ -109,7 +102,6 @@ fn library_directories(toolset: &Path, sdk_lib: &Path, sdk_version: &str) -> Vec
 /// `/BREPRO` leaves the build time out of the file, so the same inputs give the
 /// same bytes. `native_libraries` is what rustc reported for the archive, such as
 /// `kernel32.lib ntdll.lib /defaultlib:msvcrt`; the archive carries none of them.
-#[cfg(any(target_env = "msvc", test))]
 fn link_arguments(
     object: &Path,
     archive: &Path,
@@ -130,7 +122,6 @@ fn link_arguments(
 
 /// What a failed link says. `link.exe` prints its errors on standard output and
 /// leaves standard error empty, so both streams are kept, output first.
-#[cfg(any(target_env = "msvc", test))]
 fn link_diagnostics(stdout: &str, stderr: &str) -> String {
     [stdout, stderr]
         .map(str::trim)
@@ -142,15 +133,8 @@ fn link_diagnostics(stdout: &str, stderr: &str) -> String {
 
 /// A variable of the context, found without regard to case: Windows spells the
 /// search path `Path`, and the environment of the context is a case-sensitive map.
-#[cfg(any(target_env = "msvc", test))]
 fn variable(context: &crate::context::ExecutionContext, name: &str) -> Option<OsString> {
-    context
-        .envs()
-        .find(|(key, _)| {
-            key.to_str()
-                .is_some_and(|key| key.eq_ignore_ascii_case(name))
-        })
-        .map(|(_, value)| value.to_owned())
+    crate::context::env_ignoring_case(context.envs(), name).map(OsStr::to_os_string)
 }
 
 /// The linker and everything it needs to run.
@@ -164,10 +148,6 @@ pub(crate) struct Linker {
 
 #[cfg(target_env = "msvc")]
 impl Linker {
-    pub(crate) fn program(&self) -> OsString {
-        self.program.clone().into_os_string()
-    }
-
     /// The text to show when the link failed.
     pub(crate) fn diagnostics(&self, output: &std::process::Output) -> String {
         link_diagnostics(
@@ -188,13 +168,8 @@ impl Linker {
         archive: &Path,
         executable: &Path,
     ) -> Command {
-        let mut command = Command::new(&self.program);
-        command
-            .current_dir(context.cwd())
-            .env_clear()
-            .envs(context.envs())
-            .env_remove("LINK")
-            .env_remove("_LINK_");
+        let mut command = context_command(&self.program, context);
+        command.env_remove("LINK").env_remove("_LINK_");
         if let Some(library_path) = &self.library_path {
             command.env("LIB", library_path);
         }
@@ -208,15 +183,28 @@ impl Linker {
     }
 }
 
+/// The system libraries that rustc says the embedded runtime archive needs, which
+/// the MSVC linker does not take from the archive.
+#[cfg(target_env = "msvc")]
+const NODE_NATIVE_LIBRARIES: &str = env!("BAMTS_NODE_NATIVE_LIBS");
+
 /// Finds the linker and the library path to give it.
-///
-/// `native_libraries` is the list that rustc reported for the runtime archive.
 ///
 /// # Errors
 /// [`DriverError::ToolchainMissing`] when no linker is found, and the probe errors
 /// when a program cannot be run.
 #[cfg(target_env = "msvc")]
 pub(crate) fn discover(
+    context: &ExecutionContext,
+    cancel: &CancellationToken,
+) -> Result<Linker, DriverError> {
+    discover_with(context, cancel, NODE_NATIVE_LIBRARIES)
+}
+
+/// [`discover`] for a given list of the libraries that rustc reported for the
+/// runtime archive.
+#[cfg(target_env = "msvc")]
+fn discover_with(
     context: &ExecutionContext,
     cancel: &CancellationToken,
     native_libraries: &'static str,
@@ -282,6 +270,18 @@ fn program_data(context: &ExecutionContext) -> PathBuf {
         .map_or_else(|| system_drive(context).join("ProgramData"), PathBuf::from)
 }
 
+/// A command that runs in the working directory of the context with exactly the
+/// environment of the context.
+#[cfg(target_env = "msvc")]
+fn context_command(program: impl AsRef<OsStr>, context: &ExecutionContext) -> Command {
+    let mut command = Command::new(program);
+    command
+        .current_dir(context.cwd())
+        .env_clear()
+        .envs(context.envs());
+    command
+}
+
 /// Runs `program /?` and returns what it printed, or `None` when there is no such
 /// program.
 #[cfg(target_env = "msvc")]
@@ -290,12 +290,8 @@ fn ask_for_help(
     context: &ExecutionContext,
     cancel: &CancellationToken,
 ) -> Result<Option<std::process::Output>, DriverError> {
-    let mut command = Command::new(program);
-    command
-        .current_dir(context.cwd())
-        .env_clear()
-        .envs(context.envs())
-        .arg("/?");
+    let mut command = context_command(program, context);
+    command.arg("/?");
     match capture_process_with_cancel(&mut command, cancel) {
         Ok(Some(output)) => Ok(Some(output)),
         Ok(None) => Err(DriverError::Cancelled),
@@ -321,23 +317,26 @@ fn explicit_linker(
     let program = if named.components().count() > 1 {
         context.resolve_path(named)
     } else {
-        find_on_path(context, named).unwrap_or_else(|| named.to_path_buf())
+        path_candidates(context, named)
+            .next()
+            .unwrap_or_else(|| named.to_path_buf())
     };
     match ask_for_help(&program, context, cancel)? {
         Some(_) => Ok(Some(program)),
-        None => Err(DriverError::ToolchainMissing {
-            program: value.clone(),
-        }),
+        None => Err(DriverError::ToolchainMissing { program: value }),
     }
 }
 
-/// The first file called `name` in a directory of `PATH`.
+/// The files called `name` in the directories of `PATH`, in search order.
 #[cfg(target_env = "msvc")]
-fn find_on_path(context: &ExecutionContext, name: &Path) -> Option<PathBuf> {
-    let search = variable(context, "PATH")?;
-    std::env::split_paths(&search)
-        .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
+fn path_candidates(context: &ExecutionContext, name: &Path) -> impl Iterator<Item = PathBuf> {
+    let directories: Vec<PathBuf> = variable(context, "PATH")
+        .map(|search| std::env::split_paths(&search).collect())
+        .unwrap_or_default();
+    directories
+        .into_iter()
+        .map(move |directory| directory.join(name))
+        .filter(|candidate| candidate.is_file())
 }
 
 /// The first `link.exe` on `PATH` that is the Microsoft linker.
@@ -346,14 +345,7 @@ fn linker_on_path(
     context: &ExecutionContext,
     cancel: &CancellationToken,
 ) -> Result<Option<PathBuf>, DriverError> {
-    let Some(search) = variable(context, "PATH") else {
-        return Ok(None);
-    };
-    for directory in std::env::split_paths(&search) {
-        let candidate = directory.join("link.exe");
-        if !candidate.is_file() {
-            continue;
-        }
+    for candidate in path_candidates(context, Path::new("link.exe")) {
         match ask_for_help(&candidate, context, cancel) {
             Ok(Some(output))
                 if is_microsoft_linker(
@@ -384,11 +376,8 @@ fn linker_from_visual_studio(
     if !vswhere.is_file() {
         return Ok(None);
     }
-    let mut command = Command::new(&vswhere);
+    let mut command = context_command(&vswhere, context);
     command
-        .current_dir(context.cwd())
-        .env_clear()
-        .envs(context.envs())
         .env("ProgramData", program_data(context))
         .args([
             "-latest",
@@ -444,12 +433,20 @@ fn toolset_directory(installation: &Path) -> Option<PathBuf> {
     if let Some(version) = default {
         return Some(tools.join(version));
     }
-    let names: Vec<String> = fs::read_dir(&tools)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .collect();
+    let names = entry_names(&tools)?;
     newest_version(names.iter().map(String::as_str)).map(|version| tools.join(version))
+}
+
+/// The names of the entries of `directory`, leaving out any that is not text.
+#[cfg(target_env = "msvc")]
+fn entry_names(directory: &Path) -> Option<Vec<String>> {
+    Some(
+        fs::read_dir(directory)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect(),
+    )
 }
 
 /// The `LIB` value to give the linker, or `None` when the context sets its own, as
@@ -475,11 +472,9 @@ fn library_path(context: &ExecutionContext, linker: &Path) -> Option<OsString> {
             .is_file()
             && version.join("ucrt").join("x64").join("ucrt.lib").is_file()
     };
-    let versions: Vec<String> = fs::read_dir(&sdk_lib)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|entry| complete(&entry.path()))
-        .filter_map(|entry| entry.file_name().into_string().ok())
+    let versions: Vec<String> = entry_names(&sdk_lib)?
+        .into_iter()
+        .filter(|name| complete(&sdk_lib.join(name)))
         .collect();
     let version = newest_version(versions.iter().map(String::as_str))?;
     std::env::join_paths(library_directories(&toolset, &sdk_lib, version)).ok()
@@ -676,7 +671,7 @@ mod tests {
         }
 
         fn discover_in(context: &ExecutionContext) -> Result<Linker, DriverError> {
-            discover(context, &CancellationToken::new(), "kernel32.lib ntdll.lib")
+            discover_with(context, &CancellationToken::new(), "kernel32.lib ntdll.lib")
         }
 
         fn visual_studio_linker() -> Linker {
@@ -766,9 +761,8 @@ mod tests {
 
         #[test]
         fn a_link_exe_that_is_not_the_microsoft_linker_is_skipped() {
-            let directory =
-                std::env::temp_dir().join(format!("bamts-fake-link-{}", std::process::id()));
-            std::fs::create_dir_all(&directory).expect("fake directory");
+            let scratch = tempfile::tempdir().expect("temporary directory");
+            let directory = scratch.path();
             let imposter = directory.join("link.exe");
             let system = std::env::var_os("SystemRoot").expect("SystemRoot");
             std::fs::copy(
@@ -777,10 +771,8 @@ mod tests {
             )
             .expect("a program that is not a linker");
 
-            let linker = discover_in(&context(&[("Path", &directory.to_string_lossy())]));
-            std::fs::remove_dir_all(&directory).expect("remove the fake directory");
-
-            let linker = linker.expect("Visual Studio still gives the linker");
+            let linker = discover_in(&context(&[("Path", &directory.to_string_lossy())]))
+                .expect("Visual Studio still gives the linker");
             assert_ne!(linker.program, imposter);
             assert!(
                 toolset_of(&linker.program).is_some(),

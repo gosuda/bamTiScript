@@ -2164,16 +2164,15 @@ fn link_executable(
     })?;
 
     let mut command = linker.command(context, &temporary.object, &archive, &temporary.executable);
-    let program = linker.program();
     let output = capture_process_with_cancel(&mut command, cancel)
         .map_err(|source| DriverError::LinkStart {
-            program: program.clone(),
+            program: command.get_program().to_owned(),
             source,
         })?
         .ok_or(DriverError::Cancelled)?;
     if !output.status.success() {
         return Err(DriverError::LinkFailed {
-            program,
+            program: command.get_program().to_owned(),
             status: output.status,
             stderr: linker.diagnostics(&output),
         });
@@ -2189,10 +2188,6 @@ struct Linker {
 
 #[cfg(not(target_env = "msvc"))]
 impl Linker {
-    fn program(&self) -> OsString {
-        self.compiler.clone()
-    }
-
     fn command(
         &self,
         context: &ExecutionContext,
@@ -2229,20 +2224,7 @@ fn discover_linker(
 }
 
 #[cfg(target_env = "msvc")]
-use crate::windows_link::Linker;
-
-/// The system libraries that rustc says the embedded runtime archive needs, which
-/// the MSVC linker does not take from the archive.
-#[cfg(target_env = "msvc")]
-const NODE_NATIVE_LIBRARIES: &str = env!("BAMTS_NODE_NATIVE_LIBS");
-
-#[cfg(target_env = "msvc")]
-fn discover_linker(
-    context: &ExecutionContext,
-    cancel: &CancellationToken,
-) -> Result<Linker, DriverError> {
-    crate::windows_link::discover(context, cancel, NODE_NATIVE_LIBRARIES)
-}
+use crate::windows_link::discover as discover_linker;
 
 #[cfg(not(target_env = "msvc"))]
 fn discover_toolchain(

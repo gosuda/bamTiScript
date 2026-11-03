@@ -87,21 +87,35 @@ fn temp_dir_from_env(env: &BTreeMap<OsString, OsString>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
+/// The value of the variable `key`, found without regard to case: Windows spells
+/// the search path `Path`, and an environment map compares keys exactly.
+#[cfg(any(windows, test))]
+pub(crate) fn env_ignoring_case<'a>(
+    env: impl IntoIterator<Item = (&'a OsStr, &'a OsStr)>,
+    key: &str,
+) -> Option<&'a OsStr> {
+    env.into_iter()
+        .find(|(candidate, _)| candidate.to_string_lossy().eq_ignore_ascii_case(key))
+        .map(|(_, value)| value)
+}
+
 #[cfg(windows)]
 fn temp_dir_from_env(env: &BTreeMap<OsString, OsString>) -> PathBuf {
-    fn value<'a>(env: &'a BTreeMap<OsString, OsString>, key: &str) -> Option<&'a OsStr> {
-        env.iter()
-            .find(|(candidate, _)| candidate.to_string_lossy().eq_ignore_ascii_case(key))
-            .map(|(_, value)| value.as_os_str())
-    }
+    let value = |key: &str| {
+        env_ignoring_case(
+            env.iter()
+                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+            key,
+        )
+    };
 
     for key in ["TMP", "TEMP", "USERPROFILE"] {
-        if let Some(path) = value(env, key) {
+        if let Some(path) = value(key) {
             return PathBuf::from(path);
         }
     }
-    value(env, "SystemRoot")
-        .or_else(|| value(env, "WINDIR"))
+    value("SystemRoot")
+        .or_else(|| value("WINDIR"))
         .map(|root| PathBuf::from(root).join("Temp"))
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows\Temp"))
 }
