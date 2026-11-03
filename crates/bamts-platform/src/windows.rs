@@ -994,7 +994,9 @@ pub(crate) fn machine_facts() -> Result<MachineFacts> {
         RRF_RT_REG_SZ,
         1024,
     )?);
-    let microcode = registry_value(PROCESSOR_KEY, "Update Revision", RRF_RT_REG_BINARY, 16)?
+    // The buffer is far larger than any known form, so that a value of another length
+    // reaches `microcode_text` and reads as unavailable instead of failing the read.
+    let microcode = registry_value(PROCESSOR_KEY, "Update Revision", RRF_RT_REG_BINARY, 1024)?
         .and_then(|value| microcode_text(&value))
         .unwrap_or_else(|| UNAVAILABLE.to_owned());
     let (sockets, cores_per_socket) = processor_topology()?;
