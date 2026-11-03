@@ -785,6 +785,42 @@ mod tests {
     const TEST_RUN_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OTHER_RUN_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+    /// A fixture path written the Unix way, on the drive Windows needs to call it absolute.
+    fn abs(unix: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{}", unix.replace('/', "\\")))
+        } else {
+            PathBuf::from(unix)
+        }
+    }
+
+    /// A worker that outlives a 200 ms timeout: `sleep 2` on Unix, and on Windows
+    /// `ping` with three echoes, which are one second apart.
+    fn sleeping_worker() -> (PathBuf, Vec<OsString>) {
+        if cfg!(windows) {
+            let ping = windows_system_program("PING.EXE");
+            let args = ["-n", "3", "127.0.0.1"].map(OsString::from).to_vec();
+            (ping, args)
+        } else {
+            (PathBuf::from("/bin/sleep"), vec![OsString::from("2")])
+        }
+    }
+
+    /// A worker that exits with status 0 at once.
+    fn instant_worker() -> (PathBuf, Vec<OsString>) {
+        if cfg!(windows) {
+            let args = ["/C", "exit", "0"].map(OsString::from).to_vec();
+            (windows_system_program("cmd.exe"), args)
+        } else {
+            (PathBuf::from("/usr/bin/true"), Vec::new())
+        }
+    }
+
+    fn windows_system_program(name: &str) -> PathBuf {
+        let root = std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows");
+        PathBuf::from(root).join("System32").join(name)
+    }
+
     struct ScriptedExecutor {
         results: Vec<LaneProcessResult>,
         index: usize,
@@ -980,7 +1016,7 @@ mod tests {
             "case-0001",
         );
         let catalog = "typescript-7.0.2";
-        let root = PathBuf::from("/canonical/ts-suite");
+        let root = abs("/canonical/ts-suite");
         let pin = b"pin";
         let index = b"index";
         let ledger = b"ledger";
@@ -1028,7 +1064,7 @@ mod tests {
 
     #[test]
     fn snapshot_binding_matches_retained_bytes_not_sha256_alone() {
-        let root = PathBuf::from("/canonical/ts-suite");
+        let root = abs("/canonical/ts-suite");
         let bound = test_binding()
             .with_snapshot("typescript-7.0.2", &root, b"pin", b"index", b"ledger")
             .expect("bound");
@@ -1123,9 +1159,9 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&scratch).expect("scratch");
+        let (program, args) = sleeping_worker();
         let mut executor =
-            ProcessExecutor::new("/bin/sleep", vec![OsString::from("2")], "/", &scratch)
-                .with_max_output_bytes(64);
+            ProcessExecutor::new(program, args, abs("/"), &scratch).with_max_output_bytes(64);
         let item = key(
             ExecutionMode::Interpreter,
             "x86_64-unknown-linux-gnu",
@@ -1158,8 +1194,9 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&scratch).expect("scratch");
-        let mut executor = ProcessExecutor::new("/usr/bin/true", Vec::new(), "/", &scratch)
-            .with_max_output_bytes(64);
+        let (program, args) = instant_worker();
+        let mut executor =
+            ProcessExecutor::new(program, args, abs("/"), &scratch).with_max_output_bytes(64);
         let request = request(
             1,
             key(
@@ -1189,8 +1226,9 @@ mod tests {
         fs::create_dir_all(&scratch).expect("scratch");
         let retained = scratch.join(format!("lane-{TEST_RUN_ID}-1.response.json"));
         fs::write(&retained, b"stale").expect("retained response");
-        let mut executor = ProcessExecutor::new("/usr/bin/true", Vec::new(), "/", &scratch)
-            .with_max_output_bytes(64);
+        let (program, args) = instant_worker();
+        let mut executor =
+            ProcessExecutor::new(program, args, abs("/"), &scratch).with_max_output_bytes(64);
         let item = key(
             ExecutionMode::Interpreter,
             "x86_64-unknown-linux-gnu",
