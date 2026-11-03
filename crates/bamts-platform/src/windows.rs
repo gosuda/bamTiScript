@@ -1429,6 +1429,36 @@ mod tests {
             assert_eq!(process_regions(pid), Err(PlatformError::ProcessGone(pid)));
         }
 
+        #[test]
+        fn a_failed_read_is_classified_by_whether_the_process_lives() {
+            let own = Process::open(std::process::id()).expect("own process");
+            for code in [ERROR_ACCESS_DENIED, ERROR_PARTIAL_COPY] {
+                let error = std::io::Error::from_raw_os_error(code);
+                assert_eq!(
+                    own.failure("read", &error),
+                    PlatformError::NoAddressSpace(own.pid)
+                );
+            }
+            let other = std::io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER);
+            assert_eq!(
+                own.failure("read", &other),
+                PlatformError::Read {
+                    source: "read".to_owned(),
+                    detail: other.to_string(),
+                }
+            );
+
+            let mut child = waiting_child();
+            let gone = Process::open(child.id()).expect("child process");
+            drop(child.stdin.take());
+            child.wait().expect("child exits");
+            let denied = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED);
+            assert_eq!(
+                gone.failure("read", &denied),
+                PlatformError::ProcessGone(gone.pid)
+            );
+        }
+
         fn parse_cpu_list(text: &str) -> std::collections::BTreeSet<u32> {
             text.split(',')
                 .flat_map(|part| match part.split_once('-') {
@@ -1504,12 +1534,25 @@ mod tests {
                 fn SetThreadAffinityMask(thread: ffi::Handle, mask: usize) -> usize;
             }
             std::thread::spawn(|| {
+                // The process may be limited to other CPUs than the first, so pin to
+                // the lowest CPU that the thread may use now.
+                let first = *parse_cpu_list(&cpu_affinity().expect("affinity"))
+                    .first()
+                    .expect("an allowed CPU");
+                let mut group = ffi::GroupAffinity::default();
                 // SAFETY: the pseudo-handle of the calling thread needs no closing,
-                // and the mask names one CPU of the first group.
+                // and `group` is a live, writable `GROUP_AFFINITY`.
                 #[allow(unsafe_code)]
-                let before = unsafe { SetThreadAffinityMask(ffi::GetCurrentThread(), 1) };
+                let status =
+                    unsafe { ffi::GetThreadGroupAffinity(ffi::GetCurrentThread(), &raw mut group) };
+                assert_ne!(status, 0, "the host did not name the thread's CPUs");
+                let lowest = 1_usize << group.mask.trailing_zeros();
+                // SAFETY: the pseudo-handle of the calling thread needs no closing,
+                // and the mask names one CPU of the group the thread is in.
+                #[allow(unsafe_code)]
+                let before = unsafe { SetThreadAffinityMask(ffi::GetCurrentThread(), lowest) };
                 assert_ne!(before, 0, "the host refused to pin the thread");
-                assert_eq!(cpu_affinity().expect("affinity"), "0");
+                assert_eq!(cpu_affinity().expect("affinity"), first.to_string());
             })
             .join()
             .expect("the pinned thread");
