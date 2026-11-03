@@ -24,7 +24,7 @@
 use std::{
     collections::BTreeSet,
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     io::{ErrorKind, Read},
     path::{Component, Path, PathBuf},
@@ -1913,19 +1913,17 @@ fn locate_node() -> Result<PathBuf> {
             "PATH is unset; cannot locate the Node oracle",
         )
     })?;
-    for dir in env::split_paths(&path) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let candidate = dir.join("node");
-        if is_executable_file(&candidate) {
-            return Ok(candidate);
-        }
-    }
-    Err(VerificationError::new(
-        ErrorCode::ToolMissing,
-        "cannot locate `node` on PATH",
-    ))
+    find_node_in(&path).ok_or_else(|| {
+        VerificationError::new(ErrorCode::ToolMissing, "cannot locate `node` on PATH")
+    })
+}
+
+fn find_node_in(search_path: &OsStr) -> Option<PathBuf> {
+    let file_name = if cfg!(windows) { "node.exe" } else { "node" };
+    env::split_paths(search_path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(file_name))
+        .find(|candidate| is_executable_file(candidate))
 }
 
 #[cfg(unix)]
@@ -2261,6 +2259,34 @@ mod tests {
             &limits,
         )
         .expect("oracle run")
+    }
+
+    #[test]
+    fn node_is_found_by_the_file_name_the_platform_gives_it() {
+        let decoys = scratch("node-decoys");
+        let installed = scratch("node-installed");
+        let (native, foreign) = if cfg!(windows) {
+            ("node.exe", "node")
+        } else {
+            ("node", "node.exe")
+        };
+        fs::write(decoys.join(foreign), b"").expect("write foreign-named file");
+        let binary = installed.join(native);
+        fs::write(&binary, b"").expect("write stand-in binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+                .expect("mark stand-in executable");
+        }
+
+        let search = env::join_paths([&decoys, &installed]).expect("join search path");
+        assert_eq!(find_node_in(&search), Some(binary));
+        let search = env::join_paths([&decoys]).expect("join search path");
+        assert_eq!(find_node_in(&search), None);
+
+        fs::remove_dir_all(decoys).expect("remove decoys");
+        fs::remove_dir_all(installed).expect("remove installed");
     }
 
     // ---- execution modes --------------------------------------------------
