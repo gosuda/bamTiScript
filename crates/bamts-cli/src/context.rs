@@ -110,6 +110,9 @@ fn temp_dir_from_env(env: &BTreeMap<OsString, OsString>) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// The variable that names the temporary directory on this platform.
+    const TEMP_VARIABLE: &str = if cfg!(windows) { "TMP" } else { "TMPDIR" };
+
     #[test]
     fn explicit_context_resolves_relative_and_empty_temp_paths_from_cwd() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -119,7 +122,7 @@ mod tests {
         ] {
             let context = ExecutionContext::new(
                 directory.path(),
-                BTreeMap::from([(OsString::from("TMPDIR"), value)]),
+                BTreeMap::from([(OsString::from(TEMP_VARIABLE), value)]),
             )
             .expect("execution context");
             assert_eq!(context.temp_dir(), expected);
