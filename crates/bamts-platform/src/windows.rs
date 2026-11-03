@@ -374,6 +374,7 @@ mod ffi {
         pub(super) fn CloseHandle(object: Handle) -> i32;
         pub(super) fn WaitForSingleObject(object: Handle, milliseconds: u32) -> u32;
         pub(super) fn GetCurrentProcess() -> Handle;
+        pub(super) fn GetLogicalDrives() -> u32;
         pub(super) fn VirtualQueryEx(
             process: Handle,
             address: *const c_void,
@@ -631,11 +632,21 @@ fn wide(text: &str) -> Vec<u16> {
 
 /// Maps each drive letter to its NT device, so a mapped file name can be shown as
 /// the path a program opens. A letter with no device is left out.
+///
+/// Only the letters that `GetLogicalDrives` reports are asked. If it reports none,
+/// every letter is asked, as a host that cannot list its drives may still map them.
 #[cfg(target_os = "windows")]
 fn dos_devices() -> Vec<DosDevice> {
+    // SAFETY: `GetLogicalDrives` takes no arguments and returns a bit mask, with
+    // bit 0 for `A:`.
+    #[allow(unsafe_code)]
+    let logical_drives = unsafe { ffi::GetLogicalDrives() };
     let mut buffer = [0_u16; 1024];
     let mut devices = Vec::new();
-    for letter in 'A'..='Z' {
+    for (bit, letter) in ('A'..='Z').enumerate() {
+        if logical_drives != 0 && logical_drives & (1 << bit) == 0 {
+            continue;
+        }
         let drive = format!("{letter}:");
         let name = wide(&drive);
         let capacity = u32::try_from(buffer.len()).expect("the buffer fits a DWORD");
