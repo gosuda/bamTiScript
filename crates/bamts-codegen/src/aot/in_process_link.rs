@@ -683,8 +683,6 @@ fn elf_relocation_type(relocation: &Relocation) -> Option<u32> {
     }
 }
 
-/// Whether the relocation reads its symbol through a GOT entry instead of
-/// addressing the symbol directly.
 /// A GOT slot: the symbol and the addend its stored address includes.
 type GotEntry = (SymbolIndex, i64);
 
@@ -698,6 +696,8 @@ fn got_entry_addend(relocation: &Relocation) -> i64 {
     }
 }
 
+/// Whether the relocation reads its symbol through a GOT entry instead of
+/// addressing the symbol directly.
 fn needs_got_entry(relocation: &Relocation) -> bool {
     relocation.kind() == RelocationKind::GotRelative
         || matches!(
