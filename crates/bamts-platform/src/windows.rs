@@ -453,6 +453,8 @@ const WAIT_TIMEOUT: u32 = 0x102;
 #[cfg(target_os = "windows")]
 const OPEN_SOURCE: &str = "OpenProcess";
 #[cfg(target_os = "windows")]
+const WAIT_SOURCE: &str = "WaitForSingleObject";
+#[cfg(target_os = "windows")]
 const REGION_SOURCE: &str = "VirtualQueryEx";
 #[cfg(target_os = "windows")]
 const MEMORY_SOURCE: &str = "GetProcessMemoryInfo";
@@ -518,7 +520,7 @@ impl Process {
         match wait {
             WAIT_OBJECT_0 => Ok(true),
             WAIT_TIMEOUT => Ok(false),
-            _ => Err(read_error(OPEN_SOURCE, &std::io::Error::last_os_error())),
+            _ => Err(read_error(WAIT_SOURCE, &std::io::Error::last_os_error())),
         }
     }
 
@@ -1279,12 +1281,26 @@ mod tests {
         assert!(packages_and_cores(&uneven).is_err());
         assert!(packages_and_cores(&records(&[(RELATION_PROCESSOR_CORE, 48)])).is_err());
         assert!(packages_and_cores(&[]).is_err());
-        // A header cut short, a size below the header, and a size past the end.
+        // A header cut short, and a size past the end. A size below the header is
+        // the subject of a test of its own.
         assert!(packages_and_cores(&[3, 0, 0, 0, 8]).is_err());
         assert!(packages_and_cores(&records(&[(RELATION_PROCESSOR_PACKAGE, 4)])).is_err());
         let mut overrun = record(RELATION_PROCESSOR_PACKAGE, 32);
         overrun.truncate(20);
         assert!(packages_and_cores(&overrun).is_err());
+    }
+
+    #[test]
+    fn a_record_smaller_than_its_header_ends_the_walk_with_an_error() {
+        // The header is whole and its size field is below the size of a header. A
+        // size of zero would leave the offset where it is and the walk would not end.
+        for size in [0_u32, 4, 7] {
+            let mut header = Vec::new();
+            header.extend(RELATION_PROCESSOR_PACKAGE.to_le_bytes());
+            header.extend(size.to_le_bytes());
+            let error = split_records(&header).unwrap_err();
+            assert!(error.contains(&format!("has size {size}")), "{error}");
+        }
     }
 
     #[test]
