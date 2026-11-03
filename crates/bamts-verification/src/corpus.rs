@@ -1804,7 +1804,9 @@ pub(crate) fn run_process(
 
     Ok(OracleOutcome {
         timed_out,
-        exit_code: status.code(),
+        // A child the harness killed has no exit code of its own: Unix reports
+        // the signal, and Windows would report the 1 that `TerminateProcess` sets.
+        exit_code: if timed_out { None } else { status.code() },
         signal: termination_signal(&status),
         stdout,
         stdout_truncated,
