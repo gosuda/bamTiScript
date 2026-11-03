@@ -1748,6 +1748,7 @@ pub(crate) fn run_process(
     for (key, value) in environment {
         command.env(key, value);
     }
+    forward_host_runtime_env(&mut command);
     command
         .current_dir(cwd)
         .args(args)
@@ -1888,6 +1889,22 @@ fn termination_signal(status: &ExitStatus) -> Option<i32> {
 fn termination_signal(_status: &ExitStatus) -> Option<i32> {
     None
 }
+
+/// Windows resolves hosts, loads system libraries and seeds randomness through
+/// `SystemRoot`; a child started without it fails (`curl` cannot resolve any
+/// name). Neither variable reaches the guest program's observable state, so
+/// they stay out of `NORMALIZED_ENV`, which evidence records byte for byte.
+#[cfg(windows)]
+fn forward_host_runtime_env(command: &mut Command) {
+    for key in ["SystemRoot", "windir"] {
+        if let Some(value) = env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn forward_host_runtime_env(_command: &mut Command) {}
 
 fn locate_node() -> Result<PathBuf> {
     let path = env::var_os("PATH").ok_or_else(|| {
@@ -2868,6 +2885,27 @@ mod tests {
             },
         );
         assert_eq!(outcome.stdout, b"UTC,1,undefined");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_children_keep_the_host_system_root() {
+        let dir = scratch("system-root");
+        let outcome = run_process(
+            "SystemRoot probe",
+            Path::new("cmd.exe"),
+            &dir,
+            &[],
+            &["/D", "/C", "echo %SystemRoot%"].map(OsString::from),
+            &OracleLimits {
+                timeout: Duration::from_secs(10),
+                max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            },
+        )
+        .expect("run cmd.exe");
+        let expected = env::var("SystemRoot").expect("host SystemRoot");
+        assert_eq!(String::from_utf8_lossy(&outcome.stdout).trim(), expected);
         let _ = fs::remove_dir_all(&dir);
     }
 
