@@ -78,10 +78,12 @@ fn installation_path(vswhere_output: &str) -> Option<PathBuf> {
 fn toolset_of(linker: &Path) -> Option<PathBuf> {
     let host = linker.parent()?.parent()?;
     let binaries = host.parent()?;
-    let is_host = host
-        .file_name()?
-        .to_str()
-        .is_some_and(|name| name.len() > 4 && name[..4].eq_ignore_ascii_case("host"));
+    let is_host = host.file_name()?.to_str().is_some_and(|name| {
+        name.len() > 4
+            && name
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("host"))
+    });
     (is_host && binaries.file_name()?.eq_ignore_ascii_case("bin"))
         .then(|| binaries.parent().map(Path::to_path_buf))?
 }
@@ -305,6 +307,8 @@ fn ask_for_help(
 
 /// The linker that `BAMTS_LINKER` names. It is taken as it is: any program that
 /// starts is accepted, so a compatible linker such as `lld-link.exe` can be named.
+/// The library path is worked out only for a linker in a Visual Studio layout, so
+/// any other linker finds its libraries through the `LIB` of the context.
 #[cfg(target_env = "msvc")]
 fn explicit_linker(
     context: &ExecutionContext,
@@ -562,6 +566,15 @@ mod tests {
         assert_eq!(toolset_of(Path::new("tools/link.exe")), None);
         assert_eq!(toolset_of(Path::new("llvm/bin/x64/lld/link.exe")), None);
         assert_eq!(toolset_of(Path::new("link.exe")), None);
+    }
+
+    #[test]
+    fn a_directory_name_that_is_not_ascii_is_not_a_host_directory() {
+        // Byte 4 of each name is inside a character, so slicing there would panic.
+        for name in ["Café", "개발"] {
+            let linker = PathBuf::from("root").join("bin").join(name).join("x64");
+            assert_eq!(toolset_of(&linker.join("link.exe")), None, "{name}");
+        }
     }
 
     #[test]
