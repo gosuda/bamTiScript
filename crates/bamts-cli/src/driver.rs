@@ -3355,7 +3355,9 @@ exit 2
         let id = NEXT_TSC_TEST_ID.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("bamts-tsc-emit-{}-{id}.ts", std::process::id()));
-        let emitted = path.with_extension("");
+        // The emitted executable has the platform's executable extension: none on
+        // Unix, `exe` on Windows.
+        let emitted = path.with_extension(std::env::consts::EXE_EXTENSION);
         std::fs::write(&path, "const value: number = \"text\";\n").expect("write source");
 
         let outcome = execute_tsc(
