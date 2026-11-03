@@ -780,6 +780,7 @@ fn ignore_pass_attempt(body: Option<&[u8]>, cause: &str) -> String {
 mod tests {
     use super::*;
     use crate::shard::ExecutionMode;
+    use crate::test_programs::windows_system_program;
     use std::collections::BTreeMap;
 
     const TEST_RUN_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -814,11 +815,6 @@ mod tests {
         } else {
             (PathBuf::from("/usr/bin/true"), Vec::new())
         }
-    }
-
-    fn windows_system_program(name: &str) -> PathBuf {
-        let root = std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows");
-        PathBuf::from(root).join("System32").join(name)
     }
 
     struct ScriptedExecutor {

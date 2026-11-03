@@ -1156,8 +1156,7 @@ requires="live map captured"
     /// status 0: `cat` on Unix, `sort` from the system directory on Windows.
     fn idle_program() -> PathBuf {
         if cfg!(windows) {
-            let root = std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows");
-            PathBuf::from(root).join("System32").join("sort.exe")
+            crate::test_programs::windows_system_program("sort.exe")
         } else {
             PathBuf::from("/bin/cat")
         }

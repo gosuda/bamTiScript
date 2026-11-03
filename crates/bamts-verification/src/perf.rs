@@ -2601,12 +2601,8 @@ mod tests {
     /// `ping` with two echoes, which are one second apart.
     fn short_lived_child() -> Command {
         if cfg!(windows) {
-            let root = std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows");
-            let mut command = Command::new(
-                std::path::PathBuf::from(root)
-                    .join("System32")
-                    .join("PING.EXE"),
-            );
+            let mut command =
+                Command::new(crate::test_programs::windows_system_program("PING.EXE"));
             command
                 .args(["-n", "2", "127.0.0.1"])
                 .stdout(std::process::Stdio::null());
