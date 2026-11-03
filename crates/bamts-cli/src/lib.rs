@@ -8,3 +8,5 @@ pub mod diagnostics;
 pub mod driver;
 pub mod lsp;
 pub mod output;
+#[cfg(any(target_env = "msvc", test))]
+mod windows_link;

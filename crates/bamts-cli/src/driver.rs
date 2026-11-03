@@ -1956,7 +1956,7 @@ fn populate_node_environment(
     Ok(())
 }
 
-fn capture_process_with_cancel(
+pub(crate) fn capture_process_with_cancel(
     command: &mut Command,
     cancel: &CancellationToken,
 ) -> io::Result<Option<Output>> {
@@ -2156,41 +2156,95 @@ fn link_executable(
         source,
     })?;
     let archive = cached_node_archive(context)?;
-    let compiler = discover_toolchain(context, cancel)?;
+    let linker = discover_linker(context, cancel)?;
     let temporary = TemporaryLinkFiles::create(parent, &destination)?;
     fs::write(&temporary.object, object).map_err(|source| DriverError::WriteObject {
         path: temporary.object.clone(),
         source,
     })?;
 
-    let mut command = Command::new(&compiler);
-    command
-        .current_dir(context.cwd())
-        .env_clear()
-        .envs(context.envs())
-        .arg(&temporary.object)
-        .arg(&archive)
-        .arg("-o")
-        .arg(&temporary.executable);
-    if cfg!(target_os = "linux") {
-        command.args(["-ldl", "-lpthread", "-lm"]);
-    }
+    let mut command = linker.command(context, &temporary.object, &archive, &temporary.executable);
+    let program = linker.program();
     let output = capture_process_with_cancel(&mut command, cancel)
         .map_err(|source| DriverError::LinkStart {
-            program: compiler.clone(),
+            program: program.clone(),
             source,
         })?
         .ok_or(DriverError::Cancelled)?;
     if !output.status.success() {
         return Err(DriverError::LinkFailed {
-            program: compiler,
+            program,
             status: output.status,
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stderr: linker.diagnostics(&output),
         });
     }
     publish_linked_executable(&temporary.executable, &destination)
 }
 
+/// The system C compiler that links on every host except Windows MSVC.
+#[cfg(not(target_env = "msvc"))]
+struct Linker {
+    compiler: OsString,
+}
+
+#[cfg(not(target_env = "msvc"))]
+impl Linker {
+    fn program(&self) -> OsString {
+        self.compiler.clone()
+    }
+
+    fn command(
+        &self,
+        context: &ExecutionContext,
+        object: &Path,
+        archive: &Path,
+        executable: &Path,
+    ) -> Command {
+        let mut command = Command::new(&self.compiler);
+        command
+            .current_dir(context.cwd())
+            .env_clear()
+            .envs(context.envs())
+            .arg(object)
+            .arg(archive)
+            .arg("-o")
+            .arg(executable);
+        if cfg!(target_os = "linux") {
+            command.args(["-ldl", "-lpthread", "-lm"]);
+        }
+        command
+    }
+
+    fn diagnostics(&self, output: &Output) -> String {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+}
+
+#[cfg(not(target_env = "msvc"))]
+fn discover_linker(
+    context: &ExecutionContext,
+    cancel: &CancellationToken,
+) -> Result<Linker, DriverError> {
+    discover_toolchain(context, cancel).map(|compiler| Linker { compiler })
+}
+
+#[cfg(target_env = "msvc")]
+use crate::windows_link::Linker;
+
+/// The system libraries that rustc says the embedded runtime archive needs, which
+/// the MSVC linker does not take from the archive.
+#[cfg(target_env = "msvc")]
+const NODE_NATIVE_LIBRARIES: &str = env!("BAMTS_NODE_NATIVE_LIBS");
+
+#[cfg(target_env = "msvc")]
+fn discover_linker(
+    context: &ExecutionContext,
+    cancel: &CancellationToken,
+) -> Result<Linker, DriverError> {
+    crate::windows_link::discover(context, cancel, NODE_NATIVE_LIBRARIES)
+}
+
+#[cfg(not(target_env = "msvc"))]
 fn discover_toolchain(
     context: &ExecutionContext,
     cancel: &CancellationToken,
@@ -2201,6 +2255,7 @@ fn discover_toolchain(
     probe_toolchain_in_context(program, context, cancel)
 }
 
+#[cfg(any(test, not(target_env = "msvc")))]
 fn probe_toolchain_in_context(
     program: OsString,
     context: &ExecutionContext,
