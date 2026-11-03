@@ -1,2 +1,6 @@
+# Digests under corpus/ and vendor/ pin the exact bytes of text files, so a
+# checkout must not rewrite line endings, whatever core.autocrlf says.
+* text=auto eol=lf
+
 # Upstream performance fixtures are immutable byte artifacts.
 perf/fixtures/upstream/* -text
