@@ -1892,11 +1892,13 @@ fn termination_signal(_status: &ExitStatus) -> Option<i32> {
 
 /// Windows resolves hosts, loads system libraries and seeds randomness through
 /// `SystemRoot`; a child started without it fails (`curl` cannot resolve any
-/// name). Neither variable reaches the guest program's observable state, so
-/// they stay out of `NORMALIZED_ENV`, which evidence records byte for byte.
+/// name). It also finds its temporary directory only through `TEMP` and `TMP`;
+/// without them `std::env::temp_dir()` is the system directory, which an
+/// unprivileged process cannot write. These variables are host plumbing and
+/// stay out of `NORMALIZED_ENV`, which evidence records byte for byte.
 #[cfg(windows)]
 fn forward_host_runtime_env(command: &mut Command) {
-    for key in ["SystemRoot", "windir"] {
+    for key in ["SystemRoot", "windir", "TEMP", "TMP"] {
         if let Some(value) = env::var_os(key) {
             command.env(key, value);
         }
