@@ -51,8 +51,13 @@ fn set_read_only(path: &Path, read_only: bool) -> io::Result<()> {
     std::fs::set_permissions(path, permissions)
 }
 
-/// Flushes the directory entry list at `path`. Windows has no directory flush:
-/// a directory cannot be opened for writing, and NTFS journals the rename itself.
+/// Flushes the directory entry list at `path`.
+///
+/// Windows is skipped. `std` cannot open a directory there; a handle opened with
+/// `FILE_FLAG_BACKUP_SEMANTICS` for writing can be flushed on NTFS, but this code
+/// does not do that. NTFS journals the rename, which is not a promise that the
+/// rename is on disk after a power loss, so a rename that has returned is
+/// slightly less durable on Windows than on other hosts.
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     if cfg!(windows) {
         return Ok(());

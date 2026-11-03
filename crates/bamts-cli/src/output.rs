@@ -438,7 +438,10 @@ impl AtomicFs for StdAtomicFs {
     }
 
     fn sync_dir(&mut self, dir: &Path) -> Result<(), Self::Error> {
-        // Windows cannot open a directory for flushing; NTFS journals the rename itself.
+        // Windows is skipped: `File::open` cannot open a directory there. A handle
+        // opened with `FILE_FLAG_BACKUP_SEMANTICS` for writing can be flushed on
+        // NTFS, but this code does not do that. NTFS journals the rename, which is
+        // not a promise that it is on disk after a power loss.
         if cfg!(windows) {
             return Ok(());
         }
