@@ -441,6 +441,16 @@ const ERROR_INVALID_PARAMETER: i32 = 87;
 /// `ERROR_PARTIAL_COPY`: the process went away in the middle of a read.
 #[cfg(target_os = "windows")]
 const ERROR_PARTIAL_COPY: i32 = 299;
+/// `ERROR_UNEXP_NET_ERR`: what `GetMappedFileNameW` answers for an address at which
+/// no file is mapped, as when the file was unmapped after the region was listed.
+#[cfg(target_os = "windows")]
+const ERROR_UNEXP_NET_ERR: i32 = 59;
+
+/// How often a walk looks again at a region whose file was unmapped while the walk
+/// asked for its name. A region that still has no file after this is listed without
+/// a path, so memory that keeps changing is never left out of the walk.
+#[cfg(target_os = "windows")]
+const UNMAPPED_LOOKUPS: u32 = 8;
 
 /// `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE`.
 #[cfg(target_os = "windows")]
@@ -482,6 +492,19 @@ fn malformed(source: impl Into<String>, detail: impl Into<String>) -> PlatformEr
         source: source.into(),
         detail: detail.into(),
     }
+}
+
+/// What the host says about the file behind an allocation.
+#[cfg(target_os = "windows")]
+#[derive(Debug, PartialEq, Eq)]
+enum Backing {
+    /// The NT path of the file.
+    File(String),
+    /// The allocation has no file, as with memory that processes share through the
+    /// page file.
+    Anonymous,
+    /// No file is mapped at the address any more.
+    Unmapped,
 }
 
 /// An open process handle, closed on drop.
@@ -570,9 +593,11 @@ impl Process {
         }
     }
 
-    /// The NT path of the file that backs the allocation at `address`.
-    fn mapped_file(&self, address: usize, buffer: &mut [u16]) -> Option<String> {
-        let capacity = u32::try_from(buffer.len()).ok()?;
+    /// Asks for the file that backs the allocation at `address`.
+    fn mapped_file(&self, address: usize, buffer: &mut [u16]) -> Backing {
+        let Ok(capacity) = u32::try_from(buffer.len()) else {
+            return Backing::Anonymous;
+        };
         // SAFETY: `buffer` is live and writable for `capacity` UTF-16 units, the
         // size the host is told. `address` is only looked up, never read.
         #[allow(unsafe_code)]
@@ -584,10 +609,16 @@ impl Process {
                 capacity,
             )
         };
-        // Zero is no name. A full buffer was cut short, and a cut name names nothing.
-        let written = usize::try_from(written).ok()?;
-        (written != 0 && written < buffer.len())
-            .then(|| String::from_utf16_lossy(&buffer[..written]))
+        let error = std::io::Error::last_os_error();
+        match written as usize {
+            0 if error.raw_os_error() == Some(ERROR_UNEXP_NET_ERR) => Backing::Unmapped,
+            // A full buffer was cut short, and a cut name names nothing.
+            0 => Backing::Anonymous,
+            length if length < buffer.len() => {
+                Backing::File(String::from_utf16_lossy(&buffer[..length]))
+            }
+            _ => Backing::Anonymous,
+        }
     }
 
     /// Why a walk found no region at all: the process has ended, or it has no
@@ -691,6 +722,7 @@ pub(crate) fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>> {
     let mut names: HashMap<usize, Option<String>> = HashMap::new();
     let mut regions = Vec::new();
     let mut address = 0_usize;
+    let mut unmapped_lookups = 0_u32;
     loop {
         let info = match process.query(address) {
             Ok(Some(info)) => info,
@@ -702,34 +734,43 @@ pub(crate) fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>> {
             .checked_add(info.region_size)
             .filter(|next| *next > address)
             .ok_or_else(|| malformed(REGION_SOURCE, "region walk does not advance"))?;
-        address = next;
-        if info.state != MEM_COMMIT {
-            continue;
+        if info.state == MEM_COMMIT {
+            let backed = info.kind == MEM_IMAGE || info.kind == MEM_MAPPED;
+            let path = if !backed {
+                None
+            } else if let Some(known) = names.get(&info.allocation_base) {
+                known.clone()
+            } else {
+                let name = match process.mapped_file(info.allocation_base, &mut name_buffer) {
+                    Backing::File(nt_path) => Some(dos_path(&nt_path, &devices)),
+                    Backing::Anonymous => None,
+                    // The file was unmapped after the region was listed. Ask for the
+                    // region again: it is gone, or it is a new one. Naming it as
+                    // memory without a file would make a library that unloads look
+                    // like anonymous code.
+                    Backing::Unmapped if unmapped_lookups < UNMAPPED_LOOKUPS => {
+                        unmapped_lookups += 1;
+                        continue;
+                    }
+                    Backing::Unmapped => None,
+                };
+                names.insert(info.allocation_base, name.clone());
+                name
+            };
+            regions.push(MemoryRegion {
+                identity: region_identity(
+                    info.base_address as u64,
+                    next as u64,
+                    info.allocation_base as u64,
+                    info.kind,
+                    path.as_deref().unwrap_or(""),
+                ),
+                permissions: permissions_string(info.protect),
+                pathname: path,
+            });
         }
-        let backed = info.kind == MEM_IMAGE || info.kind == MEM_MAPPED;
-        let path = if backed {
-            names
-                .entry(info.allocation_base)
-                .or_insert_with(|| {
-                    process
-                        .mapped_file(info.allocation_base, &mut name_buffer)
-                        .map(|nt_path| dos_path(&nt_path, &devices))
-                })
-                .clone()
-        } else {
-            None
-        };
-        regions.push(MemoryRegion {
-            identity: region_identity(
-                info.base_address as u64,
-                next as u64,
-                info.allocation_base as u64,
-                info.kind,
-                path.as_deref().unwrap_or(""),
-            ),
-            permissions: permissions_string(info.protect),
-            pathname: path,
-        });
+        address = next;
+        unmapped_lookups = 0;
     }
     if regions.is_empty() {
         return Err(process.without_regions()?);
@@ -1385,14 +1426,113 @@ mod tests {
             .expect("start sort.exe")
         }
 
-        fn permissions_at(regions: &[MemoryRegion], address: usize) -> Option<&str> {
-            regions.iter().find_map(|region| {
-                let range = region.identity.split_whitespace().next()?;
-                let (start, end) = range.split_once('-')?;
-                let start = usize::from_str_radix(start, 16).ok()?;
-                let end = usize::from_str_radix(end, 16).ok()?;
-                (start <= address && address < end).then_some(region.permissions.as_str())
+        fn region_at(regions: &[MemoryRegion], address: usize) -> Option<&MemoryRegion> {
+            regions.iter().find(|region| {
+                let range = region.identity.split_whitespace().next();
+                let Some((start, end)) = range.and_then(|range| range.split_once('-')) else {
+                    return false;
+                };
+                matches!(
+                    (usize::from_str_radix(start, 16), usize::from_str_radix(end, 16)),
+                    (Ok(start), Ok(end)) if start <= address && address < end
+                )
             })
+        }
+
+        fn permissions_at(regions: &[MemoryRegion], address: usize) -> Option<&str> {
+            region_at(regions, address).map(|region| region.permissions.as_str())
+        }
+
+        /// A view of page-file memory, which no file backs: `(section, view address)`.
+        fn shared_view() -> (ffi::Handle, usize) {
+            #[link(name = "kernel32")]
+            #[allow(unsafe_code)]
+            unsafe extern "system" {
+                fn CreateFileMappingW(
+                    file: ffi::Handle,
+                    attributes: *mut std::ffi::c_void,
+                    protect: u32,
+                    size_high: u32,
+                    size_low: u32,
+                    name: *const u16,
+                ) -> ffi::Handle;
+                fn MapViewOfFile(
+                    section: ffi::Handle,
+                    access: u32,
+                    offset_high: u32,
+                    offset_low: u32,
+                    bytes: usize,
+                ) -> *mut std::ffi::c_void;
+            }
+            const PAGE_READWRITE: u32 = 0x04;
+            const FILE_MAP_WRITE: u32 = 0x02;
+            // SAFETY: `INVALID_HANDLE_VALUE` asks for page-file memory, and the null
+            // attributes and name are allowed. The call keeps no pointer.
+            #[allow(unsafe_code)]
+            let section = unsafe {
+                CreateFileMappingW(
+                    -1_isize as ffi::Handle,
+                    std::ptr::null_mut(),
+                    PAGE_READWRITE,
+                    0,
+                    4096,
+                    std::ptr::null(),
+                )
+            };
+            assert!(!section.is_null(), "the host made no section");
+            // SAFETY: `section` is the live section made above.
+            #[allow(unsafe_code)]
+            let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 4096) };
+            assert!(!view.is_null(), "the host mapped no view");
+            (section, view as usize)
+        }
+
+        /// Unmaps the view of [`shared_view`] and closes its section.
+        fn unmap(section: ffi::Handle, view: usize) {
+            #[link(name = "kernel32")]
+            #[allow(unsafe_code)]
+            unsafe extern "system" {
+                fn UnmapViewOfFile(view: *const std::ffi::c_void) -> i32;
+            }
+            // SAFETY: `view` is the live view of `section`, and neither is used
+            // again. The section handle is owned by the caller.
+            #[allow(unsafe_code)]
+            unsafe {
+                assert_ne!(UnmapViewOfFile(view as *const std::ffi::c_void), 0);
+                ffi::CloseHandle(section);
+            }
+        }
+
+        #[test]
+        fn the_host_tells_a_file_from_memory_without_a_file_from_nothing() {
+            let own = Process::open(std::process::id()).expect("own process");
+            let mut buffer = vec![0_u16; 1024];
+            let code =
+                the_host_tells_a_file_from_memory_without_a_file_from_nothing as fn() as usize;
+            match own.mapped_file(code, &mut buffer) {
+                Backing::File(path) => assert!(path.starts_with("\\Device\\"), "{path}"),
+                other => panic!("the test image has no file: {other:?}"),
+            }
+
+            let (section, view) = shared_view();
+            assert_eq!(own.mapped_file(view, &mut buffer), Backing::Anonymous);
+            unmap(section, view);
+            assert_eq!(own.mapped_file(view, &mut buffer), Backing::Unmapped);
+
+            let mut short = vec![0_u16; 4];
+            assert_eq!(own.mapped_file(code, &mut short), Backing::Anonymous);
+        }
+
+        #[test]
+        fn memory_without_a_file_is_listed_without_a_path() {
+            let (section, view) = shared_view();
+            let regions = process_regions(std::process::id()).expect("own regions");
+            unmap(section, view);
+
+            let region = region_at(&regions, view).expect("the view is listed");
+            assert_eq!(region.pathname, None);
+            assert_eq!(region.permissions, "rw-p");
+            assert!(region.identity.contains(" mapped"), "{}", region.identity);
         }
 
         #[test]
