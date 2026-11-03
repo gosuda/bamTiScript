@@ -651,6 +651,26 @@ fn aot_fixture_matches_jit_stdout_and_exit_code() {
     assert_eq!(output.stdout, EXPECTED_STDOUT);
 }
 
+/// `/BREPRO` leaves the link time out of the file, so the Microsoft linker gives the
+/// same bytes for the same inputs. The test pins the flag, which only it can set.
+#[cfg(target_env = "msvc")]
+#[test]
+fn aot_executables_for_the_same_source_have_the_same_bytes() {
+    let directory = ScratchDirectory::new();
+    let mut images = Vec::new();
+    for name in ["first", "second"] {
+        let executable = directory
+            .path
+            .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        let compile = directory.emit(&fixture().to_string_lossy(), &executable);
+        assert_success(&compile, "bamts tsc-compatible emit");
+        images.push(fs::read(&executable).expect("the linked executable"));
+        // The link time has a resolution of one second.
+        std::thread::sleep(Duration::from_millis(1100));
+    }
+    assert!(images[0] == images[1], "the two executables differ");
+}
+
 #[test]
 fn jit_runs_two_module_program_with_live_imported_mutation() {
     let project = ScratchDirectory::new();

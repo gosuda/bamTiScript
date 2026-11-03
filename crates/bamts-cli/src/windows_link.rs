@@ -815,6 +815,75 @@ mod tests {
             );
         }
 
+        fn system_program(name: &str) -> PathBuf {
+            let root = std::env::var_os("SystemRoot").expect("SystemRoot");
+            PathBuf::from(root).join("System32").join(name)
+        }
+
+        /// A `link.exe` in `directory` that prints the banner of the Microsoft linker
+        /// and nothing else, so it is told apart from the one of Visual Studio.
+        fn banner_linker(directory: &Path) -> PathBuf {
+            let source = directory.join("banner_linker.rs");
+            std::fs::write(
+                &source,
+                format!("fn main() {{ println!(\"{BANNER} Version 0.0\"); }}"),
+            )
+            .expect("write the source of the stand-in linker");
+            let linker = directory.join("link.exe");
+            let compiled = std::process::Command::new("rustc")
+                .arg("--edition=2021")
+                .arg(&source)
+                .arg("-o")
+                .arg(&linker)
+                .status()
+                .expect("rustc starts");
+            assert!(compiled.success());
+            linker
+        }
+
+        #[test]
+        fn a_named_program_wins_over_the_linker_of_visual_studio() {
+            // Visual Studio is installed here and would give `link.exe`.
+            let named = system_program("cmd.exe");
+
+            let linker = discover_in(&context(&[("BAMTS_LINKER", &named.to_string_lossy())]))
+                .expect("a program that starts is taken as named");
+
+            assert_eq!(linker.program, named);
+        }
+
+        #[test]
+        fn a_microsoft_linker_on_path_wins_over_visual_studio() {
+            let scratch = tempfile::tempdir().expect("temporary directory");
+            let stand_in = banner_linker(scratch.path());
+
+            let linker = discover_in(&context(&[("Path", &scratch.path().to_string_lossy())]))
+                .expect("the linker on PATH");
+
+            assert_eq!(linker.program, stand_in);
+        }
+
+        #[test]
+        fn cancelling_stops_each_stage_of_the_search() {
+            let scratch = tempfile::tempdir().expect("temporary directory");
+            std::fs::copy(system_program("cmd.exe"), scratch.path().join("link.exe"))
+                .expect("a program called link.exe");
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let cancelled = |extra: &[(&str, &str)]| {
+                let result = discover_with(&context(extra), &cancel, "kernel32.lib");
+                matches!(result, Err(DriverError::Cancelled))
+            };
+
+            // The named program, the program on PATH, and vswhere each run a child.
+            assert!(cancelled(&[(
+                "BAMTS_LINKER",
+                &system_program("cmd.exe").to_string_lossy()
+            )]));
+            assert!(cancelled(&[("Path", &scratch.path().to_string_lossy())]));
+            assert!(cancelled(&[]));
+        }
+
         #[test]
         fn no_linker_anywhere_is_reported_as_missing() {
             let context = context(&[("ProgramFiles(x86)", r"C:\no-such-program-files")]);
