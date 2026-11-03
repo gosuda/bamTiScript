@@ -4,8 +4,14 @@
 //! while the working directory, the temp directory and user input use the plain
 //! spelling (`C:\dir`). `Path::starts_with` treats the two spellings as different
 //! roots, so a file that lies inside a project looks like an escape. Every canonical
-//! path in the product goes through [`canonicalize`], which returns the plain
-//! spelling whenever the plain spelling names the same file.
+//! path that the compiler, the CLI and the `bamts` facade compare with a project
+//! root goes through [`canonicalize`], which returns the plain spelling whenever
+//! the plain spelling names the same file.
+//!
+//! Code that only compares a path with other `fs::canonicalize` results, such as
+//! the repository checks in `bamts-verification`, may keep calling
+//! `fs::canonicalize`. A path that is compared with compiler output must use this
+//! function: `check_cells` pairs case units with loaded modules that way.
 
 use std::{
     ffi::{OsStr, OsString},
