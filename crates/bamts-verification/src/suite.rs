@@ -17,6 +17,7 @@ use std::{
 use bamts_compiler::diagnostic::Diagnostic;
 use bamts_compiler::parser::parse;
 use bamts_compiler::program::ProgramLoader;
+use bamts_compiler::project::resolution_trace::display_path;
 use bamts_compiler::project::{ProjectConfig, ProjectRoot};
 use bamts_compiler::scanner::scan;
 use bamts_compiler::source::{ScriptKind, SourceId, SourceText};
@@ -3172,7 +3173,7 @@ fn produce_project_trace(
     if !rendered.is_empty() {
         rendered.push('\n');
     }
-    let physical_root = loaded.root().path().to_string_lossy().replace('\\', "/");
+    let physical_root = display_path(loaded.root().path());
     let produced = rendered
         .replace(&physical_root, fixture.project_root.trim_end_matches('/'))
         .into_bytes();

@@ -204,7 +204,8 @@ fn api_transport_serves_socket_backed_stdin() {
     drop(peer);
 
     assert_success(&output, "bamts --api");
-    let canonical_root = fs::canonicalize(&directory.path).expect("session root canonicalizes");
+    let canonical_root = bamts_compiler::project::canonical::canonicalize(&directory.path)
+        .expect("session root canonicalizes");
     let responses = decode_frames(&output.stdout);
     assert_eq!(
         responses,
@@ -292,7 +293,7 @@ process.stdout.write(process.env.BAMTS_AOT_ENTRYPOINT === undefined ? "hidden\n"
 
     let expected = format!(
         "bamts\n{}\nfirst\nsecond\nhidden\n",
-        fs::canonicalize(project.path.join("main.ts"))
+        bamts_compiler::project::canonical::canonicalize(project.path.join("main.ts"))
             .expect("entrypoint canonicalizes")
             .display()
     );

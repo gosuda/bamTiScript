@@ -20,6 +20,7 @@ use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend_with_cance
 use bamts_compiler::program::{
     ProgramLoadError, ProgramLoader, ProgramLowerError, ResolvedProgram, lower_program_with_cancel,
 };
+use bamts_compiler::project::canonical::canonicalize;
 use bamts_compiler::project::{ConfigError, ProjectConfig, ProjectRoot};
 use bamts_compiler::scanner::scan;
 use bamts_compiler::source::ScriptKind;
@@ -370,7 +371,7 @@ pub fn canonical_entrypoint_with_cancel(
             .map_err(|error| Error::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?
     };
     cancel.check()?;
-    let canonical = fs::canonicalize(&absolute).map_err(|source| {
+    let canonical = canonicalize(&absolute).map_err(|source| {
         Error::ProgramLoad(ProgramLoadError::Read {
             path: absolute,
             source,
@@ -476,7 +477,7 @@ pub fn resolve_project_with_cancel(
 ) -> Result<ResolvedProject> {
     let project = discover_project_with_cancel(entrypoint, fallback_root, cancel)?;
     cancel.check()?;
-    let canonical_root = fs::canonicalize(project.root())
+    let canonical_root = canonicalize(project.root())
         .map_err(|error| Error::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
     cancel.check()?;
     let root = ProjectRoot::new(canonical_root).map_err(|error| {
@@ -512,9 +513,9 @@ pub fn resolve_project_with_cancel(
 
 #[cfg(test)]
 mod tests {
-    use super::compile_source_file;
     #[cfg(feature = "node-host")]
     use super::run_program;
+    use super::{canonicalize, compile_source_file};
     use std::error::Error;
     use std::path::{Path, PathBuf};
 
@@ -596,7 +597,7 @@ mod tests {
         std::fs::remove_file(directory.join("sub/tsconfig.json"))?;
         let error =
             compile_source_file(&entrypoint).expect_err("the root tsconfig.json must be parsed");
-        let expected = std::fs::canonicalize(directory.join("tsconfig.json"))?;
+        let expected = canonicalize(directory.join("tsconfig.json"))?;
         assert!(matches!(
             error,
             super::Error::ProjectConfig { ref path, .. } if *path == expected

@@ -15,6 +15,7 @@ use bamts_compiler::{
     project::{
         JsonObject, JsonValue, ProjectConfig, ProjectRoot,
         build_mode::BuildInfo,
+        canonical::canonicalize,
         effective::{
             EffectiveProject, MaterializeError, ProjectBuildOptions, ProjectCompileError,
             ProjectCompileOptions, ProjectCompileResult, ProjectLoadRequest,
@@ -2616,7 +2617,7 @@ fn load_program_frontend_in_context_with_cancel(
         current_directory.join(entrypoint)
     };
     let absolute_entrypoint =
-        fs::canonicalize(&absolute_entrypoint).map_err(|source| DriverError::ReadSource {
+        canonicalize(&absolute_entrypoint).map_err(|source| DriverError::ReadSource {
             path: absolute_entrypoint,
             source,
         })?;
@@ -2629,7 +2630,7 @@ fn load_program_frontend_in_context_with_cancel(
             .to_path_buf()
     };
     let project = discover_project(&absolute_entrypoint, fallback_root);
-    let canonical_root = fs::canonicalize(project.root())
+    let canonical_root = canonicalize(project.root())
         .map_err(|error| DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
     let root = ProjectRoot::new(canonical_root).map_err(|error| {
         DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(

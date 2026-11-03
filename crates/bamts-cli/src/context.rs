@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use bamts_compiler::program::ProgramLoadError;
+use bamts_compiler::project::canonical::canonicalize;
 
 use crate::driver::DriverError;
 
@@ -68,7 +68,7 @@ impl ExecutionContext {
 }
 
 fn canonicalize_cwd(cwd: &Path) -> Result<PathBuf, DriverError> {
-    fs::canonicalize(cwd)
+    canonicalize(cwd)
         .map_err(|error| DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(error)))
 }
 

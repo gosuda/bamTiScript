@@ -12,6 +12,7 @@ use std::{
 
 use bamts_compiler::checker::SymbolKind;
 use bamts_compiler::diagnostic::DiagnosticSeverity;
+use bamts_compiler::project::canonical::canonicalize;
 use bamts_compiler::service::{
     DiagnosticEntry, DocumentSnapshot, Location, ServiceError, ServiceState,
     filesystem::{FileSystemError, OsFileSystem},
@@ -96,7 +97,7 @@ struct Session {
 
 impl Session {
     fn new(root: &Path) -> io::Result<Self> {
-        let process_root = root.canonicalize()?;
+        let process_root = canonicalize(root)?;
         let filesystem = OsFileSystem::new(&process_root).map_err(fs_io)?;
         Ok(Self {
             state: ServiceState::new(filesystem),
@@ -963,8 +964,7 @@ fn initialize_root(params: &Value, process_root: &Path) -> Result<PathBuf, Strin
 /// Symlinks are resolved by canonicalization, so a link that escapes the
 /// root is rejected just like a lexical `..` traversal.
 fn canonicalize_confined(path: &Path, root: &Path) -> Result<PathBuf, String> {
-    let canonical = path
-        .canonicalize()
+    let canonical = canonicalize(path)
         .map_err(|error| format!("cannot canonicalize {}: {error}", path.display()))?;
     if canonical.strip_prefix(root).is_err() {
         return Err(format!(

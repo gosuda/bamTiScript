@@ -4,6 +4,8 @@ use std::{
     time::SystemTime,
 };
 
+use crate::project::canonical;
+
 /// Metadata used to decide whether a closed file needs a fresh compiler snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileMetadata {
@@ -64,7 +66,7 @@ pub struct OsFileSystem {
 
 impl OsFileSystem {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, FileSystemError> {
-        let root = fs::canonicalize(root).map_err(FileSystemError::from)?;
+        let root = canonical::canonicalize(root).map_err(FileSystemError::from)?;
         if !root.is_dir() {
             return Err(FileSystemError::new(
                 io::ErrorKind::NotADirectory,
@@ -114,14 +116,14 @@ impl FileSystem for OsFileSystem {
                 Err(error) => return Err(FileSystemError::from(error)),
             }
         }
-        let mut canonical = fs::canonicalize(ancestor).map_err(FileSystemError::from)?;
+        let mut resolved = canonical::canonicalize(ancestor).map_err(FileSystemError::from)?;
         let suffix = lexical
             .strip_prefix(ancestor)
             .expect("selected ancestor is a lexical path prefix");
         for component in suffix.components() {
-            canonical.push(component);
+            resolved.push(component);
         }
-        self.confined(canonical)
+        self.confined(resolved)
     }
 
     fn read(&self, path: &Path) -> Result<String, FileSystemError> {
@@ -150,8 +152,8 @@ impl FileSystem for OsFileSystem {
         for entry in fs::read_dir(&path).map_err(FileSystemError::from)? {
             let entry = entry.map_err(FileSystemError::from)?;
             let child = path.join(entry.file_name());
-            let canonical = fs::canonicalize(&child).map_err(FileSystemError::from)?;
-            entries.push(self.confined(canonical)?);
+            let resolved = canonical::canonicalize(&child).map_err(FileSystemError::from)?;
+            entries.push(self.confined(resolved)?);
         }
         entries.sort();
         entries.dedup();

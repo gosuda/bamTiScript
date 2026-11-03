@@ -1,4 +1,5 @@
 pub mod build_mode;
+pub mod canonical;
 pub mod effective;
 pub mod output;
 pub mod references;
@@ -162,7 +163,7 @@ fn normalize_absolute(path: &Path) -> PathBuf {
             Component::Normal(part) => normalized.push(part),
         }
     }
-    normalized
+    canonical::simplify(&normalized)
 }
 
 /// The reason a JSON-with-comments document was rejected.

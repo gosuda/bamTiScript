@@ -36,6 +36,7 @@ use bamts_compiler::program::{
 use bamts_compiler::project::build_mode::{
     BUILD_INFO_SCHEMA, BuildInfo, canonical_json, source_signature,
 };
+use bamts_compiler::project::canonical::canonicalize;
 use bamts_compiler::project::resolution::{
     ModuleResolutionKind, ResolutionCache, ResolutionHost, TraceResolutionServices,
     resolve_module_name_with_trace,
@@ -1181,7 +1182,7 @@ fn pair_units_with_modules(
     units
         .iter()
         .map(|unit| {
-            let canonical = fs::canonicalize(root.join(&unit.virtual_path)).ok();
+            let canonical = canonicalize(root.join(&unit.virtual_path)).ok();
             let index = canonical.and_then(|canonical| {
                 program
                     .modules()

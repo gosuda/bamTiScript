@@ -727,7 +727,8 @@ fn initialize_confines_paths_to_the_session_root() {
     input.extend(frame(
             r#"{"id":2,"method":"service/open","params":{"path":"../escape.ts","text":"const a = 1;","version":1}}"#,
         ));
-    let canonical_root = fs::canonicalize(&root).expect("canonical root");
+    let canonical_root =
+        bamts_compiler::project::canonical::canonicalize(&root).expect("canonical root");
     let responses = run(input);
     fs::remove_dir_all(&root).expect("remove root");
 
