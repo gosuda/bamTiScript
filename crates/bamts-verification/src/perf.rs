@@ -2597,12 +2597,30 @@ mod tests {
         assert_eq!(scripted(vec![Err(broken)]), 0);
     }
 
+    /// A child that outlives a few polls: `sleep 0.3` on Unix, and on Windows
+    /// `ping` with two echoes, which are one second apart.
+    fn short_lived_child() -> Command {
+        if cfg!(windows) {
+            let root = std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows");
+            let mut command = Command::new(
+                std::path::PathBuf::from(root)
+                    .join("System32")
+                    .join("PING.EXE"),
+            );
+            command
+                .args(["-n", "2", "127.0.0.1"])
+                .stdout(std::process::Stdio::null());
+            command
+        } else {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "sleep 0.3"]);
+            command
+        }
+    }
+
     #[test]
     fn polling_beside_a_real_child_ends_when_it_is_reaped() {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "sleep 0.3"])
-            .spawn()
-            .unwrap();
+        let mut child = short_lived_child().spawn().unwrap();
         let pid = child.id();
         let poller = thread::spawn(move || poll_child_peak_rss(pid));
         child.wait().unwrap();

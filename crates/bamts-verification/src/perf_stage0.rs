@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use bamts_cli::args::{ExecutionTarget, Mode};
 use bamts_cli::driver;
+use bamts_compiler::project::canonical::canonicalize;
 use bamts_platform::{MemoryRegion, PlatformError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -689,8 +690,7 @@ fn capture_aot_child_maps(root: &Path, workload: &Path) -> Result<ChildMapSample
         compile.truncation.is_none(),
         "AOT child compilation output was truncated"
     );
-    let executable =
-        fs::canonicalize(&executable).context("canonicalizing controlled AOT child")?;
+    let executable = canonicalize(&executable).context("canonicalizing controlled AOT child")?;
     let launch_token = format!("stage0-{}", std::process::id());
     let child = Command::new(&executable)
         .current_dir(root)
@@ -1122,13 +1122,7 @@ requires="live map captured"
 
     #[test]
     fn continuous_sampler_accepts_safe_child_through_exit() {
-        let executable = fs::canonicalize("/bin/cat").unwrap();
-        let child = Command::new(&executable)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let (executable, child) = spawn_idle_cat();
         let mut executable_samples = 0;
         let sample = sample_child_maps_with_observer(
             child,
@@ -1158,8 +1152,19 @@ requires="live map captured"
         assert!(anonymous_executable_mappings(&sample.mappings).is_empty());
     }
 
+    /// A program that stays alive until its standard input closes, then exits with
+    /// status 0: `cat` on Unix, `sort` from the system directory on Windows.
+    fn idle_program() -> PathBuf {
+        if cfg!(windows) {
+            let root = std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows");
+            PathBuf::from(root).join("System32").join("sort.exe")
+        } else {
+            PathBuf::from("/bin/cat")
+        }
+    }
+
     fn spawn_idle_cat() -> (PathBuf, Child) {
-        let executable = fs::canonicalize("/bin/cat").unwrap();
+        let executable = canonicalize(idle_program()).unwrap();
         let child = Command::new(&executable)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1264,7 +1269,7 @@ requires="live map captured"
 
     #[test]
     fn a_reaped_child_is_recognised_through_the_error_context() {
-        let mut child = Command::new("/bin/cat")
+        let mut child = Command::new(idle_program())
             .stdin(Stdio::null())
             .spawn()
             .unwrap();
@@ -1273,9 +1278,42 @@ requires="live map captured"
         assert!(child_is_between_states(&process_maps_for(pid).unwrap_err()));
     }
 
-    #[test]
-    fn continuous_sampler_rejects_forbidden_mapping_added_after_executable_observation() {
-        let temp = TempDir::new("stage0-late-executable-map").unwrap();
+    /// Waits for one byte, maps a private page and makes it executable, then waits
+    /// for a second byte that never comes, as the Unix child does.
+    #[cfg(windows)]
+    const LATE_MAP_SOURCE_WINDOWS: &str = r#"
+use std::io::Read;
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn VirtualAlloc(address: *mut u8, size: usize, allocation: u32, protect: u32) -> *mut u8;
+    fn VirtualProtect(address: *mut u8, size: usize, protect: u32, old: *mut u32) -> i32;
+}
+fn main() {
+    let mut observed = [0_u8; 1];
+    let mut stdin = std::io::stdin();
+    if stdin.read(&mut observed).unwrap_or(0) != 1 {
+        std::process::exit(3);
+    }
+    unsafe {
+        // MEM_COMMIT | MEM_RESERVE, then PAGE_READWRITE -> PAGE_EXECUTE_READ.
+        let page = VirtualAlloc(std::ptr::null_mut(), 4096, 0x3000, 0x04);
+        let mut old = 0_u32;
+        if page.is_null() || VirtualProtect(page, 4096, 0x20, &mut old) == 0 {
+            std::process::exit(2);
+        }
+    }
+    // Keep the forbidden mapping live until the sampler rejects and kills us.
+    if stdin.read(&mut observed).unwrap_or(0) != 1 {
+        std::process::exit(4);
+    }
+    std::process::exit(5);
+}
+"#;
+
+    /// Builds the child that maps an executable page once it is released: a C program
+    /// on Unix, where `cc` and `mmap` exist.
+    #[cfg(not(windows))]
+    fn compile_late_map_child(temp: &TempDir) -> PathBuf {
         let source = temp.path().join("late-map.c");
         let executable = temp.path().join("late-map");
         fs::write(
@@ -1304,7 +1342,32 @@ int main(void) {
             .status()
             .unwrap();
         assert!(compiled.success());
-        let executable = fs::canonicalize(executable).unwrap();
+        executable
+    }
+
+    /// Builds the child that maps an executable page once it is released. Windows has
+    /// no `cc` and no `mmap`, so the child is a small Rust program that calls
+    /// `VirtualAlloc` and `VirtualProtect`, built with the `rustc` of this toolchain.
+    #[cfg(windows)]
+    fn compile_late_map_child(temp: &TempDir) -> PathBuf {
+        let source = temp.path().join("late_map.rs");
+        let executable = temp.path().join("late-map.exe");
+        fs::write(&source, LATE_MAP_SOURCE_WINDOWS).unwrap();
+        let compiled = Command::new("rustc")
+            .arg("--edition=2021")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .unwrap();
+        assert!(compiled.success());
+        executable
+    }
+
+    #[test]
+    fn continuous_sampler_rejects_forbidden_mapping_added_after_executable_observation() {
+        let temp = TempDir::new("stage0-late-executable-map").unwrap();
+        let executable = canonicalize(compile_late_map_child(&temp)).unwrap();
         let child = Command::new(&executable)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
