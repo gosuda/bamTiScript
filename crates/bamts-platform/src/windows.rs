@@ -20,7 +20,7 @@ use std::thread;
 use std::time::Duration;
 
 #[cfg(target_os = "windows")]
-use crate::{MemoryRegion, PlatformError};
+use crate::{MachineFacts, MemoryRegion, PlatformError, ThreadPlacement, UNAVAILABLE};
 
 #[cfg(target_os = "windows")]
 type Result<T> = std::result::Result<T, PlatformError>;
@@ -126,6 +126,151 @@ fn region_identity(start: u64, end: u64, allocation_base: u64, kind: u32, path: 
     )
 }
 
+/// Formats CPU numbers as a kernel CPU list, such as `0-3,5,7-9`.
+#[cfg(any(target_os = "windows", test))]
+fn cpu_list(cpus: impl IntoIterator<Item = u32>) -> String {
+    let cpus: std::collections::BTreeSet<u32> = cpus.into_iter().collect();
+    let mut parts = Vec::new();
+    let mut remaining = cpus.into_iter().peekable();
+    while let Some(first) = remaining.next() {
+        let mut last = first;
+        while last
+            .checked_add(1)
+            .is_some_and(|next| remaining.peek() == Some(&next))
+        {
+            last = remaining.next().unwrap_or(last);
+        }
+        parts.push(if first == last {
+            first.to_string()
+        } else {
+            format!("{first}-{last}")
+        });
+    }
+    parts.join(",")
+}
+
+/// The CPUs that `mask` sets in a processor group whose first CPU is numbered
+/// `first_cpu` across the machine.
+#[cfg(any(target_os = "windows", test))]
+fn mask_cpus(first_cpu: u32, mask: u64) -> Vec<u32> {
+    (0..u64::BITS)
+        .filter(|bit| mask >> bit & 1 == 1)
+        .map(|bit| first_cpu + bit)
+        .collect()
+}
+
+/// `LOGICAL_PROCESSOR_RELATIONSHIP` of a physical core.
+#[cfg(any(target_os = "windows", test))]
+const RELATION_PROCESSOR_CORE: u32 = 0;
+/// `LOGICAL_PROCESSOR_RELATIONSHIP` of a processor package, which is a socket.
+#[cfg(any(target_os = "windows", test))]
+const RELATION_PROCESSOR_PACKAGE: u32 = 3;
+
+/// `LOGICAL_PROCESSOR_RELATIONSHIP` of a NUMA node.
+#[cfg(any(target_os = "windows", test))]
+const RELATION_NUMA_NODE: u32 = 1;
+
+/// Splits the records that `GetLogicalProcessorInformationEx` returns into
+/// `(relationship, whole record)`.
+///
+/// Each record starts with its relationship and its own size, both `u32`.
+#[cfg(any(target_os = "windows", test))]
+fn split_records(records: &[u8]) -> std::result::Result<Vec<(u32, &[u8])>, String> {
+    let mut found = Vec::new();
+    let mut offset = 0_usize;
+    while offset < records.len() {
+        let header = records
+            .get(offset..offset + 8)
+            .ok_or_else(|| format!("a record header is cut short at byte {offset}"))?;
+        let relationship = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        let size = usize::try_from(size).unwrap_or(usize::MAX);
+        let end = offset
+            .checked_add(size)
+            .filter(|end| size >= 8 && *end <= records.len());
+        let Some(end) = end else {
+            return Err(format!("the record at byte {offset} has size {size}"));
+        };
+        found.push((relationship, &records[offset..end]));
+        offset = end;
+    }
+    Ok(found)
+}
+
+/// Reads `(packages, cores per package)` from the records.
+///
+/// The cores must divide evenly across the packages, or the host describes a
+/// machine this fact cannot state.
+#[cfg(any(target_os = "windows", test))]
+fn packages_and_cores(records: &[u8]) -> std::result::Result<(u32, u32), String> {
+    let (mut packages, mut cores) = (0_u32, 0_u32);
+    for (relationship, _) in split_records(records)? {
+        match relationship {
+            RELATION_PROCESSOR_PACKAGE => packages += 1,
+            RELATION_PROCESSOR_CORE => cores += 1,
+            _ => {}
+        }
+    }
+    if packages == 0 || cores == 0 || cores % packages != 0 {
+        return Err(format!(
+            "{cores} physical cores do not divide across {packages} packages"
+        ));
+    }
+    Ok((packages, cores / packages))
+}
+
+/// Reads the NUMA node numbers from the records, sorted. A node record holds its
+/// number right after the header.
+#[cfg(any(target_os = "windows", test))]
+fn numa_nodes(records: &[u8]) -> std::result::Result<Vec<u32>, String> {
+    let mut nodes = std::collections::BTreeSet::new();
+    for (relationship, record) in split_records(records)? {
+        if relationship != RELATION_NUMA_NODE {
+            continue;
+        }
+        let number = record
+            .get(8..12)
+            .ok_or_else(|| "a NUMA node record is cut short".to_owned())?;
+        nodes.insert(u32::from_le_bytes([
+            number[0], number[1], number[2], number[3],
+        ]));
+    }
+    if nodes.is_empty() {
+        return Err("the host reports no NUMA node".to_owned());
+    }
+    Ok(nodes.into_iter().collect())
+}
+
+/// The Windows version as `major.minor.build.revision`, such as `10.0.26200.9711`.
+#[cfg(any(target_os = "windows", test))]
+fn version_text(major: u32, minor: u32, build: u32, revision: u32) -> String {
+    format!("{major}.{minor}.{build}.{revision}")
+}
+
+/// The microcode revision as Linux prints it, such as `0x8701030`.
+///
+/// The `Update Revision` registry value is the revision register of the CPU. A
+/// four-byte value holds the revision itself; that is the form seen on an AMD
+/// host. Any other length is a form this reader has not checked against a host,
+/// so it gives `None` rather than a guess.
+#[cfg(any(target_os = "windows", test))]
+fn microcode_text(value: &[u8]) -> Option<String> {
+    let bytes: [u8; 4] = value.try_into().ok()?;
+    Some(format!("0x{:x}", u32::from_le_bytes(bytes)))
+}
+
+/// Decodes a registry string: UTF-16 up to the first NUL, without the padding that
+/// CPU vendors put around the name.
+#[cfg(any(target_os = "windows", test))]
+fn registry_text(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect();
+    String::from_utf16_lossy(&units).trim().to_owned()
+}
+
 #[cfg(target_os = "windows")]
 mod ffi {
     use std::ffi::c_void;
@@ -163,16 +308,77 @@ mod ffi {
         pub(super) _peak_pagefile_usage: usize,
     }
 
+    /// `RTL_OSVERSIONINFOW`.
+    #[repr(C)]
+    pub(super) struct OsVersionInfo {
+        pub(super) size: u32,
+        pub(super) major: u32,
+        pub(super) minor: u32,
+        pub(super) build: u32,
+        pub(super) _platform: u32,
+        pub(super) _service_pack: [u16; 128],
+    }
+
+    /// `GROUP_AFFINITY`.
+    #[repr(C)]
+    #[derive(Default)]
+    pub(super) struct GroupAffinity {
+        pub(super) mask: usize,
+        pub(super) group: u16,
+        pub(super) _reserved: [u16; 3],
+    }
+
+    /// `PERFORMANCE_INFORMATION`.
+    #[repr(C)]
+    #[derive(Default)]
+    pub(super) struct PerformanceInformation {
+        pub(super) cb: u32,
+        pub(super) _commit_total: usize,
+        pub(super) _commit_limit: usize,
+        pub(super) _commit_peak: usize,
+        pub(super) _physical_total: usize,
+        pub(super) _physical_available: usize,
+        pub(super) _system_cache: usize,
+        pub(super) _kernel_total: usize,
+        pub(super) _kernel_paged: usize,
+        pub(super) _kernel_non_paged: usize,
+        pub(super) page_size: usize,
+        pub(super) _handle_count: u32,
+        pub(super) _process_count: u32,
+        pub(super) _thread_count: u32,
+    }
+
+    /// `ENUM_PAGE_FILE_INFORMATION`.
+    #[repr(C)]
+    pub(super) struct EnumPageFileInformation {
+        pub(super) _size: u32,
+        pub(super) _reserved: u32,
+        pub(super) total_size: usize,
+        pub(super) _total_in_use: usize,
+        pub(super) _peak_usage: usize,
+    }
+
+    /// `PENUM_PAGE_FILE_CALLBACKW`.
+    pub(super) type PageFileCallback =
+        unsafe extern "system" fn(*mut c_void, *const EnumPageFileInformation, *const u16) -> i32;
+
     // Sizes measured from the SDK headers. A layout drift fails the build here,
     // not at the kernel boundary.
     #[cfg(target_pointer_width = "64")]
     const _: () = assert!(size_of::<MemoryBasicInformation>() == 48);
     #[cfg(target_pointer_width = "64")]
     const _: () = assert!(size_of::<ProcessMemoryCounters>() == 72);
+    #[cfg(target_pointer_width = "64")]
+    const _: () = assert!(size_of::<GroupAffinity>() == 16);
+    #[cfg(target_pointer_width = "64")]
+    const _: () = assert!(size_of::<PerformanceInformation>() == 104);
+    #[cfg(target_pointer_width = "64")]
+    const _: () = assert!(size_of::<EnumPageFileInformation>() == 32);
     #[cfg(target_pointer_width = "32")]
     const _: () = assert!(size_of::<MemoryBasicInformation>() == 28);
     #[cfg(target_pointer_width = "32")]
     const _: () = assert!(size_of::<ProcessMemoryCounters>() == 40);
+    const _: () = assert!(size_of::<OsVersionInfo>() == 276);
 
     #[link(name = "kernel32")]
     #[allow(unsafe_code)]
@@ -207,6 +413,36 @@ mod ffi {
             target_path: *mut u16,
             max: u32,
         ) -> u32;
+        pub(super) fn GetCurrentThread() -> Handle;
+        pub(super) fn GetThreadGroupAffinity(thread: Handle, affinity: *mut GroupAffinity) -> i32;
+        pub(super) fn GetActiveProcessorCount(group: u16) -> u32;
+        pub(super) fn GetLogicalProcessorInformationEx(
+            relationship: u32,
+            buffer: *mut c_void,
+            length: *mut u32,
+        ) -> i32;
+        pub(super) fn K32GetPerformanceInfo(info: *mut PerformanceInformation, size: u32) -> i32;
+        pub(super) fn K32EnumPageFilesW(callback: PageFileCallback, context: *mut c_void) -> i32;
+    }
+
+    #[link(name = "ntdll")]
+    #[allow(unsafe_code)]
+    unsafe extern "system" {
+        pub(super) fn RtlGetVersion(info: *mut OsVersionInfo) -> i32;
+    }
+
+    #[link(name = "advapi32")]
+    #[allow(unsafe_code)]
+    unsafe extern "system" {
+        pub(super) fn RegGetValueW(
+            key: Handle,
+            sub_key: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut c_void,
+            size: *mut u32,
+        ) -> i32;
     }
 }
 
@@ -569,6 +805,329 @@ impl Drop for Window {
     }
 }
 
+/// `RRF_RT_REG_SZ`, `RRF_RT_REG_BINARY` and `RRF_RT_REG_DWORD`: the registry value
+/// types `RegGetValueW` may return.
+#[cfg(target_os = "windows")]
+const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+#[cfg(target_os = "windows")]
+const RRF_RT_REG_BINARY: u32 = 0x0000_0008;
+#[cfg(target_os = "windows")]
+const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+/// `ERROR_FILE_NOT_FOUND`: the registry has no such value.
+#[cfg(target_os = "windows")]
+const ERROR_FILE_NOT_FOUND: i32 = 2;
+/// `ERROR_INSUFFICIENT_BUFFER`: the answer to a size query.
+#[cfg(target_os = "windows")]
+const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+/// `RelationAll` and `ALL_PROCESSOR_GROUPS`.
+#[cfg(target_os = "windows")]
+const RELATION_ALL: u32 = 0xFFFF;
+#[cfg(target_os = "windows")]
+const ALL_PROCESSOR_GROUPS: u16 = 0xFFFF;
+
+#[cfg(target_os = "windows")]
+const PROCESSOR_KEY: &str = "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0";
+#[cfg(target_os = "windows")]
+const VERSION_KEY: &str = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+
+/// Reads one value of `HKEY_LOCAL_MACHINE`. `Ok(None)` means the value does not exist.
+#[cfg(target_os = "windows")]
+fn registry_value(
+    sub_key: &str,
+    value: &str,
+    flags: u32,
+    capacity: usize,
+) -> Result<Option<Vec<u8>>> {
+    let wide = |text: &str| {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let (sub_key_wide, value_wide) = (wide(sub_key), wide(value));
+    let mut data = vec![0_u8; capacity];
+    let mut size = u32::try_from(capacity).expect("the capacity fits a DWORD");
+    // `HKEY_LOCAL_MACHINE` is `0x80000002` sign-extended to a pointer.
+    let local_machine = 0x8000_0002_u32 as i32 as isize as ffi::Handle;
+    // SAFETY: both names are NUL-terminated and live for the call. `data` is live
+    // and writable for `size` bytes, and `size` is the length the host is told.
+    #[allow(unsafe_code)]
+    let status = unsafe {
+        ffi::RegGetValueW(
+            local_machine,
+            sub_key_wide.as_ptr(),
+            value_wide.as_ptr(),
+            flags,
+            std::ptr::null_mut(),
+            data.as_mut_ptr().cast::<std::ffi::c_void>(),
+            &raw mut size,
+        )
+    };
+    match status {
+        0 => {
+            data.truncate(size as usize);
+            Ok(Some(data))
+        }
+        ERROR_FILE_NOT_FOUND => Ok(None),
+        _ => Err(PlatformError::Read {
+            source: format!("RegGetValueW {sub_key}\\{value}"),
+            detail: std::io::Error::from_raw_os_error(status).to_string(),
+        }),
+    }
+}
+
+/// A registry value that this host has to have.
+#[cfg(target_os = "windows")]
+fn required_registry_value(
+    sub_key: &str,
+    value: &str,
+    flags: u32,
+    capacity: usize,
+) -> Result<Vec<u8>> {
+    registry_value(sub_key, value, flags, capacity)?.ok_or_else(|| PlatformError::Malformed {
+        source: format!("RegGetValueW {sub_key}\\{value}"),
+        detail: "the value does not exist".to_owned(),
+    })
+}
+
+/// The Windows version `(major, minor, build)`. `RtlGetVersion` tells the real
+/// version; the documented `GetVersionEx` reports what the manifest of the caller
+/// asks for.
+#[cfg(target_os = "windows")]
+fn windows_version() -> Result<(u32, u32, u32)> {
+    let mut info = ffi::OsVersionInfo {
+        size: u32::try_from(size_of::<ffi::OsVersionInfo>()).expect("the record fits a DWORD"),
+        major: 0,
+        minor: 0,
+        build: 0,
+        _platform: 0,
+        _service_pack: [0; 128],
+    };
+    // SAFETY: `info` is a live, writable `RTL_OSVERSIONINFOW` whose size field
+    // holds its size, as the call requires.
+    #[allow(unsafe_code)]
+    let status = unsafe { ffi::RtlGetVersion(&raw mut info) };
+    if status != 0 {
+        return Err(PlatformError::Read {
+            source: "RtlGetVersion".to_owned(),
+            detail: format!("NTSTATUS {status:#x}"),
+        });
+    }
+    Ok((info.major, info.minor, info.build))
+}
+
+#[cfg(target_os = "windows")]
+const TOPOLOGY_SOURCE: &str = "GetLogicalProcessorInformationEx";
+
+/// Reads the topology records of the host, for every relationship.
+#[cfg(target_os = "windows")]
+fn processor_records() -> Result<Vec<u8>> {
+    const SOURCE: &str = TOPOLOGY_SOURCE;
+    let mut length = 0_u32;
+    // SAFETY: a null buffer with a zero length asks the host for the size it
+    // needs; it writes only `length`.
+    #[allow(unsafe_code)]
+    let sized = unsafe {
+        ffi::GetLogicalProcessorInformationEx(RELATION_ALL, std::ptr::null_mut(), &raw mut length)
+    };
+    let error = std::io::Error::last_os_error();
+    if sized != 0 || error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER) {
+        return Err(read_error(SOURCE, &error));
+    }
+    // The records hold pointer-sized fields, so the buffer is aligned for them.
+    let mut buffer = vec![0_u64; (length as usize).div_ceil(size_of::<u64>())];
+    // SAFETY: `buffer` is live and writable for at least `length` bytes, the size
+    // the host asked for and is told again.
+    #[allow(unsafe_code)]
+    let read = unsafe {
+        ffi::GetLogicalProcessorInformationEx(
+            RELATION_ALL,
+            buffer.as_mut_ptr().cast::<std::ffi::c_void>(),
+            &raw mut length,
+        )
+    };
+    if read == 0 {
+        return Err(read_error(SOURCE, &std::io::Error::last_os_error()));
+    }
+    let mut records: Vec<u8> = buffer.iter().flat_map(|word| word.to_ne_bytes()).collect();
+    records.truncate(length as usize);
+    Ok(records)
+}
+
+#[cfg(target_os = "windows")]
+fn malformed_topology(detail: String) -> PlatformError {
+    PlatformError::Malformed {
+        source: TOPOLOGY_SOURCE.to_owned(),
+        detail,
+    }
+}
+
+/// Reads `(packages, cores per package)` from the host.
+#[cfg(target_os = "windows")]
+fn processor_topology() -> Result<(u32, u32)> {
+    packages_and_cores(&processor_records()?).map_err(malformed_topology)
+}
+
+/// The NUMA nodes of the host. A Windows process is not bound to a subset of
+/// them, so these are the nodes its memory may come from.
+#[cfg(target_os = "windows")]
+pub(crate) fn numa_memory_nodes() -> Result<Vec<u32>> {
+    numa_nodes(&processor_records()?).map_err(malformed_topology)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn machine_facts() -> Result<MachineFacts> {
+    let (major, minor, build) = windows_version()?;
+    let revision = u32::from_le_bytes(
+        required_registry_value(VERSION_KEY, "UBR", RRF_RT_REG_DWORD, 4)?
+            .try_into()
+            .map_err(|_| PlatformError::Malformed {
+                source: format!("RegGetValueW {VERSION_KEY}\\UBR"),
+                detail: "the revision is not a DWORD".to_owned(),
+            })?,
+    );
+    let cpu_model = registry_text(&required_registry_value(
+        PROCESSOR_KEY,
+        "ProcessorNameString",
+        RRF_RT_REG_SZ,
+        1024,
+    )?);
+    let microcode = registry_value(PROCESSOR_KEY, "Update Revision", RRF_RT_REG_BINARY, 16)?
+        .and_then(|value| microcode_text(&value))
+        .unwrap_or_else(|| UNAVAILABLE.to_owned());
+    let (sockets, cores_per_socket) = processor_topology()?;
+    Ok(MachineFacts {
+        kernel_release: format!("{major}.{minor}.{build}"),
+        kernel_version: version_text(major, minor, build, revision),
+        cpu_model,
+        sockets,
+        cores_per_socket,
+        microcode,
+        governor: UNAVAILABLE.to_owned(),
+        swap_total_kib: swap_total_kib()?,
+    })
+}
+
+/// The size of one page, from `GetPerformanceInfo`.
+#[cfg(target_os = "windows")]
+fn page_size_bytes() -> Result<u64> {
+    let size =
+        u32::try_from(size_of::<ffi::PerformanceInformation>()).expect("the record fits a DWORD");
+    let mut info = ffi::PerformanceInformation {
+        cb: size,
+        ..ffi::PerformanceInformation::default()
+    };
+    // SAFETY: `info` is a live, writable `PERFORMANCE_INFORMATION` whose size is
+    // both in `cb` and the length the host is told.
+    #[allow(unsafe_code)]
+    let status = unsafe { ffi::K32GetPerformanceInfo(&raw mut info, size) };
+    if status == 0 {
+        return Err(read_error(
+            "GetPerformanceInfo",
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(info.page_size as u64)
+}
+
+/// Adds the size of one page file, in pages, to the total behind `context`.
+///
+/// # Safety
+/// `context` must point to the `u64` that `swap_total_kib` passed, and `info` to a
+/// record the host owns for the length of the call. `K32EnumPageFilesW` upholds this.
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+unsafe extern "system" fn add_page_file(
+    context: *mut std::ffi::c_void,
+    info: *const ffi::EnumPageFileInformation,
+    _name: *const u16,
+) -> i32 {
+    // SAFETY: the contract of this function; the total outlives the enumeration.
+    #[allow(unsafe_code)]
+    unsafe {
+        *context.cast::<u64>() += (*info).total_size as u64;
+    }
+    1
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn swap_total_kib() -> Result<u64> {
+    const SOURCE: &str = "EnumPageFiles";
+    let page = page_size_bytes()?;
+    let mut pages = 0_u64;
+    // SAFETY: the callback and the total outlive the call, and the callback only
+    // adds the sizes the host hands it to the total.
+    #[allow(unsafe_code)]
+    let status = unsafe { ffi::K32EnumPageFilesW(add_page_file, (&raw mut pages).cast()) };
+    if status == 0 {
+        return Err(read_error(SOURCE, &std::io::Error::last_os_error()));
+    }
+    pages
+        .checked_mul(page)
+        .map(|bytes| bytes / 1024)
+        .ok_or_else(|| PlatformError::Malformed {
+            source: SOURCE.to_owned(),
+            detail: "the page file size overflows".to_owned(),
+        })
+}
+
+/// How many logical CPUs are active in `group`, or in all groups.
+#[cfg(target_os = "windows")]
+fn active_processors(group: u16) -> Result<u32> {
+    // SAFETY: `GetActiveProcessorCount` takes a group number and returns a count.
+    #[allow(unsafe_code)]
+    let count = unsafe { ffi::GetActiveProcessorCount(group) };
+    if count == 0 {
+        return Err(read_error(
+            "GetActiveProcessorCount",
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(count)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn online_cpu_list() -> Result<String> {
+    Ok(cpu_list(0..active_processors(ALL_PROCESSOR_GROUPS)?))
+}
+
+/// The CPUs the calling thread may run on, numbered across processor groups.
+#[cfg(target_os = "windows")]
+pub(crate) fn cpu_affinity() -> Result<String> {
+    const SOURCE: &str = "GetThreadGroupAffinity";
+    let mut affinity = ffi::GroupAffinity::default();
+    // SAFETY: `GetCurrentThread` returns a pseudo-handle that needs no closing,
+    // and `affinity` is a live, writable `GROUP_AFFINITY`.
+    #[allow(unsafe_code)]
+    let status = unsafe { ffi::GetThreadGroupAffinity(ffi::GetCurrentThread(), &raw mut affinity) };
+    if status == 0 {
+        return Err(read_error(SOURCE, &std::io::Error::last_os_error()));
+    }
+    let mut first_cpu = 0_u32;
+    for group in 0..affinity.group {
+        first_cpu += active_processors(group)?;
+    }
+    let cpus = mask_cpus(first_cpu, affinity.mask as u64);
+    if cpus.is_empty() {
+        return Err(PlatformError::Malformed {
+            source: SOURCE.to_owned(),
+            detail: "the thread may run on no CPU".to_owned(),
+        });
+    }
+    Ok(cpu_list(cpus))
+}
+
+/// A Windows thread has a CPU affinity to read, and the host lists its NUMA nodes.
+/// The memory policy is `numactl`'s notion and has no Windows reader, so it is
+/// [`UNAVAILABLE`].
+#[cfg(target_os = "windows")]
+pub(crate) fn thread_placement() -> Result<ThreadPlacement> {
+    Ok(ThreadPlacement {
+        cpu_affinity: cpu_affinity()?,
+        memory_policy: UNAVAILABLE.to_owned(),
+        memory_nodes: cpu_list(numa_memory_nodes()?),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +1208,126 @@ mod tests {
             "\\Device\\HarddiskVolume7"
         );
         assert_eq!(dos_path("", &devices), "");
+    }
+
+    #[test]
+    fn cpu_lists_join_runs_and_keep_gaps() {
+        assert_eq!(cpu_list([0, 1, 2, 3]), "0-3");
+        assert_eq!(cpu_list([5, 0, 1, 7, 8, 9, 3, 3]), "0-1,3,5,7-9");
+        assert_eq!(cpu_list([4]), "4");
+        assert_eq!(cpu_list(std::iter::empty()), "");
+        // The last number of the range type does not overflow the run test.
+        assert_eq!(
+            cpu_list([u32::MAX - 1, u32::MAX]),
+            format!("{}-{}", u32::MAX - 1, u32::MAX)
+        );
+    }
+
+    #[test]
+    fn a_group_mask_lists_its_cpus_across_groups() {
+        assert_eq!(mask_cpus(0, 0b1011), vec![0, 1, 3]);
+        assert_eq!(mask_cpus(64, 0b101), vec![64, 66]);
+        assert_eq!(mask_cpus(0, u64::MAX).len(), 64);
+        assert!(mask_cpus(0, 0).is_empty());
+    }
+
+    /// A record as `GetLogicalProcessorInformationEx` returns it: the relationship
+    /// and the size, then the rest of the record.
+    fn record(relationship: u32, size: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(relationship.to_le_bytes());
+        bytes.extend(size.to_le_bytes());
+        bytes.resize(size as usize, 0);
+        bytes
+    }
+
+    fn records(parts: &[(u32, u32)]) -> Vec<u8> {
+        parts
+            .iter()
+            .flat_map(|(relationship, size)| record(*relationship, *size))
+            .collect()
+    }
+
+    #[test]
+    fn the_topology_counts_packages_and_cores_among_other_records() {
+        let one = records(&[
+            (RELATION_PROCESSOR_PACKAGE, 32),
+            (RELATION_PROCESSOR_CORE, 48),
+            (RELATION_PROCESSOR_CORE, 48),
+            (2, 64),
+            (4, 24),
+            (RELATION_PROCESSOR_CORE, 48),
+            (RELATION_PROCESSOR_CORE, 48),
+        ]);
+        assert_eq!(packages_and_cores(&one), Ok((1, 4)));
+
+        let two = records(&[
+            (RELATION_PROCESSOR_PACKAGE, 32),
+            (RELATION_PROCESSOR_PACKAGE, 32),
+            (RELATION_PROCESSOR_CORE, 48),
+            (RELATION_PROCESSOR_CORE, 48),
+            (RELATION_PROCESSOR_CORE, 48),
+            (RELATION_PROCESSOR_CORE, 48),
+        ]);
+        assert_eq!(packages_and_cores(&two), Ok((2, 2)));
+    }
+
+    #[test]
+    fn a_topology_that_cannot_be_stated_is_an_error() {
+        let uneven = records(&[
+            (RELATION_PROCESSOR_PACKAGE, 32),
+            (RELATION_PROCESSOR_PACKAGE, 32),
+            (RELATION_PROCESSOR_CORE, 48),
+            (RELATION_PROCESSOR_CORE, 48),
+            (RELATION_PROCESSOR_CORE, 48),
+        ]);
+        assert!(packages_and_cores(&uneven).is_err());
+        assert!(packages_and_cores(&records(&[(RELATION_PROCESSOR_CORE, 48)])).is_err());
+        assert!(packages_and_cores(&[]).is_err());
+        // A header cut short, a size below the header, and a size past the end.
+        assert!(packages_and_cores(&[3, 0, 0, 0, 8]).is_err());
+        assert!(packages_and_cores(&records(&[(RELATION_PROCESSOR_PACKAGE, 4)])).is_err());
+        let mut overrun = record(RELATION_PROCESSOR_PACKAGE, 32);
+        overrun.truncate(20);
+        assert!(packages_and_cores(&overrun).is_err());
+    }
+
+    #[test]
+    fn the_numa_nodes_are_read_from_their_records_sorted_and_once() {
+        let mut records = Vec::new();
+        for node in [1_u32, 0, 1] {
+            let mut record = record(RELATION_NUMA_NODE, 64);
+            record[8..12].copy_from_slice(&node.to_le_bytes());
+            records.extend(record);
+        }
+        records.extend(record(RELATION_PROCESSOR_CORE, 48));
+        assert_eq!(numa_nodes(&records), Ok(vec![0, 1]));
+
+        // No node record, and a node record without room for its number.
+        assert!(numa_nodes(&record(RELATION_PROCESSOR_CORE, 48)).is_err());
+        assert!(numa_nodes(&record(RELATION_NUMA_NODE, 8)).is_err());
+        assert!(numa_nodes(&[]).is_err());
+    }
+    #[test]
+    fn the_version_and_the_microcode_read_like_the_linux_facts() {
+        assert_eq!(version_text(10, 0, 26200, 9711), "10.0.26200.9711");
+        assert_eq!(
+            microcode_text(&[0x30, 0x10, 0x70, 0x08]),
+            Some("0x8701030".to_owned())
+        );
+        // A form this reader has not seen on a host is not decoded.
+        assert_eq!(microcode_text(&[1, 2, 3, 4, 5, 6, 7, 8]), None);
+        assert_eq!(microcode_text(&[]), None);
+    }
+
+    #[test]
+    fn a_registry_string_loses_its_padding_and_its_terminator() {
+        let bytes: Vec<u8> = "  AMD Ryzen 7   \0left over"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(registry_text(&bytes), "AMD Ryzen 7");
+        assert_eq!(registry_text(&[]), "");
     }
 
     #[test]
@@ -737,6 +1416,92 @@ mod tests {
 
             assert_eq!(peak_memory_bytes(pid), Err(PlatformError::ProcessGone(pid)));
             assert_eq!(process_regions(pid), Err(PlatformError::ProcessGone(pid)));
+        }
+
+        fn parse_cpu_list(text: &str) -> std::collections::BTreeSet<u32> {
+            text.split(',')
+                .flat_map(|part| match part.split_once('-') {
+                    Some((first, last)) => {
+                        first.parse::<u32>().expect("a number")..=last.parse().expect("a number")
+                    }
+                    None => {
+                        let cpu = part.parse::<u32>().expect("a number");
+                        cpu..=cpu
+                    }
+                })
+                .collect()
+        }
+
+        #[test]
+        fn this_host_describes_itself() {
+            let facts = machine_facts().expect("machine facts");
+
+            let release: Vec<&str> = facts.kernel_release.split('.').collect();
+            assert_eq!(release.len(), 3, "{}", facts.kernel_release);
+            assert!(release.iter().all(|part| part.parse::<u32>().is_ok()));
+            assert!(
+                facts
+                    .kernel_version
+                    .starts_with(&format!("{}.", facts.kernel_release)),
+                "{} / {}",
+                facts.kernel_release,
+                facts.kernel_version
+            );
+            assert!(!facts.cpu_model.is_empty());
+            assert_eq!(facts.cpu_model, facts.cpu_model.trim());
+            assert!(facts.sockets >= 1 && facts.cores_per_socket >= 1);
+            assert!(facts.microcode == UNAVAILABLE || facts.microcode.starts_with("0x"));
+            assert_eq!(facts.governor, UNAVAILABLE);
+            assert_eq!(facts.swap_total_kib, swap_total_kib().expect("swap"));
+        }
+
+        #[test]
+        fn the_online_list_covers_every_logical_cpu_and_the_thread_runs_inside_it() {
+            let online = parse_cpu_list(&online_cpu_list().expect("online CPUs"));
+            let logical = std::thread::available_parallelism().expect("parallelism");
+            // Parallelism follows the affinity of the process, the list does not.
+            assert!(online.len() >= logical.get(), "{online:?}");
+            assert_eq!(online.first(), Some(&0));
+            assert_eq!(
+                online.last().copied(),
+                Some(u32::try_from(online.len()).expect("a small count") - 1),
+                "the online CPUs are numbered without gaps"
+            );
+
+            let affinity = parse_cpu_list(&cpu_affinity().expect("affinity"));
+            assert!(
+                !affinity.is_empty() && affinity.is_subset(&online),
+                "{affinity:?}"
+            );
+            let nodes = numa_memory_nodes().expect("NUMA nodes");
+            assert!(
+                !nodes.is_empty() && nodes.windows(2).all(|pair| pair[0] < pair[1]),
+                "{nodes:?}"
+            );
+            let placement = thread_placement().expect("placement");
+            assert_eq!(parse_cpu_list(&placement.cpu_affinity), affinity);
+            assert_eq!(placement.memory_policy, UNAVAILABLE);
+            assert_eq!(placement.memory_nodes, cpu_list(nodes));
+        }
+
+        #[test]
+        fn a_thread_pinned_to_one_cpu_reports_that_cpu() {
+            // Rust's standard library has no affinity call, so pin through the host.
+            #[link(name = "kernel32")]
+            #[allow(unsafe_code)]
+            unsafe extern "system" {
+                fn SetThreadAffinityMask(thread: ffi::Handle, mask: usize) -> usize;
+            }
+            std::thread::spawn(|| {
+                // SAFETY: the pseudo-handle of the calling thread needs no closing,
+                // and the mask names one CPU of the first group.
+                #[allow(unsafe_code)]
+                let before = unsafe { SetThreadAffinityMask(ffi::GetCurrentThread(), 1) };
+                assert_ne!(before, 0, "the host refused to pin the thread");
+                assert_eq!(cpu_affinity().expect("affinity"), "0");
+            })
+            .join()
+            .expect("the pinned thread");
         }
 
         #[test]

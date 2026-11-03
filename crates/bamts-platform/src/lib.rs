@@ -100,7 +100,11 @@ pub fn machine_facts() -> Result<MachineFacts, PlatformError> {
     {
         macos::machine_facts()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::machine_facts()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Err(PlatformError::Unsupported("machine facts"))
     }
@@ -120,7 +124,11 @@ pub fn thread_placement() -> Result<ThreadPlacement, PlatformError> {
     {
         macos::thread_placement()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::thread_placement()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Err(PlatformError::Unsupported("thread placement"))
     }
@@ -138,11 +146,11 @@ pub fn cpu_governor() -> Result<String, PlatformError> {
     {
         linux::cpu_governor()
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         Ok(UNAVAILABLE.to_owned())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Err(PlatformError::Unsupported("cpu governor"))
     }
@@ -162,7 +170,11 @@ pub fn swap_total_kib() -> Result<u64, PlatformError> {
     {
         macos::swap_total_kib()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::swap_total_kib()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Err(PlatformError::Unsupported("swap total"))
     }
@@ -182,7 +194,11 @@ pub fn cpu_affinity() -> Result<String, PlatformError> {
     {
         Ok(UNAVAILABLE.to_owned())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::cpu_affinity()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Err(PlatformError::Unsupported("cpu affinity"))
     }
@@ -202,7 +218,11 @@ pub fn online_cpu_list() -> Result<String, PlatformError> {
     {
         macos::online_cpu_list()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::online_cpu_list()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Err(PlatformError::Unsupported("online CPU list"))
     }
@@ -219,11 +239,11 @@ pub fn cpu_governors() -> Result<Vec<String>, PlatformError> {
     {
         linux::cpu_governors()
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         Ok(vec![UNAVAILABLE.to_owned()])
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Err(PlatformError::Unsupported("CPU governors"))
     }
@@ -244,7 +264,8 @@ pub fn numa_policy_mode() -> String {
 }
 
 /// The memory nodes this process is bound to. A host without NUMA nodes, such as
-/// macOS, has none and returns an empty list.
+/// macOS, has none and returns an empty list. Windows binds a process to no subset
+/// of its nodes, so it lists every node the host reports.
 ///
 /// # Errors
 /// Returns [`PlatformError`] when this host has no implementation or the host
@@ -258,7 +279,11 @@ pub fn numa_memory_nodes() -> Result<Vec<u32>, PlatformError> {
     {
         Ok(Vec::new())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::numa_memory_nodes()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Err(PlatformError::Unsupported("memory nodes"))
     }
