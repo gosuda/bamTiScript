@@ -50,7 +50,6 @@ const PAGE_MODE_MASK: u32 = 0xFF;
 ///
 /// Copy-on-write pages count as writable: a write through them succeeds. A guard
 /// page and `PAGE_NOACCESS` are `---p`, as a guard page is on Linux.
-#[cfg(any(target_os = "windows", test))]
 fn permissions_string(protect: u32) -> String {
     if protect & PAGE_GUARD != 0 {
         return "---p".to_owned();
@@ -73,7 +72,6 @@ fn permissions_string(protect: u32) -> String {
 }
 
 /// What backs a committed region, for its identity.
-#[cfg(any(target_os = "windows", test))]
 fn kind_name(kind: u32) -> &'static str {
     match kind {
         MEM_IMAGE => "image",
@@ -84,7 +82,6 @@ fn kind_name(kind: u32) -> &'static str {
 
 /// One drive letter and the NT device it names, such as `C:` and
 /// `\Device\HarddiskVolume7`.
-#[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DosDevice {
     drive: String,
@@ -96,7 +93,6 @@ struct DosDevice {
 ///
 /// A path on a device with no drive letter keeps its NT spelling: it still names
 /// the backing file, and a made-up drive would not.
-#[cfg(any(target_os = "windows", test))]
 fn dos_path(nt_path: &str, devices: &[DosDevice]) -> String {
     let under_device = |device: &DosDevice| {
         let prefix = nt_path.get(..device.target.len())?;
@@ -118,7 +114,6 @@ fn dos_path(nt_path: &str, devices: &[DosDevice]) -> String {
 
 /// Names a region by its address range first, as every host does, then by the
 /// allocation it belongs to and what backs it.
-#[cfg(any(target_os = "windows", test))]
 fn region_identity(start: u64, end: u64, allocation_base: u64, kind: u32, path: &str) -> String {
     format!(
         "{start:x}-{end:x} {allocation_base:x} {} {path}",
@@ -127,7 +122,6 @@ fn region_identity(start: u64, end: u64, allocation_base: u64, kind: u32, path: 
 }
 
 /// Formats CPU numbers as a kernel CPU list, such as `0-3,5,7-9`.
-#[cfg(any(target_os = "windows", test))]
 fn cpu_list(cpus: impl IntoIterator<Item = u32>) -> String {
     let cpus: std::collections::BTreeSet<u32> = cpus.into_iter().collect();
     let mut parts = Vec::new();
@@ -151,7 +145,6 @@ fn cpu_list(cpus: impl IntoIterator<Item = u32>) -> String {
 
 /// The CPUs that `mask` sets in a processor group whose first CPU is numbered
 /// `first_cpu` across the machine.
-#[cfg(any(target_os = "windows", test))]
 fn mask_cpus(first_cpu: u32, mask: u64) -> Vec<u32> {
     (0..u64::BITS)
         .filter(|bit| mask >> bit & 1 == 1)
@@ -160,21 +153,17 @@ fn mask_cpus(first_cpu: u32, mask: u64) -> Vec<u32> {
 }
 
 /// `LOGICAL_PROCESSOR_RELATIONSHIP` of a physical core.
-#[cfg(any(target_os = "windows", test))]
 const RELATION_PROCESSOR_CORE: u32 = 0;
 /// `LOGICAL_PROCESSOR_RELATIONSHIP` of a processor package, which is a socket.
-#[cfg(any(target_os = "windows", test))]
 const RELATION_PROCESSOR_PACKAGE: u32 = 3;
 
 /// `LOGICAL_PROCESSOR_RELATIONSHIP` of a NUMA node.
-#[cfg(any(target_os = "windows", test))]
 const RELATION_NUMA_NODE: u32 = 1;
 
 /// Splits the records that `GetLogicalProcessorInformationEx` returns into
 /// `(relationship, whole record)`.
 ///
 /// Each record starts with its relationship and its own size, both `u32`.
-#[cfg(any(target_os = "windows", test))]
 fn split_records(records: &[u8]) -> std::result::Result<Vec<(u32, &[u8])>, String> {
     let mut found = Vec::new();
     let mut offset = 0_usize;
@@ -201,7 +190,6 @@ fn split_records(records: &[u8]) -> std::result::Result<Vec<(u32, &[u8])>, Strin
 ///
 /// The cores must divide evenly across the packages, or the host describes a
 /// machine this fact cannot state.
-#[cfg(any(target_os = "windows", test))]
 fn packages_and_cores(records: &[u8]) -> std::result::Result<(u32, u32), String> {
     let (mut packages, mut cores) = (0_u32, 0_u32);
     for (relationship, _) in split_records(records)? {
@@ -221,7 +209,6 @@ fn packages_and_cores(records: &[u8]) -> std::result::Result<(u32, u32), String>
 
 /// Reads the NUMA node numbers from the records, sorted. A node record holds its
 /// number right after the header.
-#[cfg(any(target_os = "windows", test))]
 fn numa_nodes(records: &[u8]) -> std::result::Result<Vec<u32>, String> {
     let mut nodes = std::collections::BTreeSet::new();
     for (relationship, record) in split_records(records)? {
@@ -242,7 +229,6 @@ fn numa_nodes(records: &[u8]) -> std::result::Result<Vec<u32>, String> {
 }
 
 /// The Windows version as `major.minor.build.revision`, such as `10.0.26200.9711`.
-#[cfg(any(target_os = "windows", test))]
 fn version_text(major: u32, minor: u32, build: u32, revision: u32) -> String {
     format!("{major}.{minor}.{build}.{revision}")
 }
@@ -250,10 +236,8 @@ fn version_text(major: u32, minor: u32, build: u32, revision: u32) -> String {
 /// The microcode revision as Linux prints it, such as `0x8701030`.
 ///
 /// The `Update Revision` registry value is the revision register of the CPU. A
-/// four-byte value holds the revision itself; that is the form seen on an AMD
-/// host. Any other length is a form this reader has not checked against a host,
-/// so it gives `None` rather than a guess.
-#[cfg(any(target_os = "windows", test))]
+/// four-byte value holds the revision itself. Any other length is a form this
+/// reader has not checked against a host, so it gives `None` rather than a guess.
 fn microcode_text(value: &[u8]) -> Option<String> {
     let bytes: [u8; 4] = value.try_into().ok()?;
     Some(format!("0x{:x}", u32::from_le_bytes(bytes)))
@@ -261,7 +245,6 @@ fn microcode_text(value: &[u8]) -> Option<String> {
 
 /// Decodes a registry string: UTF-16 up to the first NUL, without the padding that
 /// CPU vendors put around the name.
-#[cfg(any(target_os = "windows", test))]
 fn registry_text(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
         .chunks_exact(2)
@@ -472,12 +455,29 @@ const OPEN_SOURCE: &str = "OpenProcess";
 const REGION_SOURCE: &str = "VirtualQueryEx";
 #[cfg(target_os = "windows")]
 const MEMORY_SOURCE: &str = "GetProcessMemoryInfo";
+#[cfg(target_os = "windows")]
+const SAMPLER_SOURCE: &str = "peak memory sampler thread";
+
+/// The host failed to answer a read.
+#[cfg(target_os = "windows")]
+fn read_failed(source: impl Into<String>, detail: impl Into<String>) -> PlatformError {
+    PlatformError::Read {
+        source: source.into(),
+        detail: detail.into(),
+    }
+}
 
 #[cfg(target_os = "windows")]
 fn read_error(source: &str, error: &std::io::Error) -> PlatformError {
-    PlatformError::Read {
-        source: source.to_owned(),
-        detail: error.to_string(),
+    read_failed(source, error.to_string())
+}
+
+/// The host answered, but not with data of the shape this reader expects.
+#[cfg(target_os = "windows")]
+fn malformed(source: impl Into<String>, detail: impl Into<String>) -> PlatformError {
+    PlatformError::Malformed {
+        source: source.into(),
+        detail: detail.into(),
     }
 }
 
@@ -623,6 +623,12 @@ fn counters_of(
     }
 }
 
+/// UTF-16 text with the NUL terminator that Win32 calls expect.
+#[cfg(target_os = "windows")]
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 /// Maps each drive letter to its NT device, so a mapped file name can be shown as
 /// the path a program opens. A letter with no device is left out.
 #[cfg(target_os = "windows")]
@@ -631,7 +637,7 @@ fn dos_devices() -> Vec<DosDevice> {
     let mut devices = Vec::new();
     for letter in 'A'..='Z' {
         let drive = format!("{letter}:");
-        let name: Vec<u16> = drive.encode_utf16().chain(std::iter::once(0)).collect();
+        let name = wide(&drive);
         let capacity = u32::try_from(buffer.len()).expect("the buffer fits a DWORD");
         // SAFETY: `name` is NUL-terminated and `buffer` is live and writable for
         // `capacity` UTF-16 units, the size the host is told.
@@ -672,10 +678,7 @@ pub(crate) fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>> {
             .base_address
             .checked_add(info.region_size)
             .filter(|next| *next > address)
-            .ok_or_else(|| PlatformError::Malformed {
-                source: REGION_SOURCE.to_owned(),
-                detail: "region walk does not advance".to_owned(),
-            })?;
+            .ok_or_else(|| malformed(REGION_SOURCE, "region walk does not advance"))?;
         address = next;
         if info.state != MEM_COMMIT {
             continue;
@@ -770,10 +773,7 @@ impl Window {
                 }
                 peak
             })
-            .map_err(|error| PlatformError::Read {
-                source: "peak memory sampler thread".to_owned(),
-                detail: error.to_string(),
-            })?;
+            .map_err(|error| read_error(SAMPLER_SOURCE, &error))?;
         Ok(Self {
             stop,
             sampler: Some(sampler),
@@ -787,10 +787,7 @@ impl Window {
             .take()
             .expect("the sampler is present until the window finishes")
             .join()
-            .map_err(|_| PlatformError::Read {
-                source: "peak memory sampler thread".to_owned(),
-                detail: "the sampler panicked".to_owned(),
-            })?;
+            .map_err(|_| read_failed(SAMPLER_SOURCE, "the sampler panicked"))?;
         Ok(sampled.max(working_set_bytes()?))
     }
 }
@@ -838,11 +835,6 @@ fn registry_value(
     flags: u32,
     capacity: usize,
 ) -> Result<Option<Vec<u8>>> {
-    let wide = |text: &str| {
-        text.encode_utf16()
-            .chain(std::iter::once(0))
-            .collect::<Vec<u16>>()
-    };
     let (sub_key_wide, value_wide) = (wide(sub_key), wide(value));
     let mut data = vec![0_u8; capacity];
     let mut size = u32::try_from(capacity).expect("the capacity fits a DWORD");
@@ -868,11 +860,17 @@ fn registry_value(
             Ok(Some(data))
         }
         ERROR_FILE_NOT_FOUND => Ok(None),
-        _ => Err(PlatformError::Read {
-            source: format!("RegGetValueW {sub_key}\\{value}"),
-            detail: std::io::Error::from_raw_os_error(status).to_string(),
-        }),
+        _ => Err(read_error(
+            &registry_source(sub_key, value),
+            &std::io::Error::from_raw_os_error(status),
+        )),
     }
+}
+
+/// Names a registry value in an error, the way `source` names the call elsewhere.
+#[cfg(target_os = "windows")]
+fn registry_source(sub_key: &str, value: &str) -> String {
+    format!("RegGetValueW {sub_key}\\{value}")
 }
 
 /// A registry value that this host has to have.
@@ -883,10 +881,8 @@ fn required_registry_value(
     flags: u32,
     capacity: usize,
 ) -> Result<Vec<u8>> {
-    registry_value(sub_key, value, flags, capacity)?.ok_or_else(|| PlatformError::Malformed {
-        source: format!("RegGetValueW {sub_key}\\{value}"),
-        detail: "the value does not exist".to_owned(),
-    })
+    registry_value(sub_key, value, flags, capacity)?
+        .ok_or_else(|| malformed(registry_source(sub_key, value), "the value does not exist"))
 }
 
 /// The Windows version `(major, minor, build)`. `RtlGetVersion` tells the real
@@ -907,10 +903,10 @@ fn windows_version() -> Result<(u32, u32, u32)> {
     #[allow(unsafe_code)]
     let status = unsafe { ffi::RtlGetVersion(&raw mut info) };
     if status != 0 {
-        return Err(PlatformError::Read {
-            source: "RtlGetVersion".to_owned(),
-            detail: format!("NTSTATUS {status:#x}"),
-        });
+        return Err(read_failed(
+            "RtlGetVersion",
+            format!("NTSTATUS {status:#x}"),
+        ));
     }
     Ok((info.major, info.minor, info.build))
 }
@@ -953,25 +949,17 @@ fn processor_records() -> Result<Vec<u8>> {
     Ok(records)
 }
 
-#[cfg(target_os = "windows")]
-fn malformed_topology(detail: String) -> PlatformError {
-    PlatformError::Malformed {
-        source: TOPOLOGY_SOURCE.to_owned(),
-        detail,
-    }
-}
-
 /// Reads `(packages, cores per package)` from the host.
 #[cfg(target_os = "windows")]
 fn processor_topology() -> Result<(u32, u32)> {
-    packages_and_cores(&processor_records()?).map_err(malformed_topology)
+    packages_and_cores(&processor_records()?).map_err(|detail| malformed(TOPOLOGY_SOURCE, detail))
 }
 
 /// The NUMA nodes of the host. A Windows process is not bound to a subset of
 /// them, so these are the nodes its memory may come from.
 #[cfg(target_os = "windows")]
 pub(crate) fn numa_memory_nodes() -> Result<Vec<u32>> {
-    numa_nodes(&processor_records()?).map_err(malformed_topology)
+    numa_nodes(&processor_records()?).map_err(|detail| malformed(TOPOLOGY_SOURCE, detail))
 }
 
 #[cfg(target_os = "windows")]
@@ -980,9 +968,11 @@ pub(crate) fn machine_facts() -> Result<MachineFacts> {
     let revision = u32::from_le_bytes(
         required_registry_value(VERSION_KEY, "UBR", RRF_RT_REG_DWORD, 4)?
             .try_into()
-            .map_err(|_| PlatformError::Malformed {
-                source: format!("RegGetValueW {VERSION_KEY}\\UBR"),
-                detail: "the revision is not a DWORD".to_owned(),
+            .map_err(|_| {
+                malformed(
+                    registry_source(VERSION_KEY, "UBR"),
+                    "the revision is not a DWORD",
+                )
             })?,
     );
     let cpu_model = registry_text(&required_registry_value(
@@ -1064,10 +1054,7 @@ pub(crate) fn swap_total_kib() -> Result<u64> {
     pages
         .checked_mul(page)
         .map(|bytes| bytes / 1024)
-        .ok_or_else(|| PlatformError::Malformed {
-            source: SOURCE.to_owned(),
-            detail: "the page file size overflows".to_owned(),
-        })
+        .ok_or_else(|| malformed(SOURCE, "the page file size overflows"))
 }
 
 /// How many logical CPUs are active in `group`, or in all groups.
@@ -1108,10 +1095,7 @@ pub(crate) fn cpu_affinity() -> Result<String> {
     }
     let cpus = mask_cpus(first_cpu, affinity.mask as u64);
     if cpus.is_empty() {
-        return Err(PlatformError::Malformed {
-            source: SOURCE.to_owned(),
-            detail: "the thread may run on no CPU".to_owned(),
-        });
+        return Err(malformed(SOURCE, "the thread may run on no CPU"));
     }
     Ok(cpu_list(cpus))
 }
