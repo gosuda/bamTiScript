@@ -4,20 +4,51 @@
 //! to open a directory as a plain file, so `File::open(..).sync_all()` fails
 //! there with "access denied".
 
-use std::{
-    fs::{File, OpenOptions},
-    io,
-    path::Path,
-};
+use std::{fs::File, io, path::Path};
 
 /// Flushes the file at `path` to storage. Other hosts flush through a read-only
 /// handle, which also covers files whose mode forbids writing.
+#[cfg(not(windows))]
 pub(crate) fn sync_file(path: &Path) -> io::Result<()> {
-    OpenOptions::new()
-        .read(true)
-        .write(cfg!(windows))
-        .open(path)?
-        .sync_all()
+    File::open(path)?.sync_all()
+}
+
+/// Flushes the file at `path` to storage through a handle with write access.
+///
+/// A file with the read-only attribute refuses such a handle. The attribute is
+/// lifted for the flush and put back afterwards, whether or not the flush worked.
+#[cfg(windows)]
+pub(crate) fn sync_file(path: &Path) -> io::Result<()> {
+    let flush = || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .sync_all()
+    };
+    match flush() {
+        Err(denied) if denied.kind() == io::ErrorKind::PermissionDenied && is_read_only(path) => {
+            set_read_only(path, false)?;
+            let flushed = flush();
+            let restored = set_read_only(path, true);
+            flushed.and(restored)
+        }
+        flushed => flushed,
+    }
+}
+
+#[cfg(windows)]
+fn is_read_only(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().readonly())
+}
+
+/// Sets or clears the read-only attribute. Only Windows reaches this code: on
+/// Unix, clearing the flag would make the file writable for everyone.
+#[cfg(windows)]
+fn set_read_only(path: &Path, read_only: bool) -> io::Result<()> {
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_readonly(read_only);
+    std::fs::set_permissions(path, permissions)
 }
 
 /// Flushes the directory entry list at `path`. Windows has no directory flush:
@@ -63,6 +94,26 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::NotFound
         );
+
+        fs::remove_dir_all(dir).expect("remove scratch dir");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_file_with_the_read_only_attribute_flushes_and_stays_read_only() {
+        let dir = scratch("attribute");
+        let file = dir.join("data");
+        fs::write(&file, b"payload").expect("write file");
+        super::set_read_only(&file, true).expect("set the read-only attribute");
+
+        sync_file(&file).expect("flush read-only file");
+
+        let read_only = fs::metadata(&file)
+            .expect("metadata")
+            .permissions()
+            .readonly();
+        super::set_read_only(&file, false).expect("clear the attribute for cleanup");
+        assert!(read_only, "the attribute is restored after the flush");
 
         fs::remove_dir_all(dir).expect("remove scratch dir");
     }
