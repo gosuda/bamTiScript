@@ -42,6 +42,7 @@ use crate::{
         EvidenceHeader, EvidenceReader, EvidenceRow, EvidenceWriter, ExecutionBinding, PublishMode,
         RunBinding, TerminalState, ToolchainPin, WorkingDirectoryPolicy, merge_shards,
     },
+    fsync,
     lane::{
         LaneBinding, LaneExecutor, LaneOutcome, LaneProcessResult, LaneRequest, LaneResponse,
         ProcessExecutor, ProcessObservation, derive_row,
@@ -838,10 +839,7 @@ pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> 
             writer.write_row(&row)?;
         }
         writer.finish()?;
-        File::open(&temp)
-            .map_err(|error| io_path(&temp, error))?
-            .sync_all()
-            .map_err(|error| io_path(&temp, error))
+        fsync::sync_file(&temp).map_err(|error| io_path(&temp, error))
     })();
     match outcome {
         Ok(()) => {

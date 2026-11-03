@@ -438,6 +438,10 @@ impl AtomicFs for StdAtomicFs {
     }
 
     fn sync_dir(&mut self, dir: &Path) -> Result<(), Self::Error> {
+        // Windows cannot open a directory for flushing; NTFS journals the rename itself.
+        if cfg!(windows) {
+            return Ok(());
+        }
         File::open(dir)?.sync_all()
     }
 

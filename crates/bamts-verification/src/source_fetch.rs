@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256, Sha512};
 use crate::{
     ErrorCode, Result, VerificationError,
     corpus::{OracleLimits, normalized_env, run_process},
+    fsync,
     schema::{SourcePin, base64_value, load_sources, required_source},
 };
 
@@ -622,18 +623,14 @@ fn sync_tree(root: &Path) -> Result<()> {
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
             sync_tree(&entry.path())?;
         } else if metadata.is_file() {
-            File::open(entry.path())
-                .and_then(|file| file.sync_all())
-                .map_err(|error| io_error(&entry.path(), error))?;
+            fsync::sync_file(&entry.path()).map_err(|error| io_error(&entry.path(), error))?;
         }
     }
     sync_directory(root)
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| io_error(path, error))
+    fsync::sync_directory(path).map_err(|error| io_error(path, error))
 }
 
 fn ensure_parent(parent: &Path) -> Result<PathBuf> {

@@ -7,7 +7,7 @@
 //! rows are labeled for exact policy exclusion rather than guessed away.
 
 use crate::{
-    ErrorCode, Result, VerificationError,
+    ErrorCode, Result, VerificationError, fsync,
     schema::{
         CATALOG_NAMES, Catalog, CatalogSource, MANIFEST_PATH, TYPESCRIPT_SUITE_SOURCE,
         VerificationManifest, catalog_source_from_pin, encode_manifest, identifiers_sha256,
@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::Write,
     path::{Component, Path},
     sync::atomic::{AtomicU64, Ordering},
@@ -1096,9 +1096,7 @@ fn replace_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
         file.sync_all()
             .map_err(|error| io_error(&temporary, &error))?;
         fs::rename(&temporary, path).map_err(|error| io_error(path, &error))?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| io_error(parent, &error))
+        fsync::sync_directory(parent).map_err(|error| io_error(parent, &error))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
