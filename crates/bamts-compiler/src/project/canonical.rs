@@ -10,7 +10,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs, io,
-    path::{Component, Path, PathBuf, Prefix},
+    path::{Component, MAIN_SEPARATOR, Path, PathBuf, Prefix},
 };
 
 /// `fs::canonicalize` with the verbatim prefix removed when that is safe.
@@ -58,6 +58,15 @@ pub fn simplify(path: &Path) -> PathBuf {
         }
     }
     plain
+}
+
+/// The path as TypeScript prints it: `/` separates segments on every platform.
+///
+/// Source-map URLs, `sources` entries and tsc messages use this text. Where the
+/// platform separator is already `/`, the text is the path unchanged.
+#[must_use]
+pub fn slash_text(path: &Path) -> String {
+    path.to_string_lossy().replace(MAIN_SEPARATOR, "/")
 }
 
 fn is_plain_name(name: &OsStr) -> bool {
@@ -136,6 +145,24 @@ mod tests {
         assert!(canonical.is_absolute());
 
         fs::remove_dir_all(directory).expect("remove temporary directory");
+    }
+
+    #[test]
+    fn slash_text_uses_forward_slashes_and_keeps_relative_segments() {
+        let mut path = PathBuf::from("..");
+        path.push("sub");
+        path.push("name.part.js.map");
+
+        assert_eq!(slash_text(&path), "../sub/name.part.js.map");
+        assert_eq!(slash_text(Path::new("a/b")), "a/b");
+        assert_eq!(slash_text(Path::new("")), "");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn slash_text_rewrites_windows_separators() {
+        assert_eq!(slash_text(Path::new(r"C:\a\b.ts")), "C:/a/b.ts");
+        assert_eq!(slash_text(Path::new(r"..\a\*\*.ts")), "../a/*/*.ts");
     }
 
     #[test]

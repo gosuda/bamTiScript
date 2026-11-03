@@ -4,6 +4,7 @@ use super::{
         BUILD_INFO_SCHEMA, BuildInfo, BuildOutputs, is_project_up_to_date, options_signature,
         project_signature, source_signature,
     },
+    canonical::slash_text,
     output::{ArtifactKind, ArtifactSelection, OutputMapError, PlanRequest, map_output_paths},
     references::{ReferenceError, ReferenceGraph, resolve_config_file_name},
     tsconfig::{ProjectReference, ResolvedExtends, TsConfig, TsConfigError, resolve_extends},
@@ -556,17 +557,17 @@ fn surface_map_names(
     // map directory back to the original source.
     let source_name = match source_root {
         Some(root) if has_explicit_source_root && !root.is_empty() => {
-            Some(Arc::<str>::from(source_relative.to_string_lossy().as_ref()))
+            Some(Arc::<str>::from(slash_text(&source_relative)))
         }
         _ => {
             let map_directory = map_path.parent().unwrap_or_else(|| Path::new(""));
             let relative_to_map = relative_path_between(map_directory, source_path);
-            Some(Arc::<str>::from(relative_to_map.to_string_lossy().as_ref()))
+            Some(Arc::<str>::from(slash_text(&relative_to_map)))
         }
     };
 
     let source_map_url = map_root.map(|root| {
-        let source_relative_identity = format!("{}.map", output_relative.to_string_lossy());
+        let source_relative_identity = format!("{}.map", slash_text(&output_relative));
         if is_url_like(root) || root.starts_with('/') {
             Arc::<str>::from(join_url_segments(root, &source_relative_identity))
         } else {
@@ -574,7 +575,7 @@ fn surface_map_names(
             let output_directory = output_path.parent().unwrap_or_else(|| Path::new(""));
             let url =
                 relative_path_between(output_directory, &base.join(&source_relative_identity));
-            Arc::<str>::from(url.to_string_lossy().as_ref())
+            Arc::<str>::from(slash_text(&url))
         }
     });
 
@@ -1516,11 +1517,10 @@ fn materialize_sources(
                     if value_path.is_absolute() {
                         return Arc::clone(value);
                     }
-                    Arc::<str>::from(
-                        relative_path_between(directory, &source.directory.join(value_path))
-                            .to_string_lossy()
-                            .as_ref(),
-                    )
+                    Arc::<str>::from(slash_text(&relative_path_between(
+                        directory,
+                        &source.directory.join(value_path),
+                    )))
                 })
                 .collect::<Vec<_>>(),
         )
