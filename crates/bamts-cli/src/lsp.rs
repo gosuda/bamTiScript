@@ -733,15 +733,70 @@ fn uri_to_path(uri: &str) -> Result<PathBuf, String> {
         None => return Err("file URI has no path".to_owned()),
     };
     let decoded = percent_decode(&format!("/{path}"))?;
-    Ok(PathBuf::from(decoded))
+    Ok(path_from_uri_text(decoded))
+}
+
+/// The file-system path that a decoded URI path names.
+///
+/// RFC 8089 spells a Windows drive path as `/C:/dir/file.ts`; clients that
+/// percent-encode the colon send `/c:/dir/file.ts` after decoding. The leading
+/// slash is not part of the path. Everywhere else the text is the path.
+#[cfg(windows)]
+fn path_from_uri_text(decoded: String) -> PathBuf {
+    match drive_colon_index(&decoded) {
+        Some(_) => PathBuf::from(&decoded[1..]),
+        None => PathBuf::from(decoded),
+    }
+}
+
+#[cfg(not(windows))]
+fn path_from_uri_text(decoded: String) -> PathBuf {
+    PathBuf::from(decoded)
+}
+
+/// The URI path text of `path`: segments are separated by `/`, and a Windows
+/// drive path gains the leading slash that RFC 8089 puts before the drive letter.
+#[cfg(windows)]
+fn uri_path_text(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let rooted = format!("/{text}");
+    if drive_colon_index(&rooted).is_some() {
+        rooted
+    } else {
+        text
+    }
+}
+
+#[cfg(not(windows))]
+fn uri_path_text(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// The byte index of the colon in a leading `/X:` drive designator that is
+/// followed by `/` or ends the text.
+#[cfg(windows)]
+fn drive_colon_index(text: &str) -> Option<usize> {
+    match text.as_bytes() {
+        [b'/', drive, b':'] | [b'/', drive, b':', b'/', ..] if drive.is_ascii_alphabetic() => {
+            Some(2)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(not(windows))]
+fn drive_colon_index(_text: &str) -> Option<usize> {
+    None
 }
 
 fn path_to_uri(path: &Path) -> String {
-    let display = path.to_string_lossy();
+    let text = uri_path_text(path);
+    let drive_colon = drive_colon_index(&text);
     let mut encoded = String::from("file://");
-    for ch in display.chars() {
+    for (index, ch) in text.char_indices() {
         match ch {
             'A'..='Z' | 'a'..='z' | '0'..='9' | '/' | '_' | '-' | '.' | '~' => encoded.push(ch),
+            ':' if Some(index) == drive_colon => encoded.push(ch),
             _ => {
                 for byte in ch.encode_utf8(&mut [0; 4]).bytes() {
                     encoded.push_str(&format!("%{byte:02X}"));
@@ -1406,6 +1461,55 @@ mod tests {
             "{rejected:?}"
         );
         assert!(uri_to_path("file://evil.com").is_err());
+    }
+
+    #[test]
+    fn uris_round_trip_through_percent_encoding() {
+        let path = Path::new("/tmp/a b/é~1.ts");
+        let uri = path_to_uri(path);
+
+        assert_eq!(uri, "file:///tmp/a%20b/%C3%A9~1.ts");
+        assert_eq!(uri_to_path(&uri).expect("round trip"), path);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn drive_paths_use_rfc_8089_uris_in_both_directions() {
+        let path = Path::new(r"C:\Users\me\a b\é.ts");
+        let uri = path_to_uri(path);
+
+        assert_eq!(uri, "file:///C:/Users/me/a%20b/%C3%A9.ts");
+        assert_eq!(uri_to_path(&uri).expect("round trip"), path);
+        for client_uri in [
+            "file:///C:/Users/me/a%20b/%C3%A9.ts",
+            "file:///c%3A/Users/me/a%20b/%C3%A9.ts",
+            "file:///c%3a/Users/me/a%20b/%C3%A9.ts",
+        ] {
+            let parsed = uri_to_path(client_uri).expect(client_uri);
+            assert!(parsed.is_absolute(), "{client_uri} -> {}", parsed.display());
+            assert!(
+                parsed
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&path.to_string_lossy().replace('\\', "/")),
+                "{client_uri} -> {}",
+                parsed.display()
+            );
+        }
+        assert_eq!(path_to_uri(Path::new(r"D:\")), "file:///D:/");
+        assert_eq!(
+            uri_to_path("file:///D:").expect("drive root"),
+            Path::new("D:")
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn rooted_paths_without_a_drive_keep_a_single_leading_slash() {
+        assert_eq!(path_to_uri(Path::new(r"\tmp\a.ts")), "file:///tmp/a.ts");
+        assert_eq!(
+            uri_to_path("file:///tmp/a.ts").expect("rooted"),
+            Path::new("/tmp/a.ts")
+        );
     }
 
     #[test]
