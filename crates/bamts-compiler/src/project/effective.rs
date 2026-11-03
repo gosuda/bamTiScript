@@ -940,7 +940,7 @@ impl fmt::Display for MaterializeError {
             Self::FilesListEmpty { config_path } => write!(
                 formatter,
                 "TS18002: The 'files' list in config file '{}' is empty.",
-                config_path.display()
+                slash_text(config_path)
             ),
             Self::NoInputs {
                 config_path,
@@ -949,7 +949,7 @@ impl fmt::Display for MaterializeError {
             } => write!(
                 formatter,
                 "TS18003: No inputs were found in config file '{}'. Specified 'include' paths were '{:?}' and 'exclude' paths were '{:?}'.",
-                config_path.display(),
+                slash_text(config_path),
                 include,
                 exclude
             ),

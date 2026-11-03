@@ -15,7 +15,7 @@ use bamts_compiler::{
     project::{
         JsonObject, JsonValue, ProjectConfig, ProjectRoot,
         build_mode::BuildInfo,
-        canonical::canonicalize,
+        canonical::{canonicalize, slash_text},
         effective::{
             EffectiveProject, MaterializeError, ProjectBuildOptions, ProjectCompileError,
             ProjectCompileOptions, ProjectCompileResult, ProjectLoadRequest,
@@ -671,7 +671,7 @@ fn initialize_tsc_config(context: &ExecutionContext) -> Result<CommandOutcome, D
             return Ok(CommandOutcome {
                 stdout: format!(
                     "error TS5054: A 'tsconfig.json' file is already defined at: '{}'.\n",
-                    path.display()
+                    slash_text(&path)
                 )
                 .into_bytes(),
                 ..CommandOutcome::default()
@@ -834,14 +834,14 @@ fn execute_tsc_build(
                 writeln!(
                     stdout,
                     "Project '{}' is up to date",
-                    project.config_path.display()
+                    slash_text(&project.config_path)
                 )
                 .expect("writing to Vec cannot fail");
             } else {
                 writeln!(
                     stdout,
                     "Building project '{}'...",
-                    project.config_path.display()
+                    slash_text(&project.config_path)
                 )
                 .expect("writing to Vec cannot fail");
             }
@@ -850,7 +850,7 @@ fn execute_tsc_build(
         stdout.extend_from_slice(&outcome.stdout);
         has_errors |= outcome.exit_code != TscExitStatus::Success.code();
         if command.flag("dry") {
-            writeln!(stdout, "Would build {}", project.config_path.display())
+            writeln!(stdout, "Would build {}", slash_text(&project.config_path))
                 .expect("writing to Vec cannot fail");
         } else if !project.result.up_to_date {
             publish_project_result(&project.result)?;
@@ -974,7 +974,7 @@ fn project_result_outcome(
     let names = result
         .sources
         .iter()
-        .map(|source| source.path.to_string_lossy())
+        .map(|source| slash_text(&source.path))
         .collect::<Vec<_>>();
     let sources = result
         .sources
@@ -1042,7 +1042,7 @@ fn config_not_found_outcome(
             "TS5081",
             format!(
                 "Cannot find a tsconfig.json file at the current directory: {}.",
-                config_path.display()
+                slash_text(config_path)
             ),
         );
     };
@@ -1054,7 +1054,7 @@ fn config_not_found_outcome(
     {
         return tsc_error_outcome(
             "TS5083",
-            format!("Cannot read file '{}'.", config_path.display()),
+            format!("Cannot read file '{}'.", slash_text(config_path)),
         );
     }
     let directory = if project_path.is_absolute() {
@@ -1066,7 +1066,7 @@ fn config_not_found_outcome(
         "TS5057",
         format!(
             "Cannot find a tsconfig.json file at the specified directory: '{}'.",
-            directory.display()
+            slash_text(&directory)
         ),
     )
 }
@@ -2782,6 +2782,7 @@ mod tests {
     use bamts_compiler::{
         CancellationToken,
         lint::{LintLevel, SourceDialect, rule_by_name},
+        project::canonical::slash_text,
     };
 
     use crate::args::{ArgsError, parse_args};
@@ -3048,7 +3049,7 @@ exit 2
             String::from_utf8(existing.stdout).expect("UTF-8 TS5054"),
             format!(
                 "error TS5054: A 'tsconfig.json' file is already defined at: '{}'.\n",
-                config.display()
+                slash_text(&config)
             )
         );
         assert_eq!(fs::read(config).expect("read unchanged config"), original);
@@ -3075,7 +3076,7 @@ exit 2
             current,
             format!(
                 "error TS5081: Cannot find a tsconfig.json file at the current directory: {}.\n",
-                fixture.0.join("tsconfig.json").display()
+                slash_text(&fixture.0.join("tsconfig.json"))
             ),
         );
 
@@ -3090,7 +3091,7 @@ exit 2
             explicit_directory,
             format!(
                 "error TS5057: Cannot find a tsconfig.json file at the specified directory: '{}'.\n",
-                directory.display()
+                slash_text(&directory)
             ),
         );
 
@@ -3102,7 +3103,10 @@ exit 2
         .expect("file project executes");
         assert_error(
             explicit_file,
-            format!("error TS5083: Cannot read file '{}'.\n", config.display()),
+            format!(
+                "error TS5083: Cannot read file '{}'.\n",
+                slash_text(&config)
+            ),
         );
 
         fixture.write("empty.json", r#"{"files":[]}"#);
@@ -3115,7 +3119,7 @@ exit 2
             empty,
             format!(
                 "error TS18002: The 'files' list in config file '{}' is empty.\n",
-                fixture.0.join("empty.json").display()
+                slash_text(&fixture.0.join("empty.json"))
             ),
         );
 
@@ -3132,14 +3136,14 @@ exit 2
             none,
             format!(
                 "error TS18003: No inputs were found in config file '{}'. Specified 'include' paths were '[\"src/**/*.ts\"]' and 'exclude' paths were '[\"build\"]'.\n",
-                fixture.0.join("none.json").display()
+                slash_text(&fixture.0.join("none.json"))
             ),
         );
 
         let absolute_pattern = fixture.0.join("absolute/**/*.ts");
         fixture.write(
             "absolute.json",
-            &format!(r#"{{"include":["{}"]}}"#, absolute_pattern.display()),
+            &format!(r#"{{"include":["{}"]}}"#, slash_text(&absolute_pattern)),
         );
         let absolute = execute_tsc_in(
             &parse_tsc_args(["--project", "absolute.json"]).expect("absolute project parses"),
@@ -3150,8 +3154,8 @@ exit 2
             absolute,
             format!(
                 "error TS18003: No inputs were found in config file '{}'. Specified 'include' paths were '[\"{}\"]' and 'exclude' paths were '[]'.\n",
-                fixture.0.join("absolute.json").display(),
-                absolute_pattern.display()
+                slash_text(&fixture.0.join("absolute.json")),
+                slash_text(&absolute_pattern)
             ),
         );
 
@@ -3169,7 +3173,7 @@ exit 2
             inherited,
             format!(
                 "error TS18003: No inputs were found in config file '{}'. Specified 'include' paths were '[\"../base/src/**/*.ts\"]' and 'exclude' paths were '[\"../base/build\"]'.\n",
-                fixture.0.join("app/tsconfig.json").display()
+                slash_text(&fixture.0.join("app/tsconfig.json"))
             ),
         );
     }
@@ -3196,8 +3200,8 @@ exit 2
         assert!(fixture.0.join("list-dist/a.js").is_file());
         assert!(fixture.0.join("list-dist/b.js").is_file());
         let listed = String::from_utf8(listed.stdout).unwrap();
-        let dependency = fixture.0.join("src/b.ts").display().to_string();
-        let root = fixture.0.join("src/a.ts").display().to_string();
+        let dependency = slash_text(&fixture.0.join("src/b.ts"));
+        let root = slash_text(&fixture.0.join("src/a.ts"));
         assert!(listed.contains(&dependency), "{listed}");
         assert!(listed.contains(&root), "{listed}");
 
@@ -3230,7 +3234,7 @@ exit 2
         assert_eq!(bad.exit_code, TscExitStatus::Success.code());
         assert_eq!(
             String::from_utf8(bad.stdout).unwrap(),
-            format!("{}\n", fixture.0.join("bad.ts").display())
+            format!("{}\n", slash_text(&fixture.0.join("bad.ts")))
         );
     }
 
