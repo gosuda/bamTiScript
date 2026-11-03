@@ -16,7 +16,8 @@ fn main() {
     let host = required("HOST");
     let archive = out_dir.join(staticlib_archive_name(&target));
 
-    let native_libraries = match node_staticlib_action(&target, &host) {
+    let mut native_libraries = String::new();
+    match node_staticlib_action(&target, &host) {
         NodeStaticlibAction::Assemble => {
             let wrapper = out_dir.join("embedded_node.rs");
             fs::write(&wrapper, wrapper_source())
@@ -32,25 +33,21 @@ fn main() {
                 node_rlib_metadata.as_deref(),
                 &cargo.fingerprint,
             ) {
-                Some(node_rlib) => assemble_staticlib(
-                    &rustc,
-                    &target,
-                    &dependencies,
-                    &node_rlib,
-                    &archive,
-                    &wrapper,
-                ),
-                None => {
-                    write_check_placeholder(&dependencies, &archive);
-                    String::new()
+                Some(node_rlib) => {
+                    native_libraries = assemble_staticlib(
+                        &rustc,
+                        &target,
+                        &dependencies,
+                        &node_rlib,
+                        &archive,
+                        &wrapper,
+                    );
                 }
+                None => write_check_placeholder(&dependencies, &archive),
             }
         }
-        NodeStaticlibAction::WriteEmptyArchive => {
-            write_empty_archive(&archive);
-            String::new()
-        }
-    };
+        NodeStaticlibAction::WriteEmptyArchive => write_empty_archive(&archive),
+    }
 
     cargo_line("rerun-if-changed=../bamts-node/src");
     cargo_line("rerun-if-changed=../bamts-node/Cargo.toml");
@@ -457,7 +454,7 @@ fn assemble_staticlib(
         .arg(wrapper);
     // The MSVC linker takes no libraries from the archive, so the link step has to
     // name the system libraries that the archive needs. Only rustc knows them.
-    let needs_libraries = target.contains("windows-msvc");
+    let needs_libraries = targets_msvc(target);
     if needs_libraries {
         command.arg("--print=native-static-libs");
     }
@@ -562,8 +559,12 @@ fn node_staticlib_action(target: &str, host: &str) -> NodeStaticlibAction {
     }
 }
 
+fn targets_msvc(target: &str) -> bool {
+    target.contains("windows-msvc")
+}
+
 fn staticlib_archive_name(target: &str) -> &'static str {
-    if target.contains("windows-msvc") {
+    if targets_msvc(target) {
         "bamts_node.lib"
     } else {
         "libbamts_node.a"
