@@ -291,7 +291,6 @@ pub struct SuiteSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompilerSnapshot {
     pub root: PathBuf,
-    pub metadata_digest: String,
     pub index: SuiteIndex,
 }
 
@@ -2082,7 +2081,6 @@ pub fn load_bound_compiler_snapshot(
     validate_suite_index(&index)?;
     Ok(CompilerSnapshot {
         root: snapshot_root,
-        metadata_digest: sha256_hex_concat(&[&pin_bytes, &index_bytes, &ledger_bytes]),
         index,
     })
 }
