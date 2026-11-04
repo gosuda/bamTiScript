@@ -13,7 +13,7 @@ use bamts_verification::{
     evidence::WorkingDirectoryPolicy,
     lane::{
         LANE_WORKER_DONE, LANE_WORKER_READY, LANE_WORKER_REQUEST, LANE_WORKER_SERVE, LaneBinding,
-        LaneRequest, LaneResponse,
+        LaneRequest, LaneResponse, ProcessExecutor, ServingExecutor, run_lane,
     },
     shard::{ExecutionMode, ObligationKey},
 };
@@ -118,6 +118,27 @@ fn a_serving_worker_answers_each_request_like_a_one_request_worker() {
     let status = child.wait().expect("worker exits");
     let _ = fs::remove_dir_all(&dir);
     assert!(status.success(), "{status}");
+}
+
+#[test]
+fn the_serving_executor_records_the_rows_of_one_worker_per_request() {
+    let dir = scratch("executors");
+    let requests: Vec<LaneRequest> = (1..=3).map(unbound_request).collect();
+    let mut one_per_request = ProcessExecutor::new(WORKER, Vec::new(), &dir, dir.join("one"));
+    let expected = run_lane(&mut one_per_request, &requests).expect("one worker per request");
+    let mut serving = ServingExecutor::new(WORKER, Vec::new(), &dir, dir.join("serving"));
+    let served = run_lane(&mut serving, &requests).expect("one serving worker");
+    let started = serving.workers_started();
+    drop(serving);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(started, 1, "one worker answers every request");
+    assert_eq!(served.len(), expected.len());
+    for (served, expected) in served.iter().zip(&expected) {
+        assert_eq!(served.key(), expected.key());
+        assert_eq!(served.state(), expected.state());
+        assert_eq!(served.artifacts(), expected.artifacts());
+        assert_eq!(served.detail(), expected.detail());
+    }
 }
 
 #[test]

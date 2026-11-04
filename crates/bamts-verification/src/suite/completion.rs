@@ -45,7 +45,7 @@ use crate::{
     fsync,
     lane::{
         LaneBinding, LaneExecutor, LaneOutcome, LaneProcessResult, LaneRequest, LaneResponse,
-        ProcessExecutor, ProcessObservation, derive_row,
+        ProcessExecutor, ProcessObservation, ServingExecutor, derive_row,
     },
     schema,
     shard::{ObligationKey, ShardIdentity, ShardSpec, validate_catalog},
@@ -515,7 +515,7 @@ fn load_obligation_classifications(
 /// unavailable adapter. An unavailable adapter is evidence, not a suite abort.
 enum SuiteAdapter {
     TargetCells(BTreeMap<String, crate::toolchain_schema::TargetCellRecord>),
-    External(ProcessExecutor),
+    External(Box<dyn LaneExecutor>),
     Missing(String),
 }
 
@@ -569,10 +569,22 @@ impl SuiteAdapter {
                 attempted.display()
             )));
         };
-        Ok(Self::External(
-            ProcessExecutor::new(program, Vec::new(), root, root.join("target/suite-lanes"))
-                .with_max_output_bytes(PROBE_OUTPUT_BYTES),
-        ))
+        let work_dir = root.join("target/suite-lanes");
+        // The compiler worker serves many requests from one process, so it
+        // authenticates and parses the snapshot once instead of once per case.
+        // The other lane workers answer one request per process.
+        let executor: Box<dyn LaneExecutor> = if runner == SuiteRunner::Compiler {
+            Box::new(
+                ServingExecutor::new(program, Vec::new(), root, work_dir)
+                    .with_max_output_bytes(PROBE_OUTPUT_BYTES),
+            )
+        } else {
+            Box::new(
+                ProcessExecutor::new(program, Vec::new(), root, work_dir)
+                    .with_max_output_bytes(PROBE_OUTPUT_BYTES),
+            )
+        };
+        Ok(Self::External(executor))
     }
 
     /// Executes one obligation through an internal path. Result is a worker

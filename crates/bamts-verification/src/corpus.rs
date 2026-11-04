@@ -1882,13 +1882,13 @@ pub(crate) fn drain_stream<R: Read + Send + 'static>(
 }
 
 #[cfg(unix)]
-fn termination_signal(status: &ExitStatus) -> Option<i32> {
+pub(crate) fn termination_signal(status: &ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
     status.signal()
 }
 
 #[cfg(not(unix))]
-fn termination_signal(_status: &ExitStatus) -> Option<i32> {
+pub(crate) fn termination_signal(_status: &ExitStatus) -> Option<i32> {
     None
 }
 
@@ -1899,7 +1899,7 @@ fn termination_signal(_status: &ExitStatus) -> Option<i32> {
 /// unprivileged process cannot write. These variables are host plumbing and
 /// stay out of `NORMALIZED_ENV`, which evidence records byte for byte.
 #[cfg(windows)]
-fn forward_host_runtime_env(command: &mut Command) {
+pub(crate) fn forward_host_runtime_env(command: &mut Command) {
     for key in ["SystemRoot", "windir", "TEMP", "TMP"] {
         if let Some(value) = env::var_os(key) {
             command.env(key, value);
@@ -1908,7 +1908,7 @@ fn forward_host_runtime_env(command: &mut Command) {
 }
 
 #[cfg(not(windows))]
-fn forward_host_runtime_env(_command: &mut Command) {}
+pub(crate) fn forward_host_runtime_env(_command: &mut Command) {}
 
 fn locate_node() -> Result<PathBuf> {
     let path = env::var_os("PATH").ok_or_else(|| {
@@ -2160,7 +2160,11 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn spawn_error(label: &str, program: &Path, error: &std::io::Error) -> VerificationError {
+pub(crate) fn spawn_error(
+    label: &str,
+    program: &Path,
+    error: &std::io::Error,
+) -> VerificationError {
     let code = if error.kind() == ErrorKind::NotFound {
         ErrorCode::ToolMissing
     } else {
@@ -2172,18 +2176,18 @@ fn spawn_error(label: &str, program: &Path, error: &std::io::Error) -> Verificat
     )
 }
 
-fn pipe_error(label: &str, stream: &str) -> VerificationError {
+pub(crate) fn pipe_error(label: &str, stream: &str) -> VerificationError {
     VerificationError::new(
         ErrorCode::Io,
         format!("{label} {stream} pipe was not captured"),
     )
 }
 
-fn wait_error(label: &str, error: std::io::Error) -> VerificationError {
+pub(crate) fn wait_error(label: &str, error: std::io::Error) -> VerificationError {
     VerificationError::new(ErrorCode::Io, format!("cannot wait on {label}: {error}"))
 }
 
-fn thread_error(label: &str, stream: &str) -> VerificationError {
+pub(crate) fn thread_error(label: &str, stream: &str) -> VerificationError {
     VerificationError::new(
         ErrorCode::ToolFailed,
         format!("{label} {stream} reader thread panicked"),

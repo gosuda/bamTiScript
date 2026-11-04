@@ -6,20 +6,31 @@
 //! signal, protocol error, and worker crash become blocking receipts, and the
 //! lane continues with later cases.  Process execution reuses the corpus
 //! normalized environment, bounded pipe drain, process-group timeout, and
-//! whole-group termination.
+//! whole-group termination.  [`ProcessExecutor`] starts one worker per
+//! request; [`ServingExecutor`] keeps one worker for many requests and records
+//! a worker that exits or misses a deadline the way [`ProcessExecutor`] does.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
     path::{Path, PathBuf},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::{
+        Arc, Mutex, PoisonError,
+        mpsc::{self, Receiver, RecvTimeoutError},
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use crate::{
     ErrorCode, Result, VerificationError,
-    corpus::{OracleLimits, normalized_env, run_process},
+    corpus::{
+        OracleLimits, forward_host_runtime_env, normalized_env, pipe_error, run_process,
+        spawn_error, terminate_process_group, termination_signal, thread_error, wait_error,
+    },
     evidence::{EvidenceRow, TerminalState, WorkingDirectoryPolicy},
     shard::{ObligationKey, require_token},
 };
@@ -469,9 +480,15 @@ impl LaneResponse {
 /// What the parent observed about the worker process itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessObservation {
-    Exited { code: i32 },
+    Exited {
+        code: i32,
+    },
     TimedOut,
-    Signaled { number: i32 },
+    Signaled {
+        number: i32,
+    },
+    /// A serving worker said that it wrote the response, and keeps running.
+    Answered,
 }
 
 /// Raw executor result.  `response_body` is untrusted until the parent parses it.
@@ -520,65 +537,74 @@ impl ProcessExecutor {
     }
 }
 
+/// Writes `request` where its worker reads it, and returns the request and the
+/// response paths. A response that an earlier run left behind is refused.
+fn write_request_file(work_dir: &Path, request: &LaneRequest) -> Result<(PathBuf, PathBuf)> {
+    request.validate()?;
+    fs::create_dir_all(work_dir).map_err(|error| {
+        VerificationError::new(ErrorCode::Io, format!("{}: {error}", work_dir.display()))
+    })?;
+    let request_path = work_dir.join(format!(
+        "lane-{}-{}.json",
+        request.binding().run_id(),
+        request.request_id()
+    ));
+    let response_path = request_path.with_extension("response.json");
+    if response_path.try_exists().map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Io,
+            format!("{}: {error}", response_path.display()),
+        )
+    })? {
+        return Err(VerificationError::new(
+            ErrorCode::Replay,
+            format!(
+                "refusing retained lane response `{}`",
+                response_path.display()
+            ),
+        ));
+    }
+    let encoded = serde_json::to_vec(request).map_err(|error| {
+        VerificationError::new(ErrorCode::Json, format!("encode lane request: {error}"))
+    })?;
+    let mut request_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&request_path)
+        .map_err(|error| {
+            VerificationError::new(
+                ErrorCode::Io,
+                format!("{}: {error}", request_path.display()),
+            )
+        })?;
+    request_file.write_all(&encoded).map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Io,
+            format!("{}: {error}", request_path.display()),
+        )
+    })?;
+    request_file.sync_all().map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Io,
+            format!("{}: {error}", request_path.display()),
+        )
+    })?;
+    Ok((request_path, response_path))
+}
+
+/// The environment of every lane worker: the normalized corpus environment and `PATH`.
+fn worker_environment() -> Vec<(String, String)> {
+    let mut environment = normalized_env();
+    if let Ok(path) = std::env::var("PATH") {
+        environment.push(("PATH".to_owned(), path));
+    }
+    environment
+}
+
 impl LaneExecutor for ProcessExecutor {
     fn run(&mut self, request: &LaneRequest) -> Result<LaneProcessResult> {
-        request.validate()?;
-        fs::create_dir_all(&self.work_dir).map_err(|error| {
-            VerificationError::new(
-                ErrorCode::Io,
-                format!("{}: {error}", self.work_dir.display()),
-            )
-        })?;
-        let request_path = self.work_dir.join(format!(
-            "lane-{}-{}.json",
-            request.binding().run_id(),
-            request.request_id()
-        ));
-        let response_path = request_path.with_extension("response.json");
-        if response_path.try_exists().map_err(|error| {
-            VerificationError::new(
-                ErrorCode::Io,
-                format!("{}: {error}", response_path.display()),
-            )
-        })? {
-            return Err(VerificationError::new(
-                ErrorCode::Replay,
-                format!(
-                    "refusing retained lane response `{}`",
-                    response_path.display()
-                ),
-            ));
-        }
-        let encoded = serde_json::to_vec(request).map_err(|error| {
-            VerificationError::new(ErrorCode::Json, format!("encode lane request: {error}"))
-        })?;
-        let mut request_file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&request_path)
-            .map_err(|error| {
-                VerificationError::new(
-                    ErrorCode::Io,
-                    format!("{}: {error}", request_path.display()),
-                )
-            })?;
-        request_file.write_all(&encoded).map_err(|error| {
-            VerificationError::new(
-                ErrorCode::Io,
-                format!("{}: {error}", request_path.display()),
-            )
-        })?;
-        request_file.sync_all().map_err(|error| {
-            VerificationError::new(
-                ErrorCode::Io,
-                format!("{}: {error}", request_path.display()),
-            )
-        })?;
-
-        let mut environment = normalized_env();
-        if let Ok(path) = std::env::var("PATH") {
-            environment.push(("PATH".to_owned(), path));
-        }
+        let (request_path, response_path) = write_request_file(&self.work_dir, request)?;
+        let mut environment = worker_environment();
         environment.push((
             LANE_WORKER_REQUEST.to_owned(),
             request_path.to_string_lossy().into_owned(),
@@ -613,6 +639,326 @@ impl LaneExecutor for ProcessExecutor {
             detail: String::from_utf8_lossy(&outcome.stderr).into_owned(),
         })
     }
+}
+
+const SERVING_LABEL: &str = "serving lane worker";
+
+/// How long a serving worker may take to exit after its input closes.
+const SERVING_STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// How often a serving worker that is stopping is asked whether it has exited.
+const SERVING_STOP_POLL: Duration = Duration::from_millis(5);
+
+/// Sends every request to one long-lived worker that serves requests (see
+/// [`LANE_WORKER_SERVE`]). The worker starts with the first request, and each
+/// request has its own deadline. A worker that exits, or misses a deadline and
+/// is terminated, gives its request the observation that [`ProcessExecutor`]
+/// gives such a worker, and the next request starts a new worker. Environment,
+/// process group, and termination are those of [`ProcessExecutor`].
+#[derive(Debug)]
+pub struct ServingExecutor {
+    program: PathBuf,
+    args: Vec<OsString>,
+    cwd: PathBuf,
+    work_dir: PathBuf,
+    max_output_bytes: usize,
+    worker: Option<ServingWorker>,
+    workers_started: u64,
+}
+
+impl ServingExecutor {
+    pub fn new(
+        program: impl Into<PathBuf>,
+        args: Vec<OsString>,
+        cwd: impl Into<PathBuf>,
+        work_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            cwd: cwd.into(),
+            work_dir: work_dir.into(),
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            worker: None,
+            workers_started: 0,
+        }
+    }
+
+    /// Bounds the standard error kept for one request.
+    pub fn with_max_output_bytes(mut self, cap: usize) -> Self {
+        self.max_output_bytes = cap;
+        self
+    }
+
+    /// How many worker processes this executor has started.
+    #[must_use]
+    pub fn workers_started(&self) -> u64 {
+        self.workers_started
+    }
+
+    fn start_worker(&mut self) -> Result<ServingWorker> {
+        let mut command = Command::new(&self.program);
+        command.env_clear();
+        for (key, value) in worker_environment() {
+            command.env(key, value);
+        }
+        command.env(LANE_WORKER_SERVE, "1");
+        forward_host_runtime_env(&mut command);
+        command
+            .current_dir(&self.cwd)
+            .args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| spawn_error(SERVING_LABEL, &self.program, &error))?;
+        self.workers_started += 1;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| pipe_error(SERVING_LABEL, "stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| pipe_error(SERVING_LABEL, "stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| pipe_error(SERVING_LABEL, "stderr"))?;
+        let (sender, lines) = mpsc::channel();
+        let line_reader = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let text = String::from_utf8_lossy(&line).trim_end().to_owned();
+                        if sender.send(text).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        let cap = self.max_output_bytes;
+        let stderr_reader = thread::spawn(move || {
+            let mut stderr = stderr;
+            let mut chunk = [0_u8; 8192];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        let mut kept = sink.lock().unwrap_or_else(PoisonError::into_inner);
+                        let room = cap.saturating_sub(kept.len());
+                        kept.extend_from_slice(&chunk[..read.min(room)]);
+                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(ServingWorker {
+            child,
+            stdin,
+            lines,
+            stderr: captured,
+            readers: [line_reader, stderr_reader],
+        })
+    }
+}
+
+impl LaneExecutor for ServingExecutor {
+    fn run(&mut self, request: &LaneRequest) -> Result<LaneProcessResult> {
+        let (request_path, response_path) = write_request_file(&self.work_dir, request)?;
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(request.timeout_ms());
+        let mut worker = match self.worker.take() {
+            Some(worker) => worker,
+            None => {
+                let worker = self.start_worker()?;
+                match worker.await_line(|line| line == LANE_WORKER_READY, deadline) {
+                    Heard::Line => worker,
+                    heard => return worker.finish(heard, deadline, &response_path, started),
+                }
+            }
+        };
+        worker.clear_stderr();
+        let sent = writeln!(worker.stdin, "{}", request_path.to_string_lossy())
+            .and_then(|()| worker.stdin.flush());
+        let heard = if sent.is_err() {
+            Heard::Ended
+        } else {
+            let done = format!("{LANE_WORKER_DONE} {}", request.request_id());
+            worker.await_line(|line| line == done, deadline)
+        };
+        if heard != Heard::Line {
+            return worker.finish(heard, deadline, &response_path, started);
+        }
+        let result = LaneProcessResult {
+            observation: ProcessObservation::Answered,
+            response_body: fs::read(&response_path).ok(),
+            duration_ms: elapsed_ms(started),
+            detail: worker.stderr_text(),
+        };
+        self.worker = Some(worker);
+        Ok(result)
+    }
+}
+
+impl Drop for ServingExecutor {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.stop();
+        }
+    }
+}
+
+/// What a serving worker did while the parent waited for one line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Heard {
+    /// It printed the line.
+    Line,
+    /// Its output ended, because it exited or closed it.
+    Ended,
+    /// The deadline passed first.
+    Late,
+}
+
+/// One running serving worker and the threads that read its output.
+#[derive(Debug)]
+struct ServingWorker {
+    child: Child,
+    stdin: ChildStdin,
+    lines: Receiver<String>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    readers: [JoinHandle<()>; 2],
+}
+
+impl ServingWorker {
+    /// Waits for a line that `expected` accepts. Other lines are output of the
+    /// work itself, which a one-request worker also prints and nobody reads.
+    fn await_line(&self, expected: impl Fn(&str) -> bool, deadline: Instant) -> Heard {
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) if expected(&line) => return Heard::Line,
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => return Heard::Late,
+                Err(RecvTimeoutError::Disconnected) => return Heard::Ended,
+            }
+        }
+    }
+
+    fn clear_stderr(&self) {
+        self.stderr
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr.lock().unwrap_or_else(PoisonError::into_inner))
+            .into_owned()
+    }
+
+    /// Ends a worker that exited or missed the deadline, and records its request
+    /// the way [`ProcessExecutor`] records a worker that did the same.
+    fn finish(
+        mut self,
+        heard: Heard,
+        deadline: Instant,
+        response_path: &Path,
+        started: Instant,
+    ) -> Result<LaneProcessResult> {
+        let mut timed_out = heard == Heard::Late;
+        // A worker whose output ended is exiting, and it has to exit by the deadline.
+        while !timed_out
+            && self
+                .child
+                .try_wait()
+                .map_err(|error| wait_error(SERVING_LABEL, error))?
+                .is_none()
+        {
+            if Instant::now() >= deadline {
+                timed_out = true;
+            } else {
+                thread::sleep(SERVING_STOP_POLL);
+            }
+        }
+        let termination_error = if timed_out {
+            terminate_process_group(&mut self.child, SERVING_LABEL).err()
+        } else {
+            None
+        };
+        let status = self
+            .child
+            .wait()
+            .map_err(|error| wait_error(SERVING_LABEL, error))?;
+        drop(self.stdin);
+        let [line_reader, stderr_reader] = self.readers;
+        line_reader
+            .join()
+            .map_err(|_| thread_error(SERVING_LABEL, "stdout"))?;
+        stderr_reader
+            .join()
+            .map_err(|_| thread_error(SERVING_LABEL, "stderr"))?;
+        if let Some(error) = termination_error {
+            return Err(error);
+        }
+        let observation = if timed_out {
+            ProcessObservation::TimedOut
+        } else if let Some(number) = termination_signal(&status) {
+            ProcessObservation::Signaled { number }
+        } else {
+            ProcessObservation::Exited {
+                code: status.code().unwrap_or(1),
+            }
+        };
+        let detail =
+            String::from_utf8_lossy(&self.stderr.lock().unwrap_or_else(PoisonError::into_inner))
+                .into_owned();
+        Ok(LaneProcessResult {
+            observation,
+            response_body: fs::read(response_path).ok(),
+            duration_ms: elapsed_ms(started),
+            detail,
+        })
+    }
+
+    /// Closes the worker's input, so it ends its loop and exits. A worker that
+    /// does not exit within [`SERVING_STOP_GRACE`] is terminated.
+    fn stop(mut self) {
+        drop(self.stdin);
+        let deadline = Instant::now() + SERVING_STOP_GRACE;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => thread::sleep(SERVING_STOP_POLL),
+                _ => {
+                    let _ = terminate_process_group(&mut self.child, SERVING_LABEL);
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+        for reader in self.readers {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Runs every request, recording blocking evidence on failure and continuing.
@@ -654,7 +1000,7 @@ pub fn derive_row(request: &LaneRequest, process: LaneProcessResult) -> Result<E
             BTreeMap::new(),
             format!("worker exited {code}; {}", process.detail),
         ),
-        ProcessObservation::Exited { code: _ } => {
+        ProcessObservation::Exited { code: _ } | ProcessObservation::Answered => {
             match parse_response(process.response_body.as_deref()) {
                 Err(detail) => (TerminalState::ProtocolError, BTreeMap::new(), detail),
                 Ok(response) => derive_from_response(request, response),
@@ -826,6 +1172,32 @@ mod tests {
         } else {
             (PathBuf::from("/usr/bin/true"), Vec::new())
         }
+    }
+
+    /// A serving worker that says it is ready and then runs `then`, a shell
+    /// command that is the same in `cmd.exe` and `sh`.
+    fn ready_worker(then: &str) -> (PathBuf, Vec<OsString>) {
+        if cfg!(windows) {
+            let script = format!("echo {LANE_WORKER_READY}&{then}");
+            let args = vec![OsString::from("/C"), OsString::from(script)];
+            (windows_system_program("cmd.exe"), args)
+        } else {
+            let script = format!("echo '{LANE_WORKER_READY}'; {then}");
+            let args = vec![OsString::from("-c"), OsString::from(script)];
+            (PathBuf::from("/bin/sh"), args)
+        }
+    }
+
+    fn scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bamts-lane-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("scratch");
+        dir
     }
 
     struct ScriptedExecutor {
@@ -1245,6 +1617,101 @@ mod tests {
         let error = executor.run(&request).expect_err("retained response");
         let _ = fs::remove_dir_all(&scratch);
         assert_eq!(error.code(), ErrorCode::Replay);
+    }
+
+    #[test]
+    fn a_serving_worker_that_exits_is_recorded_like_an_exiting_worker_and_replaced() {
+        let scratch = scratch_dir("serving-exit");
+        let (program, args) = ready_worker("exit 3");
+        let mut executor =
+            ServingExecutor::new(program, args, &scratch, &scratch).with_max_output_bytes(64);
+        let mode = ExecutionMode::Interpreter;
+        let platform = "x86_64-unknown-linux-gnu";
+        let first = executor
+            .run(&request(1, key(mode, platform, "case-first")))
+            .expect("first");
+        let second = executor
+            .run(&request(2, key(mode, platform, "case-second")))
+            .expect("second");
+        let started = executor.workers_started();
+        drop(executor);
+        let _ = fs::remove_dir_all(&scratch);
+        assert_eq!(first.observation, ProcessObservation::Exited { code: 3 });
+        assert_eq!(second.observation, ProcessObservation::Exited { code: 3 });
+        assert_eq!(started, 2, "each request after an exit starts a new worker");
+        let row = derive_row(&request(1, key(mode, platform, "case-first")), first).expect("row");
+        assert_eq!(row.state(), TerminalState::WorkerCrash);
+    }
+
+    #[test]
+    fn a_serving_worker_that_misses_the_deadline_is_terminated_and_times_out() {
+        let scratch = scratch_dir("serving-timeout");
+        let (program, args) = ready_worker(if cfg!(windows) {
+            "ping -n 3 127.0.0.1>NUL"
+        } else {
+            "sleep 2"
+        });
+        let mut executor =
+            ServingExecutor::new(program, args, &scratch, &scratch).with_max_output_bytes(64);
+        let request = LaneRequest::new(
+            test_binding(),
+            1,
+            key(
+                ExecutionMode::Interpreter,
+                "x86_64-unknown-linux-gnu",
+                "case-silent",
+            ),
+            BTreeSet::from(["stdout".to_owned()]),
+            vec!["lane".to_owned()],
+            WorkingDirectoryPolicy::RepositoryRoot,
+            200,
+        )
+        .expect("short timeout");
+        let result = executor.run(&request).expect("run");
+        drop(executor);
+        let _ = fs::remove_dir_all(&scratch);
+        assert_eq!(result.observation, ProcessObservation::TimedOut);
+        let row = derive_row(&request, result).expect("row");
+        assert_eq!(row.state(), TerminalState::Timeout);
+    }
+
+    #[test]
+    fn a_serving_executor_refuses_a_retained_response() {
+        let scratch = scratch_dir("serving-replay");
+        let retained = scratch.join(format!("lane-{TEST_RUN_ID}-1.response.json"));
+        fs::write(&retained, b"stale").expect("retained response");
+        let (program, args) = ready_worker("exit 0");
+        let mut executor = ServingExecutor::new(program, args, &scratch, &scratch);
+        let item = key(
+            ExecutionMode::Interpreter,
+            "x86_64-unknown-linux-gnu",
+            "case-replay",
+        );
+        let error = executor
+            .run(&request(1, item))
+            .expect_err("retained response");
+        let started = executor.workers_started();
+        drop(executor);
+        let _ = fs::remove_dir_all(&scratch);
+        assert_eq!(error.code(), ErrorCode::Replay);
+        assert_eq!(started, 0, "a refused request starts no worker");
+    }
+
+    #[test]
+    fn an_answered_request_derives_its_row_from_the_response() {
+        let item = key(
+            ExecutionMode::Interpreter,
+            "x86_64-unknown-linux-gnu",
+            "case-answered",
+        );
+        let answered = LaneProcessResult {
+            observation: ProcessObservation::Answered,
+            ..success(1, &item)
+        };
+        let row = derive_row(&request(1, item.clone()), answered).expect("row");
+        let exited = derive_row(&request(1, item.clone()), success(1, &item)).expect("row");
+        assert_eq!(row.state(), TerminalState::Pass);
+        assert_eq!(row, exited);
     }
 
     #[test]
