@@ -29,6 +29,17 @@ use sha2::{Digest, Sha256};
 /// Environment variable naming the worker request JSON path.
 pub const LANE_WORKER_REQUEST: &str = "BAMTS_LANE_WORKER_REQUEST";
 
+/// Environment variable that asks a lane worker to answer one request path per
+/// line of standard input, instead of the one request in [`LANE_WORKER_REQUEST`].
+pub const LANE_WORKER_SERVE: &str = "BAMTS_LANE_WORKER_SERVE";
+
+/// The first line a serving worker prints, before it reads any request.
+pub const LANE_WORKER_READY: &str = "bamts-lane-worker ready 1";
+
+/// What a serving worker prints, followed by a space and the request ID, once
+/// it has written the response to that request.
+pub const LANE_WORKER_DONE: &str = "bamts-lane-worker done";
+
 /// Version of the compiler snapshot handoff binding.
 pub const COMPILER_SNAPSHOT_BINDING_VERSION: u32 = 1;
 
