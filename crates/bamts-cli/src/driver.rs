@@ -2496,7 +2496,7 @@ fn validate_private_fallback_dir_in_context(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn ensure_private_fallback_cache_root(path: PathBuf) -> Result<PathBuf, DriverError> {
     let context = ExecutionContext::ambient()?;
     ensure_private_fallback_cache_root_in_context(path, &context)
@@ -2813,8 +2813,11 @@ mod tests {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(unix)]
+    use std::thread;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
-    use std::{fs, process, thread};
+    use std::{fs, process};
 
     use bamts_compiler::{
         CancellationToken,
@@ -2827,10 +2830,11 @@ mod tests {
     use crate::context::ExecutionContext;
 
     use super::{
-        CommandOutcome, DriverError, capture_process_with_cancel, content_hash, execute_in_context,
-        execute_tsc, execute_tsc_in, levels, link_executable, lower_options, probe_toolchain,
-        probe_toolchain_in_context,
+        CommandOutcome, DriverError, content_hash, execute_in_context, execute_tsc, execute_tsc_in,
+        levels, lower_options, probe_toolchain,
     };
+    #[cfg(unix)]
+    use super::{capture_process_with_cancel, link_executable, probe_toolchain_in_context};
 
     #[cfg(unix)]
     #[test]
