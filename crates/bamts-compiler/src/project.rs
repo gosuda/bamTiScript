@@ -1595,7 +1595,7 @@ pub enum ResolutionFlavor {
 /// file; callers decide existence by applying their own probe to the candidates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModuleResolutionError {
-    Path(PathError),
+    Path(Box<PathError>),
     EmptySpecifier,
     BareSpecifier { specifier: Arc<str> },
     UrlLikeSpecifier { specifier: Arc<str> },
@@ -1628,7 +1628,7 @@ impl fmt::Display for ModuleResolutionError {
 impl std::error::Error for ModuleResolutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         if let Self::Path(error) = self {
-            Some(error)
+            Some(&**error)
         } else {
             None
         }
@@ -1637,7 +1637,7 @@ impl std::error::Error for ModuleResolutionError {
 
 impl From<PathError> for ModuleResolutionError {
     fn from(error: PathError) -> Self {
-        Self::Path(error)
+        Self::Path(Box::new(error))
     }
 }
 
@@ -1816,7 +1816,7 @@ pub enum PackageTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PackageError {
     Json(JsoncError),
-    Path(PathError),
+    Path(Box<PathError>),
     RootMustBeObject,
     InvalidField {
         field: Arc<str>,
@@ -1903,7 +1903,7 @@ impl std::error::Error for PackageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Json(error) => Some(error),
-            Self::Path(error) => Some(error),
+            Self::Path(error) => Some(&**error),
             _ => None,
         }
     }
@@ -1917,7 +1917,7 @@ impl From<JsoncError> for PackageError {
 
 impl From<PathError> for PackageError {
     fn from(error: PathError) -> Self {
-        Self::Path(error)
+        Self::Path(Box::new(error))
     }
 }
 
