@@ -158,7 +158,14 @@ impl Linker {
         )
     }
 
-    /// The command that links `object` and `archive` into `executable`.
+    /// The command that links `object` and `archive` into `executable`, which are
+    /// absolute paths.
+    ///
+    /// The linker runs in the directory of `archive`, the runtime cache, and not in
+    /// the working directory of the context. `link.exe` looks for a library named
+    /// without a path, such as `kernel32.lib`, in its working directory before
+    /// `LIB`, so a file of that name in a project would replace the system library.
+    /// The runtime cache holds only the archives that bamts wrote.
     ///
     /// The linker gets the environment of the context. The two variables that
     /// `link.exe` reads as extra options, `LINK` and `_LINK_`, are dropped, so an
@@ -171,6 +178,9 @@ impl Linker {
         executable: &Path,
     ) -> Command {
         let mut command = context_command(&self.program, context);
+        if let Some(directory) = archive.parent() {
+            command.current_dir(directory);
+        }
         command.env_remove("LINK").env_remove("_LINK_");
         if let Some(library_path) = &self.library_path {
             command.env("LIB", library_path);
@@ -932,13 +942,9 @@ mod tests {
         fn the_command_runs_the_linker_with_the_link_arguments() {
             let context = context(&[]);
             let linker = discover_in(&context).expect("the linker");
+            let archive = context.cwd().join("cache").join("runtime").join("b.lib");
 
-            let command = linker.command(
-                &context,
-                Path::new("a.o"),
-                Path::new("b.lib"),
-                Path::new("c.out"),
-            );
+            let command = linker.command(&context, Path::new("a.o"), &archive, Path::new("c.out"));
 
             assert_eq!(command.get_program(), linker.program.as_os_str());
             let arguments: Vec<OsString> = command.get_args().map(OsString::from).collect();
@@ -946,12 +952,13 @@ mod tests {
                 arguments,
                 link_arguments(
                     Path::new("a.o"),
-                    Path::new("b.lib"),
+                    &archive,
                     Path::new("c.out"),
                     "kernel32.lib ntdll.lib"
                 )
             );
-            assert_eq!(command.get_current_dir(), Some(context.cwd()));
+            // Not the working directory of the context, where a stray library would win.
+            assert_eq!(command.get_current_dir(), archive.parent());
             let library_path = command
                 .get_envs()
                 .find(|(key, _)| key.eq_ignore_ascii_case("LIB"))

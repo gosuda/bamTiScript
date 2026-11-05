@@ -671,6 +671,28 @@ fn aot_executables_for_the_same_source_have_the_same_bytes() {
     assert!(images[0] == images[1], "the two executables differ");
 }
 
+/// `link.exe` looks for a library named without a path in its working directory
+/// before `LIB`. A file in the project named like a system library must not be what
+/// the executable is linked against.
+#[cfg(target_env = "msvc")]
+#[test]
+fn a_file_in_the_project_named_like_a_system_library_is_not_linked() {
+    let directory = ScratchDirectory::new();
+    fs::write(directory.path.join("kernel32.lib"), b"not a library").expect("the stray file");
+    let executable = directory
+        .path
+        .join(format!("hello{}", std::env::consts::EXE_SUFFIX));
+
+    let compile = directory.emit(&fixture().to_string_lossy(), &executable);
+    assert_success(&compile, "bamts emit beside a stray kernel32.lib");
+
+    let output = Command::new(&executable)
+        .output()
+        .expect("compiled executable starts");
+    assert_success(&output, "compiled fixture");
+    assert_eq!(output.stdout, EXPECTED_STDOUT);
+}
+
 #[test]
 fn jit_runs_two_module_program_with_live_imported_mutation() {
     let project = ScratchDirectory::new();
