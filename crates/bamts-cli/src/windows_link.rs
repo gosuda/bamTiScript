@@ -139,11 +139,22 @@ fn variable(context: &crate::context::ExecutionContext, name: &str) -> Option<Os
     crate::context::env_ignoring_case(context.envs(), name).map(OsStr::to_os_string)
 }
 
+/// Whether the `LIB` of the context can serve an x64 link. A Visual Studio command
+/// prompt names the architecture that it set `LIB` up for in `VSCMD_ARG_TGT_ARCH`,
+/// and the default prompt is for x86, whose libraries an x64 link cannot use. A
+/// `LIB` that nothing marks for another architecture is taken as meant for x64.
+fn context_library_path_fits(context: &crate::context::ExecutionContext) -> bool {
+    variable(context, "LIB").is_some()
+        && variable(context, "VSCMD_ARG_TGT_ARCH")
+            .is_none_or(|architecture| architecture.eq_ignore_ascii_case("x64"))
+}
+
 /// The linker and everything it needs to run.
 #[cfg(target_env = "msvc")]
 pub(crate) struct Linker {
     program: PathBuf,
-    /// The `LIB` value to give the linker, or `None` when the context has its own.
+    /// The `LIB` value to give the linker, or `None` when the context has its own
+    /// for x64.
     library_path: Option<OsString>,
     native_libraries: &'static str,
 }
@@ -463,12 +474,13 @@ fn entry_names(directory: &Path) -> Option<Vec<String>> {
     )
 }
 
-/// The `LIB` value to give the linker, or `None` when the context sets its own, as
-/// a Visual Studio command prompt does, or when the directories cannot be worked
-/// out. In that case the linker reports the first library it cannot open.
+/// The `LIB` value to give the linker, or `None` when the context sets its own for
+/// x64, as an x64 Visual Studio command prompt does, or when the directories cannot
+/// be worked out. In that case the linker reports the first library it cannot open
+/// or cannot use. The `LIB` of a prompt for another architecture is replaced.
 #[cfg(target_env = "msvc")]
 fn library_path(context: &ExecutionContext, linker: &Path) -> Option<OsString> {
-    if variable(context, "LIB").is_some() {
+    if context_library_path_fits(context) {
         return None;
     }
     let toolset = toolset_of(linker)?;
@@ -662,6 +674,31 @@ mod tests {
             Some(OsString::from("D:\\PF"))
         );
         assert_eq!(variable(&context, "LIB"), None);
+    }
+
+    #[test]
+    fn only_a_library_path_for_x64_is_kept() {
+        let fits = |variables: &[(&str, &str)]| context_library_path_fits(&context_with(variables));
+        // With no LIB there is nothing to keep.
+        assert!(!fits(&[]));
+        assert!(!fits(&[("VSCMD_ARG_TGT_ARCH", "x64")]));
+        // A LIB that nothing marks for another architecture is kept.
+        assert!(fits(&[("LIB", r"C:\my\libs")]));
+        assert!(fits(&[
+            ("Lib", r"C:\VS\lib\x64"),
+            ("VSCMD_ARG_TGT_ARCH", "x64")
+        ]));
+        assert!(fits(&[
+            ("LIB", r"C:\VS\lib\x64"),
+            ("vscmd_arg_tgt_arch", "X64")
+        ]));
+        // The default Visual Studio prompt sets LIB up for x86.
+        for architecture in ["x86", "arm64", "arm"] {
+            assert!(
+                !fits(&[("LIB", r"C:\VS\lib"), ("VSCMD_ARG_TGT_ARCH", architecture)]),
+                "{architecture}"
+            );
+        }
     }
 
     #[cfg(target_env = "msvc")]
@@ -936,6 +973,37 @@ mod tests {
             // The environment was cleared first, so a removed variable is absent.
             assert_eq!(set("LINK"), None);
             assert_eq!(set("_LINK_"), None);
+        }
+
+        #[test]
+        fn the_library_path_of_a_prompt_for_x86_is_replaced() {
+            let context = context(&[("LIB", r"C:\x86\libs"), ("VSCMD_ARG_TGT_ARCH", "x86")]);
+            let linker = discover_in(&context).expect("the linker");
+            let library_path = linker
+                .library_path
+                .clone()
+                .expect("the x64 directories of the toolset");
+            let directories: Vec<PathBuf> = std::env::split_paths(&library_path).collect();
+            assert_eq!(directories.len(), 3, "{directories:?}");
+            assert!(
+                directories
+                    .iter()
+                    .all(|directory| directory.ends_with("x64")),
+                "{directories:?}"
+            );
+            assert!(directories[2].join("kernel32.lib").is_file());
+
+            let command = linker.command(
+                &context,
+                Path::new("a.o"),
+                Path::new(r"C:\cache\runtime\b.lib"),
+                Path::new("c.out"),
+            );
+            let given = command
+                .get_envs()
+                .find(|(key, _)| key.eq_ignore_ascii_case("LIB"))
+                .and_then(|(_, value)| value);
+            assert_eq!(given, Some(library_path.as_os_str()));
         }
 
         #[test]
