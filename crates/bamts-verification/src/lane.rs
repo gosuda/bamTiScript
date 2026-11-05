@@ -775,11 +775,36 @@ impl ServingExecutor {
             readers: [line_reader, stderr_reader],
         })
     }
+
+    /// Drops the idle worker if it exited after its last request, for example
+    /// because something outside killed it. Under [`ProcessExecutor`] each request
+    /// has a new process, so the next request starts a new worker rather than
+    /// being blamed for an exit that happened while no request was running.
+    fn retire_exited_worker(&mut self) -> Result<()> {
+        let Some(mut worker) = self.worker.take() else {
+            return Ok(());
+        };
+        match worker.child.try_wait() {
+            Ok(None) => {
+                self.worker = Some(worker);
+                Ok(())
+            }
+            Ok(Some(_)) => {
+                worker.stop();
+                Ok(())
+            }
+            Err(error) => {
+                worker.stop();
+                Err(wait_error(SERVING_LABEL, error))
+            }
+        }
+    }
 }
 
 impl LaneExecutor for ServingExecutor {
     fn run(&mut self, request: &LaneRequest) -> Result<LaneProcessResult> {
         let (request_path, response_path) = write_request_file(&self.work_dir, request)?;
+        self.retire_exited_worker()?;
         let started = Instant::now();
         let deadline = started + Duration::from_millis(request.timeout_ms());
         let mut worker = match self.worker.take() {
@@ -1641,6 +1666,41 @@ mod tests {
         assert_eq!(started, 2, "each request after an exit starts a new worker");
         let row = derive_row(&request(1, key(mode, platform, "case-first")), first).expect("row");
         assert_eq!(row.state(), TerminalState::WorkerCrash);
+    }
+
+    #[test]
+    fn a_serving_worker_that_exited_while_idle_is_replaced_and_not_blamed() {
+        let scratch = scratch_dir("serving-idle-exit");
+        // A worker that said it was ready and then exited with 9 while it had no
+        // request, as one that something outside kills between two requests.
+        let (program, args) = ready_worker("exit 9");
+        let mut other = ServingExecutor::new(program, args, &scratch, &scratch);
+        let mut idle = other.start_worker().expect("worker");
+        let ready = idle.await_line(
+            |line| line == LANE_WORKER_READY,
+            Instant::now() + Duration::from_secs(10),
+        );
+        assert_eq!(ready, Heard::Line);
+        idle.child.wait().expect("the idle worker exits");
+        let (program, args) = ready_worker("exit 3");
+        let mut executor = ServingExecutor::new(program, args, &scratch, &scratch);
+        executor.worker = Some(idle);
+        let item = key(
+            ExecutionMode::Interpreter,
+            "x86_64-unknown-linux-gnu",
+            "case-after-idle-exit",
+        );
+        let result = executor.run(&request(1, item)).expect("run");
+        let started = executor.workers_started();
+        drop(executor);
+        drop(other);
+        let _ = fs::remove_dir_all(&scratch);
+        assert_eq!(
+            result.observation,
+            ProcessObservation::Exited { code: 3 },
+            "the request runs on a new worker, not the one that exited with 9"
+        );
+        assert_eq!(started, 1);
     }
 
     #[test]
