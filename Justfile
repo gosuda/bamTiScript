@@ -18,7 +18,7 @@ doctor:
 gate-status:
     python3 -c 'import glob,re,sys; rows=[(f,len(re.findall(r"(?m)^- \[ \]",t)),len(re.findall(r"(?m)^  EVIDENCE: pending\s*$",t))) for f in sorted(glob.glob(".outline/gates/*.md")) for t in [open(f).read()]]; open_=[r for r in rows if r[1] or r[2]]; [print("OPEN %s unchecked=%d pending=%d"%r) for r in open_]; print("NO LEDGERS FOUND" if not rows else "ALL MET" if not open_ else "OPEN LEDGERS: %d of %d"%(len(open_),len(rows))); sys.exit(1 if open_ or not rows else 0)'
 
-ci: ci-quality ci-npm ci-corpus xcheck portability-check
+ci: ci-quality ci-npm ci-corpus ci-native-boundary xcheck portability-check
     printf '%s\n' 'LOCAL CI PASS'
 
 ci-quality:
@@ -42,6 +42,13 @@ ci-npm-release:
 
 ci-corpus:
     cargo test -p bamts-verification --test corpus_differential --locked -- --nocapture
+
+# The cache ownership and publication tests that the CI job "Windows native boundary"
+# runs. `cargo test --workspace` leaves the cache-guard feature off, so on a Windows host
+# ci-quality never builds the Win32 module or its tests. On other hosts the feature
+# compiles only the portable part of the module, which has no tests of its own.
+ci-native-boundary:
+    cargo test --locked -p bamts-native --features cache-guard
 
 ci-accounting:
     cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
