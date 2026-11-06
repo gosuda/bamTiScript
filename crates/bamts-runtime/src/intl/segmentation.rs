@@ -1,7 +1,8 @@
 //! UAX #29 text segmentation over UTF-16, from Unicode property data.
 
 use icu_properties::props::{
-    ExtendedPictographic, GeneralCategory, GraphemeClusterBreak, SentenceBreak, WordBreak,
+    ExtendedPictographic, GeneralCategory, GraphemeClusterBreak, IndicConjunctBreak, SentenceBreak,
+    WordBreak,
 };
 use icu_properties::{CodePointMapData, CodePointSetData};
 
@@ -30,17 +31,29 @@ fn scalars(input: &[u16]) -> Vec<Scalar> {
 /// The grapheme cluster boundaries after each code point that ends a cluster.
 fn grapheme_breaks(text: &[Scalar]) -> Vec<usize> {
     use GraphemeClusterBreak as Gcb;
+    use IndicConjunctBreak as Incb;
     let classes = CodePointMapData::<Gcb>::new();
+    let conjuncts = CodePointMapData::<Incb>::new();
     let pictographic = CodePointSetData::new::<ExtendedPictographic>();
     let mut breaks = Vec::new();
     // A pictograph and any Extend after it, which one ZWJ can join to the next.
     let mut pictographic_run = false;
+    // A consonant and any Extend or Linker after it. With a Linker among them, the
+    // run joins the next consonant.
+    let mut consonant_run = false;
+    let mut linked = false;
     let mut indicators = 0_usize;
     for (index, scalar) in text.iter().enumerate() {
         let class = classes.get(scalar.character);
         let joining_zwj = class == Gcb::ZWJ && pictographic_run;
         pictographic_run =
             pictographic.contains(scalar.character) || (pictographic_run && class == Gcb::Extend);
+        match conjuncts.get(scalar.character) {
+            Incb::Consonant => (consonant_run, linked) = (true, false),
+            Incb::Linker => linked = consonant_run,
+            Incb::Extend => {}
+            _ => (consonant_run, linked) = (false, false),
+        }
         indicators = if class == Gcb::RegionalIndicator {
             indicators + 1
         } else {
@@ -58,6 +71,7 @@ fn grapheme_breaks(text: &[Scalar]) -> Vec<usize> {
             | (Gcb::LV | Gcb::V, Gcb::V | Gcb::T)
             | (Gcb::LVT | Gcb::T, Gcb::T) => true,
             (_, Gcb::Extend | Gcb::ZWJ | Gcb::SpacingMark) | (Gcb::Prepend, _) => true,
+            _ if linked && conjuncts.get(next.character) == Incb::Consonant => true,
             (Gcb::ZWJ, _) if joining_zwj && pictographic.contains(next.character) => true,
             (Gcb::RegionalIndicator, Gcb::RegionalIndicator) => indicators % 2 == 1,
             _ => false,
@@ -366,6 +380,28 @@ mod tests {
         assert_eq!(grapheme("\u{1F468}\u{301}\u{200D}\u{1F469}"), [6]);
         assert_eq!(grapheme("\u{1F468}\u{200D}\u{200D}\u{1F469}"), [4, 6]);
         assert_eq!(grapheme("\u{1F468}\u{200D}\u{301}\u{1F469}"), [4, 6]);
+    }
+
+    #[test]
+    fn a_linker_joins_two_consonants_into_one_conjunct() {
+        let grapheme = |text| ends(SegmenterGranularity::Grapheme, text);
+        // Ka, virama, ssa.
+        assert_eq!(grapheme("\u{915}\u{94D}\u{937}"), [3]);
+        // Extend and more Linkers can stand on both sides of the Linker.
+        assert_eq!(grapheme("\u{915}\u{200D}\u{94D}\u{937}"), [4]);
+        assert_eq!(grapheme("\u{915}\u{94D}\u{200D}\u{937}"), [4]);
+        assert_eq!(grapheme("\u{915}\u{93C}\u{94D}\u{937}"), [4]);
+        assert_eq!(grapheme("\u{915}\u{94D}\u{94D}\u{937}"), [4]);
+        // The Linker can come from another script of the rule.
+        assert_eq!(grapheme("\u{915}\u{D4D}\u{937}"), [3]);
+        // A conjunct can go on, and each link needs its own Linker.
+        assert_eq!(grapheme("\u{915}\u{94D}\u{937}\u{94D}\u{915}"), [5]);
+        assert_eq!(grapheme("\u{915}\u{94D}\u{937}\u{915}"), [3, 4]);
+        // No Linker, no consonant after it, or no consonant before it.
+        assert_eq!(grapheme("\u{915}\u{937}"), [1, 2]);
+        assert_eq!(grapheme("\u{915}\u{94D}\u{905}"), [2, 3]);
+        assert_eq!(grapheme("\u{915}\u{94D}\u{E01}"), [2, 3]);
+        assert_eq!(grapheme("\u{905}\u{94D}\u{937}"), [2, 3]);
     }
 
     #[test]
