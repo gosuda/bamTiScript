@@ -173,18 +173,22 @@ pub(super) fn elements<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
 ) -> Result<Vec<Value>, EvalFailure> {
-    if let Some(values) = machine.array_elements(this)?
+    let array = machine.array_elements(this)?;
+    let is_array = array.is_some();
+    if let Some(values) = array
         && !values.contains(&Value::HOLE)
     {
         return Ok(values);
     }
     let object = array_es2023::to_object(machine, this)?;
     let length = array_es2023::length_of_array_like(machine, object)?;
-    if length > MAX_ARRAY_LIKE_ELEMENTS {
+    // An array's length is what it already holds, however many of those are holes.
+    if !is_array && length > MAX_ARRAY_LIKE_ELEMENTS {
         return Err(type_error("Array method received too long an array-like"));
     }
     let mut values = Vec::with_capacity(length);
     for index in 0..length {
+        generic::tick(machine)?;
         let key = array_es2023::index_key(index);
         values.push(if machine.internal_has_property(object, &key)? {
             machine.get_property_key(object, &key)?

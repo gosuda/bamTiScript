@@ -1499,6 +1499,27 @@ mod tests {
     }
 
     #[test]
+    fn a_holey_array_past_the_array_like_limit_still_sorts() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let limits = Limits {
+            fuel: u64::MAX,
+            ..Limits::default()
+        };
+        let mut machine = Machine::new(&module, &mut host, limits);
+        let length = (1 << 20) + 1;
+        let mut elements = vec![Value::HOLE; length];
+        elements[0] = Value::int32(2);
+        elements[length - 1] = Value::int32(1);
+        let array = allocate_array(&mut machine, elements).unwrap();
+        invoke(&mut machine, array, "sort", &[]).unwrap();
+        let sorted = machine.array_elements(array).unwrap().unwrap();
+        assert_eq!(sorted.len(), length);
+        assert_eq!(sorted[..2], [Value::int32(1), Value::int32(2)]);
+        assert!(sorted[2..].iter().all(|element| *element == Value::HOLE));
+    }
+
+    #[test]
     fn a_sort_comparator_must_be_callable_before_anything_else_happens() {
         let module = blank_program("<test>");
         let mut host = TestHost;
