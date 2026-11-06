@@ -896,7 +896,7 @@ pub fn month_day_from_fields(
 ) -> TemporalResult<PlainMonthDay> {
     match (year, month) {
         (Some(year), month) => {
-            if !calendar.has_representable_days(year as i64) {
+            if year.abs() >= YEAR_LIMIT as f64 || !calendar.has_representable_days(year as i64) {
                 return Err(out_of_range());
             }
             let days = days_from_fields(calendar, year, month, day, overflow)?;
@@ -1120,5 +1120,21 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_month_day_refuses_a_year_past_the_limit_instead_of_overflowing() {
+        for calendar in ALL {
+            for year in [1e300, -1e300, i64::MAX as f64, YEAR_LIMIT as f64] {
+                let result = month_day_from_fields(
+                    calendar,
+                    Some(year),
+                    MonthField::Ordinal(1.0),
+                    1.0,
+                    Overflow::Constrain,
+                );
+                assert!(result.is_err(), "{year}");
+            }
+        }
     }
 }
