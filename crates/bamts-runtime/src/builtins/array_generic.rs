@@ -950,8 +950,15 @@ pub(super) fn sort<H: Host>(
         for (index, value) in sorted.into_iter().enumerate() {
             set_index(machine, object, index, value)?;
         }
+        // An array holds these slots already, so its length is no claim that fuel
+        // has to bound, and most of them are holes that cost nothing to move past.
+        let is_array = machine.array_len(object)?.is_some();
         for index in count..length {
-            tick(machine)?;
+            if is_array {
+                machine.check_cancel().map_err(EvalFailure::Runtime)?;
+            } else {
+                tick(machine)?;
+            }
             delete_index(machine, object, index)?;
         }
         Ok(object)
@@ -1502,11 +1509,7 @@ mod tests {
     fn a_holey_array_past_the_array_like_limit_still_sorts() {
         let module = blank_program("<test>");
         let mut host = TestHost;
-        let limits = Limits {
-            fuel: u64::MAX,
-            ..Limits::default()
-        };
-        let mut machine = Machine::new(&module, &mut host, limits);
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
         let length = (1 << 20) + 1;
         let mut elements = vec![Value::HOLE; length];
         elements[0] = Value::int32(2);

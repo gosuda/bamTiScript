@@ -353,7 +353,9 @@ fn stable_sort<H: Host>(
     for end in 1..values.len() {
         let mut index = end;
         while index > 0 {
-            tick(machine)?;
+            // This sort takes quadratic steps, and a charge for each would make a
+            // short array run out of fuel. A comparator pays for its own work.
+            machine.check_cancel().map_err(EvalFailure::Runtime)?;
             let order =
                 compare_array_elements(machine, values[index], values[index - 1], comparator)?;
             if order != Ordering::Less {

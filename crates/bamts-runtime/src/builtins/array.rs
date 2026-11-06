@@ -188,7 +188,6 @@ pub(super) fn elements<H: Host>(
     }
     let mut values = Vec::with_capacity(length);
     for index in 0..length {
-        generic::tick(machine)?;
         let key = array_es2023::index_key(index);
         values.push(if machine.internal_has_property(object, &key)? {
             machine.get_property_key(object, &key)?
@@ -384,7 +383,53 @@ fn entries_iterator<H: Host>(
 mod fuel_tests {
     use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
+    use crate::intrinsics::{BuiltinDef, native_function};
     use crate::{Limits, RuntimeErrorKind};
+
+    #[test]
+    fn to_sorted_pays_for_its_elements_and_not_for_its_comparisons() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let limits = Limits {
+            fuel: 2100,
+            ..Limits::default()
+        };
+        let mut machine = Machine::new(&module, &mut host, limits);
+        let elements = (0..2000).rev().map(Value::int32).collect();
+        let array = super::super::allocate_array(&mut machine, elements).unwrap();
+        let method = machine.get_named_property(array, "toSorted").unwrap();
+        machine.call_value(method, array, &[]).unwrap();
+    }
+
+    fn cancel_and_keep_order(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.cancel.cancel();
+        Ok(BuiltinOutcome::Value(Value::int32(0)))
+    }
+
+    #[test]
+    fn a_cancelled_to_sorted_stops_at_the_next_comparison() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "cancel",
+            length: 2,
+            handler: cancel_and_keep_order,
+        });
+        let comparator = native_function(&mut machine.heap, id, "cancel", 2);
+        let elements = (0..4).rev().map(Value::int32).collect();
+        let array = super::super::allocate_array(&mut machine, elements).unwrap();
+        let method = machine.get_named_property(array, "toSorted").unwrap();
+        assert!(matches!(
+            machine.call_value(method, array, &[comparator]),
+            Err(EvalFailure::Runtime(RuntimeErrorKind::Cancelled))
+        ));
+    }
 
     #[test]
     fn a_loop_over_a_long_array_like_runs_out_of_fuel() {
