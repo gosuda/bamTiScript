@@ -1735,6 +1735,20 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         args: &[Value],
         new_target: Value,
     ) -> InvokeOutcome {
+        let mark = self.machine.borrow_mut().hold_temporaries(&[]);
+        let outcome = self.invoke_callee_forwarding(callee, this, args, new_target);
+        self.machine.borrow_mut().release_temporaries(mark);
+        outcome
+    }
+
+    /// [`Self::invoke_callee`], which releases what this holds for a forward.
+    fn invoke_callee_forwarding(
+        &self,
+        callee: Value,
+        this: Value,
+        args: &[Value],
+        new_target: Value,
+    ) -> InvokeOutcome {
         let mut callee = callee;
         let mut this = this;
         let mut args = Cow::Borrowed(args);
@@ -1787,6 +1801,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                             this_value: next_this,
                             arguments: next_arguments,
                         }) => {
+                            self.machine.borrow_mut().hold_forwarded_call(
+                                next,
+                                next_this,
+                                &next_arguments,
+                            );
                             callee = next;
                             this = next_this;
                             args = Cow::Owned(next_arguments);
@@ -4774,10 +4793,11 @@ mod tests {
         NativeEntryTable, NativeFrame, NativeHelper, NativeOps, ShadowFrame, Value,
     };
 
+    use crate::intrinsics::{BuiltinDef, BuiltinHandler, BuiltinOutcome, native_function};
     use crate::vm::generator_async::GeneratorCompletion;
     use crate::{
-        GeneratorState, HeapEntry, Host, Limits, Machine, Property, PropertyKey, PropertyMap,
-        RuntimeError, RuntimeErrorKind, ThrowOrigin,
+        EvalFailure, GeneratorState, HeapEntry, Host, Limits, Machine, Property, PropertyKey,
+        PropertyMap, RuntimeError, RuntimeErrorKind, ThrowOrigin,
     };
 
     use super::EcmaString;
@@ -11636,5 +11656,88 @@ mod tests {
         )
         .expect_err("cancelled token aborts loop");
         assert_eq!(error, NativeError::Cancelled);
+    }
+
+    /// A getter whose value only the list being read holds.
+    fn fresh_object(
+        machine: &mut Machine<'_, SilentHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let prototype = machine.intrinsics.object_prototype;
+        let object = crate::builtins::ordinary_runtime(machine, Some(prototype))?;
+        machine.set_data_property(object, "marker", Value::int32(7))?;
+        Ok(BuiltinOutcome::Value(object))
+    }
+
+    /// A callee that reaches a collection before it reads what it was given.
+    fn collect_then_read(
+        machine: &mut Machine<'_, SilentHost>,
+        _this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.collect_garbage();
+        machine
+            .get_named_property(args[0], "marker")
+            .map(BuiltinOutcome::Value)
+    }
+
+    fn builtin(
+        machine: &mut Machine<'_, SilentHost>,
+        name: &'static str,
+        handler: BuiltinHandler<SilentHost>,
+    ) -> Value {
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name,
+            length: 0,
+            handler,
+        });
+        native_function(&mut machine.heap, id, name, 0)
+    }
+
+    #[test]
+    fn a_collection_in_the_next_builtin_keeps_the_arguments_of_apply() {
+        let program = trivial_program();
+        let mut host = SilentHost;
+        let engine = NativeEngine::new(&program, &NoEntries, &mut host, Limits::default());
+        let (apply, reflect, target, list) = {
+            let mut machine = engine.machine.borrow_mut();
+            let target = builtin(&mut machine, "collect then read", collect_then_read);
+            let getter = builtin(&mut machine, "fresh object", fresh_object);
+            let prototype = machine.intrinsics.object_prototype;
+            let list = crate::builtins::ordinary_runtime(&mut machine, Some(prototype)).unwrap();
+            machine
+                .set_data_property(list, "length", Value::int32(1))
+                .unwrap();
+            machine
+                .define_descriptor(
+                    list,
+                    PropertyKey::Named(EcmaString::encode("0")),
+                    Property::Accessor {
+                        getter: Some(getter),
+                        setter: None,
+                        enumerable: true,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+            machine.hold_temporaries(&[target, list]);
+            let reflect = machine.intrinsics.global("Reflect").unwrap();
+            let apply = machine.get_named_property(reflect, "apply").unwrap();
+            (apply, reflect, target, list)
+        };
+        let held = engine.machine.borrow().builtin_temporaries.len();
+
+        let outcome = engine.invoke_callee(
+            apply,
+            reflect,
+            &[target, Value::UNDEFINED, list],
+            Value::UNDEFINED,
+        );
+
+        assert!(matches!(outcome, InvokeOutcome::Value(value) if value == Value::int32(7)));
+        assert_eq!(engine.machine.borrow().builtin_temporaries.len(), held);
     }
 }

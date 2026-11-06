@@ -7376,6 +7376,20 @@ impl<'a, H: Host> Machine<'a, H> {
         self.builtin_temporaries.truncate(mark);
     }
 
+    /// Roots a call that a builtin forwarded. `apply` and `Reflect.apply` read
+    /// their list into a Rust vector, and with the end of the builtin nothing
+    /// else keeps those values. The next builtin can run user code, and it
+    /// expects its caller to root what it is given.
+    pub(crate) fn hold_forwarded_call(
+        &mut self,
+        callee: Value,
+        this_value: Value,
+        arguments: &[Value],
+    ) {
+        self.builtin_temporaries.extend([callee, this_value]);
+        self.builtin_temporaries.extend_from_slice(arguments);
+    }
+
     /// Keeps a value a builtin just received until that builtin returns.
     pub(crate) fn keep_temporary(&mut self, value: Value) {
         if self.in_builtin && matches!(value.decode(), Some(Decoded::HeapRef(_))) {
@@ -7478,6 +7492,14 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn execute_call(&mut self, request: CallRequest<'_>) -> Result<(), RuntimeError> {
+        let mark = self.builtin_temporaries.len();
+        let result = self.execute_call_forwarding(request);
+        self.release_temporaries(mark);
+        result
+    }
+
+    /// [`Machine::execute_call`], which releases what this holds for a forward.
+    fn execute_call_forwarding(&mut self, request: CallRequest<'_>) -> Result<(), RuntimeError> {
         let CallRequest {
             callee,
             this_value,
@@ -7565,6 +7587,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             this_value: next_this,
                             arguments: next_arguments,
                         }) => {
+                            self.hold_forwarded_call(next, next_this, &next_arguments);
                             callee = next;
                             this_value = next_this;
                             arguments = Cow::Owned(next_arguments);
@@ -8247,6 +8270,19 @@ impl<'a, H: Host> Machine<'a, H> {
         this_value: Value,
         arguments: &[Value],
     ) -> Result<Value, EvalFailure> {
+        let mark = self.builtin_temporaries.len();
+        let result = self.dispatch_call_forwarding(callee, this_value, arguments);
+        self.release_temporaries(mark);
+        result
+    }
+
+    /// [`Machine::dispatch_call`], which releases what this holds for a forward.
+    fn dispatch_call_forwarding(
+        &mut self,
+        callee: Value,
+        this_value: Value,
+        arguments: &[Value],
+    ) -> Result<Value, EvalFailure> {
         let mut callee = callee;
         let mut this_value = this_value;
         let mut arguments = Cow::Borrowed(arguments);
@@ -8260,6 +8296,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             this_value: next_this,
                             arguments: next_arguments,
                         } => {
+                            self.hold_forwarded_call(next, next_this, &next_arguments);
                             callee = next;
                             this_value = next_this;
                             arguments = Cow::Owned(next_arguments);
