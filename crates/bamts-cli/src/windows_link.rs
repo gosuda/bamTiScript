@@ -163,8 +163,7 @@ fn context_library_path_fits(context: &crate::context::ExecutionContext) -> bool
 #[cfg(target_env = "msvc")]
 pub(crate) struct Linker {
     program: PathBuf,
-    /// The `LIB` value to give the linker, or `None` when the context has its own
-    /// for x64.
+    /// The `LIB` value to give the linker, or `None` to leave the one of the context.
     library_path: Option<OsString>,
     native_libraries: &'static str,
 }
@@ -484,14 +483,28 @@ fn entry_names(directory: &Path) -> Option<Vec<String>> {
     )
 }
 
-/// The `LIB` value to give the linker, or `None` when the context sets its own for
-/// x64, as an x64 Visual Studio command prompt does, or when the directories cannot
-/// be worked out. In that case the linker reports the first library it cannot open
-/// or cannot use. The `LIB` of a prompt for another architecture is replaced.
+/// The `LIB` of the context, with each directory made absolute. [`Linker::command`]
+/// moves the linker out of the working directory of the context, and `link.exe`
+/// reads a relative directory from its own. An empty entry names no directory, and
+/// joined to the working directory it would name the project.
+#[cfg(target_env = "msvc")]
+fn context_library_path(context: &ExecutionContext) -> Option<OsString> {
+    let directories = variable(context, "LIB")?;
+    let directories = std::env::split_paths(&directories)
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .map(|directory| context.resolve_path(directory));
+    std::env::join_paths(directories).ok()
+}
+
+/// The `LIB` value to give the linker: the one of the context when it is for x64, as
+/// in an x64 Visual Studio command prompt, and otherwise the x64 directories of the
+/// toolset and the SDK, so the `LIB` of a prompt for another architecture is
+/// replaced. `None` when neither can be worked out. In that case the linker reports
+/// the first library it cannot open or cannot use.
 #[cfg(target_env = "msvc")]
 fn library_path(context: &ExecutionContext, linker: &Path) -> Option<OsString> {
     if context_library_path_fits(context) {
-        return None;
+        return context_library_path(context);
     }
     let toolset = toolset_of(linker)?;
     let kits = variable(context, "WindowsSdkDir").map_or_else(
@@ -964,7 +977,7 @@ mod tests {
                 ("_LINK_", "/OPT:NOREF"),
             ]);
             let linker = discover_in(&context).expect("the linker");
-            assert!(linker.library_path.is_none(), "the context has its own LIB");
+            assert_eq!(linker.library_path, Some(OsString::from(r"C:\my\libs")));
 
             let command = linker.command(
                 &context,
@@ -985,6 +998,20 @@ mod tests {
             // The environment was cleared first, so a removed variable is absent.
             assert_eq!(set("LINK"), None);
             assert_eq!(set("_LINK_"), None);
+        }
+
+        #[test]
+        fn a_relative_library_directory_stays_in_the_working_directory_of_the_context() {
+            let context = context(&[("LIB", r";libs;C:\my\libs;")]);
+
+            let linker = discover_in(&context).expect("the linker");
+
+            let library_path = linker.library_path.expect("the LIB of the context");
+            let directories: Vec<PathBuf> = std::env::split_paths(&library_path).collect();
+            assert_eq!(
+                directories,
+                [context.cwd().join("libs"), PathBuf::from(r"C:\my\libs")]
+            );
         }
 
         #[test]
