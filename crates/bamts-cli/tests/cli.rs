@@ -693,6 +693,33 @@ fn a_file_in_the_project_named_like_a_system_library_is_not_linked() {
     assert_eq!(output.stdout, EXPECTED_STDOUT);
 }
 
+/// The call depth limit of the runtime is the error that a program gets for deep
+/// recursion. The 1 MiB stack that `link.exe` gives by default overflows first, and
+/// that ends the process with 0xC00000FD and no message.
+#[cfg(target_env = "msvc")]
+#[test]
+fn aot_deep_recursion_reaches_the_call_depth_limit_before_the_end_of_the_stack() {
+    let directory = ScratchDirectory::new();
+    directory.write(
+        "deep.ts",
+        "function down(n: number): number {\n  return n === 0 ? 0 : 1 + down(n - 1);\n}\nconsole.log(down(100000));\n",
+    );
+    let executable = directory.path.join("deep.exe");
+
+    let compile = directory.emit("deep.ts", &executable);
+    assert_success(&compile, "bamts emit of a deep recursion");
+
+    let output = Command::new(&executable)
+        .output()
+        .expect("compiled executable starts");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("call depth limit"),
+        "{}\nstderr:\n{stderr}",
+        output.status
+    );
+}
+
 #[test]
 fn jit_runs_two_module_program_with_live_imported_mutation() {
     let project = ScratchDirectory::new();

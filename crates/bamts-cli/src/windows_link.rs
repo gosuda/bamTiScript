@@ -101,18 +101,27 @@ fn library_directories(toolset: &Path, sdk_lib: &Path, sdk_version: &str) -> Vec
 
 /// The arguments that link the object and the runtime archive into `output`.
 ///
-/// `/BREPRO` leaves the build time out of the file, so the same inputs give the
-/// same bytes. `native_libraries` is what rustc reported for the archive, such as
-/// `kernel32.lib ntdll.lib /defaultlib:msvcrt`; the archive carries none of them.
+/// `/STACK` gives the main thread the 8 MiB that it has on Linux and macOS.
+/// `link.exe` gives it 1 MiB, and on that a program overflows the stack before it
+/// reaches the call depth limit of the runtime. `/BREPRO` leaves the build time out
+/// of the file, so the same inputs give the same bytes. `native_libraries` is what
+/// rustc reported for the archive, such as `kernel32.lib ntdll.lib
+/// /defaultlib:msvcrt`; the archive carries none of them.
 fn link_arguments(
     object: &Path,
     archive: &Path,
     output: &Path,
     native_libraries: &str,
 ) -> Vec<OsString> {
-    let mut arguments: Vec<OsString> = ["/NOLOGO", "/MACHINE:X64", "/SUBSYSTEM:CONSOLE", "/BREPRO"]
-        .map(OsString::from)
-        .to_vec();
+    let mut arguments: Vec<OsString> = [
+        "/NOLOGO",
+        "/MACHINE:X64",
+        "/SUBSYSTEM:CONSOLE",
+        "/STACK:8388608",
+        "/BREPRO",
+    ]
+    .map(OsString::from)
+    .to_vec();
     let mut output_option = OsString::from("/OUT:");
     output_option.push(output);
     arguments.push(output_option);
@@ -635,6 +644,7 @@ mod tests {
                 "/NOLOGO",
                 "/MACHINE:X64",
                 "/SUBSYSTEM:CONSOLE",
+                "/STACK:8388608",
                 "/BREPRO",
                 "/OUT:out/app with space.exe",
                 "out/.app.o",
@@ -646,7 +656,7 @@ mod tests {
         );
         // No system libraries gives no extra arguments, not an empty one.
         let bare = link_arguments(Path::new("a.o"), Path::new("b.lib"), Path::new("c.exe"), "");
-        assert_eq!(bare.len(), 7);
+        assert_eq!(bare.len(), 8);
     }
 
     #[test]
