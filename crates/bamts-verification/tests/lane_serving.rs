@@ -11,15 +11,19 @@ use std::{
 
 use bamts_verification::{
     evidence::WorkingDirectoryPolicy,
+    facets::DIAGNOSTIC_CODE_MAP_PATH,
     lane::{
         LANE_WORKER_DONE, LANE_WORKER_READY, LANE_WORKER_REQUEST, LANE_WORKER_SERVE, LaneBinding,
-        LaneRequest, LaneResponse, ProcessExecutor, ServingExecutor, run_lane,
+        LaneOutcome, LaneRequest, LaneResponse, ProcessExecutor, ServingExecutor, run_lane,
     },
     shard::{ExecutionMode, ObligationKey},
+    suite::{DEFAULT_SNAPSHOT_REL, materialize_from_extracted},
 };
 
 const WORKER: &str = env!("CARGO_BIN_EXE_ts_lane_worker");
+const CATALOG: &str = "typescript-7.0.2";
 const RUN_ID: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const OTHER_RUN_ID: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 fn scratch(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -48,6 +52,67 @@ fn unbound_request(request_id: u64) -> LaneRequest {
         )
         .expect("key"),
         BTreeSet::from(["diagnostics".to_owned()]),
+        vec!["lane".to_owned()],
+        WorkingDirectoryPolicy::RepositoryRoot,
+        30_000,
+    )
+    .expect("request")
+}
+
+/// A one-case compiler snapshot where a worker that runs in `dir` looks for one.
+fn write_snapshot(dir: &Path) -> PathBuf {
+    let extracted = dir.join("extracted");
+    let case = extracted.join("tests/cases/compiler/scalarPin.ts");
+    fs::create_dir_all(case.parent().expect("case directory")).expect("case directory");
+    fs::write(&case, "var x: any;\n").expect("case");
+    let baseline = extracted.join("tests/baselines/reference/scalarPin.types");
+    fs::create_dir_all(baseline.parent().expect("baseline directory")).expect("baseline directory");
+    fs::write(
+        &baseline,
+        "//// [tests/cases/compiler/scalarPin.ts] ////\n\n=== scalarPin.ts ===\nvar x: any;\n>x : any\n>  : ^^^\n\n",
+    )
+    .expect("baseline");
+    fs::write(extracted.join("LICENSE"), b"Apache-2.0\n").expect("license");
+    let root = dir.join(DEFAULT_SNAPSHOT_REL);
+    fs::create_dir_all(&root).expect("snapshot root");
+    materialize_from_extracted(&root, &extracted).expect("snapshot");
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    fs::copy(
+        repository.join(DIAGNOSTIC_CODE_MAP_PATH),
+        dir.join(DIAGNOSTIC_CODE_MAP_PATH),
+    )
+    .expect("diagnostic code map");
+    root
+}
+
+fn bind_snapshot(root: &Path, run_id: &str) -> LaneBinding {
+    let root = fs::canonicalize(root).expect("snapshot root");
+    let read = |name: &str| fs::read(root.join(name)).expect("snapshot metadata");
+    LaneBinding::unbound(run_id)
+        .expect("binding")
+        .with_snapshot(
+            CATALOG,
+            &root,
+            &read("oracle/pin.json"),
+            &read("index.json"),
+            &read("ledger.json"),
+        )
+        .expect("snapshot binding")
+}
+
+fn bound_request(binding: &LaneBinding, request_id: u64) -> LaneRequest {
+    LaneRequest::new(
+        binding.clone(),
+        request_id,
+        ObligationKey::new(
+            CATALOG,
+            "compiler/tests/cases/compiler/scalarPin.ts",
+            "default#types",
+            ExecutionMode::Aot,
+            "x86_64-unknown-linux-gnu",
+        )
+        .expect("key"),
+        BTreeSet::from(["types".to_owned()]),
         vec!["lane".to_owned()],
         WorkingDirectoryPolicy::RepositoryRoot,
         30_000,
@@ -126,6 +191,61 @@ fn a_serving_worker_answers_each_request_like_a_one_request_worker() {
         assert_eq!(answered.binding(), expected.binding());
         assert_eq!(answered.outcome(), expected.outcome());
     }
+    drop(stdin);
+    let status = child.wait().expect("worker exits");
+    let _ = fs::remove_dir_all(&dir);
+    assert!(status.success(), "{status}");
+}
+
+#[test]
+fn a_serving_worker_keeps_the_snapshot_of_a_binding_until_the_binding_changes() {
+    let dir = scratch("bound");
+    let root = write_snapshot(&dir);
+    let first = bind_snapshot(&root, RUN_ID);
+    let second = bind_snapshot(&root, OTHER_RUN_ID);
+    let single = write_request(&dir, &bound_request(&first, 1));
+    assert!(one_request_worker(&dir, &single).status.success());
+    let expected = response(&single);
+    assert!(
+        matches!(expected.outcome(), LaneOutcome::Completed { .. }),
+        "{:?}",
+        expected.outcome()
+    );
+
+    let mut child = serving_worker(&dir);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout"))
+        .lines()
+        .map(|line| line.expect("line"))
+        .filter(|line| !line.is_empty());
+    assert_eq!(lines.next().as_deref(), Some(LANE_WORKER_READY));
+    let mut ask = |binding: &LaneBinding, request_id: u64| {
+        let path = write_request(&dir, &bound_request(binding, request_id));
+        writeln!(stdin, "{}", path.display()).expect("send request");
+        stdin.flush().expect("flush request");
+        assert_eq!(
+            lines.next(),
+            Some(format!("{LANE_WORKER_DONE} {request_id}"))
+        );
+        response(&path)
+    };
+
+    assert_eq!(ask(&first, 2).outcome(), expected.outcome());
+    // No binding matches the metadata on disk now, so a load fails. The next request
+    // of the same binding can only be answered from the snapshot in memory.
+    fs::write(root.join("index.json"), b"{}").expect("change the snapshot");
+    assert_eq!(ask(&first, 3).outcome(), expected.outcome());
+    // A new binding is authenticated again, and that lets go of the old snapshot.
+    for (binding, request_id) in [(&second, 4), (&first, 5)] {
+        let answered = ask(binding, request_id);
+        assert_eq!(answered.binding(), binding);
+        assert!(
+            matches!(answered.outcome(), LaneOutcome::BlockingFail { .. }),
+            "{:?}",
+            answered.outcome()
+        );
+    }
+
     drop(stdin);
     let status = child.wait().expect("worker exits");
     let _ = fs::remove_dir_all(&dir);
