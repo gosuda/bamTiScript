@@ -2,15 +2,18 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 host_triple := `rustc -vV | awk '/^host:/{print $2}'`
 export PATH := env_var_or_default('HOME', '') + "/.nvm/versions/node/v24.18.0/bin:/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/llvm/bin:" + env_var('PATH')
+xcheck_targets := "x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc"
 
 doctor:
     [[ "$(node -v)" == "v24.18.0" ]]
-    [[ "$(rustc -V)" == *"1.97.1"* ]]
-    [[ "$(racket --version)" == *"9.2"* ]]
+    [[ "$(rustc -V)" == "rustc 1.97.1 "* ]]
+    [[ "$(racket --version)" == *" v9.2 "* ]]
     command -v ld.lld
     command -v llvm-readelf
     command -v lake
+    command -v npm
     test -x formal/quint/node_modules/.bin/quint
+    installed="$(rustup target list --installed)"; for target in {{xcheck_targets}}; do grep -qx "$target" <<< "$installed"; done
     printf '%s\n' 'DOCTOR PASS'
 
 # Fails while any gate ledger has an unchecked box or pending evidence, and lists
@@ -188,10 +191,7 @@ conformance-shard index count="4" catalog="typescript-7.0.2":
 # Check that the whole workspace, tests included, still builds for every host
 # the product targets. This proves only that it compiles.
 xcheck:
-    cargo check --workspace --all-targets --locked --target x86_64-apple-darwin
-    cargo check --workspace --all-targets --locked --target x86_64-unknown-linux-gnu
-    cargo check --workspace --all-targets --locked --target aarch64-unknown-linux-gnu
-    cargo check --workspace --all-targets --locked --target x86_64-pc-windows-msvc
+    for target in {{xcheck_targets}}; do cargo check --workspace --all-targets --locked --target "$target"; done
     printf '%s\n' 'XCHECK PASS'
 
 # Fail when code outside bamts-platform reads /proc or /sys, or runs numactl or
