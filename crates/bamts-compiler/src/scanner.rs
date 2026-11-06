@@ -440,7 +440,11 @@ pub fn scan_with_cancel(
                 token.kind(),
                 TokenKind::Whitespace | TokenKind::LineComment | TokenKind::BlockComment
             ) {
-                previous = Some(token.kind());
+                previous = Some(match previous {
+                    // A keyword here is a property name, so `o.in / 2` divides.
+                    Some(TokenKind::Dot | TokenKind::QuestionDot) => TokenKind::Identifier,
+                    _ => token.kind(),
+                });
             }
             tokens.push(token);
         };
@@ -2315,6 +2319,22 @@ mod tests {
             );
             assert_eq!(scan_text(text).diagnostics(), &[], "{text}");
         }
+    }
+
+    #[test]
+    fn a_slash_after_a_keyword_named_property_stays_division() {
+        for text in [
+            "o.in / 2 / 1",
+            "o?.in / 2 / 1",
+            "o.typeof / 2 / 1",
+            "o.\n  return /* name */ / 2 / 1",
+        ] {
+            assert!(
+                !kinds(text).contains(&TokenKind::RegularExpressionLiteral),
+                "{text}"
+            );
+        }
+        assert!(kinds("x in / 2 / 1").contains(&TokenKind::RegularExpressionLiteral));
     }
 
     #[test]
