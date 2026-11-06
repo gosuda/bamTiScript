@@ -13629,6 +13629,37 @@ console.log(JSON.stringify([bar, bar4, log]));
         assert!(code.contains("N.a = Math.pow(N.a, 2);"), "{code}");
     }
 
+    /// What Node prints for the CommonJS output of `source`, then `report`.
+    fn node_prints(source: &str, target: ScriptTarget, report: &str) -> String {
+        let code = commonjs_at(source, target);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("bamts-cjs-{nonce}.cjs"));
+        std::fs::write(&path, format!("{code}\n{report}\n")).expect("write lowered JavaScript");
+        let result = std::process::Command::new("node")
+            .arg(&path)
+            .output()
+            .expect("execute Node");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout)
+            .expect("Node stdout")
+            .trim()
+            .to_owned()
+    }
+
+    const EMIT_TARGETS: [ScriptTarget; 3] = [
+        ScriptTarget::Es5,
+        ScriptTarget::Es2015,
+        ScriptTarget::Es2020,
+    ];
+
     #[test]
     fn node_executes_lowered_writes_to_exported_variables() {
         let source = r#"
@@ -13648,38 +13679,27 @@ a **= 2;
 var d: any;
 [d, o.e] = s;
 "#;
-        for target in [
-            ScriptTarget::Es5,
-            ScriptTarget::Es2015,
-            ScriptTarget::Es2020,
-        ] {
-            let code = commonjs_at(source, target);
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("bamts-cjs-{nonce}.cjs"));
-            let runner = format!(
-                "{code}\nconsole.log(JSON.stringify([exports.a, exports.b, exports.c, exports.o, d]));\n"
-            );
-            std::fs::write(&path, runner).expect("write lowered JavaScript");
-            let result = std::process::Command::new("node")
-                .arg(&path)
-                .output()
-                .expect("execute Node");
-            let _ = std::fs::remove_file(&path);
-            assert!(
-                result.status.success(),
-                "{}\n{code}",
-                String::from_utf8_lossy(&result.stderr)
-            );
+        let report =
+            "console.log(JSON.stringify([exports.a, exports.b, exports.c, exports.o, d]));";
+        for target in EMIT_TARGETS {
             assert_eq!(
-                String::from_utf8(result.stdout)
-                    .expect("Node stdout")
-                    .trim(),
-                r#"[25,8,9,{"e":21},20]"#,
-                "{code}"
+                node_prints(source, target, report),
+                r#"[25,8,9,{"e":21},20]"#
             );
+        }
+    }
+
+    #[test]
+    fn node_executes_a_for_of_that_writes_exported_variables() {
+        let source = r#"
+export var a: any = 0;
+export var b: any = 0;
+for (a of [1, 2]) {}
+for ([b] of [[3], [4]]) {}
+"#;
+        let report = "console.log(JSON.stringify([exports.a, exports.b]));";
+        for target in EMIT_TARGETS {
+            assert_eq!(node_prints(source, target, report), "[2,4]");
         }
     }
 
