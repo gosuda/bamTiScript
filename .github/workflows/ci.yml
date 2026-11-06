@@ -56,6 +56,8 @@ jobs:
         run: cargo test --locked -p bamts-cli --test cli -- aot_ deep_nesting a_file_in_the_project_named_like_a_system_library_is_not_linked
       - name: Test the lane workers
         run: cargo test --locked -p bamts-verification --test lane_serving
+      - name: Test the serving lane executor
+        run: cargo test --locked -p bamts-verification --lib serving
 
   quality:
     name: Quality

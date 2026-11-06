@@ -1014,9 +1014,10 @@ impl ServingWorker {
 
 /// Whether the threads that read the output of an exited worker ended. They end
 /// when nothing holds the pipes, and a child that the worker left can hold them for
-/// as long as it runs. So the process group of the worker is terminated after
-/// [`SERVING_STOP_GRACE`]. A holder that survives that costs its thread and not the
-/// run: the thread stays blocked until the holder exits, and nothing waits for it.
+/// as long as it runs. So on Unix the process group of the worker is terminated after
+/// [`SERVING_STOP_GRACE`]. Windows has no such group, so this reaches only the worker
+/// that already exited. A holder that survives costs its thread and not the run: the
+/// thread stays blocked until the holder exits, and nothing waits for it.
 fn readers_ended(child: &mut Child, readers: &[JoinHandle<()>; 2]) -> bool {
     let ended_in_time = || {
         let deadline = Instant::now() + SERVING_STOP_GRACE;
