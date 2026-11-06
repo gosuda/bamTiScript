@@ -235,12 +235,21 @@ fn version_text(major: u32, minor: u32, build: u32, revision: u32) -> String {
 
 /// The microcode revision as Linux prints it, such as `0x8701030`.
 ///
-/// The `Update Revision` registry value is the revision register of the CPU. A
-/// four-byte value holds the revision itself. Any other length is a form this
-/// reader has not checked against a host, so it gives `None` rather than a guess.
+/// The `Update Revision` registry value is the revision register of the CPU. Four
+/// bytes hold the revision itself. In eight bytes, Intel hosts hold it in the high
+/// half and AMD hosts in the low half, so the half that is not zero is the revision.
+/// A value with two such halves, or of any other length, gives `None`, not a guess.
 fn microcode_text(value: &[u8]) -> Option<String> {
-    let bytes: [u8; 4] = value.try_into().ok()?;
-    Some(format!("0x{:x}", u32::from_le_bytes(bytes)))
+    let word = |bytes: &[u8]| Some(u32::from_le_bytes(bytes.try_into().ok()?));
+    let revision = if value.len() == 8 {
+        match (word(&value[..4])?, word(&value[4..])?) {
+            (revision, 0) | (0, revision) => revision,
+            _ => return None,
+        }
+    } else {
+        word(value)?
+    };
+    Some(format!("0x{revision:x}"))
 }
 
 /// Decodes a registry string: UTF-16 up to the first NUL, without the padding that
@@ -862,14 +871,16 @@ impl Drop for Window {
     }
 }
 
-/// `RRF_RT_REG_SZ`, `RRF_RT_REG_BINARY` and `RRF_RT_REG_DWORD`: the registry value
-/// types `RegGetValueW` may return.
+/// `RRF_RT_REG_SZ`, `RRF_RT_REG_BINARY`, `RRF_RT_REG_DWORD` and `RRF_RT_REG_QWORD`:
+/// the registry value types `RegGetValueW` may return.
 #[cfg(target_os = "windows")]
 const RRF_RT_REG_SZ: u32 = 0x0000_0002;
 #[cfg(target_os = "windows")]
 const RRF_RT_REG_BINARY: u32 = 0x0000_0008;
 #[cfg(target_os = "windows")]
 const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+#[cfg(target_os = "windows")]
+const RRF_RT_REG_QWORD: u32 = 0x0000_0040;
 /// `ERROR_FILE_NOT_FOUND`: the registry has no such value.
 #[cfg(target_os = "windows")]
 const ERROR_FILE_NOT_FOUND: i32 = 2;
@@ -1041,11 +1052,19 @@ pub(crate) fn machine_facts() -> Result<MachineFacts> {
         RRF_RT_REG_SZ,
         1024,
     )?);
-    // The buffer is far larger than any known form, so that a value of another length
-    // reaches `microcode_text` and reads as unavailable instead of failing the read.
-    let microcode = registry_value(PROCESSOR_KEY, "Update Revision", RRF_RT_REG_BINARY, 1024)?
-        .and_then(|value| microcode_text(&value))
-        .unwrap_or_else(|| UNAVAILABLE.to_owned());
+    // The microcode is the one fact here that a host may lack or spell another way,
+    // as some AMD hosts do with a DWORD. What cannot be read is unavailable, and it
+    // does not fail the other facts. The buffer is far larger than any known form.
+    let microcode = registry_value(
+        PROCESSOR_KEY,
+        "Update Revision",
+        RRF_RT_REG_BINARY | RRF_RT_REG_DWORD | RRF_RT_REG_QWORD,
+        1024,
+    )
+    .ok()
+    .flatten()
+    .and_then(|value| microcode_text(&value))
+    .unwrap_or_else(|| UNAVAILABLE.to_owned());
     let (sockets, cores_per_socket) = processor_topology()?;
     Ok(MachineFacts {
         kernel_release: format!("{major}.{minor}.{build}"),
@@ -1375,8 +1394,19 @@ mod tests {
             microcode_text(&[0x30, 0x10, 0x70, 0x08]),
             Some("0x8701030".to_owned())
         );
-        // A form this reader has not seen on a host is not decoded.
+        // Intel holds the revision in the high half of eight bytes, AMD in the low half.
+        assert_eq!(
+            microcode_text(&[0, 0, 0, 0, 0xf0, 0, 0, 0]),
+            Some("0xf0".to_owned())
+        );
+        assert_eq!(
+            microcode_text(&[0x16, 0x10, 0x20, 0x0a, 0, 0, 0, 0]),
+            Some("0xa201016".to_owned())
+        );
+        assert_eq!(microcode_text(&[0; 8]), Some("0x0".to_owned()));
+        // A form with no one reading is not decoded.
         assert_eq!(microcode_text(&[1, 2, 3, 4, 5, 6, 7, 8]), None);
+        assert_eq!(microcode_text(&[1, 2, 3]), None);
         assert_eq!(microcode_text(&[]), None);
     }
 
