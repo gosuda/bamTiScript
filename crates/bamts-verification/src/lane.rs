@@ -857,7 +857,8 @@ impl LaneExecutor for ServingExecutor {
             observation: ProcessObservation::Answered,
             response_body: fs::read(&response_path).ok(),
             duration_ms: elapsed_ms(started),
-            detail: worker.stderr_text(),
+            // The row of an answered request comes from its response alone.
+            detail: String::new(),
         };
         self.worker = Some(worker);
         Ok(result)
@@ -908,16 +909,14 @@ impl ServingWorker {
         }
     }
 
+    /// Starts the cap on standard error again for the next request. The reader
+    /// thread may still store late output of the last request after this, so the
+    /// detail of a failed request can start with such lines.
     fn clear_stderr(&self) {
         self.stderr
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
-    }
-
-    fn stderr_text(&self) -> String {
-        String::from_utf8_lossy(&self.stderr.lock().unwrap_or_else(PoisonError::into_inner))
-            .into_owned()
     }
 
     /// Ends a worker that exited or missed the deadline, and records its request
