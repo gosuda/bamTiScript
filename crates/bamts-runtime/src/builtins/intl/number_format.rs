@@ -264,7 +264,10 @@ fn format_getter<H: Host>(
 }
 
 /// The value of a StringNumericLiteral as an exact number, as
-/// ToIntlMathematicalValue reads it: magnitudes a Number cannot hold saturate.
+/// ToIntlMathematicalValue reads it: a magnitude past the range of a Number
+/// saturates. A magnitude below that range stays exact, as it does in V8, where the
+/// specification reads it as zero. An exponent that nothing can hold reads as the
+/// nearest Number.
 fn string_mathematical_value(text: &str) -> IntlMathematicalValue {
     let trimmed = text.trim_matches(super::is_string_whitespace);
     if trimmed.is_empty() {
@@ -300,12 +303,12 @@ fn string_mathematical_value(text: &str) -> IntlMathematicalValue {
         return IntlMathematicalValue::from_f64(f64::NAN);
     }
     let approximate: f64 = body.parse().unwrap_or(f64::NAN);
-    if approximate.is_infinite() || approximate == 0.0 {
-        let saturated = if negative { -approximate } else { approximate };
-        return IntlMathematicalValue::from_f64(saturated);
+    let number = if negative { -approximate } else { approximate };
+    if approximate.is_infinite() {
+        return IntlMathematicalValue::from_f64(number);
     }
     IntlMathematicalValue::from_decimal_string(trimmed)
-        .unwrap_or_else(|_| IntlMathematicalValue::from_f64(f64::NAN))
+        .unwrap_or_else(|_| IntlMathematicalValue::from_f64(number))
 }
 
 /// Converts digits of `radix` to a decimal string, by long multiplication.
@@ -562,4 +565,78 @@ fn resolved_options<H: Host>(
         resolved.trailing_zero_display.as_str(),
     )?;
     Ok(BuiltinOutcome::Value(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exact(text: &str) -> IntlMathematicalValue {
+        IntlMathematicalValue::from_decimal_string(text).expect("a decimal")
+    }
+
+    #[test]
+    fn a_string_below_the_range_of_a_number_stays_exact() {
+        for text in [
+            "1e-400",
+            "-1e-400",
+            "1.5e-400",
+            "1E-400",
+            "5e-324",
+            "1e-1000000",
+        ] {
+            assert_eq!(string_mathematical_value(text), exact(text), "{text}");
+        }
+        assert_eq!(string_mathematical_value(" +1e-400 "), exact("1e-400"));
+        assert_ne!(string_mathematical_value("1e-400"), exact("0"));
+    }
+
+    #[test]
+    fn a_string_of_zero_keeps_its_sign() {
+        for zero in ["0", "+0", "0e5", "0.000e-400", "0e-400", ""] {
+            assert_eq!(
+                string_mathematical_value(zero),
+                IntlMathematicalValue::from_f64(0.0),
+                "{zero:?}"
+            );
+        }
+        for zero in ["-0", "-0e5", "-0.000e-400"] {
+            assert_eq!(
+                string_mathematical_value(zero),
+                IntlMathematicalValue::from_f64(-0.0),
+                "{zero:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_string_past_the_range_of_a_number_saturates() {
+        for (text, number) in [
+            ("1e400", f64::INFINITY),
+            ("1e5000", f64::INFINITY),
+            ("-1e400", f64::NEG_INFINITY),
+        ] {
+            assert_eq!(
+                string_mathematical_value(text),
+                IntlMathematicalValue::from_f64(number),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exponent_that_nothing_can_hold_reads_as_the_nearest_number() {
+        for (text, number) in [
+            ("1e-99999999999", 0.0),
+            ("-1e-99999999999", -0.0),
+            ("0e99999999999", 0.0),
+            ("1e99999999999", f64::INFINITY),
+        ] {
+            assert_eq!(
+                string_mathematical_value(text),
+                IntlMathematicalValue::from_f64(number),
+                "{text}"
+            );
+        }
+    }
 }

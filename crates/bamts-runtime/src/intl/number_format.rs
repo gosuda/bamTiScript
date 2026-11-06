@@ -1085,6 +1085,11 @@ fn to_raw_fixed(
     })
 }
 
+/// The most zeros that a formatted number spells out after its decimal point. A
+/// short decimal string can ask for any number of them, and the text exists before
+/// the heap limit can refuse it. The default heap of 64 MiB holds no more units.
+const MAX_LEADING_ZEROS: usize = 1 << 25;
+
 fn to_raw_precision(
     value: &Decimal,
     minimum_precision: u8,
@@ -1143,6 +1148,9 @@ fn to_raw_precision(
     } else {
         let zeros = usize::try_from(-(exponent + 1))
             .map_err(|_| NumberFormatError::range("decimal magnitude is out of range"))?;
+        if zeros > MAX_LEADING_ZEROS {
+            return Err(NumberFormatError::range("formatted number is too long"));
+        }
         formatted.insert_str(0, &format!("0.{}", "0".repeat(zeros)));
         integer_digits_count = 1;
     }
@@ -3149,6 +3157,38 @@ mod tests {
         assert_eq!(
             significant.format_number(1e-300).expect("a Number"),
             format!("0.{}1", "0".repeat(299))
+        );
+    }
+
+    #[test]
+    fn a_value_below_the_range_of_a_number_is_formatted_exactly() {
+        let tiny = IntlMathematicalValue::from_decimal_string("1e-400").expect("a decimal");
+        let scientific = formatter(NumberFormatOptions {
+            notation: Some("scientific".to_owned()),
+            ..NumberFormatOptions::default()
+        })
+        .expect("scientific");
+        assert_eq!(scientific.format(&tiny).expect("scientific"), "1E−400");
+        let plain = formatter(NumberFormatOptions::default()).expect("plain");
+        assert_eq!(plain.format(&tiny).expect("plain"), "0");
+        let significant = formatter(NumberFormatOptions {
+            maximum_significant_digits: Some(3.0),
+            ..NumberFormatOptions::default()
+        })
+        .expect("significant");
+        assert_eq!(
+            significant.format(&tiny).expect("significant"),
+            format!("0.{}1", "0".repeat(399))
+        );
+
+        // The text of this value would not fit in the heap, and only that form needs it.
+        let far = IntlMathematicalValue::from_decimal_string("1e-2000000000").expect("a decimal");
+        let refused = significant.format(&far).expect_err("too many zeros");
+        assert_eq!(refused.kind, NumberFormatErrorKind::RangeError);
+        assert_eq!(plain.format(&far).expect("plain"), "0");
+        assert_eq!(
+            scientific.format(&far).expect("scientific"),
+            "1E−2000000000"
         );
     }
 
