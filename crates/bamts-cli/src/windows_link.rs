@@ -361,11 +361,18 @@ fn explicit_linker(
     }
 }
 
-/// The files called `name` in the directories of `PATH`, in search order.
+/// The files called `name` in the directories of `PATH`, in search order. An empty
+/// entry names no directory, and a relative one is read from the working directory
+/// of the context.
 #[cfg(target_env = "msvc")]
 fn path_candidates(context: &ExecutionContext, name: &Path) -> impl Iterator<Item = PathBuf> {
     let directories: Vec<PathBuf> = variable(context, "PATH")
-        .map(|search| std::env::split_paths(&search).collect())
+        .map(|search| {
+            std::env::split_paths(&search)
+                .filter(|directory| !directory.as_os_str().is_empty())
+                .map(|directory| context.resolve_path(directory))
+                .collect()
+        })
         .unwrap_or_default();
     directories
         .into_iter()
@@ -911,6 +918,24 @@ mod tests {
                 .expect("rustc starts");
             assert!(compiled.success());
             linker
+        }
+
+        #[test]
+        fn the_search_path_is_read_from_the_working_directory_of_the_context() {
+            let scratch = tempfile::tempdir().expect("temporary directory");
+            let tools = scratch.path().join("tools");
+            std::fs::create_dir(&tools).expect("a directory of tools");
+            std::fs::write(tools.join("link.exe"), b"").expect("a file in the directory");
+            std::fs::write(scratch.path().join("link.exe"), b"").expect("a file in the project");
+            let path = [("Path", ";tools;")]
+                .map(|(name, value)| (OsString::from(name), OsString::from(value)));
+            let context =
+                ExecutionContext::new(scratch.path(), path.into()).expect("execution context");
+
+            let found: Vec<PathBuf> = path_candidates(&context, Path::new("link.exe")).collect();
+
+            // The empty entries do not name the file in the project.
+            assert_eq!(found, [context.cwd().join("tools").join("link.exe")]);
         }
 
         #[test]
