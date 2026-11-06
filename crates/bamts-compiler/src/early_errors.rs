@@ -420,7 +420,8 @@ impl Walker<'_> {
             PropertyName::String(literal) => self
                 .file
                 .token_text(literal.data().token())
-                .map(|text| text.trim_matches(['\'', '"']).to_owned()),
+                .and_then(crate::literal::string_value)
+                .map(|value| value.to_utf8_lossy()),
             _ => None,
         }
     }
@@ -2283,6 +2284,27 @@ mod tests {
             "function* g() { (x = () => { yield; }) => 1; }",
             "function* g() { (x) => yield; }",
             "(x = yield) => 1;",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_string_property_name_is_read_as_its_value() {
+        for source in [
+            r#"({ "__proto__": 1, __proto__: 2 });"#,
+            r#"({ "\x5f_proto__": 1, "__proto__": 2 });"#,
+            r#"class C { static "\x70rototype"() {} }"#,
+            r#"class C { get "\x63onstructor"() {} }"#,
+            r#"class C { "\x63onstructor"; }"#,
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            r#"({ "'__proto__'": 1, __proto__: 2 });"#,
+            r#"class C { static "'prototype'"() {} }"#,
+            r#"class C { get "'constructor'"() { return 1; } }"#,
+            r#"class C { "'constructor'"; }"#,
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
