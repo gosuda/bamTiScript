@@ -13682,4 +13682,18 @@ var d: any;
             );
         }
     }
+
+    #[test]
+    fn a_string_named_constructor_is_the_constructor() {
+        // quotedConstructors.js: a string with the value `constructor` makes the
+        // constructor, whatever its escapes, and a computed name is a method.
+        let code = javascript(&emit_at(
+            "class C {\n    \"constructor\"() { }\n}\nclass D {\n    '\\x63onstructor'() { }\n}\nclass E {\n    ['constructor']() { }\n}\nclass F {\n    'constructors'() { }\n}\n",
+            ScriptTarget::Es2015,
+        ))
+        .to_owned();
+        assert_eq!(code.matches("    constructor() { }").count(), 2, "{code}");
+        assert!(code.contains("]() { }"), "{code}");
+        assert!(code.contains("'constructors'() { }"), "{code}");
+    }
 }

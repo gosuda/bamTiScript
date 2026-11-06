@@ -2144,6 +2144,15 @@ mod tests {
     }
 
     #[test]
+    fn a_string_named_constructor_counts_as_the_constructor() {
+        assert!(!errors("class C { 'constructor'() {} constructor() {} }").is_empty());
+        assert_eq!(
+            errors("class C { 'constructor'() {} }"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
     fn a_module_is_strict_and_reserves_await() {
         for source in [
             "export {}; var public;",

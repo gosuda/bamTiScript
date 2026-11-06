@@ -2320,13 +2320,18 @@ impl Parser {
             || (self.at(TokenKind::KwStatic) && next == TokenKind::LBrace)
     }
 
-    /// Returns whether `name` is exactly the `constructor` identifier, so a
-    /// method named `constructors` is not misread as a constructor.
+    /// Returns whether `name` is exactly the `constructor` identifier or a string
+    /// with that value, so a method named `constructors` is not misread as a
+    /// constructor. A computed name is never one.
     fn is_constructor_name(&self, name: &PropertyName) -> bool {
-        let PropertyName::Identifier(node) = name else {
-            return false;
-        };
-        self.lexeme(*node.data().token()) == "constructor"
+        match name {
+            PropertyName::Identifier(node) => self.lexeme(*node.data().token()) == "constructor",
+            PropertyName::String(node) => {
+                crate::literal::string_value(self.lexeme(*node.data().token()))
+                    .is_some_and(|value| value.eq_ascii("constructor"))
+            }
+            _ => false,
+        }
     }
 
     /// Distinguishes `[key: string]: T` from a computed member name.
