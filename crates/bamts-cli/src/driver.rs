@@ -2360,10 +2360,38 @@ fn fallback_cache_root_path_in_context(context: &ExecutionContext) -> Result<Pat
 
 #[cfg(not(unix))]
 fn fallback_cache_root_path_in_context(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
+    #[cfg(windows)]
+    if is_windows_temp_directory(context.temp_dir(), context) {
+        return Err(DriverError::UnsafeFallbackCacheRoot {
+            path: context.temp_dir().to_owned(),
+        });
+    }
     Ok(context.temp_dir().join(format!(
         "bamts-cache-{}",
         fallback_cache_user_key_in_context(context)?
     )))
+}
+
+/// Whether `directory` is the temporary directory of Windows itself. A process with
+/// no `TMP`, `TEMP` or `USERPROFILE` falls back to it, and so does the SYSTEM account.
+/// Every user can create a directory there, so another user could make the cache
+/// first, and a link trusts the archive and the libraries that it finds in the cache.
+/// Windows has no check here like the owner and mode check of a Unix fallback.
+#[cfg(windows)]
+fn is_windows_temp_directory(directory: &Path, context: &ExecutionContext) -> bool {
+    let spelling = |path: &Path| {
+        path.components()
+            .as_path()
+            .to_string_lossy()
+            .to_ascii_lowercase()
+    };
+    let directory = spelling(directory);
+    ["SystemRoot", "WINDIR"]
+        .into_iter()
+        .filter_map(|name| crate::context::env_ignoring_case(context.envs(), name))
+        .map(|root| Path::new(root).join("Temp"))
+        .chain([PathBuf::from(r"C:\Windows\Temp")])
+        .any(|shared| spelling(&shared) == directory)
 }
 
 #[cfg(unix)]
@@ -3571,6 +3599,45 @@ exit 2
         assert_eq!(
             table.level_for_source(typescript_only, SourceDialect::JavaScript),
             LintLevel::Allow
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fallback_cache_root_refuses_the_temporary_directory_of_windows() {
+        let root = |variables: &[(&str, &str)]| {
+            let env = variables
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                .collect();
+            let context = ExecutionContext::new(std::env::temp_dir(), env).expect("context");
+            super::fallback_cache_root_path_in_context(&context)
+        };
+        let refused = |variables: &[(&str, &str)]| {
+            matches!(
+                root(variables),
+                Err(DriverError::UnsafeFallbackCacheRoot { .. })
+            )
+        };
+
+        // Nothing names a directory of the user.
+        assert!(refused(&[]));
+        assert!(refused(&[("SystemRoot", r"D:\Windows")]));
+        assert!(refused(&[("WINDIR", r"D:\Windows")]));
+        // The SYSTEM account names it, in any spelling.
+        assert!(refused(&[
+            ("SystemRoot", r"C:\Windows"),
+            ("TEMP", r"c:\windows\TEMP\")
+        ]));
+
+        assert_eq!(
+            root(&[
+                ("SystemRoot", r"C:\Windows"),
+                ("TMP", r"D:\Temp"),
+                ("USERNAME", "builder")
+            ])
+            .expect("a directory of the user"),
+            PathBuf::from(r"D:\Temp\bamts-cache-builder")
         );
     }
 
