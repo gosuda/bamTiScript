@@ -257,6 +257,7 @@ fn locale_join<H: Host>(
     let length = array_es2023::length_of_array_like(machine, object)?;
     let mut output = bamts_bytecode::EcmaStringBuilder::new();
     for index in 0..length {
+        generic::tick(machine)?;
         if index != 0 {
             output.push_unit(u16::from(b','));
         }
@@ -310,6 +311,7 @@ fn copy_within_steps<H: Host>(
         to += count - 1;
     }
     while count > 0 {
+        generic::tick(machine)?;
         let from_key = array_es2023::index_key(from);
         let to_key = array_es2023::index_key(to);
         if machine.internal_has_property(object, &from_key)? {
@@ -374,6 +376,55 @@ fn entries_iterator<H: Host>(
     )?))
 }
 
+#[cfg(test)]
+mod fuel_tests {
+    use super::super::test_support::{TestHost, blank_program, ordinary_object};
+    use super::*;
+    use crate::{Limits, RuntimeErrorKind};
+
+    #[test]
+    fn a_loop_over_a_long_array_like_runs_out_of_fuel() {
+        for (method, arguments) in [
+            ("copyWithin", vec![Value::int32(0), Value::int32(1)]),
+            ("toLocaleString", Vec::new()),
+            ("toReversed", Vec::new()),
+            ("toSorted", Vec::new()),
+            ("toSpliced", Vec::new()),
+            ("with", vec![Value::int32(0), Value::int32(0)]),
+            ("findLast", Vec::new()),
+        ] {
+            let module = blank_program("<test>");
+            let mut host = TestHost;
+            let limits = Limits {
+                fuel: 16,
+                ..Limits::default()
+            };
+            let mut machine = Machine::new(&module, &mut host, limits);
+            let object = ordinary_object(&mut machine);
+            machine
+                .set_data_property(object, "length", Value::int32(1000))
+                .unwrap();
+            let constructor = machine.intrinsics.global("Array").unwrap();
+            let prototype = machine
+                .get_named_property(constructor, "prototype")
+                .unwrap();
+            let function = machine.get_named_property(prototype, method).unwrap();
+            let predicate = machine.intrinsics.global("Boolean").unwrap();
+            let arguments = if method == "findLast" {
+                vec![predicate]
+            } else {
+                arguments
+            };
+            assert!(
+                matches!(
+                    machine.call_value(function, object, &arguments),
+                    Err(EvalFailure::Runtime(RuntimeErrorKind::FuelExhausted { .. }))
+                ),
+                "{method}"
+            );
+        }
+    }
+}
 #[cfg(test)]
 mod copy_within_tests {
     use super::super::allocate_array;

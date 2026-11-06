@@ -34,7 +34,7 @@ fn argument(args: &[Value], index: usize) -> Value {
 
 /// Charges one step, so a claimed length of 2^53 - 1 ends in fuel exhaustion
 /// rather than a loop nothing can interrupt.
-fn tick<H: Host>(machine: &mut Machine<'_, H>) -> Result<(), EvalFailure> {
+pub(super) fn tick<H: Host>(machine: &mut Machine<'_, H>) -> Result<(), EvalFailure> {
     machine.consume_fuel(1).map_err(EvalFailure::Runtime)
 }
 
