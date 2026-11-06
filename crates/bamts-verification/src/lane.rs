@@ -633,7 +633,7 @@ impl LaneExecutor for ProcessExecutor {
         Ok(LaneProcessResult {
             observation,
             response_body,
-            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            duration_ms: elapsed_ms(started),
             detail: String::from_utf8_lossy(&outcome.stderr).into_owned(),
         })
     }
