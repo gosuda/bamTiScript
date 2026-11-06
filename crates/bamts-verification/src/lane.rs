@@ -649,6 +649,36 @@ const SERVING_STOP_GRACE: Duration = Duration::from_secs(5);
 /// How often a serving worker that is stopping is asked whether it has exited.
 const SERVING_STOP_POLL: Duration = Duration::from_millis(5);
 
+/// How much of one output line of a serving worker the parent keeps. The protocol
+/// lines are far shorter, and the rest of the output is read only to be skipped.
+const SERVING_LINE_BYTES: usize = 4096;
+
+/// Reads one line into `line`, of which at most [`SERVING_LINE_BYTES`] are kept, so
+/// a worker that prints without a line end cannot grow the memory of the parent.
+/// Returns `false` when the output has ended or cannot be read.
+fn read_bounded_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> bool {
+    line.clear();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        };
+        if available.is_empty() {
+            return !line.is_empty();
+        }
+        let end = available.iter().position(|byte| *byte == b'\n');
+        let text = &available[..end.unwrap_or(available.len())];
+        let room = SERVING_LINE_BYTES.saturating_sub(line.len());
+        line.extend_from_slice(&text[..text.len().min(room)]);
+        let read = end.map_or(available.len(), |end| end + 1);
+        reader.consume(read);
+        if end.is_some() {
+            return true;
+        }
+    }
+}
+
 /// Sends every request to one long-lived worker that serves requests (see
 /// [`LANE_WORKER_SERVE`]). The worker starts with the first request, and each
 /// request has its own deadline. A worker that exits, or misses a deadline and
@@ -735,16 +765,10 @@ impl ServingExecutor {
         let line_reader = thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = Vec::new();
-            loop {
-                line.clear();
-                match reader.read_until(b'\n', &mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        let text = String::from_utf8_lossy(&line).trim_end().to_owned();
-                        if sender.send(text).is_err() {
-                            break;
-                        }
-                    }
+            while read_bounded_line(&mut reader, &mut line) {
+                let text = String::from_utf8_lossy(&line).trim_end().to_owned();
+                if sender.send(text).is_err() {
+                    break;
                 }
             }
         });
@@ -1642,6 +1666,26 @@ mod tests {
         let error = executor.run(&request).expect_err("retained response");
         let _ = fs::remove_dir_all(&scratch);
         assert_eq!(error.code(), ErrorCode::Replay);
+    }
+
+    #[test]
+    fn a_long_line_of_a_serving_worker_is_cut_and_the_next_line_is_kept() {
+        let long = "x".repeat(SERVING_LINE_BYTES * 3);
+        let output = format!("{long}\n{LANE_WORKER_DONE} 1\r\nlast");
+        let mut reader = BufReader::with_capacity(16, output.as_bytes());
+        let mut line = Vec::new();
+
+        assert!(read_bounded_line(&mut reader, &mut line));
+        assert_eq!(line.len(), SERVING_LINE_BYTES);
+        assert!(read_bounded_line(&mut reader, &mut line));
+        assert_eq!(
+            String::from_utf8_lossy(&line).trim_end(),
+            format!("{LANE_WORKER_DONE} 1")
+        );
+        // Output that ends without a line end is still a line.
+        assert!(read_bounded_line(&mut reader, &mut line));
+        assert_eq!(line, b"last");
+        assert!(!read_bounded_line(&mut reader, &mut line));
     }
 
     #[test]
