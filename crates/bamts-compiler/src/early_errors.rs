@@ -17,11 +17,11 @@ use crate::{
     syntax::{
         ArrayBindingElement, ArrayElement, AssignmentArrayElement, AssignmentOperator,
         AssignmentTarget, AssignmentTargetNode, BinaryOperator, BindingPattern, BlockNode,
-        CallArgument, ClassDeclaration, ClassMember, ExportDeclaration, ExportDefaultValue, Expr,
-        Expression, ForBinding, ForInitializer, FunctionBody, FunctionLike, IdentifierNode,
-        Literal, LogicalOperator, MemberProperty, MetaProperty, ObjectMember, ParameterNode,
-        Pattern, PrivateIdentifierNode, PropertyModifier, PropertyName, SourceFile, Statement,
-        Stmt, Token, TokenKind, UnaryOperator, VariableKind,
+        CallArgument, ClassDeclaration, ClassMember, ExportDeclaration, ExportDefaultValue,
+        ExportNamedDeclaration, Expr, Expression, ForBinding, ForInitializer, FunctionBody,
+        FunctionLike, IdentifierNode, Literal, LogicalOperator, MemberProperty, MetaProperty,
+        ObjectMember, ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier,
+        PropertyName, SourceFile, Statement, Stmt, Token, TokenKind, UnaryOperator, VariableKind,
     },
 };
 
@@ -240,6 +240,16 @@ fn directives(statements: &[Stmt]) -> impl Iterator<Item = &crate::syntax::Token
 fn unlabeled(statement: &Stmt) -> &Stmt {
     match statement.data() {
         Statement::Labeled(labeled) => unlabeled(&labeled.body),
+        _ => statement,
+    }
+}
+
+/// The declaration `statement` exports, or `statement` when it exports none.
+fn unexported(statement: &Stmt) -> &Stmt {
+    match statement.data() {
+        Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner))) => {
+            inner
+        }
         _ => statement,
     }
 }
@@ -579,7 +589,7 @@ impl Walker<'_> {
     }
 
     fn statement_var_names(&self, statement: &Stmt, names: &mut Vec<(String, TextRange)>) {
-        match statement.data() {
+        match unexported(statement).data() {
             Statement::Variable(declaration) => self.declarator_names(declaration, names),
             Statement::Block(block) => self.var_names(&block.data().statements, names),
             Statement::If(conditional) => {
@@ -633,7 +643,7 @@ impl Walker<'_> {
     fn lexical_names(&self, statements: &[Stmt], functions_are_lexical: bool) -> Vec<Lexical> {
         let mut lexical = Vec::new();
         for statement in statements {
-            let statement = unlabeled(statement);
+            let statement = unexported(unlabeled(statement));
             match statement.data() {
                 Statement::Variable(declaration)
                     if !matches!(declaration.kind, VariableKind::Var) =>
@@ -648,29 +658,41 @@ impl Walker<'_> {
                         plain_function: false,
                     }));
                 }
-                Statement::Class(class) => {
-                    if let Some(name) = &class.name {
-                        lexical.push(Lexical {
-                            name: self.name(name),
-                            range: name.range(),
-                            plain_function: false,
-                        });
-                    }
-                }
+                Statement::Class(class) => self.class_name(class, &mut lexical),
                 Statement::Function(function) if functions_are_lexical => {
-                    let function = &function.function;
-                    if let Some(name) = &function.name {
-                        lexical.push(Lexical {
-                            name: self.name(name),
-                            range: name.range(),
-                            plain_function: !function.is_async && !function.is_generator,
-                        });
-                    }
+                    self.function_name(&function.function, &mut lexical);
                 }
+                Statement::Export(ExportDeclaration::Default(default)) => match &default.value {
+                    ExportDefaultValue::Function(function) => {
+                        self.function_name(function, &mut lexical);
+                    }
+                    ExportDefaultValue::Class(class) => self.class_name(class, &mut lexical),
+                    _ => {}
+                },
                 _ => {}
             }
         }
         lexical
+    }
+
+    fn class_name(&self, class: &ClassDeclaration, lexical: &mut Vec<Lexical>) {
+        if let Some(name) = &class.name {
+            lexical.push(Lexical {
+                name: self.name(name),
+                range: name.range(),
+                plain_function: false,
+            });
+        }
+    }
+
+    fn function_name(&self, function: &FunctionLike, lexical: &mut Vec<Lexical>) {
+        if let Some(name) = &function.name {
+            lexical.push(Lexical {
+                name: self.name(name),
+                range: name.range(),
+                plain_function: !function.is_async && !function.is_generator,
+            });
+        }
     }
 
     /// Reports redeclarations in one scope. `extra_vars` are var-like names from
@@ -1062,8 +1084,11 @@ impl Walker<'_> {
     }
 
     fn export(&mut self, export: &ExportDeclaration, context: Context) {
-        if let ExportDeclaration::Default(default) = export {
-            match &default.value {
+        match export {
+            ExportDeclaration::Named(ExportNamedDeclaration::Declaration(declaration)) => {
+                self.statement(declaration, context);
+            }
+            ExportDeclaration::Default(default) => match &default.value {
                 ExportDefaultValue::Function(function) => {
                     self.function(function, false, false, context);
                 }
@@ -1072,7 +1097,8 @@ impl Walker<'_> {
                     self.expression(expression, context);
                 }
                 _ => {}
-            }
+            },
+            _ => {}
         }
     }
 
@@ -2079,6 +2105,39 @@ mod tests {
             "({ a, ...b } = c);",
             "({ ...a.b } = c);",
             "({ ...a[0] } = c);",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    #[test]
+    fn an_exported_declaration_is_checked_like_any_other() {
+        for source in [
+            "export function f() { break; }",
+            "export function f(a, a) {}",
+            "export function f() { with (a) {} }",
+            "export function f() {} function f() {}",
+            "export class C { constructor() {} constructor() {} }",
+            "export class C { #a; #a; }",
+            "export const a;",
+            "export let a, a;",
+            "export let a; let a;",
+            "export var a; let a;",
+            "let a; export var a;",
+            "export default function f() {} let f;",
+            "export default class C {} let C;",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "export function f() { return 1; }",
+            "export class C { constructor() {} }",
+            "export const a = 1;",
+            "export let a, b;",
+            "export var a; var a;",
+            "export default function f() {} let g;",
+            "export default function () {}",
+            "export default class {}",
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
