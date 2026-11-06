@@ -454,6 +454,10 @@ const ERROR_PARTIAL_COPY: i32 = 299;
 /// no file is mapped, as when the file was unmapped after the region was listed.
 #[cfg(target_os = "windows")]
 const ERROR_UNEXP_NET_ERR: i32 = 59;
+/// `ERROR_FILE_INVALID`: what `GetMappedFileNameW` answers for an allocation that
+/// has no file, such as memory that processes share through the page file.
+#[cfg(target_os = "windows")]
+const ERROR_FILE_INVALID: i32 = 1006;
 
 /// How often a walk looks again at a region whose file was unmapped while the walk
 /// asked for its name. A region that still has no file after this is listed without
@@ -514,6 +518,9 @@ enum Backing {
     Anonymous,
     /// No file is mapped at the address any more.
     Unmapped,
+    /// The host did not answer, with this error code. That says nothing about the
+    /// allocation, and a process that is exiting answers this way.
+    Failed(i32),
 }
 
 /// An open process handle, closed on drop.
@@ -619,13 +626,14 @@ impl Process {
             )
         };
         let error = std::io::Error::last_os_error();
-        match written as usize {
-            0 if error.raw_os_error() == Some(ERROR_UNEXP_NET_ERR) => Backing::Unmapped,
-            // A full buffer was cut short, and a cut name names nothing.
-            0 => Backing::Anonymous,
-            length if length < buffer.len() => {
+        match (written as usize, error.raw_os_error()) {
+            (0, Some(ERROR_UNEXP_NET_ERR)) => Backing::Unmapped,
+            (0, Some(ERROR_FILE_INVALID)) => Backing::Anonymous,
+            (0, code) => Backing::Failed(code.unwrap_or_default()),
+            (length, _) if length < buffer.len() => {
                 Backing::File(String::from_utf16_lossy(&buffer[..length]))
             }
+            // A full buffer was cut short, and a cut name names nothing.
             _ => Backing::Anonymous,
         }
     }
@@ -762,6 +770,12 @@ pub(crate) fn process_regions(pid: u32) -> Result<Vec<MemoryRegion>> {
                         continue;
                     }
                     Backing::Unmapped => None,
+                    // A region without a name reads as anonymous code, so an unknown
+                    // name cannot stand in for it.
+                    Backing::Failed(code) => {
+                        let error = std::io::Error::from_raw_os_error(code);
+                        return Err(process.failure(REGION_SOURCE, &error));
+                    }
                 };
                 names.insert(info.allocation_base, name.clone());
                 name
@@ -1551,6 +1565,20 @@ mod tests {
 
             let mut short = vec![0_u16; 4];
             assert_eq!(own.mapped_file(code, &mut short), Backing::Anonymous);
+        }
+
+        #[test]
+        fn a_lookup_in_an_exited_process_does_not_say_that_the_allocation_has_no_file() {
+            let mut child = waiting_child();
+            let gone = Process::open(child.id()).expect("child process");
+            drop(child.stdin.take());
+            child.wait().expect("child exits");
+
+            let mut buffer = vec![0_u16; 1024];
+            assert_eq!(
+                gone.mapped_file(0x1_0000, &mut buffer),
+                Backing::Failed(ERROR_ACCESS_DENIED)
+            );
         }
 
         #[test]
