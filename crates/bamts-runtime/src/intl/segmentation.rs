@@ -33,15 +33,14 @@ fn grapheme_breaks(text: &[Scalar]) -> Vec<usize> {
     let classes = CodePointMapData::<Gcb>::new();
     let pictographic = CodePointSetData::new::<ExtendedPictographic>();
     let mut breaks = Vec::new();
+    // A pictograph and any Extend after it, which one ZWJ can join to the next.
     let mut pictographic_run = false;
     let mut indicators = 0_usize;
     for (index, scalar) in text.iter().enumerate() {
         let class = classes.get(scalar.character);
-        if pictographic.contains(scalar.character) {
-            pictographic_run = true;
-        } else if class != Gcb::Extend && class != Gcb::ZWJ {
-            pictographic_run = false;
-        }
+        let joining_zwj = class == Gcb::ZWJ && pictographic_run;
+        pictographic_run =
+            pictographic.contains(scalar.character) || (pictographic_run && class == Gcb::Extend);
         indicators = if class == Gcb::RegionalIndicator {
             indicators + 1
         } else {
@@ -59,7 +58,7 @@ fn grapheme_breaks(text: &[Scalar]) -> Vec<usize> {
             | (Gcb::LV | Gcb::V, Gcb::V | Gcb::T)
             | (Gcb::LVT | Gcb::T, Gcb::T) => true,
             (_, Gcb::Extend | Gcb::ZWJ | Gcb::SpacingMark) | (Gcb::Prepend, _) => true,
-            (Gcb::ZWJ, _) if pictographic_run && pictographic.contains(next.character) => true,
+            (Gcb::ZWJ, _) if joining_zwj && pictographic.contains(next.character) => true,
             (Gcb::RegionalIndicator, Gcb::RegionalIndicator) => indicators % 2 == 1,
             _ => false,
         };
@@ -358,6 +357,15 @@ mod tests {
             .iter()
             .map(|boundary| boundary.end)
             .collect()
+    }
+
+    #[test]
+    fn one_zwj_after_a_pictograph_joins_the_next_pictograph() {
+        let grapheme = |text| ends(SegmenterGranularity::Grapheme, text);
+        assert_eq!(grapheme("\u{1F468}\u{200D}\u{1F469}"), [5]);
+        assert_eq!(grapheme("\u{1F468}\u{301}\u{200D}\u{1F469}"), [6]);
+        assert_eq!(grapheme("\u{1F468}\u{200D}\u{200D}\u{1F469}"), [4, 6]);
+        assert_eq!(grapheme("\u{1F468}\u{200D}\u{301}\u{1F469}"), [4, 6]);
     }
 
     #[test]
