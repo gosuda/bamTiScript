@@ -87,6 +87,18 @@ fn serving_worker(dir: &Path) -> std::process::Child {
         .expect("serving worker")
 }
 
+/// The stack of the main thread, in the optional header of the image: after the
+/// 4-byte signature and the 20-byte file header, at offset 72 in the PE32+ format.
+#[cfg(target_env = "msvc")]
+#[test]
+fn a_lane_worker_has_the_main_thread_stack_of_unix() {
+    let image = fs::read(WORKER).expect("worker image");
+    let signature = u32::from_le_bytes(image[0x3c..0x40].try_into().expect("four bytes"));
+    let reserve = usize::try_from(signature).expect("an offset") + 4 + 20 + 72;
+    let bytes = image[reserve..reserve + 8].try_into().expect("eight bytes");
+    assert_eq!(u64::from_le_bytes(bytes), 8 * 1024 * 1024);
+}
+
 #[test]
 fn a_serving_worker_answers_each_request_like_a_one_request_worker() {
     let dir = scratch("answers");

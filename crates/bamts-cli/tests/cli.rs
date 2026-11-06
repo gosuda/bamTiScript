@@ -720,6 +720,18 @@ fn aot_deep_recursion_reaches_the_call_depth_limit_before_the_end_of_the_stack()
     );
 }
 
+/// The compiler recurses on the main thread, whose stack `link.exe` sets to 1 MiB
+/// unless the build asks for more. This depth overflowed that stack.
+#[cfg(target_env = "msvc")]
+#[test]
+fn deep_nesting_does_not_overflow_the_stack_of_the_main_thread() {
+    let directory = ScratchDirectory::new();
+    let source = format!("const nested = {}0{};\n", "[".repeat(50), "]".repeat(50));
+    directory.write("nested.ts", &source);
+
+    assert_success(&directory.check("nested.ts"), "bamts check of deep nesting");
+}
+
 #[test]
 fn jit_runs_two_module_program_with_live_imported_mutation() {
     let project = ScratchDirectory::new();

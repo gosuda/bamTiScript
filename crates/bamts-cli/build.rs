@@ -61,6 +61,12 @@ fn main() {
     ));
     cargo_line(&format!("rustc-env=BAMTS_HOST_TARGET={host}"));
     cargo_line(&format!("rustc-env=BAMTS_BUILD_TARGET={target}"));
+    // The compiler recurses on the main thread. Linux and macOS give that thread
+    // 8 MiB and link.exe gives it 1 MiB, on which a nesting depth that the parser
+    // accepts overflows the stack.
+    if env::var_os("CARGO_CFG_TARGET_ENV").is_some_and(|environment| environment == "msvc") {
+        cargo_line("rustc-link-arg-bin=bamts=/STACK:8388608");
+    }
 }
 
 fn wrapper_source() -> &'static str {
