@@ -1648,6 +1648,10 @@ fn parse_offset_minutes(value: &str) -> Result<Option<i32>, DateTimeFormatError>
         return Ok(None);
     };
     let invalid = || DateTimeFormatError::range("timeZone", value);
+    // The lengths below count digits, so a wider character must not reach them.
+    if !body.is_ascii() {
+        return Err(invalid());
+    }
     let (hours, minutes) = match body.len() {
         2 => (body, "00"),
         4 => body.split_at(2),
@@ -2257,7 +2261,7 @@ mod tests {
     fn invalid_zones_and_identifiers_are_range_errors() {
         let provider = FixtureProvider::new();
         let host = FixtureHost;
-        for time_zone in ["Mars/Phobos", "+24:00", "+01:00:01", "+1:00"] {
+        for time_zone in ["Mars/Phobos", "+24:00", "+01:00:01", "+1:00", "+a€", "-€:"] {
             let error =
                 DateTimeFormat::try_new(&[], &options_with_time_zone(time_zone), &provider, &host)
                     .expect_err("invalid zone must fail");
