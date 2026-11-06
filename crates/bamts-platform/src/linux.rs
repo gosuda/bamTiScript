@@ -80,34 +80,39 @@ fn parse_process_maps(text: &str) -> Result<Vec<MemoryRegion>> {
     const SOURCE: &str = "/proc/<pid>/maps";
     text.lines()
         .map(|line| {
-            let mut fields = line.split_whitespace();
-            let range = fields
-                .next()
-                .ok_or_else(|| malformed(SOURCE, "mapping lacks range"))?;
-            let permissions = fields
-                .next()
-                .ok_or_else(|| malformed(SOURCE, "mapping lacks permissions"))?
-                .to_owned();
-            let offset = fields
-                .next()
-                .ok_or_else(|| malformed(SOURCE, "mapping lacks offset"))?;
-            let device = fields
-                .next()
-                .ok_or_else(|| malformed(SOURCE, "mapping lacks device"))?;
-            let inode = fields
-                .next()
-                .ok_or_else(|| malformed(SOURCE, "mapping lacks inode"))?;
-            let pathname = fields.next().map(str::to_owned);
+            let (range, rest) =
+                next_word(line).ok_or_else(|| malformed(SOURCE, "mapping lacks range"))?;
+            let (permissions, rest) =
+                next_word(rest).ok_or_else(|| malformed(SOURCE, "mapping lacks permissions"))?;
+            let (offset, rest) =
+                next_word(rest).ok_or_else(|| malformed(SOURCE, "mapping lacks offset"))?;
+            let (device, rest) =
+                next_word(rest).ok_or_else(|| malformed(SOURCE, "mapping lacks device"))?;
+            let (inode, rest) =
+                next_word(rest).ok_or_else(|| malformed(SOURCE, "mapping lacks inode"))?;
+            // Padding comes before the path, and the path runs to the end of the
+            // line: it can hold spaces, and the kernel marks a removed file with
+            // ` (deleted)`.
+            let pathname = Some(rest.trim_start())
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned);
             Ok(MemoryRegion {
                 identity: format!(
                     "{range} {offset} {device} {inode} {}",
                     pathname.as_deref().unwrap_or("")
                 ),
-                permissions,
+                permissions: permissions.to_owned(),
                 pathname,
             })
         })
         .collect()
+}
+
+/// The first word of `text`, and what follows that word.
+fn next_word(text: &str) -> Option<(&str, &str)> {
+    let text = text.trim_start();
+    let end = text.find(char::is_whitespace).unwrap_or(text.len());
+    (end > 0).then(|| text.split_at(end))
 }
 
 /// Classifies a failed read of a `/proc/<pid>` file. A process reaped before
@@ -730,6 +735,28 @@ mod tests {
         assert_eq!(regions[1].permissions, "rwxp");
         assert_eq!(regions[1].pathname, None);
         assert!(parse_process_maps("55d0c8a00000-55d0c8a21000\n").is_err());
+    }
+
+    #[test]
+    fn a_mapping_keeps_every_word_of_its_path() {
+        let pathname = |path: &str| {
+            let line = format!("55d0c8a00000-55d0c8a21000 r-xp 00000000 fd:01 1048   {path}\n");
+            parse_process_maps(&line).unwrap().remove(0).pathname
+        };
+        for path in [
+            "/usr/bin/cat",
+            "/home/a user/my dir/program",
+            "/tmp/program (deleted)",
+            "/tmp/a b (deleted)",
+            "[heap]",
+        ] {
+            assert_eq!(pathname(path).as_deref(), Some(path));
+        }
+        assert_eq!(pathname(""), None);
+        assert!(
+            parse_process_maps("55d0c8a00000-55d0c8a21000 r-xp 00000000 fd:01\n").is_err(),
+            "a line that stops before the inode is malformed"
+        );
     }
 
     #[test]
