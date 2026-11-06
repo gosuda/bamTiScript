@@ -157,6 +157,9 @@ struct Context {
     /// Inside an async arrow's parameters, through any arrow nested there.
     async_parameters: bool,
     generator: bool,
+    /// An arrow inside a generator. Its parameters keep the rules of the
+    /// generator for `yield`, and its body does not.
+    arrow_in_generator: bool,
     is_async: bool,
     in_parameters: bool,
     /// Inside a class field initializer or static block, where `arguments` is
@@ -1211,6 +1214,7 @@ impl Walker<'_> {
         let inner = Context { strict, ..context };
         let parameter_context = Context {
             in_parameters: true,
+            generator: inner.generator || inner.arrow_in_generator,
             ..inner
         };
         let mut names = Vec::new();
@@ -1704,6 +1708,7 @@ impl Walker<'_> {
             Expression::Arrow(arrow) => {
                 let inner = Context {
                     generator: false,
+                    arrow_in_generator: context.generator,
                     is_async: arrow.is_async,
                     static_block: false,
                     unique_parameters: true,
@@ -2234,6 +2239,39 @@ mod tests {
             "for (f() in {}) ;",
             "[f().x] = [];",
             "({ a: f().x } = {});",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_yield_never_reaches_the_parameters_of_an_arrow() {
+        for source in [
+            "function* g() { (x = yield) => 1; }",
+            "function* g() { (x, y = yield) => 1; }",
+            "function* g() { (x = [yield]) => 1; }",
+            "function* g() { (x = (yield)) => 1; }",
+            "function* g() { (yield) => 1; }",
+            "function* g() { ({ x = yield }) => 1; }",
+            "function* g() { ([x = yield]) => 1; }",
+            "function* g() { (x = { [yield]: 1 }) => 1; }",
+            "function* g() { (x = class { [yield]() {} }) => 1; }",
+            "function* g() { (x = (y = yield) => 1) => 1; }",
+            "function* g() { async (x = yield) => 1; }",
+            "async function* g() { (x = yield) => 1; }",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "function* g() { (x = yield); }",
+            "function* g() { function h(x = yield) {} }",
+            "function* g() { (x = function () { yield; }) => 1; }",
+            "function* g() { (x = function* () { yield; }) => 1; }",
+            "function* g() { () => { yield; }; }",
+            "function* g() { () => { var yield; }; }",
+            "function* g() { (x = () => { yield; }) => 1; }",
+            "function* g() { (x) => yield; }",
+            "(x = yield) => 1;",
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
