@@ -153,6 +153,9 @@ fn observe_from_workspace(
     }
 }
 
+/// Writes the response under a temporary name and renames it, so the parent never
+/// reads half of one. It is not synced: the parent reads it from the page cache of
+/// this host, and a power failure ends the run that needs it.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -182,16 +185,10 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes).map_err(|error| {
             VerificationError::new(ErrorCode::Io, format!("{}: {error}", temporary.display()))
         })?;
-        file.sync_all().map_err(|error| {
-            VerificationError::new(ErrorCode::Io, format!("{}: {error}", temporary.display()))
-        })?;
+        drop(file);
         fs::rename(&temporary, path).map_err(|error| {
             VerificationError::new(ErrorCode::Io, format!("{}: {error}", path.display()))
-        })?;
-        if let Ok(directory) = fs::File::open(parent) {
-            let _ = directory.sync_all();
-        }
-        Ok(())
+        })
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);

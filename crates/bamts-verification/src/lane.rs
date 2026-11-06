@@ -539,6 +539,9 @@ impl ProcessExecutor {
 
 /// Writes `request` where its worker reads it, and returns the request and the
 /// response paths. A response that an earlier run left behind is refused.
+///
+/// The file is not synced: the worker runs on this host and reads it from the page
+/// cache, and a power failure ends the run that needs it.
 fn write_request_file(work_dir: &Path, request: &LaneRequest) -> Result<(PathBuf, PathBuf)> {
     request.validate()?;
     fs::create_dir_all(work_dir).map_err(|error| {
@@ -578,12 +581,6 @@ fn write_request_file(work_dir: &Path, request: &LaneRequest) -> Result<(PathBuf
             )
         })?;
     request_file.write_all(&encoded).map_err(|error| {
-        VerificationError::new(
-            ErrorCode::Io,
-            format!("{}: {error}", request_path.display()),
-        )
-    })?;
-    request_file.sync_all().map_err(|error| {
         VerificationError::new(
             ErrorCode::Io,
             format!("{}: {error}", request_path.display()),
