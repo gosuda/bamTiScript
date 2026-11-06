@@ -1,7 +1,7 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 host_triple := `rustc -vV | awk '/^host:/{print $2}'`
-export PATH := env_var('HOME') + "/.nvm/versions/node/v24.18.0/bin:/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/llvm/bin:" + env_var('PATH')
+export PATH := env_var_or_default('HOME', '') + "/.nvm/versions/node/v24.18.0/bin:/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/llvm/bin:" + env_var('PATH')
 
 doctor:
     [[ "$(node -v)" == "v24.18.0" ]]
