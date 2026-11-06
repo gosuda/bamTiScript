@@ -10,7 +10,7 @@ use std::{
 };
 
 use bamts_verification::{
-    evidence::WorkingDirectoryPolicy,
+    evidence::{TerminalState, WorkingDirectoryPolicy},
     facets::DIAGNOSTIC_CODE_MAP_PATH,
     lane::{
         LANE_WORKER_DONE, LANE_WORKER_READY, LANE_WORKER_REQUEST, LANE_WORKER_SERVE, LaneBinding,
@@ -59,19 +59,41 @@ fn unbound_request(request_id: u64) -> LaneRequest {
     .expect("request")
 }
 
-/// A one-case compiler snapshot where a worker that runs in `dir` looks for one.
+/// The name, the source and the lines of the `.types` baseline of each case. The
+/// cases share the name `x`: a compile that keeps a declaration of the compile before
+/// it sees a conflict, or the wrong type, and the last case declares no `x` at all.
+const CASES: [(&str, &str, &str); 3] = [
+    ("scalarPin", "var x: any;\n", ">x : any\n>  : ^^^\n"),
+    (
+        "stringPin",
+        "var x: string;\n",
+        ">x : string\n>  : ^^^^^^\n",
+    ),
+    (
+        "unresolvedPin",
+        "var y = x;\n",
+        ">y : any\n>  : ^^^\n>x : any\n>  : ^^^\n",
+    ),
+];
+
+/// A compiler snapshot of [`CASES`] where a worker that runs in `dir` looks for one.
 fn write_snapshot(dir: &Path) -> PathBuf {
     let extracted = dir.join("extracted");
-    let case = extracted.join("tests/cases/compiler/scalarPin.ts");
-    fs::create_dir_all(case.parent().expect("case directory")).expect("case directory");
-    fs::write(&case, "var x: any;\n").expect("case");
-    let baseline = extracted.join("tests/baselines/reference/scalarPin.types");
-    fs::create_dir_all(baseline.parent().expect("baseline directory")).expect("baseline directory");
-    fs::write(
-        &baseline,
-        "//// [tests/cases/compiler/scalarPin.ts] ////\n\n=== scalarPin.ts ===\nvar x: any;\n>x : any\n>  : ^^^\n\n",
-    )
-    .expect("baseline");
+    for (name, source, types) in CASES {
+        let case = extracted.join(format!("tests/cases/compiler/{name}.ts"));
+        fs::create_dir_all(case.parent().expect("case directory")).expect("case directory");
+        fs::write(&case, source).expect("case");
+        let baseline = extracted.join(format!("tests/baselines/reference/{name}.types"));
+        fs::create_dir_all(baseline.parent().expect("baseline directory"))
+            .expect("baseline directory");
+        fs::write(
+            &baseline,
+            format!(
+                "//// [tests/cases/compiler/{name}.ts] ////\n\n=== {name}.ts ===\n{source}{types}\n"
+            ),
+        )
+        .expect("baseline");
+    }
     fs::write(extracted.join("LICENSE"), b"Apache-2.0\n").expect("license");
     let root = dir.join(DEFAULT_SNAPSHOT_REL);
     fs::create_dir_all(&root).expect("snapshot root");
@@ -101,12 +123,16 @@ fn bind_snapshot(root: &Path, run_id: &str) -> LaneBinding {
 }
 
 fn bound_request(binding: &LaneBinding, request_id: u64) -> LaneRequest {
+    case_request(binding, CASES[0].0, request_id)
+}
+
+fn case_request(binding: &LaneBinding, name: &str, request_id: u64) -> LaneRequest {
     LaneRequest::new(
         binding.clone(),
         request_id,
         ObligationKey::new(
             CATALOG,
-            "compiler/tests/cases/compiler/scalarPin.ts",
+            format!("compiler/tests/cases/compiler/{name}.ts"),
             "default#types",
             ExecutionMode::Aot,
             "x86_64-unknown-linux-gnu",
@@ -255,7 +281,15 @@ fn a_serving_worker_keeps_the_snapshot_of_a_binding_until_the_binding_changes() 
 #[test]
 fn the_serving_executor_records_the_rows_of_one_worker_per_request() {
     let dir = scratch("executors");
-    let requests: Vec<LaneRequest> = (1..=3).map(unbound_request).collect();
+    let root = write_snapshot(&dir);
+    let binding = bind_snapshot(&root, RUN_ID);
+    // Each case runs right after each other case, because a compile that leaks
+    // leaks into the compile after it.
+    let order = [0, 1, 2, 0, 2, 1, 0];
+    let requests: Vec<LaneRequest> = (1_u64..)
+        .zip(order)
+        .map(|(request_id, case)| case_request(&binding, CASES[case].0, request_id))
+        .collect();
     let mut one_per_request = ProcessExecutor::new(WORKER, Vec::new(), &dir, dir.join("one"));
     let expected = run_lane(&mut one_per_request, &requests).expect("one worker per request");
     let mut serving = ServingExecutor::new(WORKER, Vec::new(), &dir, dir.join("serving"));
@@ -271,6 +305,15 @@ fn the_serving_executor_records_the_rows_of_one_worker_per_request() {
         assert_eq!(served.artifacts(), expected.artifacts());
         assert_eq!(served.detail(), expected.detail());
     }
+    // An equal row proves nothing if it is a failure, or if every case gives the same row.
+    assert!(
+        expected
+            .iter()
+            .all(|row| row.state() == TerminalState::Pass),
+        "{expected:#?}"
+    );
+    let answers: BTreeSet<_> = expected.iter().map(|row| row.artifacts()).collect();
+    assert_eq!(answers.len(), CASES.len(), "{expected:#?}");
 }
 
 #[test]
