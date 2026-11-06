@@ -19,9 +19,10 @@ use crate::{
         AssignmentTarget, AssignmentTargetNode, BinaryOperator, BindingPattern, BlockNode,
         CallArgument, ClassDeclaration, ClassMember, ExportDeclaration, ExportDefaultValue,
         ExportNamedDeclaration, Expr, Expression, ForBinding, ForInitializer, FunctionBody,
-        FunctionLike, IdentifierNode, Literal, LogicalOperator, MemberProperty, MetaProperty,
-        ObjectMember, ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier,
-        PropertyName, SourceFile, Statement, Stmt, Token, TokenKind, UnaryOperator, VariableKind,
+        FunctionLike, IdentifierNode, ImportBinding, ImportDeclaration, ImportSpecifierMode,
+        Literal, LogicalOperator, MemberProperty, MetaProperty, ObjectMember, ParameterNode,
+        Pattern, PrivateIdentifierNode, PropertyModifier, PropertyName, SourceFile, Statement,
+        Stmt, Token, TokenKind, UnaryOperator, VariableKind,
     },
 };
 
@@ -662,6 +663,7 @@ impl Walker<'_> {
                 Statement::Function(function) if functions_are_lexical => {
                     self.function_name(&function.function, &mut lexical);
                 }
+                Statement::Import(import) => self.import_names(import, &mut lexical),
                 Statement::Export(ExportDeclaration::Default(default)) => match &default.value {
                     ExportDefaultValue::Function(function) => {
                         self.function_name(function, &mut lexical);
@@ -673,6 +675,30 @@ impl Walker<'_> {
             }
         }
         lexical
+    }
+
+    /// The names an import binds in the module. A type-only import binds no value.
+    fn import_names(&self, import: &ImportDeclaration, lexical: &mut Vec<Lexical>) {
+        let Some(clause) = import.clause.as_ref().filter(|_| !import.type_only) else {
+            return;
+        };
+        let (namespace, specifiers) = match &clause.binding {
+            Some(ImportBinding::Namespace(local)) => (Some(local), &[][..]),
+            Some(ImportBinding::Named(specifiers)) => (None, specifiers.as_slice()),
+            None => (None, &[][..]),
+        };
+        let named = specifiers
+            .iter()
+            .map(|specifier| specifier.data())
+            .filter(|specifier| specifier.mode == ImportSpecifierMode::Value)
+            .map(|specifier| &specifier.local);
+        for local in clause.default.iter().chain(namespace).chain(named) {
+            lexical.push(Lexical {
+                name: self.name(local),
+                range: local.range(),
+                plain_function: false,
+            });
+        }
     }
 
     fn class_name(&self, class: &ClassDeclaration, lexical: &mut Vec<Lexical>) {
@@ -2138,6 +2164,37 @@ mod tests {
             "export default function f() {} let g;",
             "export default function () {}",
             "export default class {}",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    #[test]
+    fn an_import_binds_a_lexical_name_of_the_module() {
+        for source in [
+            "import a from 'x'; let a;",
+            "import { a } from 'x'; function a() {}",
+            "import * as a from 'x'; var a;",
+            "import a from 'x'; class a {}",
+            "import a from 'x'; import a from 'y';",
+            "import { a, a } from 'x';",
+            "import { b as a, c as a } from 'x';",
+            "import { default as a } from 'x'; let a;",
+            "import a, { a } from 'x';",
+            "import a, * as a from 'x';",
+            "import a from 'x'; { var a; }",
+            "let a; import a from 'x';",
+            "var a; import a from 'x';",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "import a from 'x'; { let a; }",
+            "import a from 'x'; function f() { let a; }",
+            "import { a as b } from 'x'; let a;",
+            "import 'x'; let a;",
+            "import type a from 'x'; let a;",
+            "import { type a } from 'x'; let a;",
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
