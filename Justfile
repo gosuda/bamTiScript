@@ -43,8 +43,8 @@ ci-npm-release:
 ci-corpus:
     cargo test -p bamts-verification --test corpus_differential --locked -- --nocapture
 
-# The cache ownership and publication tests that the CI job "Windows native boundary"
-# runs. `cargo test --workspace` leaves the cache-guard feature off, so on a Windows host
+# The cache ownership and publication tests, which the CI job "Windows native boundary"
+# also runs. `cargo test --workspace` leaves the cache-guard feature off, so on a Windows host
 # ci-quality never builds the Win32 module or its tests. On other hosts the feature
 # compiles only the portable part of the module, which has no tests of its own.
 ci-native-boundary:

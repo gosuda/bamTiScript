@@ -22,7 +22,7 @@ jobs:
   windows-native:
     name: Windows native boundary
     runs-on: windows-2025
-    timeout-minutes: 15
+    timeout-minutes: 60
     defaults:
       run:
         shell: pwsh
@@ -31,14 +31,31 @@ jobs:
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
       - name: Install pinned Rust toolchain
         run: |
           $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          rustup toolchain install $toolchain --profile minimal
+          rustup toolchain install $toolchain --profile minimal --component clippy
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default $toolchain
       - name: Test Windows cache ownership and publication
         run: cargo test --locked -p bamts-native --features cache-guard
+      # Every other job runs on Linux, where the Win32 backend, the Microsoft
+      # linker driver and the stack size of a linked image are not compiled.
+      - name: Lint the Windows platform backend and linker driver
+        run: cargo clippy --locked -p bamts-platform -p bamts-cli --all-targets -- -D warnings
+      - name: Test the Windows platform backend
+        run: cargo test --locked -p bamts-platform
+      - name: Test the Microsoft linker driver
+        run: cargo test --locked -p bamts-cli --lib windows_link
+      - name: Test linked native executables
+        run: cargo test --locked -p bamts-cli --test cli -- aot_ deep_nesting a_file_in_the_project_named_like_a_system_library_is_not_linked
+      - name: Test the lane workers
+        run: cargo test --locked -p bamts-verification --test lane_serving
 
   quality:
     name: Quality
