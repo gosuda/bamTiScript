@@ -1497,7 +1497,7 @@ impl Walker<'_> {
                     if let PropertyName::Computed(key) = &property.name {
                         self.expression(key, context);
                     }
-                    self.target(&property.target, true, context);
+                    self.pattern_target(&property.target, context);
                     if let Some(initializer) = &property.initializer {
                         self.expression(initializer, context);
                     }
@@ -1523,7 +1523,7 @@ impl Walker<'_> {
                                     "a rest element cannot have an initializer",
                                 );
                             }
-                            self.target(element, true, context);
+                            self.pattern_target(element, context);
                         }
                         AssignmentArrayElement::Elision | AssignmentArrayElement::Missing(_) => {}
                     }
@@ -1551,11 +1551,23 @@ impl Walker<'_> {
             && let Expression::Assignment(assignment) = expression.data()
             && assignment.operator == AssignmentOperator::Assign
         {
-            self.target(&assignment.left, true, context);
+            self.pattern_target(&assignment.left, context);
             self.expression(&assignment.right, context);
         } else {
-            self.target(element, true, context);
+            self.pattern_target(element, context);
         }
+    }
+
+    /// A target inside a pattern. Annex B covers `f() = 1` alone, so a call here
+    /// is an early error in sloppy code too.
+    fn pattern_target(&mut self, target: &AssignmentTargetNode, context: Context) {
+        if !context.strict
+            && let AssignmentTarget::Invalid(expression) = target.data()
+            && matches!(expression.data(), Expression::Call(_))
+        {
+            self.error(target.range(), "this cannot be assigned to");
+        }
+        self.target(target, true, context);
     }
 
     fn member(&mut self, object: &Expr, property: &MemberProperty, context: Context) {
@@ -2195,6 +2207,33 @@ mod tests {
             "import 'x'; let a;",
             "import type a from 'x'; let a;",
             "import { type a } from 'x'; let a;",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_call_is_never_a_target_inside_a_pattern() {
+        for source in [
+            "[f()] = [];",
+            "[...f()] = [];",
+            "[f() = 1] = [];",
+            "[(f())] = [];",
+            "({ a: (f()) } = {});",
+            "({ a: f() } = {});",
+            "({ a: f() = 1 } = {});",
+            "for ([f()] of []) ;",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "f() = 1;",
+            "(f()) = 1;",
+            "f()++;",
+            "for (f() of []) ;",
+            "for (f() in {}) ;",
+            "[f().x] = [];",
+            "({ a: f().x } = {});",
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
