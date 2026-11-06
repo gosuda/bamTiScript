@@ -441,8 +441,8 @@ pub struct PluralOperands {
     pub fraction_digits: String,
     /// Visible fraction digits after removing trailing zeros.
     pub fraction_digits_without_trailing_zeros: String,
-    pub visible_fraction_digits: u8,
-    pub visible_fraction_digits_without_trailing_zeros: u8,
+    pub visible_fraction_digits: usize,
+    pub visible_fraction_digits_without_trailing_zeros: usize,
     /// Compact decimal exponent (`e`/`c` in CLDR operands).
     pub exponent: i32,
 }
@@ -2120,10 +2120,8 @@ fn operands_from_ascii(ascii: &str, exponent: i32) -> PluralOperands {
         integer_digits,
         fraction_digits: fraction.to_owned(),
         fraction_digits_without_trailing_zeros: without_trailing.clone(),
-        visible_fraction_digits: u8::try_from(fraction.len())
-            .expect("fraction option is at most 100"),
-        visible_fraction_digits_without_trailing_zeros: u8::try_from(without_trailing.len())
-            .expect("fraction option is at most 100"),
+        visible_fraction_digits: fraction.len(),
+        visible_fraction_digits_without_trailing_zeros: without_trailing.len(),
         exponent,
     }
 }
@@ -3139,6 +3137,19 @@ mod tests {
         .err()
         .expect("NaN digits");
         assert_eq!(nan_digits.kind, NumberFormatErrorKind::RangeError);
+    }
+
+    #[test]
+    fn a_fraction_of_any_length_has_plural_operands() {
+        let significant = formatter(NumberFormatOptions {
+            maximum_significant_digits: Some(3.0),
+            ..NumberFormatOptions::default()
+        })
+        .expect("significant");
+        assert_eq!(
+            significant.format_number(1e-300).expect("a Number"),
+            format!("0.{}1", "0".repeat(299))
+        );
     }
 
     #[test]
