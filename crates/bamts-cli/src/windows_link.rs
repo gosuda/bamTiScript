@@ -151,12 +151,17 @@ fn variable(context: &crate::context::ExecutionContext, name: &str) -> Option<Os
 /// Whether the `LIB` of the context can serve an x64 link. A Visual Studio command
 /// prompt names the architecture that it set `LIB` up for in `VSCMD_ARG_TGT_ARCH`,
 /// and the default prompt is for x86, whose libraries an x64 link cannot use. A
-/// `LIB` that nothing marks for another architecture is taken as meant for x64. An
-/// empty `LIB` names no directory, so it counts as no `LIB`.
+/// `LIB` that nothing marks for another architecture is taken as meant for x64. A
+/// `LIB` of only separators names no directory, so it counts as no `LIB`.
 fn context_library_path_fits(context: &crate::context::ExecutionContext) -> bool {
-    variable(context, "LIB").is_some_and(|directories| !directories.is_empty())
-        && variable(context, "VSCMD_ARG_TGT_ARCH")
-            .is_none_or(|architecture| architecture.eq_ignore_ascii_case("x64"))
+    variable(context, "LIB").is_some_and(|directories| {
+        // `split_paths` would split on `:` on Unix, where this function is tested too.
+        directories
+            .to_string_lossy()
+            .split(';')
+            .any(|directory| !directory.trim().is_empty())
+    }) && variable(context, "VSCMD_ARG_TGT_ARCH")
+        .is_none_or(|architecture| architecture.eq_ignore_ascii_case("x64"))
 }
 
 /// The linker and everything it needs to run.
@@ -710,12 +715,15 @@ mod tests {
     #[test]
     fn only_a_library_path_for_x64_is_kept() {
         let fits = |variables: &[(&str, &str)]| context_library_path_fits(&context_with(variables));
-        // With no LIB there is nothing to keep, and an empty LIB is no LIB.
+        // With no LIB there is nothing to keep, and a LIB of no directories is no LIB.
         assert!(!fits(&[]));
         assert!(!fits(&[("VSCMD_ARG_TGT_ARCH", "x64")]));
-        assert!(!fits(&[("LIB", "")]));
+        for empty in ["", ";", ";;", " ; "] {
+            assert!(!fits(&[("LIB", empty)]), "{empty:?}");
+        }
         // A LIB that nothing marks for another architecture is kept.
         assert!(fits(&[("LIB", r"C:\my\libs")]));
+        assert!(fits(&[("LIB", r";C:\my\libs;")]));
         assert!(fits(&[
             ("Lib", r"C:\VS\lib\x64"),
             ("VSCMD_ARG_TGT_ARCH", "x64")
