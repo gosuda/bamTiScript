@@ -529,7 +529,7 @@ impl Walker<'_> {
                         self.expression(key, context);
                     }
                     if let BindingPattern::Rest(rest) = property.binding.data() {
-                        if position != last {
+                        if position != last || self.comma_follows(property.binding.range()) {
                             self.error(property.binding.range(), "a rest property must come last");
                         }
                         if !matches!(rest.argument.data(), BindingPattern::Identifier(_)) {
@@ -1484,7 +1484,9 @@ impl Walker<'_> {
                 }
                 let last = object.properties.len().saturating_sub(1);
                 for (position, property) in object.properties.iter().enumerate() {
-                    if property.rest && position != last {
+                    if property.rest
+                        && (position != last || self.comma_follows(property.target.range()))
+                    {
                         self.error(property.target.range(), "a rest property must come last");
                     }
                     if property.rest
@@ -2141,6 +2143,11 @@ mod tests {
             "({ ...[a] } = b);",
             "({ get a() {} } = b);",
             "[{ m() {} }] = a;",
+            "var { ...a, } = b;",
+            "let { c, ...a, } = b;",
+            "function f({ ...a, }) {}",
+            "({ ...a, }) => 1;",
+            "({ ...a, } = b);",
         ] {
             assert!(!errors(source).is_empty(), "{source} must be rejected");
         }
@@ -2148,6 +2155,10 @@ mod tests {
             "({ a, ...b } = c);",
             "({ ...a.b } = c);",
             "({ ...a[0] } = c);",
+            "var { ...a } = b;",
+            "var { a, } = b;",
+            "({ a, } = b);",
+            "({ ...a, });",
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
