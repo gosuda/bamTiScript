@@ -384,6 +384,14 @@ mod ffi {
         pub(super) fn WaitForSingleObject(object: Handle, milliseconds: u32) -> u32;
         pub(super) fn GetCurrentProcess() -> Handle;
         pub(super) fn GetLogicalDrives() -> u32;
+        pub(super) fn MultiByteToWideChar(
+            code_page: u32,
+            flags: u32,
+            text: *const u8,
+            text_length: i32,
+            buffer: *mut u16,
+            buffer_length: i32,
+        ) -> i32;
         pub(super) fn VirtualQueryEx(
             process: Handle,
             address: *const c_void,
@@ -688,6 +696,46 @@ fn counters_of(
 #[cfg(target_os = "windows")]
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// `CP_OEMCP`: the OEM code page of the system.
+#[cfg(target_os = "windows")]
+const CP_OEMCP: u32 = 1;
+
+/// Decodes `bytes` in the OEM code page, or `None` when the host fails to.
+#[cfg(target_os = "windows")]
+fn oem_text(bytes: &[u8]) -> Option<String> {
+    let length = i32::try_from(bytes.len()).ok()?;
+    // SAFETY: `bytes` is live for `length` bytes. A null buffer of length zero only
+    // asks for the size.
+    #[allow(unsafe_code)]
+    let needed = unsafe {
+        ffi::MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), length, std::ptr::null_mut(), 0)
+    };
+    let mut units = vec![0_u16; usize::try_from(needed).ok()?];
+    // SAFETY: `bytes` is live for `length` bytes, and `units` is live and writable
+    // for `needed` UTF-16 units, the size the host is told.
+    #[allow(unsafe_code)]
+    let written = unsafe {
+        ffi::MultiByteToWideChar(
+            CP_OEMCP,
+            0,
+            bytes.as_ptr(),
+            length,
+            units.as_mut_ptr(),
+            needed,
+        )
+    };
+    units.truncate(usize::try_from(written).ok()?);
+    (written > 0).then(|| String::from_utf16_lossy(&units))
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn console_tool_text(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes).map_or_else(
+        |_| oem_text(bytes).unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
+        str::to_owned,
+    )
 }
 
 /// Maps each drive letter to its NT device, so a mapped file name can be shown as
@@ -1565,6 +1613,19 @@ mod tests {
 
             let mut short = vec![0_u16; 4];
             assert_eq!(own.mapped_file(code, &mut short), Backing::Anonymous);
+        }
+
+        #[test]
+        fn the_text_of_a_console_tool_is_decoded_in_the_oem_code_page() {
+            assert_eq!(console_tool_text(b""), "");
+            assert_eq!(console_tool_text(b"LNK1181"), "LNK1181");
+            assert_eq!(console_tool_text("한글".as_bytes()), "한글");
+
+            // This is "한글" in code page 949. It is not UTF-8, so it is decoded in the
+            // code page of the host, whose characters differ from host to host.
+            let decoded = console_tool_text(&[0xc7, 0xd1, 0xb1, 0xdb]);
+            assert!(!decoded.is_empty());
+            assert!(!decoded.contains(char::REPLACEMENT_CHARACTER), "{decoded}");
         }
 
         #[test]

@@ -1066,6 +1066,7 @@ fn expected_internal_graph() -> InternalGraph {
                 internal_dependency(false, &["node-host"]),
             ),
             ("bamts-compiler".to_owned(), internal_dependency(false, &[])),
+            ("bamts-platform".to_owned(), internal_dependency(false, &[])),
             ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
             (
                 "bamts-codegen".to_owned(),

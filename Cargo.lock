@@ -94,6 +94,7 @@ dependencies = [
  "bamts-codegen",
  "bamts-compiler",
  "bamts-node",
+ "bamts-platform",
  "bamts-runtime",
  "rustix",
  "serde",

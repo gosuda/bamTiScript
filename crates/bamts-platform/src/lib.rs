@@ -433,6 +433,23 @@ impl PeakWindow {
     }
 }
 
+/// Decodes what a console tool wrote to a pipe.
+///
+/// On Windows a tool such as `link.exe` writes in the OEM code page of the system,
+/// so a path that is not ASCII is not UTF-8. Text that is valid UTF-8 stays as it
+/// is. Other hosts write UTF-8, and what is not valid there is replaced.
+#[must_use]
+pub fn console_tool_text(bytes: &[u8]) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        windows::console_tool_text(bytes)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
 /// The Rust target triple of this host, in the form receipts record.
 #[must_use]
 pub fn host_triple() -> String {

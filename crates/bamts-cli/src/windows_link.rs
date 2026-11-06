@@ -164,8 +164,8 @@ impl Linker {
     /// The text to show when the link failed.
     pub(crate) fn diagnostics(&self, output: &std::process::Output) -> String {
         link_diagnostics(
-            &String::from_utf8_lossy(&output.stdout),
-            &String::from_utf8_lossy(&output.stderr),
+            &bamts_platform::console_tool_text(&output.stdout),
+            &bamts_platform::console_tool_text(&output.stderr),
         )
     }
 
