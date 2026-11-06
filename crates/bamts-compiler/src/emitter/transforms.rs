@@ -3172,11 +3172,11 @@ impl<'a> Rewriter<'a> {
         assignment: &AssignmentExpression,
     ) -> Vec<Stmt> {
         let mut statements = Vec::new();
-        let value = if matches!(assignment.right.data(), Expression::Identifier(_)) {
-            (*assignment.right).clone()
+        let right = self.rewrite_expr(&assignment.right);
+        let value = if matches!(right.data(), Expression::Identifier(_)) {
+            right
         } else {
             let temp = self.temp_ident();
-            let right = self.rewrite_expr(&assignment.right);
             statements.push(self.make_temp_declaration(temp.clone(), right, range));
             self.node(temp.range(), Expression::Identifier(temp))
         };
@@ -3193,12 +3193,17 @@ impl<'a> Rewriter<'a> {
     ) {
         match target.data() {
             AssignmentTarget::Identifier(_) | AssignmentTarget::Member(_) => {
+                let published = self.live_exports_of(target).pop();
                 let assignment = Expression::Assignment(AssignmentExpression {
                     operator: AssignmentOperator::Assign,
-                    left: target.clone(),
+                    left: self.rewrite_assignment_target(target),
                     right: Box::new(value.clone()),
                 });
                 let expression = self.node(target.range(), assignment);
+                let expression = match published {
+                    Some((_, names)) => self.cjs_assign_exports(&names, expression, target.range()),
+                    None => expression,
+                };
                 statements.push(self.node(
                     target.range(),
                     Statement::Expression(ExpressionStatement {
@@ -7647,19 +7652,43 @@ impl<'a> Rewriter<'a> {
         self.node(member.range(), rewritten)
     }
 
+    /// The object that holds an identifier target when no local does: `exports`
+    /// for an exported variable, or a namespace's parameter for its member.
+    fn identifier_target_owner(
+        &self,
+        target: &AssignmentTargetNode,
+        identifier: &IdentifierNode,
+    ) -> Option<String> {
+        self.namespace_member_parameter(target.id())
+            .or_else(|| self.namespace_member_parameter(identifier.id()))
+            .or_else(|| {
+                self.cjs_reads_exported_variable(identifier.id())
+                    .then(|| "exports".to_owned())
+            })
+    }
+
+    /// A read of what an identifier target writes, for a lowering that reads the
+    /// target too. A copy of the identifier would name a local that may not exist.
+    fn read_of_identifier_target(
+        &mut self,
+        target: &AssignmentTargetNode,
+        identifier: &IdentifierNode,
+    ) -> Expr {
+        let range = identifier.range();
+        let owner = self.identifier_target_owner(target, identifier);
+        match (owner, self.identifier_name(identifier)) {
+            (Some(owner), Some(name)) => self.namespace_member(&owner, &name, range),
+            _ => self.node(range, Expression::Identifier(identifier.clone())),
+        }
+    }
+
     /// An assignment target with its nested expressions rewritten. A member
     /// target is how a suspending target reaches the machine as a visible
     /// refusal instead of a live `await` in ES5 output.
     fn rewrite_assignment_target(&mut self, target: &AssignmentTargetNode) -> AssignmentTargetNode {
         let rewritten = match target.data() {
             AssignmentTarget::Identifier(ident) => {
-                let parameter = self
-                    .namespace_member_parameter(target.id())
-                    .or_else(|| self.namespace_member_parameter(ident.id()))
-                    .or_else(|| {
-                        self.cjs_reads_exported_variable(ident.id())
-                            .then(|| "exports".to_owned())
-                    });
+                let parameter = self.identifier_target_owner(target, ident);
                 let (Some(parameter), Some(name)) = (parameter, self.identifier_name(ident)) else {
                     return target.clone();
                 };
@@ -7872,19 +7901,14 @@ impl<'a> Rewriter<'a> {
         let right = self.rewrite_expr(&assignment.right);
         match assignment.left.data() {
             AssignmentTarget::Identifier(identifier) => {
-                let read = self.node(
-                    identifier.range(),
-                    Expression::Identifier(identifier.clone()),
-                );
-                let plain_read = self.node(
-                    identifier.range(),
-                    Expression::Identifier(identifier.clone()),
-                );
+                let read = self.read_of_identifier_target(&assignment.left, identifier);
+                let plain_read = self.read_of_identifier_target(&assignment.left, identifier);
+                let left = self.rewrite_assignment_target(&assignment.left);
                 let inner_assign = self.node(
                     range,
                     Expression::Assignment(AssignmentExpression {
                         operator: AssignmentOperator::Assign,
-                        left: assignment.left.clone(),
+                        left,
                         right: Box::new(right),
                     }),
                 );
@@ -8197,13 +8221,11 @@ impl<'a> Rewriter<'a> {
         let right = self.rewrite_expr(&assignment.right);
         match assignment.left.data() {
             AssignmentTarget::Identifier(identifier) => {
-                let read = self.node(
-                    identifier.range(),
-                    Expression::Identifier(identifier.clone()),
-                );
+                let read = self.read_of_identifier_target(&assignment.left, identifier);
+                let left = self.rewrite_assignment_target(&assignment.left);
                 let lowered = Expression::Assignment(AssignmentExpression {
                     operator: AssignmentOperator::Assign,
-                    left: assignment.left.clone(),
+                    left,
                     right: Box::new(self.math_pow(read, right, expression.range())),
                 });
                 self.node(expression.range(), lowered)
@@ -13542,5 +13564,122 @@ console.log(JSON.stringify([bar, bar4, log]));
             javascript(&native).contains("names?.filter(f)"),
             "{native:?}"
         );
+    }
+
+    fn commonjs_at(source: &str, target: ScriptTarget) -> String {
+        let output = emit_with_options(
+            source,
+            EmitOptions {
+                target,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        javascript(&output).to_owned()
+    }
+
+    #[test]
+    fn a_lowered_write_to_an_exported_variable_goes_to_exports() {
+        // A variable exported where it is declared has no local: upstream's module
+        // transform runs after these lowerings and rewrites what they produce.
+        for (source, lowered) in [
+            ("a ||= 1;", "exports.a || (exports.a = 1);"),
+            ("a &&= 1;", "exports.a && (exports.a = 1);"),
+            (
+                "a ??= 1;",
+                "exports.a !== null && exports.a !== void 0 ? exports.a : (exports.a = 1);",
+            ),
+            ("a **= 2;", "exports.a = Math.pow(exports.a, 2);"),
+        ] {
+            let code = commonjs_at(
+                &format!("export var a: any = 0;\n{source}\n"),
+                ScriptTarget::Es5,
+            );
+            assert!(code.contains(lowered), "{code}");
+        }
+    }
+
+    #[test]
+    fn lowered_destructuring_writes_an_exported_variable_through_exports() {
+        let code = commonjs_at(
+            "export var a: any = 0;\nvar o: any = {};\nexport var s: any = [1];\n[a] = [2];\n({ a } = { a: 3 });\n[o.x] = [4];\n[o.y] = s;\n",
+            ScriptTarget::Es5,
+        );
+        assert!(!code.contains("\na = "), "{code}");
+        assert!(code.contains("exports.a = _"), "{code}");
+        assert!(!code.contains("= s;"), "{code}");
+    }
+
+    #[test]
+    fn lowered_destructuring_publishes_a_local_exported_by_a_specifier() {
+        let code = commonjs_at(
+            "var a: any = 0;\nexport { a, a as b };\n[a] = [2];\n",
+            ScriptTarget::Es5,
+        );
+        assert!(code.contains("exports.b = exports.a = a = _"), "{code}");
+    }
+
+    #[test]
+    fn a_lowered_write_to_a_namespace_member_goes_to_the_namespace() {
+        let code = commonjs_at(
+            "export namespace N {\n    export var a: any = 0;\n    a ||= 1;\n    a **= 2;\n}\n",
+            ScriptTarget::Es5,
+        );
+        assert!(code.contains("N.a || (N.a = 1);"), "{code}");
+        assert!(code.contains("N.a = Math.pow(N.a, 2);"), "{code}");
+    }
+
+    #[test]
+    fn node_executes_lowered_writes_to_exported_variables() {
+        let source = r#"
+export var a: any = 0;
+export let b: any = 1;
+var c: any = 0;
+export { c };
+export var s: any = [20, 21];
+var o: any = {};
+export { o };
+a ||= 5;
+b &&= 6;
+c ??= 7;
+a **= 2;
+[b] = [8];
+({ c } = { c: 9 });
+var d: any;
+[d, o.e] = s;
+"#;
+        for target in [
+            ScriptTarget::Es5,
+            ScriptTarget::Es2015,
+            ScriptTarget::Es2020,
+        ] {
+            let code = commonjs_at(source, target);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("bamts-cjs-{nonce}.cjs"));
+            let runner = format!(
+                "{code}\nconsole.log(JSON.stringify([exports.a, exports.b, exports.c, exports.o, d]));\n"
+            );
+            std::fs::write(&path, runner).expect("write lowered JavaScript");
+            let result = std::process::Command::new("node")
+                .arg(&path)
+                .output()
+                .expect("execute Node");
+            let _ = std::fs::remove_file(&path);
+            assert!(
+                result.status.success(),
+                "{}\n{code}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(result.stdout)
+                    .expect("Node stdout")
+                    .trim(),
+                r#"[25,8,9,{"e":21},20]"#,
+                "{code}"
+            );
+        }
     }
 }
