@@ -355,7 +355,8 @@ fn validate_atomic_access<H: Host>(
     Ok(snapshot.byte_offset + index * snapshot.kind.element_size())
 }
 
-/// RevalidateAtomicAccess, for after a coercion that may have run guest code.
+/// RevalidateAtomicAccess, for after a coercion that may have run guest code. A
+/// buffer can shrink to end inside the element, so the whole element must fit.
 fn revalidate_atomic_access<H: Host>(
     machine: &Machine<'_, H>,
     view: Value,
@@ -367,7 +368,8 @@ fn revalidate_atomic_access<H: Host>(
             "Atomics operation requires an in-bounds TypedArray",
         ));
     }
-    if position >= snapshot.buffer.byte_length(machine)? {
+    let end = position + snapshot.kind.element_size();
+    if end > snapshot.buffer.byte_length(machine)? {
         return Err(range_error("Atomics index is outside the TypedArray"));
     }
     Ok(())
@@ -804,6 +806,7 @@ fn string_outcome<H: Host>(
 mod tests {
     use super::super::test_support::{TestHost, blank_program};
     use super::*;
+    use crate::intrinsics::{BuiltinDef, native_function};
     use crate::{
         CancellationToken, Limits, PromiseState, RuntimeErrorKind, ThrowOrigin, TimerError,
         TimerProvider, TimerWakeup,
@@ -1477,6 +1480,70 @@ mod tests {
                 call(machine, fixed, "grow", &[Value::int32(4)]),
                 Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
             ));
+        });
+    }
+
+    /// `valueOf` of an object: shrinks the object's `buffer` to end inside the
+    /// second element of an `Int32Array`, then answers 1.
+    fn shrink_buffer(
+        machine: &mut Machine<'_, TestHost>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let buffer = machine.get_named_property(this, "buffer")?;
+        call(machine, buffer, "resize", &[Value::int32(6)])?;
+        Ok(BuiltinOutcome::Value(Value::int32(1)))
+    }
+
+    /// The arguments of one Atomics call, from the view and the shrinking operand.
+    type Arguments = fn(Value, Value) -> Vec<Value>;
+
+    #[test]
+    fn a_buffer_that_shrinks_inside_the_element_is_a_range_error() {
+        with_machine(|machine| {
+            let id = machine.intrinsics.builtins.register(BuiltinDef {
+                name: "valueOf",
+                length: 0,
+                handler: shrink_buffer,
+            });
+            let value_of = native_function(&mut machine.heap, id, "valueOf", 0);
+            let atomics = atomics(machine);
+            let constructor = machine.intrinsics.global("ArrayBuffer").unwrap();
+            let operations: [(&str, Arguments); 4] = [
+                ("add", |view, shrinks| vec![view, Value::int32(1), shrinks]),
+                ("load", |view, shrinks| vec![view, shrinks]),
+                ("store", |view, shrinks| {
+                    vec![view, Value::int32(1), shrinks]
+                }),
+                ("compareExchange", |view, shrinks| {
+                    vec![view, Value::int32(1), shrinks, Value::int32(0)]
+                }),
+            ];
+            for (method, arguments) in operations {
+                let options = crate::builtins::ordinary_runtime(machine, None).unwrap();
+                machine
+                    .set_data_property(options, "maxByteLength", Value::int32(8))
+                    .unwrap();
+                let buffer = machine
+                    .construct_value(constructor, &[Value::int32(8), options])
+                    .unwrap();
+                let view = view_of(machine, "Int32Array", buffer);
+                let shrinks = crate::builtins::ordinary_runtime(machine, None).unwrap();
+                machine
+                    .set_data_property(shrinks, "valueOf", value_of)
+                    .unwrap();
+                machine
+                    .set_data_property(shrinks, "buffer", buffer)
+                    .unwrap();
+                assert!(
+                    matches!(
+                        call(machine, atomics, method, &arguments(view, shrinks)),
+                        Err(EvalFailure::Throw(ThrowOrigin::RangeError { .. }))
+                    ),
+                    "{method}"
+                );
+            }
         });
     }
 }
