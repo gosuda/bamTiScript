@@ -50,8 +50,8 @@ jobs:
         run: cargo clippy --locked -p bamts-platform -p bamts-cli --all-targets -- -D warnings
       - name: Test the Windows platform backend
         run: cargo test --locked -p bamts-platform
-      - name: Test the Microsoft linker driver
-        run: cargo test --locked -p bamts-cli --lib windows_link
+      - name: Test the Microsoft linker driver and the Windows cache root
+        run: cargo test --locked -p bamts-cli --lib -- windows_link fallback_cache_root
       - name: Test linked native executables
         run: cargo test --locked -p bamts-cli --test cli -- aot_ deep_nesting a_file_in_the_project_named_like_a_system_library_is_not_linked
       - name: Test the lane workers

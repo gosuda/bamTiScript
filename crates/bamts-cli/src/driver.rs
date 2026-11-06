@@ -2379,19 +2379,22 @@ fn fallback_cache_root_path_in_context(context: &ExecutionContext) -> Result<Pat
 /// Windows has no check here like the owner and mode check of a Unix fallback.
 #[cfg(windows)]
 fn is_windows_temp_directory(directory: &Path, context: &ExecutionContext) -> bool {
-    let spelling = |path: &Path| {
-        path.components()
-            .as_path()
+    // One directory has many spellings: slashes, `\\?\`, a short name, a junction.
+    // Only a directory that exists has a canonical path, so another one compares
+    // by its components.
+    let identity = |path: &Path| {
+        std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.components().collect())
             .to_string_lossy()
             .to_ascii_lowercase()
     };
-    let directory = spelling(directory);
+    let directory = identity(directory);
     ["SystemRoot", "WINDIR"]
         .into_iter()
         .filter_map(|name| crate::context::env_ignoring_case(context.envs(), name))
         .map(|root| Path::new(root).join("Temp"))
         .chain([PathBuf::from(r"C:\Windows\Temp")])
-        .any(|shared| spelling(&shared) == directory)
+        .any(|shared| identity(&shared) == directory)
 }
 
 #[cfg(unix)]
@@ -3629,6 +3632,37 @@ exit 2
             ("SystemRoot", r"C:\Windows"),
             ("TEMP", r"c:\windows\TEMP\")
         ]));
+        assert!(refused(&[
+            ("SystemRoot", r"D:\Windows"),
+            ("TEMP", "D:/Windows/Temp/")
+        ]));
+        let windows = std::env::var("SystemRoot").expect("SystemRoot");
+        for spelling in [
+            format!("{windows}/Temp").replace('\\', "/"),
+            format!(r"\\?\{windows}\Temp"),
+            format!(r"{windows}\.\Temp"),
+            format!(r"{windows}\System32\..\Temp"),
+        ] {
+            assert!(
+                refused(&[("SystemRoot", &windows), ("TEMP", &spelling)]),
+                "{spelling}"
+            );
+        }
+        // A junction is a directory that any user can make, and it leads there too.
+        let junction = std::env::temp_dir().join(format!("bamts-temp-link-{}", std::process::id()));
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(format!(r"{windows}\Temp"))
+            .output()
+            .expect("run mklink");
+        assert!(made.status.success(), "{made:?}");
+        let through_junction = refused(&[
+            ("SystemRoot", &windows),
+            ("TEMP", junction.to_str().expect("a UTF-8 path")),
+        ]);
+        std::fs::remove_dir(&junction).expect("remove the junction");
+        assert!(through_junction);
 
         assert_eq!(
             root(&[
