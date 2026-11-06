@@ -354,8 +354,16 @@ impl Walker<'_> {
     }
 
     /// Whether a comma follows `range`, which a rest element cannot have.
+    /// Whether a comma follows `range`. A parenthesized target ends before its `)`.
     fn comma_follows(&self, range: TextRange) -> bool {
-        next_token(self.file, range.end()).is_some_and(|token| token.kind() == TokenKind::Comma)
+        let mut end = range.end();
+        while let Some(token) = next_token(self.file, end) {
+            if token.kind() != TokenKind::RParen {
+                return token.kind() == TokenKind::Comma;
+            }
+            end = token.range().end();
+        }
+        false
     }
 
     fn token_of(&self, token: &Token) -> &str {
@@ -2149,6 +2157,10 @@ mod tests {
             "function f({ ...a, }) {}",
             "({ ...a, }) => 1;",
             "({ ...a, } = b);",
+            "({ ...(a), } = b);",
+            "({ ...((a)), } = b);",
+            "({ ...(a.b), } = c);",
+            "[...(a),] = b;",
         ] {
             assert!(!errors(source).is_empty(), "{source} must be rejected");
         }
@@ -2160,6 +2172,13 @@ mod tests {
             "var { a, } = b;",
             "({ a, } = b);",
             "({ ...a, });",
+            "({ ...(a) } = b);",
+            "[...(a)] = b;",
+            "[...((a))] = b;",
+            "f((...a) => 1, 2);",
+            "f(function (...a) {}, 2);",
+            "({ m(...a) {}, });",
+            "[(...a) => 1, 2];",
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
