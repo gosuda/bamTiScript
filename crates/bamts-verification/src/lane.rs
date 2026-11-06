@@ -956,13 +956,15 @@ impl ServingWorker {
             .wait()
             .map_err(|error| wait_error(SERVING_LABEL, error))?;
         drop(self.stdin);
-        let [line_reader, stderr_reader] = self.readers;
-        line_reader
-            .join()
-            .map_err(|_| thread_error(SERVING_LABEL, "stdout"))?;
-        stderr_reader
-            .join()
-            .map_err(|_| thread_error(SERVING_LABEL, "stderr"))?;
+        if readers_ended(&mut self.child, &self.readers) {
+            let [line_reader, stderr_reader] = self.readers;
+            line_reader
+                .join()
+                .map_err(|_| thread_error(SERVING_LABEL, "stdout"))?;
+            stderr_reader
+                .join()
+                .map_err(|_| thread_error(SERVING_LABEL, "stderr"))?;
+        }
         if let Some(error) = termination_error {
             return Err(error);
         }
@@ -1002,10 +1004,35 @@ impl ServingWorker {
                 }
             }
         }
-        for reader in self.readers {
-            let _ = reader.join();
+        if readers_ended(&mut self.child, &self.readers) {
+            for reader in self.readers {
+                let _ = reader.join();
+            }
         }
     }
+}
+
+/// Whether the threads that read the output of an exited worker ended. They end
+/// when nothing holds the pipes, and a child that the worker left can hold them for
+/// as long as it runs. So the process group of the worker is terminated after
+/// [`SERVING_STOP_GRACE`]. A holder that survives that costs its thread and not the
+/// run: the thread stays blocked until the holder exits, and nothing waits for it.
+fn readers_ended(child: &mut Child, readers: &[JoinHandle<()>; 2]) -> bool {
+    let ended_in_time = || {
+        let deadline = Instant::now() + SERVING_STOP_GRACE;
+        while !readers.iter().all(JoinHandle::is_finished) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(SERVING_STOP_POLL);
+        }
+        true
+    };
+    if ended_in_time() {
+        return true;
+    }
+    let _ = terminate_process_group(child, SERVING_LABEL);
+    ended_in_time()
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -1712,6 +1739,30 @@ mod tests {
         assert_eq!(started, 2, "each request after an exit starts a new worker");
         let row = derive_row(&request(1, key(mode, platform, "case-first")), first).expect("row");
         assert_eq!(row.state(), TerminalState::WorkerCrash);
+    }
+
+    #[test]
+    fn a_child_that_a_serving_worker_left_cannot_hold_up_its_stop() {
+        let scratch = scratch_dir("serving-left-child");
+        // The worker exits at once, and its child keeps the output open.
+        let child = if cfg!(windows) {
+            "start /b ping -n 40 127.0.0.1"
+        } else {
+            "sleep 40 &"
+        };
+        let (program, args) = ready_worker(child);
+        let mut executor = ServingExecutor::new(program, args, &scratch, &scratch);
+        let worker = executor.start_worker().expect("worker");
+        let ready = worker.await_line(
+            |line| line == LANE_WORKER_READY,
+            Instant::now() + Duration::from_secs(10),
+        );
+        assert_eq!(ready, Heard::Line);
+        let started = Instant::now();
+        worker.stop();
+        let elapsed = started.elapsed();
+        let _ = fs::remove_dir_all(&scratch);
+        assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
     }
 
     #[test]
