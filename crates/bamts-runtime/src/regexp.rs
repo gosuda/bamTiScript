@@ -319,7 +319,18 @@ impl Regex {
                     })
                     .collect())
             }
-            Node::Modified { flags, body } => self.match_node(*flags, body, input, state),
+            // A group's flags come from the parser, which does not know the
+            // direction this reads in. That belongs to the enclosing lookaround.
+            Node::Modified {
+                flags: modified,
+                body,
+            } => {
+                let inside = Flags {
+                    backward: flags.backward,
+                    ..*modified
+                };
+                self.match_node(inside, body, input, state)
+            }
             Node::BackReference(index) => {
                 let Some(range) = state.captures.get(*index).and_then(Clone::clone) else {
                     return Ok(vec![state]);
@@ -2013,6 +2024,23 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_modifier_group_reads_in_the_direction_of_its_lookbehind() {
+        assert_eq!(ranges("(?<=(?i:ab))c", "", "ABc"), [Some(2..3)]);
+        assert_eq!(ranges("(?<=(?i:a)b)c", "", "Abc"), [Some(2..3)]);
+        assert_eq!(
+            ranges(r"(?<=(?i:(\d+)(\d+)))$", "", "1053"),
+            [Some(4..4), Some(0..1), Some(1..4)]
+        );
+        assert!(
+            regex("(?<=(?-i:a)b)c", "i")
+                .exec(&text("ABc"), 0)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(ranges("(?<=(?-i:a)b)c", "i", "aBc"), [Some(2..3)]);
     }
 
     #[test]
