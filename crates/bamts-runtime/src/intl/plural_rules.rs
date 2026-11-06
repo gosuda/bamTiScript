@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use super::locale_negotiation::{
     HostLocaleHook, LanguageTag, LocaleDataProvider, LocaleError, LocaleMatcher,
@@ -2240,11 +2241,12 @@ pub struct SegmentRecord {
     pub is_word_like: Option<bool>,
 }
 
-/// A segmented UTF-16 string without per-segment input copies.
+/// A segmented UTF-16 string. A `Segments` object and each iterator over it share
+/// one copy of the input and of the records, so a clone costs nothing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SegmentedText {
-    input: Vec<u16>,
-    records: Vec<SegmentRecord>,
+    input: Arc<[u16]>,
+    records: Arc<[SegmentRecord]>,
 }
 
 impl SegmentedText {
@@ -2269,12 +2271,8 @@ impl SegmentedText {
     /// Implements `Segments.prototype.containing` with a UTF-16 code-unit index.
     #[must_use]
     pub fn containing(&self, index: usize) -> Option<&SegmentRecord> {
-        if index >= self.input.len() {
-            return None;
-        }
-        self.records
-            .iter()
-            .find(|record| record.start <= index && index < record.end)
+        let position = self.records.partition_point(|record| record.end <= index);
+        self.records.get(position)
     }
 }
 
@@ -2324,8 +2322,8 @@ impl<'a> Segmenter<'a> {
     pub fn segment_utf16(&self, input: &[u16]) -> Result<SegmentedText, IntlError> {
         if input.is_empty() {
             return Ok(SegmentedText {
-                input: Vec::new(),
-                records: Vec::new(),
+                input: Arc::from([]),
+                records: Arc::from([]),
             });
         }
         let boundaries = self
@@ -2360,8 +2358,8 @@ impl<'a> Segmenter<'a> {
             ));
         }
         Ok(SegmentedText {
-            input: input.to_vec(),
-            records,
+            input: Arc::from(input),
+            records: Arc::from(records),
         })
     }
 

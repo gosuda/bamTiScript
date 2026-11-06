@@ -1246,8 +1246,8 @@ enum HeapEntry {
         extensible: bool,
     },
     /// Instances of the `Intl` classes. The boxed record holds no `Value`;
-    /// `bound` is the instance's one cached function, the getter-created
-    /// `format` or `compare`.
+    /// `bound` is the one value an instance keeps: the getter-created `format`
+    /// or `compare`, or the input string of a `Segments` object or its iterator.
     Intl {
         value: Box<intl::IntlObject>,
         bound: Option<Value>,

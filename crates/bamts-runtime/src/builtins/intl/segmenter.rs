@@ -125,12 +125,49 @@ fn segment<H: Host>(
     };
     let granularity = segmenter.resolved_options().granularity;
     let segmented = segmenter.segment_utf16(text.as_units());
-    let text = segmented.map_err(|error| service_failure(machine, &error))?;
-    create(
+    let segmented = segmented.map_err(|error| service_failure(machine, &error))?;
+    let input = super::super::allocate_string(machine, text)?;
+    let segments = create(
         machine,
-        IntlObject::Segments(Box::new(SegmentsRecord { text, granularity })),
-    )
-    .map(BuiltinOutcome::Value)
+        IntlObject::Segments(Box::new(SegmentsRecord {
+            text: segmented,
+            granularity,
+        })),
+    )?;
+    keep_input(machine, segments, input)?;
+    Ok(BuiltinOutcome::Value(segments))
+}
+
+/// Gives a `Segments` object or iterator the one string that every segment data
+/// object it makes reports as `input`, so a step does not copy a long input.
+fn keep_input<H: Host>(
+    machine: &mut Machine<'_, H>,
+    instance: Value,
+    input: Value,
+) -> Result<(), EvalFailure> {
+    let index = machine
+        .runtime_slot(instance)
+        .map_err(EvalFailure::Runtime)?
+        .expect("the instance was just allocated");
+    if let HeapEntry::Intl { bound, .. } = &mut machine.heap[index] {
+        *bound = Some(input);
+    }
+    Ok(())
+}
+
+/// The string [`keep_input`] gave a `Segments` object or iterator.
+fn kept_input<H: Host>(machine: &Machine<'_, H>, instance: Value) -> Result<Value, EvalFailure> {
+    let index = machine
+        .runtime_slot(instance)
+        .map_err(EvalFailure::Runtime)?
+        .expect("the receiver was checked");
+    let HeapEntry::Intl {
+        bound: Some(input), ..
+    } = &machine.heap[index]
+    else {
+        unreachable!("a Segments object and its iterator keep their input")
+    };
+    Ok(*input)
 }
 
 fn resolved_options<H: Host>(
@@ -158,6 +195,7 @@ fn resolved_options<H: Host>(
 fn segment_data<H: Host>(
     machine: &mut Machine<'_, H>,
     text: &SegmentedText,
+    input: Value,
     record: &SegmentRecord,
     granularity: SegmenterGranularity,
 ) -> Result<Value, EvalFailure> {
@@ -167,7 +205,6 @@ fn segment_data<H: Host>(
     define_field(machine, result, "segment", segment)?;
     let index = crate::number_value(record.start as f64);
     define_field(machine, result, "index", index)?;
-    let input = super::super::allocate_string(machine, EcmaString::from_units(text.input()))?;
     define_field(machine, result, "input", input)?;
     if granularity == SegmenterGranularity::Word {
         let word_like = Value::boolean(record.is_word_like.unwrap_or(false));
@@ -206,7 +243,9 @@ fn containing<H: Host>(
     let Some(segment) = record.text.containing(number as usize) else {
         return Ok(BuiltinOutcome::Value(Value::UNDEFINED));
     };
-    segment_data(machine, &record.text, segment, record.granularity).map(BuiltinOutcome::Value)
+    let input = kept_input(machine, this)?;
+    segment_data(machine, &record.text, input, segment, record.granularity)
+        .map(BuiltinOutcome::Value)
 }
 
 fn create_iterator<H: Host>(
@@ -216,15 +255,17 @@ fn create_iterator<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let record = this_segments(machine, this)?;
-    create(
+    let input = kept_input(machine, this)?;
+    let iterator = create(
         machine,
         IntlObject::SegmentIterator(Box::new(SegmentIteratorRecord {
             text: record.text,
             granularity: record.granularity,
             next_record: 0,
         })),
-    )
-    .map(BuiltinOutcome::Value)
+    )?;
+    keep_input(machine, iterator, input)?;
+    Ok(BuiltinOutcome::Value(iterator))
 }
 
 fn next<H: Host>(
@@ -250,8 +291,91 @@ fn next<H: Host>(
     iterator.next_record += 1;
     let text = iterator.text.clone();
     let granularity = iterator.granularity;
-    let data = segment_data(machine, &text, &record, granularity)?;
+    let input = kept_input(machine, this)?;
+    let data = segment_data(machine, &text, input, &record, granularity)?;
     machine
         .iterator_result(data, false)
         .map(BuiltinOutcome::Value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::test_support::{TestHost, blank_program};
+    use super::*;
+    use crate::Limits;
+
+    fn call(machine: &mut Machine<'_, TestHost>, receiver: Value, method: &str) -> Value {
+        let function = machine.get_named_property(receiver, method).unwrap();
+        machine.call_value(function, receiver, &[]).unwrap()
+    }
+
+    fn next_input(machine: &mut Machine<'_, TestHost>, iterator: Value) -> Value {
+        let result = call(machine, iterator, "next");
+        let data = machine.get_named_property(result, "value").unwrap();
+        machine.get_named_property(data, "input").unwrap()
+    }
+
+    #[test]
+    fn every_step_reports_one_input_string_that_survives_a_collection() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let intl = machine.intrinsics.global("Intl").unwrap();
+        let constructor = machine.get_named_property(intl, "Segmenter").unwrap();
+        let segmenter = machine.construct_value(constructor, &[]).unwrap();
+        let text = super::super::super::allocate_string(&mut machine, EcmaString::encode("abc"));
+        let segment = machine.get_named_property(segmenter, "segment").unwrap();
+        let segments = machine
+            .call_value(segment, segmenter, &[text.unwrap()])
+            .unwrap();
+        let symbol = machine.intrinsics.builtins.symbol_iterator();
+        let key = machine.to_property_key(symbol).unwrap();
+        let create = machine.get_property_key(segments, &key).unwrap();
+        let iterator = machine.call_value(create, segments, &[]).unwrap();
+        machine.hold_temporaries(&[segments, iterator]);
+
+        machine.collect_garbage();
+        let first = next_input(&mut machine, iterator);
+        machine.hold_temporaries(&[first]);
+        machine.collect_garbage();
+        let second = next_input(&mut machine, iterator);
+
+        assert_eq!(first, second);
+        assert!(
+            machine
+                .string_value(first)
+                .is_some_and(|text| text.eq_ascii("abc"))
+        );
+    }
+
+    #[test]
+    fn containing_finds_the_segment_by_its_position() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let intl = machine.intrinsics.global("Intl").unwrap();
+        let constructor = machine.get_named_property(intl, "Segmenter").unwrap();
+        let segmenter = machine.construct_value(constructor, &[]).unwrap();
+        let text = super::super::super::allocate_string(&mut machine, EcmaString::encode("abc"));
+        let segment = machine.get_named_property(segmenter, "segment").unwrap();
+        let segments = machine
+            .call_value(segment, segmenter, &[text.unwrap()])
+            .unwrap();
+        let containing = machine.get_named_property(segments, "containing").unwrap();
+        for position in 0..3 {
+            let data = machine
+                .call_value(containing, segments, &[Value::int32(position)])
+                .unwrap();
+            assert_eq!(
+                machine.get_named_property(data, "index").unwrap(),
+                Value::int32(position)
+            );
+        }
+        assert_eq!(
+            machine
+                .call_value(containing, segments, &[Value::int32(3)])
+                .unwrap(),
+            Value::UNDEFINED
+        );
+    }
 }
