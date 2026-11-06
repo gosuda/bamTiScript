@@ -8,7 +8,8 @@
 //! normalized environment, bounded pipe drain, process-group timeout, and
 //! whole-group termination.  [`ProcessExecutor`] starts one worker per
 //! request; [`ServingExecutor`] keeps one worker for many requests and records
-//! a worker that exits or misses a deadline the way [`ProcessExecutor`] does.
+//! a worker that exits or misses a deadline during a request the way
+//! [`ProcessExecutor`] does.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -682,6 +683,11 @@ fn read_bounded_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> bool {
 /// is terminated, gives its request the observation that [`ProcessExecutor`]
 /// gives such a worker, and the next request starts a new worker. Environment,
 /// process group, and termination are those of [`ProcessExecutor`].
+///
+/// A request ends at the done line of the worker. A worker that exits after that
+/// line belongs to no request: the complete response decides the last row, where
+/// [`ProcessExecutor`] would also see the exit status, and the status is dropped
+/// when the next request replaces the worker.
 #[derive(Debug)]
 pub struct ServingExecutor {
     program: PathBuf,

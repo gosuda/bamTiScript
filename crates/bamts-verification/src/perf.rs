@@ -1457,8 +1457,9 @@ fn invalid_conditions(observed: &ObservedConditions, expected: &HostConditions) 
 }
 
 /// Polls the peak memory of a child until it is gone, and returns the highest
-/// value seen. Run it beside the `wait` that reaps the child: `ProcessGone`
-/// comes only after the reap.
+/// value seen. Run it beside the `wait` that reaps the child: `ProcessGone` comes
+/// after the reap on Linux and macOS. On Windows it comes as soon as the child has
+/// exited, so what the child used after the last read is not seen.
 fn poll_child_peak_rss(pid: u32) -> u64 {
     poll_peak(|| bamts_platform::peak_memory_bytes(pid))
 }
@@ -1473,7 +1474,7 @@ fn poll_peak(
             // Not the end: Linux reads this for most of a child's exit, and
             // macOS while a live child execs.
             Err(bamts_platform::PlatformError::NoAddressSpace(_)) => {}
-            // Gone after the reap, or unreadable. Stop on every other error, so a
+            // Gone, or unreadable. Stop on every other error, so a
             // persistent one cannot hang the thread that joins this poller.
             Err(_) => return peak,
         }
