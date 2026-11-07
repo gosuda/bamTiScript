@@ -590,6 +590,24 @@ mod tests {
     }
 
     #[test]
+    fn a_currency_symbol_keeps_the_short_compact_form() {
+        let long = |display: &str| {
+            english(NumberFormatOptions {
+                style: Some("currency".to_owned()),
+                currency: Some("USD".to_owned()),
+                currency_display: Some(display.to_owned()),
+                notation: Some("compact".to_owned()),
+                compact_display: Some("long".to_owned()),
+                ..NumberFormatOptions::default()
+            })
+        };
+        let text = |format: &NumberFormat<'_>| format.format_number(1000.0).expect("a text");
+        assert_eq!(text(&long("symbol")), "$1K");
+        assert_eq!(text(&long("code")), "USD\u{a0}1K");
+        assert_eq!(text(&long("name")), "1 thousand US dollars");
+    }
+
+    #[test]
     fn an_exponent_makes_a_name_plural() {
         let meters = |notation: &str| {
             english(NumberFormatOptions {

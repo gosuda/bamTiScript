@@ -1797,6 +1797,18 @@ impl<'a> NumberFormat<'a> {
         }
     }
 
+    /// The compact form in use. The long form has no place for a currency symbol or
+    /// code, which keep the short form, and only a currency name can follow a long word.
+    fn compact_form(&self) -> CompactDisplay {
+        let currency_symbol = self.style == NumberStyle::Currency
+            && self.currency_display != Some(CurrencyDisplay::Name);
+        if currency_symbol {
+            CompactDisplay::Short
+        } else {
+            self.compact_display.expect("compact display is resolved")
+        }
+    }
+
     fn compute_exponent_for_magnitude(&self, magnitude: i32) -> Result<i32, NumberFormatError> {
         match self.notation {
             Notation::Standard => Ok(0),
@@ -1804,11 +1816,7 @@ impl<'a> NumberFormat<'a> {
             Notation::Engineering => Ok(magnitude.div_euclid(3) * 3),
             Notation::Compact => self
                 .provider
-                .compact_exponent(
-                    &self.data_locale,
-                    self.compact_display.expect("compact display is resolved"),
-                    magnitude,
-                )
+                .compact_exponent(&self.data_locale, self.compact_form(), magnitude)
                 .ok_or_else(|| {
                     NumberFormatError::missing(format!(
                         "missing compact exponent for magnitude {magnitude}"
@@ -1938,7 +1946,7 @@ impl<'a> NumberFormat<'a> {
                     .provider
                     .compact_pattern(
                         &self.data_locale,
-                        self.compact_display.expect("compact display resolved"),
+                        self.compact_form(),
                         prepared.exponent,
                         category,
                     )
