@@ -1471,10 +1471,13 @@ impl<'a> NumberFormat<'a> {
             .collect())
     }
 
-    /// ECMA-402 `PartitionNumberRangePattern`. `CollapseNumberRange` removes an
-    /// affix the two ends share when it is longer than one code point, so
-    /// `+$2.90–3.10` shares its `+$` and `$3 – $5` repeats its `$`. Any affix
-    /// left on an inner side spaces out the separator.
+    /// ECMA-402 `PartitionNumberRangePattern`, with the collapse choices of ICU, which
+    /// V8 uses. An end has three layers around its digits: an exponent, the sign and
+    /// symbols, and a unit or currency name. A name always collapses, in the plural
+    /// form of a range. The sign and symbols collapse when both ends share them and
+    /// they are longer than one code point, so `+$2.90–3.10` shares its `+$` and
+    /// `$3 – $5` repeats its `$`. An exponent or a sign or symbol that the start keeps
+    /// spaces out the separator, so `-1 – 1` has spaces and `1–-1` does not.
     pub fn format_range_to_parts(
         &self,
         start: &IntlMathematicalValue,
@@ -1485,18 +1488,23 @@ impl<'a> NumberFormat<'a> {
                 "number range endpoints must not be NaN",
             ));
         }
-        let start_parts = self.format_to_parts(start)?;
-        let end_parts = self.format_to_parts(end)?;
+        let start_prepared = self.prepare_format(start)?;
+        let end_prepared = self.prepare_format(end)?;
+        let start_parts = self.partition_for_category(&start_prepared, PluralCategory::Other)?;
+        let end_parts = self.partition_for_category(&end_prepared, PluralCategory::Other)?;
         if concatenate_parts(&start_parts) == concatenate_parts(&end_parts) {
-            return self.approximate_range(start_parts);
+            return self.approximate_range(self.partition_outer_pattern(&start_prepared)?);
         }
         let (start_prefix, start_number, start_suffix) = split_number(&start_parts);
         let (end_prefix, end_number, end_suffix) = split_number(&end_parts);
-        let shared_prefix = collapsible(start_prefix, end_prefix);
-        let shared_suffix = collapsible(start_suffix, end_suffix);
-        let spaced = (!shared_prefix && !(start_prefix.is_empty() && end_prefix.is_empty()))
-            || (!shared_suffix && !(start_suffix.is_empty() && end_suffix.is_empty()));
-        let separator = if spaced {
+        let (start_suffix, name) = self.split_name(start_suffix);
+        let (end_suffix, _) = self.split_name(end_suffix);
+        let symbols = code_points(start_prefix) + code_points(start_suffix);
+        let shared = symbols > 1 && start_prefix == end_prefix && start_suffix == end_suffix;
+        let exponent = start_number
+            .iter()
+            .any(|part| part.part_type == NumberPartType::ExponentSeparator);
+        let separator = if exponent || (!shared && symbols > 0) {
             format!(" {} ", self.range_patterns.separator)
         } else {
             self.range_patterns.separator.clone()
@@ -1509,13 +1517,13 @@ impl<'a> NumberFormat<'a> {
                 source,
             }));
         };
-        if shared_prefix {
+        if shared {
             push(start_prefix, RangeSource::Shared);
         } else {
             push(start_prefix, RangeSource::StartRange);
         }
         push(start_number, RangeSource::StartRange);
-        if !shared_suffix {
+        if !shared {
             push(start_suffix, RangeSource::StartRange);
         }
         push(
@@ -1525,16 +1533,37 @@ impl<'a> NumberFormat<'a> {
             }],
             RangeSource::Shared,
         );
-        if !shared_prefix {
+        if !shared {
             push(end_prefix, RangeSource::EndRange);
         }
         push(end_number, RangeSource::EndRange);
-        if shared_suffix {
+        if shared {
             push(start_suffix, RangeSource::Shared);
         } else {
             push(end_suffix, RangeSource::EndRange);
         }
+        push(name, RangeSource::Shared);
         Ok(result)
+    }
+
+    /// Splits what follows a number at its unit or currency name and the space before.
+    /// A percent sign is a symbol, unless compact notation or the word makes it a name.
+    fn split_name<'p>(&self, suffix: &'p [NumberPart]) -> (&'p [NumberPart], &'p [NumberPart]) {
+        let percent_is_name = matches!(self.notation, Notation::Compact)
+            || self.unit_display == Some(UnitDisplay::Long);
+        let is_name = |part: &NumberPart| match part.part_type {
+            NumberPartType::Unit => percent_is_name || self.unit.as_deref() != Some("percent"),
+            NumberPartType::Currency => self.currency_display == Some(CurrencyDisplay::Name),
+            NumberPartType::PercentSign => percent_is_name,
+            _ => false,
+        };
+        let Some(name) = suffix.iter().position(is_name) else {
+            return (suffix, &[]);
+        };
+        let spaced = name
+            .checked_sub(1)
+            .filter(|space| suffix[*space].part_type == NumberPartType::Literal);
+        suffix.split_at(spaced.unwrap_or(name))
     }
 
     fn prepare_format(
@@ -1729,7 +1758,6 @@ impl<'a> NumberFormat<'a> {
         &self,
         prepared: &PreparedFormat,
     ) -> Result<Vec<NumberPart>, NumberFormatError> {
-        let pattern = self.pattern_for_value(&prepared.rounded);
         let operands = operands_from_ascii(&prepared.ascii, prepared.exponent);
         let category = match prepared.rounded {
             IntlMathematicalValue::Finite { .. } | IntlMathematicalValue::NegativeZero => {
@@ -1737,6 +1765,15 @@ impl<'a> NumberFormat<'a> {
             }
             _ => PluralCategory::Other,
         };
+        self.partition_for_category(prepared, category)
+    }
+
+    fn partition_for_category(
+        &self,
+        prepared: &PreparedFormat,
+        category: PluralCategory,
+    ) -> Result<Vec<NumberPart>, NumberFormatError> {
+        let pattern = self.pattern_for_value(&prepared.rounded);
         let tokens = partition_pattern(pattern)?;
         let mut result = Vec::new();
         for token in tokens {
@@ -2066,7 +2103,6 @@ fn split_number(parts: &[NumberPart]) -> (&[NumberPart], &[NumberPart], &[Number
                 | NumberPartType::Fraction
                 | NumberPartType::Nan
                 | NumberPartType::Infinity
-                | NumberPartType::Compact
                 | NumberPartType::ExponentInteger
                 | NumberPartType::ExponentMinusSign
                 | NumberPartType::ExponentSeparator
@@ -2079,13 +2115,8 @@ fn split_number(parts: &[NumberPart]) -> (&[NumberPart], &[NumberPart], &[Number
     (&parts[..first], &parts[first..last], &parts[last..])
 }
 
-fn collapsible(start: &[NumberPart], end: &[NumberPart]) -> bool {
-    start == end
-        && start
-            .iter()
-            .map(|part| part.value.chars().count())
-            .sum::<usize>()
-            > 1
+fn code_points(parts: &[NumberPart]) -> usize {
+    parts.iter().map(|part| part.value.chars().count()).sum()
 }
 
 fn concatenate_parts(parts: &[NumberPart]) -> String {

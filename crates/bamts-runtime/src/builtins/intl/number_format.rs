@@ -575,6 +575,110 @@ mod tests {
         IntlMathematicalValue::from_decimal_string(text).expect("a decimal")
     }
 
+    fn english(options: NumberFormatOptions) -> NumberFormat<'static> {
+        let data: &'static crate::intl::locale_data::IntlData = &DATA;
+        NumberFormat::new(&["en".to_owned()], &options, data, &NoHostLocale).expect("a format")
+    }
+
+    fn range(format: &NumberFormat<'_>, start: f64, end: f64) -> String {
+        format
+            .format_range(
+                &IntlMathematicalValue::from_f64(start),
+                &IntlMathematicalValue::from_f64(end),
+            )
+            .expect("a range")
+    }
+
+    #[test]
+    fn only_a_sign_or_symbol_of_the_start_spaces_a_range() {
+        let plain = english(NumberFormatOptions::default());
+        assert_eq!(range(&plain, 1.0, 2.0), "1–2");
+        assert_eq!(range(&plain, 1.0, -1.0), "1–-1");
+        assert_eq!(range(&plain, -1.0, 1.0), "-1 – 1");
+        assert_eq!(range(&plain, -2.0, -1.0), "-2 – -1");
+    }
+
+    #[test]
+    fn an_exponent_always_spaces_a_range() {
+        let scientific = english(NumberFormatOptions {
+            notation: Some("scientific".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(range(&scientific, 1.0, 2.0), "1E0 – 2E0");
+        assert_eq!(range(&scientific, 0.0, f64::INFINITY), "0E0 – ∞");
+        assert_eq!(range(&scientific, f64::INFINITY, 1.0), "∞–1E0");
+    }
+
+    #[test]
+    fn a_percent_sign_is_a_name_only_in_compact_notation_or_as_a_word() {
+        let compact = english(NumberFormatOptions {
+            style: Some("percent".to_owned()),
+            notation: Some("compact".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(range(&compact, 1.0, 2.0), "100–200%");
+        assert_eq!(range(&compact, -2.0, -1.0), "-200 – -100%");
+        let unit = |display: &str| {
+            english(NumberFormatOptions {
+                style: Some("unit".to_owned()),
+                unit: Some("percent".to_owned()),
+                unit_display: Some(display.to_owned()),
+                ..NumberFormatOptions::default()
+            })
+        };
+        assert_eq!(range(&unit("short"), 1.0, 2.0), "1% – 2%");
+        assert_eq!(range(&unit("long"), 1.0, 2.0), "1–2 percent");
+    }
+
+    #[test]
+    fn a_range_shares_its_symbols_as_one_group() {
+        let percent = english(NumberFormatOptions {
+            style: Some("percent".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(range(&percent, -2.0, -1.0), "-200–100%");
+        assert_eq!(range(&percent, 1.0, 2.0), "100% – 200%");
+        let compact = english(NumberFormatOptions {
+            notation: Some("compact".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(range(&compact, 1000.0, 2000.0), "1K – 2K");
+        let dollars = english(NumberFormatOptions {
+            style: Some("currency".to_owned()),
+            currency: Some("USD".to_owned()),
+            notation: Some("compact".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(range(&dollars, 1000.0, 2000.0), "$1–2K");
+        let words = english(NumberFormatOptions {
+            notation: Some("compact".to_owned()),
+            compact_display: Some("long".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(range(&words, 1000.0, 2000.0), "1–2 thousand");
+    }
+
+    #[test]
+    fn a_range_always_shares_its_name_in_the_plural_of_a_range() {
+        let meters = english(NumberFormatOptions {
+            style: Some("unit".to_owned()),
+            unit: Some("meter".to_owned()),
+            unit_display: Some("long".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(range(&meters, 1.0, 2.0), "1–2 meters");
+        assert_eq!(range(&meters, 0.0, 1.0), "0–1 meters");
+        assert_eq!(range(&meters, -1.0, 1.0), "-1 – 1 meters");
+        assert_eq!(range(&meters, 1.0, 1.0), "~1 meter");
+        let dollars = english(NumberFormatOptions {
+            style: Some("currency".to_owned()),
+            currency: Some("USD".to_owned()),
+            currency_display: Some("name".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(range(&dollars, 1.0, -1.0), "1.00–-1.00 US dollars");
+    }
+
     #[test]
     fn a_string_below_the_range_of_a_number_stays_exact() {
         for text in [
