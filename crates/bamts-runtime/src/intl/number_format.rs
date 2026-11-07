@@ -647,6 +647,19 @@ impl Decimal {
         self.is_zero() || self.exponent >= 0
     }
 
+    /// The value, when it is an integer of at most 19 digits.
+    fn small_integer(&self) -> Option<i128> {
+        let zeros = usize::try_from(self.exponent).ok()?;
+        if self.digits.len().saturating_add(zeros) > 19 {
+            return None;
+        }
+        let coefficient = self
+            .digits
+            .iter()
+            .fold(0_i128, |value, digit| value * 10 + i128::from(*digit));
+        Some((0..zeros).fold(coefficient, |value, _| value * 10))
+    }
+
     fn magnitude(&self) -> Result<i32, NumberFormatError> {
         if self.is_zero() {
             return Ok(0);
@@ -757,6 +770,54 @@ impl IntlMathematicalValue {
 
     fn is_nan(&self) -> bool {
         matches!(self, Self::Nan)
+    }
+
+    /// Whether ICU, which compares the ends of a range before it rounds them, holds
+    /// both as one value. It holds an integer that fits 64 bits exactly, and any other
+    /// value as the nearest Number, so `"1e-400"` and `"2e-400"` are one value there.
+    fn same_in_icu(&self, other: &Self) -> bool {
+        match (self.as_i64(), other.as_i64()) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => self.nearest_number() == other.nearest_number(),
+            _ => false,
+        }
+    }
+
+    fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::NegativeZero => Some(0),
+            Self::Finite {
+                negative,
+                magnitude,
+            } => {
+                let value = magnitude.small_integer()?;
+                i64::try_from(if *negative { -value } else { value }).ok()
+            }
+            _ => None,
+        }
+    }
+
+    fn nearest_number(&self) -> f64 {
+        match self {
+            Self::Finite {
+                negative,
+                magnitude,
+            } => {
+                let digits: String = magnitude
+                    .digits
+                    .iter()
+                    .map(|digit| char::from(b'0' + digit))
+                    .collect();
+                let value = format!("{digits}e{}", magnitude.exponent)
+                    .parse()
+                    .unwrap_or(f64::NAN);
+                if *negative { -value } else { value }
+            }
+            Self::NegativeZero => -0.0,
+            Self::PositiveInfinity => f64::INFINITY,
+            Self::NegativeInfinity => f64::NEG_INFINITY,
+            Self::Nan => f64::NAN,
+        }
     }
 }
 
@@ -1492,7 +1553,9 @@ impl<'a> NumberFormat<'a> {
         let end_prepared = self.prepare_format(end)?;
         let start_parts = self.partition_for_category(&start_prepared, PluralCategory::Other)?;
         let end_parts = self.partition_for_category(&end_prepared, PluralCategory::Other)?;
-        if concatenate_parts(&start_parts) == concatenate_parts(&end_parts) {
+        if concatenate_parts(&start_parts) == concatenate_parts(&end_parts)
+            || (start.same_in_icu(end) && beside_digits(&start_parts).eq(beside_digits(&end_parts)))
+        {
             return self.approximate_range(self.partition_outer_pattern(&start_prepared)?);
         }
         let (start_prefix, start_number, start_suffix) = split_number(&start_parts);
@@ -2113,6 +2176,19 @@ fn split_number(parts: &[NumberPart]) -> (&[NumberPart], &[NumberPart], &[Number
     };
     let last = parts.iter().rposition(is_number).unwrap_or(first) + 1;
     (&parts[..first], &parts[first..last], &parts[last..])
+}
+
+/// The parts of a number other than the digits of its coefficient.
+fn beside_digits(parts: &[NumberPart]) -> impl Iterator<Item = &NumberPart> {
+    parts.iter().filter(|part| {
+        !matches!(
+            part.part_type,
+            NumberPartType::Integer
+                | NumberPartType::Group
+                | NumberPartType::Decimal
+                | NumberPartType::Fraction
+        )
+    })
 }
 
 fn code_points(parts: &[NumberPart]) -> usize {

@@ -590,6 +590,58 @@ mod tests {
     }
 
     #[test]
+    fn range_ends_are_one_value_as_icu_holds_them() {
+        let text_range = |format: &NumberFormat<'_>, start: &str, end: &str| {
+            format
+                .format_range(&exact(start), &exact(end))
+                .expect("a range")
+        };
+        let scientific = english(NumberFormatOptions {
+            notation: Some("scientific".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(text_range(&scientific, "1e-400", "2e-400"), "~1E-400");
+        assert_eq!(text_range(&scientific, "2e-400", "1e-400"), "~2E-400");
+        // A different exponent, or a different sign, is more than the digits.
+        assert_eq!(
+            text_range(&scientific, "1e-400", "1e-500"),
+            "1E-400 – 1E-500"
+        );
+        assert_eq!(
+            text_range(&scientific, "-1e-400", "1e-400"),
+            "-1E-400 – 1E-400"
+        );
+
+        let plain = english(NumberFormatOptions::default());
+        // Integers that fit 64 bits stay exact, and those past 64 bits do not.
+        assert_eq!(
+            text_range(&plain, "9223372036854775806", "9223372036854775807"),
+            "9,223,372,036,854,775,806–9,223,372,036,854,775,807"
+        );
+        assert_eq!(
+            text_range(&plain, "-9223372036854775808", "-9223372036854775807"),
+            "-9,223,372,036,854,775,808 – -9,223,372,036,854,775,807"
+        );
+        assert_eq!(
+            text_range(&plain, "9223372036854775808", "9223372036854775809"),
+            "~9,223,372,036,854,775,808"
+        );
+        // One end fits 64 bits and the other does not, so they are not one value.
+        let long = english(NumberFormatOptions {
+            maximum_fraction_digits: Some(20.0),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(
+            text_range(&long, "1", "1.00000000000000001"),
+            "1–1.00000000000000001"
+        );
+        assert_eq!(
+            text_range(&long, "1.00000000000000001", "1.00000000000000002"),
+            "~1.00000000000000001"
+        );
+    }
+
+    #[test]
     fn only_a_sign_or_symbol_of_the_start_spaces_a_range() {
         let plain = english(NumberFormatOptions::default());
         assert_eq!(range(&plain, 1.0, 2.0), "1–2");
