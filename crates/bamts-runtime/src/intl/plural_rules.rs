@@ -1637,6 +1637,8 @@ fn format_significant_result(
     finish_decimal(integer, fraction, trailing_zero_display)
 }
 
+/// The significant digits of a plain decimal. Every digit of a zero counts, so
+/// `0.00` has three.
 fn significant_digit_count(integer: &str, fraction: &str) -> usize {
     let combined = integer.bytes().chain(fraction.bytes());
     let mut seen_nonzero = false;
@@ -1649,7 +1651,11 @@ fn significant_digit_count(integer: &str, fraction: &str) -> usize {
             count += 1;
         }
     }
-    count.max(1)
+    if seen_nonzero {
+        count
+    } else {
+        fraction.len() + 1
+    }
 }
 
 fn finish_decimal(
@@ -2668,4 +2674,26 @@ fn is_unicode_type(value: &str) -> bool {
 
 fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::locale_data::DATA;
+    use super::super::number_data::NoHostLocale;
+    use super::{PluralCategory, PluralRules, PluralRulesOptions};
+
+    fn rules(options: &PluralRulesOptions) -> PluralRules<'static> {
+        PluralRules::try_new(&["en".to_owned()], options, &*DATA, &NoHostLocale).expect("rules")
+    }
+
+    #[test]
+    fn a_zero_has_as_many_significant_digits_as_it_shows() {
+        let minimum = rules(&PluralRulesOptions {
+            minimum_significant_digits: Some(3),
+            ..PluralRulesOptions::default()
+        });
+        assert_eq!(minimum.select(0.0).expect("zero"), PluralCategory::Other);
+        assert_eq!(minimum.select(-0.0).expect("zero"), PluralCategory::Other);
+        assert_eq!(minimum.select(1.0).expect("one"), PluralCategory::Other);
+    }
 }
