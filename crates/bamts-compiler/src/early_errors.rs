@@ -1356,6 +1356,7 @@ impl Walker<'_> {
                     self.callable(&constructor.parameters, Some(&body), inner);
                 }
                 ClassMember::Method(method) => {
+                    self.string_name(&method.name, context);
                     self.check_method_name(method, member.range());
                     self.accessor_parameters(
                         method.modifier,
@@ -1368,6 +1369,7 @@ impl Walker<'_> {
                     self.function(&method.function, true, false, context);
                 }
                 ClassMember::Property(property) => {
+                    self.string_name(&property.name, context);
                     self.check_field_name(
                         &property.name,
                         property.modifiers.is_static,
@@ -1381,6 +1383,7 @@ impl Walker<'_> {
                     }
                 }
                 ClassMember::AutoAccessor(accessor) => {
+                    self.string_name(&accessor.name, context);
                     self.check_field_name(
                         &accessor.name,
                         accessor.modifiers.is_static,
@@ -1641,11 +1644,25 @@ impl Walker<'_> {
         }
     }
 
+    /// A string that names a property is still a string literal in strict code.
+    fn string_name(&mut self, name: &PropertyName, context: Context) {
+        if let PropertyName::String(literal) = name
+            && context.strict
+            && has_legacy_escape(self.token_of(literal.data().token()))
+        {
+            self.error(
+                literal.range(),
+                "legacy octal is not allowed in strict code",
+            );
+        }
+    }
+
     fn object(&mut self, members: &[crate::syntax::ObjectMemberNode], context: Context) {
         let mut proto = 0;
         for member in members {
             match member.data() {
                 ObjectMember::Property(property) => {
+                    self.string_name(&property.name, context);
                     if property.shorthand
                         && (!matches!(property.name, PropertyName::Identifier(_))
                             || matches!(property.value.data(), Expression::Assignment(_)))
@@ -1666,6 +1683,7 @@ impl Walker<'_> {
                     self.expression(&property.value, context);
                 }
                 ObjectMember::Method(method) => {
+                    self.string_name(&method.name, context);
                     self.accessor_parameters(
                         method.modifier,
                         &method.function.parameters,
@@ -2370,6 +2388,31 @@ mod tests {
         for source in [
             "import { eval as x } from 'y';",
             "import { x as y } from 'y';",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_string_that_names_a_property_follows_strict_code() {
+        for source in [
+            r#""use strict"; ({ "\1": 1 });"#,
+            r#""use strict"; ({ "\8": 1 });"#,
+            r#""use strict"; ({ "\1"() {} });"#,
+            r#""use strict"; ({ get "\1"() { return 1; } });"#,
+            r#""use strict"; class C { "\1"() {} }"#,
+            r#"class C { "\1"() {} }"#,
+            r#"class C { "\1" = 1; }"#,
+            r#"class C { accessor "\1" = 1; }"#,
+            r#"function f() { "\1"; "use strict"; }"#,
+            r#""\1"; "use strict";"#,
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            r#"({ "\1": 1 });"#,
+            r#""use strict"; ({ "\0": 1 });"#,
+            r#""use strict"; ({ "\x41": 1 });"#,
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
