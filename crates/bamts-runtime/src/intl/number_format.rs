@@ -772,6 +772,14 @@ impl IntlMathematicalValue {
         matches!(self, Self::Nan)
     }
 
+    fn is_negative(&self) -> bool {
+        match self {
+            Self::Finite { negative, .. } => *negative,
+            Self::NegativeZero | Self::NegativeInfinity => true,
+            Self::PositiveInfinity | Self::Nan => false,
+        }
+    }
+
     /// Whether ICU, which compares the ends of a range before it rounds them, holds
     /// both as one value. It holds an integer that fits 64 bits exactly, and any other
     /// value as the nearest Number, so `"1e-400"` and `"2e-400"` are one value there.
@@ -1553,7 +1561,9 @@ impl<'a> NumberFormat<'a> {
         let end_prepared = self.prepare_format(end)?;
         let start_parts = self.partition_for_category(&start_prepared, PluralCategory::Other)?;
         let end_parts = self.partition_for_category(&end_prepared, PluralCategory::Other)?;
-        if concatenate_parts(&start_parts) == concatenate_parts(&end_parts)
+        let same_text = concatenate_parts(&start_parts) == concatenate_parts(&end_parts)
+            && start.is_negative() == end.is_negative();
+        if same_text
             || (start.same_in_icu(end) && beside_digits(&start_parts).eq(beside_digits(&end_parts)))
         {
             return self.approximate_range(self.partition_outer_pattern(&start_prepared)?);

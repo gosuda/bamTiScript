@@ -590,6 +590,18 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_sign_keeps_a_range_a_range() {
+        let unsigned = english(NumberFormatOptions {
+            sign_display: Some("never".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(range(&unsigned, -1.0, 1.0), "1–1");
+        assert_eq!(range(&unsigned, f64::NEG_INFINITY, f64::INFINITY), "∞–∞");
+        assert_eq!(range(&unsigned, 1.0, 1.0), "~1");
+        assert_eq!(range(&unsigned, 0.0, -0.0), "~0");
+    }
+
+    #[test]
     fn a_currency_symbol_keeps_the_short_compact_form() {
         let long = |display: &str| {
             english(NumberFormatOptions {
