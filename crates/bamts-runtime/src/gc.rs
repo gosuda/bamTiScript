@@ -76,11 +76,16 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 }
 
+/// The heap that starts the first collection, however large the limit is. Half of a
+/// large limit would let garbage fill gigabytes before anything collects it.
+const FIRST_COLLECTION_BYTES: usize = 32 << 20;
+const FIRST_COLLECTION_SLOTS: usize = 1 << 19;
+
 impl GcState {
     pub(super) fn new(limits: &Limits) -> Self {
         Self {
-            byte_watermark: limits.max_heap_bytes / 2,
-            slot_watermark: limits.max_heap_slots / 2,
+            byte_watermark: (limits.max_heap_bytes / 2).min(FIRST_COLLECTION_BYTES),
+            slot_watermark: (limits.max_heap_slots / 2).min(FIRST_COLLECTION_SLOTS),
             ..Self::default()
         }
     }

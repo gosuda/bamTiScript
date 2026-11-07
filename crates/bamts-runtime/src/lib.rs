@@ -14711,6 +14711,21 @@ mod tests {
     }
 
     #[test]
+    fn a_large_limit_does_not_delay_the_first_collection() {
+        let large = Limits {
+            max_heap_bytes: 1 << 32,
+            max_heap_slots: 1 << 30,
+            ..Limits::default()
+        };
+        with_machine(large, |machine| {
+            assert_eq!(machine.gc_watermarks_for_test(), (32 << 20, 1 << 19));
+        });
+        with_machine(Limits::default(), |machine| {
+            assert_eq!(machine.gc_watermarks_for_test(), (32 << 20, 1 << 19));
+        });
+    }
+
+    #[test]
     fn gc_recomputes_watermarks_from_live_usage() {
         with_machine(Limits::default(), |machine| {
             let value = machine
