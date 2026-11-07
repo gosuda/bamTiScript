@@ -746,6 +746,38 @@ fn jit_runs_two_module_program_with_live_imported_mutation() {
     assert_eq!(output.stdout, b"2\n");
 }
 
+/// Runs one compiled module and returns its output.
+fn run_compiled_module(source: &str) -> std::process::Output {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", source);
+    let executable = project
+        .path
+        .join(format!("module{}", std::env::consts::EXE_SUFFIX));
+    let compile = project.emit("main.ts", &executable);
+    assert_success(&compile, "bamts emit of a module");
+    Command::new(&executable)
+        .output()
+        .expect("the compiled module starts")
+}
+
+/// An import of a module's own export shares a cell with the export. The module
+/// writes the cell through the export, and only the import is read-only.
+#[test]
+fn a_module_writes_the_export_that_it_imports() {
+    let output = run_compiled_module(
+        "// @ts-nocheck\n\
+         import self from \"./main.js\";\n\
+         import { count as other } from \"./main.js\";\n\
+         export let count = 1;\n\
+         count = 2;\n\
+         export default 42;\n\
+         console.log(self, other);\n\
+         try {\n  other = 3;\n} catch (error) {\n  console.log(error.name);\n}\n",
+    );
+    assert_success(&output, "the module that imports itself");
+    assert_eq!(output.stdout, b"42 2\nTypeError\n");
+}
+
 /// The API keeps a budget of 1,000,000 instructions and 64 MiB, so that a request
 /// ends. A compiled program runs for its user and has neither.
 #[test]

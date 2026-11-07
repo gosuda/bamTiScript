@@ -1986,6 +1986,9 @@ struct ExternalExport {
 struct ModuleInstance {
     binding_cells: Vec<Option<CellId>>,
     constant_cells: Vec<Option<CellId>>,
+    /// Whether a constant names an import. One cell can have two names: a module
+    /// that imports its own export reads the cell that it writes.
+    constant_is_import: Vec<bool>,
     namespace: Option<Value>,
     state: ModuleState,
     import_meta: Option<Value>,
@@ -4592,6 +4595,7 @@ impl<'a, H: Host> Machine<'a, H> {
         self.registry.modules.push(ModuleInstance {
             binding_cells: Vec::new(),
             constant_cells: Vec::new(),
+            constant_is_import: Vec::new(),
             namespace: None,
             import_meta: None,
             state: ModuleState::Unevaluated,
@@ -4637,6 +4641,7 @@ impl<'a, H: Host> Machine<'a, H> {
             .iter()
             .map(|module| ModuleInstance {
                 binding_cells: vec![None; module.bindings.len()],
+                constant_is_import: vec![false; module.code.constants().len()],
                 constant_cells: vec![None; module.code.constants().len()],
                 namespace: None,
                 import_meta: None,
@@ -4734,13 +4739,17 @@ impl<'a, H: Host> Machine<'a, H> {
                 let Constant::String(name) = constant else {
                     continue;
                 };
-                if let Some((binding_index, _)) =
+                if let Some((binding_index, binding)) =
                     bindings.iter().enumerate().find(|(_, binding)| {
                         self.constant_text(ModuleId::new(module_index as u32), binding.name) == name
                     })
                 {
                     self.registry.modules[module_index].constant_cells[constant_index] =
                         self.registry.modules[module_index].binding_cells[binding_index];
+                    self.registry.modules[module_index].constant_is_import[constant_index] = matches!(
+                        binding.kind,
+                        BindingKind::Imported { .. } | BindingKind::Namespace { .. }
+                    );
                 }
             }
         }
@@ -6936,15 +6945,8 @@ impl<'a, H: Host> Machine<'a, H> {
             .copied()
             .flatten();
         if let Some(cell) = cell {
-            let binding = self.registry.modules[module.get() as usize]
-                .binding_cells
-                .iter()
-                .position(|candidate| *candidate == Some(cell))
-                .expect("mapped module cell belongs to a binding");
-            if matches!(
-                self.program_module(module).bindings[binding].kind,
-                BindingKind::Imported { .. } | BindingKind::Namespace { .. }
-            ) {
+            if self.registry.modules[module.get() as usize].constant_is_import[name.get() as usize]
+            {
                 return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "assign to immutable module binding",
                 }));
