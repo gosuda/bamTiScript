@@ -590,6 +590,25 @@ mod tests {
     }
 
     #[test]
+    fn an_accounting_negative_has_no_place_for_the_approximately_sign() {
+        let accounting = english(NumberFormatOptions {
+            style: Some("currency".to_owned()),
+            currency: Some("USD".to_owned()),
+            currency_sign: Some("accounting".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(range(&accounting, -1.0, -1.0), "($1.00)");
+        assert_eq!(range(&accounting, -0.0, -0.0), "($0.00)");
+        assert_eq!(range(&accounting, 1.0, 1.0), "~$1.00");
+        let standard = english(NumberFormatOptions {
+            style: Some("currency".to_owned()),
+            currency: Some("USD".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(range(&standard, -1.0, -1.0), "~-$1.00");
+    }
+
+    #[test]
     fn a_hidden_sign_keeps_a_range_a_range() {
         let unsigned = english(NumberFormatOptions {
             sign_display: Some("never".to_owned()),

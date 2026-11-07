@@ -1566,7 +1566,7 @@ impl<'a> NumberFormat<'a> {
         if same_text
             || (start.same_in_icu(end) && beside_digits(&start_parts).eq(beside_digits(&end_parts)))
         {
-            return self.approximate_range(self.partition_outer_pattern(&start_prepared)?);
+            return self.approximate_range(&start_prepared);
         }
         let (start_prefix, start_number, start_suffix) = split_number(&start_parts);
         let (end_prefix, end_number, end_suffix) = split_number(&end_parts);
@@ -2095,11 +2095,20 @@ impl<'a> NumberFormat<'a> {
         }
     }
 
+    /// The range of one value. The approximately sign stands with the sign of a pattern,
+    /// so a negative pattern with no minus sign, as in accounting, has no place for it.
     fn approximate_range(
         &self,
-        number_parts: Vec<NumberPart>,
+        prepared: &PreparedFormat,
     ) -> Result<Vec<NumberRangePart>, NumberFormatError> {
-        let tokens = partition_pattern(&self.range_patterns.approximate)?;
+        let number_parts = self.partition_outer_pattern(prepared)?;
+        let pattern = self.pattern_for_value(&prepared.rounded);
+        let unsigned = pattern == self.patterns.negative && !pattern.contains("{minusSign}");
+        let tokens = partition_pattern(if unsigned {
+            "{number}"
+        } else {
+            &self.range_patterns.approximate
+        })?;
         let mut result = Vec::new();
         for token in tokens {
             match token {
