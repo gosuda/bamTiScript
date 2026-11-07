@@ -127,6 +127,8 @@ const MAX_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1 << 20;
 const READ_CHUNK: usize = 8192;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// How long output drains may run after the process group of a timed-out run ends.
+const DRAIN_GRACE: Duration = Duration::from_secs(1);
 const NODE_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const NODE_VERSION_OUTPUT_CAP: usize = 128;
 /// Wall-clock bound for the AOT compile lane. A case timeout bounds the
@@ -1792,6 +1794,41 @@ pub(crate) fn run_process(
         thread::sleep(POLL_INTERVAL);
     };
 
+    // The drains end when nothing holds the pipes, and a child that this process left
+    // can hold them for as long as it runs. The timeout covers that wait too. A holder
+    // that survives keeps its thread blocked, and nothing waits for the thread.
+    let drained = |deadline: Instant| {
+        while !(stdout_handle.is_finished() && stderr_handle.is_finished()) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        true
+    };
+    if !drained(start + limits.timeout) {
+        if !timed_out {
+            timed_out = true;
+            let _ = terminate_process_group(&mut child, label);
+        }
+        if !drained(Instant::now() + DRAIN_GRACE) {
+            if let Some(error) = termination_error {
+                return Err(error);
+            }
+            return Ok(OracleOutcome {
+                timed_out,
+                exit_code: None,
+                signal: termination_signal(&status),
+                stdout: Vec::new(),
+                stdout_truncated: false,
+                stderr: Vec::new(),
+                stderr_truncated: false,
+                compile_stderr: Vec::new(),
+                compile_stderr_truncated: false,
+            });
+        }
+    }
+
     let (stdout, stdout_truncated) = stdout_handle
         .join()
         .map_err(|_| thread_error(label, "stdout"))?;
@@ -2958,6 +2995,26 @@ mod tests {
         assert_eq!(outcome.exit_code, Some(0));
         assert_eq!(outcome.stdout.len(), 1000);
         assert!(outcome.stdout_truncated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A detached child leaves the process group, so nothing here can end it, and it
+    /// inherits both pipes after the process that started it exits.
+    #[test]
+    fn oracle_does_not_wait_for_a_child_that_holds_the_pipes() {
+        let dir = scratch("holder");
+        let started = Instant::now();
+        let outcome = run_script(
+            &dir,
+            "process.getBuiltinModule('node:child_process').spawn(process.execPath, \
+             ['-e', 'setTimeout(() => {}, 30000)'], { detached: true, stdio: 'inherit' }).unref();",
+            OracleLimits {
+                timeout: Duration::from_secs(3),
+                max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            },
+        );
+        assert!(outcome.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(20));
         let _ = fs::remove_dir_all(&dir);
     }
 
