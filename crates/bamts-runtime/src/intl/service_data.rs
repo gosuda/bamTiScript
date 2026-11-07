@@ -23,7 +23,8 @@ const ORDINAL: [PluralCategory; 4] = [
     PluralCategory::Other,
 ];
 
-/// The English ordinal rule, on the integer digits.
+/// The English ordinal rule, on the integer digits of a whole `n`. The rule reads
+/// `n` and not `v`, so `1.00` is whole.
 fn ordinal(integer: &str) -> PluralCategory {
     let last = |count: usize| {
         integer
@@ -269,7 +270,7 @@ impl IntlServiceDataProvider for IntlData {
         Some(match rule_type {
             PluralRuleType::Cardinal if operands.i == "1" && operands.v == 0 => PluralCategory::One,
             PluralRuleType::Cardinal => PluralCategory::Other,
-            PluralRuleType::Ordinal if operands.v == 0 => ordinal(&operands.i),
+            PluralRuleType::Ordinal if operands.w == 0 => ordinal(&operands.i),
             PluralRuleType::Ordinal => PluralCategory::Other,
         })
     }

@@ -2696,4 +2696,18 @@ mod tests {
         assert_eq!(minimum.select(-0.0).expect("zero"), PluralCategory::Other);
         assert_eq!(minimum.select(1.0).expect("one"), PluralCategory::Other);
     }
+
+    #[test]
+    fn an_ordinal_reads_the_value_and_not_the_digits_shown() {
+        let padded = rules(&PluralRulesOptions {
+            plural_type: Some("ordinal".to_owned()),
+            minimum_significant_digits: Some(3),
+            ..PluralRulesOptions::default()
+        });
+        assert_eq!(padded.select(1.0).expect("1.00"), PluralCategory::One);
+        assert_eq!(padded.select(2.0).expect("2.00"), PluralCategory::Two);
+        assert_eq!(padded.select(3.0).expect("3.00"), PluralCategory::Few);
+        assert_eq!(padded.select(1.5).expect("1.50"), PluralCategory::Other);
+        assert_eq!(padded.select(11.0).expect("11.0"), PluralCategory::Other);
+    }
 }
