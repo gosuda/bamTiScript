@@ -275,13 +275,15 @@ impl IntlServiceDataProvider for IntlData {
         })
     }
 
+    /// Every English range is `other`, cardinal or ordinal. CLDR says so for the pairs
+    /// that it lists, and `other` is its fallback for the rest.
     fn plural_range(
         &self,
         _locale: &str,
         _start: PluralCategory,
-        end: PluralCategory,
+        _end: PluralCategory,
     ) -> Option<PluralCategory> {
-        Some(end)
+        Some(PluralCategory::Other)
     }
 
     fn format_number(

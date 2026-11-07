@@ -2710,4 +2710,23 @@ mod tests {
         assert_eq!(padded.select(1.5).expect("1.50"), PluralCategory::Other);
         assert_eq!(padded.select(11.0).expect("11.0"), PluralCategory::Other);
     }
+
+    #[test]
+    fn every_english_range_is_other() {
+        let cardinal = rules(&PluralRulesOptions::default());
+        let ordinal = rules(&PluralRulesOptions {
+            plural_type: Some("ordinal".to_owned()),
+            ..PluralRulesOptions::default()
+        });
+        for (start, end) in [(0.0, 1.0), (1.0, 1.0), (1.0, 2.0), (2.0, 1.0), (1.0, 3.0)] {
+            assert_eq!(
+                cardinal.select_range(start, end).expect("cardinal"),
+                PluralCategory::Other
+            );
+            assert_eq!(
+                ordinal.select_range(start, end).expect("ordinal"),
+                PluralCategory::Other
+            );
+        }
+    }
 }
