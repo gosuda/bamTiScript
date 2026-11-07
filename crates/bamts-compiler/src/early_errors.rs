@@ -139,13 +139,19 @@ fn walk(file: &SourceFile, context: Context) -> Vec<Diagnostic> {
         labels: Vec::new(),
         private_scopes: Vec::new(),
     };
-    walker.scope(file.statements(), ScopeKind::Program, context);
+    let program = Context {
+        program_level: true,
+        ..context
+    };
+    walker.scope(file.statements(), ScopeKind::Program, program);
     walker.errors
 }
 
 /// What the surrounding code allows at the node being walked.
 #[derive(Clone, Copy, Debug, Default)]
 struct Context {
+    /// A statement of the program itself, where `import` and `export` belong.
+    program_level: bool,
     strict: bool,
     module: bool,
     /// The host named the goal, so `import.meta` is decidable.
@@ -924,6 +930,19 @@ impl Walker<'_> {
     // --- Statements ------------------------------------------------------
 
     fn statement(&mut self, statement: &Stmt, context: Context) {
+        let program_level = context.program_level;
+        let context = Context {
+            program_level: false,
+            ..context
+        };
+        if !program_level
+            && matches!(
+                statement.data(),
+                Statement::Import(_) | Statement::Export(_)
+            )
+        {
+            self.error(statement.range(), "module syntax needs the top level");
+        }
         let looping = Context {
             in_iteration: true,
             ..context
@@ -2303,6 +2322,27 @@ mod tests {
             "function* g() { (x = () => { yield; }) => 1; }",
             "function* g() { (x) => yield; }",
             "(x = yield) => 1;",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    #[test]
+    fn module_syntax_belongs_to_the_top_level() {
+        for source in [
+            "{ import a from 'x'; }",
+            "function f() { import a from 'x'; }",
+            "if (1) import a from 'x';",
+            "if (1) { export { a }; } var a;",
+            "{ export default 1; }",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "import a from 'x';",
+            "export { a }; var a;",
+            "import('x');",
+            "{ import('x'); }",
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
