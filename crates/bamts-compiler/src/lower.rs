@@ -3,7 +3,7 @@ use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar, EnumValue};
 use crate::jsx_desugar::JsxSourceDesugarPlan;
 use crate::literal::{
     BigIntTextError, MAX_BIGINT_CONVERSION_LIMB_OPS, canonical_bigint_text, cook_escapes,
-    number_value, string_value,
+    has_cooked_value, number_value, string_value,
 };
 use crate::namespace_plan::{ContainerAcquisition, NamespaceFacts};
 pub use crate::program::{
@@ -6338,8 +6338,12 @@ impl<'a> FunctionContext<'a> {
         let raw = self.raw_template_parts(&tagged.template)?;
         let strings = self.alloc_register(range)?;
         self.emit(range, Instruction::CreateArray { dst: strings })?;
-        for part in &cooked {
-            let value = self.string_reg(builder, part.clone(), range)?;
+        for (part, element) in cooked.iter().zip(&tagged.template.elements) {
+            let value = if self.template_element_is_cooked(element) {
+                self.string_reg(builder, part.clone(), range)?
+            } else {
+                self.undefined(builder, range)?
+            };
             self.emit(
                 range,
                 Instruction::ArrayPush {
@@ -6419,6 +6423,12 @@ impl<'a> FunctionContext<'a> {
             .iter()
             .map(|element| self.template_element_text(element, false))
             .collect()
+    }
+    fn template_element_is_cooked(&self, element: &TemplateElementNode) -> bool {
+        let token = element.data().token();
+        self.file
+            .token_text(token)
+            .is_none_or(|text| has_cooked_value(trim_template_delimiters(text, token.kind())))
     }
     fn template_element_text(
         &self,

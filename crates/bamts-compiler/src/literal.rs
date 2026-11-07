@@ -185,6 +185,51 @@ pub(crate) fn cook_escapes(input: &str) -> EcmaString {
     cook(input, false)
 }
 
+/// Whether a template interior has a cooked value. Every escape must be valid, and a
+/// tag reads `undefined` for an interior that fails.
+pub(crate) fn has_cooked_value(input: &str) -> bool {
+    let mut chars = input.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            continue;
+        }
+        let valid = match chars.next() {
+            Some('1'..='9') => false,
+            Some('0') => !chars.peek().is_some_and(char::is_ascii_digit),
+            Some('x') => has_hex_digits(&mut chars, 2),
+            Some('u') if chars.peek() == Some(&'{') => has_braced_code_point(&mut chars),
+            Some('u') => has_hex_digits(&mut chars, 4),
+            _ => true,
+        };
+        if !valid {
+            return false;
+        }
+    }
+    true
+}
+
+fn has_hex_digits(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, count: usize) -> bool {
+    (0..count).all(|_| chars.next().is_some_and(|digit| digit.is_ascii_hexdigit()))
+}
+
+/// Reads the `{` that the cursor is on, then the code point and its `}`.
+fn has_braced_code_point(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    chars.next();
+    let mut value = 0_u32;
+    let mut any = false;
+    for character in chars.by_ref() {
+        if character == '}' {
+            return any && value <= 0x0010_FFFF;
+        }
+        let Some(digit) = character.to_digit(16) else {
+            return false;
+        };
+        value = value.saturating_mul(16).saturating_add(digit);
+        any = true;
+    }
+    false
+}
+
 /// Cooks the value of a legacy octal escape, whose first digit is `first`. It reads
 /// up to three digits, and stops at two when a third would pass 0o377.
 fn cook_legacy_octal(first: u32, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> u16 {
@@ -375,7 +420,7 @@ fn cook_unicode_escape(
 
 #[cfg(test)]
 mod tests {
-    use super::{cook_escapes, number_value, string_value};
+    use super::{cook_escapes, has_cooked_value, number_value, string_value};
 
     #[test]
     fn cooks_numbers_and_utf16_strings() {
@@ -508,6 +553,43 @@ mod tests {
             assert_eq!(string_value(lexeme).unwrap().as_units(), units, "{lexeme}");
         }
         assert_eq!(cook_escapes(r"\101"), string_value("'101'").unwrap());
+    }
+
+    #[test]
+    fn a_template_interior_has_a_cooked_value_only_with_valid_escapes() {
+        for interior in [
+            "plain",
+            r"\0",
+            r"\0a",
+            r"\n",
+            r"\x41",
+            r"A",
+            r"\u{41}",
+            r"\u{10FFFF}",
+            r"\$",
+            "a\\\nb",
+        ] {
+            assert!(has_cooked_value(interior), "{interior}");
+        }
+        for interior in [
+            r"\1",
+            r"\8",
+            r"\01",
+            r"\08",
+            r"\x",
+            r"\x4",
+            r"\xg",
+            r"\u",
+            r"\u004",
+            r"\u{",
+            r"\u{}",
+            r"\u{41",
+            r"\u{g}",
+            r"\u{110000}",
+            r"a\n\1",
+        ] {
+            assert!(!has_cooked_value(interior), "{interior}");
+        }
     }
 
     #[test]
