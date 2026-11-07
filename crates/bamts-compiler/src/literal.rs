@@ -177,11 +177,31 @@ pub(crate) fn string_value(lexeme: &str) -> Option<EcmaString> {
         return None;
     }
     let interior = lexeme.get(1..lexeme.len().checked_sub(1)?)?;
-    Some(cook_escapes(interior))
+    Some(cook(interior, true))
 }
 
-/// Cooks JavaScript escape sequences in a string or template interior.
+/// Cooks JavaScript escape sequences in a template interior.
 pub(crate) fn cook_escapes(input: &str) -> EcmaString {
+    cook(input, false)
+}
+
+/// Cooks the value of a legacy octal escape, whose first digit is `first`. It reads
+/// up to three digits, and stops at two when a third would pass 0o377.
+fn cook_legacy_octal(first: u32, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> u16 {
+    let most_digits = if first <= 3 { 3 } else { 2 };
+    let mut value = first;
+    for _ in 1..most_digits {
+        let Some(digit) = chars.peek().and_then(|next| next.to_digit(8)) else {
+            break;
+        };
+        chars.next();
+        value = value * 8 + digit;
+    }
+    u16::try_from(value).expect("three octal digits fit a code unit")
+}
+
+/// `legacy` reads the octal escapes of a string literal, which a template refuses.
+fn cook(input: &str, legacy: bool) -> EcmaString {
     if !input.contains('\\') {
         return EcmaString::encode(input);
     }
@@ -206,6 +226,10 @@ pub(crate) fn cook_escapes(input: &str) -> EcmaString {
             'f' => output.push_unit(0x000C),
             'v' => output.push_unit(0x000B),
             '0' if !chars.peek().is_some_and(|c| c.is_ascii_digit()) => output.push_unit(0),
+            '0'..='7' if legacy => {
+                let first = escape.to_digit(8).expect("an octal digit");
+                output.push_unit(cook_legacy_octal(first, &mut chars));
+            }
             '\n' => {}
             '\r' => {
                 if chars.peek() == Some(&'\n') {
@@ -459,6 +483,31 @@ mod tests {
             number_value(&format!("0o1{}", "0".repeat(342))),
             Some(f64::INFINITY)
         );
+    }
+
+    #[test]
+    fn cooks_legacy_octal_escapes_in_strings_only() {
+        for (lexeme, units) in [
+            (r#""\101""#, &[65][..]),
+            (r#"'\101\102'"#, &[65, 66]),
+            (r#""\0""#, &[0]),
+            (r#""\08""#, &[0, 56]),
+            (r#""\00""#, &[0]),
+            (r#""\000""#, &[0]),
+            (r#""\0000""#, &[0, 48]),
+            (r#""\1""#, &[1]),
+            (r#""\18""#, &[1, 56]),
+            (r#""\78""#, &[7, 56]),
+            (r#""\8""#, &[56]),
+            (r#""\9""#, &[57]),
+            (r#""\377""#, &[255]),
+            (r#""\400""#, &[32, 48]),
+            (r#""\777""#, &[63, 55]),
+            (r#""\12a""#, &[10, 97]),
+        ] {
+            assert_eq!(string_value(lexeme).unwrap().as_units(), units, "{lexeme}");
+        }
+        assert_eq!(cook_escapes(r"\101"), string_value("'101'").unwrap());
     }
 
     #[test]
