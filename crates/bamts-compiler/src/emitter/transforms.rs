@@ -3218,16 +3218,22 @@ impl<'a> Rewriter<'a> {
             }
             AssignmentTarget::Array(pattern) => {
                 for (index, element) in pattern.elements.iter().enumerate() {
-                    let AssignmentArrayElement::Target(inner) = element else {
-                        continue;
-                    };
-                    let index_expr = self.number_expr(&index.to_string());
-                    let member = self.member_expr(
-                        value,
-                        MemberProperty::Computed(Box::new(index_expr)),
-                        range,
-                    );
-                    self.assign_or_recurse(inner, member, statements, range);
+                    match element {
+                        AssignmentArrayElement::Target(inner) => {
+                            let index_expr = self.number_expr(&index.to_string());
+                            let member = self.member_expr(
+                                value,
+                                MemberProperty::Computed(Box::new(index_expr)),
+                                range,
+                            );
+                            self.assign_or_recurse(inner, member, statements, range);
+                        }
+                        AssignmentArrayElement::Rest(inner) => {
+                            let slice = self.slice_of(value, index, range);
+                            self.assign_or_recurse(inner, slice, statements, range);
+                        }
+                        AssignmentArrayElement::Elision | AssignmentArrayElement::Missing(_) => {}
+                    }
                 }
             }
             AssignmentTarget::Missing(_) => {}
@@ -3363,7 +3369,13 @@ impl<'a> Rewriter<'a> {
     }
 
     fn slice_call(&mut self, object: &IdentifierNode, start: usize, range: TextRange) -> Expr {
-        let member = self.member_ident(object, "slice", range);
+        let object = self.node(object.range(), Expression::Identifier(object.clone()));
+        self.slice_of(&object, start, range)
+    }
+
+    fn slice_of(&mut self, object: &Expr, start: usize, range: TextRange) -> Expr {
+        let property = self.ident("slice");
+        let member = self.member_expr(object, MemberProperty::Named(property), range);
         let start_expr = self.number_expr(&start.to_string());
         self.node(
             range,
@@ -13728,7 +13740,7 @@ export var a: any, b: any, c: any, d: any, e: any, f: any;
 [...f] = [9];
 "#;
         let report = "console.log(JSON.stringify([exports.a, exports.b, exports.c, exports.d, exports.e, exports.f]));";
-        for target in [ScriptTarget::Es2015, ScriptTarget::Es2020] {
+        for target in EMIT_TARGETS {
             assert_eq!(node_prints(source, target, report), "[1,[2,3],[5],6,7,[9]]");
         }
     }
