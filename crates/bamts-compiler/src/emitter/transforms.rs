@@ -13703,6 +13703,36 @@ for ([b] of [[3], [4]]) {}
         }
     }
 
+    /// tsc 7.0.2 prints a loop head that writes a local of `export { c }` as it stands,
+    /// so `exports.c` keeps its value. Parity keeps that gap.
+    #[test]
+    fn a_loop_head_does_not_publish_a_local_exported_by_a_specifier() {
+        let source = "var c: any = 0;\nexport { c };\nfor (c of [5, 6]) {}\n";
+        for target in [ScriptTarget::Es2015, ScriptTarget::Es2020] {
+            assert!(
+                commonjs_at(source, target).contains("for (c of [5, 6]) { }"),
+                "{target:?}"
+            );
+            let report = "console.log(JSON.stringify(exports.c));";
+            assert_eq!(node_prints(source, target, report), "0");
+        }
+    }
+
+    #[test]
+    fn node_executes_the_rest_of_an_array_assignment() {
+        let source = r#"
+export var a: any, b: any, c: any, d: any, e: any, f: any;
+[a, ...b] = [1, 2, 3];
+[, ...c] = [4, 5];
+[d, ...[e]] = [6, 7, 8];
+[...f] = [9];
+"#;
+        let report = "console.log(JSON.stringify([exports.a, exports.b, exports.c, exports.d, exports.e, exports.f]));";
+        for target in [ScriptTarget::Es2015, ScriptTarget::Es2020] {
+            assert_eq!(node_prints(source, target, report), "[1,[2,3],[5],6,7,[9]]");
+        }
+    }
+
     #[test]
     fn a_string_named_constructor_is_the_constructor() {
         // quotedConstructors.js: a string with the value `constructor` makes the

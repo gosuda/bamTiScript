@@ -8287,7 +8287,9 @@ impl<'src> Binder<'src> {
             }
             crate::syntax::AssignmentTarget::Array(array) => {
                 for element in &array.elements {
-                    if let crate::syntax::AssignmentArrayElement::Target(target) = element {
+                    if let crate::syntax::AssignmentArrayElement::Target(target)
+                    | crate::syntax::AssignmentArrayElement::Rest(target) = element
+                    {
                         self.reserve_assignment_target(
                             target,
                             scope,
@@ -9868,7 +9870,9 @@ impl<'src> Binder<'src> {
             }
             AssignmentTarget::Array(array) => {
                 for element in &array.elements {
-                    if let crate::syntax::AssignmentArrayElement::Target(target) = element {
+                    if let crate::syntax::AssignmentArrayElement::Target(target)
+                    | crate::syntax::AssignmentArrayElement::Rest(target) = element
+                    {
                         self.invalidate_assignment_flow(target);
                     }
                 }
@@ -9924,7 +9928,9 @@ impl<'src> Binder<'src> {
             }
             AssignmentTarget::Array(array) => {
                 for element in &array.elements {
-                    if let crate::syntax::AssignmentArrayElement::Target(target) = element {
+                    if let crate::syntax::AssignmentArrayElement::Target(target)
+                    | crate::syntax::AssignmentArrayElement::Rest(target) = element
+                    {
                         self.inventory_assignment_target_writes(target, inventory);
                     }
                 }
@@ -19265,7 +19271,8 @@ impl<'src> Binder<'src> {
             AssignmentTarget::Array(array) => {
                 for element in &array.elements {
                     match element {
-                        crate::syntax::AssignmentArrayElement::Target(inner) => {
+                        crate::syntax::AssignmentArrayElement::Target(inner)
+                        | crate::syntax::AssignmentArrayElement::Rest(inner) => {
                             self.resolve_assignment_target(inner, scope);
                         }
                         crate::syntax::AssignmentArrayElement::Missing(_) => {
@@ -26912,6 +26919,15 @@ mod tests {
                 .expect("test source fits the per-file budget")
                 .with_declaration_file(true),
         )
+    }
+
+    #[test]
+    fn the_rest_target_of_an_array_assignment_is_resolved() {
+        let (_, diagnostics) = bound("var known: number[] = [];\n[...missing] = known;\n");
+        let codes: Vec<_> = diagnostics.iter().map(Diagnostic::code).collect();
+        assert_eq!(codes, [CANNOT_FIND_NAME]);
+        let (_, diagnostics) = bound("var known: number[] = [];\n[...known] = known;\n");
+        assert_eq!(diagnostics.len(), 0, "{diagnostics:?}");
     }
 
     fn bound(text: &str) -> (super::SemanticModel, Vec<Diagnostic>) {
