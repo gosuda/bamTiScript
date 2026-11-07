@@ -42,7 +42,7 @@
 use std::sync::Arc;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
-use crate::scanner::ScannedSource;
+use crate::scanner::{INVALID_ESCAPE, INVALID_UNICODE_ESCAPE, ScannedSource};
 use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
 use crate::syntax::{
     Accessibility, ArrayBindingElement, ArrayBindingPattern, ArrayElement, ArrayLiteral,
@@ -227,11 +227,18 @@ pub fn parse_with_cancel(
     // Spans reinterpreted as JSX likewise supersede the default pass's lexical
     // diagnostics: character data and attribute strings were mis-lexed there.
     let jsx_spans = &parser.jsx_spans;
+    // A tag accepts any escape and reads a value of `undefined` for a bad one, so the
+    // text of a tagged template keeps no escape diagnostic.
+    let tagged_spans = &parser.tagged_spans;
     let mut diagnostics = lexical;
     diagnostics.retain(|diagnostic| {
         let start = diagnostic.range().start().get();
         let in_span = |span: &TextRange| start >= span.start().get() && start < span.end().get();
-        !regex_spans.iter().any(in_span) && !jsx_spans.iter().any(in_span)
+        let code = diagnostic.code();
+        let escape = code == INVALID_ESCAPE || code == INVALID_UNICODE_ESCAPE;
+        !regex_spans.iter().any(in_span)
+            && !jsx_spans.iter().any(in_span)
+            && !(escape && tagged_spans.iter().any(in_span))
     });
     diagnostics.extend(parser.diagnostics.iter().cloned());
     diagnostics.sort();
@@ -277,6 +284,7 @@ struct ParserCheckpoint {
     next_node_id: u32,
     journal: usize,
     jsx_spans: usize,
+    tagged_spans: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -326,6 +334,8 @@ struct Parser {
     /// recorded inside them reflect a non-JSX reading and are dropped, mirroring
     /// the regex-rescan span handling.
     jsx_spans: Vec<TextRange>,
+    /// The text of every tagged template, which takes any escape.
+    tagged_spans: Vec<TextRange>,
     /// Cooperative cancellation signal checked at statement and list boundaries.
     cancel: CancellationToken,
 }
@@ -494,6 +504,7 @@ impl Parser {
             keyword_context: KeywordContext::default(),
             ambient: AmbientContext::None,
             jsx_spans: Vec::new(),
+            tagged_spans: Vec::new(),
             cancel,
         };
         parser.cursor = parser.next_significant(0);
@@ -815,6 +826,7 @@ impl Parser {
             next_node_id: self.next_node_id,
             journal: self.journal.len(),
             jsx_spans: self.jsx_spans.len(),
+            tagged_spans: self.tagged_spans.len(),
         }
     }
 
@@ -829,6 +841,7 @@ impl Parser {
         self.diagnostics.truncate(checkpoint.diagnostics);
         self.next_node_id = checkpoint.next_node_id;
         self.jsx_spans.truncate(checkpoint.jsx_spans);
+        self.tagged_spans.truncate(checkpoint.tagged_spans);
     }
 
     // ------------------------------------------------------------------
@@ -3845,14 +3858,7 @@ impl Parser {
                     );
                 }
                 TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead => {
-                    let template = self.parse_template_literal();
-                    expr = self.node(
-                        start,
-                        Expression::TaggedTemplate(TaggedTemplateExpression {
-                            tag: Box::new(expr),
-                            template,
-                        }),
-                    );
+                    expr = self.parse_tagged_template(start, expr);
                 }
                 _ if self.at_less_like() => {
                     // `f<T>(...)` / `f<T>\`...\``: only a call/tagged-template
@@ -3876,14 +3882,7 @@ impl Parser {
                         self.kind(),
                         TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead
                     ) {
-                        let template = self.parse_template_literal();
-                        expr = self.node(
-                            start,
-                            Expression::TaggedTemplate(TaggedTemplateExpression {
-                                tag: Box::new(expr),
-                                template,
-                            }),
-                        );
+                        expr = self.parse_tagged_template(start, expr);
                     } else {
                         break;
                     }
@@ -3892,6 +3891,19 @@ impl Parser {
             }
         }
         expr
+    }
+
+    fn parse_tagged_template(&mut self, start: Utf16Pos, tag: Expr) -> Expr {
+        let template = self.parse_template_literal();
+        self.tagged_spans
+            .extend(template.elements.iter().map(|element| element.range()));
+        self.node(
+            start,
+            Expression::TaggedTemplate(TaggedTemplateExpression {
+                tag: Box::new(tag),
+                template,
+            }),
+        )
     }
 
     fn parse_optional_chain_link(&mut self, start: Utf16Pos, expr: Expr, no_call: bool) -> Expr {
@@ -7228,6 +7240,23 @@ mod tests {
             );
         }
         assert_eq!(parameter_names, ["B", "x", "public"]);
+    }
+
+    /// Only a tag takes a bad escape, and a tag does not cover the substitutions.
+    #[test]
+    fn a_tag_takes_any_escape_in_its_own_text() {
+        let escapes = |text: &str| {
+            parse_ts(text)
+                .diagnostics()
+                .iter()
+                .filter(|d| matches!(d.code().as_str(), "BAMTS-L006" | "BAMTS-L007"))
+                .count()
+        };
+        assert_eq!(escapes(r"tag`\xg \u12 \u{110000}`;"), 0);
+        assert_eq!(escapes(r"tag`${1}\xg${2}\u12`;"), 0);
+        assert_eq!(escapes(r"tag<T>`\xg`;"), 0);
+        assert_eq!(escapes(r"`\xg`;"), 1);
+        assert_eq!(escapes(r"tag`${`\xg`}`;"), 1);
     }
 
     #[test]

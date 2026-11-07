@@ -48,9 +48,9 @@ const UNTERMINATED_REGEX: DiagnosticCode = DiagnosticCode::new("BAMTS-L004");
 /// A character that cannot begin any token.
 const UNEXPECTED_CHARACTER: DiagnosticCode = DiagnosticCode::new("BAMTS-L005");
 /// A malformed escape sequence.
-const INVALID_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L006");
+pub(crate) const INVALID_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L006");
 /// A malformed unicode escape sequence.
-const INVALID_UNICODE_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L007");
+pub(crate) const INVALID_UNICODE_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L007");
 /// A misplaced numeric separator.
 const INVALID_NUMERIC_SEPARATOR: DiagnosticCode = DiagnosticCode::new("BAMTS-L008");
 /// A numeric literal with no valid digits.
