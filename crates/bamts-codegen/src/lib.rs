@@ -853,6 +853,8 @@ const fn unary_op_selector(op: UnaryOp) -> i64 {
         UnaryOp::Negate => 3,
         UnaryOp::BitwiseNot => 4,
         UnaryOp::LogicalNot => 5,
+        UnaryOp::ToString => 6,
+        UnaryOp::ToPropertyKey => 7,
     }
 }
 
@@ -919,6 +921,8 @@ const fn accessor_kind_selector(kind: AccessorKind) -> i64 {
     match kind {
         AccessorKind::Getter => 0,
         AccessorKind::Setter => 1,
+        AccessorKind::ClassGetter => 2,
+        AccessorKind::ClassSetter => 3,
     }
 }
 
@@ -929,6 +933,7 @@ const fn descriptor_slot_selector(slot: DescriptorSlot) -> i64 {
         DescriptorSlot::Value => 0,
         DescriptorSlot::Getter => 1,
         DescriptorSlot::Setter => 2,
+        DescriptorSlot::Entire => 4,
     }
 }
 

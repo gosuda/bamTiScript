@@ -17,6 +17,7 @@ use std::{
 use bamts_compiler::diagnostic::Diagnostic;
 use bamts_compiler::parser::parse;
 use bamts_compiler::program::ProgramLoader;
+use bamts_compiler::project::resolution_trace::display_path;
 use bamts_compiler::project::{ProjectConfig, ProjectRoot};
 use bamts_compiler::scanner::scan;
 use bamts_compiler::source::{ScriptKind, SourceId, SourceText};
@@ -290,7 +291,6 @@ pub struct SuiteSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompilerSnapshot {
     pub root: PathBuf,
-    pub metadata_digest: String,
     pub index: SuiteIndex,
 }
 
@@ -2081,7 +2081,6 @@ pub fn load_bound_compiler_snapshot(
     validate_suite_index(&index)?;
     Ok(CompilerSnapshot {
         root: snapshot_root,
-        metadata_digest: sha256_hex_concat(&[&pin_bytes, &index_bytes, &ledger_bytes]),
         index,
     })
 }
@@ -2608,7 +2607,7 @@ pub fn materialize_from_extracted(
     })
 }
 
-const COMPILER_CATALOG: &str = "typescript-7.0.2";
+pub(crate) const COMPILER_CATALOG: &str = "typescript-7.0.2";
 
 /// Exact compiler-lane observation of one catalog key through BamTS check cells.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3172,7 +3171,7 @@ fn produce_project_trace(
     if !rendered.is_empty() {
         rendered.push('\n');
     }
-    let physical_root = loaded.root().path().to_string_lossy().replace('\\', "/");
+    let physical_root = display_path(loaded.root().path());
     let produced = rendered
         .replace(&physical_root, fixture.project_root.trim_end_matches('/'))
         .into_bytes();

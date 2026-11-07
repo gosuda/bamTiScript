@@ -228,7 +228,6 @@ mod tests {
         num::NonZeroUsize,
         sync::Arc,
         task::{Context, Poll, Waker},
-        time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::{AsyncService, CancellationToken};
@@ -247,15 +246,7 @@ mod tests {
     }
 
     fn service() -> (std::path::PathBuf, AsyncService<OsFileSystem>) {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "bamts-async-service-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir(&root).expect("create root");
+        let root = crate::service::test_support::fresh_dir("bamts-async-service");
         let service = AsyncService::new(
             OsFileSystem::new(&root).expect("filesystem"),
             NonZeroUsize::new(1).expect("nonzero"),

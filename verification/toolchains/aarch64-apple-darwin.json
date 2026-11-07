@@ -1,0 +1,63 @@
+{
+  "cell_class": "native_host",
+  "obligations": {
+    "execmem-guard": {
+      "evidence": "command=bamts-verification toolchain measure --target aarch64-apple-darwin; executable_sha256=335285bc37c9f2e9e485aa48b0e5da26596cb24d054f5907da5352d79d3aceca; inspector_sha256=92b87bfab012271e3fddcddef4c5536022f0873a75ad075f600093e2b6cd40cc; writable_executable_regions=0; pie=true; signature=adhoc",
+      "missing_artifact": "",
+      "reason": "Stored execmem-guard observation for this triple.",
+      "status": "PASS",
+      "unblock_condition": ""
+    },
+    "hardened-link": {
+      "evidence": "command=cc -arch arm64 -o probe ../support.o probe.o; executable_sha256=335285bc37c9f2e9e485aa48b0e5da26596cb24d054f5907da5352d79d3aceca; object_format=macho; object_type=executable; machine=aarch64; pie=true; signature=adhoc; linker_version=Apple clang version 21.0.0 (clang-2100.1.1.101); linker_sha256=34129c71a01a74f7f3b2443521519b2e5447553fa187f5fcafaaf8c42cc192e2",
+      "missing_artifact": "",
+      "reason": "Stored hardened link artifact for this triple.",
+      "status": "PASS",
+      "unblock_condition": ""
+    },
+    "native-runtime": {
+      "evidence": "command=./probe; executable_sha256=335285bc37c9f2e9e485aa48b0e5da26596cb24d054f5907da5352d79d3aceca; execution=native; exit=0; result=int32:42; fuel=positive",
+      "missing_artifact": "",
+      "reason": "This process runs natively on the cell triple.",
+      "status": "PASS",
+      "unblock_condition": ""
+    },
+    "reproducible-build": {
+      "evidence": "command=bamts-verification toolchain measure --target aarch64-apple-darwin; first_object_sha256=6b61d80d002fd1fa97653ab90d54de3ca4d1b541d283b6d1f2d18322573b45d6; second_object_sha256=6b61d80d002fd1fa97653ab90d54de3ca4d1b541d283b6d1f2d18322573b45d6; first_executable_sha256=335285bc37c9f2e9e485aa48b0e5da26596cb24d054f5907da5352d79d3aceca; second_executable_sha256=335285bc37c9f2e9e485aa48b0e5da26596cb24d054f5907da5352d79d3aceca; byte_identical=true",
+      "missing_artifact": "",
+      "reason": "Stored reproducible-build identity for this triple.",
+      "status": "PASS",
+      "unblock_condition": ""
+    },
+    "target-functional": {
+      "evidence": "command=./probe; executable_sha256=335285bc37c9f2e9e485aa48b0e5da26596cb24d054f5907da5352d79d3aceca; execution=native; exit=0; result=int32:42; fuel=positive",
+      "missing_artifact": "",
+      "reason": "Native-host functional execution completed without emulation.",
+      "status": "PASS",
+      "unblock_condition": ""
+    },
+    "target-object": {
+      "evidence": "command=bamts-verification toolchain object --target aarch64-apple-darwin --out probe.o; object_sha256=6b61d80d002fd1fa97653ab90d54de3ca4d1b541d283b6d1f2d18322573b45d6; object_format=macho; object_type=relocatable; machine=aarch64; bytes=2992; entry=bamts_m0_fn_0; helpers=bamts_load_constant,bamts_consume_fuel",
+      "missing_artifact": "",
+      "reason": "Stored relocatable AOT object for this triple.",
+      "status": "PASS",
+      "unblock_condition": ""
+    },
+    "toolchain-manifest": {
+      "evidence": "command=rustc -vV; rustc_version=1.97.1; rustc_host=aarch64-apple-darwin; rustc_sha256=210df6794001b73ec3d453878707fa1e0bdcb63c427024a6e6574bbe5615a4da",
+      "missing_artifact": "",
+      "reason": "Recorded from rustc -vV on this host.",
+      "status": "PASS",
+      "unblock_condition": ""
+    }
+  },
+  "rustc": {
+    "commit": "8bab26f4f68e0e26f0bb7960be334d5b520ea452",
+    "commit_date": "2026-07-14",
+    "host": "aarch64-apple-darwin",
+    "llvm_version": "22.1.6",
+    "version": "1.97.1"
+  },
+  "schema": "bamti.target-cell/v2",
+  "triple": "aarch64-apple-darwin"
+}

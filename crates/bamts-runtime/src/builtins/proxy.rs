@@ -46,6 +46,14 @@ impl ProxyRecord {
         self.constructable
     }
 
+    /// The target of a live proxy; a revoked proxy has none.
+    pub(crate) fn live_target(&self) -> Option<Value> {
+        match self.state {
+            ProxyState::Live { target, .. } => Some(target),
+            ProxyState::Revoked => None,
+        }
+    }
+
     pub(crate) fn for_each_value(&self, mut visit: impl FnMut(Value)) {
         if let ProxyState::Live { target, handler } = &self.state {
             visit(*target);

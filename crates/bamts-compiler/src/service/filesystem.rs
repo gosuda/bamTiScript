@@ -4,6 +4,8 @@ use std::{
     time::SystemTime,
 };
 
+use crate::project::canonical;
+
 /// Metadata used to decide whether a closed file needs a fresh compiler snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileMetadata {
@@ -43,7 +45,17 @@ impl std::error::Error for FileSystemError {}
 
 impl From<io::Error> for FileSystemError {
     fn from(error: io::Error) -> Self {
-        Self::new(error.kind(), error.to_string())
+        Self::new(absent_aware_kind(&error), error.to_string())
+    }
+}
+
+/// Windows answers `InvalidFilename` for a name it cannot hold, such as
+/// `engine:clock`, where Unix answers `NotFound`. No file can carry such a name,
+/// so both platforms report the file as absent.
+fn absent_aware_kind(error: &io::Error) -> io::ErrorKind {
+    match error.kind() {
+        io::ErrorKind::InvalidFilename => io::ErrorKind::NotFound,
+        kind => kind,
     }
 }
 
@@ -64,7 +76,7 @@ pub struct OsFileSystem {
 
 impl OsFileSystem {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, FileSystemError> {
-        let root = fs::canonicalize(root).map_err(FileSystemError::from)?;
+        let root = canonical::canonicalize(root).map_err(FileSystemError::from)?;
         if !root.is_dir() {
             return Err(FileSystemError::new(
                 io::ErrorKind::NotADirectory,
@@ -103,7 +115,7 @@ impl FileSystem for OsFileSystem {
         loop {
             match fs::symlink_metadata(ancestor) {
                 Ok(_) => break,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Err(error) if absent_aware_kind(&error) == io::ErrorKind::NotFound => {
                     ancestor = ancestor.parent().ok_or_else(|| {
                         FileSystemError::new(
                             io::ErrorKind::NotFound,
@@ -114,14 +126,14 @@ impl FileSystem for OsFileSystem {
                 Err(error) => return Err(FileSystemError::from(error)),
             }
         }
-        let mut canonical = fs::canonicalize(ancestor).map_err(FileSystemError::from)?;
+        let mut resolved = canonical::canonicalize(ancestor).map_err(FileSystemError::from)?;
         let suffix = lexical
             .strip_prefix(ancestor)
             .expect("selected ancestor is a lexical path prefix");
         for component in suffix.components() {
-            canonical.push(component);
+            resolved.push(component);
         }
-        self.confined(canonical)
+        self.confined(resolved)
     }
 
     fn read(&self, path: &Path) -> Result<String, FileSystemError> {
@@ -150,8 +162,8 @@ impl FileSystem for OsFileSystem {
         for entry in fs::read_dir(&path).map_err(FileSystemError::from)? {
             let entry = entry.map_err(FileSystemError::from)?;
             let child = path.join(entry.file_name());
-            let canonical = fs::canonicalize(&child).map_err(FileSystemError::from)?;
-            entries.push(self.confined(canonical)?);
+            let resolved = canonical::canonicalize(&child).map_err(FileSystemError::from)?;
+            entries.push(self.confined(resolved)?);
         }
         entries.sort();
         entries.dedup();
@@ -163,12 +175,7 @@ fn normalize_lexically(path: &Path) -> Result<PathBuf, FileSystemError> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::Prefix(_) => {
-                return Err(FileSystemError::new(
-                    io::ErrorKind::InvalidInput,
-                    "platform path prefix is unsupported",
-                ));
-            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
             Component::RootDir => normalized.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
@@ -187,23 +194,12 @@ fn normalize_lexically(path: &Path) -> Result<PathBuf, FileSystemError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs, io,
-        path::Path,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{fs, io, path::Path};
 
     use super::{FileSystem, OsFileSystem};
 
     fn temporary_root() -> std::path::PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("bamts-service-fs-{}-{nonce}", std::process::id()));
-        fs::create_dir(&root).expect("create temporary root");
-        root
+        crate::service::test_support::fresh_dir("bamts-service-fs")
     }
 
     fn collect_names(entries: Vec<std::path::PathBuf>) -> Vec<String> {
@@ -236,6 +232,72 @@ mod tests {
                 .expect_err("escape")
                 .kind(),
             io::ErrorKind::PermissionDenied
+        );
+
+        fs::remove_dir_all(root).expect("remove temporary root");
+    }
+
+    #[test]
+    fn absolute_paths_are_accepted_inside_the_root_and_confined_outside_it() {
+        let root = temporary_root();
+        fs::write(root.join("a.ts"), "const a = 1;").expect("write source");
+        let filesystem = OsFileSystem::new(&root).expect("filesystem");
+
+        let inside = filesystem.root().join("a.ts");
+        assert_eq!(filesystem.normalize(&inside).expect("inside"), inside);
+        assert_eq!(filesystem.read(&inside).expect("read"), "const a = 1;");
+
+        let outside = filesystem.root().parent().expect("root has a parent");
+        assert_eq!(
+            filesystem
+                .normalize(outside)
+                .expect_err("outside the root")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        fs::remove_dir_all(root).expect("remove temporary root");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn lexical_normalization_keeps_drive_and_verbatim_prefixes() {
+        use super::normalize_lexically;
+
+        for (input, expected) in [
+            (r"C:\a\.\b\..\c", r"C:\a\c"),
+            (r"\\?\C:\a\..\b", r"\\?\C:\b"),
+            (r"\\server\share\a\..\b", r"\\server\share\b"),
+        ] {
+            assert_eq!(
+                normalize_lexically(Path::new(input)).expect(input),
+                Path::new(expected),
+                "{input}"
+            );
+        }
+        assert_eq!(
+            normalize_lexically(Path::new(r"C:\.."))
+                .expect_err("above the drive root")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn names_the_platform_cannot_hold_are_absent_not_invalid() {
+        let root = temporary_root();
+        let filesystem = OsFileSystem::new(&root).expect("filesystem");
+        let scheme = Path::new("node_modules/engine:clock/package.json");
+
+        let normalized = filesystem.normalize(scheme).expect("normalize is lexical");
+        assert_eq!(normalized, filesystem.root().join(scheme));
+        assert_eq!(
+            filesystem.metadata(scheme).expect_err("absent").kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            filesystem.read(scheme).expect_err("absent").kind(),
+            io::ErrorKind::NotFound
         );
 
         fs::remove_dir_all(root).expect("remove temporary root");
@@ -324,7 +386,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn read_dir_rejects_escaping_symlink() {
-        use std::os::unix::fs::symlink;
+        use std::{
+            os::unix::fs::symlink,
+            time::{SystemTime, UNIX_EPOCH},
+        };
 
         let root = temporary_root();
         let outside = root.parent().unwrap().join(format!("bamts-outside-{}", {

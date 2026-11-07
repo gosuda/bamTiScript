@@ -683,19 +683,20 @@ fn feed_bytes(canonical: &mut Vec<u8>, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::test_paths::abs;
 
     fn test_root() -> ProjectRoot {
-        ProjectRoot::new("/workspace/test").expect("absolute test root")
+        ProjectRoot::new(abs("/workspace/test")).expect("absolute test root")
     }
 
-    fn parse(root: &ProjectRoot, path: &str, source: &str) -> TsConfig {
+    fn parse(root: &ProjectRoot, path: impl AsRef<Path>, source: &str) -> TsConfig {
         TsConfig::parse(root, path, source).expect("valid test tsconfig")
     }
 
     #[test]
     fn empty_references_parses_to_empty_node() {
         let root = test_root();
-        let config = parse(&root, "/workspace/test/app/tsconfig.json", r#"{}"#);
+        let config = parse(&root, abs("/workspace/test/app/tsconfig.json"), r#"{}"#);
         let graph = ReferenceGraph::from_tsconfigs(&root, &[&config]).unwrap();
 
         let node = graph.node(config.config().path()).expect("node exists");
@@ -709,10 +710,10 @@ mod tests {
         let root = test_root();
         let app = parse(
             &root,
-            "/workspace/test/app/tsconfig.json",
+            abs("/workspace/test/app/tsconfig.json"),
             r#"{"references": [{"path": "../lib"}]}"#,
         );
-        let lib = parse(&root, "/workspace/test/lib/tsconfig.json", r#"{}"#);
+        let lib = parse(&root, abs("/workspace/test/lib/tsconfig.json"), r#"{}"#);
 
         let graph = ReferenceGraph::from_tsconfigs(&root, &[&app, &lib]).unwrap();
         let node = graph.node(app.config().path()).unwrap();
@@ -720,7 +721,7 @@ mod tests {
         assert_eq!(node.references.len(), 1);
         assert_eq!(
             node.references[0].path(),
-            Path::new("/workspace/test/lib/tsconfig.json")
+            abs("/workspace/test/lib/tsconfig.json").as_path()
         );
         assert_eq!(node.references[0].original_path().unwrap(), "../lib");
         assert_eq!(node.references[0].circular(), None);
@@ -732,7 +733,7 @@ mod tests {
         let root = test_root();
         let app = parse(
             &root,
-            "/workspace/test/app/tsconfig.json",
+            abs("/workspace/test/app/tsconfig.json"),
             r#"{"references": [{"path": "../lib/custom.json"}]}"#,
         );
 
@@ -741,7 +742,7 @@ mod tests {
 
         assert_eq!(
             node.references[0].path(),
-            Path::new("/workspace/test/lib/custom.json")
+            abs("/workspace/test/lib/custom.json").as_path()
         );
         assert!(is_json_path(node.references[0].path()));
     }
@@ -751,10 +752,10 @@ mod tests {
         let root = test_root();
         let app = parse(
             &root,
-            "/workspace/test/app/tsconfig.json",
+            abs("/workspace/test/app/tsconfig.json"),
             r#"{"references": [{"path": "../lib"}]}"#,
         );
-        let lib = parse(&root, "/workspace/test/lib/tsconfig.json", r#"{}"#);
+        let lib = parse(&root, abs("/workspace/test/lib/tsconfig.json"), r#"{}"#);
 
         let graph = ReferenceGraph::from_tsconfigs(&root, &[&app, &lib]).unwrap();
         let order = graph.topological_order().unwrap();
@@ -762,8 +763,8 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                PathBuf::from("/workspace/test/lib/tsconfig.json"),
-                PathBuf::from("/workspace/test/app/tsconfig.json"),
+                abs("/workspace/test/lib/tsconfig.json"),
+                abs("/workspace/test/app/tsconfig.json"),
             ]
         );
     }
@@ -773,28 +774,25 @@ mod tests {
         let root = test_root();
         let app = parse(
             &root,
-            "/workspace/test/app/tsconfig.json",
+            abs("/workspace/test/app/tsconfig.json"),
             r#"{"references": [{"path": "../left"}, {"path": "../right"}]}"#,
         );
         let left = parse(
             &root,
-            "/workspace/test/left/tsconfig.json",
+            abs("/workspace/test/left/tsconfig.json"),
             r#"{"references": [{"path": "../shared"}]}"#,
         );
         let right = parse(
             &root,
-            "/workspace/test/right/tsconfig.json",
+            abs("/workspace/test/right/tsconfig.json"),
             r#"{"references": [{"path": "../shared"}]}"#,
         );
-        let shared = parse(&root, "/workspace/test/shared/tsconfig.json", r#"{}"#);
+        let shared = parse(&root, abs("/workspace/test/shared/tsconfig.json"), r#"{}"#);
 
         let graph = ReferenceGraph::from_tsconfigs(&root, &[&app, &left, &right, &shared]).unwrap();
         let order = graph.topological_order().unwrap();
 
-        assert_eq!(
-            order[0],
-            PathBuf::from("/workspace/test/shared/tsconfig.json")
-        );
+        assert_eq!(order[0], abs("/workspace/test/shared/tsconfig.json"));
         assert!(
             order
                 .iter()
@@ -836,12 +834,12 @@ mod tests {
         let root = test_root();
         let a = parse(
             &root,
-            "/workspace/test/a/tsconfig.json",
+            abs("/workspace/test/a/tsconfig.json"),
             r#"{"references": [{"path": "../b"}]}"#,
         );
         let b = parse(
             &root,
-            "/workspace/test/b/tsconfig.json",
+            abs("/workspace/test/b/tsconfig.json"),
             r#"{"references": [{"path": "../a"}]}"#,
         );
 
@@ -860,7 +858,7 @@ mod tests {
         let root = test_root();
         let config = parse(
             &root,
-            "/workspace/test/p/tsconfig.json",
+            abs("/workspace/test/p/tsconfig.json"),
             r#"{"compilerOptions": {"composite": true, "declaration": false, "incremental": false}}"#,
         );
 
@@ -884,13 +882,13 @@ mod tests {
         let root = test_root();
         let parent = parse(
             &root,
-            "/workspace/test/parent/tsconfig.json",
+            abs("/workspace/test/parent/tsconfig.json"),
             r#"{
                 "files": ["a.ts"],
                 "references": [{"path": "../child"}]
             }"#,
         );
-        let child = parse(&root, "/workspace/test/child/tsconfig.json", r#"{}"#);
+        let child = parse(&root, abs("/workspace/test/child/tsconfig.json"), r#"{}"#);
 
         let graph = ReferenceGraph::from_tsconfigs(&root, &[&parent, &child]).unwrap();
         let errors = graph.validate();
@@ -907,7 +905,7 @@ mod tests {
         let root = test_root();
         let parent = parse(
             &root,
-            "/workspace/test/parent/tsconfig.json",
+            abs("/workspace/test/parent/tsconfig.json"),
             r#"{
                 "files": ["a.ts"],
                 "compilerOptions": {"composite": true, "declaration": true},
@@ -916,7 +914,7 @@ mod tests {
         );
         let child = parse(
             &root,
-            "/workspace/test/child/tsconfig.json",
+            abs("/workspace/test/child/tsconfig.json"),
             r#"{"compilerOptions": {"composite": true, "noEmit": true}}"#,
         );
 
@@ -935,7 +933,7 @@ mod tests {
         let root = test_root();
         let config = parse(
             &root,
-            "/workspace/test/p/tsconfig.json",
+            abs("/workspace/test/p/tsconfig.json"),
             r#"{"compilerOptions": {"incremental": true}}"#,
         );
 
@@ -944,7 +942,7 @@ mod tests {
 
         assert_eq!(
             node.build_info_path.as_deref(),
-            Some(Path::new("/workspace/test/p/tsconfig.tsbuildinfo"))
+            Some(abs("/workspace/test/p/tsconfig.tsbuildinfo").as_path())
         );
     }
 
@@ -953,7 +951,7 @@ mod tests {
         let root = test_root();
         let config = parse(
             &root,
-            "/workspace/test/src/p/tsconfig.json",
+            abs("/workspace/test/src/p/tsconfig.json"),
             r#"{
                 "compilerOptions": {
                     "composite": true,
@@ -969,7 +967,7 @@ mod tests {
 
         assert_eq!(
             node.build_info_path.as_deref(),
-            Some(Path::new("/workspace/test/out/p/tsconfig.tsbuildinfo"))
+            Some(abs("/workspace/test/out/p/tsconfig.tsbuildinfo").as_path())
         );
     }
 
@@ -978,7 +976,7 @@ mod tests {
         let root = test_root();
         let config = parse(
             &root,
-            "/workspace/test/p/tsconfig.json",
+            abs("/workspace/test/p/tsconfig.json"),
             r#"{
                 "compilerOptions": {
                     "incremental": true,
@@ -992,7 +990,7 @@ mod tests {
 
         assert_eq!(
             node.build_info_path.as_deref(),
-            Some(Path::new("/workspace/test/cache/info.json"))
+            Some(abs("/workspace/test/cache/info.json").as_path())
         );
     }
 
@@ -1001,7 +999,7 @@ mod tests {
         let root = test_root();
         let parent = parse(
             &root,
-            "/workspace/test/parent/tsconfig.json",
+            abs("/workspace/test/parent/tsconfig.json"),
             r#"{
                 "files": ["a.ts"],
                 "compilerOptions": {"composite": true, "declaration": true, "outDir": "../out"},
@@ -1010,7 +1008,7 @@ mod tests {
         );
         let child = parse(
             &root,
-            "/workspace/test/child/tsconfig.json",
+            abs("/workspace/test/child/tsconfig.json"),
             r#"{
                 "compilerOptions": {"composite": true, "declaration": true, "outDir": "../out"}
             }"#,
@@ -1031,7 +1029,7 @@ mod tests {
         let root = test_root();
         let config = parse(
             &root,
-            "/workspace/test/p/tsconfig.json",
+            abs("/workspace/test/p/tsconfig.json"),
             r#"{
                 "files": ["a.ts"],
                 "compilerOptions": {"incremental": true}
@@ -1048,7 +1046,7 @@ mod tests {
 
         let different = parse(
             &root,
-            "/workspace/test/p/tsconfig.json",
+            abs("/workspace/test/p/tsconfig.json"),
             r#"{
                 "files": ["a.ts", "b.ts"],
                 "compilerOptions": {"incremental": true}
@@ -1066,7 +1064,7 @@ mod tests {
         let root = test_root();
         let config = parse(
             &root,
-            "/workspace/test/p/tsconfig.json",
+            abs("/workspace/test/p/tsconfig.json"),
             r#"{"compilerOptions": {"incremental": true}}"#,
         );
 
@@ -1081,7 +1079,7 @@ mod tests {
     #[test]
     fn non_incremental_project_has_no_build_info_identity() {
         let root = test_root();
-        let config = parse(&root, "/workspace/test/p/tsconfig.json", r#"{}"#);
+        let config = parse(&root, abs("/workspace/test/p/tsconfig.json"), r#"{}"#);
 
         let graph = ReferenceGraph::from_tsconfigs(&root, &[&config]).unwrap();
         assert!(graph.tsbuildinfo_identity(config.config().path()).is_none());
@@ -1092,7 +1090,7 @@ mod tests {
         let root = test_root();
         let config = parse(
             &root,
-            "/workspace/test/p/tsconfig.json",
+            abs("/workspace/test/p/tsconfig.json"),
             r#"{"references": [{"path": "../lib", "circular": true}]}"#,
         );
 

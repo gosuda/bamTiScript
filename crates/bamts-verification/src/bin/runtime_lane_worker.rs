@@ -155,7 +155,7 @@ fn execute_obligation(workspace: &Path, request: &LaneRequest) -> LaneOutcome {
     let deadline = Duration::from_millis(request.timeout_ms());
     let scratch = workspace.join("target/tmp/runtime-worker");
     let runner = match backend_runner(mode, scratch) {
-        Ok(runner) => runner,
+        Ok(runner) => runner.for_test_file(&test_file),
         Err(reason) => {
             return LaneOutcome::BlockingFail {
                 detail: reason.to_owned(),

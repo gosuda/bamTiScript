@@ -210,7 +210,11 @@ fn upstream_candidates(
 }
 
 /// Renders a path the way upstream traces do: forward slashes, lowercased drive.
-fn display_path(path: &Path) -> String {
+///
+/// Anything that looks for a path inside a rendered trace must build the text
+/// with this function.
+#[must_use]
+pub fn display_path(path: &Path) -> String {
     let mut value = path.to_string_lossy().replace('\\', "/");
     if value.as_bytes().get(1) == Some(&b':') {
         value.make_ascii_lowercase();

@@ -349,7 +349,10 @@ fn symbol_key<H: Host>(
     Ok(PropertyKey::Symbol(index as u32))
 }
 
-fn is_regexp<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<bool, EvalFailure> {
+pub(super) fn is_regexp<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<bool, EvalFailure> {
     if !machine.is_object(value) {
         return Ok(false);
     }
@@ -375,7 +378,7 @@ fn replace_all<H: Host>(
     let search = args.first().copied().unwrap_or(Value::UNDEFINED);
     let replacement = args.get(1).copied().unwrap_or(Value::UNDEFINED);
 
-    if !matches!(search.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+    if machine.is_object(search) {
         if is_regexp(machine, search)? {
             let flags = machine.get_named_property(search, "flags")?;
             require_coercible(flags)?;
@@ -720,7 +723,8 @@ fn repeat<H: Host>(
         return Err(range_error("Invalid count value"));
     }
     if source.is_empty() || count == 0.0 {
-        return Ok(BuiltinOutcome::Value(allocate_string(machine, source)?));
+        let empty = EcmaString::encode("");
+        return Ok(BuiltinOutcome::Value(allocate_string(machine, empty)?));
     }
     if count > usize::MAX as f64 {
         return Err(heap_limit(machine));
@@ -1148,6 +1152,8 @@ mod tests {
         let huge_empty =
             repeat(&mut machine, empty, &[crate::number_value(f64::MAX)], false).unwrap();
         assert!(result_text(&machine, huge_empty).is_empty());
+        let none = repeat(&mut machine, x, &[Value::int32(0)], false).unwrap();
+        assert!(result_text(&machine, none).is_empty());
         assert!(matches!(
             repeat(
                 &mut machine,

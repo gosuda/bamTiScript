@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
-#[cfg(test)]
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use bamts_bytecode::EcmaString;
+use bamts_cancel::CancellationToken;
 use bamts_native::{Decoded, Value};
 
 use super::{
@@ -15,9 +15,110 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, Proper
 
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
+/// How often a suspended agent looks for cancellation, which has no wake signal.
+const CANCELLATION_POLL: Duration = Duration::from_millis(20);
+
+/// One agent suspended in `Atomics.wait`.
+#[derive(Debug, Default)]
+pub(crate) struct Suspension {
+    notified: Mutex<bool>,
+    ready: Condvar,
+}
+
+impl Suspension {
+    pub(crate) fn wake(&self) {
+        *self
+            .notified
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.ready.notify_one();
+    }
+
+    /// Suspends until woken, past `deadline`, or until `cancel` fires, and
+    /// reports whether this agent was woken.
+    pub(crate) fn wait(&self, deadline: Option<Instant>, cancel: &CancellationToken) -> bool {
+        let mut notified = self
+            .notified
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*notified && !cancel.is_cancelled() {
+            let remaining = deadline.map_or(CANCELLATION_POLL, |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
+            if remaining.is_zero() {
+                break;
+            }
+            (notified, _) = self
+                .ready
+                .wait_timeout(notified, remaining.min(CANCELLATION_POLL))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *notified
+    }
+}
+
+/// A Waiter Record.
+#[derive(Clone, Debug)]
+pub(crate) enum Waiter {
+    Blocking(Arc<Suspension>),
+    /// `Atomics.waitAsync`, as the id of the machine's record of it.
+    Async(u64),
+}
+
+impl Waiter {
+    fn is(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Blocking(left), Self::Blocking(right)) => Arc::ptr_eq(left, right),
+            (Self::Async(left), Self::Async(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+/// The WaiterList of one shared block: a queue per byte position, oldest first.
+#[derive(Debug, Default)]
+pub(crate) struct WaiterList {
+    queues: BTreeMap<usize, VecDeque<Waiter>>,
+}
+
+impl WaiterList {
+    pub(crate) fn add(&mut self, position: usize, waiter: Waiter) {
+        self.queues.entry(position).or_default().push_back(waiter);
+    }
+
+    /// Reports whether `waiter` was still queued. It is not once a notifier has
+    /// taken it, which is how a timeout that lost that race learns it did.
+    pub(crate) fn remove(&mut self, position: usize, waiter: &Waiter) -> bool {
+        let Some(queue) = self.queues.get_mut(&position) else {
+            return false;
+        };
+        let Some(index) = queue.iter().position(|queued| queued.is(waiter)) else {
+            return false;
+        };
+        queue.remove(index);
+        if queue.is_empty() {
+            self.queues.remove(&position);
+        }
+        true
+    }
+
+    /// RemoveWaiters: up to `count` waiters at `position`, oldest first.
+    pub(crate) fn take(&mut self, position: usize, count: usize) -> Vec<Waiter> {
+        let Some(queue) = self.queues.get_mut(&position) else {
+            return Vec::new();
+        };
+        let taken = queue.drain(..count.min(queue.len())).collect();
+        if queue.is_empty() {
+            self.queues.remove(&position);
+        }
+        taken
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SharedBlock {
     state: Mutex<SharedBlockState>,
+    waiters: Mutex<WaiterList>,
 }
 
 #[derive(Debug)]
@@ -27,14 +128,21 @@ struct SharedBlockState {
 }
 
 impl SharedBlock {
-    #[cfg(test)]
     pub(crate) fn new(bytes: Vec<u8>, max_byte_length: Option<usize>) -> Self {
         Self {
             state: Mutex::new(SharedBlockState {
                 bytes,
                 max_byte_length,
             }),
+            waiters: Mutex::default(),
         }
+    }
+
+    /// Enters this block's waiter critical section.
+    pub(crate) fn waiters(&self) -> MutexGuard<'_, WaiterList> {
+        self.waiters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub(crate) fn byte_length(&self) -> usize {
@@ -45,7 +153,6 @@ impl SharedBlock {
             .len()
     }
 
-    #[cfg(test)]
     pub(crate) fn max_byte_length(&self) -> usize {
         let state = self
             .state
@@ -84,7 +191,6 @@ impl SharedBlock {
 
     /// Mutates the shared backing store after the caller has charged the owning
     /// heap slot. Length validation belongs to [`grow_shared_array_buffer`].
-    #[cfg(test)]
     fn resize_backing(&self, new_length: usize) -> Result<(), ()> {
         let mut state = self
             .state
@@ -112,7 +218,6 @@ impl SharedBlock {
 /// Grows a SharedArrayBuffer through its owning runtime slot so the byte delta
 /// is charged exactly once, even when other heap entries alias the same
 /// `Arc<SharedBlock>`.
-#[cfg(test)]
 pub(crate) fn grow_shared_array_buffer<H: Host>(
     machine: &mut Machine<'_, H>,
     buffer: Value,
@@ -748,7 +853,7 @@ fn clamp_index(relative: f64, length: usize) -> usize {
         relative.min(length as f64) as usize
     }
 }
-fn to_clamped_index<H: Host>(
+pub(super) fn to_clamped_index<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
     length: usize,
@@ -766,11 +871,11 @@ fn to_clamped_index<H: Host>(
     Ok(clamp_index(integer, length))
 }
 
-fn species_constructor<H: Host>(
+pub(super) fn species_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
+    default: Value,
 ) -> Result<Value, EvalFailure> {
-    let default = machine.intrinsics.builtins.arraybuffer_constructor();
     let constructor = machine.get_named_property(object, "constructor")?;
     if constructor == Value::UNDEFINED {
         return Ok(default);
@@ -810,7 +915,8 @@ fn slice<H: Host>(
         Some(value) => to_clamped_index(machine, value, source_length)?,
     };
     let new_length = end.saturating_sub(start);
-    let constructor = species_constructor(machine, this)?;
+    let default = machine.intrinsics.builtins.arraybuffer_constructor();
+    let constructor = species_constructor(machine, this, default)?;
     let target_value =
         machine.construct_value(constructor, &[crate::number_value(new_length as f64)])?;
     let target = handle(machine, target_value)?;

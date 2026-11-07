@@ -14,14 +14,22 @@ use std::collections::BTreeMap;
 use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
-use super::{define_data, define_frozen_data, install_constructor_function};
-use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyMap, ScriptSource, ThrowOrigin};
+use super::{
+    define_data, define_frozen_data, define_to_string_tag, heap_index, install_constructor_function,
+};
+use crate::intrinsics::{
+    BuiltinDef, BuiltinHandler, BuiltinOutcome, BuiltinTable, native_function,
+};
+use crate::{
+    EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap, ScriptSource,
+    ThrowOrigin,
+};
 
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
+    script_compiler: bool,
 ) {
     let prototype = builtins.function_prototype();
     let constructor = install_constructor_function(
@@ -34,51 +42,143 @@ pub(crate) fn install<H: Host>(
     define_frozen_data(heap, constructor, "prototype", prototype);
     define_data(heap, prototype, "constructor", constructor);
     globals.insert(EcmaString::encode("Function"), constructor);
+    let generator_prototype = builtins.generator_prototype();
+    let async_generator_prototype = builtins.async_generator_prototype();
+    let tag = builtins.symbol_to_string_tag();
+    define_to_string_tag(heap, generator_prototype, tag, "Generator");
+    define_to_string_tag(heap, async_generator_prototype, tag, "AsyncGenerator");
+    let generator = install_function_kind(
+        heap,
+        builtins,
+        "GeneratorFunction",
+        generator_function_constructor::<H>,
+        constructor,
+        Some(generator_prototype),
+    );
+    let asynchronous = install_function_kind(
+        heap,
+        builtins,
+        "AsyncFunction",
+        async_function_constructor::<H>,
+        constructor,
+        None,
+    );
+    let async_generator = install_function_kind(
+        heap,
+        builtins,
+        "AsyncGeneratorFunction",
+        async_generator_function_constructor::<H>,
+        constructor,
+        Some(async_generator_prototype),
+    );
+    builtins.set_function_kind_prototypes(generator, asynchronous, async_generator);
+    if script_compiler {
+        let id = builtins.register(BuiltinDef {
+            name: "eval",
+            length: 1,
+            handler: eval::<H>,
+        });
+        let function = native_function(heap, id, "eval", 1);
+        globals.insert(EcmaString::encode("eval"), function);
+    }
 }
 
-/// `Function(p1, ..., pn, body)` / `new Function(p1, ..., pn, body)`.
-///
-/// The arguments synthesize into a `function anonymous(...) { ... }`
-/// expression compiled as a classic script; classic scripts return their
-/// completion value, so the entry's result is the new function itself.
-fn function_constructor<H: Host>(
+/// A read-only link between function-kind intrinsics.
+fn define_link(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
+    let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
+        panic!("function kind intrinsics are ordinary objects");
+    };
+    properties.insert(
+        PropertyKey::Named(EcmaString::encode(name)),
+        Property::Data {
+            value,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        },
+    );
+}
+
+/// Installs one of the hidden kinds of function constructor and returns the
+/// prototype its closures inherit from. Neither is reachable from a global:
+/// they are found through `Object.getPrototypeOf(function* () {})`.
+fn install_function_kind<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    builtins: &mut BuiltinTable<H>,
+    name: &'static str,
+    handler: BuiltinHandler<H>,
+    function_constructor: Value,
+    instance_prototype: Option<Value>,
+) -> Value {
+    let prototype = crate::intrinsics::push(
+        heap,
+        HeapEntry::Object {
+            properties: PropertyMap::default(),
+            prototype: Some(builtins.function_prototype()),
+            extensible: true,
+            boxed_primitive: None,
+        },
+    );
+    let constructor = install_constructor_function(heap, builtins, name, 1, handler);
+    let HeapEntry::NativeFunction {
+        prototype: parent, ..
+    } = &mut heap[heap_index(constructor)]
+    else {
+        panic!("function kind constructor is a native function");
+    };
+    *parent = Some(function_constructor);
+    define_frozen_data(heap, constructor, "prototype", prototype);
+    define_link(heap, prototype, "constructor", constructor);
+    define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), name);
+    if let Some(instance_prototype) = instance_prototype {
+        define_link(heap, prototype, "prototype", instance_prototype);
+        define_link(heap, instance_prototype, "constructor", prototype);
+    }
+    prototype
+}
+
+/// `eval(x)` as an indirect call: the source runs in the global scope, as a
+/// classic script, and yields its completion value. Anything but a string comes
+/// back unchanged. A host without a script compiler has no `eval` at all, so
+/// the name reads as undeclared there rather than failing when called.
+fn eval<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
     args: &[Value],
-    _constructing: bool,
+    constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let (parameter_source, body_source) = match args.split_last() {
-        None => (String::new(), String::new()),
-        Some((body, parameters)) => {
-            let mut names = Vec::with_capacity(parameters.len());
-            for parameter in parameters {
-                let text = machine.to_string(*parameter)?;
-                names.push(String::from_utf16_lossy(text.as_units()));
-            }
-            let body_text = machine.to_string(*body)?;
-            (
-                names.join(","),
-                String::from_utf16_lossy(body_text.as_units()),
-            )
-        }
-    };
-    // Line offsets inside the body must match the spec's synthesis, so the
-    // body starts on its own source line.
-    let mut source = String::from("(function anonymous(");
-    source.push_str(&parameter_source);
-    source.push_str("\n)\n{\n");
-    source.push_str(&body_source);
-    source.push_str("\n})");
-    let script = EcmaString::encode(&source);
-    let script_name = EcmaString::encode("Function constructor");
+    if constructing {
+        return Err(type_error("eval is not a constructor"));
+    }
+    let source = args.first().copied().unwrap_or(Value::UNDEFINED);
+    match machine.string_value(source) {
+        Some(text) => run_script(
+            machine,
+            &text,
+            "eval",
+            "eval: this host provides no script compiler",
+        ),
+        None => Ok(BuiltinOutcome::Value(source)),
+    }
+}
+
+/// Compiles `source` as a classic script, runs it against the global object,
+/// and returns its completion value.
+fn run_script<H: Host>(
+    machine: &mut Machine<'_, H>,
+    source: &EcmaString,
+    name: &str,
+    no_compiler: &'static str,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let name = EcmaString::encode(name);
     let compiled = {
         let provider = machine
             .host
             .script_compiler()
-            .ok_or_else(|| type_error("Function: this host provides no script compiler"))?;
+            .ok_or_else(|| type_error(no_compiler))?;
         provider.compile_script(ScriptSource {
-            source: script.as_units(),
-            name: script_name.as_units(),
+            source: source.as_units(),
+            name: name.as_units(),
         })
     }
     .map_err(|error| crate::vm::compile_error(machine, error))?;
@@ -100,6 +200,77 @@ fn function_constructor<H: Host>(
     let result = machine.call_value(entry, machine.global_object, &[]);
     machine.context_global = previous;
     result.map(BuiltinOutcome::Value)
+}
+
+/// `Function(p1, ..., pn, body)` / `new Function(p1, ..., pn, body)`.
+fn function_constructor<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    create_dynamic_function(machine, args, "function")
+}
+
+fn generator_function_constructor<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    create_dynamic_function(machine, args, "function*")
+}
+
+fn async_function_constructor<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    create_dynamic_function(machine, args, "async function")
+}
+
+fn async_generator_function_constructor<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    create_dynamic_function(machine, args, "async function*")
+}
+
+/// The arguments synthesize into an `anonymous` function expression compiled
+/// as a classic script; classic scripts return their completion value, so the
+/// entry's result is the new function itself.
+fn create_dynamic_function<H: Host>(
+    machine: &mut Machine<'_, H>,
+    args: &[Value],
+    keyword: &str,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let (parameter_source, body_source) = match args.split_last() {
+        None => (String::new(), String::new()),
+        Some((body, parameters)) => {
+            let mut names = Vec::with_capacity(parameters.len());
+            for parameter in parameters {
+                let text = machine.coerce_string_observable(*parameter)?;
+                names.push(String::from_utf16_lossy(text.as_units()));
+            }
+            let body_text = machine.coerce_string_observable(*body)?;
+            (
+                names.join(","),
+                String::from_utf16_lossy(body_text.as_units()),
+            )
+        }
+    };
+    // Line offsets inside the body must match the spec's synthesis, so the
+    // body starts on its own source line.
+    let source = format!("({keyword} anonymous({parameter_source}\n)\n{{\n{body_source}\n}})");
+    run_script(
+        machine,
+        &EcmaString::encode(&source),
+        "Function constructor",
+        "Function: this host provides no script compiler",
+    )
 }
 
 fn type_error(operation: &'static str) -> EvalFailure {

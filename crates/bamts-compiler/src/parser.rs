@@ -42,7 +42,7 @@
 use std::sync::Arc;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
-use crate::scanner::ScannedSource;
+use crate::scanner::{INVALID_ESCAPE, INVALID_UNICODE_ESCAPE, ScannedSource};
 use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
 use crate::syntax::{
     Accessibility, ArrayBindingElement, ArrayBindingPattern, ArrayElement, ArrayLiteral,
@@ -214,11 +214,10 @@ pub fn parse_with_cancel(
     let mut parser = Parser::new_with_cancel(source_id, script_kind, source, tokens, eof, cancel);
     let statements = parser.parse_statements_until(&[]);
 
-    // The default scanner pass emits only `Slash`/`SlashEq`, never a
-    // `RegularExpressionLiteral`; every such token in the final stream is a
-    // committed parser regex rescan. The lexical diagnostics the default pass
-    // recorded inside those spans reflect the wrong (division) interpretation,
-    // so they are dropped and superseded by the rescan's own diagnostics.
+    // Every `RegularExpressionLiteral` in the final stream is either one the
+    // default pass was certain of or a committed parser regex rescan. Any lexical
+    // diagnostics recorded inside those spans reflect the wrong (division)
+    // interpretation, so they are dropped and superseded by the rescan's own.
     let regex_spans: Vec<TextRange> = parser
         .tokens
         .iter()
@@ -228,11 +227,18 @@ pub fn parse_with_cancel(
     // Spans reinterpreted as JSX likewise supersede the default pass's lexical
     // diagnostics: character data and attribute strings were mis-lexed there.
     let jsx_spans = &parser.jsx_spans;
+    // A tag accepts any escape and reads a value of `undefined` for a bad one, so the
+    // text of a tagged template keeps no escape diagnostic.
+    let tagged_spans = &parser.tagged_spans;
     let mut diagnostics = lexical;
     diagnostics.retain(|diagnostic| {
         let start = diagnostic.range().start().get();
         let in_span = |span: &TextRange| start >= span.start().get() && start < span.end().get();
-        !regex_spans.iter().any(in_span) && !jsx_spans.iter().any(in_span)
+        let code = diagnostic.code();
+        let escape = code == INVALID_ESCAPE || code == INVALID_UNICODE_ESCAPE;
+        !regex_spans.iter().any(in_span)
+            && !jsx_spans.iter().any(in_span)
+            && !(escape && tagged_spans.iter().any(in_span))
     });
     diagnostics.extend(parser.diagnostics.iter().cloned());
     diagnostics.sort();
@@ -278,6 +284,7 @@ struct ParserCheckpoint {
     next_node_id: u32,
     journal: usize,
     jsx_spans: usize,
+    tagged_spans: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -327,6 +334,8 @@ struct Parser {
     /// recorded inside them reflect a non-JSX reading and are dropped, mirroring
     /// the regex-rescan span handling.
     jsx_spans: Vec<TextRange>,
+    /// The text of every tagged template, which takes any escape.
+    tagged_spans: Vec<TextRange>,
     /// Cooperative cancellation signal checked at statement and list boundaries.
     cancel: CancellationToken,
 }
@@ -495,6 +504,7 @@ impl Parser {
             keyword_context: KeywordContext::default(),
             ambient: AmbientContext::None,
             jsx_spans: Vec::new(),
+            tagged_spans: Vec::new(),
             cancel,
         };
         parser.cursor = parser.next_significant(0);
@@ -816,6 +826,7 @@ impl Parser {
             next_node_id: self.next_node_id,
             journal: self.journal.len(),
             jsx_spans: self.jsx_spans.len(),
+            tagged_spans: self.tagged_spans.len(),
         }
     }
 
@@ -830,6 +841,7 @@ impl Parser {
         self.diagnostics.truncate(checkpoint.diagnostics);
         self.next_node_id = checkpoint.next_node_id;
         self.jsx_spans.truncate(checkpoint.jsx_spans);
+        self.tagged_spans.truncate(checkpoint.tagged_spans);
     }
 
     // ------------------------------------------------------------------
@@ -1995,7 +2007,13 @@ impl Parser {
                 break;
             }
             let before = self.cursor;
-            let member = self.parse_class_member();
+            let member = if self.at(TokenKind::Semicolon) {
+                let start = self.cur_start();
+                self.bump();
+                self.node(start, ClassMember::Semicolon)
+            } else {
+                self.parse_class_member()
+            };
             members.push(member);
             if self.cursor == before {
                 let skipped = self.bump();
@@ -2151,8 +2169,14 @@ impl Parser {
         };
 
         // Constructor.
+        // In JavaScript a static, async, or generator `constructor` is an ordinary
+        // method, which the early-error pass judges. TypeScript keeps one shape
+        // here because its checker reports these itself.
+        let plain_in_javascript =
+            self.is_typescript() || !(modifiers.is_static || is_async || is_generator);
         if !is_accessor
             && property_modifier == PropertyModifier::None
+            && plain_in_javascript
             && self.is_constructor_name(&name)
             && self.at(TokenKind::LParen)
         {
@@ -2309,13 +2333,18 @@ impl Parser {
             || (self.at(TokenKind::KwStatic) && next == TokenKind::LBrace)
     }
 
-    /// Returns whether `name` is exactly the `constructor` identifier, so a
-    /// method named `constructors` is not misread as a constructor.
+    /// Returns whether `name` is exactly the `constructor` identifier or a string
+    /// with that value, so a method named `constructors` is not misread as a
+    /// constructor. A computed name is never one.
     fn is_constructor_name(&self, name: &PropertyName) -> bool {
-        let PropertyName::Identifier(node) = name else {
-            return false;
-        };
-        self.lexeme(*node.data().token()) == "constructor"
+        match name {
+            PropertyName::Identifier(node) => self.lexeme(*node.data().token()) == "constructor",
+            PropertyName::String(node) => {
+                crate::literal::string_value(self.lexeme(*node.data().token()))
+                    .is_some_and(|value| value.eq_ascii("constructor"))
+            }
+            _ => false,
+        }
     }
 
     /// Distinguishes `[key: string]: T` from a computed member name.
@@ -3239,7 +3268,10 @@ impl Parser {
     fn parse_assignment_inner(&mut self, no_in: bool) -> Expr {
         let start = self.cur_start();
 
-        if self.at(TokenKind::KwYield) {
+        // Outside a generator, sloppy JavaScript reads `yield` as an identifier.
+        if self.at(TokenKind::KwYield)
+            && (self.is_typescript() || self.keyword_context.yield_reserved)
+        {
             return self.parse_yield_expression(start, no_in);
         }
 
@@ -3495,7 +3527,7 @@ impl Parser {
             );
         }
 
-        if self.at(TokenKind::KwAwait) && self.can_start_expression_after(1) {
+        if self.at(TokenKind::KwAwait) && self.await_is_an_operator() {
             let keyword_range = self.cur().range();
             self.bump();
             let argument = self.parse_unary_expression();
@@ -3534,6 +3566,72 @@ impl Parser {
     }
 
     /// Whether the `n`-th token can begin the operand of a prefix operator.
+    /// Whether the `await` here starts an await expression. TypeScript always
+    /// reads one so it can report misuse. In JavaScript, `await` outside an async
+    /// function is an ordinary name, and `await instanceof f` uses that name.
+    fn await_is_an_operator(&self) -> bool {
+        if !self.can_start_expression_after(1) {
+            return false;
+        }
+        if self.is_typescript() || self.keyword_context.await_reserved {
+            return true;
+        }
+        if self.keyword_context.in_function {
+            return false;
+        }
+        let next = self.nth_kind(1);
+        if self.has_module_syntax() {
+            return !matches!(next, TokenKind::KwInstanceof | TokenKind::KwIn);
+        }
+        // Without module syntax nothing settles the goal yet. Like Node, read
+        // the name unless what follows could not continue an expression.
+        is_identifier_like(next)
+            || matches!(
+                next,
+                TokenKind::NumericLiteral
+                    | TokenKind::BigIntLiteral
+                    | TokenKind::StringLiteral
+                    | TokenKind::LBrace
+                    | TokenKind::Bang
+                    | TokenKind::Tilde
+                    | TokenKind::KwClass
+                    | TokenKind::KwDelete
+                    | TokenKind::KwFalse
+                    | TokenKind::KwFunction
+                    | TokenKind::KwImport
+                    | TokenKind::KwNew
+                    | TokenKind::KwNull
+                    | TokenKind::KwSuper
+                    | TokenKind::KwThis
+                    | TokenKind::KwTrue
+                    | TokenKind::KwTypeof
+                    | TokenKind::KwVoid
+            )
+    }
+
+    /// Whether any token in the file looks like module syntax. `import(` and
+    /// `import.` also work in a script. A keyword used as a property name
+    /// counts too, which only keeps `await` an operator.
+    fn has_module_syntax(&self) -> bool {
+        let mut index = self.next_significant(0);
+        while index < self.tokens.len() {
+            let next = self.next_significant(index + 1);
+            match self.tokens[index].kind() {
+                TokenKind::KwExport => return true,
+                TokenKind::KwImport
+                    if !self.tokens.get(next).is_some_and(|token| {
+                        matches!(token.kind(), TokenKind::LParen | TokenKind::Dot)
+                    }) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+            index = next;
+        }
+        false
+    }
+
     fn can_start_expression_after(&self, n: usize) -> bool {
         !matches!(
             self.nth_kind(n),
@@ -3760,14 +3858,7 @@ impl Parser {
                     );
                 }
                 TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead => {
-                    let template = self.parse_template_literal();
-                    expr = self.node(
-                        start,
-                        Expression::TaggedTemplate(TaggedTemplateExpression {
-                            tag: Box::new(expr),
-                            template,
-                        }),
-                    );
+                    expr = self.parse_tagged_template(start, expr);
                 }
                 _ if self.at_less_like() => {
                     // `f<T>(...)` / `f<T>\`...\``: only a call/tagged-template
@@ -3791,14 +3882,7 @@ impl Parser {
                         self.kind(),
                         TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead
                     ) {
-                        let template = self.parse_template_literal();
-                        expr = self.node(
-                            start,
-                            Expression::TaggedTemplate(TaggedTemplateExpression {
-                                tag: Box::new(expr),
-                                template,
-                            }),
-                        );
+                        expr = self.parse_tagged_template(start, expr);
                     } else {
                         break;
                     }
@@ -3807,6 +3891,19 @@ impl Parser {
             }
         }
         expr
+    }
+
+    fn parse_tagged_template(&mut self, start: Utf16Pos, tag: Expr) -> Expr {
+        let template = self.parse_template_literal();
+        self.tagged_spans
+            .extend(template.elements.iter().map(|element| element.range()));
+        self.node(
+            start,
+            Expression::TaggedTemplate(TaggedTemplateExpression {
+                tag: Box::new(tag),
+                template,
+            }),
+        )
     }
 
     fn parse_optional_chain_link(&mut self, start: Utf16Pos, expr: Expr, no_call: bool) -> Expr {
@@ -3928,7 +4025,7 @@ impl Parser {
     fn parse_primary_expression(&mut self) -> Expr {
         let start = self.cur_start();
         match self.kind() {
-            TokenKind::Slash | TokenKind::SlashEq => {
+            TokenKind::Slash | TokenKind::SlashEq | TokenKind::RegularExpressionLiteral => {
                 self.rescan_regex_here();
                 let token = self.bump();
                 let range = token.range();
@@ -5472,12 +5569,9 @@ impl Parser {
                     let target = self.expression_to_target(*expr);
                     elements.push(AssignmentArrayElement::Target(target));
                 }
-                ArrayElement::Spread(_) => {
-                    // A rest element has no array-target slot. Record a missing
-                    // element so the checker can report it; the parser stays silent.
-                    elements.push(AssignmentArrayElement::Missing(MissingNode::new(
-                        NodeKind::MissingAssignmentTarget,
-                    )));
+                ArrayElement::Spread(spread) => {
+                    let target = self.expression_to_target(*spread.argument);
+                    elements.push(AssignmentArrayElement::Rest(target));
                 }
                 ArrayElement::Missing(node) => {
                     elements.push(AssignmentArrayElement::Missing(node));
@@ -5502,9 +5596,19 @@ impl Parser {
                         name: property.name,
                         target,
                         initializer,
+                        rest: false,
                     });
                 }
-                ObjectMember::Spread(_) | ObjectMember::Method(_) | ObjectMember::Missing(_) => {
+                ObjectMember::Spread(spread) => {
+                    let target = self.expression_to_target(*spread.argument);
+                    properties.push(AssignmentObjectProperty {
+                        name: PropertyName::Missing(MissingNode::new(NodeKind::Identifier)),
+                        target,
+                        initializer: None,
+                        rest: true,
+                    });
+                }
+                ObjectMember::Method(_) | ObjectMember::Missing(_) => {
                     properties.push(AssignmentObjectProperty {
                         name: PropertyName::Missing(MissingNode::new(NodeKind::Identifier)),
                         target: self.node_at(
@@ -5514,6 +5618,7 @@ impl Parser {
                             )),
                         ),
                         initializer: None,
+                        rest: false,
                     });
                 }
             }
@@ -6957,6 +7062,34 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_semicolon_is_a_class_member() {
+        for source in [
+            "class C { ; }",
+            "class C { ;;; }",
+            "class C { a() {}; b = 1;; static c() {} ; }",
+            "class C { #a() {}; get #b() { return 1; }; }",
+        ] {
+            assert_clean(source);
+        }
+        let recovered = assert_clean("class C { a() {}; }");
+        let Statement::Class(class) = recovered.product().statements()[0].data() else {
+            panic!("expected a class");
+        };
+        let members: Vec<_> = class.members.iter().map(|member| member.data()).collect();
+        assert!(matches!(
+            members[..],
+            [ClassMember::Method(_), ClassMember::Semicolon]
+        ));
+    }
+
+    #[test]
+    fn jsx_text_that_looks_like_a_regex_stays_text() {
+        let source = "const a = <p>, /x</p>;\nconst b = <p>= /'</p>;\n";
+        let parsed = parse_text(source, ScriptKind::TypeScriptReact);
+        assert!(errors(&parsed).is_empty(), "{:?}", errors(&parsed));
+    }
+
+    #[test]
     fn regex_rescan_produces_literal() {
         let recovered = assert_clean("const r = /a[/]b/gi;");
         let Statement::Variable(decl) = recovered.product().statements()[0].data() else {
@@ -7107,6 +7240,23 @@ mod tests {
             );
         }
         assert_eq!(parameter_names, ["B", "x", "public"]);
+    }
+
+    /// Only a tag takes a bad escape, and a tag does not cover the substitutions.
+    #[test]
+    fn a_tag_takes_any_escape_in_its_own_text() {
+        let escapes = |text: &str| {
+            parse_ts(text)
+                .diagnostics()
+                .iter()
+                .filter(|d| matches!(d.code().as_str(), "BAMTS-L006" | "BAMTS-L007"))
+                .count()
+        };
+        assert_eq!(escapes(r"tag`\xg \u12 \u{110000}`;"), 0);
+        assert_eq!(escapes(r"tag`${1}\xg${2}\u12`;"), 0);
+        assert_eq!(escapes(r"tag<T>`\xg`;"), 0);
+        assert_eq!(escapes(r"`\xg`;"), 1);
+        assert_eq!(escapes(r"tag`${`\xg`}`;"), 1);
     }
 
     #[test]

@@ -1170,27 +1170,50 @@ mod tests {
         assert!(host.stdout.is_empty(), "fuel failure precedes console.log");
     }
 
+    /// The permissions of the region that contains `address`, as the host's
+    /// process map reports them. A region's `identity` begins with its hex
+    /// address range, `start-end`, on every host.
+    fn permissions_at(regions: &[bamts_platform::MemoryRegion], address: usize) -> Option<&str> {
+        regions.iter().find_map(|region| {
+            let range = region.identity.split_whitespace().next()?;
+            let (start, end) = range.split_once('-')?;
+            let start = usize::from_str_radix(start, 16).ok()?;
+            let end = usize::from_str_radix(end, 16).ok()?;
+            (start <= address && address < end).then_some(region.permissions.as_str())
+        })
+    }
+
+    fn own_regions() -> Vec<bamts_platform::MemoryRegion> {
+        bamts_platform::process_regions(std::process::id()).expect("process regions are readable")
+    }
+
+    /// The lookup above is the oracle for the next test, so it has to tell code
+    /// from data on a real process before its verdict on JIT code means anything.
     #[test]
-    #[cfg(target_os = "linux")]
+    fn the_region_lookup_tells_code_from_data() {
+        let code = the_region_lookup_tells_code_from_data as fn() as usize;
+        let data = Box::new(0_u8);
+        let data = std::ptr::from_ref::<u8>(&data) as usize;
+        let regions = own_regions();
+
+        let code_permissions = permissions_at(&regions, code).expect("code is mapped");
+        assert!(code_permissions.contains('x'), "{code_permissions}");
+        assert!(!code_permissions.contains('w'), "{code_permissions}");
+        let data_permissions = permissions_at(&regions, data).expect("data is mapped");
+        assert!(data_permissions.contains('w'), "{data_permissions}");
+        assert!(!data_permissions.contains('x'), "{data_permissions}");
+    }
+
+    #[test]
     fn finalized_jit_code_is_executable_and_not_writable() {
         let program = compile_jit(&two_module_program()).expect("host JIT compiles");
-        let maps = std::fs::read_to_string("/proc/self/maps").expect("process maps are readable");
+        let regions = own_regions();
 
         // Every compiled function address is executable and not writable, as an
-        // independent smoke test against `/proc/self/maps`.
+        // independent smoke test against the host's process map.
         for unit in &program.functions {
             let address = program.module.get_finalized_function(unit.function) as usize;
-            let permissions = maps
-                .lines()
-                .find_map(|line| {
-                    let mut fields = line.split_whitespace();
-                    let range = fields.next()?;
-                    let permissions = fields.next()?;
-                    let (start, end) = range.split_once('-')?;
-                    let start = usize::from_str_radix(start, 16).ok()?;
-                    let end = usize::from_str_radix(end, 16).ok()?;
-                    (start <= address && address < end).then_some(permissions)
-                })
+            let permissions = permissions_at(&regions, address)
                 .unwrap_or_else(|| panic!("finalized function at {address:#x} has no mapped page"));
 
             // `finalize_definitions` must publish code with an RW -> RX transition.

@@ -204,7 +204,8 @@ fn api_transport_serves_socket_backed_stdin() {
     drop(peer);
 
     assert_success(&output, "bamts --api");
-    let canonical_root = fs::canonicalize(&directory.path).expect("session root canonicalizes");
+    let canonical_root = bamts_compiler::project::canonical::canonicalize(&directory.path)
+        .expect("session root canonicalizes");
     let responses = decode_frames(&output.stdout);
     assert_eq!(
         responses,
@@ -292,7 +293,7 @@ process.stdout.write(process.env.BAMTS_AOT_ENTRYPOINT === undefined ? "hidden\n"
 
     let expected = format!(
         "bamts\n{}\nfirst\nsecond\nhidden\n",
-        fs::canonicalize(project.path.join("main.ts"))
+        bamts_compiler::project::canonical::canonicalize(project.path.join("main.ts"))
             .expect("entrypoint canonicalizes")
             .display()
     );
@@ -650,6 +651,87 @@ fn aot_fixture_matches_jit_stdout_and_exit_code() {
     assert_eq!(output.stdout, EXPECTED_STDOUT);
 }
 
+/// `/BREPRO` leaves the link time out of the file, so the Microsoft linker gives the
+/// same bytes for the same inputs. The test pins the flag, which only it can set.
+#[cfg(target_env = "msvc")]
+#[test]
+fn aot_executables_for_the_same_source_have_the_same_bytes() {
+    let directory = ScratchDirectory::new();
+    let mut images = Vec::new();
+    for name in ["first", "second"] {
+        let executable = directory
+            .path
+            .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        let compile = directory.emit(&fixture().to_string_lossy(), &executable);
+        assert_success(&compile, "bamts tsc-compatible emit");
+        images.push(fs::read(&executable).expect("the linked executable"));
+        // The link time has a resolution of one second.
+        std::thread::sleep(Duration::from_millis(1100));
+    }
+    assert!(images[0] == images[1], "the two executables differ");
+}
+
+/// `link.exe` looks for a library named without a path in its working directory
+/// before `LIB`. A file in the project named like a system library must not be what
+/// the executable is linked against.
+#[cfg(target_env = "msvc")]
+#[test]
+fn a_file_in_the_project_named_like_a_system_library_is_not_linked() {
+    let directory = ScratchDirectory::new();
+    fs::write(directory.path.join("kernel32.lib"), b"not a library").expect("the stray file");
+    let executable = directory
+        .path
+        .join(format!("hello{}", std::env::consts::EXE_SUFFIX));
+
+    let compile = directory.emit(&fixture().to_string_lossy(), &executable);
+    assert_success(&compile, "bamts emit beside a stray kernel32.lib");
+
+    let output = Command::new(&executable)
+        .output()
+        .expect("compiled executable starts");
+    assert_success(&output, "compiled fixture");
+    assert_eq!(output.stdout, EXPECTED_STDOUT);
+}
+
+/// The call depth limit of the runtime is the error that a program gets for deep
+/// recursion. The 1 MiB stack that `link.exe` gives by default overflows first, and
+/// that ends the process with 0xC00000FD and no message.
+#[cfg(target_env = "msvc")]
+#[test]
+fn aot_deep_recursion_reaches_the_call_depth_limit_before_the_end_of_the_stack() {
+    let directory = ScratchDirectory::new();
+    directory.write(
+        "deep.ts",
+        "function down(n: number): number {\n  return n === 0 ? 0 : 1 + down(n - 1);\n}\nconsole.log(down(100000));\n",
+    );
+    let executable = directory.path.join("deep.exe");
+
+    let compile = directory.emit("deep.ts", &executable);
+    assert_success(&compile, "bamts emit of a deep recursion");
+
+    let output = Command::new(&executable)
+        .output()
+        .expect("compiled executable starts");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("call depth limit"),
+        "{}\nstderr:\n{stderr}",
+        output.status
+    );
+}
+
+/// The compiler recurses on the main thread, whose stack `link.exe` sets to 1 MiB
+/// unless the build asks for more. This depth overflowed that stack.
+#[cfg(target_env = "msvc")]
+#[test]
+fn deep_nesting_does_not_overflow_the_stack_of_the_main_thread() {
+    let directory = ScratchDirectory::new();
+    let source = format!("const nested = {}0{};\n", "[".repeat(50), "]".repeat(50));
+    directory.write("nested.ts", &source);
+
+    assert_success(&directory.check("nested.ts"), "bamts check of deep nesting");
+}
+
 #[test]
 fn jit_runs_two_module_program_with_live_imported_mutation() {
     let project = ScratchDirectory::new();
@@ -662,6 +744,98 @@ fn jit_runs_two_module_program_with_live_imported_mutation() {
     let output = project.execute("jit", "main.ts", &[]);
     assert_execution_success(&output, "compiler/execute two-module JIT");
     assert_eq!(output.stdout, b"2\n");
+}
+
+/// Runs one compiled module and returns its output.
+fn run_compiled_module(source: &str) -> std::process::Output {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", source);
+    let executable = project
+        .path
+        .join(format!("module{}", std::env::consts::EXE_SUFFIX));
+    let compile = project.emit("main.ts", &executable);
+    assert_success(&compile, "bamts emit of a module");
+    Command::new(&executable)
+        .output()
+        .expect("the compiled module starts")
+}
+
+/// An import of a module's own export shares a cell with the export. The module
+/// writes the cell through the export, and only the import is read-only.
+#[test]
+fn a_module_writes_the_export_that_it_imports() {
+    let output = run_compiled_module(
+        "// @ts-nocheck\n\
+         import self from \"./main.js\";\n\
+         import { count as other } from \"./main.js\";\n\
+         export let count = 1;\n\
+         count = 2;\n\
+         export default 42;\n\
+         console.log(self, other);\n\
+         try {\n  other = 3;\n} catch (error) {\n  console.log(error.name);\n}\n",
+    );
+    assert_success(&output, "the module that imports itself");
+    assert_eq!(output.stdout, b"42 2\nTypeError\n");
+}
+
+#[test]
+fn a_read_before_a_module_binding_is_initialized_can_be_caught() {
+    let output = run_compiled_module(
+        "// @ts-nocheck\n\
+         import * as self from \"./main.js\";\n\
+         import { later as other } from \"./main.js\";\n\
+         for (const read of [() => later, () => other, () => self.later]) {\n\
+           try {\n    read();\n  } catch (error) {\n    console.log(error.name);\n  }\n\
+         }\n\
+         export let later = 1;\n\
+         console.log(later, other, self.later);\n",
+    );
+    assert_success(&output, "the reads before initialization");
+    assert_eq!(
+        output.stdout,
+        b"ReferenceError\nReferenceError\nReferenceError\n1 1 1\n"
+    );
+}
+
+/// A fatal error before the first `await` aborts the module in the turn that runs
+/// it, and then settles it again on the way out.
+#[test]
+fn a_fatal_error_before_the_first_await_is_reported() {
+    let output = run_compiled_module(
+        "function down(n: number): number {\n  return down(n + 1) + 1;\n}\n\
+         down(0);\n\
+         await 1;\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("call depth limit"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+/// The API keeps a budget of 1,000,000 instructions and 64 MiB, so that a request
+/// ends. A compiled program runs for its user and has neither.
+#[test]
+fn an_executable_runs_past_the_budget_of_the_api() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        "let total = 0;\n\
+         for (let index = 0; index < 1100000; index++) {\n  total += 1;\n}\n\
+         const parts: string[] = [];\n\
+         for (let index = 0; index < 40; index++) {\n  parts.push(\"x\".repeat(1 << 20));\n}\n\
+         console.log(total, parts.join(\"\").length);\n",
+    );
+
+    let executable = project
+        .path
+        .join(format!("long{}", std::env::consts::EXE_SUFFIX));
+    let compile = project.emit("main.ts", &executable);
+    assert_success(&compile, "bamts emit of a long program");
+    let output = Command::new(&executable)
+        .output()
+        .expect("the long program starts");
+    assert_success(&output, "the compiled long program");
+    assert_eq!(output.stdout, b"1100000 41943040\n");
 }
 
 #[test]

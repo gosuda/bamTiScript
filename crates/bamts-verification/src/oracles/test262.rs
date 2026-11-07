@@ -10,7 +10,8 @@
 
 use bamts_bytecode::EcmaString;
 use bamts_compiler::diagnostic::Diagnostic;
-use bamts_runtime::{RuntimeErrorKind, ThrowOrigin, run_linked_program};
+use bamts_compiler::lint::{LintLevel, LintOverride, LintProfile, LintTable};
+use bamts_runtime::{CancellationToken, RuntimeErrorKind, ThrowOrigin, run_linked_program};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -25,7 +26,32 @@ pub const DEFAULT_ASYNC_DEADLINE: Duration = Duration::from_millis(500);
 const HARNESS_ASSERT: &str = "assert.js";
 const HARNESS_STA: &str = "sta.js";
 const HARNESS_DONE: &str = "doneprintHandle.js";
+/// What names a file a test may import from its own directory.
+const FIXTURE_MARKER: &str = "_FIXTURE";
 const STRICT_PREFIX: &str = "\"use strict\";\n";
+/// The host's `$262`, for every test that gets a harness. A member exists only
+/// where the engine truly does the work, so a test of a missing facility fails.
+/// `INTERPRETING.md` makes it a writable, configurable, non-enumerable global,
+/// and the methods capture what they use because tests replace builtins.
+const HOST_PRELUDE: &str = "(function (global) {\n\
+    var apply = Reflect.apply;\n\
+    var transfer = ArrayBuffer.prototype.transfer;\n\
+    var evaluate = global.eval;\n\
+    Object.defineProperty(global, '$262', {\n\
+    value: {\n\
+    global: global,\n\
+    detachArrayBuffer: function (buffer) { apply(transfer, buffer, []); return null; },\n\
+    evalScript: function (source) { return evaluate(source); },\n\
+    },\n\
+    writable: true,\n\
+    enumerable: false,\n\
+    configurable: true,\n\
+    });\n\
+    })(globalThis);\n";
+/// Ends a module case. The compiler reads the goal from the tree, as `tsc` does,
+/// so this is what makes a test with no `import` or `export` of its own a module.
+/// It exports no name, so it cannot collide with one the test declares.
+const MODULE_MARKER: &str = "\nexport {};\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OracleError {
@@ -50,6 +76,8 @@ pub enum OracleError {
     ExpectationMismatch {
         expected: String,
         actual: String,
+        /// What the throw said, when it said anything.
+        message: String,
     },
     /// The runner could not observe the script at all. Always blocking.
     BlockedRun {
@@ -257,6 +285,8 @@ pub struct ExecutionPlan {
     pub harness: HarnessPlan,
     pub negative: Option<Negative>,
     pub async_done: bool,
+    /// The `[[CanBlock]]` of the agent that must run the test.
+    pub can_block: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,6 +310,7 @@ pub struct RunRequest {
     pub script: ComposedScript,
     pub negative: Option<Negative>,
     pub async_done: bool,
+    pub can_block: bool,
     pub deadline: Duration,
 }
 
@@ -287,6 +318,8 @@ pub struct RunRequest {
 pub struct ThrownError {
     pub phase: NegativePhase,
     pub error_type: NegativeType,
+    /// What the throw said. Never part of a verdict.
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,6 +587,7 @@ pub fn plan_execution(
         harness,
         negative: frontmatter.negative.clone(),
         async_done,
+        can_block: !frontmatter.has(Flag::CanBlockIsFalse),
     })
 }
 
@@ -563,11 +597,7 @@ pub fn compose_script(
     variant: &ExecutionVariant,
     harness_sources: &[HarnessSource],
 ) -> Result<ComposedScript, OracleError> {
-    let early = plan
-        .negative
-        .as_ref()
-        .is_some_and(|negative| negative.phase.is_early());
-    if early || variant.kind == SourceKind::Raw {
+    if variant.kind == SourceKind::Raw {
         return Ok(ComposedScript {
             bytes: parsed.source_bytes.clone(),
             test_offset: 0,
@@ -576,8 +606,18 @@ pub fn compose_script(
         });
     }
 
-    let mut prefix = Vec::new();
-    if let HarnessPlan::Canonical { files, .. } = &plan.harness {
+    // `INTERPRETING.md`: the directive is the initial character sequence of the
+    // file and precedes every other text modification, so it leads the harness.
+    let mut bytes = Vec::new();
+    if variant.kind == SourceKind::ScriptStrict {
+        bytes.extend_from_slice(STRICT_PREFIX.as_bytes());
+    }
+    let early = plan
+        .negative
+        .as_ref()
+        .is_some_and(|negative| negative.phase.is_early());
+    if !early && let HarnessPlan::Canonical { files, .. } = &plan.harness {
+        bytes.extend_from_slice(HOST_PRELUDE.as_bytes());
         for file in files {
             let source = harness_sources
                 .iter()
@@ -586,22 +626,23 @@ pub fn compose_script(
                 .ok_or_else(|| OracleError::MissingHarness {
                     name: file.requested.clone(),
                 })?;
-            prefix.extend_from_slice(source);
+            bytes.extend_from_slice(source);
             if !source.ends_with(b"\n") {
-                prefix.push(b'\n');
+                bytes.push(b'\n');
             }
         }
     }
-    if variant.kind == SourceKind::ScriptStrict {
-        prefix.extend_from_slice(STRICT_PREFIX.as_bytes());
+    let test_offset = bytes.len();
+    bytes.extend_from_slice(&parsed.source_bytes);
+    if variant.kind == SourceKind::Module {
+        bytes.extend_from_slice(MODULE_MARKER.as_bytes());
     }
-    let test_offset = prefix.len();
-    prefix.extend_from_slice(&parsed.source_bytes);
+    let untouched = bytes.len() == parsed.source_bytes.len();
     Ok(ComposedScript {
-        bytes: prefix,
+        bytes,
         test_offset,
         kind: variant.kind,
-        untouched: false,
+        untouched,
     })
 }
 
@@ -629,6 +670,32 @@ pub fn judge_done(trace: &AsyncTrace) -> Result<(), DoneFailure> {
     }
 }
 
+/// What a failed run reports. A mismatch reads as its cause, so runs that failed
+/// the same way group together in a sweep report.
+fn failure_detail(error: &OracleError) -> String {
+    match error {
+        OracleError::ExpectationMismatch {
+            expected,
+            actual,
+            message,
+        } if message.is_empty() => format!("expected {expected}, got {actual}"),
+        OracleError::ExpectationMismatch {
+            expected,
+            actual,
+            message,
+        } => format!("expected {expected}, got {actual}: {message}"),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The first diagnostic of a rejected parse, which is what the parser objected to.
+fn parse_message(diagnostics: &[Diagnostic]) -> String {
+    diagnostics
+        .first()
+        .map(|diagnostic| format!("{} {}", diagnostic.code().as_str(), diagnostic.message()))
+        .unwrap_or_default()
+}
+
 pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), OracleError> {
     match outcome {
         RunOutcome::Async(trace) => {
@@ -636,6 +703,7 @@ pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), Oracl
                 return Err(OracleError::ExpectationMismatch {
                     expected: "non-async".to_owned(),
                     actual: "async".to_owned(),
+                    message: String::new(),
                 });
             }
             match judge_done(trace) {
@@ -644,6 +712,7 @@ pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), Oracl
                     Some(expected) => Err(OracleError::ExpectationMismatch {
                         expected: format!("{:?}/{}", expected.phase, expected.error_type.as_str()),
                         actual: "async completion".to_owned(),
+                        message: String::new(),
                     }),
                 },
                 Err(DoneFailure::Error) => match &request.negative {
@@ -676,6 +745,7 @@ pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), Oracl
                                         trace.failure_value.as_deref().unwrap_or_default()
                                     ),
                                 },
+                                message: trace.failure_value.clone().unwrap_or_default(),
                             })
                         }
                     }
@@ -698,16 +768,19 @@ pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), Oracl
                     Err(OracleError::ExpectationMismatch {
                         expected: format!("{:?}/{}", expected.phase, expected.error_type.as_str()),
                         actual: format!("{:?}/{}", actual.phase, actual.error_type.as_str()),
+                        message: actual.message.clone(),
                     })
                 }
             }
             (Some(expected), None) => Err(OracleError::ExpectationMismatch {
                 expected: format!("{:?}/{}", expected.phase, expected.error_type.as_str()),
                 actual: "completed".to_owned(),
+                message: String::new(),
             }),
             (None, Some(actual)) => Err(OracleError::ExpectationMismatch {
                 expected: "success".to_owned(),
                 actual: format!("{:?}/{}", actual.phase, actual.error_type.as_str()),
+                message: actual.message.clone(),
             }),
         },
         RunOutcome::Blocked { detail } => Err(OracleError::BlockedRun {
@@ -744,13 +817,14 @@ pub fn evaluate_in_all_modes<R: Test262Runner>(
                 script,
                 negative: plan.negative.clone(),
                 async_done: plan.async_done,
+                can_block: plan.can_block,
                 deadline,
             };
             let outcome = runner.run(&request);
             if let Err(error) = judge_run(&request, &outcome) {
                 return Err(OracleError::ModeFailure(ModeFailure {
                     mode,
-                    detail: format!("{error:?}"),
+                    detail: failure_detail(&error),
                 }));
             }
         }
@@ -793,13 +867,14 @@ pub fn evaluate_in_mode<R: Test262Runner>(
             script,
             negative: plan.negative.clone(),
             async_done: plan.async_done,
+            can_block: plan.can_block,
             deadline,
         };
         let outcome = runner.run(&request);
         if let Err(error) = judge_run(&request, &outcome) {
             return Err(OracleError::ModeFailure(ModeFailure {
                 mode,
-                detail: format!("{error:?}"),
+                detail: failure_detail(&error),
             }));
         }
     }
@@ -839,16 +914,29 @@ pub fn evaluate_in_mode<R: Test262Runner>(
 pub struct InterpreterRunner {
     scratch: PathBuf,
     composed: AtomicU64,
+    origin: Option<PathBuf>,
 }
 
-/// Removes a materialized script on every exit path, including early `?`-less
+/// Removes a materialized case on every exit path, including early `?`-less
 /// classification returns and panics.
-struct MaterializedScript(PathBuf);
+struct MaterializedCase(PathBuf);
 
-impl Drop for MaterializedScript {
+impl Drop for MaterializedCase {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+/// Copies the `_FIXTURE` files beside a test, which it imports by relative path.
+fn copy_fixtures(from: &Path, to: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().contains(FIXTURE_MARKER) && entry.file_type()?.is_file() {
+            fs::copy(entry.path(), to.join(name))?;
+        }
+    }
+    Ok(())
 }
 
 impl InterpreterRunner {
@@ -860,7 +948,37 @@ impl InterpreterRunner {
         Self {
             scratch: scratch.into(),
             composed: AtomicU64::new(0),
+            origin: None,
         }
+    }
+
+    /// Materializes each composed script as `test_file` would be found: under
+    /// its name, beside copies of its fixtures. Relative imports then resolve,
+    /// including a module test that imports itself.
+    #[must_use]
+    pub fn for_test_file(mut self, test_file: impl Into<PathBuf>) -> Self {
+        self.origin = Some(test_file.into());
+        self
+    }
+
+    fn materialize(&self, request: &RunRequest, directory: &Path) -> std::io::Result<PathBuf> {
+        fs::create_dir_all(directory)?;
+        let origin = self.origin.as_deref();
+        if let Some(parent) = origin.and_then(Path::parent)
+            && request
+                .script
+                .bytes
+                .windows(FIXTURE_MARKER.len())
+                .any(|window| window == FIXTURE_MARKER.as_bytes())
+        {
+            copy_fixtures(parent, directory)?;
+        }
+        let name = origin
+            .and_then(Path::file_name)
+            .map_or_else(|| "composed.js".into(), std::ffi::OsStr::to_os_string);
+        let script = directory.join(name);
+        fs::write(&script, &request.script.bytes)?;
+        Ok(script)
     }
 }
 
@@ -875,20 +993,30 @@ impl Test262Runner for InterpreterRunner {
             };
         }
         let unique = self.composed.fetch_add(1, Ordering::Relaxed);
-        let script = MaterializedScript(
+        let case = MaterializedCase(
             self.scratch
-                .join(format!("composed-{}-{unique}.js", std::process::id())),
+                .join(format!("case-{}-{unique}", std::process::id())),
         );
-        if let Err(error) = fs::write(&script.0, &request.script.bytes) {
-            return RunOutcome::Blocked {
-                detail: format!(
-                    "could not materialize composed script `{}`: {error}",
-                    script.0.display()
-                ),
-            };
-        }
+        let script = match self.materialize(request, &case.0) {
+            Ok(script) => script,
+            Err(error) => {
+                return RunOutcome::Blocked {
+                    detail: format!(
+                        "could not materialize composed script in `{}`: {error}",
+                        case.0.display()
+                    ),
+                };
+            }
+        };
 
-        let executable = match bamts::compile_source_file(&script.0) {
+        let lints = conformance_lints();
+        let cancel = CancellationToken::new();
+        let compiled = if request.script.kind == SourceKind::Module {
+            bamts::compile_source_file_with_lints(&script, &lints, &cancel)
+        } else {
+            bamts::compile_script_file(&script, &lints, &cancel)
+        };
+        let executable = match compiled {
             Ok(executable) => executable,
             Err(bamts::Error::Diagnostics { diagnostics }) => {
                 return parse_phase_outcome(&diagnostics);
@@ -900,9 +1028,14 @@ impl Test262Runner for InterpreterRunner {
             }
         };
 
-        let limits = interpreter_fuel(request.deadline);
+        let limits = bamts_runtime::Limits {
+            agent_can_suspend: request.can_block,
+            ..interpreter_fuel(request.deadline)
+        };
         let started = Instant::now();
         let mut host = bamts_node::NodeHost::new();
+        // Local time needs a zone, and test262 accepts any of them.
+        host.set_env("TZ", "UTC");
         // Dynamic `Function(...)` synthesis needs a compile provider; the
         // facade's ScriptCompiler is the same one `bamts::run_program` uses.
         host.set_script_compiler(Box::new(bamts::ScriptCompiler));
@@ -1008,6 +1141,16 @@ fn synthetic_runtime_error(error: bamts_runtime::NativeError) -> bamts_runtime::
 /// JavaScript parse errors. Any other diagnostic means the oracle pipeline
 /// rejected source that Test262 considers valid, which is an observation
 /// failure and never a Test262 verdict.
+/// The lints a conformance run compiles under. A lint is project policy, so
+/// one must not refuse a program the language allows.
+fn conformance_lints() -> LintTable {
+    let mut lints = LintTable::new(LintProfile::Default);
+    lints
+        .apply_cli([LintOverride::new("no-with", LintLevel::Allow, "test262")])
+        .expect("the default profile forbids no rule");
+    lints
+}
+
 fn parse_phase_outcome(diagnostics: &[Diagnostic]) -> RunOutcome {
     let parse_shaped = diagnostics.iter().any(|diagnostic| {
         let code = diagnostic.code().as_str();
@@ -1018,6 +1161,7 @@ fn parse_phase_outcome(diagnostics: &[Diagnostic]) -> RunOutcome {
             thrown: Some(ThrownError {
                 phase: NegativePhase::Parse,
                 error_type: NegativeType::SyntaxError,
+                message: parse_message(diagnostics),
             }),
         };
     }
@@ -1067,12 +1211,16 @@ fn observed_failure(error: &bamts_runtime::RuntimeError, deadline: Duration) -> 
         RuntimeErrorKind::UncaughtThrow {
             origin,
             constructor_name,
+            message,
             ..
         } => match classify_thrown(*origin, constructor_name.as_ref()) {
             Some(error_type) => RunOutcome::Completed {
                 thrown: Some(ThrownError {
                     phase: NegativePhase::Runtime,
                     error_type,
+                    message: message
+                        .as_ref()
+                        .map_or_else(|| format!("{origin:?}"), EcmaString::to_utf8_lossy),
                 }),
             },
             None => {
@@ -1276,17 +1424,36 @@ function $ERROR(message) {\n\
         sources: &[HarnessSource],
         variant: &ExecutionVariant,
     ) -> Result<(), OracleError> {
+        run_variant_in(
+            ExecutionMode::Interpreter,
+            runner,
+            parsed,
+            plan,
+            sources,
+            variant,
+        )
+    }
+
+    fn run_variant_in(
+        mode: ExecutionMode,
+        runner: &InterpreterRunner,
+        parsed: &ParsedTest,
+        plan: &ExecutionPlan,
+        sources: &[HarnessSource],
+        variant: &ExecutionVariant,
+    ) -> Result<(), OracleError> {
         // These real-engine fixtures check completion/error classification,
         // not host scheduling latency. Deadline policy is tested below with
         // explicit timestamps; retain a finite budget under parallel CI load.
         const SEMANTIC_FIXTURE_DEADLINE: Duration = Duration::from_secs(10);
         let script = compose_script(parsed, plan, variant, sources)?;
         let request = RunRequest {
-            mode: ExecutionMode::Interpreter,
+            mode,
             variant: variant.clone(),
             script,
             negative: plan.negative.clone(),
             async_done: plan.async_done,
+            can_block: plan.can_block,
             deadline: SEMANTIC_FIXTURE_DEADLINE,
         };
         let outcome = runner.run(&request);
@@ -1295,6 +1462,65 @@ function $ERROR(message) {\n\
 
     fn wrap(yaml: &str, body: &str) -> String {
         format!("{FRONTMATTER_OPEN}\n{yaml}\n{FRONTMATTER_CLOSE}\n{body}")
+    }
+
+    /// Runs `body` as a module test named `case.js` beside `value_FIXTURE.js`.
+    fn run_module_beside_fixture(name: &str, body: &str) -> (RunOutcome, usize) {
+        let root =
+            std::env::temp_dir().join(format!("bamts-test262-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let tests = root.join("tests");
+        let scratch = root.join("scratch");
+        fs::create_dir_all(&tests).expect("tests directory");
+        fs::write(tests.join("value_FIXTURE.js"), "export const value = 42;\n").expect("fixture");
+        fs::write(tests.join("unrelated.js"), "throw 1;\n").expect("sibling");
+
+        let runner = InterpreterRunner::new(&scratch).for_test_file(tests.join("case.js"));
+        let request = RunRequest {
+            mode: ExecutionMode::Interpreter,
+            variant: ExecutionVariant {
+                kind: SourceKind::Module,
+            },
+            script: ComposedScript {
+                bytes: body.as_bytes().to_vec(),
+                test_offset: 0,
+                kind: SourceKind::Module,
+                untouched: true,
+            },
+            negative: None,
+            async_done: false,
+            can_block: true,
+            deadline: Duration::from_secs(10),
+        };
+        let outcome = runner.run(&request);
+        let left = fs::read_dir(&scratch).map_or(0, |entries| entries.count());
+        fs::remove_dir_all(root).expect("remove scratch");
+        (outcome, left)
+    }
+
+    #[test]
+    fn a_composed_module_finds_the_fixtures_beside_its_test() {
+        let (outcome, left) = run_module_beside_fixture(
+            "fixture",
+            "import { value } from './value_FIXTURE.js';\nif (value !== 42) { throw new Error('wrong'); }\n",
+        );
+        assert!(
+            matches!(outcome, RunOutcome::Completed { thrown: None }),
+            "{outcome:?}"
+        );
+        assert_eq!(left, 0, "a run leaves nothing behind");
+    }
+
+    #[test]
+    fn a_composed_module_can_import_itself_by_its_test_name() {
+        let (outcome, _) = run_module_beside_fixture(
+            "self",
+            "import * as self from './case.js';\nexport const mine = 1;\nif (self.mine !== 1) { throw new Error('wrong'); }\n",
+        );
+        assert!(
+            matches!(outcome, RunOutcome::Completed { thrown: None }),
+            "{outcome:?}"
+        );
     }
 
     fn harness_root() -> PathBuf {
@@ -1341,6 +1567,7 @@ function $ERROR(message) {\n\
                     thrown: Some(ThrownError {
                         phase: negative.phase,
                         error_type: negative.error_type,
+                        message: String::new(),
                     }),
                 }
             } else {
@@ -1358,6 +1585,7 @@ function $ERROR(message) {\n\
                     thrown: Some(ThrownError {
                         phase: NegativePhase::Runtime,
                         error_type: NegativeType::TypeError,
+                        message: String::new(),
                     }),
                 }
             } else {
@@ -1511,8 +1739,9 @@ function $ERROR(message) {\n\
             let script = compose_script(&parsed, &plan, variant, &harness_sources())
                 .expect("compose negative");
             if phase.is_early() {
-                assert!(script.untouched);
-                assert_eq!(script.bytes, parsed.source_bytes);
+                // No harness, though a module case keeps what makes it a module.
+                assert_eq!(script.untouched, variant.kind == SourceKind::Raw);
+                assert!(script.bytes.starts_with(&parsed.source_bytes));
                 assert_eq!(script.test_offset, 0);
             }
             let request = RunRequest {
@@ -1521,6 +1750,7 @@ function $ERROR(message) {\n\
                 script,
                 negative: plan.negative.clone(),
                 async_done: plan.async_done,
+                can_block: plan.can_block,
                 deadline: DEFAULT_ASYNC_DEADLINE,
             };
             let outcome = PassRunner.run(&request);
@@ -1566,7 +1796,7 @@ function $ERROR(message) {\n\
         let strict_script =
             compose_script(&parsed, &plan, strict, &harness_sources()).expect("compose strict");
         let before_test = &strict_script.bytes[..strict_script.test_offset];
-        assert!(before_test.ends_with(STRICT_PREFIX.as_bytes()));
+        assert!(before_test.starts_with(STRICT_PREFIX.as_bytes()));
         assert_eq!(
             &strict_script.bytes[strict_script.test_offset..],
             parsed.source_bytes.as_slice()
@@ -1764,20 +1994,1091 @@ function $ERROR(message) {\n\
         let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
         let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
 
-        // Strict frontmatter is preserved: the strict variant still composes
-        // the directive directly before the test body.
+        // The strict variant opens with the directive, ahead of the harness.
         assert_eq!(plan.variants.len(), 2);
         let strict = compose_script(&parsed, &plan, &plan.variants[1], &sources).unwrap();
         assert_eq!(strict.kind, SourceKind::ScriptStrict);
-        assert_eq!(
-            &strict.bytes[strict.test_offset - STRICT_PREFIX.len()..strict.test_offset],
-            STRICT_PREFIX.as_bytes()
-        );
+        assert!(strict.bytes.starts_with(STRICT_PREFIX.as_bytes()));
 
         let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
         for variant in &plan.variants {
             run_variant(&runner, &parsed, &plan, &sources, variant).unwrap();
         }
+    }
+
+    /// Runs every variant of `source` against the small fixture harness.
+    fn run_fixture(label: &str, source: &str) -> Result<(), OracleError> {
+        run_fixture_in(ExecutionMode::Interpreter, label, source)
+    }
+
+    fn run_fixture_in(mode: ExecutionMode, label: &str, source: &str) -> Result<(), OracleError> {
+        let harness = runner_scratch(&format!("{label}-harness"));
+        let scratch = runner_scratch(&format!("{label}-scratch"));
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        write_harness(&harness, "doneprintHandle.js", DONEPRINT_JS);
+        let parsed = parse_test(source).unwrap();
+        let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
+        let runner = backend_runner(mode, &scratch).unwrap();
+        for variant in &plan.variants {
+            run_variant_in(mode, &runner, &parsed, &plan, &sources, variant)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn can_block_is_false_runs_on_an_agent_that_cannot_suspend() {
+        let body = "var view = new Int32Array(new SharedArrayBuffer(8));\n\
+                    var threw = false;\n\
+                    try { Atomics.wait(view, 0, 0, 0); } catch (e) { threw = e instanceof TypeError; }\n\
+                    assert.sameValue(threw, true);\n";
+        let source = wrap(
+            "description: agent cannot block\nflags: [CanBlockIsFalse]",
+            body,
+        );
+        for mode in ExecutionMode::ALL {
+            run_fixture_in(mode, "can-block-false", &source).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_case_with_no_can_block_flag_runs_on_an_agent_that_can_suspend() {
+        let body = "var view = new Int32Array(new SharedArrayBuffer(8));\n\
+                    assert.sameValue(Atomics.wait(view, 0, 0, 0), 'timed-out');\n";
+        let source = wrap("description: agent can block", body);
+        run_fixture("can-block-default", &source).unwrap();
+    }
+
+    #[test]
+    fn an_object_pattern_collects_what_is_left() {
+        let source = wrap(
+            "description: object rest in an assignment pattern",
+            "var a, rest, holder = {};\n\
+             ({ a, ...rest } = { a: 1, b: 2, c: 3 });\n\
+             assert.sameValue(a, 1);\n\
+             assert.sameValue(rest.a, undefined);\n\
+             assert.sameValue(rest.b, 2);\n\
+             assert.sameValue(rest.c, 3);\n\
+             ({ ...holder.rest } = { d: 4 });\n\
+             assert.sameValue(holder.rest.d, 4);",
+        );
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            run_fixture_in(mode, &format!("object-rest-{mode:?}"), &source).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_object_pattern_refuses_null_and_undefined() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [(&str, &str); 3] = [
+            (
+                "",
+                "assert.sameValue(throws(TypeError, function () { let {} = undefined; }), true);",
+            ),
+            (
+                "",
+                "var a; assert.sameValue(throws(TypeError, function () { ({} = null); }), true);",
+            ),
+            (
+                "",
+                "var read = 0; var key = function () { read += 1; return 'k'; }; assert.sameValue(throws(TypeError, function () { var { [key()]: x } = null; }), true); assert.sameValue(read, 0);",
+            ),
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, (flags, body)) in CASES.iter().enumerate() {
+                let source = wrap(
+                    &format!("description: object patterns\n{flags}"),
+                    &format!("{THROWS}{body}"),
+                );
+                let label = format!("object-patterns-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_generator_binds_its_parameters_at_the_call() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [(&str, &str); 9] = [
+            (
+                "",
+                "function* g({}) {} assert.sameValue(throws(TypeError, function () { g(undefined); }), true);",
+            ),
+            (
+                "",
+                "async function* g({}) {} assert.sameValue(throws(TypeError, function () { g(undefined); }), true);",
+            ),
+            (
+                "",
+                "class C { static *m({}) {} } assert.sameValue(throws(TypeError, function () { C.m(undefined); }), true);",
+            ),
+            (
+                "",
+                "function* g(a = (function () { throw new Test262Error(); })()) {} assert.sameValue(throws(Test262Error, function () { g(); }), true);",
+            ),
+            (
+                "",
+                "var log = 0; function* g(a = log += 1) { log += 10; } var it = g(); assert.sameValue(log, 1); it.next(); assert.sameValue(log, 11);",
+            ),
+            (
+                "",
+                "function* g(a = 1) { yield a; } var it = g(); assert.sameValue(it.next(5).value, 1); assert.sameValue(it.next().done, true);",
+            ),
+            (
+                "",
+                "function* g(a = 1) { yield a; } var it = g(); assert.sameValue(it.return(7).value, 7); assert.sameValue(it.next().done, true);",
+            ),
+            (
+                "",
+                "function* g(a = 1) { yield a; } var it = g(); assert.sameValue(throws(Test262Error, function () { it.throw(new Test262Error()); }), true); assert.sameValue(it.next().done, true);",
+            ),
+            (
+                "flags: [async]",
+                "async function* g(a = 1) { yield a; } g().next().then(function (result) { assert.sameValue(result.value, 1); }).then($DONE, $DONE);",
+            ),
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, (flags, body)) in CASES.iter().enumerate() {
+                let source = wrap(
+                    &format!("description: generator parameters\n{flags}"),
+                    &format!("{THROWS}{body}"),
+                );
+                let label = format!("generator-parameters-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_host_object_does_real_work() {
+        const CASES: [&str; 5] = [
+            "var b = new ArrayBuffer(8); assert.sameValue($262.detachArrayBuffer(b), null); \
+             assert.sameValue(b.detached, true); assert.sameValue(b.byteLength, 0);",
+            "var view = new Uint8Array(4); $262.detachArrayBuffer(view.buffer); \
+             assert.sameValue(view.length, 0);",
+            "assert.sameValue($262.global, globalThis);",
+            "assert.sameValue($262.evalScript('1 + 2'), 3);",
+            "var d = Object.getOwnPropertyDescriptor(globalThis, '$262'); \
+             assert.sameValue(d.enumerable, false); assert.sameValue(d.writable, true); \
+             assert.sameValue(d.configurable, true);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: the host object", body);
+                let label = format!("host-object-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrapper_prototypes_report_their_own_primitive() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [&str; 7] = [
+            "assert.sameValue('a'.toString(), 'a');",
+            "assert.sameValue('a'.valueOf(), 'a');",
+            "assert.sameValue(new String('a').toString(), 'a');",
+            "assert.sameValue(String.prototype.toString.call(new String('')), '');",
+            "assert.sameValue(throws(TypeError, function () { String.prototype.toString.call(1); }), true);",
+            "assert.sameValue(true.toString(), 'true'); assert.sameValue(new Boolean(false).toString(), 'false');",
+            "assert.sameValue(throws(TypeError, function () { Boolean.prototype.toString.call('a'); }), true);",
+        ];
+        for (index, body) in CASES.iter().enumerate() {
+            let source = wrap(
+                "description: wrapper prototypes",
+                &format!("{THROWS}{body}"),
+            );
+            if let Err(error) = run_fixture(&format!("wrapper-prototypes-{index}"), &source) {
+                panic!("{body}: {error:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn super_reads_above_the_home_object() {
+        const CASES: [&str; 17] = [
+            "class A { m() { return this.v; } } \
+             class B extends A { v = 1; f() { return (() => super.m())(); } } \
+             assert.sameValue(new B().f(), 1);",
+            "class A { static s() { return 'A'; } static t = 1; } \
+             class B extends A { static s() { return 'B'; } static x = super.s(); \
+             static y = super.t; static z; static { this.z = super.s(); } } \
+             assert.sameValue(B.x, 'A'); assert.sameValue(B.y, 1); assert.sameValue(B.z, 'A');",
+            "class A {} class B extends A { m() { [super.x] = [1]; return this.x; } } \
+             assert.sameValue(new B().m(), 1);",
+            "class A {} class B extends A { m() { for (super.x of [2]); return this.x; } } \
+             assert.sameValue(new B().m(), 2);",
+            "class A {} class B extends A { m() { delete super.x; } } \
+             var caught; try { new B().m(); } catch (error) { caught = error; } \
+             assert.sameValue(caught instanceof ReferenceError, true);",
+            "class A { constructor() { this.a = 1; } } \
+             class B extends A { f = 2; constructor() { (() => super())(); this.c = 3; } } \
+             var b = new B(); assert.sameValue(b.a, 1); assert.sameValue(b.f, 2); \
+             assert.sameValue(b.c, 3);",
+            "class A { m() { return 1; } } \
+             class B extends A { *g() { yield super.m(); } async a() { return super.m(); } } \
+             assert.sameValue(new B().g().next().value, 1);",
+            "var o = { m() { return super.x; } }; Object.setPrototypeOf(o, null); \
+             var caught; try { o.m(); } catch (error) { caught = error; } \
+             assert.sameValue(caught instanceof TypeError, true);",
+            "class A { m() { return 1; } } \
+             class B extends A { m() { return super.m() + 1; } } \
+             assert.sameValue(new B().m(), 2);",
+            "class A { get g() { return this.v; } } \
+             class B extends A { constructor() { super(); this.v = 5; } h() { return super.g; } } \
+             assert.sameValue(new B().h(), 5);",
+            "class A { m() { return 'a'; } } \
+             class B extends A { constructor() { super(); this.r = super.m(); } } \
+             assert.sameValue(new B().r, 'a');",
+            "class A { static s() { return 1; } } \
+             class B extends A { static s() { return super.s() + 1; } } \
+             assert.sameValue(B.s(), 2);",
+            "class A { m() { return 1; } } \
+             class B extends A { m() { var f = () => super.m(); return f(); } } \
+             assert.sameValue(new B().m(), 1);",
+            "var p = { m() { return 'p'; } }; \
+             var o = { __proto__: p, m() { return super.m(); } }; \
+             assert.sameValue(o.m(), 'p');",
+            "class A {} class B extends A { w() { super.x = 1; return this.x; } } \
+             assert.sameValue(new B().w(), 1); \
+             assert.sameValue(A.prototype.x, undefined);",
+            "class A { get x() { return 1; } set x(v) { this.y = v; } } \
+             class B extends A { u() { super.x += 1; return this.y; } } \
+             assert.sameValue(new B().u(), 2);",
+            "class A { m() { return 1; } } class B extends A { f = super.m(); } \
+             assert.sameValue(new B().f, 1);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: super references", body);
+                let label = format!("super-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_write_reference_converts_its_key_once() {
+        const KEY: &str = "var n = 0;\n\
+            var k = { toString() { n++; return 'a'; } };\n\
+            function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [&str; 6] = [
+            "var o = { a: 1 }; o[k] += 1; assert.sameValue(n, 1); assert.sameValue(o.a, 2);",
+            "var o = { a: 1 }; o[k]++; assert.sameValue(n, 1); assert.sameValue(o.a, 2);",
+            "var o = { a: 0 }; o[k] ||= 5; assert.sameValue(n, 1); assert.sameValue(o.a, 5);",
+            "var o = null; assert.sameValue(throws(TypeError, function () { o[k] += 1; }), true); \
+             assert.sameValue(n, 0);",
+            "var a = [1, 2]; a[1] += 1; a[0]--; assert.sameValue(a[1], 3); \
+             assert.sameValue(a[0], 0);",
+            "var s = Symbol(); var o = { [s]: 1 }; o[s]++; assert.sameValue(o[s], 2);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: one key conversion", &format!("{KEY}{body}"));
+                let label = format!("key-once-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn super_called_in_an_arrow_finishes_the_constructor() {
+        const SETUP: &str = "var fields = 0;\n\
+            class A { m() { return 7; } }\n\
+            function refused(body) {\n\
+            try { body(); } catch (error) { return error instanceof ReferenceError; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [&str; 8] = [
+            "class B extends A { f = () => { return super.m(); }; g = () => { return; }; \
+             h = () => { return 3; }; }\n\
+             var b = new B; assert.sameValue(b.f(), 7); assert.sameValue(b.g(), undefined); \
+             assert.sameValue(b.h(), 3);",
+            "class B extends A { constructor() { const init = () => { super(); return 5; }; \
+             assert.sameValue(init(), 5); } }\n\
+             new B;",
+            "function m() { const y = 1; class B extends A { v = y; #p = y + 1; \
+             get p() { return this.#p; } constructor() { (() => super())(); } } return new B; }\n\
+             var b = m(); assert.sameValue(b.v, 1); assert.sameValue(b.p, 2);",
+            "class B extends A { v = fields++; constructor() { super(); \
+             assert.sameValue(refused(() => super()), true); } }\n\
+             new B; assert.sameValue(fields, 1);",
+            "class B extends A { v = fields++; constructor() { const init = () => super(); \
+             init(); assert.sameValue(refused(init), true); } }\n\
+             new B; assert.sameValue(fields, 1);",
+            "var later; class B extends A { v = fields++; \
+             constructor() { super(); later = () => super(); } }\n\
+             new B; assert.sameValue(refused(later), true); assert.sameValue(fields, 1);",
+            "class B extends A { constructor(a = (() => super())()) { \
+             assert.sameValue(this instanceof A, true); } }\n\
+             new B;",
+            "class B extends A { v = fields++; constructor() { (() => super())(); \
+             var caught; try { super(); } catch (error) { caught = error; } \
+             assert.sameValue(caught instanceof ReferenceError, true); } }\n\
+             new B; assert.sameValue(fields, 1);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: arrow super", &format!("{SETUP}{body}"));
+                let label = format!("arrow-super-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_field_initializer_sees_the_class_scope() {
+        const SETUP: &str = "function run() {\n\
+            const y = 10;\n\
+            class A {}\n";
+        const CASES: [&str; 6] = [
+            "class C { v = y; constructor(y) { assert.sameValue(this.v, 10); \
+             assert.sameValue(y, 3); } } new C(3);",
+            "class C { v = y; constructor() { var y = 2; assert.sameValue(this.v, 10); \
+             assert.sameValue(y, 2); } } new C;",
+            "class B extends A { v = y; constructor() { const y = 2; super(); \
+             assert.sameValue(this.v, 10); assert.sameValue(y, 2); } } new B;",
+            "class B extends A { v = y; constructor() { const y = 2; ((y) => super())(3); \
+             assert.sameValue(this.v, 10); assert.sameValue(y, 2); } } new B;",
+            "class B extends A { v = () => y; constructor(y) { super(); \
+             assert.sameValue(this.v(), 10); assert.sameValue(y, 3); } } new B(3);",
+            "class C { v = y; w = class { m() { return y; } }; constructor() { \
+             assert.sameValue(new this.w().m(), 10); } } new C;",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap(
+                    "description: field scope",
+                    &format!("{SETUP}{body}\n}}\nrun();"),
+                );
+                let label = format!("field-scope-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_collection_during_a_callback_keeps_what_native_code_holds() {
+        const SETUP: &str = "var sink; var warm = false;\n\
+            function gc() { var n = warm ? 12 : 44; warm = true; \
+            for (var i = 0; i < n; i++) { sink = 'x'.repeat(1 << 20) + i; } }\n\
+            gc();\n\
+            function* items() { yield { x: 1 }; gc(); yield { x: 2 }; }\n";
+        const CASES: [&str; 12] = [
+            "var many = []; for (var i = 0; i < 64; i++) { many.push({ toJSON() { \
+             if (i === 63) { gc(); } return { v: 'a' + 'b' }; } }); } \
+             assert.sameValue(JSON.stringify(many).length > 64, true);",
+            "var strings = []; for (var i = 0; i < 64; i++) { strings.push(i); } \
+             var doubled = Float64Array.from(strings, (v) => { if (v === 63) { gc(); } \
+             return String(v) + '0'; }); assert.sameValue(doubled[1], 10);",
+            "var text = ''; for (var i = 0; i < 2000; i++) { text += 'a line of text\\n'; } \
+             var lines = text.split('\\n'); \
+             var joined = lines.reduce((sum, line) => sum + line + '\\n', ''); \
+             assert.sameValue(joined.length > 2000, true);",
+            "var left = { valueOf() { return 'a' + 'b'; } }; \
+             var right = { valueOf() { gc(); return 'y'; } }; \
+             assert.sameValue(left + right, 'aby'); assert.sameValue(left < right, true);",
+            "var list = new Proxy([{ a: 3 }, { a: 1 }], { get(t, k) { gc(); \
+             var v = t[k]; return typeof v === 'object' ? { a: v.a } : v; } }); \
+             var ordered = Array.prototype.toSorted.call(list, (p, q) => { gc(); \
+             return p.a - q.a; }); assert.sameValue(ordered[0].a, 1);",
+            "var seen = 0; Promise.resolve(1).then(() => { gc(); return { a: 1 }; })\
+             .then((v) => { seen = v.a; });",
+            "var sorted = [{ a: 3 }, { a: 1 }].toSorted((p, q) => { gc(); return p.a - q.a; }); \
+             assert.sameValue(sorted[0].a, 1);",
+            "var groups = Object.groupBy(items(), (v) => { gc(); return 'k' + v.x; }); \
+             assert.sameValue(groups.k2[0].x, 2);",
+            "var spread = [...items()]; assert.sameValue(spread[1].x, 2);",
+            "function add(a, b) { return a.x + b.x; } \
+             assert.sameValue(add(...items()), 3);",
+            "var parsed = JSON.parse('{\"a\":{\"b\":1},\"c\":2}', function (k, v) { \
+             gc(); return v; }); assert.sameValue(parsed.a.b, 1);",
+            "var proxy = new Proxy({}, { get(t, k) { gc(); return { key: k }; } }); \
+             assert.sameValue(proxy.a.key, 'a');",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: native roots", &format!("{SETUP}{body}"));
+                let label = format!("native-roots-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_class_is_constructed_only_with_new_and_defines_its_static_fields() {
+        const SETUP: &str = "function refused(body) {\n\
+            try { body(); } catch (error) { return error instanceof TypeError; }\n\
+            return false;\n\
+            }\n\
+            class A {}\n\
+            class B extends A {}\n\
+            class C extends A { constructor() { super(); } }\n";
+        const CASES: [&str; 5] = [
+            "assert.sameValue(refused(() => A()), true);",
+            "assert.sameValue(refused(() => B()), true);",
+            "assert.sameValue(refused(() => C.call({})), true);",
+            "class D { static name = 'x'; static length = 2; #p = 1; static #q = 3; \
+             static q() { return D.#q; } get p() { return this.#p; } }\n\
+             assert.sameValue(D.name, 'x'); assert.sameValue(D.length, 2); \
+             assert.sameValue(D.q(), 3); assert.sameValue(new D().p, 1);",
+            "assert.sameValue(Math.abs(new Number(-1)), 1); \
+             assert.sameValue(Math.pow({ valueOf() { return 2; } }, 3), 8);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: class calls", &format!("{SETUP}{body}"));
+                let label = format!("class-call-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_destructuring_target_is_evaluated_before_its_value() {
+        const LOG: &str = "var log = [];\n\
+            function source() { log.push('source'); return { get p() { log.push('get'); } }; }\n\
+            function target() { log.push('target'); return { set q(v) { log.push('set'); } }; }\n\
+            function key() { log.push('key'); return 'q'; }\n\
+            function sourceKey() { log.push('source-key'); \
+            return { toString() { log.push('source-string'); return 'p'; } }; }\n\
+            var empty = { [Symbol.iterator]() { return { next() { log.push('next'); \
+            return { done: true }; } }; } };\n";
+        const CASES: [(&str, &str); 7] = [
+            (
+                "({ [sourceKey()]: target()[key()] } = source());",
+                "source,source-key,source-string,target,key,get,set",
+            ),
+            (
+                "var hits = 0, rest; var k = { toString() { hits++; return 'p'; } }; \
+                 ({ [k]: target().q, ...rest } = { p: 1, r: 2 }); log.push(hits, rest.r, rest.p);",
+                "target,set,1,2,",
+            ),
+            (
+                "({ p: target()[key()] } = source());",
+                "source,target,key,get,set",
+            ),
+            (
+                "({ p: target()[key()] = log.push('default') } = source());",
+                "source,target,key,get,default,set",
+            ),
+            (
+                "({ ...target()[key()] } = source());",
+                "source,target,key,get,set",
+            ),
+            ("[target()[key()]] = empty;", "target,key,next,set"),
+            ("[...target()[key()]] = empty;", "target,key,next,set"),
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, (body, expected)) in CASES.iter().enumerate() {
+                let source = wrap(
+                    "description: target before value",
+                    &format!("{LOG}{body}\nassert.sameValue(log.join(), '{expected}');"),
+                );
+                let label = format!("target-order-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_computed_literal_key_converts_before_its_value() {
+        let source = wrap(
+            "description: key order",
+            "var log = []; var key = { toString() { log.push('key'); return 'k'; } }; \
+             function value() { log.push('value'); return 1; } \
+             var o = { [key]: value() }; \
+             assert.sameValue(log.join(), 'key,value'); assert.sameValue(o.k, 1);",
+        );
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            let label = format!("key-order-{mode:?}");
+            if let Err(error) = run_fixture_in(mode, &label, &source) {
+                panic!("{label}: {error:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn closing_an_iterator_checks_its_return_method() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n\
+            function iterable(close) {\n\
+            var it = { next() { return { done: false }; }, return: close };\n\
+            return { [Symbol.iterator]() { return it; } };\n\
+            }\n";
+        const CASES: [&str; 3] = [
+            "assert.sameValue(throws(TypeError, function () { \
+             for (var x of iterable(1)) { break; } }), true);",
+            "for (var x of iterable(null)) { break; }",
+            "for (var x of iterable(undefined)) { break; }",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: iterator close", &format!("{THROWS}{body}"));
+                let label = format!("iterator-close-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn construction_behaves_the_same_in_every_tier() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [&str; 7] = [
+            "assert.sameValue(throws(TypeError, function () { new (() => {}); }), true);",
+            "function* g() {} assert.sameValue(throws(TypeError, function () { new g(); }), true);",
+            "var o = { m() {} }; assert.sameValue(throws(TypeError, function () { new o.m(); }), true);",
+            "function F() { this.args = arguments; } \
+             var r = Reflect.construct(F, [1, 2, 3]); \
+             assert.sameValue(r instanceof F, true); assert.sameValue(r.args.length, 3);",
+            "function F() { return { x: 1 }; } \
+             assert.sameValue(Reflect.construct(F, []).x, 1);",
+            "function F() { this.x = 1; } var B = F.bind(null); \
+             assert.sameValue(new B().x, 1); \
+             assert.sameValue(Reflect.construct(B, []).x, 1);",
+            "function F() { throw new RangeError('no'); } \
+             assert.sameValue(throws(RangeError, function () { \
+             Reflect.construct(F, []); }), true);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: construction", &format!("{THROWS}{body}"));
+                let label = format!("construction-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_object_literal_defines_its_own_properties() {
+        const CASES: [&str; 5] = [
+            "Object.defineProperty(Object.prototype, 'x', { set() { throw new Error('set'); }, \
+             configurable: true }); \
+             var o = { x: 1 }; delete Object.prototype.x; \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             assert.sameValue(d.value, 1); assert.sameValue(d.enumerable, true); \
+             assert.sameValue(d.writable, true); assert.sameValue(d.configurable, true);",
+            "Object.defineProperty(Object.prototype, '0', { value: 9, writable: false, \
+             configurable: true }); var o = { 0: true }; delete Object.prototype[0]; \
+             assert.sameValue(o[0], true);",
+            "var o = { get a() { return 1; }, a: 2 }; assert.sameValue(o.a, 2); \
+             assert.sameValue(Object.getOwnPropertyDescriptor(o, 'a').writable, true);",
+            "var p = {}; var o = { __proto__: p }; assert.sameValue(Object.getPrototypeOf(o), p); \
+             assert.sameValue(Object.keys(o).length, 0);",
+            "var p = {}; var o = { ['__proto__']: p }; \
+             assert.sameValue(Object.getPrototypeOf(o), Object.prototype); \
+             assert.sameValue(Object.keys(o)[0], '__proto__');",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: object literal definition", body);
+                let label = format!("object-literal-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_time_works_in_the_host() {
+        let source = wrap(
+            "description: local time",
+            "assert.sameValue(new Date(0).getTimezoneOffset(), 0);\n\
+             assert.sameValue(new Date(0).getHours(), 0);",
+        );
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            let label = format!("local-time-{mode:?}");
+            if let Err(error) = run_fixture_in(mode, &label, &source) {
+                panic!("{label}: {error:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_array_elision_leaves_a_hole() {
+        const CASES: [&str; 4] = [
+            "var a = [0, , 2]; assert.sameValue(a.length, 3); \
+             assert.sameValue(1 in a, false); assert.sameValue(a[2], 2);",
+            "var a = [,]; assert.sameValue(a.length, 1); assert.sameValue(0 in a, false);",
+            "var a = [1, , ]; assert.sameValue(a.length, 2); assert.sameValue(1 in a, false);",
+            "var a = [...[1, 2], , 4]; assert.sameValue(a.length, 4); \
+             assert.sameValue(2 in a, false); assert.sameValue(a[3], 4);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: array elisions", body);
+                let label = format!("array-elision-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{label}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_template_substitution_is_converted_with_to_string() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [&str; 4] = [
+            "var o = { valueOf() { return 'V'; }, toString() { return 'T'; } }; \
+             assert.sameValue(`${o}`, 'T');",
+            "assert.sameValue(`${1}${'a'}${null}${undefined}`, '1anullundefined');",
+            "assert.sameValue(throws(TypeError, function () { `${Symbol()}`; }), true);",
+            "var log = ''; var part = function (name) { return { toString() { log += name; \
+             return name; } }; }; assert.sameValue(`${part('a')}-${part('b')}`, 'a-b'); \
+             assert.sameValue(log, 'ab');",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: template literals", &format!("{THROWS}{body}"));
+                let label = format!("template-literal-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_anonymous_function_takes_the_name_it_initializes() {
+        const CASES: [&str; 20] = [
+            "var f = function () {}; assert.sameValue(f.name, 'f');",
+            "var a = () => {}; assert.sameValue(a.name, 'a');",
+            "var c = class {}; assert.sameValue(c.name, 'c');",
+            "var g = function* () {}; assert.sameValue(g.name, 'g');",
+            "var { x = function () {} } = {}; assert.sameValue(x.name, 'x');",
+            "var [y = () => {}] = []; assert.sameValue(y.name, 'y');",
+            "function p(z = class {}) { return z; } assert.sameValue(p().name, 'z');",
+            "var h; h = function () {}; assert.sameValue(h.name, 'h');",
+            "var i; i ??= function () {}; assert.sameValue(i.name, 'i');",
+            "var j; j ||= () => {}; assert.sameValue(j.name, 'j');",
+            "var u; [u = function () {}] = []; assert.sameValue(u.name, 'u');",
+            "var v; ({ v = function () {} } = {}); assert.sameValue(v.name, 'v');",
+            "var o = { m: function () {}, 'n': () => {} }; assert.sameValue(o.m.name, 'm'); \
+             assert.sameValue(o.n.name, 'n');",
+            "var paren = (function () {}); assert.sameValue(paren.name, 'paren');",
+            "var kept = function other() {}; assert.sameValue(kept.name, 'other');",
+            "var cover = (0, function () {}); assert.sameValue(cover.name, '');",
+            "var q; (q) = function () {}; assert.sameValue(q.name, '');",
+            "var s = class { static name() {} }; assert.sameValue(typeof s.name, 'function');",
+            "var inner = class { static c = class {}; }; assert.sameValue(inner.c.name, 'c');",
+            "var calls = 0; var [w = (calls += 1, undefined)] = []; assert.sameValue(calls, 1);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: function names", body);
+                let label = format!("function-names-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn negative_zero_survives_in_every_tier() {
+        const CASES: [&str; 12] = [
+            "assert.sameValue(1 / Math.round(-0), -Infinity);",
+            "assert.sameValue(Math.round(0.49999999999999994), 0);",
+            "assert.sameValue(Math.round(-0.5) === 0, true); assert.sameValue(Math.round(2.5), 3); \
+             assert.sameValue(Math.round(-2.5), -2); assert.sameValue(Math.round(4503599627370495.5), 4503599627370496);",
+            "assert.sameValue(1 / -0, -Infinity);",
+            "assert.sameValue(Object.is(-0, 0), false);",
+            "var z = 0; assert.sameValue(1 / -z, -Infinity);",
+            "var z = 0; assert.sameValue(1 / (z * -1), -Infinity);",
+            "var a = -1; var b = 0; assert.sameValue(1 / (a * b), -Infinity);",
+            "assert.sameValue(1 / Math.round(-0.4), -Infinity);",
+            "assert.sameValue(Object.is(Number('-0'), -0), true);",
+            "assert.sameValue(String(-0), '0'); assert.sameValue(-0 === 0, true);",
+            "var o = {}; o[-0] = 1; assert.sameValue(o['0'], 1);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: negative zero", body);
+                let label = format!("negative-zero-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indirect_eval_runs_in_the_global_scope() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [&str; 12] = [
+            "assert.sameValue((0, eval)('1 + 1'), 2);",
+            "assert.sameValue((0, eval)(1), 1);",
+            "assert.sameValue((0, eval)(), undefined);",
+            "var x = 1; assert.sameValue((0, eval)('x'), 1);",
+            "(0, eval)('var y = 2'); assert.sameValue(globalThis.y, 2);",
+            "(0, eval)('function g() { return 3; }'); assert.sameValue(globalThis.g(), 3);",
+            "assert.sameValue((0, eval)('this'), globalThis);",
+            "assert.sameValue((0, eval)('if (true) { 4; } else { 5; }'), 4);",
+            "assert.sameValue(throws(SyntaxError, function () { (0, eval)('('); }), true);",
+            "assert.sameValue(throws(TypeError, function () { new eval('1'); }), true);",
+            "assert.sameValue(throws(SyntaxError, function () { (0, eval)('\"use strict\"; with (a) {}'); }), true);",
+            "assert.sameValue(throws(SyntaxError, function () { Function('\"use strict\"; var public;'); }), true);",
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, body) in CASES.iter().enumerate() {
+                let source = wrap("description: indirect eval", &format!("{THROWS}{body}"));
+                let label = format!("indirect-eval-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_script_declares_on_the_global_object() {
+        const CASES: [(&str, &str); 11] = [
+            (
+                "",
+                "function f() { var x = 1; var x; return x; } assert.sameValue(f(), 1);",
+            ),
+            ("", "var x = 1; assert.sameValue(globalThis.x, 1);"),
+            ("", "function f() {} assert.sameValue(globalThis.f, f);"),
+            ("", "assert.sameValue(hoisted, undefined); var hoisted = 1;"),
+            (
+                "",
+                "assert.sameValue(early(), 1); function early() { return 1; }",
+            ),
+            ("", "assert.sameValue(this, globalThis);"),
+            ("", "var undefined; assert.sameValue(undefined, void 0);"),
+            ("", "var Array; assert.sameValue(typeof Array, 'function');"),
+            (
+                "",
+                "let y = 1; assert.sameValue(y, 1); assert.sameValue('y' in globalThis, false);",
+            ),
+            (
+                "",
+                "var v = 1; (function () { v = 2; })(); assert.sameValue(globalThis.v, 2);",
+            ),
+            (
+                "flags: [module]",
+                "var x = 1; assert.sameValue('x' in globalThis, false); assert.sameValue(this, undefined);",
+            ),
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, (flags, body)) in CASES.iter().enumerate() {
+                let source = wrap(&format!("description: script goal\n{flags}"), body);
+                let label = format!("script-goal-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn module_syntax_is_an_early_error_in_a_script() {
+        for (index, body) in ["export var x;", "import './composed.js';", "import.meta;"]
+            .iter()
+            .enumerate()
+        {
+            let source = wrap(
+                "description: module syntax in a script\n\
+                 negative:\n  phase: parse\n  type: SyntaxError",
+                body,
+            );
+            run_fixture(&format!("script-goal-early-{index}"), &source)
+                .unwrap_or_else(|error| panic!("{body}: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn a_lint_cannot_refuse_a_valid_program() {
+        let source = wrap(
+            "description: a with statement is valid in sloppy code\nflags: [noStrict]",
+            "with ({ a: 1 }) { assert.sameValue(a, 1); }",
+        );
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            run_fixture_in(mode, &format!("with-{mode:?}"), &source).unwrap();
+        }
+    }
+
+    #[test]
+    fn strict_and_sloppy_code_differ_the_same_way_in_every_tier() {
+        const THROWS: &str = "function throws(kind, body) {\n\
+            try { body(); } catch (error) { return error instanceof kind; }\n\
+            return false;\n\
+            }\n";
+        const CASES: [(&str, &str); 18] = [
+            (
+                "noStrict",
+                "assert.sameValue((function () { return this; })(), globalThis);",
+            ),
+            (
+                "onlyStrict",
+                "assert.sameValue((function () { return this; })(), undefined);",
+            ),
+            (
+                "noStrict",
+                "assert.sameValue((function () { return this; }).call(null), globalThis);",
+            ),
+            (
+                "noStrict",
+                "assert.sameValue(typeof (function () { return this; }).call(1), 'object');",
+            ),
+            (
+                "noStrict",
+                "var f = function () { return this === this; }; assert.sameValue(f.call(1), true);",
+            ),
+            (
+                "onlyStrict",
+                "assert.sameValue((function () { return this; }).call(1), 1);",
+            ),
+            (
+                "noStrict",
+                "assert.sameValue((function () { return (() => this)(); })(), globalThis);",
+            ),
+            (
+                "noStrict",
+                "function *g() { yield this; } assert.sameValue(g().next().value, globalThis);",
+            ),
+            (
+                "noStrict",
+                "function f() { 'use strict'; return this; } assert.sameValue(f(), undefined);",
+            ),
+            (
+                "noStrict",
+                "class C { m() { return this; } } var m = new C().m; assert.sameValue(m(), undefined);",
+            ),
+            (
+                "noStrict",
+                "var o = Object.freeze({ a: 1 }); o.a = 2; assert.sameValue(o.a, 1);",
+            ),
+            (
+                "onlyStrict",
+                "var o = Object.freeze({ a: 1 }); assert.sameValue(throws(TypeError, function () { o.a = 2; }), true);",
+            ),
+            (
+                "noStrict",
+                "'text'.x = 1; (1).x = 1; assert.sameValue((1).x, undefined);",
+            ),
+            (
+                "onlyStrict",
+                "assert.sameValue(throws(TypeError, function () { 'text'.x = 1; }), true);",
+            ),
+            (
+                "noStrict",
+                "undeclared = 1; assert.sameValue(undeclared, 1);",
+            ),
+            (
+                "onlyStrict",
+                "assert.sameValue(throws(ReferenceError, function () { undeclared = 1; }), true);",
+            ),
+            (
+                "noStrict",
+                "assert.sameValue(delete Object.prototype, false);",
+            ),
+            (
+                "onlyStrict",
+                "assert.sameValue(throws(TypeError, function () { delete Object.prototype; }), true);",
+            ),
+        ];
+        for mode in [
+            ExecutionMode::Interpreter,
+            ExecutionMode::Jit,
+            ExecutionMode::Aot,
+        ] {
+            for (index, (flag, body)) in CASES.iter().enumerate() {
+                let source = wrap(
+                    &format!("description: strictness\nflags: [{flag}]"),
+                    &format!("{THROWS}{body}"),
+                );
+                let label = format!("strictness-{mode:?}-{index}");
+                if let Err(error) = run_fixture_in(mode, &label, &source) {
+                    panic!("{mode:?} [{flag}] {body}: {error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_composed_test_is_compiled_as_strict_code() {
+        let source = wrap(
+            "description: reserved in strict code only, so this must not compile\n\
+             flags: [onlyStrict]",
+            "var public;",
+        );
+        assert!(
+            run_fixture("strict-compiled", &source).is_err(),
+            "the directive reaches the test past the harness"
+        );
+    }
+
+    #[test]
+    fn an_early_negative_is_parsed_under_its_own_flags() {
+        let strict = wrap(
+            "description: reserved in strict code only\n\
+             flags: [onlyStrict]\n\
+             negative:\n  phase: parse\n  type: SyntaxError",
+            "var public;",
+        );
+        run_fixture("strict-parse", &strict).expect("rejected as strict code");
+        let module = wrap(
+            "description: reserved in module code only\n\
+             flags: [module]\n\
+             negative:\n  phase: parse\n  type: SyntaxError",
+            "var await;",
+        );
+        run_fixture("module-parse", &module).expect("rejected as module code");
+    }
+
+    #[test]
+    fn a_module_case_without_imports_has_the_module_goal() {
+        let source = wrap(
+            "description: reserved in module code only, so this must not compile\n\
+             flags: [module]",
+            "var await;",
+        );
+        assert!(
+            run_fixture("module-goal", &source).is_err(),
+            "a test with no import or export is still a module"
+        );
     }
 
     #[test]
@@ -1824,7 +3125,15 @@ function $ERROR(message) {\n\
         let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
         for variant in &plan.variants {
             let script = compose_script(&parsed, &plan, variant, &sources).unwrap();
-            assert!(script.untouched, "early negatives compose untouched");
+            assert_eq!(
+                script.untouched,
+                variant.kind == SourceKind::ScriptNonStrict,
+                "an early negative takes no harness, only its strict directive"
+            );
+            assert_eq!(
+                &script.bytes[script.test_offset..],
+                parsed.source_bytes.as_slice()
+            );
             run_variant(&runner, &parsed, &plan, &sources, variant).unwrap();
         }
     }
@@ -1866,6 +3175,7 @@ function $ERROR(message) {\n\
             },
             negative,
             async_done: true,
+            can_block: true,
             deadline: Duration::from_millis(100),
         }
     }
@@ -2051,7 +3361,9 @@ function $ERROR(message) {\n\
             async_done_outcome(DoneEventKind::Error, Some("CustomError: not a known type"));
 
         match judge_run(&request, &outcome) {
-            Err(OracleError::ExpectationMismatch { expected, actual }) => {
+            Err(OracleError::ExpectationMismatch {
+                expected, actual, ..
+            }) => {
                 assert_eq!(expected, "Runtime/Test262Error");
                 assert_eq!(actual, "Runtime/CustomError: not a known type");
             }
@@ -2171,11 +3483,50 @@ function $ERROR(message) {\n\
             // this is an ExpectationMismatch, not a BlockedRun.
             assert!(
                 matches!(&result,
-                    Err(OracleError::ExpectationMismatch { expected, actual })
+                    Err(OracleError::ExpectationMismatch { expected, actual, .. })
                         if expected == "success" && actual == "Runtime/Test262Error"
                 ),
                 "a guest throw with a known constructor must be classified, not blocked: {result:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_failed_run_reads_as_what_it_expected_and_what_the_throw_said() {
+        let mismatch = |message: &str| OracleError::ExpectationMismatch {
+            expected: "success".to_owned(),
+            actual: "Runtime/Test262Error".to_owned(),
+            message: message.to_owned(),
+        };
+        assert_eq!(
+            failure_detail(&mismatch("Expected SameValue(«1», «2»)")),
+            "expected success, got Runtime/Test262Error: Expected SameValue(«1», «2»)"
+        );
+        assert_eq!(
+            failure_detail(&mismatch("")),
+            "expected success, got Runtime/Test262Error"
+        );
+        let blocked = OracleError::BlockedRun {
+            detail: "no verdict".to_owned(),
+        };
+        assert!(failure_detail(&blocked).contains("no verdict"));
+    }
+
+    #[test]
+    fn a_thrown_message_never_changes_a_verdict() {
+        let request = negative_async_request(Some(Negative {
+            phase: NegativePhase::Runtime,
+            error_type: NegativeType::TypeError,
+        }));
+        for message in ["", "anything at all"] {
+            let outcome = RunOutcome::Completed {
+                thrown: Some(ThrownError {
+                    phase: NegativePhase::Runtime,
+                    error_type: NegativeType::TypeError,
+                    message: message.to_owned(),
+                }),
+            };
+            assert!(judge_run(&request, &outcome).is_ok());
         }
     }
 
@@ -2201,6 +3552,7 @@ function $ERROR(message) {\n\
                 script,
                 negative: plan.negative.clone(),
                 async_done: plan.async_done,
+                can_block: plan.can_block,
                 deadline: Duration::from_millis(1),
             };
             let outcome = runner.run(&request);
@@ -2233,6 +3585,7 @@ function $ERROR(message) {\n\
                 },
                 negative: None,
                 async_done: false,
+                can_block: true,
                 deadline: Duration::from_millis(100),
             });
         }

@@ -183,6 +183,7 @@ mod tests {
             value: Value::UNDEFINED,
             origin: ThrowOrigin::Bytecode,
             constructor_name: None,
+            message: None,
         })
     }
 

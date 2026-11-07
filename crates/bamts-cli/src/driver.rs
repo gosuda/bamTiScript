@@ -15,6 +15,7 @@ use bamts_compiler::{
     project::{
         JsonObject, JsonValue, ProjectConfig, ProjectRoot,
         build_mode::BuildInfo,
+        canonical::{canonicalize, slash_text},
         effective::{
             EffectiveProject, MaterializeError, ProjectBuildOptions, ProjectCompileError,
             ProjectCompileOptions, ProjectCompileResult, ProjectLoadRequest,
@@ -670,7 +671,7 @@ fn initialize_tsc_config(context: &ExecutionContext) -> Result<CommandOutcome, D
             return Ok(CommandOutcome {
                 stdout: format!(
                     "error TS5054: A 'tsconfig.json' file is already defined at: '{}'.\n",
-                    path.display()
+                    slash_text(&path)
                 )
                 .into_bytes(),
                 ..CommandOutcome::default()
@@ -833,14 +834,14 @@ fn execute_tsc_build(
                 writeln!(
                     stdout,
                     "Project '{}' is up to date",
-                    project.config_path.display()
+                    slash_text(&project.config_path)
                 )
                 .expect("writing to Vec cannot fail");
             } else {
                 writeln!(
                     stdout,
                     "Building project '{}'...",
-                    project.config_path.display()
+                    slash_text(&project.config_path)
                 )
                 .expect("writing to Vec cannot fail");
             }
@@ -849,7 +850,7 @@ fn execute_tsc_build(
         stdout.extend_from_slice(&outcome.stdout);
         has_errors |= outcome.exit_code != TscExitStatus::Success.code();
         if command.flag("dry") {
-            writeln!(stdout, "Would build {}", project.config_path.display())
+            writeln!(stdout, "Would build {}", slash_text(&project.config_path))
                 .expect("writing to Vec cannot fail");
         } else if !project.result.up_to_date {
             publish_project_result(&project.result)?;
@@ -973,7 +974,7 @@ fn project_result_outcome(
     let names = result
         .sources
         .iter()
-        .map(|source| source.path.to_string_lossy())
+        .map(|source| slash_text(&source.path))
         .collect::<Vec<_>>();
     let sources = result
         .sources
@@ -1041,7 +1042,7 @@ fn config_not_found_outcome(
             "TS5081",
             format!(
                 "Cannot find a tsconfig.json file at the current directory: {}.",
-                config_path.display()
+                slash_text(config_path)
             ),
         );
     };
@@ -1053,7 +1054,7 @@ fn config_not_found_outcome(
     {
         return tsc_error_outcome(
             "TS5083",
-            format!("Cannot read file '{}'.", config_path.display()),
+            format!("Cannot read file '{}'.", slash_text(config_path)),
         );
     }
     let directory = if project_path.is_absolute() {
@@ -1065,7 +1066,7 @@ fn config_not_found_outcome(
         "TS5057",
         format!(
             "Cannot find a tsconfig.json file at the specified directory: '{}'.",
-            directory.display()
+            slash_text(&directory)
         ),
     )
 }
@@ -1722,6 +1723,7 @@ fn forbidden_lint_override(error: bamts_compiler::lint::ForbidOverrideError) -> 
 fn lower_options(args: &CliArgs) -> LowerOptions {
     LowerOptions {
         javascript_compatibility: args.js_compat.enabled,
+        ..LowerOptions::default()
     }
 }
 
@@ -1954,7 +1956,7 @@ fn populate_node_environment(
     Ok(())
 }
 
-fn capture_process_with_cancel(
+pub(crate) fn capture_process_with_cancel(
     command: &mut Command,
     cancel: &CancellationToken,
 ) -> io::Result<Option<Output>> {
@@ -2154,41 +2156,77 @@ fn link_executable(
         source,
     })?;
     let archive = cached_node_archive(context)?;
-    let compiler = discover_toolchain(context, cancel)?;
+    let linker = discover_linker(context, cancel)?;
     let temporary = TemporaryLinkFiles::create(parent, &destination)?;
     fs::write(&temporary.object, object).map_err(|source| DriverError::WriteObject {
         path: temporary.object.clone(),
         source,
     })?;
 
-    let mut command = Command::new(&compiler);
-    command
-        .current_dir(context.cwd())
-        .env_clear()
-        .envs(context.envs())
-        .arg(&temporary.object)
-        .arg(&archive)
-        .arg("-o")
-        .arg(&temporary.executable);
-    if cfg!(target_os = "linux") {
-        command.args(["-ldl", "-lpthread", "-lm"]);
-    }
+    let mut command = linker.command(context, &temporary.object, &archive, &temporary.executable);
     let output = capture_process_with_cancel(&mut command, cancel)
         .map_err(|source| DriverError::LinkStart {
-            program: compiler.clone(),
+            program: command.get_program().to_owned(),
             source,
         })?
         .ok_or(DriverError::Cancelled)?;
     if !output.status.success() {
         return Err(DriverError::LinkFailed {
-            program: compiler,
+            program: command.get_program().to_owned(),
             status: output.status,
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stderr: linker.diagnostics(&output),
         });
     }
     publish_linked_executable(&temporary.executable, &destination)
 }
 
+/// The system C compiler that links on every host except Windows MSVC.
+#[cfg(not(target_env = "msvc"))]
+struct Linker {
+    compiler: OsString,
+}
+
+#[cfg(not(target_env = "msvc"))]
+impl Linker {
+    fn command(
+        &self,
+        context: &ExecutionContext,
+        object: &Path,
+        archive: &Path,
+        executable: &Path,
+    ) -> Command {
+        let mut command = Command::new(&self.compiler);
+        command
+            .current_dir(context.cwd())
+            .env_clear()
+            .envs(context.envs())
+            .arg(object)
+            .arg(archive)
+            .arg("-o")
+            .arg(executable);
+        if cfg!(target_os = "linux") {
+            command.args(["-ldl", "-lpthread", "-lm"]);
+        }
+        command
+    }
+
+    fn diagnostics(&self, output: &Output) -> String {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+}
+
+#[cfg(not(target_env = "msvc"))]
+fn discover_linker(
+    context: &ExecutionContext,
+    cancel: &CancellationToken,
+) -> Result<Linker, DriverError> {
+    discover_toolchain(context, cancel).map(|compiler| Linker { compiler })
+}
+
+#[cfg(target_env = "msvc")]
+use crate::windows_link::discover as discover_linker;
+
+#[cfg(not(target_env = "msvc"))]
 fn discover_toolchain(
     context: &ExecutionContext,
     cancel: &CancellationToken,
@@ -2199,6 +2237,7 @@ fn discover_toolchain(
     probe_toolchain_in_context(program, context, cancel)
 }
 
+#[cfg(any(test, not(target_env = "msvc")))]
 fn probe_toolchain_in_context(
     program: OsString,
     context: &ExecutionContext,
@@ -2321,10 +2360,46 @@ fn fallback_cache_root_path_in_context(context: &ExecutionContext) -> Result<Pat
 
 #[cfg(not(unix))]
 fn fallback_cache_root_path_in_context(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
+    #[cfg(windows)]
+    if is_windows_temp_directory(context.temp_dir(), context) {
+        return Err(DriverError::UnsafeFallbackCacheRoot {
+            path: context.temp_dir().to_owned(),
+        });
+    }
     Ok(context.temp_dir().join(format!(
         "bamts-cache-{}",
         fallback_cache_user_key_in_context(context)?
     )))
+}
+
+/// Whether `directory` is in the temporary directory of Windows itself. A process with
+/// no `TMP`, `TEMP` or `USERPROFILE` falls back to it, and so does the SYSTEM account.
+/// Every user can create a directory there, so another user could make the cache
+/// first, and a link trusts the archive and the libraries that it finds in the cache.
+/// Windows has no check here like the owner and mode check of a Unix fallback.
+#[cfg(windows)]
+fn is_windows_temp_directory(directory: &Path, context: &ExecutionContext) -> bool {
+    // One directory has many spellings: slashes, `\\?\`, a short name, a junction.
+    // Only a directory that exists has a canonical path, so a new one resolves through
+    // its nearest parent that exists, and a path on no drive compares by components.
+    let identity = |path: &Path| -> PathBuf {
+        path.ancestors()
+            .find_map(|ancestor| {
+                let parent = std::fs::canonicalize(ancestor).ok()?;
+                Some(parent.join(path.strip_prefix(ancestor).ok()?))
+            })
+            .unwrap_or_else(|| path.components().collect())
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .into()
+    };
+    let directory = identity(directory);
+    ["SystemRoot", "WINDIR"]
+        .into_iter()
+        .filter_map(|name| crate::context::env_ignoring_case(context.envs(), name))
+        .map(|root| Path::new(root).join("Temp"))
+        .chain([PathBuf::from(r"C:\Windows\Temp")])
+        .any(|shared| directory.starts_with(identity(&shared)))
 }
 
 #[cfg(unix)]
@@ -2457,7 +2532,7 @@ fn validate_private_fallback_dir_in_context(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn ensure_private_fallback_cache_root(path: PathBuf) -> Result<PathBuf, DriverError> {
     let context = ExecutionContext::ambient()?;
     ensure_private_fallback_cache_root_in_context(path, &context)
@@ -2491,7 +2566,7 @@ fn effective_uid_in_context(context: &ExecutionContext) -> Result<u32, DriverErr
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn effective_uid() -> Result<u32, DriverError> {
     let context = ExecutionContext::ambient()?;
     effective_uid_in_context(&context)
@@ -2615,7 +2690,7 @@ fn load_program_frontend_in_context_with_cancel(
         current_directory.join(entrypoint)
     };
     let absolute_entrypoint =
-        fs::canonicalize(&absolute_entrypoint).map_err(|source| DriverError::ReadSource {
+        canonicalize(&absolute_entrypoint).map_err(|source| DriverError::ReadSource {
             path: absolute_entrypoint,
             source,
         })?;
@@ -2628,7 +2703,7 @@ fn load_program_frontend_in_context_with_cancel(
             .to_path_buf()
     };
     let project = discover_project(&absolute_entrypoint, fallback_root);
-    let canonical_root = fs::canonicalize(project.root())
+    let canonical_root = canonicalize(project.root())
         .map_err(|error| DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
     let root = ProjectRoot::new(canonical_root).map_err(|error| {
         DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
@@ -2774,12 +2849,16 @@ mod tests {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(unix)]
+    use std::thread;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
-    use std::{fs, process, thread};
+    use std::{fs, process};
 
     use bamts_compiler::{
         CancellationToken,
         lint::{LintLevel, SourceDialect, rule_by_name},
+        project::canonical::slash_text,
     };
 
     use crate::args::{ArgsError, parse_args};
@@ -2787,10 +2866,11 @@ mod tests {
     use crate::context::ExecutionContext;
 
     use super::{
-        CommandOutcome, DriverError, capture_process_with_cancel, content_hash, execute_in_context,
-        execute_tsc, execute_tsc_in, levels, link_executable, lower_options, probe_toolchain,
-        probe_toolchain_in_context,
+        CommandOutcome, DriverError, content_hash, execute_in_context, execute_tsc, execute_tsc_in,
+        levels, lower_options, probe_toolchain,
     };
+    #[cfg(unix)]
+    use super::{capture_process_with_cancel, link_executable, probe_toolchain_in_context};
 
     #[cfg(unix)]
     #[test]
@@ -3046,7 +3126,7 @@ exit 2
             String::from_utf8(existing.stdout).expect("UTF-8 TS5054"),
             format!(
                 "error TS5054: A 'tsconfig.json' file is already defined at: '{}'.\n",
-                config.display()
+                slash_text(&config)
             )
         );
         assert_eq!(fs::read(config).expect("read unchanged config"), original);
@@ -3073,7 +3153,7 @@ exit 2
             current,
             format!(
                 "error TS5081: Cannot find a tsconfig.json file at the current directory: {}.\n",
-                fixture.0.join("tsconfig.json").display()
+                slash_text(&fixture.0.join("tsconfig.json"))
             ),
         );
 
@@ -3088,7 +3168,7 @@ exit 2
             explicit_directory,
             format!(
                 "error TS5057: Cannot find a tsconfig.json file at the specified directory: '{}'.\n",
-                directory.display()
+                slash_text(&directory)
             ),
         );
 
@@ -3100,7 +3180,10 @@ exit 2
         .expect("file project executes");
         assert_error(
             explicit_file,
-            format!("error TS5083: Cannot read file '{}'.\n", config.display()),
+            format!(
+                "error TS5083: Cannot read file '{}'.\n",
+                slash_text(&config)
+            ),
         );
 
         fixture.write("empty.json", r#"{"files":[]}"#);
@@ -3113,7 +3196,7 @@ exit 2
             empty,
             format!(
                 "error TS18002: The 'files' list in config file '{}' is empty.\n",
-                fixture.0.join("empty.json").display()
+                slash_text(&fixture.0.join("empty.json"))
             ),
         );
 
@@ -3130,14 +3213,14 @@ exit 2
             none,
             format!(
                 "error TS18003: No inputs were found in config file '{}'. Specified 'include' paths were '[\"src/**/*.ts\"]' and 'exclude' paths were '[\"build\"]'.\n",
-                fixture.0.join("none.json").display()
+                slash_text(&fixture.0.join("none.json"))
             ),
         );
 
         let absolute_pattern = fixture.0.join("absolute/**/*.ts");
         fixture.write(
             "absolute.json",
-            &format!(r#"{{"include":["{}"]}}"#, absolute_pattern.display()),
+            &format!(r#"{{"include":["{}"]}}"#, slash_text(&absolute_pattern)),
         );
         let absolute = execute_tsc_in(
             &parse_tsc_args(["--project", "absolute.json"]).expect("absolute project parses"),
@@ -3148,8 +3231,8 @@ exit 2
             absolute,
             format!(
                 "error TS18003: No inputs were found in config file '{}'. Specified 'include' paths were '[\"{}\"]' and 'exclude' paths were '[]'.\n",
-                fixture.0.join("absolute.json").display(),
-                absolute_pattern.display()
+                slash_text(&fixture.0.join("absolute.json")),
+                slash_text(&absolute_pattern)
             ),
         );
 
@@ -3167,7 +3250,7 @@ exit 2
             inherited,
             format!(
                 "error TS18003: No inputs were found in config file '{}'. Specified 'include' paths were '[\"../base/src/**/*.ts\"]' and 'exclude' paths were '[\"../base/build\"]'.\n",
-                fixture.0.join("app/tsconfig.json").display()
+                slash_text(&fixture.0.join("app/tsconfig.json"))
             ),
         );
     }
@@ -3194,8 +3277,8 @@ exit 2
         assert!(fixture.0.join("list-dist/a.js").is_file());
         assert!(fixture.0.join("list-dist/b.js").is_file());
         let listed = String::from_utf8(listed.stdout).unwrap();
-        let dependency = fixture.0.join("src/b.ts").display().to_string();
-        let root = fixture.0.join("src/a.ts").display().to_string();
+        let dependency = slash_text(&fixture.0.join("src/b.ts"));
+        let root = slash_text(&fixture.0.join("src/a.ts"));
         assert!(listed.contains(&dependency), "{listed}");
         assert!(listed.contains(&root), "{listed}");
 
@@ -3228,7 +3311,7 @@ exit 2
         assert_eq!(bad.exit_code, TscExitStatus::Success.code());
         assert_eq!(
             String::from_utf8(bad.stdout).unwrap(),
-            format!("{}\n", fixture.0.join("bad.ts").display())
+            format!("{}\n", slash_text(&fixture.0.join("bad.ts")))
         );
     }
 
@@ -3294,7 +3377,9 @@ exit 2
         let id = NEXT_TSC_TEST_ID.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("bamts-tsc-emit-{}-{id}.ts", std::process::id()));
-        let emitted = path.with_extension("");
+        // The emitted executable has the platform's executable extension: none on
+        // Unix, `exe` on Windows.
+        let emitted = path.with_extension(std::env::consts::EXE_EXTENSION);
         std::fs::write(&path, "const value: number = \"text\";\n").expect("write source");
 
         let outcome = execute_tsc(
@@ -3522,6 +3607,91 @@ exit 2
         assert_eq!(
             table.level_for_source(typescript_only, SourceDialect::JavaScript),
             LintLevel::Allow
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fallback_cache_root_refuses_the_temporary_directory_of_windows() {
+        let root = |variables: &[(&str, &str)]| {
+            let env = variables
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                .collect();
+            let context = ExecutionContext::new(std::env::temp_dir(), env).expect("context");
+            super::fallback_cache_root_path_in_context(&context)
+        };
+        let refused = |variables: &[(&str, &str)]| {
+            matches!(
+                root(variables),
+                Err(DriverError::UnsafeFallbackCacheRoot { .. })
+            )
+        };
+
+        // Nothing names a directory of the user.
+        assert!(refused(&[]));
+        assert!(refused(&[("SystemRoot", r"D:\Windows")]));
+        assert!(refused(&[("WINDIR", r"D:\Windows")]));
+        // The SYSTEM account names it, in any spelling.
+        assert!(refused(&[
+            ("SystemRoot", r"C:\Windows"),
+            ("TEMP", r"c:\windows\TEMP\")
+        ]));
+        assert!(refused(&[
+            ("SystemRoot", r"D:\Windows"),
+            ("TEMP", "D:/Windows/Temp/")
+        ]));
+        let windows = std::env::var("SystemRoot").expect("SystemRoot");
+        for spelling in [
+            format!("{windows}/Temp").replace('\\', "/"),
+            format!(r"\\?\{windows}\Temp"),
+            format!(r"{windows}\.\Temp"),
+            format!(r"{windows}\System32\..\Temp"),
+        ] {
+            assert!(
+                refused(&[("SystemRoot", &windows), ("TEMP", &spelling)]),
+                "{spelling}"
+            );
+        }
+        // A directory below it is as open to other users, and it need not exist yet.
+        for below in [
+            format!(r"{windows}\Temp\bamts-missing"),
+            format!("{windows}/Temp/bamts-missing/deeper/"),
+        ] {
+            assert!(
+                refused(&[("SystemRoot", &windows), ("TEMP", &below)]),
+                "{below}"
+            );
+        }
+        // A name that only starts the same way is another directory.
+        assert!(!refused(&[
+            ("SystemRoot", &windows),
+            ("TEMP", &format!(r"{windows}\Temporary"))
+        ]));
+        // A junction is a directory that any user can make, and it leads there too.
+        let junction = std::env::temp_dir().join(format!("bamts-temp-link-{}", std::process::id()));
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(format!(r"{windows}\Temp"))
+            .output()
+            .expect("run mklink");
+        assert!(made.status.success(), "{made:?}");
+        let through_junction = refused(&[
+            ("SystemRoot", &windows),
+            ("TEMP", junction.to_str().expect("a UTF-8 path")),
+        ]);
+        std::fs::remove_dir(&junction).expect("remove the junction");
+        assert!(through_junction);
+
+        assert_eq!(
+            root(&[
+                ("SystemRoot", r"C:\Windows"),
+                ("TMP", r"D:\Temp"),
+                ("USERNAME", "builder")
+            ])
+            .expect("a directory of the user"),
+            PathBuf::from(r"D:\Temp\bamts-cache-builder")
         );
     }
 
@@ -3897,7 +4067,7 @@ printf '#!/bin/sh\npwd\n' > "$output"
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn managed_capture_kills_descendant_without_external_kill_before_reader_join()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3942,10 +4112,12 @@ printf '#!/bin/sh\npwd\n' > "$output"
         let pid = std::fs::read_to_string(&pid_file)?.trim().parse::<u32>()?;
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            let alive = process::Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
                 .ok()
-                .and_then(|stat| stat.split_whitespace().nth(2).map(str::to_owned))
-                .is_some_and(|state| state != "Z");
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                .is_some_and(|state| !state.is_empty() && !state.starts_with('Z'));
             if !alive {
                 break;
             }

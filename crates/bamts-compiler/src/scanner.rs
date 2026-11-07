@@ -14,9 +14,10 @@
 //! resolved through *explicit* scanner operations rather than guesses:
 //!
 //! * A `/` is ambiguous between division and a regular-expression literal. The
-//!   default pass always emits [`TokenKind::Slash`]/[`TokenKind::SlashEq`]; a
-//!   caller with grammar context calls [`Scanner::rescan_regex`] to reinterpret
-//!   it as a [`TokenKind::RegularExpressionLiteral`].
+//!   default pass emits [`TokenKind::Slash`]/[`TokenKind::SlashEq`] unless the
+//!   token before it cannot end an expression; a caller with grammar context
+//!   calls [`Scanner::rescan_regex`] to reinterpret it as a
+//!   [`TokenKind::RegularExpressionLiteral`].
 //! * A `>` is ambiguous between a single relational operator and the start of a
 //!   shift/compound operator. The default pass greedily forms the longest
 //!   operator; a caller closing type arguments or a JSX tag calls
@@ -47,9 +48,9 @@ const UNTERMINATED_REGEX: DiagnosticCode = DiagnosticCode::new("BAMTS-L004");
 /// A character that cannot begin any token.
 const UNEXPECTED_CHARACTER: DiagnosticCode = DiagnosticCode::new("BAMTS-L005");
 /// A malformed escape sequence.
-const INVALID_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L006");
+pub(crate) const INVALID_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L006");
 /// A malformed unicode escape sequence.
-const INVALID_UNICODE_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L007");
+pub(crate) const INVALID_UNICODE_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L007");
 /// A misplaced numeric separator.
 const INVALID_NUMERIC_SEPARATOR: DiagnosticCode = DiagnosticCode::new("BAMTS-L008");
 /// A numeric literal with no valid digits.
@@ -386,10 +387,10 @@ impl ScannedSource {
 
 /// Scans a whole source into an ordered token stream with recovery diagnostics.
 ///
-/// This is the default single-pass driver: `/` stays division and `>` forms the
-/// longest operator, both of which a grammar-aware caller can reinterpret with
-/// [`Scanner::rescan_regex`] and [`Scanner::rescan_greater_than`]. Template
-/// literals are fully segmented here.
+/// This is the default single-pass driver: `>` forms the longest operator and `/`
+/// is division unless nothing before it could be divided. A grammar-aware caller
+/// can reinterpret either with [`Scanner::rescan_regex`] and
+/// [`Scanner::rescan_greater_than`]. Template literals are fully segmented here.
 #[must_use]
 pub fn scan(
     source_id: SourceId,
@@ -420,13 +421,30 @@ pub fn scan_with_cancel(
     let (tokens, eof, diagnostics) = {
         let mut scanner = Scanner::new_with_cancel(source_id, script_kind, &source, cancel.clone());
         let mut tokens = Vec::new();
+        let mut previous = None;
         let eof = loop {
             if scanner.is_cancelled() {
                 break scanner.make(TokenKind::EndOfFile, scanner.position().get());
             }
-            let token = scanner.next_token();
+            let mut token = scanner.next_token();
+            if matches!(token.kind(), TokenKind::Slash | TokenKind::SlashEq)
+                && previous.is_some_and(cannot_end_expression)
+                && scanner.regex_closes_at_last_token()
+            {
+                token = scanner.rescan_regex();
+            }
             if token.kind() == TokenKind::EndOfFile || scanner.is_cancelled() {
                 break token;
+            }
+            if !matches!(
+                token.kind(),
+                TokenKind::Whitespace | TokenKind::LineComment | TokenKind::BlockComment
+            ) {
+                previous = Some(match previous {
+                    // A keyword here is a property name, so `o.in / 2` divides.
+                    Some(TokenKind::Dot | TokenKind::QuestionDot) => TokenKind::Identifier,
+                    _ => token.kind(),
+                });
             }
             tokens.push(token);
         };
@@ -445,6 +463,71 @@ pub fn scan_with_cancel(
         eof,
     };
     Ok(Recovered::new(product, diagnostics))
+}
+
+/// Whether no expression can end with `kind`, so a `/` after it has nothing to
+/// divide and can only start a regular expression. This needs no grammar: reading
+/// that `/` as division here would let a quote in the regex open a false string.
+/// Tokens an expression can end with, such as `)`, `}`, `]`, `!`, and `>`, stay
+/// with the parser, which knows what they closed. So does `<`, which opens a
+/// closing JSX tag.
+const fn cannot_end_expression(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::LParen
+            | TokenKind::LBracket
+            | TokenKind::LBrace
+            | TokenKind::Comma
+            | TokenKind::Semicolon
+            | TokenKind::Colon
+            | TokenKind::Question
+            | TokenKind::QuestionQuestion
+            | TokenKind::Arrow
+            | TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::StarStar
+            | TokenKind::Percent
+            | TokenKind::Eq
+            | TokenKind::EqEq
+            | TokenKind::EqEqEq
+            | TokenKind::BangEq
+            | TokenKind::BangEqEq
+            | TokenKind::Amp
+            | TokenKind::AmpAmp
+            | TokenKind::Pipe
+            | TokenKind::PipePipe
+            | TokenKind::Caret
+            | TokenKind::Tilde
+            | TokenKind::PlusEq
+            | TokenKind::MinusEq
+            | TokenKind::StarEq
+            | TokenKind::StarStarEq
+            | TokenKind::SlashEq
+            | TokenKind::PercentEq
+            | TokenKind::LessLessEq
+            | TokenKind::GreaterGreaterEq
+            | TokenKind::GreaterGreaterGreaterEq
+            | TokenKind::AmpEq
+            | TokenKind::AmpAmpEq
+            | TokenKind::PipeEq
+            | TokenKind::PipePipeEq
+            | TokenKind::CaretEq
+            | TokenKind::QuestionQuestionEq
+            | TokenKind::TemplateHead
+            | TokenKind::TemplateMiddle
+            | TokenKind::KwReturn
+            | TokenKind::KwTypeof
+            | TokenKind::KwCase
+            | TokenKind::KwThrow
+            | TokenKind::KwVoid
+            | TokenKind::KwDelete
+            | TokenKind::KwIn
+            | TokenKind::KwInstanceof
+            | TokenKind::KwNew
+            | TokenKind::KwElse
+            | TokenKind::KwDo
+    )
 }
 
 /// The kind of an open brace the scanner is currently inside, used to segment
@@ -627,6 +710,12 @@ impl<'a> Scanner<'a> {
         let start_u = self.utf16_pos;
         let kind = self.scan_regex(start_u);
         self.make(kind, start_u)
+    }
+
+    /// Whether a regular expression starting at the most recent token closes on
+    /// its own line. One that does not is left for the parser to judge.
+    fn regex_closes_at_last_token(&self) -> bool {
+        scan_regex_slice(&self.text[self.last_start_byte..]).1
     }
 
     /// Reinterprets the most recent `>`-family token as a single `>`, advancing
@@ -2198,6 +2287,90 @@ mod tests {
     }
 
     #[test]
+    fn a_regex_holding_a_quote_does_not_break_the_template_around_it() {
+        // Read as a division, the `'` opens a string that swallows the `}` and
+        // leaves the template unterminated.
+        let text = "`${k.replace(/'/g, \"\\\\'\")}`;\n";
+        let recovered = scan_text(text);
+        assert_eq!(recovered.diagnostics(), &[]);
+        let tokens = significant(text);
+        assert!(tokens.contains(&(TokenKind::RegularExpressionLiteral, "/'/g".to_owned())));
+        assert_eq!(
+            tokens.last().map(|token| token.0),
+            Some(TokenKind::Semicolon)
+        );
+    }
+
+    #[test]
+    fn a_slash_that_cannot_divide_starts_a_regex() {
+        for text in [
+            "x = /'/;",
+            "f(/'/);",
+            "[/'/];",
+            "a, /'/;",
+            "a ? /'/ : b;",
+            "return /'/;",
+            "typeof /'/;",
+            "x = /=/;",
+        ] {
+            assert!(
+                kinds(text).contains(&TokenKind::RegularExpressionLiteral),
+                "{text}"
+            );
+            assert_eq!(scan_text(text).diagnostics(), &[], "{text}");
+        }
+    }
+
+    #[test]
+    fn a_slash_after_a_keyword_named_property_stays_division() {
+        for text in [
+            "o.in / 2 / 1",
+            "o?.in / 2 / 1",
+            "o.typeof / 2 / 1",
+            "o.\n  return /* name */ / 2 / 1",
+        ] {
+            assert!(
+                !kinds(text).contains(&TokenKind::RegularExpressionLiteral),
+                "{text}"
+            );
+        }
+        assert!(kinds("x in / 2 / 1").contains(&TokenKind::RegularExpressionLiteral));
+    }
+
+    #[test]
+    fn a_slash_with_an_operand_before_it_stays_division() {
+        for text in [
+            "a / b / c",
+            "1 / 2 / 3",
+            "(a) / b / c",
+            "a[0] / b / c",
+            "x! / 2 / 3",
+            "a++ / b / c",
+            "a-- / b / c",
+            "f<T> / b / c",
+            "{} / b / c",
+            "this / b / c",
+        ] {
+            assert!(
+                !kinds(text).contains(&TokenKind::RegularExpressionLiteral),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_closing_tag_slash_stays_for_the_parser() {
+        assert!(!kinds("<a></a>").contains(&TokenKind::RegularExpressionLiteral));
+    }
+
+    #[test]
+    fn a_slash_that_never_closes_is_left_for_the_parser_to_judge() {
+        let text = "x = /abc\n";
+        assert!(kinds(text).contains(&TokenKind::Slash));
+        assert_eq!(scan_text(text).diagnostics(), &[]);
+    }
+
+    #[test]
     fn templates_segment_with_nested_braces() {
         // `${ {a:1} }` nests an object literal whose braces must not close the
         // substitution early.
@@ -2386,15 +2559,8 @@ mod tests {
 
     #[test]
     fn corpus_cases_lex_totally_and_tile() {
-        // The default pass does not guess `/` as a regular expression, so a
-        // file that uses a regex literal will not lex cleanly without the
-        // explicit `rescan_regex` a parser would drive. These files still must
-        // tile and round-trip; only the clean-diagnostics claim is waived.
-        const REGEX_LITERAL_CASES: &[&str] = &["escape-string-regexp.ts"];
-
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/cases");
         let mut scanned_any = false;
-        let mut regex_case_seen = false;
         for entry in std::fs::read_dir(&root).expect("corpus/cases must be readable") {
             let path = entry.expect("directory entry").path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("ts") {
@@ -2437,29 +2603,14 @@ mod tests {
                 "{name}: lexemes did not reproduce the source"
             );
 
-            if REGEX_LITERAL_CASES.contains(&name.as_str()) {
-                regex_case_seen = true;
-                // The no-guess contract means the default pass reports at least
-                // one diagnostic on a raw regex literal it cannot recognize.
-                assert!(
-                    !recovered.diagnostics().is_empty(),
-                    "{name}: expected the default pass to reject a regex literal"
-                );
-            } else {
-                // Every regex-free corpus driver is valid TypeScript and must
-                // lex cleanly under the default pass.
-                assert!(
-                    recovered.diagnostics().is_empty(),
-                    "{name}: unexpected diagnostics {:?}",
-                    recovered.diagnostics()
-                );
-            }
+            // Every corpus driver is valid TypeScript and must lex cleanly.
+            assert!(
+                recovered.diagnostics().is_empty(),
+                "{name}: unexpected diagnostics {:?}",
+                recovered.diagnostics()
+            );
         }
         assert!(scanned_any, "expected at least one corpus case");
-        assert!(
-            regex_case_seen,
-            "expected the regex-literal case to be present"
-        );
     }
 
     #[test]

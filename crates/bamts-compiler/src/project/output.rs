@@ -491,10 +491,17 @@ pub(super) fn normalize_lexically(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::test_paths::abs;
+    use std::sync::OnceLock;
+
+    fn project_root() -> &'static Path {
+        static ROOT: OnceLock<PathBuf> = OnceLock::new();
+        ROOT.get_or_init(|| abs("/project")).as_path()
+    }
 
     fn request<'a>(sources: &'a [PathBuf]) -> PlanRequest<'a> {
         PlanRequest {
-            project_root: Path::new("/project"),
+            project_root: project_root(),
             sources,
             root_dir: None,
             out_dir: Some(Path::new("out")),
@@ -524,8 +531,8 @@ mod tests {
         assert_eq!(
             map_output_paths(request),
             Err(OutputMapError::RootDirViolation {
-                source: PathBuf::from("/project/shared/b.ts"),
-                root_dir: PathBuf::from("/project/src"),
+                source: abs("/project/shared/b.ts"),
+                root_dir: abs("/project/src"),
             })
         );
     }
@@ -538,15 +545,12 @@ mod tests {
             PathBuf::from("types/outside.d.ts"),
         ];
         let plan = map_output_paths(request(&sources)).unwrap();
-        assert_eq!(plan.common_source_dir, Path::new("/project/src"));
+        assert_eq!(plan.common_source_dir, abs("/project/src").as_path());
         assert_eq!(
             paths(&plan),
             vec![
-                (PathBuf::from("/project/out/a.js"), ArtifactKind::JavaScript),
-                (
-                    PathBuf::from("/project/out/deep/b.js"),
-                    ArtifactKind::JavaScript,
-                ),
+                (abs("/project/out/a.js"), ArtifactKind::JavaScript),
+                (abs("/project/out/deep/b.js"), ArtifactKind::JavaScript,),
             ]
         );
     }
@@ -578,7 +582,7 @@ mod tests {
         assert!(
             preserve
                 .artifacts
-                .contains_key(Path::new("/project/out/b.jsx"))
+                .contains_key(abs("/project/out/b.jsx").as_path())
         );
     }
 
@@ -637,17 +641,17 @@ mod tests {
         assert!(
             routed
                 .artifacts
-                .contains_key(Path::new("/project/out/a.mjs"))
+                .contains_key(abs("/project/out/a.mjs").as_path())
         );
         assert!(
             routed
                 .artifacts
-                .contains_key(Path::new("/project/types/a.d.mts"))
+                .contains_key(abs("/project/types/a.d.mts").as_path())
         );
         assert!(
             routed
                 .artifacts
-                .contains_key(Path::new("/project/types/a.d.mts.map"))
+                .contains_key(abs("/project/types/a.d.mts.map").as_path())
         );
     }
 
@@ -672,8 +676,8 @@ mod tests {
         assert_eq!(
             map_output_paths(request(&sources)),
             Err(OutputMapError::ClobbersInput {
-                path: PathBuf::from("/project/out/src/a.js"),
-                source: PathBuf::from("/project/out/src/a.js"),
+                path: abs("/project/out/src/a.js"),
+                source: abs("/project/out/src/a.js"),
             })
         );
     }

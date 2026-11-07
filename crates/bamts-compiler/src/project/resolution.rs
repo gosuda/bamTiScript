@@ -1264,6 +1264,8 @@ fn conditions_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::canonical::slash_text;
+    use crate::project::test_paths::abs;
     use crate::project::{JsonObject, JsonValue, PathMapping, ProjectConfig};
     use std::collections::BTreeMap;
 
@@ -1274,8 +1276,8 @@ mod tests {
     }
 
     impl MemoryHost {
-        fn file(&mut self, path: &str, source: &str) {
-            let path = PathBuf::from(path);
+        fn file(&mut self, path: impl AsRef<Path>, source: &str) {
+            let path = path.as_ref().to_path_buf();
             if let Some(parent) = path.parent() {
                 self.mark_dirs(parent);
             }
@@ -1306,13 +1308,21 @@ mod tests {
     }
 
     fn root() -> ProjectRoot {
-        ProjectRoot::new("/workspace").expect("absolute root")
+        ProjectRoot::new(abs("/workspace")).expect("absolute root")
+    }
+
+    /// How a trace line spells the root of the fixture file system: c: on Windows,
+    /// where upstream traces print a lowercase drive, and nothing elsewhere.
+    fn trace_drive() -> String {
+        slash_text(&abs("/"))
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
     }
 
     fn options_with_resolution(module_resolution: &str) -> CompilerOptions {
         let config = ProjectConfig::parse(
             &root(),
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             &format!(
                 r#"{{"compilerOptions":{{"moduleResolution":"{module_resolution}","resolveJsonModule":true}}}}"#
             ),
@@ -1324,7 +1334,7 @@ mod tests {
     fn options_with_paths(paths_json: &str) -> CompilerOptions {
         let config = ProjectConfig::parse(
             &root(),
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             &format!(
                 r#"{{"compilerOptions":{{"moduleResolution":"bundler","baseUrl":".","paths":{paths_json}}}}}"#
             ),
@@ -1364,22 +1374,22 @@ mod tests {
     #[test]
     fn relative_extension_substitution_and_index_fallback() {
         let mut host = MemoryHost::default();
-        host.file("/workspace/src/util.ts", "export const n = 1;\n");
-        host.file("/workspace/src/nested/index.ts", "export {};\n");
+        host.file(abs("/workspace/src/util.ts"), "export const n = 1;\n");
+        host.file(abs("/workspace/src/nested/index.ts"), "export {};\n");
         let options = options_with_resolution("node16");
         let mut cache = ResolutionCache::new();
 
         let resolved = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./util.js",
             (ModuleResolutionKind::Node16, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("util.js → util.ts");
-        assert_eq!(resolved.path(), Path::new("/workspace/src/util.ts"));
+        assert_eq!(resolved.path(), abs("/workspace/src/util.ts").as_path());
         assert!(
             resolved
                 .trace()
@@ -1391,25 +1401,28 @@ mod tests {
         let nested = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./nested",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("directory index");
-        assert_eq!(nested.path(), Path::new("/workspace/src/nested/index.ts"));
+        assert_eq!(
+            nested.path(),
+            abs("/workspace/src/nested/index.ts").as_path()
+        );
     }
     #[test]
     fn nodenext_import_requires_relative_extension_but_require_and_bundler_do_not() {
         let mut host = MemoryHost::default();
-        host.file("/workspace/src/util.ts", "export const n = 1;\n");
+        host.file(abs("/workspace/src/util.ts"), "export const n = 1;\n");
         let options = options_with_resolution("nodenext");
         let mut cache = ResolutionCache::new();
         let missing = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./util",
             (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
             &host,
@@ -1423,34 +1436,34 @@ mod tests {
             let resolved = resolve_module_name(
                 &root(),
                 &options,
-                "/workspace/src/main.ts",
+                abs("/workspace/src/main.ts"),
                 "./util",
                 strategy,
                 &host,
                 &mut cache,
             )
             .expect("extensionless resolution is permitted");
-            assert_eq!(resolved.path(), Path::new("/workspace/src/util.ts"));
+            assert_eq!(resolved.path(), abs("/workspace/src/util.ts").as_path());
         }
     }
 
     #[test]
     fn paths_longest_prefix_wins_with_star_substitution() {
         let mut host = MemoryHost::default();
-        host.file("/workspace/lib/foo/bar.ts", "export {};\n");
+        host.file(abs("/workspace/lib/foo/bar.ts"), "export {};\n");
         let options = options_with_paths(r#"{ "@app/*": ["lib/*"], "@app/foo/*": ["lib/foo/*"] }"#);
         let mut cache = ResolutionCache::new();
         let resolved = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "@app/foo/bar",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("paths");
-        assert_eq!(resolved.path(), Path::new("/workspace/lib/foo/bar.ts"));
+        assert_eq!(resolved.path(), abs("/workspace/lib/foo/bar.ts").as_path());
         assert!(resolved.trace().steps().iter().any(|step| matches!(
             step,
             ResolutionTraceStep::PathsMatch { pattern, .. } if pattern.as_ref() == "@app/foo/*"
@@ -1461,7 +1474,7 @@ mod tests {
     fn package_exports_honor_resolution_mode_conditions() {
         let mut host = MemoryHost::default();
         host.file(
-            "/workspace/node_modules/pkg/package.json",
+            abs("/workspace/node_modules/pkg/package.json"),
             r#"{
                 "name":"pkg",
                 "exports":{
@@ -1472,14 +1485,14 @@ mod tests {
                 }
             }"#,
         );
-        host.file("/workspace/node_modules/pkg/esm.js", "export {};\n");
+        host.file(abs("/workspace/node_modules/pkg/esm.js"), "export {};\n");
         host.file(
-            "/workspace/node_modules/pkg/cjs.js",
+            abs("/workspace/node_modules/pkg/cjs.js"),
             "module.exports = {};\n",
         );
         // Provide TS stand-ins so extension substitution can succeed for both modes.
-        host.file("/workspace/node_modules/pkg/esm.ts", "export {};\n");
-        host.file("/workspace/node_modules/pkg/cjs.ts", "export {};\n");
+        host.file(abs("/workspace/node_modules/pkg/esm.ts"), "export {};\n");
+        host.file(abs("/workspace/node_modules/pkg/cjs.ts"), "export {};\n");
 
         let options = options_with_resolution("nodenext");
         let mut cache = ResolutionCache::new();
@@ -1487,7 +1500,7 @@ mod tests {
         let import_hit = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "pkg",
             (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
             &host,
@@ -1496,13 +1509,13 @@ mod tests {
         .expect("import condition");
         assert_eq!(
             import_hit.path(),
-            Path::new("/workspace/node_modules/pkg/esm.ts")
+            abs("/workspace/node_modules/pkg/esm.ts").as_path()
         );
 
         let require_hit = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "pkg",
             (ModuleResolutionKind::NodeNext, ResolutionMode::Require),
             &host,
@@ -1511,25 +1524,31 @@ mod tests {
         .expect("require condition");
         assert_eq!(
             require_hit.path(),
-            Path::new("/workspace/node_modules/pkg/cjs.ts")
+            abs("/workspace/node_modules/pkg/cjs.ts").as_path()
         );
     }
     #[test]
     fn package_exports_block_private_and_null_subpaths() {
         let mut host = MemoryHost::default();
         host.file(
-            "/workspace/node_modules/pkg/package.json",
+            abs("/workspace/node_modules/pkg/package.json"),
             r#"{"exports":{".":"./index.js","./blocked":null}}"#,
         );
-        host.file("/workspace/node_modules/pkg/index.ts", "export {};\n");
-        host.file("/workspace/node_modules/pkg/private.ts", "export {};\n");
-        host.file("/workspace/node_modules/pkg/blocked.ts", "export {};\n");
+        host.file(abs("/workspace/node_modules/pkg/index.ts"), "export {};\n");
+        host.file(
+            abs("/workspace/node_modules/pkg/private.ts"),
+            "export {};\n",
+        );
+        host.file(
+            abs("/workspace/node_modules/pkg/blocked.ts"),
+            "export {};\n",
+        );
         let options = options_with_resolution("nodenext");
         for specifier in ["pkg/private", "pkg/blocked"] {
             let error = resolve_module_name(
                 &root(),
                 &options,
-                "/workspace/src/main.ts",
+                abs("/workspace/src/main.ts"),
                 specifier,
                 (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
                 &host,
@@ -1548,7 +1567,7 @@ mod tests {
     fn package_imports_resolve_and_detect_cycles() {
         let mut host = MemoryHost::default();
         host.file(
-            "/workspace/package.json",
+            abs("/workspace/package.json"),
             r##"{
                 "name":"app",
                 "imports":{
@@ -1557,27 +1576,27 @@ mod tests {
                 }
             }"##,
         );
-        host.file("/workspace/src/value.ts", "export const v = 1;\n");
-        host.file("/workspace/src/main.ts", "import '#internal/value';\n");
+        host.file(abs("/workspace/src/value.ts"), "export const v = 1;\n");
+        host.file(abs("/workspace/src/main.ts"), "import '#internal/value';\n");
 
         let options = options_with_resolution("bundler");
         let mut cache = ResolutionCache::new();
         let resolved = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "#internal/value",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("hash import");
-        assert_eq!(resolved.path(), Path::new("/workspace/src/value.ts"));
+        assert_eq!(resolved.path(), abs("/workspace/src/value.ts").as_path());
 
         let cycle = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "#loop",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
@@ -1591,12 +1610,15 @@ mod tests {
     fn node_modules_walk_stops_at_project_root_and_confinement_rejects_escape() {
         let mut host = MemoryHost::default();
         host.file(
-            "/workspace/node_modules/left-pad/package.json",
+            abs("/workspace/node_modules/left-pad/package.json"),
             r#"{"name":"left-pad","main":"./index.js"}"#,
         );
-        host.file("/workspace/node_modules/left-pad/index.ts", "export {};\n");
         host.file(
-            "/workspace/node_modules/left-pad/index.js",
+            abs("/workspace/node_modules/left-pad/index.ts"),
+            "export {};\n",
+        );
+        host.file(
+            abs("/workspace/node_modules/left-pad/index.js"),
             "module.exports = {};\n",
         );
 
@@ -1605,7 +1627,7 @@ mod tests {
         let resolved = resolve_module_name(
             &root(),
             &options,
-            "/workspace/packages/app/src/main.ts",
+            abs("/workspace/packages/app/src/main.ts"),
             "left-pad",
             (ModuleResolutionKind::Node16, ResolutionMode::Require),
             &host,
@@ -1614,7 +1636,7 @@ mod tests {
         .expect("upward walk");
         assert_eq!(
             resolved.path(),
-            Path::new("/workspace/node_modules/left-pad/index.ts")
+            abs("/workspace/node_modules/left-pad/index.ts").as_path()
         );
         assert!(
             resolved
@@ -1627,7 +1649,7 @@ mod tests {
         let escape = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "../../outside",
             (ModuleResolutionKind::Node16, ResolutionMode::Import),
             &host,
@@ -1640,7 +1662,7 @@ mod tests {
     fn types_fallback_mangles_scoped_package_names() {
         let mut host = MemoryHost::default();
         host.file(
-            "/workspace/node_modules/@types/scope__pkg/index.d.ts",
+            abs("/workspace/node_modules/@types/scope__pkg/index.d.ts"),
             "export {};\n",
         );
         let options = options_with_resolution("nodenext");
@@ -1648,7 +1670,7 @@ mod tests {
         let resolved = resolve_type_reference(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "@scope/pkg",
             (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
             &host,
@@ -1657,7 +1679,7 @@ mod tests {
         .expect("@types scope mangling");
         assert_eq!(
             resolved.path(),
-            Path::new("/workspace/node_modules/@types/scope__pkg/index.d.ts")
+            abs("/workspace/node_modules/@types/scope__pkg/index.d.ts").as_path()
         );
         assert!(resolved.trace().steps().iter().any(|step| matches!(
             step,
@@ -1669,13 +1691,13 @@ mod tests {
     #[test]
     fn cache_returns_identical_results_for_repeated_lookups() {
         let mut host = MemoryHost::default();
-        host.file("/workspace/src/a.ts", "export {};\n");
+        host.file(abs("/workspace/src/a.ts"), "export {};\n");
         let options = options_with_resolution("bundler");
         let mut cache = ResolutionCache::new();
         let first = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./a",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
@@ -1685,7 +1707,7 @@ mod tests {
         let second = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./a",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
@@ -1698,7 +1720,7 @@ mod tests {
         let missing = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./missing",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
@@ -1708,7 +1730,7 @@ mod tests {
         let missing_again = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./missing",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
@@ -1725,18 +1747,18 @@ mod tests {
     fn trace_is_deterministic_across_two_fresh_caches() {
         let mut host = MemoryHost::default();
         host.file(
-            "/workspace/node_modules/demo/package.json",
+            abs("/workspace/node_modules/demo/package.json"),
             r#"{"name":"demo","exports":{".":{"import":"./lib.js"}}}"#,
         );
-        host.file("/workspace/node_modules/demo/lib.ts", "export {};\n");
-        host.file("/workspace/node_modules/demo/lib.js", "export {};\n");
+        host.file(abs("/workspace/node_modules/demo/lib.ts"), "export {};\n");
+        host.file(abs("/workspace/node_modules/demo/lib.js"), "export {};\n");
         let options = options_with_resolution("node16");
 
         let mut cache_a = ResolutionCache::new();
         let a = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "demo",
             (ModuleResolutionKind::Node16, ResolutionMode::Import),
             &host,
@@ -1747,7 +1769,7 @@ mod tests {
         let b = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "demo",
             (ModuleResolutionKind::Node16, ResolutionMode::Import),
             &host,
@@ -1802,17 +1824,17 @@ mod tests {
             "======== Module name './dir/index' was successfully resolved to '/dir/index.ts'. ========",
         ];
 
-        let fs_root = ProjectRoot::new("/").expect("absolute root");
+        let fs_root = ProjectRoot::new(abs("/")).expect("absolute root");
         let config = ProjectConfig::parse(
             &fs_root,
-            "/tsconfig.json",
+            abs("/tsconfig.json"),
             r#"{"compilerOptions":{"moduleResolution":"bundler"}}"#,
         )
         .expect("config");
         let options = config.options().clone();
         let mut host = MemoryHost::default();
-        host.file("/main.ts", "import {} from './dir/index.js';\n");
-        host.file("/dir/index.ts", "export {};\n");
+        host.file(abs("/main.ts"), "import {} from './dir/index.js';\n");
+        host.file(abs("/dir/index.ts"), "export {};\n");
         let mut cache = ResolutionCache::new();
         let mut log = ResolutionTraceLog::default();
 
@@ -1820,7 +1842,7 @@ mod tests {
             resolve_module_name_with_trace(
                 &fs_root,
                 &options,
-                "/main.ts",
+                abs("/main.ts"),
                 specifier,
                 (
                     ModuleResolutionKind::Bundler,
@@ -1838,7 +1860,7 @@ mod tests {
         resolve_module_name_with_trace(
             &fs_root,
             &options,
-            "/main.ts",
+            abs("/main.ts"),
             "./dir/index",
             (
                 ModuleResolutionKind::Bundler,
@@ -1853,22 +1875,27 @@ mod tests {
         )
         .expect("cache hit");
 
+        let drive = trace_drive();
+        let expected: Vec<String> = expected
+            .iter()
+            .map(|line| line.replace("'/", &format!("'{drive}/")))
+            .collect();
         let produced: Vec<&str> = log.lines().iter().map(String::as_str).collect();
         assert_eq!(produced, expected);
         assert!(log.unsupported().is_empty());
     }
     #[test]
     fn trace_mode_word_follows_resolution_mode() {
-        let fs_root = ProjectRoot::new("/").expect("absolute root");
+        let fs_root = ProjectRoot::new(abs("/")).expect("absolute root");
         let config = ProjectConfig::parse(
             &fs_root,
-            "/tsconfig.json",
+            abs("/tsconfig.json"),
             r#"{"compilerOptions":{"moduleResolution":"bundler"}}"#,
         )
         .expect("config");
         let options = config.options().clone();
         let mut host = MemoryHost::default();
-        host.file("/dir/index.ts", "export {};\n");
+        host.file(abs("/dir/index.ts"), "export {};\n");
 
         for (mode, word) in [
             (ResolutionMode::Import, "ESM"),
@@ -1879,7 +1906,7 @@ mod tests {
             resolve_module_name_with_trace(
                 &fs_root,
                 &options,
-                "/main.ts",
+                abs("/main.ts"),
                 "./dir/index.ts",
                 (
                     ModuleResolutionKind::Bundler,
@@ -1907,17 +1934,17 @@ mod tests {
 
     #[test]
     fn trace_types_flavor_narrates_declaration_candidates_first() {
-        let fs_root = ProjectRoot::new("/").expect("absolute root");
+        let fs_root = ProjectRoot::new(abs("/")).expect("absolute root");
         let config = ProjectConfig::parse(
             &fs_root,
-            "/tsconfig.json",
+            abs("/tsconfig.json"),
             r#"{"compilerOptions":{"moduleResolution":"bundler"}}"#,
         )
         .expect("config");
         let options = config.options().clone();
         let mut host = MemoryHost::default();
-        host.file("/dir/index.d.ts", "export {};\n");
-        host.file("/dir/index.ts", "export {};\n");
+        host.file(abs("/dir/index.d.ts"), "export {};\n");
+        host.file(abs("/dir/index.ts"), "export {};\n");
 
         for (flavor, chosen, narrated) in [
             (ResolutionFlavor::Runtime, "index.ts", "dir/index.ts"),
@@ -1928,7 +1955,7 @@ mod tests {
             let resolved = resolve_module_name_with_trace(
                 &fs_root,
                 &options,
-                "/main.ts",
+                abs("/main.ts"),
                 "./dir/index",
                 (
                     ModuleResolutionKind::Bundler,
@@ -1942,7 +1969,7 @@ mod tests {
                 },
             )
             .expect("resolution");
-            assert_eq!(resolved.path(), Path::new(&format!("/dir/{chosen}")));
+            assert_eq!(resolved.path(), abs(&format!("/dir/{chosen}")).as_path());
             // Narration stops at the first probed candidate, so the single
             // narrated file must be the one the resolver actually chose.
             let narrated_files: Vec<String> = log
@@ -1951,24 +1978,26 @@ mod tests {
                 .filter(|line| line.starts_with("File '"))
                 .cloned()
                 .collect();
-            let expected =
-                format!("File '/{narrated}' exists - use it as a name resolution result.");
+            let expected = format!(
+                "File '{}/{narrated}' exists - use it as a name resolution result.",
+                trace_drive()
+            );
             assert_eq!(narrated_files, vec![expected]);
         }
     }
 
     #[test]
     fn cache_keys_distinguish_runtime_and_types_flavors() {
-        let fs_root = ProjectRoot::new("/").expect("absolute root");
+        let fs_root = ProjectRoot::new(abs("/")).expect("absolute root");
         let mut host = MemoryHost::default();
-        host.file("/dir/index.d.ts", "export {};\n");
-        host.file("/dir/index.ts", "export {};\n");
+        host.file(abs("/dir/index.d.ts"), "export {};\n");
+        host.file(abs("/dir/index.ts"), "export {};\n");
         let options = options_with_resolution("bundler");
         let mut cache = ResolutionCache::new();
         let runtime = resolve_module_name(
             &fs_root,
             &options,
-            "/main.ts",
+            abs("/main.ts"),
             "./dir/index",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
@@ -1978,29 +2007,29 @@ mod tests {
         let types = resolve_type_reference(
             &fs_root,
             &options,
-            "/main.ts",
+            abs("/main.ts"),
             "./dir/index",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("types flavor");
-        assert_eq!(runtime.path(), Path::new("/dir/index.ts"));
-        assert_eq!(types.path(), Path::new("/dir/index.d.ts"));
+        assert_eq!(runtime.path(), abs("/dir/index.ts").as_path());
+        assert_eq!(types.path(), abs("/dir/index.d.ts").as_path());
         assert_eq!(cache.len(), 2);
     }
 
     #[test]
     fn json_specifier_resolves_the_exact_file_when_resolve_json_module_is_on() {
         let mut host = MemoryHost::default();
-        host.file("/workspace/src/data.json", "{\n  \"a\": 1\n}\n");
+        host.file(abs("/workspace/src/data.json"), "{\n  \"a\": 1\n}\n");
         // A script module beside the JSON file must not win: a `.json`
         // specifier is planned as an exact file with no extension
         // substitution.
-        host.file("/workspace/src/data.ts", "export const a = 1;\n");
+        host.file(abs("/workspace/src/data.ts"), "export const a = 1;\n");
         let config = ProjectConfig::parse(
             &root(),
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions":{"moduleResolution":"bundler","resolveJsonModule":true}}"#,
         )
         .expect("config");
@@ -2009,14 +2038,14 @@ mod tests {
         let resolved = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./data.json",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("exact JSON module");
-        assert_eq!(resolved.path(), Path::new("/workspace/src/data.json"));
+        assert_eq!(resolved.path(), abs("/workspace/src/data.json").as_path());
         assert!(
             resolved.trace().steps().iter().all(|step| !matches!(
                 step,
@@ -2030,10 +2059,10 @@ mod tests {
     #[test]
     fn json_specifier_probes_the_exact_file_even_when_resolve_json_module_is_off() {
         let mut host = MemoryHost::default();
-        host.file("/workspace/src/data.json", "{\n  \"a\": 1\n}\n");
+        host.file(abs("/workspace/src/data.json"), "{\n  \"a\": 1\n}\n");
         let config = ProjectConfig::parse(
             &root(),
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions":{"moduleResolution":"bundler"}}"#,
         )
         .expect("config");
@@ -2046,14 +2075,14 @@ mod tests {
         let resolved = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./data.json",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("exact JSON module resolves without the flag");
-        assert_eq!(resolved.path(), Path::new("/workspace/src/data.json"));
+        assert_eq!(resolved.path(), abs("/workspace/src/data.json").as_path());
 
         // A `.json` specifier that names no file fails as a plain cannot-find
         // miss (upstream TS2732) — never as an unsupported-extension
@@ -2061,7 +2090,7 @@ mod tests {
         let error = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./missing.json",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
@@ -2074,10 +2103,13 @@ mod tests {
     #[test]
     fn json_specifier_with_paths_mapping_resolves_through_the_mapping() {
         let mut host = MemoryHost::default();
-        host.file("/workspace/config/pkg.json", "{\n  \"name\": \"pkg\"\n}\n");
+        host.file(
+            abs("/workspace/config/pkg.json"),
+            "{\n  \"name\": \"pkg\"\n}\n",
+        );
         let config = ProjectConfig::parse(
             &root(),
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions":{"moduleResolution":"bundler","baseUrl":".","paths":{"@config/*":["config/*"]},"resolveJsonModule":true}}"#,
         )
         .expect("config");
@@ -2086,14 +2118,14 @@ mod tests {
         let resolved = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "@config/pkg.json",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("paths-mapped JSON module");
-        assert_eq!(resolved.path(), Path::new("/workspace/config/pkg.json"));
+        assert_eq!(resolved.path(), abs("/workspace/config/pkg.json").as_path());
 
         // The searched routes stay flag-gated: with `resolveJsonModule`
         // disabled a paths-mapped `.json` cannot be found with the current
@@ -2102,7 +2134,7 @@ mod tests {
         // though the mapped target file exists.
         let without_flag = ProjectConfig::parse(
             &root(),
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions":{"moduleResolution":"bundler","baseUrl":".","paths":{"@config/*":["config/*"]}}}"#,
         )
         .expect("config");
@@ -2112,7 +2144,7 @@ mod tests {
         let error = resolve_module_name(
             &root(),
             without_flag.options(),
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "@config/pkg.json",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,

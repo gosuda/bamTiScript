@@ -479,6 +479,7 @@ mod tests {
                         is_async: false,
                         is_generator: true,
                         is_constructable: false,
+                        ..FunctionFlags::default()
                     },
                     vec![
                         Instruction::LoadConst {
@@ -620,6 +621,7 @@ mod tests {
                         is_async: true,
                         is_generator: false,
                         is_constructable: false,
+                        ..FunctionFlags::default()
                     },
                     vec![
                         Instruction::LoadConst {
@@ -672,6 +674,7 @@ mod tests {
                         is_async: true,
                         is_generator: false,
                         is_constructable: false,
+                        ..FunctionFlags::default()
                     },
                     vec![
                         Instruction::LoadConst {
@@ -744,6 +747,7 @@ mod tests {
                         is_async: true,
                         is_generator: false,
                         is_constructable: false,
+                        ..FunctionFlags::default()
                     },
                     vec![
                         Instruction::Await {
@@ -805,6 +809,7 @@ mod tests {
                         is_async: false,
                         is_generator: true,
                         is_constructable: false,
+                        ..FunctionFlags::default()
                     },
                     vec![
                         Instruction::Suspend {
@@ -876,6 +881,7 @@ mod tests {
                         is_async: true,
                         is_generator: false,
                         is_constructable: false,
+                        ..FunctionFlags::default()
                     },
                     vec![
                         Instruction::CreateArray { dst: reg(0) },
@@ -975,6 +981,7 @@ mod tests {
                         is_async: true,
                         is_generator: true,
                         is_constructable: false,
+                        ..FunctionFlags::default()
                     },
                     vec![
                         Instruction::LoadConst {

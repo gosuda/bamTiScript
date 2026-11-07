@@ -571,13 +571,16 @@ mod tests {
         .expect("test program verifies")
     }
 
+    /// Mirrors `host_target`, which needs the `host-jit` feature these tests
+    /// do not enable: the triple picks the host ABI and the container stays ELF.
     fn target() -> &'static str {
-        if cfg!(target_arch = "x86_64") {
-            "x86_64-unknown-linux-gnu"
-        } else if cfg!(target_arch = "aarch64") {
-            "aarch64-unknown-linux-gnu"
-        } else {
-            panic!("AOT object test needs a supported 64-bit host architecture")
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => "aarch64-apple-darwin-elf",
+            ("macos", "x86_64") => "x86_64-apple-darwin-elf",
+            ("windows", "x86_64") => "x86_64-pc-windows-msvc-elf",
+            (_, "x86_64") => "x86_64-unknown-linux-gnu",
+            (_, "aarch64") => "aarch64-unknown-linux-gnu",
+            _ => panic!("AOT object test needs a supported 64-bit host architecture"),
         }
     }
 

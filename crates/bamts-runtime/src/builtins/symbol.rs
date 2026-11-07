@@ -4,7 +4,8 @@ use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
 use super::{
-    allocate_string, builtin_property, define_data, heap_index, install_function, type_error,
+    allocate_string, builtin_property, define_data, define_to_string_tag, heap_index,
+    install_constructor_function, install_function, type_error,
 };
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey};
@@ -24,11 +25,22 @@ pub(super) fn install<H: Host>(
     let async_dispose = symbol(heap, "Symbol.asyncDispose");
     let match_symbol = symbol(heap, "Symbol.match");
     let replace_symbol = symbol(heap, "Symbol.replace");
+    let match_all_symbol = symbol(heap, "Symbol.matchAll");
+    let search_symbol = symbol(heap, "Symbol.search");
+    let split_symbol = symbol(heap, "Symbol.split");
+    let is_concat_spreadable = symbol(heap, "Symbol.isConcatSpreadable");
+    let to_primitive = symbol(heap, "Symbol.toPrimitive");
     let unscopables = symbol(heap, "Symbol.unscopables");
     builtins.set_symbol_iterator(iterator);
     builtins.set_symbol_async_iterator(async_iterator);
     builtins.set_symbol_match(match_symbol);
     builtins.set_symbol_replace(replace_symbol);
+    builtins.set_symbol_match_all(match_all_symbol);
+    builtins.set_symbol_search(search_symbol);
+    builtins.set_symbol_split(split_symbol);
+    builtins.set_symbol_is_concat_spreadable(is_concat_spreadable);
+    builtins.set_symbol_has_instance(has_instance);
+    builtins.set_symbol_to_primitive(to_primitive);
     builtins.set_symbol_to_string_tag(to_string_tag);
     builtins.set_symbol_species(species);
     builtins.set_symbol_dispose(dispose);
@@ -36,16 +48,23 @@ pub(super) fn install<H: Host>(
     builtins.set_symbol_unscopables(unscopables);
     builtins.set_symbol_prototype(prototype);
 
-    let constructor = install_function(heap, builtins, "Symbol", 0, constructor::<H>);
+    let constructor = install_constructor_function(heap, builtins, "Symbol", 0, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     let symbol_for = install_function(heap, builtins, "for", 1, symbol_for::<H>);
     define_native_property(heap, constructor, "for", symbol_for);
+    let key_for = install_function(heap, builtins, "keyFor", 1, key_for::<H>);
+    define_native_property(heap, constructor, "keyFor", key_for);
     for (name, value) in [
         ("iterator", iterator),
         ("asyncIterator", async_iterator),
         ("hasInstance", has_instance),
         ("match", match_symbol),
         ("replace", replace_symbol),
+        ("matchAll", match_all_symbol),
+        ("search", search_symbol),
+        ("split", split_symbol),
+        ("isConcatSpreadable", is_concat_spreadable),
+        ("toPrimitive", to_primitive),
         ("toStringTag", to_string_tag),
         ("species", species),
         ("dispose", dispose),
@@ -56,11 +75,13 @@ pub(super) fn install<H: Host>(
     }
 
     let to_string = install_function(heap, builtins, "toString", 0, to_string::<H>);
-    let value_of = install_function(heap, builtins, "valueOf", 0, value_of::<H>);
+    let value_of_method = install_function(heap, builtins, "valueOf", 0, value_of::<H>);
     let description = install_function(heap, builtins, "get description", 0, description::<H>);
     define_data(heap, prototype, "toString", to_string);
-    define_data(heap, prototype, "valueOf", value_of);
-    let symbol_tag = allocate_literal_string(heap, "Symbol");
+    define_data(heap, prototype, "valueOf", value_of_method);
+    let to_primitive_method =
+        install_function(heap, builtins, "[Symbol.toPrimitive]", 1, value_of::<H>);
+    define_to_string_tag(heap, prototype, to_string_tag, "Symbol");
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
         unreachable!()
     };
@@ -74,8 +95,13 @@ pub(super) fn install<H: Host>(
         },
     );
     properties.insert(
-        PropertyKey::Symbol(heap_index(to_string_tag) as u32),
-        builtin_property(symbol_tag),
+        PropertyKey::Symbol(heap_index(to_primitive) as u32),
+        Property::Data {
+            value: to_primitive_method,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        },
     );
 
     globals.insert(EcmaString::encode("Symbol"), constructor);
@@ -88,10 +114,6 @@ fn symbol(heap: &mut Vec<HeapEntry>, description: &str) -> Value {
             description: EcmaString::encode(description),
         },
     )
-}
-
-fn allocate_literal_string(heap: &mut Vec<HeapEntry>, text: &str) -> Value {
-    super::super::push(heap, HeapEntry::String(EcmaString::encode(text)))
 }
 
 fn define_native_property(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
@@ -132,7 +154,7 @@ fn constructor<H: Host>(
         .first()
         .copied()
         .filter(|value| *value != Value::UNDEFINED)
-        .map(|value| machine.to_string(value))
+        .map(|value| machine.coerce_string_observable(value))
         .transpose()?
         .unwrap_or_default();
     let symbol = machine
@@ -147,7 +169,8 @@ fn symbol_for<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let key = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let key =
+        machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     if let Some(existing) = machine.intrinsics.symbol_registry.get(&key).copied() {
         return Ok(BuiltinOutcome::Value(existing));
     }
@@ -178,16 +201,51 @@ fn symbol_for<H: Host>(
     Ok(BuiltinOutcome::Value(symbol))
 }
 
+/// `Symbol.keyFor`: a symbol's key is its description only when the global
+/// registry holds that very symbol under it.
+fn key_for<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let symbol = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let index = machine.runtime_slot(symbol).map_err(EvalFailure::Runtime)?;
+    let Some(HeapEntry::Symbol { description }) = index.map(|index| &machine.heap[index]) else {
+        return Err(type_error("Symbol.keyFor requires a symbol"));
+    };
+    let description = description.clone();
+    if machine.intrinsics.symbol_registry.get(&description) == Some(&symbol) {
+        return Ok(BuiltinOutcome::Value(allocate_string(
+            machine,
+            description,
+        )?));
+    }
+    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
+
+/// `ThisSymbolValue`: a symbol, or the symbol a Symbol wrapper object holds.
+fn this_symbol_value<H: Host>(
+    machine: &Machine<'_, H>,
+    value: Value,
+) -> Result<Value, EvalFailure> {
+    let symbol = machine.unbox_primitive_or_self(value)?;
+    let index = machine.runtime_slot(symbol).map_err(EvalFailure::Runtime)?;
+    match index.map(|index| &machine.heap[index]) {
+        Some(HeapEntry::Symbol { .. }) => Ok(symbol),
+        _ => Err(type_error("Symbol method called on incompatible receiver")),
+    }
+}
+
 fn symbol_description<H: Host>(
     machine: &Machine<'_, H>,
     value: Value,
 ) -> Result<EcmaString, EvalFailure> {
-    let Some(index) = machine.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
-        return Err(type_error("Symbol method called on incompatible receiver"));
-    };
-    match &machine.heap[index] {
-        HeapEntry::Symbol { description } => Ok(description.clone()),
-        _ => Err(type_error("Symbol method called on incompatible receiver")),
+    let symbol = this_symbol_value(machine, value)?;
+    let index = machine.runtime_slot(symbol).map_err(EvalFailure::Runtime)?;
+    match index.map(|index| &machine.heap[index]) {
+        Some(HeapEntry::Symbol { description }) => Ok(description.clone()),
+        _ => unreachable!("this_symbol_value returned a symbol"),
     }
 }
 
@@ -230,8 +288,7 @@ fn value_of<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    symbol_description(machine, this)?;
-    Ok(BuiltinOutcome::Value(this))
+    Ok(BuiltinOutcome::Value(this_symbol_value(machine, this)?))
 }
 
 #[cfg(test)]
@@ -242,7 +299,7 @@ mod tests {
     use crate::PropertyMap;
     use crate::ThrowOrigin;
     use crate::intrinsics::{BuiltinDef, BuiltinOutcome, BuiltinTable, native_function};
-    use bamts_bytecode::{FunctionId, ModuleId};
+    use bamts_bytecode::{FunctionId, ModuleId, UnaryOp};
 
     fn well_known_symbol_builtin(builtins: &BuiltinTable<TestHost>, name: &str) -> Option<Value> {
         match name {
@@ -251,6 +308,7 @@ mod tests {
             "hasInstance" => None,
             "match" => Some(builtins.symbol_match()),
             "replace" => Some(builtins.symbol_replace()),
+            "toPrimitive" => Some(builtins.symbol_to_primitive()),
             "toStringTag" => Some(builtins.symbol_to_string_tag()),
             "species" => Some(builtins.symbol_species()),
             "dispose" => Some(builtins.symbol_dispose()),
@@ -258,6 +316,128 @@ mod tests {
             "unscopables" => Some(builtins.symbol_unscopables()),
             _ => None,
         }
+    }
+
+    fn echo_hint(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        args: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(args[0]))
+    }
+
+    fn return_this(
+        _: &mut Machine<'_, TestHost>,
+        this: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(this))
+    }
+
+    fn with_to_primitive(machine: &mut Machine<'_, TestHost>, method: Value) -> Value {
+        let object = ordinary_object(machine);
+        let key = machine
+            .to_property_key(machine.intrinsics.builtins.symbol_to_primitive())
+            .unwrap();
+        machine.set_data_property_key(object, key, method).unwrap();
+        object
+    }
+
+    #[test]
+    fn to_primitive_method_receives_the_hint_of_each_coercion() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "echo hint",
+            length: 1,
+            handler: echo_hint,
+        });
+        let method = native_function(&mut machine.heap, id, "echo hint", 1);
+        let object = with_to_primitive(&mut machine, method);
+
+        let string = machine.coerce_primitive_observable(object, true).unwrap();
+        let number = machine.coerce_primitive_observable(object, false).unwrap();
+        let default = machine.coerce_primitive_default(object).unwrap();
+        for (value, hint) in [(string, "string"), (number, "number"), (default, "default")] {
+            assert!(
+                machine
+                    .string_value(value)
+                    .is_some_and(|text| text.eq_ascii(hint)),
+                "expected hint {hint}"
+            );
+        }
+    }
+
+    fn return_seven(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(Value::int32(7)))
+    }
+
+    #[test]
+    fn unary_plus_coerces_an_object_through_to_primitive() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "return seven",
+            length: 0,
+            handler: return_seven,
+        });
+        let method = native_function(&mut machine.heap, id, "return seven", 0);
+        let object = with_to_primitive(&mut machine, method);
+        assert_eq!(
+            machine.eval_unary(UnaryOp::Plus, object).unwrap(),
+            Value::int32(7)
+        );
+    }
+
+    #[test]
+    fn to_primitive_rejects_object_results_and_non_callable_methods() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "return this",
+            length: 0,
+            handler: return_this,
+        });
+        let method = native_function(&mut machine.heap, id, "return this", 0);
+        for method in [method, Value::int32(1)] {
+            let object = with_to_primitive(&mut machine, method);
+            assert!(matches!(
+                machine.coerce_primitive_observable(object, false),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_null_to_primitive_method_falls_back_to_the_ordinary_methods() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object = with_to_primitive(&mut machine, Value::NULL);
+        let primitive = machine.coerce_primitive_observable(object, true).unwrap();
+        assert!(
+            machine
+                .string_value(primitive)
+                .is_some_and(|text| text.eq_ascii("[object Object]"))
+        );
+    }
+
+    #[test]
+    fn symbols_are_primitives_not_objects() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+        assert!(!machine.is_object(machine.intrinsics.builtins.symbol_iterator()));
     }
 
     #[test]
@@ -274,6 +454,11 @@ mod tests {
             ("iterator", "Symbol.iterator"),
             ("asyncIterator", "Symbol.asyncIterator"),
             ("hasInstance", "Symbol.hasInstance"),
+            ("isConcatSpreadable", "Symbol.isConcatSpreadable"),
+            ("matchAll", "Symbol.matchAll"),
+            ("search", "Symbol.search"),
+            ("split", "Symbol.split"),
+            ("toPrimitive", "Symbol.toPrimitive"),
             ("toStringTag", "Symbol.toStringTag"),
             ("species", "Symbol.species"),
             ("dispose", "Symbol.dispose"),
@@ -325,6 +510,99 @@ mod tests {
                 Property::Accessor { .. } => panic!("Symbol.{name} must be a data property"),
             }
         }
+    }
+
+    #[test]
+    fn symbol_has_construct_but_new_throws_from_the_function_body() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = machine.intrinsics.global("Symbol").unwrap();
+        assert!(
+            machine.is_constructor(symbol).unwrap(),
+            "an extends clause needs Symbol to have [[Construct]]"
+        );
+        assert!(matches!(
+            machine.construct_value(symbol, &[]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Symbol is not a constructor"
+            }))
+        ));
+        let result = machine.call_value(symbol, Value::UNDEFINED, &[]).unwrap();
+        assert!(
+            !machine.is_object(result),
+            "a plain call still returns a primitive symbol"
+        );
+    }
+
+    #[test]
+    fn key_for_answers_only_for_the_registered_symbol() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol_constructor = machine.intrinsics.global("Symbol").unwrap();
+        let symbol_for = machine
+            .get_named_property(symbol_constructor, "for")
+            .unwrap();
+        let key_for = machine
+            .get_named_property(symbol_constructor, "keyFor")
+            .unwrap();
+        let key = machine
+            .allocate(HeapEntry::String(EcmaString::encode("shared")))
+            .unwrap();
+        let registered = machine
+            .call_value(symbol_for, symbol_constructor, &[key])
+            .unwrap();
+        let unregistered = machine
+            .call_value(symbol_constructor, Value::UNDEFINED, &[key])
+            .unwrap();
+
+        let found = machine
+            .call_value(key_for, symbol_constructor, &[registered])
+            .unwrap();
+        assert!(
+            machine
+                .string_value(found)
+                .is_some_and(|text| text.eq_ascii("shared"))
+        );
+        assert_eq!(
+            machine
+                .call_value(key_for, symbol_constructor, &[unregistered])
+                .unwrap(),
+            Value::UNDEFINED,
+            "a same-named symbol outside the registry has no key"
+        );
+        assert!(matches!(
+            machine.call_value(key_for, symbol_constructor, &[key]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+    }
+
+    #[test]
+    fn symbol_prototype_methods_accept_wrapper_objects() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let symbol = machine.intrinsics.builtins.symbol_iterator();
+        let wrapper = machine.value_to_object(symbol).unwrap();
+
+        let key = machine
+            .to_property_key(machine.intrinsics.builtins.symbol_to_primitive())
+            .unwrap();
+        let to_primitive = machine.get_property_key(wrapper, &key).unwrap();
+        assert_eq!(
+            machine.call_value(to_primitive, wrapper, &[]).unwrap(),
+            symbol
+        );
+        assert_eq!(
+            machine.coerce_primitive_default(wrapper).unwrap(),
+            symbol,
+            "ToPrimitive reaches the symbol through the prototype method"
+        );
+        assert!(matches!(
+            machine.call_value(to_primitive, Value::int32(1), &[]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
     }
 
     #[test]
@@ -480,7 +758,7 @@ mod tests {
             .unwrap();
         let key = has_instance_property_key(&mut machine);
         machine
-            .set_data_property_key(constructor, key, handler)
+            .create_data_property_key(constructor, key, handler)
             .unwrap();
 
         assert!(
@@ -551,7 +829,7 @@ mod tests {
             .unwrap();
         let key = has_instance_property_key(&mut machine);
         machine
-            .set_data_property_key(constructor, key, handler)
+            .create_data_property_key(constructor, key, handler)
             .unwrap();
 
         assert!(
@@ -572,7 +850,7 @@ mod tests {
         // A present but non-callable @@hasInstance is a TypeError per GetMethod.
         let key = has_instance_property_key(&mut machine);
         machine
-            .set_data_property_key(constructor, key, Value::int32(42))
+            .create_data_property_key(constructor, key, Value::int32(42))
             .unwrap();
 
         let value = ordinary_object(&mut machine);

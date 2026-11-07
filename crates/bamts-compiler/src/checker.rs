@@ -604,6 +604,7 @@ pub struct ProgramCheckOptions {
     /// Whether `noEmitHelpers` is enabled: emit references downleveling
     /// helpers without emitting their definitions.
     no_emit_helpers: bool,
+    remove_comments: bool,
     /// ECMAScript target — drives lib derivation and downleveling decisions.
     target: crate::emitter::ScriptTarget,
     /// Active lib set — controls which intrinsic globals are installed.
@@ -623,6 +624,7 @@ impl ProgramCheckOptions {
             strict_property_initialization: false,
             always_strict: false,
             no_emit_helpers: false,
+            remove_comments: false,
             target: crate::emitter::ScriptTarget::EsNext,
             libs: LibSet::ALL,
             check_js: false,
@@ -638,6 +640,7 @@ impl ProgramCheckOptions {
             strict_property_initialization: false,
             always_strict: false,
             no_emit_helpers: false,
+            remove_comments: false,
             target: crate::emitter::ScriptTarget::EsNext,
             libs: LibSet::ALL,
             check_js: false,
@@ -691,6 +694,17 @@ impl ProgramCheckOptions {
     #[must_use]
     pub const fn no_emit_helpers(&self) -> bool {
         self.no_emit_helpers
+    }
+
+    #[must_use]
+    pub const fn with_remove_comments(mut self, value: bool) -> Self {
+        self.remove_comments = value;
+        self
+    }
+
+    #[must_use]
+    pub const fn remove_comments(&self) -> bool {
+        self.remove_comments
     }
 
     /// Sets the target from a string (e.g. `"es5"`, `"es2020"`) and derives

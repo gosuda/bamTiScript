@@ -14,7 +14,7 @@ Scope: Track E native tiers, target cells, and performance with Track F formal e
 
 - [ ] G3: The native root has no incomplete state
   CHECK: cargo run -p bamts-verification -- completion verify --root native
-  EXPECT: NATIVE COMPLETE formal=PASS targets=28/28 benchmarks=9/9
+  EXPECT: NATIVE COMPLETE formal=PASS targets=49/49 benchmarks=9/9
   EVIDENCE: pending
 
 - [ ] G4: The native root has no PASS-to-non-PASS transition

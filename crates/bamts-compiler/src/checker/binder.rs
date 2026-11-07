@@ -241,6 +241,14 @@ impl Scope {
     pub fn type_binding(&self, name: &str) -> Option<SymbolId> {
         self.types.get(name).copied()
     }
+
+    /// The names this scope declares only as types.
+    pub fn type_only_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.types
+            .keys()
+            .map(AsRef::as_ref)
+            .filter(|name: &&str| !self.values.contains_key(*name))
+    }
 }
 
 /// Resolves a value name from `scope` outward through its ancestors. Class
@@ -8013,7 +8021,7 @@ impl<'src> Binder<'src> {
                         index.type_annotation.data().type_node.as_ref(),
                     );
                 }
-                crate::syntax::ClassMember::Missing(_) => {}
+                crate::syntax::ClassMember::Missing(_) | crate::syntax::ClassMember::Semicolon => {}
             }
         }
         Ok(())
@@ -8279,7 +8287,9 @@ impl<'src> Binder<'src> {
             }
             crate::syntax::AssignmentTarget::Array(array) => {
                 for element in &array.elements {
-                    if let crate::syntax::AssignmentArrayElement::Target(target) = element {
+                    if let crate::syntax::AssignmentArrayElement::Target(target)
+                    | crate::syntax::AssignmentArrayElement::Rest(target) = element
+                    {
                         self.reserve_assignment_target(
                             target,
                             scope,
@@ -9860,7 +9870,9 @@ impl<'src> Binder<'src> {
             }
             AssignmentTarget::Array(array) => {
                 for element in &array.elements {
-                    if let crate::syntax::AssignmentArrayElement::Target(target) = element {
+                    if let crate::syntax::AssignmentArrayElement::Target(target)
+                    | crate::syntax::AssignmentArrayElement::Rest(target) = element
+                    {
                         self.invalidate_assignment_flow(target);
                     }
                 }
@@ -9916,7 +9928,9 @@ impl<'src> Binder<'src> {
             }
             AssignmentTarget::Array(array) => {
                 for element in &array.elements {
-                    if let crate::syntax::AssignmentArrayElement::Target(target) = element {
+                    if let crate::syntax::AssignmentArrayElement::Target(target)
+                    | crate::syntax::AssignmentArrayElement::Rest(target) = element
+                    {
                         self.inventory_assignment_target_writes(target, inventory);
                     }
                 }
@@ -12148,7 +12162,9 @@ impl<'src> Binder<'src> {
                         inventory,
                     );
                 }
-                ClassMember::IndexSignature(_) | ClassMember::Missing(_) => {}
+                ClassMember::IndexSignature(_)
+                | ClassMember::Missing(_)
+                | ClassMember::Semicolon => {}
             }
         }
         if local_name.is_some() {
@@ -13376,6 +13392,7 @@ impl<'src> Binder<'src> {
                             self.complex_catch_scopes.insert(catch_scope);
                         }
                         self.bind_pattern(binding, VariableKind::Let, catch_scope, handler.id());
+                        self.resolve_pattern_expressions(binding, catch_scope);
                     }
                     // Body declarations live in a child block like the try
                     // body above, so `function e` shadows the parameter
@@ -13709,6 +13726,7 @@ impl<'src> Binder<'src> {
         let key_type = self.types.intersection(vec![object_key, string]);
         let keep_literal = variable.kind == VariableKind::Const;
         for declarator in &variable.declarations {
+            self.resolve_pattern_expressions(&declarator.data().binding, scope);
             if declarator.data().type_annotation.is_none() {
                 self.assign_binding_pattern_types(
                     &declarator.data().binding,
@@ -13731,6 +13749,7 @@ impl<'src> Binder<'src> {
                 self.bind_variable(variable, scope, NodeId::default());
                 for declarator_node in &variable.declarations {
                     let declarator = declarator_node.data();
+                    self.resolve_pattern_expressions(&declarator.binding, scope);
                     if matches!(
                         variable.kind,
                         VariableKind::Using | VariableKind::AwaitUsing
@@ -13801,6 +13820,7 @@ impl<'src> Binder<'src> {
             if let Some(initializer) = &declarator.initializer {
                 self.resolve_expr(initializer, scope);
             }
+            self.resolve_pattern_expressions(&declarator.binding, scope);
             if let Some(symbols) = self.declarator_symbols.get(&declarator_node.id())
                 && declarator.initializer.is_some()
             {
@@ -13968,6 +13988,40 @@ impl<'src> Binder<'src> {
                 Self::is_fresh_literal_array(parenthesized.as_ref())
             }
             _ => false,
+        }
+    }
+
+    /// Resolves the defaults and computed keys a binding pattern carries.
+    fn resolve_pattern_expressions(
+        &mut self,
+        pattern: &'src crate::syntax::Pattern,
+        scope: ScopeId,
+    ) {
+        match pattern.data() {
+            BindingPattern::Object(object) => {
+                for property in &object.properties {
+                    self.resolve_property_name(&property.name, scope);
+                    if let Some(initializer) = &property.initializer {
+                        self.resolve_expr(initializer, scope);
+                    }
+                    self.resolve_pattern_expressions(&property.binding, scope);
+                }
+            }
+            BindingPattern::Array(array) => {
+                for element in &array.elements {
+                    if let crate::syntax::ArrayBindingElement::Binding(inner) = element {
+                        self.resolve_pattern_expressions(inner, scope);
+                    }
+                }
+            }
+            BindingPattern::Rest(rest) => {
+                self.resolve_pattern_expressions(&rest.argument, scope);
+            }
+            BindingPattern::Assignment(assignment) => {
+                self.resolve_expr(&assignment.right, scope);
+                self.resolve_pattern_expressions(&assignment.left, scope);
+            }
+            BindingPattern::Identifier(_) | BindingPattern::Missing(_) => {}
         }
     }
 
@@ -14416,6 +14470,7 @@ impl<'src> Binder<'src> {
         if let Some(initializer) = &data.initializer {
             self.resolve_expr(initializer, scope);
         }
+        self.resolve_pattern_expressions(&data.binding, scope);
         let initializer_type = data
             .initializer
             .as_ref()
@@ -16227,7 +16282,8 @@ impl<'src> Binder<'src> {
             ClassMember::Method(_)
             | ClassMember::Constructor(_)
             | ClassMember::StaticBlock(_)
-            | ClassMember::Missing(_) => {}
+            | ClassMember::Missing(_)
+            | ClassMember::Semicolon => {}
         }
     }
 
@@ -19215,7 +19271,8 @@ impl<'src> Binder<'src> {
             AssignmentTarget::Array(array) => {
                 for element in &array.elements {
                     match element {
-                        crate::syntax::AssignmentArrayElement::Target(inner) => {
+                        crate::syntax::AssignmentArrayElement::Target(inner)
+                        | crate::syntax::AssignmentArrayElement::Rest(inner) => {
                             self.resolve_assignment_target(inner, scope);
                         }
                         crate::syntax::AssignmentArrayElement::Missing(_) => {
@@ -26862,6 +26919,15 @@ mod tests {
                 .expect("test source fits the per-file budget")
                 .with_declaration_file(true),
         )
+    }
+
+    #[test]
+    fn the_rest_target_of_an_array_assignment_is_resolved() {
+        let (_, diagnostics) = bound("var known: number[] = [];\n[...missing] = known;\n");
+        let codes: Vec<_> = diagnostics.iter().map(Diagnostic::code).collect();
+        assert_eq!(codes, [CANNOT_FIND_NAME]);
+        let (_, diagnostics) = bound("var known: number[] = [];\n[...known] = known;\n");
+        assert_eq!(diagnostics.len(), 0, "{diagnostics:?}");
     }
 
     fn bound(text: &str) -> (super::SemanticModel, Vec<Diagnostic>) {

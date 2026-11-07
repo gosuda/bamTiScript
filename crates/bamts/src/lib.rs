@@ -15,11 +15,15 @@ use bamts_cancel::{CancellationToken, Cancelled};
 use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
 use bamts_compiler::lint::{LintProfile, LintTable};
 use bamts_compiler::lower::LowerOptions;
+use bamts_compiler::parser::parse;
 use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend_with_cancel};
 use bamts_compiler::program::{
     ProgramLoadError, ProgramLoader, ProgramLowerError, ResolvedProgram, lower_program_with_cancel,
 };
+use bamts_compiler::project::canonical::canonicalize;
 use bamts_compiler::project::{ConfigError, ProjectConfig, ProjectRoot};
+use bamts_compiler::scanner::scan;
+use bamts_compiler::source::ScriptKind;
 
 pub use bamts_bytecode as bytecode;
 pub use bamts_compiler as compiler;
@@ -186,7 +190,37 @@ pub fn compile_source_file_with_cancel(
     path: impl AsRef<Path>,
     cancel: &CancellationToken,
 ) -> Result<bamts_compiler::program::ExecutableProgram> {
-    let path = canonical_entrypoint_with_cancel(path.as_ref(), cancel)?;
+    compile_source_file_with_lints(path, &LintTable::new(LintProfile::Default), cancel)
+}
+
+/// Compiles an entrypoint and its complete local module graph under `lints`.
+pub fn compile_source_file_with_lints(
+    path: impl AsRef<Path>,
+    lints: &LintTable,
+    cancel: &CancellationToken,
+) -> Result<bamts_compiler::program::ExecutableProgram> {
+    compile_entry(path.as_ref(), lints, false, cancel)
+}
+
+/// Compiles an entrypoint the host runs as an ECMAScript Script. Its top-level
+/// `var` and function names live on the global object, and module syntax in it
+/// is an error. A file cannot say this of itself, which is why it is a separate
+/// entry: Node runs the same bytes as a CommonJS module.
+pub fn compile_script_file(
+    path: impl AsRef<Path>,
+    lints: &LintTable,
+    cancel: &CancellationToken,
+) -> Result<bamts_compiler::program::ExecutableProgram> {
+    compile_entry(path.as_ref(), lints, true, cancel)
+}
+
+fn compile_entry(
+    path: &Path,
+    lints: &LintTable,
+    script_entry: bool,
+    cancel: &CancellationToken,
+) -> Result<bamts_compiler::program::ExecutableProgram> {
+    let path = canonical_entrypoint_with_cancel(path, cancel)?;
     let fallback_root = path.parent().map(Path::to_path_buf).ok_or_else(|| {
         Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -197,7 +231,7 @@ pub fn compile_source_file_with_cancel(
     let frontend = compile_program_frontend_with_cancel(
         &resolved.program,
         FrontendMode::Check,
-        &LintTable::new(LintProfile::Default),
+        lints,
         cancel,
     )?;
     let diagnostics = frontend
@@ -210,15 +244,49 @@ pub fn compile_source_file_with_cancel(
     if !diagnostics.is_empty() {
         return Err(Error::Diagnostics { diagnostics });
     }
+    let diagnostics = early_errors(&resolved.program, script_entry);
+    if !diagnostics.is_empty() {
+        return Err(Error::Diagnostics { diagnostics });
+    }
     lower_program_with_cancel(
         &resolved.program,
         &frontend,
         LowerOptions {
             javascript_compatibility: true,
+            script_entry,
         },
         cancel,
     )
     .map_err(Error::from)
+}
+
+/// The early errors of every JavaScript module about to run. TypeScript sources
+/// answer to the checker instead.
+fn early_errors(program: &ResolvedProgram, script_entry: bool) -> Vec<Diagnostic> {
+    let entrypoint = program.entrypoint().source_id();
+    program
+        .modules()
+        .iter()
+        .filter(|module| {
+            matches!(
+                module.script_kind(),
+                ScriptKind::JavaScript | ScriptKind::JavaScriptReact
+            )
+        })
+        .flat_map(|module| {
+            let scanned = scan(
+                module.source_id(),
+                module.script_kind(),
+                module.source().clone(),
+            );
+            let parsed = parse(scanned);
+            if script_entry && module.source_id() == entrypoint {
+                bamts_compiler::early_errors::check_script(parsed.product())
+            } else {
+                bamts_compiler::early_errors::check(parsed.product())
+            }
+        })
+        .collect()
 }
 
 /// Runs an entrypoint and its complete local module graph with the deterministic
@@ -303,7 +371,7 @@ pub fn canonical_entrypoint_with_cancel(
             .map_err(|error| Error::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?
     };
     cancel.check()?;
-    let canonical = fs::canonicalize(&absolute).map_err(|source| {
+    let canonical = canonicalize(&absolute).map_err(|source| {
         Error::ProgramLoad(ProgramLoadError::Read {
             path: absolute,
             source,
@@ -409,7 +477,7 @@ pub fn resolve_project_with_cancel(
 ) -> Result<ResolvedProject> {
     let project = discover_project_with_cancel(entrypoint, fallback_root, cancel)?;
     cancel.check()?;
-    let canonical_root = fs::canonicalize(project.root())
+    let canonical_root = canonicalize(project.root())
         .map_err(|error| Error::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
     cancel.check()?;
     let root = ProjectRoot::new(canonical_root).map_err(|error| {
@@ -445,9 +513,9 @@ pub fn resolve_project_with_cancel(
 
 #[cfg(test)]
 mod tests {
-    use super::compile_source_file;
     #[cfg(feature = "node-host")]
     use super::run_program;
+    use super::{canonicalize, compile_source_file};
     use std::error::Error;
     use std::path::{Path, PathBuf};
 
@@ -529,7 +597,7 @@ mod tests {
         std::fs::remove_file(directory.join("sub/tsconfig.json"))?;
         let error =
             compile_source_file(&entrypoint).expect_err("the root tsconfig.json must be parsed");
-        let expected = std::fs::canonicalize(directory.join("tsconfig.json"))?;
+        let expected = canonicalize(directory.join("tsconfig.json"))?;
         assert!(matches!(
             error,
             super::Error::ProjectConfig { ref path, .. } if *path == expected

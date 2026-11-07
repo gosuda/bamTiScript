@@ -243,7 +243,7 @@ fn is_extensible<H: Host>(
     )))
 }
 
-fn property_key_value<H: Host>(
+pub(crate) fn property_key_value<H: Host>(
     machine: &mut Machine<'_, H>,
     key: PropertyKey,
 ) -> Result<Value, EvalFailure> {
@@ -866,5 +866,131 @@ mod tests {
                 operation: "late observable operation"
             }))
         ));
+    }
+
+    /// A getter whose value only the list being read holds.
+    fn fresh_object(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let object = ordinary_object(machine);
+        machine.set_data_property(object, "marker", Value::int32(7))?;
+        Ok(BuiltinOutcome::Value(object))
+    }
+
+    /// A callee that reaches a collection before it reads what it was given.
+    fn collect_then_read(
+        machine: &mut Machine<'_, TestHost>,
+        this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.collect_garbage();
+        let held = if args.is_empty() { this } else { args[0] };
+        let marker = machine.get_named_property(held, "marker")?;
+        assert_eq!(marker, Value::int32(7));
+        Ok(BuiltinOutcome::Value(marker))
+    }
+
+    /// `{ length, get [position]() }`, rooted for the whole test.
+    fn list_with_a_getter(
+        machine: &mut Machine<'_, TestHost>,
+        length: i32,
+        position: &str,
+    ) -> Value {
+        let getter = callback(machine, "fresh object", 0, fresh_object);
+        let list = ordinary_object(machine);
+        machine
+            .set_data_property(list, "length", Value::int32(length as u32))
+            .unwrap();
+        machine
+            .define_descriptor(
+                list,
+                PropertyKey::Named(EcmaString::encode(position)),
+                Property::Accessor {
+                    getter: Some(getter),
+                    setter: None,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        machine.hold_temporaries(&[list]);
+        list
+    }
+
+    #[test]
+    fn a_collection_in_the_next_builtin_keeps_the_arguments_of_apply() {
+        let module = constructable_program("<reflect-forward>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = callback(&mut machine, "collect then read", 1, collect_then_read);
+        let list = list_with_a_getter(&mut machine, 1, "0");
+        assert_eq!(
+            call_reflect(&mut machine, "apply", &[target, Value::UNDEFINED, list]).unwrap(),
+            Value::int32(7)
+        );
+
+        let function = machine.get_named_property(target, "apply").unwrap();
+        assert_eq!(
+            machine
+                .call_value(function, target, &[Value::UNDEFINED, list])
+                .unwrap(),
+            Value::int32(7)
+        );
+    }
+
+    #[test]
+    fn a_collection_in_the_next_builtin_keeps_the_receiver_of_a_nested_apply() {
+        let module = constructable_program("<reflect-forward-receiver>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = callback(&mut machine, "collect then read", 0, collect_then_read);
+        let reflect = machine.intrinsics.global("Reflect").unwrap();
+        let apply = machine.get_named_property(reflect, "apply").unwrap();
+        let empty = empty_array(&mut machine);
+        let list = list_with_a_getter(&mut machine, 3, "1");
+        machine.set_data_property(list, "0", target).unwrap();
+        machine.set_data_property(list, "2", empty).unwrap();
+        assert_eq!(
+            call_reflect(&mut machine, "apply", &[apply, Value::UNDEFINED, list]).unwrap(),
+            Value::int32(7)
+        );
+    }
+
+    #[test]
+    fn a_call_instruction_keeps_the_arguments_of_apply_for_the_next_builtin() {
+        let module = constructable_program("<reflect-forward-instruction>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = callback(&mut machine, "collect then read", 1, collect_then_read);
+        let list = list_with_a_getter(&mut machine, 1, "0");
+        let reflect = machine.intrinsics.global("Reflect").unwrap();
+        let apply = machine.get_named_property(reflect, "apply").unwrap();
+        machine
+            .execute_call(crate::CallRequest {
+                callee: apply,
+                this_value: reflect,
+                arguments: &[target, Value::UNDEFINED, list],
+                destination: None,
+                call_pc: 0,
+                constructed: None,
+                new_target: Value::UNDEFINED,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_finished_call_releases_what_it_held_for_a_forward() {
+        let module = constructable_program("<reflect-forward-release>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = callback(&mut machine, "collect then read", 1, collect_then_read);
+        let list = list_with_a_getter(&mut machine, 1, "0");
+        let held = machine.builtin_temporaries.len();
+        call_reflect(&mut machine, "apply", &[target, Value::UNDEFINED, list]).unwrap();
+        assert_eq!(machine.builtin_temporaries.len(), held);
     }
 }
