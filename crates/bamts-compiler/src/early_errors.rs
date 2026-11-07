@@ -1125,8 +1125,17 @@ impl Walker<'_> {
                 }
             }
             Statement::Throw(throw) => self.expression(&throw.argument, context),
+            Statement::Import(import) => self.import(import, context),
             Statement::Export(export) => self.export(export, context),
             _ => {}
+        }
+    }
+
+    fn import(&mut self, import: &ImportDeclaration, context: Context) {
+        let mut names = Vec::new();
+        self.import_names(import, &mut names);
+        for name in names {
+            self.check_binding(&name.name, name.range, context);
         }
     }
 
@@ -2343,6 +2352,24 @@ mod tests {
             "export { a }; var a;",
             "import('x');",
             "{ import('x'); }",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    #[test]
+    fn an_import_cannot_bind_eval_or_arguments() {
+        for source in [
+            "import { x as eval } from 'y';",
+            "import { x as arguments } from 'y';",
+            "import eval from 'y';",
+            "import * as arguments from 'y';",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "import { eval as x } from 'y';",
+            "import { x as y } from 'y';",
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
