@@ -603,6 +603,8 @@ mod tests {
         assert_eq!(text(f64::INFINITY), "EUR∞");
         assert_eq!(text(f64::NEG_INFINITY), "-EUR∞");
         assert_eq!(text(f64::NAN), "EURNaN");
+        assert_eq!(range(&euros, 1.0, f64::INFINITY), "EUR\u{a0}1.00–∞");
+        assert_eq!(range(&euros, f64::INFINITY, 1.0), "EUR∞–1.00");
     }
 
     #[test]

@@ -1573,7 +1573,9 @@ impl<'a> NumberFormat<'a> {
         let (start_suffix, name) = self.split_name(start_suffix);
         let (end_suffix, _) = self.split_name(end_suffix);
         let symbols = code_points(start_prefix) + code_points(start_suffix);
-        let shared = symbols > 1 && start_prefix == end_prefix && start_suffix == end_suffix;
+        let shared = symbols > 1
+            && without_digit_space(start_prefix).eq(without_digit_space(end_prefix))
+            && start_suffix == end_suffix;
         let exponent = start_number
             .iter()
             .any(|part| part.part_type == NumberPartType::ExponentSeparator);
@@ -2209,6 +2211,11 @@ fn split_number(parts: &[NumberPart]) -> (&[NumberPart], &[NumberPart], &[Number
     };
     let last = parts.iter().rposition(is_number).unwrap_or(first) + 1;
     (&parts[..first], &parts[first..last], &parts[last..])
+}
+
+/// The parts of a prefix other than the space that only digits take.
+fn without_digit_space(parts: &[NumberPart]) -> impl Iterator<Item = &NumberPart> {
+    parts.iter().filter(|part| part.value != " ")
 }
 
 /// The parts of a number other than the digits of its coefficient.
