@@ -398,7 +398,10 @@ impl NumberFormatDataProvider for IntlData {
     }
 
     fn plural_category(&self, _data_locale: &str, operands: &PluralOperands) -> PluralCategory {
-        if operands.integer_digits == "1" && operands.visible_fraction_digits == 0 {
+        if operands.integer_digits == "1"
+            && operands.visible_fraction_digits == 0
+            && operands.exponent == 0
+        {
             PluralCategory::One
         } else {
             PluralCategory::Other

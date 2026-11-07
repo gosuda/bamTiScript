@@ -590,6 +590,33 @@ mod tests {
     }
 
     #[test]
+    fn an_exponent_makes_a_name_plural() {
+        let meters = |notation: &str| {
+            english(NumberFormatOptions {
+                style: Some("unit".to_owned()),
+                unit: Some("meter".to_owned()),
+                unit_display: Some("long".to_owned()),
+                notation: Some(notation.to_owned()),
+                ..NumberFormatOptions::default()
+            })
+        };
+        let text = |format: &NumberFormat<'_>, value| format.format_number(value).expect("a text");
+        assert_eq!(text(&meters("compact"), 1.0), "1 meter");
+        assert_eq!(text(&meters("compact"), 1000.0), "1K meters");
+        assert_eq!(text(&meters("scientific"), 1.0), "1E0 meter");
+        assert_eq!(text(&meters("scientific"), 1000.0), "1E3 meters");
+        assert_eq!(text(&meters("scientific"), 0.1), "1E-1 meters");
+        let dollars = english(NumberFormatOptions {
+            style: Some("currency".to_owned()),
+            currency: Some("USD".to_owned()),
+            currency_display: Some("name".to_owned()),
+            notation: Some("compact".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(text(&dollars, 1_000_000.0), "1M US dollars");
+    }
+
+    #[test]
     fn range_ends_are_one_value_as_icu_holds_them() {
         let text_range = |format: &NumberFormat<'_>, start: &str, end: &str| {
             format
