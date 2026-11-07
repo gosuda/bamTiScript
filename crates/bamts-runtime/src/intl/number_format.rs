@@ -1856,9 +1856,15 @@ impl<'a> NumberFormat<'a> {
     ) -> Result<Vec<NumberPart>, NumberFormatError> {
         let pattern = self.pattern_for_value(&prepared.rounded);
         let tokens = partition_pattern(pattern)?;
+        let digits = matches!(
+            prepared.rounded,
+            IntlMathematicalValue::Finite { .. } | IntlMathematicalValue::NegativeZero
+        );
         let mut result = Vec::new();
         for token in tokens {
             match token {
+                // A no-break space sets a currency off from digits only.
+                PatternToken::Literal(value) if value == " " && !digits => {}
                 PatternToken::Literal(value) => {
                     push_part(&mut result, NumberPartType::Literal, value)
                 }

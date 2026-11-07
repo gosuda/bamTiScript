@@ -590,6 +590,22 @@ mod tests {
     }
 
     #[test]
+    fn a_currency_code_is_set_off_only_from_digits() {
+        let euros = english(NumberFormatOptions {
+            style: Some("currency".to_owned()),
+            currency: Some("EUR".to_owned()),
+            currency_display: Some("code".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        let text = |value| euros.format_number(value).expect("a text");
+        assert_eq!(text(1.0), "EUR\u{a0}1.00");
+        assert_eq!(text(-1.0), "-EUR\u{a0}1.00");
+        assert_eq!(text(f64::INFINITY), "EUR∞");
+        assert_eq!(text(f64::NEG_INFINITY), "-EUR∞");
+        assert_eq!(text(f64::NAN), "EURNaN");
+    }
+
+    #[test]
     fn an_accounting_negative_has_no_place_for_the_approximately_sign() {
         let accounting = english(NumberFormatOptions {
             style: Some("currency".to_owned()),
