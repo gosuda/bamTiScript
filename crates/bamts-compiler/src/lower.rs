@@ -2684,7 +2684,20 @@ impl<'a> FunctionContext<'a> {
                     declaration_scope,
                 )
             }
-            ForBinding::Target(target) => self.assign_target(builder, target, value),
+            ForBinding::Target(target) => {
+                if let AssignmentTarget::Invalid(operand) = target.data()
+                    && let Some(call) = call_target(operand)
+                {
+                    self.lower_call_target(
+                        builder,
+                        target.range(),
+                        call,
+                        "Invalid left-hand side in for-loop",
+                    )?;
+                    return Ok(());
+                }
+                self.assign_target(builder, target, value)
+            }
         }
     }
     fn lower_break(
@@ -4424,10 +4437,37 @@ impl<'a> FunctionContext<'a> {
             AssignmentTarget::Missing(missing) => {
                 Err(self.missing(assignment.left.range(), missing.expected()))
             }
-            AssignmentTarget::Invalid(_) => {
-                Err(self.missing(assignment.left.range(), NodeKind::AssignmentExpression))
+            AssignmentTarget::Invalid(operand) => {
+                let logical = matches!(
+                    compound_operator(assignment.operator),
+                    Some(CompoundOp::Logical(_))
+                );
+                match call_target(operand).filter(|_| !logical) {
+                    Some(call) => self.lower_call_target(
+                        builder,
+                        assignment.left.range(),
+                        call,
+                        "Invalid left-hand side in assignment",
+                    ),
+                    None => {
+                        Err(self.missing(assignment.left.range(), NodeKind::AssignmentExpression))
+                    }
+                }
             }
         }
+    }
+    /// A call parses as a target, for the sake of old code, and fails only when it runs:
+    /// V8 evaluates the call, then throws, and never evaluates the other side.
+    fn lower_call_target(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        call: &Expr,
+        message: &str,
+    ) -> Result<Register, LowerError> {
+        self.lower_expression(builder, call)?;
+        self.throw_error_message(builder, range, "ReferenceError", Some(message))?;
+        self.undefined(builder, range)
     }
     fn lower_identifier_assignment(
         &mut self,
@@ -4588,9 +4628,19 @@ impl<'a> FunctionContext<'a> {
             AssignmentTarget::Missing(missing) => {
                 Err(self.missing(update.argument.range(), missing.expected()))
             }
-            AssignmentTarget::Invalid(_) => {
-                Err(self.missing(update.argument.range(), NodeKind::UpdateExpression))
-            }
+            AssignmentTarget::Invalid(operand) => match call_target(operand) {
+                Some(call) => self.lower_call_target(
+                    builder,
+                    update.argument.range(),
+                    call,
+                    if update.prefix {
+                        "Invalid left-hand side expression in prefix operation"
+                    } else {
+                        "Invalid left-hand side expression in postfix operation"
+                    },
+                ),
+                None => Err(self.missing(update.argument.range(), NodeKind::UpdateExpression)),
+            },
         }
     }
     /// `await x` suspends on `x` ([`Instruction::Await`], distinct from the
@@ -5133,11 +5183,30 @@ impl<'a> FunctionContext<'a> {
         range: TextRange,
         kind: &str,
     ) -> Result<(), LowerError> {
+        self.throw_error_message(builder, range, kind, None)
+    }
+    fn throw_error_message(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        kind: &str,
+        message: Option<&str>,
+    ) -> Result<(), LowerError> {
         let name = builder.intern(Constant::String(EcmaString::encode(kind)), range)?;
         let callee = self.alloc_register(range)?;
         self.emit(range, Instruction::LoadGlobal { dst: callee, name })?;
         let arguments = self.alloc_register(range)?;
         self.emit(range, Instruction::CreateArray { dst: arguments })?;
+        if let Some(message) = message {
+            let value = self.string_reg(builder, EcmaString::encode(message), range)?;
+            self.emit(
+                range,
+                Instruction::ArrayPush {
+                    array: arguments,
+                    value,
+                },
+            )?;
+        }
         let value = self.alloc_register(range)?;
         self.emit(
             range,
@@ -11124,6 +11193,14 @@ impl<'a> FreeVarScanner<'a> {
         }
     }
 }
+/// The plain call that an invalid target holds. An optional call stays an early error.
+fn call_target(operand: &Expr) -> Option<&Expr> {
+    match operand.data() {
+        Expression::Parenthesized(inner) => call_target(inner),
+        Expression::Call(call) if !call.optional => Some(operand),
+        _ => None,
+    }
+}
 /// The `for` head range used for the back-edge jump's diagnostic anchor.
 fn head_range(for_statement: &ForStatement) -> TextRange {
     for_statement
@@ -11751,6 +11828,39 @@ mod tests {
     }
     fn lower_js(src: &str) -> Module<Verified> {
         lower_js_result(src).expect("snippet lowers to a verified module")
+    }
+    #[test]
+    fn a_call_target_lowers_to_the_call_and_a_reference_error() {
+        for (statement, message) in [
+            ("f() = 1;", "Invalid left-hand side in assignment"),
+            ("f() += 1;", "Invalid left-hand side in assignment"),
+            ("(f()) = 1;", "Invalid left-hand side in assignment"),
+            ("(f()) += 1;", "Invalid left-hand side in assignment"),
+            (
+                "++f();",
+                "Invalid left-hand side expression in prefix operation",
+            ),
+            (
+                "f()--;",
+                "Invalid left-hand side expression in postfix operation",
+            ),
+            ("for (f() in {}) {}", "Invalid left-hand side in for-loop"),
+            ("for (f() of []) {}", "Invalid left-hand side in for-loop"),
+        ] {
+            let module = lower_js(&format!("function f() {{}} {statement}"));
+            assert!(
+                module.constants().iter().any(
+                    |constant| matches!(constant, Constant::String(text) if text.eq_ascii(message))
+                ),
+                "{statement}"
+            );
+        }
+        for statement in ["f() &&= 1;", "f() ??= 1;", "f?.() = 1;", "1 = 2;"] {
+            assert!(
+                lower_js_result(&format!("function f() {{}} {statement}")).is_err(),
+                "{statement}"
+            );
+        }
     }
     #[test]
     fn class_decorators_lower_in_reverse_and_bind_the_final_class_once() {
