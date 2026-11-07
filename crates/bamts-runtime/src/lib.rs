@@ -121,6 +121,22 @@ impl Default for Limits {
     }
 }
 
+impl Limits {
+    /// The ceilings of a compiled program. The defaults hold a test, an embedded script
+    /// or an API request to a small budget. A compiled program runs until it ends, and
+    /// its heap stops near the default of Node. The call depth stays at the default,
+    /// because the native stack sets that limit.
+    #[must_use]
+    pub fn program() -> Self {
+        Self {
+            fuel: u64::MAX,
+            max_heap_slots: 1 << 30,
+            max_heap_bytes: 1 << 32,
+            ..Self::default()
+        }
+    }
+}
+
 /// The exact source of one classic script. Source and resource name preserve
 /// UTF-16 code units verbatim, including unpaired surrogates.
 pub struct ScriptSource<'a> {

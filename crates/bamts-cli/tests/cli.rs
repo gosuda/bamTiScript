@@ -746,6 +746,32 @@ fn jit_runs_two_module_program_with_live_imported_mutation() {
     assert_eq!(output.stdout, b"2\n");
 }
 
+/// The API keeps a budget of 1,000,000 instructions and 64 MiB, so that a request
+/// ends. A compiled program runs for its user and has neither.
+#[test]
+fn an_executable_runs_past_the_budget_of_the_api() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        "let total = 0;\n\
+         for (let index = 0; index < 1100000; index++) {\n  total += 1;\n}\n\
+         const parts: string[] = [];\n\
+         for (let index = 0; index < 40; index++) {\n  parts.push(\"x\".repeat(1 << 20));\n}\n\
+         console.log(total, parts.join(\"\").length);\n",
+    );
+
+    let executable = project
+        .path
+        .join(format!("long{}", std::env::consts::EXE_SUFFIX));
+    let compile = project.emit("main.ts", &executable);
+    assert_success(&compile, "bamts emit of a long program");
+    let output = Command::new(&executable)
+        .output()
+        .expect("the long program starts");
+    assert_success(&output, "the compiled long program");
+    assert_eq!(output.stdout, b"1100000 41943040\n");
+}
+
 #[test]
 fn aot_runs_two_module_program_with_live_imported_mutation() {
     let project = ScratchDirectory::new();

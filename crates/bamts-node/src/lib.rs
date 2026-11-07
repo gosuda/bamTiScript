@@ -510,7 +510,7 @@ fn run_aot_main() -> i32 {
             AotCompletion::Failure(AotMainFailure::Context(error)),
         );
     }
-    let outcome = match run_linked_program(&program, &linked, &mut host, &Limits::default()) {
+    let outcome = match run_linked_program(&program, &linked, &mut host, &Limits::program()) {
         Ok(outcome) => outcome,
         Err(error) => {
             return finish_aot_process(
