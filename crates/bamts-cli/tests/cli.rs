@@ -797,6 +797,21 @@ fn a_read_before_a_module_binding_is_initialized_can_be_caught() {
     );
 }
 
+/// A fatal error before the first `await` aborts the module in the turn that runs
+/// it, and then settles it again on the way out.
+#[test]
+fn a_fatal_error_before_the_first_await_is_reported() {
+    let output = run_compiled_module(
+        "function down(n: number): number {\n  return down(n + 1) + 1;\n}\n\
+         down(0);\n\
+         await 1;\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("call depth limit"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
 /// The API keeps a budget of 1,000,000 instructions and 64 MiB, so that a request
 /// ends. A compiled program runs for its user and has neither.
 #[test]

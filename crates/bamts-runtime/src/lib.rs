@@ -5600,6 +5600,13 @@ impl<'a, H: Host> Machine<'a, H> {
         ) {
             return;
         }
+        // A fatal error stores nothing, and it can reach a module that an inner turn
+        // already aborted, so it comes before the check of the state.
+        if matches!(&result, Err(error) if !matches!(error.kind, RuntimeErrorKind::UncaughtThrow { .. }))
+        {
+            self.abort_module_evaluation(module);
+            return;
+        }
         debug_assert!(
             matches!(
                 self.registry.modules[module.get() as usize].state,
@@ -5607,16 +5614,7 @@ impl<'a, H: Host> Machine<'a, H> {
             ),
             "only an in-flight module settles"
         );
-        match result {
-            Ok(()) => {
-                self.registry.modules[module.get() as usize].state = ModuleState::Evaluated(Ok(()));
-            }
-            Err(error) if matches!(error.kind, RuntimeErrorKind::UncaughtThrow { .. }) => {
-                self.registry.modules[module.get() as usize].state =
-                    ModuleState::Evaluated(Err(error));
-            }
-            Err(_) => self.abort_module_evaluation(module),
-        }
+        self.registry.modules[module.get() as usize].state = ModuleState::Evaluated(result);
     }
 
     pub(crate) fn abort_module_evaluation(&mut self, module: ModuleId) {
