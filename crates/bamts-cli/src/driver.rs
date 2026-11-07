@@ -2372,7 +2372,7 @@ fn fallback_cache_root_path_in_context(context: &ExecutionContext) -> Result<Pat
     )))
 }
 
-/// Whether `directory` is the temporary directory of Windows itself. A process with
+/// Whether `directory` is in the temporary directory of Windows itself. A process with
 /// no `TMP`, `TEMP` or `USERPROFILE` falls back to it, and so does the SYSTEM account.
 /// Every user can create a directory there, so another user could make the cache
 /// first, and a link trusts the archive and the libraries that it finds in the cache.
@@ -2380,13 +2380,18 @@ fn fallback_cache_root_path_in_context(context: &ExecutionContext) -> Result<Pat
 #[cfg(windows)]
 fn is_windows_temp_directory(directory: &Path, context: &ExecutionContext) -> bool {
     // One directory has many spellings: slashes, `\\?\`, a short name, a junction.
-    // Only a directory that exists has a canonical path, so another one compares
-    // by its components.
-    let identity = |path: &Path| {
-        std::fs::canonicalize(path)
-            .unwrap_or_else(|_| path.components().collect())
+    // Only a directory that exists has a canonical path, so a new one resolves through
+    // its nearest parent that exists, and a path on no drive compares by components.
+    let identity = |path: &Path| -> PathBuf {
+        path.ancestors()
+            .find_map(|ancestor| {
+                let parent = std::fs::canonicalize(ancestor).ok()?;
+                Some(parent.join(path.strip_prefix(ancestor).ok()?))
+            })
+            .unwrap_or_else(|| path.components().collect())
             .to_string_lossy()
             .to_ascii_lowercase()
+            .into()
     };
     let directory = identity(directory);
     ["SystemRoot", "WINDIR"]
@@ -2394,7 +2399,7 @@ fn is_windows_temp_directory(directory: &Path, context: &ExecutionContext) -> bo
         .filter_map(|name| crate::context::env_ignoring_case(context.envs(), name))
         .map(|root| Path::new(root).join("Temp"))
         .chain([PathBuf::from(r"C:\Windows\Temp")])
-        .any(|shared| identity(&shared) == directory)
+        .any(|shared| directory.starts_with(identity(&shared)))
 }
 
 #[cfg(unix)]
@@ -3648,6 +3653,21 @@ exit 2
                 "{spelling}"
             );
         }
+        // A directory below it is as open to other users, and it need not exist yet.
+        for below in [
+            format!(r"{windows}\Temp\bamts-missing"),
+            format!("{windows}/Temp/bamts-missing/deeper/"),
+        ] {
+            assert!(
+                refused(&[("SystemRoot", &windows), ("TEMP", &below)]),
+                "{below}"
+            );
+        }
+        // A name that only starts the same way is another directory.
+        assert!(!refused(&[
+            ("SystemRoot", &windows),
+            ("TEMP", &format!(r"{windows}\Temporary"))
+        ]));
         // A junction is a directory that any user can make, and it leads there too.
         let junction = std::env::temp_dir().join(format!("bamts-temp-link-{}", std::process::id()));
         let made = std::process::Command::new("cmd")
