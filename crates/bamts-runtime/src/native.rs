@@ -6313,8 +6313,10 @@ mod tests {
         let error = assert_program_parity(&linked(vec![first, second], 0)).unwrap_err();
         assert!(matches!(
             error.kind,
-            RuntimeErrorKind::TemporalDeadZone { module, binding }
-                if module == ModuleId::new(1) && binding == BindingId::new(0)
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::ReferenceError { .. },
+                ..
+            }
         ));
     }
 

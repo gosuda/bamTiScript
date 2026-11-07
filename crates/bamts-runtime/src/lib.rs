@@ -6734,16 +6734,7 @@ impl<'a, H: Host> Machine<'a, H> {
         {
             let value = self.registry.cells[cell.0].value;
             if value.is_uninitialized() {
-                let binding = self.registry.modules[module.get() as usize]
-                    .binding_cells
-                    .iter()
-                    .position(|candidate| *candidate == Some(cell))
-                    .map(|index| BindingId::new(index as u32))
-                    .expect("linked cell belongs to a binding");
-                return Err(EvalFailure::Runtime(RuntimeErrorKind::TemporalDeadZone {
-                    module,
-                    binding,
-                }));
+                return Err(self.uninitialized_read());
             }
             return Ok(Some(value));
         }
@@ -8802,30 +8793,42 @@ impl<'a, H: Host> Machine<'a, H> {
     }
     fn found_outcome(&mut self, found: Found) -> Result<GetOutcome, EvalFailure> {
         match found {
-            Found::Value(Value::UNINITIALIZED) => {
-                let id = self
-                    .intrinsics
-                    .builtins
-                    .id_named("ReferenceError")
-                    .expect("ReferenceError intrinsic is installed");
-                match self.throw_error(
-                    id,
-                    "Cannot access lexical binding before initialization".into(),
-                ) {
-                    EvalFailure::ThrowValue(value) => Err(EvalFailure::ThrowValueOrigin {
-                        value,
-                        origin: ThrowOrigin::ReferenceError {
-                            operation: "lexical binding is uninitialized",
-                        },
-                    }),
-                    failure => Err(failure),
-                }
-            }
+            Found::Value(Value::UNINITIALIZED) => Err(self.uninitialized_read()),
             Found::Value(value) => Ok(GetOutcome::Value(value)),
             Found::Text(text) => Ok(GetOutcome::Text(text)),
             Found::Getter(getter) => Ok(GetOutcome::Getter(getter)),
-            Found::Failure(kind) => Err(EvalFailure::Runtime(kind)),
+            Found::Failure(kind) => Err(self.read_failure(kind)),
             Found::NoGetter => Ok(GetOutcome::Value(Value::UNDEFINED)),
+        }
+    }
+
+    /// The `ReferenceError` of a read before a binding is initialized.
+    fn uninitialized_read(&mut self) -> EvalFailure {
+        let id = self
+            .intrinsics
+            .builtins
+            .id_named("ReferenceError")
+            .expect("ReferenceError intrinsic is installed");
+        match self.throw_error(
+            id,
+            "Cannot access lexical binding before initialization".into(),
+        ) {
+            EvalFailure::ThrowValue(value) => EvalFailure::ThrowValueOrigin {
+                value,
+                origin: ThrowOrigin::ReferenceError {
+                    operation: "lexical binding is uninitialized",
+                },
+            },
+            failure => failure,
+        }
+    }
+
+    /// The failure of a read. A program can catch a read before initialization, and
+    /// any other kind ends it.
+    pub(crate) fn read_failure(&mut self, kind: RuntimeErrorKind) -> EvalFailure {
+        match kind {
+            RuntimeErrorKind::TemporalDeadZone { .. } => self.uninitialized_read(),
+            kind => EvalFailure::Runtime(kind),
         }
     }
 
@@ -23904,8 +23907,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error.kind,
-            RuntimeErrorKind::TemporalDeadZone { module, binding }
-                if module == ModuleId::new(1) && binding == BindingId::new(0)
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::ReferenceError { .. },
+                ..
+            }
         ));
     }
 
@@ -25411,8 +25416,10 @@ mod tests {
             .expect_err("descriptor reads uninitialized namespace export");
         assert!(matches!(
             error.kind,
-            RuntimeErrorKind::TemporalDeadZone { module, binding }
-                if module == ModuleId::new(0) && binding == BindingId::new(0)
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::ReferenceError { .. },
+                ..
+            }
         ));
     }
 

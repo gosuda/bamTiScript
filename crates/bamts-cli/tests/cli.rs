@@ -778,6 +778,25 @@ fn a_module_writes_the_export_that_it_imports() {
     assert_eq!(output.stdout, b"42 2\nTypeError\n");
 }
 
+#[test]
+fn a_read_before_a_module_binding_is_initialized_can_be_caught() {
+    let output = run_compiled_module(
+        "// @ts-nocheck\n\
+         import * as self from \"./main.js\";\n\
+         import { later as other } from \"./main.js\";\n\
+         for (const read of [() => later, () => other, () => self.later]) {\n\
+           try {\n    read();\n  } catch (error) {\n    console.log(error.name);\n  }\n\
+         }\n\
+         export let later = 1;\n\
+         console.log(later, other, self.later);\n",
+    );
+    assert_success(&output, "the reads before initialization");
+    assert_eq!(
+        output.stdout,
+        b"ReferenceError\nReferenceError\nReferenceError\n1 1 1\n"
+    );
+}
+
 /// The API keeps a budget of 1,000,000 instructions and 64 MiB, so that a request
 /// ends. A compiled program runs for its user and has neither.
 #[test]

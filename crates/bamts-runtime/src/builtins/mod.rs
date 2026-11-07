@@ -1313,17 +1313,15 @@ impl<'a, H: Host> Machine<'a, H> {
                 let PropertyKey::Named(name) = key else {
                     return Ok(None);
                 };
-                return self
-                    .namespace_export(*module, name)
-                    .map(|value| {
-                        value.map(|value| Property::Data {
-                            value,
-                            writable: true,
-                            enumerable: true,
-                            configurable: false,
-                        })
-                    })
-                    .map_err(EvalFailure::Runtime);
+                return match self.namespace_export(*module, name) {
+                    Ok(value) => Ok(value.map(|value| Property::Data {
+                        value,
+                        writable: true,
+                        enumerable: true,
+                        configurable: false,
+                    })),
+                    Err(kind) => Err(self.read_failure(kind)),
+                };
             }
             HeapEntry::Array {
                 elements,
