@@ -68,6 +68,8 @@ const TS1160: DiagnosticCode = DiagnosticCode::new("TS1160");
 const TS1161: DiagnosticCode = DiagnosticCode::new("TS1161");
 const TS1163: DiagnosticCode = DiagnosticCode::new("TS1163");
 const TS1308: DiagnosticCode = DiagnosticCode::new("TS1308");
+/// A `try` statement needs `catch` or `finally`.
+const TS1472: DiagnosticCode = DiagnosticCode::new("TS1472");
 /// Expected corresponding JSX closing tag.
 const TS17002: DiagnosticCode = DiagnosticCode::new("TS17002");
 /// JSX fragment has no corresponding closing tag.
@@ -144,6 +146,7 @@ pub fn typescript_parse_message(code: DiagnosticCode) -> Option<&'static str> {
         "TS1160" => "Unterminated template literal.",
         "TS1161" => "Unterminated regular expression literal.",
         "TS1163" => "A 'yield' expression is only allowed in a generator body.",
+        "TS1472" => "'catch' or 'finally' expected.",
         "TS1308" => {
             "'await' expressions are only allowed within async functions and at the top levels of modules."
         }
@@ -242,6 +245,8 @@ fn map_expected_token(message: &str) -> DiagnosticCode {
         TS1206
     } else if lower.contains("jsx closing tag does not match") {
         TS17002
+    } else if lower.contains("`catch` or `finally`") {
+        TS1472
     } else if lower.contains("declaration or statement") {
         TS1128
     } else {

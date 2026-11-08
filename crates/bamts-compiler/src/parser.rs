@@ -6966,6 +6966,7 @@ mod tests {
                 "An unary expression with the '-' operator is not allowed in the left-hand side of an exponentiation expression. Consider enclosing the expression in parentheses.",
             ),
             ("const o = { a: 1;", "TS1005", "',' expected."),
+            ("try { }", "TS1472", "'catch' or 'finally' expected."),
             (
                 r#"const a = "\101";"#,
                 "TS1487",
