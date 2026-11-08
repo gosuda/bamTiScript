@@ -1894,6 +1894,60 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         let index = target.function.get() as usize;
         let handle = self.code_ref(target.module);
         let flags = handle.code(target.module).functions()[index].flags();
+        if flags.is_async || flags.is_generator {
+            return self.start_suspendable(target, captures, context, this, new_target, args);
+        }
+        let previous = {
+            let mut machine = self.machine.borrow_mut();
+            std::mem::replace(&mut machine.context_global, context)
+        };
+        let outcome = if self.backend == Backend::Reference || self.is_dynamic_module(target.module)
+        {
+            match self.execute(
+                target.module,
+                index,
+                this,
+                new_target,
+                args.to_vec(),
+                captures,
+            ) {
+                Ok((FrameCompletion::Normal(value), _)) => InvokeOutcome::Value(value),
+                Ok((FrameCompletion::Unwind(value, origin, fault_pc), _)) => {
+                    self.pending_fault.set(Some((target, fault_pc)));
+                    InvokeOutcome::Threw(value, origin)
+                }
+                Ok((FrameCompletion::Suspend(value, _), _)) => {
+                    self.pending_fatal_kind
+                        .set(Some(RuntimeErrorKind::InvalidValue { value }));
+                    InvokeOutcome::Fatal
+                }
+                Err(error) => {
+                    self.pending_error.set(Some(error));
+                    InvokeOutcome::Fatal
+                }
+            }
+        } else {
+            self.invoke_linked(target, captures, this, new_target, args)
+        };
+        self.machine.borrow_mut().context_global = previous;
+        outcome
+    }
+
+    /// The start of a generator or an async function. It stays out of the frame of
+    /// [`Self::invoke_runtime`], which a recursion has on the stack once for each
+    /// level.
+    #[inline(never)]
+    fn start_suspendable(
+        &self,
+        target: crate::RuntimeFunction,
+        captures: &[Value],
+        context: Option<Value>,
+        this: Value,
+        new_target: Value,
+        args: &[Value],
+    ) -> InvokeOutcome {
+        let handle = self.code_ref(target.module);
+        let flags = handle.code(target.module).functions()[target.function.get() as usize].flags();
         if flags.is_async && flags.is_generator {
             // An async generator's prologue runs on the shared Machine, like
             // the rest of its body.
@@ -1936,59 +1990,23 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             }
             return InvokeOutcome::Value(generator);
         }
-        if flags.is_async && !flags.is_generator {
-            // Async calls route through the shared reference Machine state
-            // machine, which drives the body on the interpreter to its first
-            // await or completion and returns the implicit Promise. No
-            // bytecode, codegen, or ABI change is involved.
-            let outcome = crate::vm::generator_async::start_async_function(
-                &mut self.machine.borrow_mut(),
-                target,
-                captures,
-                context,
-                this,
-                new_target,
-                args,
-            );
-            return match outcome {
-                Ok(promise) => InvokeOutcome::Value(promise),
-                Err(failure) => self.failure_outcome(failure),
-            };
+        // Async calls route through the shared reference Machine state
+        // machine, which drives the body on the interpreter to its first
+        // await or completion and returns the implicit Promise. No
+        // bytecode, codegen, or ABI change is involved.
+        let outcome = crate::vm::generator_async::start_async_function(
+            &mut self.machine.borrow_mut(),
+            target,
+            captures,
+            context,
+            this,
+            new_target,
+            args,
+        );
+        match outcome {
+            Ok(promise) => InvokeOutcome::Value(promise),
+            Err(failure) => self.failure_outcome(failure),
         }
-        let previous = {
-            let mut machine = self.machine.borrow_mut();
-            std::mem::replace(&mut machine.context_global, context)
-        };
-        let outcome = if self.backend == Backend::Reference || self.is_dynamic_module(target.module)
-        {
-            match self.execute(
-                target.module,
-                index,
-                this,
-                new_target,
-                args.to_vec(),
-                captures,
-            ) {
-                Ok((FrameCompletion::Normal(value), _)) => InvokeOutcome::Value(value),
-                Ok((FrameCompletion::Unwind(value, origin, fault_pc), _)) => {
-                    self.pending_fault.set(Some((target, fault_pc)));
-                    InvokeOutcome::Threw(value, origin)
-                }
-                Ok((FrameCompletion::Suspend(value, _), _)) => {
-                    self.pending_fatal_kind
-                        .set(Some(RuntimeErrorKind::InvalidValue { value }));
-                    InvokeOutcome::Fatal
-                }
-                Err(error) => {
-                    self.pending_error.set(Some(error));
-                    InvokeOutcome::Fatal
-                }
-            }
-        } else {
-            self.invoke_linked(target, captures, this, new_target, args)
-        };
-        self.machine.borrow_mut().context_global = previous;
-        outcome
     }
 
     fn resume_generator(&self, generator: Value, completion: GeneratorCompletion) -> InvokeOutcome {
@@ -3941,7 +3959,6 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
 
     fn dispatch(&self, frame: &mut NativeFrame<'_>, call: HelperCall) -> HelperResult {
         self.prepare_native_helper(frame);
-        let module = ModuleId::new(frame.module_id());
         let amount = match call {
             HelperCall::ResumeValue | HelperCall::ResumeMode => None,
             HelperCall::ConsumeFuel { amount } => Some(u64::from(amount)),
@@ -3952,7 +3969,56 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
         {
             return self.fatal(kind);
         }
-        let result = 'result: {
+        let result = match call {
+            HelperCall::Call {
+                callee,
+                this_value,
+                arguments,
+            } => self.call_helper(callee, this_value, arguments),
+            // Tag 12 has no explicit `new.target`: the callee is it.
+            HelperCall::Construct { callee, arguments } => {
+                self.construct_helper(callee, callee, arguments)
+            }
+            HelperCall::ConstructWithNewTarget {
+                callee,
+                new_target,
+                arguments,
+            } => self.construct_helper(callee, new_target, arguments),
+            call => self.helper(frame, call),
+        };
+        self.finish_helper_result(frame, result)
+    }
+}
+
+impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
+    /// A call from native code. A recursion has this frame on the stack once for
+    /// each level, so the call stays out of [`Self::helper`], whose frame holds the
+    /// locals of every other helper.
+    fn call_helper(&self, callee: Value, this_value: Value, arguments: Value) -> HelperResult {
+        let read = self.machine.borrow().arguments_from_array(arguments);
+        let arguments = match read {
+            Ok(arguments) => arguments,
+            Err(failure) => return self.fail(failure),
+        };
+        let outcome = self.invoke_callee(callee, this_value, &arguments, Value::UNDEFINED);
+        self.outcome_result(outcome)
+    }
+
+    /// A construction from native code, kept out of [`Self::helper`] as a call is.
+    fn construct_helper(&self, callee: Value, new_target: Value, arguments: Value) -> HelperResult {
+        let read = self.machine.borrow().arguments_from_array(arguments);
+        let arguments = match read {
+            Ok(arguments) => arguments,
+            Err(failure) => return self.fail(failure),
+        };
+        self.construct(callee, new_target, &arguments)
+    }
+
+    /// Every helper except a call and a construction.
+    #[inline(never)]
+    fn helper(&self, frame: &mut NativeFrame<'_>, call: HelperCall) -> HelperResult {
+        let module = ModuleId::new(frame.module_id());
+        'result: {
             match call {
                 HelperCall::LoadConstant { const_id } => {
                     let result = self
@@ -4311,46 +4377,10 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         .template_object_at(site, cooked, raw);
                     self.eval_result(result)
                 }
-                HelperCall::Call {
-                    callee,
-                    this_value,
-                    arguments,
-                } => {
-                    let arguments = {
-                        let read = self.machine.borrow().arguments_from_array(arguments);
-                        match read {
-                            Ok(arguments) => arguments,
-                            Err(failure) => break 'result self.fail(failure),
-                        }
-                    };
-                    let outcome =
-                        self.invoke_callee(callee, this_value, &arguments, Value::UNDEFINED);
-                    self.outcome_result(outcome)
-                }
-                HelperCall::Construct { callee, arguments } => {
-                    let arguments = {
-                        let read = self.machine.borrow().arguments_from_array(arguments);
-                        match read {
-                            Ok(arguments) => arguments,
-                            Err(failure) => break 'result self.fail(failure),
-                        }
-                    };
-                    // Tag 12 has no explicit `new.target`: the callee is it.
-                    self.construct(callee, callee, &arguments)
-                }
-                HelperCall::ConstructWithNewTarget {
-                    callee,
-                    new_target,
-                    arguments,
-                } => {
-                    let arguments = {
-                        let read = self.machine.borrow().arguments_from_array(arguments);
-                        match read {
-                            Ok(arguments) => arguments,
-                            Err(failure) => break 'result self.fail(failure),
-                        }
-                    };
-                    self.construct(callee, new_target, &arguments)
+                HelperCall::Call { .. }
+                | HelperCall::Construct { .. }
+                | HelperCall::ConstructWithNewTarget { .. } => {
+                    unreachable!("`dispatch` runs a call outside this frame")
                 }
                 HelperCall::Import { specifier } => self.import_namespace(module, specifier),
                 HelperCall::LoadImportMeta => {
@@ -4589,8 +4619,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::ConsumeFuel { .. } => HelperResult::normal(Value::UNDEFINED),
             }
-        };
-        self.finish_helper_result(frame, result)
+        }
     }
 }
 
