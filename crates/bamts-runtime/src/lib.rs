@@ -132,14 +132,29 @@ impl Default for Limits {
 }
 
 impl Limits {
+    /// The native stack of the thread that runs a compiled program. The system
+    /// reserves it as address space and commits only the pages that the program uses.
+    pub const PROGRAM_STACK: usize = 256 << 20;
+
     /// The ceilings of a compiled program. The defaults hold a test, an embedded script
     /// or an API request to a small budget. A compiled program runs until it ends, and
-    /// its heap stops near the default of Node. The call depth stays at the default,
-    /// because the native stack sets that limit.
+    /// its heap stops near the default of Node.
+    ///
+    /// Its guest stack is about as deep as that of Node 24, which holds 9,686 calls of
+    /// a function with one parameter and 12,516 calls of an empty function. A call
+    /// past it throws `RangeError`. Run the program on a thread with
+    /// [`Self::PROGRAM_STACK`] bytes of stack. A native call takes about 10 KiB, so
+    /// 10,000 calls use less than half of it, and a call through a builtin callback,
+    /// which takes more, stops at [`Self::max_stack_bytes`]. The host ceiling stays
+    /// far past the guest stack, and the registers hold 10,000 large frames.
     #[must_use]
     pub fn program() -> Self {
         Self {
             fuel: u64::MAX,
+            max_call_depth: 1 << 20,
+            max_stack_depth: 10_000,
+            max_stack_bytes: Self::PROGRAM_STACK - (16 << 20),
+            max_total_registers: 1 << 24,
             max_heap_slots: 1 << 30,
             max_heap_bytes: 1 << 32,
             ..Self::default()

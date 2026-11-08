@@ -693,30 +693,63 @@ fn a_file_in_the_project_named_like_a_system_library_is_not_linked() {
     assert_eq!(output.stdout, EXPECTED_STDOUT);
 }
 
-/// The call depth limit of the runtime is the error that a program gets for deep
-/// recursion. The 1 MiB stack that `link.exe` gives by default overflows first, and
-/// that ends the process with 0xC00000FD and no message.
-#[cfg(target_env = "msvc")]
+/// A recursion past the guest stack throws `RangeError`, which ends the program with
+/// exit code 1, as in Node. A native stack overflow would end the process with no
+/// message, with 0xC00000FD on Windows.
 #[test]
-fn aot_deep_recursion_reaches_the_call_depth_limit_before_the_end_of_the_stack() {
-    let directory = ScratchDirectory::new();
-    directory.write(
-        "deep.ts",
-        "function down(n: number): number {\n  return n === 0 ? 0 : 1 + down(n - 1);\n}\nconsole.log(down(100000));\n",
+fn aot_deep_recursion_throws_range_error_before_the_end_of_the_stack() {
+    let output = run_compiled_module(
+        "function down(n: number): number {\n  return n === 0 ? 0 : 1 + down(n - 1);\n}\n\
+         console.log(down(100000));\n\
+         export {};\n",
     );
-    let executable = directory.path.join("deep.exe");
-
-    let compile = directory.emit("deep.ts", &executable);
-    assert_success(&compile, "bamts emit of a deep recursion");
-
-    let output = Command::new(&executable)
-        .output()
-        .expect("compiled executable starts");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
     assert!(
-        stderr.contains("call depth limit"),
-        "{}\nstderr:\n{stderr}",
-        output.status
+        stderr.contains("Maximum call stack size exceeded"),
+        "stderr:\n{stderr}"
+    );
+}
+
+/// The guest stack of a compiled program is about as deep as that of Node, and each
+/// call that passes it throws `RangeError`: a recursion, a recursion through a
+/// builtin callback, a construction, a construction through a builtin, a generator
+/// delegation, a proxy chain, and chains of generators and of async generators that
+/// resume the next one. The output is that of Node 24.
+#[test]
+fn a_compiled_program_has_a_stack_as_deep_as_node() {
+    let output = run_compiled_module(
+        "// @ts-nocheck\n\
+         function down(n) { return down(n + 1) + 1; }\n\
+         try { down(0); } catch (error) { console.log(error instanceof RangeError, error.message); }\n\
+         const callback = () => [0].map(callback);\n\
+         try { callback(); } catch (error) { console.log(error.name); }\n\
+         class Deep { constructor(n) { new Deep(n + 1); } }\n\
+         try { new Deep(0); } catch (error) { console.log(error.name); }\n\
+         class Reflected { constructor(n) { Reflect.construct(Reflected, [n + 1]); } }\n\
+         try { new Reflected(0); } catch (error) { console.log(error.name); }\n\
+         function* nest() { yield* nest(); }\n\
+         try { [...nest()]; } catch (error) { console.log(error.name); }\n\
+         let proxy = {};\n\
+         for (let i = 0; i < 20000; i++) proxy = new Proxy(proxy, {});\n\
+         try { proxy.x; } catch (error) { console.log(error.name); }\n\
+         const chain = [];\n\
+         function* link(i) { chain[i + 1].next(); }\n\
+         for (let i = 0; i < 20000; i++) chain.push(link(i));\n\
+         try { chain[0].next(); } catch (error) { console.log(error.name); }\n\
+         const tasks = [];\n\
+         async function* task(i) { await tasks[i + 1].next(); }\n\
+         for (let i = 0; i < 20000; i++) tasks.push(task(i));\n\
+         tasks[0].next().then(() => console.log('done'), (error) => console.log(error.name));\n\
+         function count(n) { return n === 0 ? 0 : 1 + count(n - 1); }\n\
+         console.log(count(5000));\n\
+         export {};\n",
+    );
+    assert_success(&output, "the calls past the guest stack");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "true Maximum call stack size exceeded\nRangeError\nRangeError\nRangeError\nRangeError\n\
+         RangeError\nRangeError\n5000\nRangeError\n"
     );
 }
 
@@ -798,12 +831,12 @@ fn a_read_before_a_module_binding_is_initialized_can_be_caught() {
 }
 
 /// A fatal error before the first `await` aborts the module in the turn that runs
-/// it, and then settles it again on the way out.
+/// it, and then settles it again on the way out. JSON nested past the depth of the
+/// parser is such an error.
 #[test]
 fn a_fatal_error_before_the_first_await_is_reported() {
     let output = run_compiled_module(
-        "function down(n: number): number {\n  return down(n + 1) + 1;\n}\n\
-         down(0);\n\
+        "JSON.parse(\"[\".repeat(300) + \"]\".repeat(300));\n\
          await 1;\n",
     );
     assert!(!output.status.success());

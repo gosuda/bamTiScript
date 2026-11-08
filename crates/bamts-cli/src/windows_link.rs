@@ -101,9 +101,9 @@ fn library_directories(toolset: &Path, sdk_lib: &Path, sdk_version: &str) -> Vec
 
 /// The arguments that link the object and the runtime archive into `output`.
 ///
-/// `/STACK` gives the main thread the 8 MiB that it has on Linux and macOS.
-/// `link.exe` gives it 1 MiB, and on that a program overflows the stack before it
-/// reaches the call depth limit of the runtime. `/BREPRO` leaves the build time out
+/// `/STACK` gives the main thread the 8 MiB that it has on Linux and macOS, where
+/// `link.exe` gives it 1 MiB. The program itself runs on a thread whose stack the
+/// runtime sets. `/BREPRO` leaves the build time out
 /// of the file, so the same inputs give the same bytes. `native_libraries` is what
 /// rustc reported for the archive, such as `kernel32.lib ntdll.lib
 /// /defaultlib:msvcrt`; the archive carries none of them.
