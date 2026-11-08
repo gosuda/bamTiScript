@@ -54,6 +54,10 @@ const TS1127: DiagnosticCode = DiagnosticCode::new("TS1127");
 const TS1198: DiagnosticCode = DiagnosticCode::new("TS1198");
 /// Unterminated Unicode escape sequence.
 const TS1199: DiagnosticCode = DiagnosticCode::new("TS1199");
+/// Octal escape sequences are not allowed.
+const TS1487: DiagnosticCode = DiagnosticCode::new("TS1487");
+/// An escape sequence is not allowed.
+const TS1488: DiagnosticCode = DiagnosticCode::new("TS1488");
 /// Declaration or statement expected.
 const TS1128: DiagnosticCode = DiagnosticCode::new("TS1128");
 /// Property assignment expected.
@@ -85,6 +89,8 @@ pub fn typescript_parse_code(code: DiagnosticCode, message: &str) -> Option<Diag
         "BAMTS-L011" => TS1127,
         "BAMTS-L012" => TS1198,
         "BAMTS-L013" => TS1199,
+        "BAMTS-L014" => TS1487,
+        "BAMTS-L015" => TS1488,
         "BAMTS-P001" => map_expected_token(message),
         "BAMTS-P002" => map_expected_expression(message),
         "BAMTS-P003" => TS1003,
@@ -131,6 +137,8 @@ pub fn typescript_parse_message(code: DiagnosticCode) -> Option<&'static str> {
         "TS1127" => "Invalid character.",
         "TS1198" => "An extended Unicode escape value must be between 0x0 and 0x10FFFF inclusive.",
         "TS1199" => "Unterminated Unicode escape sequence.",
+        "TS1487" => "Octal escape sequences are not allowed. Use the syntax '{0}'.",
+        "TS1488" => "Escape sequence '{0}' is not allowed.",
         "TS1128" => "Declaration or statement expected.",
         "TS1136" => "Property assignment expected.",
         "TS1160" => "Unterminated template literal.",
@@ -331,6 +339,8 @@ mod tests {
                 "unicode escape is not closed",
                 "TS1199",
             ),
+            ("BAMTS-L014", 1, 5, "legacy octal escape", "TS1487"),
+            ("BAMTS-L015", 1, 3, "the escape is not allowed", "TS1488"),
             ("BAMTS-L005", 0, 1, "unexpected character", "TS1127"),
             (
                 "BAMTS-P005",

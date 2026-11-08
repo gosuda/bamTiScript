@@ -482,6 +482,18 @@
       "tsCode": 1199
     },
     {
+      "bamtsCode": "BAMTS-L014",
+      "evidence": "Legacy octal escape in a TypeScript file -> TS1487 from its backslash via tsc 7.0.2 --noEmit on const a = \"\\101\"; (x.ts(1,12), Use the syntax '\\x41'), also with --alwaysStrict false.",
+      "status": "mapped",
+      "tsCode": 1487
+    },
+    {
+      "bamtsCode": "BAMTS-L015",
+      "evidence": "\\8 or \\9 escape in a TypeScript file -> TS1488 from its backslash via tsc 7.0.2 --noEmit on const b = \"\\8\"; (x.ts(1,12)).",
+      "status": "mapped",
+      "tsCode": 1488
+    },
+    {
       "bamtsCode": "BAMTS-P001",
       "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
       "status": "unmapped",

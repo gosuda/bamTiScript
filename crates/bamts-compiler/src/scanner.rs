@@ -28,6 +28,7 @@
 //! deterministically instead of being guessed. A parser that drives the scanner
 //! itself may instead call [`Scanner::rescan_template_continuation`].
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
@@ -63,6 +64,10 @@ const INVALID_PRIVATE_IDENTIFIER: DiagnosticCode = DiagnosticCode::new("BAMTS-L0
 const UNICODE_ESCAPE_OUT_OF_RANGE: DiagnosticCode = DiagnosticCode::new("BAMTS-L012");
 /// A `\u{...}` escape without its closing brace.
 const UNTERMINATED_UNICODE_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L013");
+/// A legacy octal escape, such as `\1` or `\08`, in a TypeScript file.
+const LEGACY_OCTAL_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L014");
+/// A `\8` or `\9` escape in a TypeScript file.
+const NON_OCTAL_DECIMAL_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L015");
 
 /// Whether `code` reports a malformed escape in the text of a literal. A tagged
 /// template accepts such an escape, so its text keeps none of these.
@@ -72,6 +77,8 @@ pub(crate) fn is_escape_diagnostic(code: DiagnosticCode) -> bool {
         INVALID_UNICODE_ESCAPE,
         UNICODE_ESCAPE_OUT_OF_RANGE,
         UNTERMINATED_UNICODE_ESCAPE,
+        LEGACY_OCTAL_ESCAPE,
+        NON_OCTAL_DECIMAL_ESCAPE,
     ]
     .contains(&code)
 }
@@ -1512,9 +1519,18 @@ impl<'a> Scanner<'a> {
     /// Scans an escape in the text of a string or a template. TypeScript reports
     /// a bad escape at the character where the escape goes wrong.
     fn scan_escape(&mut self) {
+        let backslash = self.utf16_pos;
         self.bump();
         match self.first() {
             None => {}
+            Some('0'..='9')
+                if matches!(
+                    self.script_kind,
+                    ScriptKind::TypeScript | ScriptKind::TypeScriptReact
+                ) =>
+            {
+                self.scan_digit_escape(backslash);
+            }
             // A line continuation consumes the terminator; CRLF counts as one.
             Some('\r') => {
                 self.bump();
@@ -1545,6 +1561,46 @@ impl<'a> Scanner<'a> {
                 self.bump();
             }
         }
+    }
+
+    /// Scans an escape that begins with a digit. TypeScript rejects `\8`, `\9`
+    /// and a legacy octal escape in every file. It accepts `\0` before a
+    /// character that is not a digit.
+    fn scan_digit_escape(&mut self, backslash: usize) {
+        let Some(first) = self.bump() else {
+            return;
+        };
+        if matches!(first, '8' | '9') {
+            self.error(
+                NON_OCTAL_DECIMAL_ESCAPE,
+                backslash,
+                self.utf16_pos,
+                format!("the escape `\\{first}` is not allowed"),
+            );
+            return;
+        }
+        if first == '0' && !self.first().is_some_and(|c| c.is_ascii_digit()) {
+            return;
+        }
+        // An escape that starts with 0 to 3 has up to three octal digits; one
+        // that starts with 4 to 7 has up to two.
+        let mut value = first.to_digit(8).unwrap_or(0);
+        let limit = if value < 4 { 3 } else { 2 };
+        for _ in 1..limit {
+            match self.first().and_then(|c| c.to_digit(8)) {
+                Some(digit) => {
+                    self.bump();
+                    value = value * 8 + digit;
+                }
+                None => break,
+            }
+        }
+        self.error(
+            LEGACY_OCTAL_ESCAPE,
+            backslash,
+            self.utf16_pos,
+            format!("a legacy octal escape is not allowed; write `\\x{value:02x}`"),
+        );
     }
 
     /// Reads the code point of a `\u` escape after its `u`, in the four-digit
@@ -1852,7 +1908,13 @@ impl<'a> Scanner<'a> {
         Token::new(kind, range)
     }
 
-    fn error(&mut self, code: DiagnosticCode, start_u: usize, end_u: usize, message: &'static str) {
+    fn error(
+        &mut self,
+        code: DiagnosticCode,
+        start_u: usize,
+        end_u: usize,
+        message: impl Into<Cow<'static, str>>,
+    ) {
         let range = TextRange::new(Utf16Pos::new(start_u), Utf16Pos::new(end_u))
             .expect("diagnostic ranges advance monotonically");
         self.diagnostics
@@ -2242,8 +2304,50 @@ mod tests {
             ]
         );
         assert_eq!(faults(r#""\u{10FFFF}""#), []);
+        assert_eq!(faults(r#""\0" + "\0x""#), []);
         assert_eq!(faults(r"var \u{30}x"), [(UNEXPECTED_CHARACTER, 4, 5)]);
         assert_eq!(faults(r"a\u{110000}"), [(UNEXPECTED_CHARACTER, 1, 2)]);
+    }
+
+    /// `tsc` 7.0.2 rejects `\8`, `\9` and a legacy octal escape in a TypeScript
+    /// file, from the backslash to the end of the escape, and suggests the `\x`
+    /// form. JavaScript keeps them for sloppy code; its early errors reject them
+    /// in strict code.
+    #[test]
+    fn a_typescript_file_rejects_a_legacy_octal_escape() {
+        let found = |text: &str| -> Vec<(DiagnosticCode, usize, usize, String)> {
+            scan_text(text)
+                .diagnostics()
+                .iter()
+                .map(|d| {
+                    let range = d.range();
+                    let (start, end) = (range.start().get(), range.end().get());
+                    (d.code(), start, end, d.message().to_owned())
+                })
+                .collect()
+        };
+        let octal = |start, end, hex: &str| {
+            let message = format!("a legacy octal escape is not allowed; write `\\x{hex}`");
+            (LEGACY_OCTAL_ESCAPE, start, end, message)
+        };
+        assert_eq!(found(r#""\101""#), [octal(1, 5, "41")]);
+        assert_eq!(found(r#""\0123""#), [octal(1, 5, "0a")]);
+        assert_eq!(found(r#""\400""#), [octal(1, 4, "20")]);
+        assert_eq!(found(r#""\377""#), [octal(1, 5, "ff")]);
+        assert_eq!(found(r"'a\08b'"), [octal(2, 4, "00")]);
+        assert_eq!(found(r"`\1`"), [octal(1, 3, "01")]);
+        let message = "the escape `\\9` is not allowed".to_owned();
+        assert_eq!(
+            found(r#""\9x""#),
+            [(NON_OCTAL_DECIMAL_ESCAPE, 1, 3, message)]
+        );
+        let javascript = SourceText::new(r#""\101" + "\8""#).expect("test source fits budget");
+        let scanned = scan(
+            SourceId::new(0),
+            ScriptKind::JavaScript,
+            Arc::new(javascript),
+        );
+        assert!(scanned.diagnostics().is_empty());
     }
 
     #[test]

@@ -6910,6 +6910,16 @@ mod tests {
                 "An unary expression with the '-' operator is not allowed in the left-hand side of an exponentiation expression. Consider enclosing the expression in parentheses.",
             ),
             ("const o = { a: 1;", "TS1005", "',' expected."),
+            (
+                r#"const a = "\101";"#,
+                "TS1487",
+                r"Octal escape sequences are not allowed. Use the syntax '\x41'.",
+            ),
+            (
+                r#"const b = "\8";"#,
+                "TS1488",
+                r"Escape sequence '\8' is not allowed.",
+            ),
         ] {
             let parsed = parse_ts(source);
             let mapped = crate::diagnostics_parser::map_parse_diagnostic(errors(&parsed)[0]);
@@ -7328,13 +7338,16 @@ mod tests {
             parse_ts(text)
                 .diagnostics()
                 .iter()
-                .filter(|d| matches!(d.code().as_str(), "BAMTS-L006" | "BAMTS-L007"))
+                .filter(|d| is_escape_diagnostic(d.code()))
                 .count()
         };
-        assert_eq!(escapes(r"tag`\xg \u12 \u{110000}`;"), 0);
+        assert_eq!(escapes(r"tag`\xg \u12 \u{110000} \u{12`;"), 0);
+        assert_eq!(escapes(r"tag`\1 \08 \8`;"), 0);
         assert_eq!(escapes(r"tag`${1}\xg${2}\u12`;"), 0);
         assert_eq!(escapes(r"tag<T>`\xg`;"), 0);
         assert_eq!(escapes(r"`\xg`;"), 1);
+        assert_eq!(escapes(r"`\1`;"), 1);
+        assert_eq!(escapes(r"`\u{110000}`;"), 1);
         assert_eq!(escapes(r"tag`${`\xg`}`;"), 1);
     }
 
