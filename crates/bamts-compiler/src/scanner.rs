@@ -87,17 +87,22 @@ pub(crate) fn is_escape_diagnostic(code: DiagnosticCode) -> bool {
 /// that a literal reports for it.
 type EscapeFault = (DiagnosticCode, usize, usize, &'static str);
 
+/// Whether `code` reports a string, a template or a comment that is not closed.
+pub(crate) fn is_unterminated_diagnostic(code: DiagnosticCode) -> bool {
+    [
+        UNTERMINATED_STRING,
+        UNTERMINATED_BLOCK_COMMENT,
+        UNTERMINATED_TEMPLATE,
+    ]
+    .contains(&code)
+}
+
 /// `diagnostic` where TypeScript reports it. The scanner records a literal or
 /// a comment that is not closed over its whole text, so that the parser can
 /// drop the errors of text that it scans again. TypeScript reports it at the
 /// end of that text.
 pub(crate) fn at_reported_position(diagnostic: Diagnostic) -> Diagnostic {
-    let unterminated = [
-        UNTERMINATED_STRING,
-        UNTERMINATED_BLOCK_COMMENT,
-        UNTERMINATED_TEMPLATE,
-    ];
-    if !unterminated.contains(&diagnostic.code()) {
+    if !is_unterminated_diagnostic(diagnostic.code()) {
         return diagnostic;
     }
     let end = diagnostic.range().end();

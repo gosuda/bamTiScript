@@ -42,8 +42,10 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
-use crate::scanner::{ScannedSource, at_reported_position, is_escape_diagnostic};
+use crate::diagnostic::{Diagnostic, DiagnosticCode, DiagnosticSeverity, Recovered};
+use crate::scanner::{
+    ScannedSource, at_reported_position, is_escape_diagnostic, is_unterminated_diagnostic,
+};
 use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
 use crate::syntax::{
     Accessibility, ArrayBindingElement, ArrayBindingPattern, ArrayElement, ArrayLiteral,
@@ -241,9 +243,32 @@ pub fn parse_with_cancel(
             && !jsx_spans.iter().any(in_span)
             && !(escape && tagged_spans.iter().any(in_span))
     });
-    let mut diagnostics: Vec<Diagnostic> =
-        diagnostics.into_iter().map(at_reported_position).collect();
-    diagnostics.extend(parser.diagnostics.iter().cloned());
+    // TypeScript reports no parse error at the start of an earlier one. Its
+    // scanner runs as it parses, so at one position a lexical error comes first,
+    // a literal that is not closed comes after the errors in its text, and the
+    // parse errors come last, in the order that the parser found them.
+    let mut ordered: Vec<(usize, u8, Diagnostic)> = diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            let rank = u8::from(is_unterminated_diagnostic(diagnostic.code()));
+            let diagnostic = at_reported_position(diagnostic);
+            (diagnostic.range().start().get(), rank, diagnostic)
+        })
+        .chain(
+            parser
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.range().start().get(), 2, diagnostic.clone())),
+        )
+        .collect();
+    ordered.sort_by_key(|(start, rank, _)| (*start, *rank));
+    let mut starts = std::collections::BTreeSet::new();
+    let mut diagnostics: Vec<Diagnostic> = ordered
+        .into_iter()
+        .filter_map(|(start, _, diagnostic)| {
+            (!is_parse_error(&diagnostic) || starts.insert(start)).then_some(diagnostic)
+        })
+        .collect();
     diagnostics.sort();
     diagnostics.dedup();
 
@@ -352,6 +377,25 @@ fn is_trivia(kind: TokenKind) -> bool {
             | TokenKind::Shebang
             | TokenKind::Unknown
     )
+}
+
+/// Whether TypeScript reports `diagnostic` while it parses. Every lexical error
+/// is one. A grammar error, such as `yield` outside a generator, is reported by
+/// its checker instead.
+fn is_parse_error(diagnostic: &Diagnostic) -> bool {
+    let code = diagnostic.code();
+    diagnostic.severity() == DiagnosticSeverity::Error
+        && (code.as_str().starts_with("BAMTS-L")
+            || [
+                EXPECTED_TOKEN,
+                EXPECTED_EXPRESSION,
+                EXPECTED_IDENTIFIER,
+                EXPECTED_TYPE,
+                UNEXPECTED_TOKEN,
+                EXPECTED_PROPERTY_NAME,
+                NESTING_TOO_DEEP,
+            ]
+            .contains(&code))
 }
 
 fn empty_range(at: Utf16Pos) -> TextRange {
@@ -6726,7 +6770,7 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnostic::DiagnosticSeverity;
+
     use crate::scanner::scan;
 
     fn parse_text(text: &str, script_kind: ScriptKind) -> Recovered<SourceFile> {
@@ -6929,6 +6973,32 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    /// `tsc` 7.0.2 reports no parse error at the start of an earlier one, and a
+    /// lexical error comes first.
+    #[test]
+    fn one_parse_error_is_reported_at_a_position() {
+        let found = |text: &str| -> Vec<(usize, String)> {
+            errors(&parse_ts(text))
+                .iter()
+                .map(|d| {
+                    let mapped = crate::diagnostics_parser::map_parse_diagnostic(d);
+                    (d.range().start().get(), mapped.message().to_owned())
+                })
+                .collect()
+        };
+        assert_eq!(
+            found("const o = { a: 1;\n"),
+            [
+                (16, "',' expected.".to_owned()),
+                (18, "'}' expected.".to_owned())
+            ]
+        );
+        assert_eq!(
+            found(r#"let a = "\x"#),
+            [(11, "Hexadecimal digit expected.".to_owned())]
+        );
     }
 
     /// `tsc` 7.0.2 reports a string, a template or a comment that is not closed
