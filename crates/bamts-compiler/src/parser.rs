@@ -402,6 +402,18 @@ fn empty_range(at: Utf16Pos) -> TextRange {
     TextRange::new(at, at).expect("an empty range is ordered")
 }
 
+/// The text of a JSX tag name, from its first part to its last.
+fn jsx_name_range(name: &JsxElementName) -> TextRange {
+    let (start, end) = match name {
+        JsxElementName::Identifier(identifier) => (identifier.range(), identifier.range()),
+        JsxElementName::Namespace(namespaced) => {
+            (namespaced.namespace.range(), namespaced.name.range())
+        }
+        JsxElementName::Member(member) => (jsx_name_range(&member.object), member.property.range()),
+    };
+    TextRange::new(start.start(), end.end()).expect("a JSX name grows forward")
+}
+
 /// The operator of a unary expression that cannot be the left operand of `**`.
 fn exponent_operand_operator(expression: &Expression) -> Option<&'static str> {
     Some(match expression {
@@ -3508,11 +3520,11 @@ impl Parser {
             // still points at the operator, so inspect it before consuming.
             let is_exponent = matches!(self.kind(), TokenKind::StarStar);
             if is_exponent && let Some(operator) = exponent_operand_operator(left.data()) {
-                let op_range = self.cur().range();
-                // The operator is quoted first, because TypeScript names it.
+                let operand = left.range();
+                // TypeScript reports the operand and names its operator first.
                 self.error_at(
                     UNEXPECTED_TOKEN,
-                    op_range,
+                    operand,
                     format!(
                         "an unparenthesized unary expression with `{operator}` cannot be the left operand of `**`"
                     ),
@@ -4353,7 +4365,7 @@ impl Parser {
         if open_text != close_text {
             self.error_at(
                 EXPECTED_TOKEN,
-                closing.range(),
+                jsx_name_range(&closing.data().name),
                 format!("JSX closing tag does not match the opening tag `{open_text}`"),
             );
         }
@@ -6972,6 +6984,37 @@ mod tests {
                 (code, message),
                 "{source}"
             );
+        }
+    }
+
+    /// `tsc` 7.0.2 reports TS17006 over the unary operand and TS17002 over the
+    /// name of the closing tag.
+    #[test]
+    fn an_operand_or_a_tag_error_is_where_tsc_reports_it() {
+        for (source, script_kind, range) in [
+            ("const z = -2 ** 2;", ScriptKind::TypeScript, (10, 12)),
+            (
+                "async () => { await 1 ** 2; };",
+                ScriptKind::TypeScript,
+                (14, 21),
+            ),
+            (
+                "const e = <div></span>;",
+                ScriptKind::TypeScriptReact,
+                (17, 21),
+            ),
+            (
+                "const e = <a.b></a.c>;",
+                ScriptKind::TypeScriptReact,
+                (17, 20),
+            ),
+        ] {
+            let parsed = parse_text(source, script_kind);
+            let found: Vec<(usize, usize)> = errors(&parsed)
+                .iter()
+                .map(|d| (d.range().start().get(), d.range().end().get()))
+                .collect();
+            assert_eq!(found, [range], "{source}");
         }
     }
 
