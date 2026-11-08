@@ -43,7 +43,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
-use crate::scanner::{INVALID_ESCAPE, INVALID_UNICODE_ESCAPE, ScannedSource};
+use crate::scanner::{ScannedSource, is_escape_diagnostic};
 use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
 use crate::syntax::{
     Accessibility, ArrayBindingElement, ArrayBindingPattern, ArrayElement, ArrayLiteral,
@@ -236,7 +236,7 @@ pub fn parse_with_cancel(
         let start = diagnostic.range().start().get();
         let in_span = |span: &TextRange| start >= span.start().get() && start < span.end().get();
         let code = diagnostic.code();
-        let escape = code == INVALID_ESCAPE || code == INVALID_UNICODE_ESCAPE;
+        let escape = is_escape_diagnostic(code);
         !regex_spans.iter().any(in_span)
             && !jsx_spans.iter().any(in_span)
             && !(escape && tagged_spans.iter().any(in_span))

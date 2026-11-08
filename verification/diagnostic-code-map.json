@@ -435,9 +435,9 @@
     },
     {
       "bamtsCode": "BAMTS-L006",
-      "evidence": "Invalid escape sequence -> TS1488 via tsc --noEmit on \"\\8\".",
+      "evidence": "Hexadecimal escape without two digits -> TS1125 at the first character that is not a digit via tsc 7.0.2 --noEmit on const x = \"\\xg\"; (x.ts(1,14)).",
       "status": "mapped",
-      "tsCode": 1488
+      "tsCode": 1125
     },
     {
       "bamtsCode": "BAMTS-L007",
@@ -468,6 +468,18 @@
       "evidence": "Invalid private identifier / hash not followed by identifier -> TS1127 via tsc --noEmit on \"# \".",
       "status": "mapped",
       "tsCode": 1127
+    },
+    {
+      "bamtsCode": "BAMTS-L012",
+      "evidence": "Extended unicode escape above U+10FFFF -> TS1198 over its digits via tsc 7.0.2 --noEmit on const z = \"\\u{110000}\"; (x.ts(1,15)).",
+      "status": "mapped",
+      "tsCode": 1198
+    },
+    {
+      "bamtsCode": "BAMTS-L013",
+      "evidence": "Extended unicode escape without its closing brace -> TS1199 at the character after the digits via tsc 7.0.2 --noEmit on const u = \"\\u{12\"; (x.ts(1,17)).",
+      "status": "mapped",
+      "tsCode": 1199
     },
     {
       "bamtsCode": "BAMTS-P001",

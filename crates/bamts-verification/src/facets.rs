@@ -19,7 +19,7 @@
 //!   path. Empty stdout cannot pass on its own.
 //!
 //! The diagnostic code map at [`DIAGNOSTIC_CODE_MAP_PATH`] must enumerate every
-//! current `BAMTS-L001…L011`, parser, and checker diagnostic codes.
+//! current `BAMTS-L001…L013`, parser, and checker diagnostic codes.
 //! Unmapped entries are first-class evidence, not invented TypeScript codes.
 
 use std::{
@@ -51,7 +51,7 @@ pub const DIAGNOSTIC_CODE_MAP_PATH: &str = "verification/diagnostic-code-map.jso
 pub const DIAGNOSTIC_CODE_MAP_SCHEMA_VERSION: u32 = 1;
 
 /// Every current BAMTS diagnostic code the map must cover exactly once.
-pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 104] = [
+pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 106] = [
     "BAMTS-L001",
     "BAMTS-L002",
     "BAMTS-L003",
@@ -63,6 +63,8 @@ pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 104] = [
     "BAMTS-L009",
     "BAMTS-L010",
     "BAMTS-L011",
+    "BAMTS-L012",
+    "BAMTS-L013",
     "BAMTS-P001",
     "BAMTS-P002",
     "BAMTS-P003",

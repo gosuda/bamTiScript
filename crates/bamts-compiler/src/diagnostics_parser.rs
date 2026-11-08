@@ -50,6 +50,10 @@ const TS1124: DiagnosticCode = DiagnosticCode::new("TS1124");
 const TS1125: DiagnosticCode = DiagnosticCode::new("TS1125");
 /// Invalid character.
 const TS1127: DiagnosticCode = DiagnosticCode::new("TS1127");
+/// An extended Unicode escape value is above U+10FFFF.
+const TS1198: DiagnosticCode = DiagnosticCode::new("TS1198");
+/// Unterminated Unicode escape sequence.
+const TS1199: DiagnosticCode = DiagnosticCode::new("TS1199");
 /// Declaration or statement expected.
 const TS1128: DiagnosticCode = DiagnosticCode::new("TS1128");
 /// Property assignment expected.
@@ -79,6 +83,8 @@ pub fn typescript_parse_code(code: DiagnosticCode, message: &str) -> Option<Diag
         "BAMTS-L006" | "BAMTS-L007" => TS1125,
         "BAMTS-L008" | "BAMTS-L009" | "BAMTS-L010" => TS1124,
         "BAMTS-L011" => TS1127,
+        "BAMTS-L012" => TS1198,
+        "BAMTS-L013" => TS1199,
         "BAMTS-P001" => map_expected_token(message),
         "BAMTS-P002" => map_expected_expression(message),
         "BAMTS-P003" => TS1003,
@@ -123,6 +129,8 @@ pub fn typescript_parse_message(code: DiagnosticCode) -> Option<&'static str> {
         "TS1124" => "Digit expected.",
         "TS1125" => "Hexadecimal digit expected.",
         "TS1127" => "Invalid character.",
+        "TS1198" => "An extended Unicode escape value must be between 0x0 and 0x10FFFF inclusive.",
+        "TS1199" => "Unterminated Unicode escape sequence.",
         "TS1128" => "Declaration or statement expected.",
         "TS1136" => "Property assignment expected.",
         "TS1160" => "Unterminated template literal.",
@@ -315,6 +323,14 @@ mod tests {
                 "TS1124",
             ),
             ("BAMTS-L007", 1, 4, "invalid unicode escape", "TS1125"),
+            ("BAMTS-L012", 4, 10, "unicode escape too large", "TS1198"),
+            (
+                "BAMTS-L013",
+                10,
+                11,
+                "unicode escape is not closed",
+                "TS1199",
+            ),
             ("BAMTS-L005", 0, 1, "unexpected character", "TS1127"),
             (
                 "BAMTS-P005",

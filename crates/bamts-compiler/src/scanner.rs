@@ -47,10 +47,10 @@ const UNTERMINATED_TEMPLATE: DiagnosticCode = DiagnosticCode::new("BAMTS-L003");
 const UNTERMINATED_REGEX: DiagnosticCode = DiagnosticCode::new("BAMTS-L004");
 /// A character that cannot begin any token.
 const UNEXPECTED_CHARACTER: DiagnosticCode = DiagnosticCode::new("BAMTS-L005");
-/// A malformed escape sequence.
-pub(crate) const INVALID_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L006");
-/// A malformed unicode escape sequence.
-pub(crate) const INVALID_UNICODE_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L007");
+/// A `\x` escape without two hexadecimal digits.
+const INVALID_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L006");
+/// A `\u` escape without a hexadecimal digit where one must be.
+const INVALID_UNICODE_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L007");
 /// A misplaced numeric separator.
 const INVALID_NUMERIC_SEPARATOR: DiagnosticCode = DiagnosticCode::new("BAMTS-L008");
 /// A numeric literal with no valid digits.
@@ -59,6 +59,26 @@ const INVALID_NUMERIC_LITERAL: DiagnosticCode = DiagnosticCode::new("BAMTS-L009"
 const INVALID_BIGINT_LITERAL: DiagnosticCode = DiagnosticCode::new("BAMTS-L010");
 /// A `#` that does not begin a private identifier.
 const INVALID_PRIVATE_IDENTIFIER: DiagnosticCode = DiagnosticCode::new("BAMTS-L011");
+/// A `\u{...}` escape whose value is above U+10FFFF.
+const UNICODE_ESCAPE_OUT_OF_RANGE: DiagnosticCode = DiagnosticCode::new("BAMTS-L012");
+/// A `\u{...}` escape without its closing brace.
+const UNTERMINATED_UNICODE_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L013");
+
+/// Whether `code` reports a malformed escape in the text of a literal. A tagged
+/// template accepts such an escape, so its text keeps none of these.
+pub(crate) fn is_escape_diagnostic(code: DiagnosticCode) -> bool {
+    [
+        INVALID_ESCAPE,
+        INVALID_UNICODE_ESCAPE,
+        UNICODE_ESCAPE_OUT_OF_RANGE,
+        UNTERMINATED_UNICODE_ESCAPE,
+    ]
+    .contains(&code)
+}
+
+/// A malformed `\u` escape. Each fault names the UTF-16 range and the message
+/// that a literal reports for it.
+type EscapeFault = (DiagnosticCode, usize, usize, &'static str);
 
 /// Scans a regular-expression literal starting at `text[0] == '/'`, returning
 /// `(consumed_utf16, terminated)`.  This is the single source of truth for
@@ -1394,35 +1414,30 @@ impl<'a> Scanner<'a> {
         keyword_kind(word).unwrap_or(TokenKind::Identifier)
     }
 
+    /// Scans a `\u` escape in a name. TypeScript reports a bad one as an invalid
+    /// character at its backslash.
     fn scan_identifier_escape(&mut self, is_start: bool) {
-        let esc_start = self.utf16_pos;
+        let backslash = self.utf16_pos;
         self.bump();
-        if self.first() != Some('u') {
+        let valid = self.first() == Some('u') && {
+            self.bump();
+            self.read_hex_code_point().is_ok_and(|code_point| {
+                char::from_u32(code_point).is_some_and(|character| {
+                    if is_start {
+                        is_id_start(character)
+                    } else {
+                        is_id_continue(character)
+                    }
+                })
+            })
+        };
+        if !valid {
             self.error(
-                INVALID_UNICODE_ESCAPE,
-                esc_start,
-                self.utf16_pos,
-                "an identifier escape must be a unicode escape",
+                UNEXPECTED_CHARACTER,
+                backslash,
+                backslash + 1,
+                "this escape does not name a character of an identifier",
             );
-            return;
-        }
-        self.bump();
-        if let Some(code_point) = self.read_hex_code_point(esc_start) {
-            let valid = char::try_from(code_point).ok().is_some_and(|character| {
-                if is_start {
-                    is_id_start(character)
-                } else {
-                    is_id_continue(character)
-                }
-            });
-            if !valid {
-                self.error(
-                    INVALID_UNICODE_ESCAPE,
-                    esc_start,
-                    self.utf16_pos,
-                    "the escaped code point is not a valid identifier character",
-                );
-            }
         }
     }
 
@@ -1477,8 +1492,9 @@ impl<'a> Scanner<'a> {
         TokenKind::PrivateIdentifier
     }
 
+    /// Scans an escape in the text of a string or a template. TypeScript reports
+    /// a bad escape at the character where the escape goes wrong.
     fn scan_escape(&mut self) {
-        let esc_start = self.utf16_pos;
         self.bump();
         match self.first() {
             None => {}
@@ -1495,17 +1511,18 @@ impl<'a> Scanner<'a> {
             Some('x') => {
                 self.bump();
                 if !self.consume_fixed_hex(2) {
-                    self.error(
-                        INVALID_ESCAPE,
-                        esc_start,
-                        self.utf16_pos,
-                        "a hexadecimal escape requires two digits",
-                    );
+                    let fault =
+                        self.fault_here(INVALID_ESCAPE, "a hexadecimal escape requires two digits");
+                    self.report(fault);
                 }
             }
             Some('u') => {
                 self.bump();
-                let _ = self.read_hex_code_point(esc_start);
+                if let Err(faults) = self.read_hex_code_point() {
+                    for fault in faults {
+                        self.report(fault);
+                    }
+                }
             }
             Some(_) => {
                 self.bump();
@@ -1513,82 +1530,75 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Reads a `\u`-style code point after the `u` has been consumed, handling
-    /// both the fixed four-digit and braced forms and reporting malformations.
-    fn read_hex_code_point(&mut self, esc_start: usize) -> Option<u32> {
-        if self.first() == Some('{') {
-            self.bump();
+    /// Reads the code point of a `\u` escape after its `u`, in the four-digit
+    /// or the braced form.
+    fn read_hex_code_point(&mut self) -> Result<u32, Vec<EscapeFault>> {
+        if self.first() != Some('{') {
             let mut value: u32 = 0;
-            let mut any = false;
-            let mut overflow = false;
-            while let Some(digit) = self.first().and_then(|c| c.to_digit(16)) {
-                if self.is_cancelled() {
-                    break;
-                }
-                self.bump();
-                any = true;
-                value = value.saturating_mul(16).saturating_add(digit);
-                if value > 0x0010_FFFF {
-                    overflow = true;
-                }
-            }
-            if self.first() == Some('}') {
-                self.bump();
-            } else {
-                self.error(
-                    INVALID_UNICODE_ESCAPE,
-                    esc_start,
-                    self.utf16_pos,
-                    "a unicode escape is missing its closing brace",
-                );
-                return None;
-            }
-            if !any {
-                self.error(
-                    INVALID_UNICODE_ESCAPE,
-                    esc_start,
-                    self.utf16_pos,
-                    "a unicode escape has no digits",
-                );
-                return None;
-            }
-            if overflow {
-                self.error(
-                    INVALID_UNICODE_ESCAPE,
-                    esc_start,
-                    self.utf16_pos,
-                    "a unicode escape is greater than the maximum code point",
-                );
-                return None;
-            }
-            Some(value)
-        } else {
-            let mut value: u32 = 0;
-            let mut count = 0;
-            while count < 4 {
-                if self.is_cancelled() {
-                    break;
-                }
+            for _ in 0..4 {
                 match self.first().and_then(|c| c.to_digit(16)) {
-                    Some(digit) => {
+                    Some(digit) if !self.is_cancelled() => {
                         self.bump();
                         value = value * 16 + digit;
-                        count += 1;
                     }
-                    None => break,
+                    _ => {
+                        return Err(vec![self.fault_here(
+                            INVALID_UNICODE_ESCAPE,
+                            "a unicode escape requires four hexadecimal digits",
+                        )]);
+                    }
                 }
             }
-            if count < 4 {
-                self.error(
-                    INVALID_UNICODE_ESCAPE,
-                    esc_start,
-                    self.utf16_pos,
-                    "a unicode escape requires four hexadecimal digits",
-                );
-                return None;
-            }
-            Some(value)
+            return Ok(value);
         }
+        self.bump();
+        let digits = self.utf16_pos;
+        let mut value: u32 = 0;
+        while let Some(digit) = self.first().and_then(|c| c.to_digit(16)) {
+            if self.is_cancelled() {
+                break;
+            }
+            self.bump();
+            value = value.saturating_mul(16).saturating_add(digit);
+        }
+        if self.utf16_pos == digits {
+            return Err(vec![self.fault_here(
+                INVALID_UNICODE_ESCAPE,
+                "a unicode escape has no digits",
+            )]);
+        }
+        let mut faults = Vec::new();
+        if value > 0x0010_FFFF {
+            faults.push((
+                UNICODE_ESCAPE_OUT_OF_RANGE,
+                digits,
+                self.utf16_pos,
+                "a unicode escape is greater than the maximum code point",
+            ));
+        }
+        if self.first() == Some('}') {
+            self.bump();
+        } else {
+            faults.push(self.fault_here(
+                UNTERMINATED_UNICODE_ESCAPE,
+                "a unicode escape is missing its closing brace",
+            ));
+        }
+        if faults.is_empty() {
+            Ok(value)
+        } else {
+            Err(faults)
+        }
+    }
+
+    /// A fault at the next character, or at the end of the text.
+    fn fault_here(&self, code: DiagnosticCode, message: &'static str) -> EscapeFault {
+        let width = self.first().map_or(0, char::len_utf16);
+        (code, self.utf16_pos, self.utf16_pos + width, message)
+    }
+
+    fn report(&mut self, (code, start, end, message): EscapeFault) {
+        self.error(code, start, end, message);
     }
 
     /// Consumes exactly `count` hexadecimal digits, or as many as are present,
@@ -2183,6 +2193,40 @@ mod tests {
         );
         // Recovery still tiles the source and resumes after the break.
         assert_tiles("\"open\nnext");
+    }
+
+    /// Each escape fault is where `tsc` 7.0.2 reports it, in UTF-16 units:
+    /// TS1125 at the bad character, TS1198 over the digits, TS1199 where the
+    /// brace is missing, and TS1127 at the backslash of a name.
+    #[test]
+    fn escape_faults_are_where_typescript_reports_them() {
+        let faults = |text: &str| -> Vec<(DiagnosticCode, usize, usize)> {
+            scan_text(text)
+                .diagnostics()
+                .iter()
+                .map(|d| (d.code(), d.range().start().get(), d.range().end().get()))
+                .collect()
+        };
+        assert_eq!(faults(r#""\xg""#), [(INVALID_ESCAPE, 3, 4)]);
+        assert_eq!(faults(r#""ab\x1""#), [(INVALID_ESCAPE, 6, 7)]);
+        assert_eq!(faults("\"\\x😀\""), [(INVALID_ESCAPE, 3, 5)]);
+        assert_eq!(faults(r#""\u12""#), [(INVALID_UNICODE_ESCAPE, 5, 6)]);
+        assert_eq!(faults(r#""\u{}""#), [(INVALID_UNICODE_ESCAPE, 4, 5)]);
+        assert_eq!(faults(r#""\u{zz}""#), [(INVALID_UNICODE_ESCAPE, 4, 5)]);
+        assert_eq!(
+            faults(r#""\u{1234567}""#),
+            [(UNICODE_ESCAPE_OUT_OF_RANGE, 4, 11)]
+        );
+        assert_eq!(
+            faults(r#""\u{110000""#),
+            [
+                (UNICODE_ESCAPE_OUT_OF_RANGE, 4, 10),
+                (UNTERMINATED_UNICODE_ESCAPE, 10, 11)
+            ]
+        );
+        assert_eq!(faults(r#""\u{10FFFF}""#), []);
+        assert_eq!(faults(r"var \u{30}x"), [(UNEXPECTED_CHARACTER, 4, 5)]);
+        assert_eq!(faults(r"a\u{110000}"), [(UNEXPECTED_CHARACTER, 1, 2)]);
     }
 
     #[test]
