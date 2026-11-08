@@ -207,7 +207,7 @@ fn fill_arguments(template: &'static str, native: &str) -> Option<Cow<'static, s
 
 fn is_export_modifier_on_class_element(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("export modifier") && lower.contains("class element")
+    lower.contains("`export` modifier") && lower.contains("class element")
 }
 
 fn map_expected_token(message: &str) -> DiagnosticCode {
@@ -368,7 +368,7 @@ mod tests {
                 "BAMTS-C051",
                 10,
                 16,
-                "export modifier cannot appear on a class element",
+                "`export` modifier cannot appear on class elements",
                 "TS1031",
             ),
             (
@@ -465,7 +465,7 @@ mod tests {
             "BAMTS-C051",
             9,
             15,
-            "export modifier cannot appear on a class element",
+            "`export` modifier cannot appear on class elements",
         );
         let mapped = map_parse_diagnostics(&[checker.clone(), parser]);
         let preserved = mapped

@@ -2121,7 +2121,7 @@ impl Parser {
                     self.error_at(
                         EXPORT_MODIFIER_ON_CLASS_ELEMENT,
                         range,
-                        "'export' modifier cannot appear on class elements.",
+                        "`export` modifier cannot appear on class elements",
                     );
                 }
                 TokenKind::KwAsync if !self.has_newline_before_nth(1) => is_async = true,
@@ -6890,6 +6890,33 @@ mod tests {
                 "'await' expressions are only allowed within async functions and at the top levels of modules."
             )
         );
+    }
+
+    /// The text that `tsc` 7.0.2 prints for each source, from the message that
+    /// the parser writes.
+    #[test]
+    fn parser_messages_project_onto_the_text_of_tsc() {
+        for (source, code, message) in [
+            (
+                "class C { export x = 1; }",
+                "TS1031",
+                "'export' modifier cannot appear on class elements of this kind.",
+            ),
+            (
+                "const z = -2 ** 2;",
+                "TS17006",
+                "An unary expression with the '-' operator is not allowed in the left-hand side of an exponentiation expression. Consider enclosing the expression in parentheses.",
+            ),
+            ("const o = { a: 1;", "TS1005", "',' expected."),
+        ] {
+            let parsed = parse_ts(source);
+            let mapped = crate::diagnostics_parser::map_parse_diagnostic(errors(&parsed)[0]);
+            assert_eq!(
+                (mapped.code().as_str(), mapped.message()),
+                (code, message),
+                "{source}"
+            );
+        }
     }
 
     #[test]
