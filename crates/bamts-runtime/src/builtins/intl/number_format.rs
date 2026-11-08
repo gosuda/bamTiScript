@@ -17,7 +17,7 @@ use crate::intl::locale_data::DATA;
 use crate::intl::number_data::NoHostLocale;
 use crate::intl::number_format::{
     IntlMathematicalValue, NumberFormat, NumberFormatError, NumberFormatErrorKind,
-    NumberFormatOptions, NumberPart, UseGrouping, UseGroupingOption,
+    NumberFormatOptions, NumberPart, RangeEnd, UseGrouping, UseGroupingOption,
 };
 use crate::intl::{IntlKind, IntlObject};
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
@@ -267,11 +267,12 @@ fn format_getter<H: Host>(
 /// ToIntlMathematicalValue reads it: a magnitude past the range of a Number
 /// saturates. A magnitude below that range stays exact, as it does in V8, where the
 /// specification reads it as zero. An exponent that nothing can hold reads as the
-/// nearest Number.
-fn string_mathematical_value(text: &str) -> IntlMathematicalValue {
+/// nearest Number. V8 hands decimal digits to ICU as digits, and reads any other
+/// string as a Number.
+fn string_range_end(text: &str) -> RangeEnd {
     let trimmed = text.trim_matches(super::is_string_whitespace);
     if trimmed.is_empty() {
-        return IntlMathematicalValue::from_f64(0.0);
+        return RangeEnd::number(0.0);
     }
     let (negative, body) = match trimmed.as_bytes()[0] {
         b'-' => (true, &trimmed[1..]),
@@ -279,7 +280,7 @@ fn string_mathematical_value(text: &str) -> IntlMathematicalValue {
         _ => (false, trimmed),
     };
     if body == "Infinity" {
-        return IntlMathematicalValue::from_f64(if negative {
+        return RangeEnd::number(if negative {
             f64::NEG_INFINITY
         } else {
             f64::INFINITY
@@ -294,21 +295,39 @@ fn string_mathematical_value(text: &str) -> IntlMathematicalValue {
     if radix != 10 {
         let unsigned = trimmed.len() == body.len();
         return match (unsigned, radix_digits(&body[2..], radix)) {
-            (true, Some(decimal)) => IntlMathematicalValue::from_bigint(&decimal)
-                .unwrap_or_else(|_| IntlMathematicalValue::from_f64(f64::NAN)),
-            _ => IntlMathematicalValue::from_f64(f64::NAN),
+            (true, Some(decimal)) => non_decimal_end(&decimal),
+            _ => RangeEnd::number(f64::NAN),
         };
     }
     if !is_decimal_literal(body) {
-        return IntlMathematicalValue::from_f64(f64::NAN);
+        return RangeEnd::number(f64::NAN);
     }
     let approximate: f64 = body.parse().unwrap_or(f64::NAN);
     let number = if negative { -approximate } else { approximate };
     if approximate.is_infinite() {
-        return IntlMathematicalValue::from_f64(number);
+        return RangeEnd::digits(IntlMathematicalValue::from_f64(number));
     }
-    IntlMathematicalValue::from_decimal_string(trimmed)
-        .unwrap_or_else(|_| IntlMathematicalValue::from_f64(number))
+    RangeEnd::digits(
+        IntlMathematicalValue::from_decimal_string(trimmed)
+            .unwrap_or_else(|_| IntlMathematicalValue::from_f64(number)),
+    )
+}
+
+/// V8 reads a `0x`, `0o` or `0b` integer below this as a Number. It keeps a larger
+/// one exact, and hands it to ICU as digits.
+const NON_DECIMAL_NUMBER_LIMIT: u64 = (1 << 53) - 1;
+
+/// A `0x`, `0o` or `0b` integer, given in decimal digits.
+fn non_decimal_end(decimal: &str) -> RangeEnd {
+    match IntlMathematicalValue::from_bigint(decimal) {
+        Ok(value) => RangeEnd {
+            value,
+            as_double: decimal
+                .parse::<u64>()
+                .is_ok_and(|integer| integer < NON_DECIMAL_NUMBER_LIMIT),
+        },
+        Err(_) => RangeEnd::number(f64::NAN),
+    }
 }
 
 /// Converts digits of `radix` to a decimal string, by long multiplication.
@@ -357,13 +376,22 @@ pub(super) fn to_mathematical_value<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<IntlMathematicalValue, EvalFailure> {
+    to_range_end(machine, value).map(|end| end.value)
+}
+
+/// ToIntlMathematicalValue, with the form in which V8 hands the value to ICU.
+fn to_range_end<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<RangeEnd, EvalFailure> {
     let primitive = machine.coerce_primitive_observable(value, false)?;
     if let Some(bigint) = bigint_from_value(machine, primitive)? {
         return IntlMathematicalValue::from_bigint(&bigint.to_string_radix(10))
+            .map(RangeEnd::digits)
             .map_err(|error| number_failure(machine, error));
     }
     if let Some(text) = machine.string_value(primitive) {
-        return Ok(string_mathematical_value(&text.to_utf8_lossy()));
+        return Ok(string_range_end(&text.to_utf8_lossy()));
     }
     let number = machine.coerce_number_observable(primitive)?;
     let number = match number.decode() {
@@ -371,7 +399,7 @@ pub(super) fn to_mathematical_value<H: Host>(
         Some(Decoded::Number(number)) => number,
         _ => f64::NAN,
     };
-    Ok(IntlMathematicalValue::from_f64(number))
+    Ok(RangeEnd::number(number))
 }
 
 /// The function `format` hands out, bound to its NumberFormat.
@@ -430,7 +458,7 @@ fn range_arguments<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
-) -> Result<(IntlMathematicalValue, IntlMathematicalValue), EvalFailure> {
+) -> Result<(RangeEnd, RangeEnd), EvalFailure> {
     if this_format(machine, this)?.is_none() {
         return Err(not_a_number_format(machine));
     }
@@ -438,8 +466,8 @@ fn range_arguments<H: Host>(
     if start == Value::UNDEFINED || end == Value::UNDEFINED {
         return Err(type_error(machine, "a range needs two ends"));
     }
-    let start = to_mathematical_value(machine, start)?;
-    let end = to_mathematical_value(machine, end)?;
+    let start = to_range_end(machine, start)?;
+    let end = to_range_end(machine, end)?;
     Ok((start, end))
 }
 
@@ -582,11 +610,12 @@ mod tests {
 
     fn range(format: &NumberFormat<'_>, start: f64, end: f64) -> String {
         format
-            .format_range(
-                &IntlMathematicalValue::from_f64(start),
-                &IntlMathematicalValue::from_f64(end),
-            )
+            .format_range(&RangeEnd::number(start), &RangeEnd::number(end))
             .expect("a range")
+    }
+
+    fn string_mathematical_value(text: &str) -> IntlMathematicalValue {
+        string_range_end(text).value
     }
 
     #[test]
@@ -687,7 +716,10 @@ mod tests {
     fn range_ends_are_one_value_as_icu_holds_them() {
         let text_range = |format: &NumberFormat<'_>, start: &str, end: &str| {
             format
-                .format_range(&exact(start), &exact(end))
+                .format_range(
+                    &RangeEnd::digits(exact(start)),
+                    &RangeEnd::digits(exact(end)),
+                )
                 .expect("a range")
         };
         let scientific = english(NumberFormatOptions {
@@ -732,6 +764,92 @@ mod tests {
         assert_eq!(
             text_range(&long, "1.00000000000000001", "1.00000000000000002"),
             "~1.00000000000000001"
+        );
+    }
+
+    #[test]
+    fn a_range_end_keeps_the_form_that_v8_hands_to_icu() {
+        let long = english(NumberFormatOptions {
+            maximum_fraction_digits: Some(20.0),
+            ..NumberFormatOptions::default()
+        });
+        let precise = english(NumberFormatOptions {
+            maximum_significant_digits: Some(21.0),
+            ..NumberFormatOptions::default()
+        });
+        let both = |format: &NumberFormat<'_>, start: &RangeEnd, end: &RangeEnd| {
+            format.format_range(start, end).expect("a range")
+        };
+        let string = string_range_end;
+        let number = RangeEnd::number;
+        let bigint = |text: &str| {
+            RangeEnd::digits(IntlMathematicalValue::from_bigint(text).expect("a BigInt"))
+        };
+
+        // A Number is a double, so it is one value with digits that round to it.
+        let tiny = string("1.00000000000000001");
+        assert_eq!(both(&long, &number(1.0), &tiny), "~1");
+        assert_eq!(both(&long, &tiny, &number(1.0)), "~1.00000000000000001");
+        assert_eq!(both(&long, &string("1"), &tiny), "1–1.00000000000000001");
+        assert_eq!(both(&long, &bigint("1"), &tiny), "1–1.00000000000000001");
+        assert_eq!(both(&precise, &number(0.0), &string("1e-400")), "~0");
+        assert_eq!(
+            both(
+                &precise,
+                &number(-9_223_372_036_854_775_808.0),
+                &bigint("-9223372036854775809")
+            ),
+            "~-9,223,372,036,854,776,000"
+        );
+        // A Number never matches an integer that ICU holds exactly.
+        assert_eq!(
+            both(
+                &long,
+                &number(9_007_199_254_740_992.0),
+                &string("9007199254740993")
+            ),
+            "9,007,199,254,740,992–9,007,199,254,740,993"
+        );
+
+        // An empty string reads as the Number 0.
+        assert_eq!(both(&precise, &string(""), &string("1e-400")), "~0");
+        assert_eq!(both(&precise, &string(" \t"), &string("1e-400")), "~0");
+
+        // A 0x, 0o or 0b integer is a Number below 2^53 - 1, and exact from there.
+        assert_eq!(both(&long, &string("0x1"), &tiny), "~1");
+        assert_eq!(both(&long, &string("0b1"), &tiny), "~1");
+        assert_eq!(both(&long, &string("0x00000001"), &tiny), "~1");
+        assert_eq!(
+            both(
+                &long,
+                &string("0x1ffffffffffffe"),
+                &string("9007199254740990.0000000001")
+            ),
+            "~9,007,199,254,740,990"
+        );
+        assert_eq!(
+            both(
+                &long,
+                &string("0x1fffffffffffff"),
+                &string("9007199254740991.0000000001")
+            ),
+            "9,007,199,254,740,991–9,007,199,254,740,991.0000000001"
+        );
+        assert_eq!(
+            both(
+                &long,
+                &string("0x20000000000001"),
+                &number(9_007_199_254_740_992.0)
+            ),
+            "9,007,199,254,740,993–9,007,199,254,740,992"
+        );
+        assert_eq!(
+            both(
+                &long,
+                &string("0x8000000000000000"),
+                &string("9223372036854775808.0000000001")
+            ),
+            "~9,223,372,036,854,775,808"
         );
     }
 

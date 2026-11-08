@@ -780,17 +780,6 @@ impl IntlMathematicalValue {
         }
     }
 
-    /// Whether ICU, which compares the ends of a range before it rounds them, holds
-    /// both as one value. It holds an integer that fits 64 bits exactly, and any other
-    /// value as the nearest Number, so `"1e-400"` and `"2e-400"` are one value there.
-    fn same_in_icu(&self, other: &Self) -> bool {
-        match (self.as_i64(), other.as_i64()) {
-            (Some(left), Some(right)) => left == right,
-            (None, None) => self.nearest_number() == other.nearest_number(),
-            _ => false,
-        }
-    }
-
     fn as_i64(&self) -> Option<i64> {
         match self {
             Self::NegativeZero => Some(0),
@@ -825,6 +814,57 @@ impl IntlMathematicalValue {
             Self::PositiveInfinity => f64::INFINITY,
             Self::NegativeInfinity => f64::NEG_INFINITY,
             Self::Nan => f64::NAN,
+        }
+    }
+}
+
+/// One end of a range, as V8 hands it to ICU. ICU compares the two ends before it
+/// rounds them, and the result of that comparison depends on the form of each end.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RangeEnd {
+    /// The value that `ToIntlMathematicalValue` read.
+    pub value: IntlMathematicalValue,
+    /// Whether V8 hands the value to ICU as a double, as it does a Number.
+    pub as_double: bool,
+}
+
+impl RangeEnd {
+    /// A Number, which V8 hands to ICU as a double.
+    #[must_use]
+    pub fn number(value: f64) -> Self {
+        Self {
+            value: IntlMathematicalValue::from_f64(value),
+            as_double: true,
+        }
+    }
+
+    /// A BigInt or a numeric string, which V8 hands to ICU as decimal digits.
+    #[must_use]
+    pub fn digits(value: IntlMathematicalValue) -> Self {
+        Self {
+            value,
+            as_double: false,
+        }
+    }
+
+    /// Whether ICU holds both ends as one value. ICU holds the digits of an integer
+    /// that fits 64 bits as that integer, and any other end as the nearest double.
+    /// Ends in different forms are never one value. Thus `"1e-400"` and `"2e-400"`
+    /// are one value, and so are the Number `1` and `"1.00000000000000001"`, but
+    /// `"1"` and `"1.00000000000000001"` are not.
+    fn same_in_icu(&self, other: &Self) -> bool {
+        match (self.integer_in_icu(), other.integer_in_icu()) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => self.value.nearest_number() == other.value.nearest_number(),
+            _ => false,
+        }
+    }
+
+    fn integer_in_icu(&self) -> Option<i64> {
+        if self.as_double {
+            None
+        } else {
+            self.value.as_i64()
         }
     }
 }
@@ -1530,8 +1570,8 @@ impl<'a> NumberFormat<'a> {
     /// Formats a range. Number ranges are not ordered; only NaN endpoints are rejected.
     pub fn format_range(
         &self,
-        start: &IntlMathematicalValue,
-        end: &IntlMathematicalValue,
+        start: &RangeEnd,
+        end: &RangeEnd,
     ) -> Result<String, NumberFormatError> {
         Ok(self
             .format_range_to_parts(start, end)?
@@ -1549,20 +1589,20 @@ impl<'a> NumberFormat<'a> {
     /// spaces out the separator, so `-1 – 1` has spaces and `1–-1` does not.
     pub fn format_range_to_parts(
         &self,
-        start: &IntlMathematicalValue,
-        end: &IntlMathematicalValue,
+        start: &RangeEnd,
+        end: &RangeEnd,
     ) -> Result<Vec<NumberRangePart>, NumberFormatError> {
-        if start.is_nan() || end.is_nan() {
+        if start.value.is_nan() || end.value.is_nan() {
             return Err(NumberFormatError::range(
                 "number range endpoints must not be NaN",
             ));
         }
-        let start_prepared = self.prepare_format(start)?;
-        let end_prepared = self.prepare_format(end)?;
+        let start_prepared = self.prepare_format(&start.value)?;
+        let end_prepared = self.prepare_format(&end.value)?;
         let start_parts = self.partition_for_category(&start_prepared, PluralCategory::Other)?;
         let end_parts = self.partition_for_category(&end_prepared, PluralCategory::Other)?;
         let same_text = concatenate_parts(&start_parts) == concatenate_parts(&end_parts)
-            && start.is_negative() == end.is_negative();
+            && start.value.is_negative() == end.value.is_negative();
         if same_text
             || (start.same_in_icu(end) && beside_digits(&start_parts).eq(beside_digits(&end_parts)))
         {
@@ -3519,8 +3559,8 @@ mod tests {
             ..NumberFormatOptions::default()
         })
         .expect("formatter");
-        let start = IntlMathematicalValue::from_f64(1.2);
-        let end = IntlMathematicalValue::from_f64(2.3);
+        let start = RangeEnd::number(1.2);
+        let end = RangeEnd::number(2.3);
         let parts = formatter
             .format_range_to_parts(&start, &end)
             .expect("range parts");
@@ -3551,10 +3591,7 @@ mod tests {
         );
 
         let equal = formatter
-            .format_range_to_parts(
-                &IntlMathematicalValue::from_f64(1.21),
-                &IntlMathematicalValue::from_f64(1.24),
-            )
+            .format_range_to_parts(&RangeEnd::number(1.21), &RangeEnd::number(1.24))
             .expect("approximately equal");
         assert!(equal.iter().all(|part| part.source == RangeSource::Shared));
         assert_eq!(
@@ -3570,10 +3607,7 @@ mod tests {
         );
 
         let nan_error = formatter
-            .format_range(
-                &IntlMathematicalValue::Nan,
-                &IntlMathematicalValue::from_f64(1.0),
-            )
+            .format_range(&RangeEnd::number(f64::NAN), &RangeEnd::number(1.0))
             .expect_err("NaN endpoint");
         assert_eq!(nan_error.kind, NumberFormatErrorKind::RangeError);
     }
