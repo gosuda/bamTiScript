@@ -1882,6 +1882,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
 
     /// Re-enters a runtime function with the active recursion and register
     /// ceilings, dispatching to the reference driver or the linked entry table.
+    /// A call past the guest stack throws in place of the activation.
     fn invoke_runtime(
         &self,
         target: crate::RuntimeFunction,
@@ -1891,6 +1892,9 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         new_target: Value,
         args: &[Value],
     ) -> InvokeOutcome {
+        if self.machine.borrow().stack_overflows() {
+            return InvokeOutcome::Threw(Value::UNDEFINED, crate::STACK_OVERFLOW);
+        }
         let index = target.function.get() as usize;
         let handle = self.code_ref(target.module);
         let flags = handle.code(target.module).functions()[index].flags();
@@ -2010,6 +2014,9 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     }
 
     fn resume_generator(&self, generator: Value, completion: GeneratorCompletion) -> InvokeOutcome {
+        if self.machine.borrow().stack_overflows() {
+            return InvokeOutcome::Threw(Value::UNDEFINED, crate::STACK_OVERFLOW);
+        }
         let operation = crate::vm::generator_async::prepare_generator_operation(
             &mut self.machine.borrow_mut(),
             generator,

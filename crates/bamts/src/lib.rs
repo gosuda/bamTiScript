@@ -677,6 +677,107 @@ mod tests {
         })
     }
 
+    /// The calls that end the guest stack: a recursion, a recursion through a
+    /// builtin callback, a construction, a construction through a builtin, a
+    /// generator delegation, a proxy chain, and chains of generators and of async
+    /// generators that resume the next one. Each throws `RangeError`, and the
+    /// program goes on.
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    const STACK_OVERFLOWS: &str = "// @ts-nocheck\n\
+         function down(n) { return down(n + 1) + 1; }\n\
+         try { down(0); } catch (error) { console.log(error instanceof RangeError, error.message); }\n\
+         const callback = () => [0].map(callback);\n\
+         try { callback(); } catch (error) { console.log(error.name); }\n\
+         class Deep { constructor(n) { new Deep(n + 1); } }\n\
+         try { new Deep(0); } catch (error) { console.log(error.name); }\n\
+         class Reflected { constructor(n) { Reflect.construct(Reflected, [n + 1]); } }\n\
+         try { new Reflected(0); } catch (error) { console.log(error.name); }\n\
+         function* nest() { yield* nest(); }\n\
+         try { [...nest()]; } catch (error) { console.log(error.name); }\n\
+         let proxy = {};\n\
+         for (let i = 0; i < 2000; i++) proxy = new Proxy(proxy, {});\n\
+         try { proxy.x; } catch (error) { console.log(error.name); }\n\
+         const chain = [];\n\
+         function* link(i) { chain[i + 1].next(); }\n\
+         for (let i = 0; i < 2000; i++) chain.push(link(i));\n\
+         try { chain[0].next(); } catch (error) { console.log(error.name); }\n\
+         const tasks = [];\n\
+         async function* task(i) { await tasks[i + 1].next(); }\n\
+         for (let i = 0; i < 2000; i++) tasks.push(task(i));\n\
+         tasks[0].next().then(() => console.log('done'), (error) => console.log(error.name));\n\
+         function count(n) { return n === 0 ? 0 : 1 + count(n - 1); }\n\
+         console.log(count(500));\n";
+
+    /// What [`STACK_OVERFLOWS`] prints with [`small_guest_stack`]. Each chain of
+    /// 2,000 passes the guest stack of 1,000.
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    const STACK_OVERFLOW_OUTPUT: &str = "true Maximum call stack size exceeded\nRangeError\nRangeError\n\
+         RangeError\nRangeError\nRangeError\nRangeError\n500\nRangeError\n";
+
+    /// A guest stack of 1,000 activations, which 32 MiB of native stack holds in a
+    /// debug build.
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    fn small_guest_stack() -> bamts_runtime::Limits {
+        bamts_runtime::Limits {
+            fuel: u64::MAX,
+            max_call_depth: 1 << 20,
+            max_stack_depth: 1_000,
+            max_stack_bytes: 32 << 20,
+            ..bamts_runtime::Limits::default()
+        }
+    }
+
+    /// Runs `body` on a thread whose stack holds [`small_guest_stack`] and its slack.
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    fn on_a_large_stack<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(body)
+            .expect("the test thread starts")
+            .join()
+            .expect("the test thread ends")
+    }
+
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    #[test]
+    fn the_interpreter_throws_range_error_at_the_end_of_the_guest_stack() {
+        let stdout = on_a_large_stack(|| {
+            let (directory, entrypoint) =
+                script_fixture("interpreter-stack", STACK_OVERFLOWS).expect("the fixture");
+            let executable = compile_source_file(&entrypoint).expect("the fixture compiles");
+            let mut host = bamts_node::NodeHost::new();
+            bamts_runtime::run(executable.wire(), &mut host, &small_guest_stack())
+                .expect("the program runs");
+            remove_fixture(&directory).expect("the fixture is removed");
+            host.stdout().to_vec()
+        });
+        assert_eq!(String::from_utf8_lossy(&stdout), STACK_OVERFLOW_OUTPUT);
+    }
+
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    #[test]
+    fn native_code_throws_range_error_at_the_end_of_the_guest_stack() {
+        let stdout = on_a_large_stack(|| {
+            let (directory, entrypoint) =
+                script_fixture("native-stack", STACK_OVERFLOWS).expect("the fixture");
+            let executable = compile_source_file(&entrypoint).expect("the fixture compiles");
+            let compiled = bamts_codegen::compile_jit(executable.wire()).expect("the JIT compiles");
+            let mut host = bamts_node::NodeHost::new();
+            let outcome = bamts_runtime::run_linked_program(
+                executable.wire(),
+                &compiled,
+                &mut host,
+                &small_guest_stack(),
+            )
+            .expect("the program runs");
+            remove_fixture(&directory).expect("the fixture is removed");
+            let mut stdout = host.stdout().to_vec();
+            stdout.extend_from_slice(&outcome.stdout);
+            stdout
+        });
+        assert_eq!(String::from_utf8_lossy(&stdout), STACK_OVERFLOW_OUTPUT);
+    }
+
     #[test]
     fn compiles_complete_program_with_module_local_function_ids() -> Result<(), Box<dyn Error>> {
         let (directory, entrypoint) = fixture("compile")?;

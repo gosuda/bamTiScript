@@ -85,7 +85,15 @@ pub struct Execution {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Limits {
     pub fuel: u64,
+    /// The ceiling of the host on activations. Past it the run ends.
     pub max_call_depth: usize,
+    /// The activations of the guest stack. A call past it throws `RangeError`, which
+    /// the program can catch, as V8 does when its stack is full.
+    pub max_stack_depth: usize,
+    /// The native stack that the guest stack can use, from the position where the
+    /// machine was built. A call past it throws the same `RangeError`. Build and run
+    /// the machine on one thread when this is less than `usize::MAX`.
+    pub max_stack_bytes: usize,
     pub max_total_registers: usize,
     /// Ceiling on the length of a single call's arguments array.
     pub max_argument_count: u32,
@@ -108,6 +116,8 @@ impl Default for Limits {
         Self {
             fuel: 1_000_000,
             max_call_depth: 64,
+            max_stack_depth: usize::MAX,
+            max_stack_bytes: usize::MAX,
             max_total_registers: 1 << 20,
             max_argument_count: 1 << 16,
             max_heap_slots: 1 << 20,
@@ -135,6 +145,23 @@ impl Limits {
             ..Self::default()
         }
     }
+}
+
+/// What a call throws when it passes the guest stack, in the words of V8.
+pub(crate) const STACK_OVERFLOW: ThrowOrigin = ThrowOrigin::RangeError {
+    operation: "Maximum call stack size exceeded",
+};
+
+/// How far past [`Limits::max_stack_bytes`] the native stack goes before the run
+/// ends. It covers the frames between the check of a call and the next check of
+/// the host ceiling.
+const STACK_SLACK: usize = 1 << 20;
+
+/// The address of a local in the frame of the caller. The stack grows down on
+/// every supported target, so a deeper call has a smaller position.
+fn stack_position() -> usize {
+    let marker = 0_u8;
+    std::ptr::from_ref(&marker).addr()
 }
 
 /// The exact source of one classic script. Source and resource name preserve
@@ -1889,6 +1916,9 @@ pub struct Machine<'a, H: Host> {
     heap_bytes: usize,
     live_registers: usize,
     native_depth: usize,
+    /// The native stack position where the machine was built, from which
+    /// [`Limits::max_stack_bytes`] is measured.
+    stack_base: usize,
     fuel: u64,
     global_object: Value,
     vm_context_marker: Value,
@@ -2269,6 +2299,7 @@ impl<'a, H: Host> Machine<'a, H> {
             heap_bytes: 0,
             live_registers,
             native_depth: 0,
+            stack_base: stack_position(),
             last_completion: None,
             callback_boundaries: Vec::new(),
             generator_boundaries: Vec::new(),
@@ -5653,7 +5684,9 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn run_loop(&mut self, stop_depth: usize) -> Result<Option<Execution>, RuntimeError> {
-        if self.frames.len().saturating_add(self.native_depth) > self.limits.max_call_depth {
+        if self.frames.len().saturating_add(self.native_depth) > self.limits.max_call_depth
+            || self.native_stack_exhausted()
+        {
             return Err(self.error_here(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
             }));
@@ -7226,7 +7259,7 @@ impl<'a, H: Host> Machine<'a, H> {
             (_, None) => self.error_at_in_module(kind, target.module, function_index, 0),
             (None, Some(_)) => unreachable!("a returning frame has a caller"),
         };
-        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+        if self.call_depth_exhausted() {
             return Err(limit_error(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
             }));
@@ -7268,11 +7301,35 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// Whether a call here passes the guest stack, so that it throws
+    /// [`STACK_OVERFLOW`] in place of a new activation.
+    pub(crate) fn stack_overflows(&self) -> bool {
+        self.frames.len().saturating_add(self.native_depth) >= self.limits.max_stack_depth
+            || self.native_stack_used() > self.limits.max_stack_bytes
+    }
+
+    /// Whether a new activation here ends the run: the host ceiling of
+    /// [`Limits::max_call_depth`], or a native stack that is [`STACK_SLACK`] past
+    /// the guest stack. Only a path that did not check [`Self::stack_overflows`]
+    /// gets that far, and it ends with an error, not with a stack overflow.
+    fn call_depth_exhausted(&self) -> bool {
+        self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth
+            || self.native_stack_exhausted()
+    }
+
+    fn native_stack_exhausted(&self) -> bool {
+        self.native_stack_used() > self.limits.max_stack_bytes.saturating_add(STACK_SLACK)
+    }
+
+    fn native_stack_used(&self) -> usize {
+        self.stack_base.saturating_sub(stack_position())
+    }
+
     pub(crate) fn reserve_native_activation(
         &mut self,
         register_count: usize,
     ) -> Result<(), RuntimeErrorKind> {
-        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+        if self.call_depth_exhausted() {
             return Err(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
             });
@@ -7310,7 +7367,7 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn enter_native_generator(&mut self) -> Result<(), RuntimeErrorKind> {
-        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+        if self.call_depth_exhausted() {
             return Err(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
             });
@@ -7328,7 +7385,10 @@ impl<'a, H: Host> Machine<'a, H> {
     /// chain of transparent proxies would exhaust the process stack while the
     /// `frames.len() + native_depth` ceiling still had room.
     pub(crate) fn enter_proxy_dispatch(&mut self) -> Result<(), EvalFailure> {
-        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+        if self.stack_overflows() {
+            return Err(EvalFailure::Throw(STACK_OVERFLOW));
+        }
+        if self.call_depth_exhausted() {
             return Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
             }));
@@ -7526,6 +7586,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     captures,
                     context,
                 }) => {
+                    if self.stack_overflows() {
+                        return self.resolve_failure(EvalFailure::Throw(STACK_OVERFLOW), call_pc);
+                    }
                     let flags = self.module_code(target.module).functions()
                         [target.function.get() as usize]
                         .flags();
@@ -8188,6 +8251,9 @@ impl<'a, H: Host> Machine<'a, H> {
                         operation: "construct",
                     }));
                 }
+                if self.stack_overflows() {
+                    return Err(EvalFailure::Throw(STACK_OVERFLOW));
+                }
                 let object = self.allocate_constructed_receiver(new_target)?;
                 let stop_depth = self.frames.len();
                 // Native code calling back has no interpreter frame here, and
@@ -8323,6 +8389,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     captures,
                     context,
                 } => {
+                    if self.stack_overflows() {
+                        return Err(EvalFailure::Throw(STACK_OVERFLOW));
+                    }
                     let flags = self.module_code(target.module).functions()
                         [target.function.get() as usize]
                         .flags();
@@ -10880,6 +10949,9 @@ impl<'a, H: Host> Machine<'a, H> {
         generator: Value,
         completion: GeneratorCompletion,
     ) -> Result<Value, EvalFailure> {
+        if self.stack_overflows() {
+            return Err(EvalFailure::Throw(STACK_OVERFLOW));
+        }
         let operation =
             crate::vm::generator_async::prepare_generator_operation(self, generator, completion)?;
         let stop_depth = self.frames.len();
@@ -10937,7 +11009,7 @@ impl<'a, H: Host> Machine<'a, H> {
         completion: GeneratorCompletion,
         return_to: Option<ReturnTo>,
     ) -> Result<(), EvalFailure> {
-        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+        if self.call_depth_exhausted() {
             self.release_suspended_activation_registers(activation.registers.len());
             return Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
@@ -11128,7 +11200,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let module_entry = self.async_activation_module(record)?.is_some();
         let activation = self.take_async_activation(record)?;
         let register_count = activation.registers.len();
-        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+        if self.call_depth_exhausted() {
             self.release_suspended_activation_registers(register_count);
             return Err(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
@@ -11350,6 +11422,9 @@ impl<'a, H: Host> Machine<'a, H> {
         generator: Value,
         completion: GeneratorCompletion,
     ) -> Result<Value, EvalFailure> {
+        if self.stack_overflows() {
+            return Err(EvalFailure::Throw(STACK_OVERFLOW));
+        }
         let capability = self.create_promise()?;
         let operation = completion.operation().async_receiver_error();
         let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
@@ -14442,6 +14517,44 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, limits);
         test(&mut machine);
+    }
+
+    /// Descends `levels` frames of at least 4 KiB each, and reports
+    /// [`Machine::stack_overflows`] and [`Machine::call_depth_exhausted`] there.
+    #[inline(never)]
+    fn checks_below(machine: &Machine<'_, TestHost>, levels: usize) -> (bool, bool) {
+        let pad = std::hint::black_box([0_u8; 4096]);
+        if levels == 0 {
+            return (machine.stack_overflows(), machine.call_depth_exhausted());
+        }
+        let checks = checks_below(machine, levels - 1);
+        std::hint::black_box(&pad);
+        checks
+    }
+
+    /// A call past the native stack throws, and a path that did not check that
+    /// ends the run a little later, before the native stack overflows.
+    #[test]
+    fn the_native_stack_ends_the_run_a_little_past_the_guest_stack() {
+        std::thread::Builder::new()
+            .stack_size(16 << 20)
+            .spawn(|| {
+                let limits = Limits {
+                    max_stack_bytes: 256 << 10,
+                    ..Limits::default()
+                };
+                with_machine(limits, |machine| {
+                    assert_eq!(checks_below(machine, 0), (false, false));
+                    assert_eq!(checks_below(machine, 64), (true, false));
+                    assert_eq!(checks_below(machine, 512), (true, true));
+                });
+                with_machine(Limits::default(), |machine| {
+                    assert_eq!(checks_below(machine, 512), (false, false));
+                });
+            })
+            .expect("the test thread starts")
+            .join()
+            .expect("the test thread ends");
     }
 
     #[test]
