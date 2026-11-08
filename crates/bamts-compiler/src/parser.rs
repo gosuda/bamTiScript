@@ -43,7 +43,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
-use crate::scanner::{ScannedSource, is_escape_diagnostic};
+use crate::scanner::{ScannedSource, at_reported_position, is_escape_diagnostic};
 use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
 use crate::syntax::{
     Accessibility, ArrayBindingElement, ArrayBindingPattern, ArrayElement, ArrayLiteral,
@@ -241,6 +241,8 @@ pub fn parse_with_cancel(
             && !jsx_spans.iter().any(in_span)
             && !(escape && tagged_spans.iter().any(in_span))
     });
+    let mut diagnostics: Vec<Diagnostic> =
+        diagnostics.into_iter().map(at_reported_position).collect();
     diagnostics.extend(parser.diagnostics.iter().cloned());
     diagnostics.sort();
     diagnostics.dedup();
@@ -6917,6 +6919,30 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    /// `tsc` 7.0.2 reports a string, a template or a comment that is not closed
+    /// at the end of its text. The parser still drops one that starts in text
+    /// that it scans again.
+    #[test]
+    fn an_unterminated_literal_is_reported_at_its_end() {
+        for (source, start) in [
+            ("let a = \"abc\nlet b = 1;", 12),
+            ("let a = `ab${1}cd\nlet b = 2;\n", 29),
+            ("let a = 1; /* nope\nlet b = 2;\n", 30),
+        ] {
+            let parsed = parse_ts(source);
+            let found: Vec<(usize, usize)> = errors(&parsed)
+                .iter()
+                .map(|d| (d.range().start().get(), d.range().end().get()))
+                .collect();
+            assert_eq!(found, [(start, start)], "{source}");
+        }
+        let jsx = parse_text(
+            "const a = <div>don't</div>; const b = 1;\n",
+            ScriptKind::TypeScriptReact,
+        );
+        assert!(errors(&jsx).is_empty(), "{:?}", errors(&jsx));
     }
 
     #[test]

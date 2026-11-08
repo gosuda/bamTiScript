@@ -80,6 +80,23 @@ pub(crate) fn is_escape_diagnostic(code: DiagnosticCode) -> bool {
 /// that a literal reports for it.
 type EscapeFault = (DiagnosticCode, usize, usize, &'static str);
 
+/// `diagnostic` where TypeScript reports it. The scanner records a literal or
+/// a comment that is not closed over its whole text, so that the parser can
+/// drop the errors of text that it scans again. TypeScript reports it at the
+/// end of that text.
+pub(crate) fn at_reported_position(diagnostic: Diagnostic) -> Diagnostic {
+    let unterminated = [
+        UNTERMINATED_STRING,
+        UNTERMINATED_BLOCK_COMMENT,
+        UNTERMINATED_TEMPLATE,
+    ];
+    if !unterminated.contains(&diagnostic.code()) {
+        return diagnostic;
+    }
+    let end = diagnostic.range().end();
+    diagnostic.with_range(TextRange::new(end, end).expect("an empty range is ordered"))
+}
+
 /// Scans a regular-expression literal starting at `text[0] == '/'`, returning
 /// `(consumed_utf16, terminated)`.  This is the single source of truth for
 /// both `Scanner::scan_regex` and `Parser::rescan_regex_here`.
