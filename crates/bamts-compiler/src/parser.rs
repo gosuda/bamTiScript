@@ -39,6 +39,7 @@
 //! React source (`.tsx`/`.jsx`) is parsed into JSX element, fragment, and
 //! self-closing-element nodes with `Missing*` recovery for malformed tags.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
@@ -355,6 +356,23 @@ fn empty_range(at: Utf16Pos) -> TextRange {
     TextRange::new(at, at).expect("an empty range is ordered")
 }
 
+/// The operator of a unary expression that cannot be the left operand of `**`.
+fn exponent_operand_operator(expression: &Expression) -> Option<&'static str> {
+    Some(match expression {
+        Expression::Await(_) => "await",
+        Expression::Unary(unary) => match unary.operator {
+            UnaryOperator::Plus => "+",
+            UnaryOperator::Minus => "-",
+            UnaryOperator::Not => "!",
+            UnaryOperator::BitNot => "~",
+            UnaryOperator::Typeof => "typeof",
+            UnaryOperator::Void => "void",
+            UnaryOperator::Delete => "delete",
+        },
+        _ => return None,
+    })
+}
+
 fn is_line_terminator(c: char) -> bool {
     matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
 }
@@ -655,7 +673,12 @@ impl Parser {
     // Diagnostics and recovery products
     // ------------------------------------------------------------------
 
-    fn error_at(&mut self, code: DiagnosticCode, range: TextRange, message: &'static str) {
+    fn error_at(
+        &mut self,
+        code: DiagnosticCode,
+        range: TextRange,
+        message: impl Into<Cow<'static, str>>,
+    ) {
         self.diagnostics
             .push(Diagnostic::error(code, self.source_id, range, message));
     }
@@ -3438,12 +3461,15 @@ impl Parser {
             // unparenthesized prefix-unary (or `await`) left operand. `self`
             // still points at the operator, so inspect it before consuming.
             let is_exponent = matches!(self.kind(), TokenKind::StarStar);
-            if is_exponent && matches!(left.data(), Expression::Unary(_) | Expression::Await(_)) {
+            if is_exponent && let Some(operator) = exponent_operand_operator(left.data()) {
                 let op_range = self.cur().range();
+                // The operator is quoted first, because TypeScript names it.
                 self.error_at(
                     UNEXPECTED_TOKEN,
                     op_range,
-                    "an unparenthesized unary expression cannot be the left operand of `**`",
+                    format!(
+                        "an unparenthesized unary expression with `{operator}` cannot be the left operand of `**`"
+                    ),
                 );
             }
             self.bump();
@@ -4282,7 +4308,7 @@ impl Parser {
             self.error_at(
                 EXPECTED_TOKEN,
                 closing.range(),
-                "JSX closing tag does not match the opening tag",
+                format!("JSX closing tag does not match the opening tag `{open_text}`"),
             );
         }
         self.node(
@@ -6261,7 +6287,7 @@ impl Parser {
                         && matches!(self.cur_lexeme(), "with" | "assert")
                 {
                     self.bump();
-                    self.expect(TokenKind::Colon, "expected colon");
+                    self.expect(TokenKind::Colon, "expected `:`");
                     self.parse_attribute_object()
                 } else {
                     self.error_here(EXPECTED_TOKEN, "expected with or assert");

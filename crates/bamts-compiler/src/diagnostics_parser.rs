@@ -149,7 +149,7 @@ pub fn map_parse_diagnostic(diagnostic: &Diagnostic) -> Diagnostic {
         return diagnostic.clone();
     };
     let message: Cow<'static, str> = typescript_parse_message(ts_code)
-        .map(Cow::Borrowed)
+        .and_then(|template| fill_arguments(template, diagnostic.message()))
         .unwrap_or_else(|| diagnostic.message_cow());
     let mapped = Diagnostic::new(
         diagnostic.severity(),
@@ -182,6 +182,27 @@ pub fn map_parse_diagnostic(diagnostic: &Diagnostic) -> Diagnostic {
 pub fn map_parse_diagnostics(diagnostics: &[Diagnostic]) -> Vec<Diagnostic> {
     let mapped: Vec<Diagnostic> = diagnostics.iter().map(map_parse_diagnostic).collect();
     crate::diagnostic::Recovered::new((), mapped).into_parts().1
+}
+
+/// The TypeScript message `template` with each `{n}` replaced by the `n`th part
+/// of `native` in backticks. A native message quotes the arguments of its
+/// TypeScript message in that order. `None` when `native` quotes too few parts.
+fn fill_arguments(template: &'static str, native: &str) -> Option<Cow<'static, str>> {
+    if !template.contains('{') {
+        return Some(Cow::Borrowed(template));
+    }
+    let arguments: Vec<&str> = native.split('`').skip(1).step_by(2).collect();
+    let mut message = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let close = open + rest[open..].find('}')?;
+        let index: usize = rest[open + 1..close].parse().ok()?;
+        message.push_str(&rest[..open]);
+        message.push_str(arguments.get(index)?);
+        rest = &rest[close + 1..];
+    }
+    message.push_str(rest);
+    Some(Cow::Owned(message))
 }
 
 fn is_export_modifier_on_class_element(message: &str) -> bool {
@@ -394,6 +415,37 @@ mod tests {
                 mapped.note().map(str::to_owned),
                 Some(format!("{native_code}: {message}"))
             );
+        }
+    }
+
+    #[test]
+    fn a_mapped_message_takes_its_arguments_from_the_native_message() {
+        let cases = [
+            ("BAMTS-P001", "expected `;`", "';' expected."),
+            (
+                "BAMTS-P005",
+                "an unparenthesized unary expression with `typeof` cannot be the left operand of `**`",
+                "An unary expression with the 'typeof' operator is not allowed in the left-hand side of an exponentiation expression. Consider enclosing the expression in parentheses.",
+            ),
+            (
+                "BAMTS-P001",
+                "JSX closing tag does not match the opening tag `a.b`",
+                "Expected corresponding JSX closing tag for 'a.b'.",
+            ),
+            (
+                "BAMTS-P001",
+                "expected a template continuation",
+                "expected a template continuation",
+            ),
+            (
+                "BAMTS-L001",
+                "unterminated `string`",
+                "Unterminated string literal.",
+            ),
+        ];
+        for (code, message, expected) in cases {
+            let mapped = map_parse_diagnostic(&native(code, 0, 1, message));
+            assert_eq!(mapped.message(), expected, "{code}: {message}");
         }
     }
 
