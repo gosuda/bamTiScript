@@ -62,6 +62,8 @@ const TS1488: DiagnosticCode = DiagnosticCode::new("TS1488");
 const TS1128: DiagnosticCode = DiagnosticCode::new("TS1128");
 /// Property assignment expected.
 const TS1136: DiagnosticCode = DiagnosticCode::new("TS1136");
+/// String literal expected.
+const TS1141: DiagnosticCode = DiagnosticCode::new("TS1141");
 /// Unterminated template literal.
 const TS1160: DiagnosticCode = DiagnosticCode::new("TS1160");
 /// Unterminated regular expression literal.
@@ -143,6 +145,7 @@ pub fn typescript_parse_message(code: DiagnosticCode) -> Option<&'static str> {
         "TS1488" => "Escape sequence '{0}' is not allowed.",
         "TS1128" => "Declaration or statement expected.",
         "TS1136" => "Property assignment expected.",
+        "TS1141" => "String literal expected.",
         "TS1160" => "Unterminated template literal.",
         "TS1161" => "Unterminated regular expression literal.",
         "TS1163" => "A 'yield' expression is only allowed in a generator body.",
@@ -247,6 +250,8 @@ fn map_expected_token(message: &str) -> DiagnosticCode {
         TS17002
     } else if lower.contains("`catch` or `finally`") {
         TS1472
+    } else if lower == "expected a string literal" {
+        TS1141
     } else if lower.contains("declaration or statement") {
         TS1128
     } else {
@@ -465,8 +470,23 @@ mod tests {
             ),
             (
                 "BAMTS-P001",
-                "expected a template continuation",
-                "expected a template continuation",
+                "expected `}` to continue the template",
+                "'}' expected.",
+            ),
+            (
+                "BAMTS-P001",
+                "expected `{` to begin the method body",
+                "'{' expected.",
+            ),
+            (
+                "BAMTS-P001",
+                "expected a string literal",
+                "String literal expected.",
+            ),
+            (
+                "BAMTS-P001",
+                "expected with or assert",
+                "expected with or assert",
             ),
             (
                 "BAMTS-L001",

@@ -4746,7 +4746,7 @@ impl Parser {
                 // diagnostic instead of derailing the object literal.
                 None
             } else {
-                self.error_here(EXPECTED_TOKEN, "expected a method body");
+                self.error_here(EXPECTED_TOKEN, "expected `{` to begin the method body");
                 None
             };
             return self.node(
@@ -4925,7 +4925,7 @@ impl Parser {
                     break;
                 }
                 _ => {
-                    self.error_here(EXPECTED_TOKEN, "expected a template continuation");
+                    self.error_here(EXPECTED_TOKEN, "expected `}` to continue the template");
                     let tail = self.missing_token(TokenKind::TemplateTail);
                     let range = tail.range();
                     elements.push(self.node_at(range, TemplateElement::new(tail)));
@@ -6450,7 +6450,7 @@ impl Parser {
                     elements.push(self.node_at(range, TemplateElement::new(token)));
                     break;
                 } else {
-                    self.error_here(EXPECTED_TOKEN, "expected a template continuation");
+                    self.error_here(EXPECTED_TOKEN, "expected `}` to continue the template");
                     break;
                 }
             }
@@ -7565,7 +7565,7 @@ mod tests {
         // Upstream accepts `{ get foo() }` with zero diagnostics (its
         // parseFunctionBlockOrSemicolon tolerates a member-ending token), so
         // the parser must recover the accessor with a missing body instead
-        // of minting "expected a method body".
+        // of reporting that a method body is expected.
         let recovered = assert_clean("var v = { get foo() }");
         let Statement::Variable(decl) = recovered.product().statements()[0].data() else {
             panic!("expected a variable declaration");
