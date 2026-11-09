@@ -254,12 +254,17 @@ pub fn parse_with_cancel(
             let diagnostic = at_reported_position(diagnostic);
             (diagnostic.range().start().get(), rank, diagnostic)
         })
-        .chain(
-            parser
-                .diagnostics
-                .iter()
-                .map(|diagnostic| (diagnostic.range().start().get(), 2, diagnostic.clone())),
-        )
+        .chain(parser.diagnostics.iter().map(|diagnostic| {
+            // A literal that the parser scans again, such as a JSX attribute
+            // string, is not closed at the same place as a scanned one.
+            let rank = if is_unterminated_diagnostic(diagnostic.code()) {
+                1
+            } else {
+                2
+            };
+            let diagnostic = at_reported_position(diagnostic.clone());
+            (diagnostic.range().start().get(), rank, diagnostic)
+        }))
         .collect();
     ordered.sort_by_key(|(start, rank, _)| (*start, *rank));
     let mut starts = std::collections::BTreeSet::new();
@@ -7114,6 +7119,19 @@ mod tests {
             ScriptKind::TypeScriptReact,
         );
         assert!(errors(&jsx).is_empty(), "{:?}", errors(&jsx));
+        // The parser scans a JSX attribute again. A literal there that is not
+        // closed is reported at the end of the text too, and alone.
+        for (source, start) in [
+            ("const e = <a b=\"abc />;\nconst f = 1;\n", 37),
+            ("const e = <a b={`abc} />;\nconst f = 1;\n", 39),
+        ] {
+            let parsed = parse_text(source, ScriptKind::TypeScriptReact);
+            let found: Vec<(usize, usize)> = errors(&parsed)
+                .iter()
+                .map(|d| (d.range().start().get(), d.range().end().get()))
+                .collect();
+            assert_eq!(found, [(start, start)], "{source}");
+        }
     }
 
     #[test]
