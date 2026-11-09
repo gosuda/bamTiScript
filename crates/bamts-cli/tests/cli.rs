@@ -939,6 +939,16 @@ const NESTED_STRING_PROGRAM: &str = "let nested: unknown[] = [];\n\
      console.log(\"ok\");\n";
 
 #[test]
+fn jit_throws_range_error_for_builtins_that_call_builtins_without_end() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", &NESTED_STRING_PROGRAM.replace("DEPTH", "50000"));
+
+    let output = project.execute("jit", "main.ts", &[]);
+    assert_execution_success(&output, "compiler/execute nested String JIT");
+    assert_eq!(output.stdout, b"RangeError\nok\n");
+}
+
+#[test]
 fn aot_throws_range_error_for_builtins_that_call_builtins_without_end() {
     let project = ScratchDirectory::new();
     project.write(

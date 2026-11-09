@@ -1816,6 +1816,13 @@ fn run_in_context_with_cancel(
     }
 }
 
+/// The native stack that a program in the JIT can use before it throws
+/// `RangeError`. The program runs on the main thread, also for the API server.
+/// That thread has 8 MiB of stack: the linker sets this on Windows, and it is the
+/// usual default on Linux and macOS. A builtin that calls builtins adds no guest frame,
+/// so only this limit stops it before that stack overflows.
+const JIT_STACK_BYTES: usize = 5 << 20;
+
 fn run_jit(
     args: &CliArgs,
     entrypoint: &Path,
@@ -1843,7 +1850,10 @@ fn run_jit(
         executable.wire(),
         &program,
         &mut host,
-        &Limits::default(),
+        &Limits {
+            max_stack_bytes: JIT_STACK_BYTES,
+            ..Limits::default()
+        },
         cancel.clone(),
     )
     .map_err(DriverError::Native)?;
