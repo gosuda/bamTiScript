@@ -636,6 +636,52 @@ mod tests {
         assert_eq!(range(&euros, f64::INFINITY, 1.0), "EUR∞–1.00");
     }
 
+    /// ICU holds an end beyond the range of a double as `Infinity`, so the
+    /// digits of such an end and `∞` are one value.
+    #[test]
+    fn an_end_beyond_a_double_is_one_value_with_infinity() {
+        let bigint = |text: String| {
+            RangeEnd::digits(IntlMathematicalValue::from_bigint(&text).expect("a BigInt"))
+        };
+        let huge = bigint(format!("1{}", "0".repeat(400)));
+        let negative_huge = bigint(format!("-1{}", "0".repeat(400)));
+        let infinity = RangeEnd::number(f64::INFINITY);
+        let negative_infinity = RangeEnd::number(f64::NEG_INFINITY);
+        let digits = format!("10{}", ",000".repeat(133));
+        let both = |format: &NumberFormat<'_>, start: &RangeEnd, end: &RangeEnd| {
+            format.format_range(start, end).expect("a range")
+        };
+        let plain = english(NumberFormatOptions::default());
+        assert_eq!(both(&plain, &huge, &infinity), format!("~{digits}"));
+        assert_eq!(both(&plain, &infinity, &huge), "~∞");
+        assert_eq!(both(&plain, &negative_infinity, &negative_huge), "~-∞");
+        let euros = english(NumberFormatOptions {
+            style: Some("currency".to_owned()),
+            currency: Some("EUR".to_owned()),
+            currency_display: Some("code".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(
+            both(&euros, &huge, &infinity),
+            format!("~EUR\u{a0}{digits}.00")
+        );
+        assert_eq!(both(&euros, &infinity, &huge), "~EUR∞");
+        let accounting = english(NumberFormatOptions {
+            style: Some("currency".to_owned()),
+            currency: Some("USD".to_owned()),
+            currency_sign: Some("accounting".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        assert_eq!(
+            both(&accounting, &negative_infinity, &negative_huge),
+            "($∞)"
+        );
+        assert_eq!(
+            both(&accounting, &negative_huge, &negative_infinity),
+            format!("(${digits}.00)")
+        );
+    }
+
     #[test]
     fn an_accounting_negative_has_no_place_for_the_approximately_sign() {
         let accounting = english(NumberFormatOptions {

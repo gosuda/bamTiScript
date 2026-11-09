@@ -2258,15 +2258,18 @@ fn without_digit_space(parts: &[NumberPart]) -> impl Iterator<Item = &NumberPart
     parts.iter().filter(|part| part.value != " ")
 }
 
-/// The parts of a number other than the digits of its coefficient.
+/// The parts of a number other than its coefficient. An end beyond the range of
+/// a double is the same value as `Infinity`, so `∞` counts as a coefficient, and
+/// so does the space that only digits take.
 fn beside_digits(parts: &[NumberPart]) -> impl Iterator<Item = &NumberPart> {
-    parts.iter().filter(|part| {
+    without_digit_space(parts).filter(|part| {
         !matches!(
             part.part_type,
             NumberPartType::Integer
                 | NumberPartType::Group
                 | NumberPartType::Decimal
                 | NumberPartType::Fraction
+                | NumberPartType::Infinity
         )
     })
 }
