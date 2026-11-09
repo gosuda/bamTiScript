@@ -11203,11 +11203,12 @@ impl<'a> FreeVarScanner<'a> {
         }
     }
 }
-/// The plain call that an invalid target holds. An optional call stays an early error.
+/// The plain call that an invalid target holds. A call in an optional chain stays
+/// an early error.
 fn call_target(operand: &Expr) -> Option<&Expr> {
     match operand.data() {
         Expression::Parenthesized(inner) => call_target(inner),
-        Expression::Call(call) if !call.optional => Some(operand),
+        Expression::Call(_) if !crate::early_errors::in_optional_chain(operand) => Some(operand),
         _ => None,
     }
 }
@@ -11856,6 +11857,7 @@ mod tests {
             ),
             ("for (f() in {}) {}", "Invalid left-hand side in for-loop"),
             ("for (f() of []) {}", "Invalid left-hand side in for-loop"),
+            ("(a?.b)() = 1;", "Invalid left-hand side in assignment"),
         ] {
             let module = lower_js(&format!("function f() {{}} {statement}"));
             assert!(
@@ -11865,7 +11867,19 @@ mod tests {
                 "{statement}"
             );
         }
-        for statement in ["f() &&= 1;", "f() ??= 1;", "f?.() = 1;", "1 = 2;"] {
+        for statement in [
+            "f() &&= 1;",
+            "f() ??= 1;",
+            "f?.() = 1;",
+            "1 = 2;",
+            "a?.b() = 1;",
+            "a?.b() += 1;",
+            "a?.b()++;",
+            "++a?.b();",
+            "for (a?.b() of []) {}",
+            "a?.b.c() = 1;",
+            "a?.b()() = 1;",
+        ] {
             assert!(
                 lower_js_result(&format!("function f() {{}} {statement}")).is_err(),
                 "{statement}"

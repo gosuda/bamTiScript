@@ -319,8 +319,9 @@ fn has_legacy_escape(text: &str) -> bool {
     false
 }
 
-/// Whether a member chain passes through `?.`, which a tag cannot do.
-fn in_optional_chain(expression: &Expr) -> bool {
+/// Whether a member chain passes through `?.`. A tag cannot do this, and a call
+/// that does is not an assignment target, even at run time.
+pub(crate) fn in_optional_chain(expression: &Expr) -> bool {
     match expression.data() {
         Expression::Member(member) => member.optional || in_optional_chain(&member.object),
         Expression::Call(call) => call.optional || in_optional_chain(&call.callee),
