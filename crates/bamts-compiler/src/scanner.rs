@@ -64,9 +64,10 @@ const INVALID_PRIVATE_IDENTIFIER: DiagnosticCode = DiagnosticCode::new("BAMTS-L0
 const UNICODE_ESCAPE_OUT_OF_RANGE: DiagnosticCode = DiagnosticCode::new("BAMTS-L012");
 /// A `\u{...}` escape without its closing brace.
 const UNTERMINATED_UNICODE_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L013");
-/// A legacy octal escape, such as `\1` or `\08`, in a TypeScript file.
+/// A legacy octal escape, such as `\1` or `\08`, in a TypeScript file or in a
+/// template.
 const LEGACY_OCTAL_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L014");
-/// A `\8` or `\9` escape in a TypeScript file.
+/// A `\8` or `\9` escape in a TypeScript file or in a template.
 const NON_OCTAL_DECIMAL_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L015");
 
 /// Whether `code` reports a malformed escape in the text of a literal. A tagged
@@ -1166,7 +1167,7 @@ impl<'a> Scanner<'a> {
                     );
                     break;
                 }
-                Some('\\') => self.scan_escape(),
+                Some('\\') => self.scan_escape(false),
                 Some(_) => {
                     self.bump();
                 }
@@ -1211,7 +1212,7 @@ impl<'a> Scanner<'a> {
                         TokenKind::TemplateHead
                     };
                 }
-                Some('\\') => self.scan_escape(),
+                Some('\\') => self.scan_escape(true),
                 Some(_) => {
                     self.bump();
                 }
@@ -1521,18 +1522,21 @@ impl<'a> Scanner<'a> {
         TokenKind::PrivateIdentifier
     }
 
-    /// Scans an escape in the text of a string or a template. TypeScript reports
-    /// a bad escape at the character where the escape goes wrong.
-    fn scan_escape(&mut self) {
+    /// Scans an escape in the text of a string or a `template`. TypeScript reports
+    /// a bad escape at the character where the escape goes wrong. Sloppy
+    /// JavaScript accepts a legacy octal escape in a string, but no JavaScript
+    /// accepts one in a template.
+    fn scan_escape(&mut self, template: bool) {
         let backslash = self.utf16_pos;
         self.bump();
         match self.first() {
             None => {}
             Some('0'..='9')
-                if matches!(
-                    self.script_kind,
-                    ScriptKind::TypeScript | ScriptKind::TypeScriptReact
-                ) =>
+                if template
+                    || matches!(
+                        self.script_kind,
+                        ScriptKind::TypeScript | ScriptKind::TypeScriptReact
+                    ) =>
             {
                 self.scan_digit_escape(backslash);
             }
@@ -2316,8 +2320,8 @@ mod tests {
 
     /// `tsc` 7.0.2 rejects `\8`, `\9` and a legacy octal escape in a TypeScript
     /// file, from the backslash to the end of the escape, and suggests the `\x`
-    /// form. JavaScript keeps them for sloppy code; its early errors reject them
-    /// in strict code.
+    /// form. A JavaScript string keeps them for sloppy code, and its early errors
+    /// reject them in strict code. A JavaScript template rejects them in all code.
     #[test]
     fn a_typescript_file_rejects_a_legacy_octal_escape() {
         let found = |text: &str| -> Vec<(DiagnosticCode, usize, usize, String)> {
@@ -2346,13 +2350,17 @@ mod tests {
             found(r#""\9x""#),
             [(NON_OCTAL_DECIMAL_ESCAPE, 1, 3, message)]
         );
-        let javascript = SourceText::new(r#""\101" + "\8""#).expect("test source fits budget");
-        let scanned = scan(
-            SourceId::new(0),
-            ScriptKind::JavaScript,
-            Arc::new(javascript),
-        );
-        assert!(scanned.diagnostics().is_empty());
+        let javascript = |text: &str| -> Vec<DiagnosticCode> {
+            let source = SourceText::new(text).expect("test source fits budget");
+            scan(SourceId::new(0), ScriptKind::JavaScript, Arc::new(source))
+                .diagnostics()
+                .iter()
+                .map(Diagnostic::code)
+                .collect()
+        };
+        assert_eq!(javascript(r#""\101" + "\8""#), []);
+        assert_eq!(javascript(r"`\0` + `a${1}\1`"), [LEGACY_OCTAL_ESCAPE]);
+        assert_eq!(javascript(r"`\8`"), [NON_OCTAL_DECIMAL_ESCAPE]);
     }
 
     #[test]
