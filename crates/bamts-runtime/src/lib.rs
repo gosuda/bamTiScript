@@ -7320,7 +7320,13 @@ impl<'a, H: Host> Machine<'a, H> {
     /// [`STACK_OVERFLOW`] in place of a new activation.
     pub(crate) fn stack_overflows(&self) -> bool {
         self.frames.len().saturating_add(self.native_depth) >= self.limits.max_stack_depth
-            || self.native_stack_used() > self.limits.max_stack_bytes
+            || self.native_stack_overflows()
+    }
+
+    /// Whether the native stack here passes [`Limits::max_stack_bytes`]. A builtin
+    /// that calls a builtin adds no activation, so only this bounds that path.
+    pub(crate) fn native_stack_overflows(&self) -> bool {
+        self.native_stack_used() > self.limits.max_stack_bytes
     }
 
     /// Whether a new activation here ends the run: the host ceiling of

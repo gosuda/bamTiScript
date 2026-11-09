@@ -931,6 +931,34 @@ fn jit_supports_apply_and_bound_callables() {
     assert!(output.stdout.is_empty());
 }
 
+/// Builtins that call builtins with no guest call between them: `String` of an
+/// array nested past the native stack. Node throws `RangeError` and goes on.
+const NESTED_STRING_PROGRAM: &str = "let nested: unknown[] = [];\n\
+     for (let i = 0; i < DEPTH; i++) nested = [nested];\n\
+     try { String(nested); } catch (error) { console.log((error as Error).name); }\n\
+     console.log(\"ok\");\n";
+
+#[test]
+fn aot_throws_range_error_for_builtins_that_call_builtins_without_end() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        &NESTED_STRING_PROGRAM.replace("DEPTH", "1000000"),
+    );
+    let executable = project
+        .path
+        .join(format!("nested{}", std::env::consts::EXE_SUFFIX));
+
+    let compile = project.emit("main.ts", &executable);
+    assert_success(&compile, "bamts tsc-compatible nested String AOT emit");
+
+    let output = Command::new(&executable)
+        .output()
+        .expect("nested String AOT executable starts");
+    assert_success(&output, "compiled nested String program");
+    assert_eq!(output.stdout, b"RangeError\nok\n");
+}
+
 #[test]
 fn aot_supports_apply_and_bound_callables() {
     let project = ScratchDirectory::new();

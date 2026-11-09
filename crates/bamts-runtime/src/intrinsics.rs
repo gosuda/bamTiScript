@@ -1238,6 +1238,9 @@ impl<'a, H: Host> Machine<'a, H> {
         constructing: bool,
         new_target: Value,
     ) -> Result<BuiltinOutcome, EvalFailure> {
+        if self.native_stack_overflows() {
+            return Err(EvalFailure::Throw(crate::STACK_OVERFLOW));
+        }
         let handler = self.intrinsics.builtins.get(id).handler;
         let previous_id = self.current_builtin_id.replace(id);
         let previous_new_target = std::mem::replace(&mut self.current_new_target, new_target);

@@ -679,9 +679,9 @@ mod tests {
 
     /// The calls that end the guest stack: a recursion, a recursion through a
     /// builtin callback, a construction, a construction through a builtin, a
-    /// generator delegation, a proxy chain, and chains of generators and of async
-    /// generators that resume the next one. Each throws `RangeError`, and the
-    /// program goes on.
+    /// generator delegation, a proxy chain, chains of generators and of async
+    /// generators that resume the next one, and builtins that call builtins with
+    /// no guest call between them. Each throws `RangeError`, and the program goes on.
     #[cfg(all(feature = "node-host", feature = "host-jit"))]
     const STACK_OVERFLOWS: &str = "// @ts-nocheck\n\
          function down(n) { return down(n + 1) + 1; }\n\
@@ -705,6 +705,9 @@ mod tests {
          async function* task(i) { await tasks[i + 1].next(); }\n\
          for (let i = 0; i < 2000; i++) tasks.push(task(i));\n\
          tasks[0].next().then(() => console.log('done'), (error) => console.log(error.name));\n\
+         let nested = [];\n\
+         for (let i = 0; i < 200000; i++) nested = [nested];\n\
+         try { String(nested); } catch (error) { console.log(error.name); }\n\
          function count(n) { return n === 0 ? 0 : 1 + count(n - 1); }\n\
          console.log(count(500));\n";
 
@@ -712,7 +715,7 @@ mod tests {
     /// 2,000 passes the guest stack of 1,000.
     #[cfg(all(feature = "node-host", feature = "host-jit"))]
     const STACK_OVERFLOW_OUTPUT: &str = "true Maximum call stack size exceeded\nRangeError\nRangeError\n\
-         RangeError\nRangeError\nRangeError\nRangeError\n500\nRangeError\n";
+         RangeError\nRangeError\nRangeError\nRangeError\nRangeError\n500\nRangeError\n";
 
     /// A guest stack of 1,000 activations, which 32 MiB of native stack holds in a
     /// debug build.
