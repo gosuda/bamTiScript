@@ -544,6 +544,7 @@ impl Walker<'_> {
                     if let PropertyName::Computed(key) = &property.name {
                         self.expression(key, context);
                     }
+                    self.string_name(&property.name, context);
                     if let BindingPattern::Rest(rest) = property.binding.data() {
                         if position != last || self.comma_follows(property.binding.range()) {
                             self.error(property.binding.range(), "a rest property must come last");
@@ -1544,6 +1545,7 @@ impl Walker<'_> {
                     if let PropertyName::Computed(key) = &property.name {
                         self.expression(key, context);
                     }
+                    self.string_name(&property.name, context);
                     self.pattern_target(&property.target, context);
                     if let Some(initializer) = &property.initializer {
                         self.expression(initializer, context);
@@ -2407,11 +2409,17 @@ mod tests {
             r#"class C { accessor "\1" = 1; }"#,
             r#"function f() { "\1"; "use strict"; }"#,
             r#""\1"; "use strict";"#,
+            r#""use strict"; ({ "\1": x } = {});"#,
+            r#""use strict"; for ({ "\8": x } of []);"#,
+            r#""use strict"; var { "\1": x } = {};"#,
+            r#""use strict"; function f({ "\1": x }) {}"#,
         ] {
             assert!(!errors(source).is_empty(), "{source}");
         }
         for source in [
             r#"({ "\1": 1 });"#,
+            r#"({ "\1": x } = {});"#,
+            r#"var { "\1": x } = {};"#,
             r#""use strict"; ({ "\0": 1 });"#,
             r#""use strict"; ({ "\x41": 1 });"#,
         ] {
