@@ -742,6 +742,17 @@ impl Parser {
     }
 
     fn error_here(&mut self, code: DiagnosticCode, message: &'static str) {
+        // At the end of the text, TypeScript reports a missing name or expression
+        // where the trivia before the end starts.
+        if self.at_eof() && [EXPECTED_EXPRESSION, EXPECTED_IDENTIFIER].contains(&code) {
+            self.error_at(code, empty_range(Utf16Pos::new(self.prev_end)), message);
+        } else {
+            self.error_at_token(code, message);
+        }
+    }
+
+    /// Records a diagnostic over the current token, or at the end of the text.
+    fn error_at_token(&mut self, code: DiagnosticCode, message: &'static str) {
         let range = if self.at_eof() {
             empty_range(self.eof.range().start())
         } else {
@@ -4485,7 +4496,8 @@ impl Parser {
         if self.at(TokenKind::StringLiteral) {
             return JsxAttributeInitializer::String(self.parse_string_literal());
         }
-        self.error_here(EXPECTED_EXPRESSION, "expected a JSX attribute value");
+        // TypeScript reports this at the token, even at the end of the text.
+        self.error_at_token(EXPECTED_EXPRESSION, "expected a JSX attribute value");
         let start = self.cur_start();
         let container = self.node(start, JsxExpressionContainer { expression: None });
         JsxAttributeInitializer::Expression(container)
@@ -7042,6 +7054,41 @@ mod tests {
         assert_eq!(
             found(r#"let a = "\x"#),
             [(11, "Hexadecimal digit expected.".to_owned())]
+        );
+        // At the end of the text, a missing name or expression is reported
+        // after the last token, so it does not meet an error at the end.
+        assert_eq!(
+            found("let x = /* nope"),
+            [
+                (7, "Expression expected.".to_owned()),
+                (15, "'*/' expected.".to_owned())
+            ]
+        );
+        assert_eq!(
+            found("let x = 1 +  /* c"),
+            [
+                (11, "Expression expected.".to_owned()),
+                (17, "'*/' expected.".to_owned())
+            ]
+        );
+        assert_eq!(
+            found("let x = \n\n"),
+            [(7, "Expression expected.".to_owned())]
+        );
+        assert_eq!(
+            found("/* 😀 */ a.  // c"),
+            [(11, "Identifier expected.".to_owned())]
+        );
+        let jsx = parse_text("const e = <a b= ", ScriptKind::TypeScriptReact);
+        let value: Vec<usize> = errors(&jsx)
+            .iter()
+            .filter(|d| d.code() == EXPECTED_EXPRESSION)
+            .map(|d| d.range().start().get())
+            .collect();
+        assert_eq!(
+            value,
+            [16],
+            "a JSX attribute value is expected at the token"
         );
     }
 
