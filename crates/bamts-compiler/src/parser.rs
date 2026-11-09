@@ -407,16 +407,13 @@ fn empty_range(at: Utf16Pos) -> TextRange {
     TextRange::new(at, at).expect("an empty range is ordered")
 }
 
-/// The text of a JSX tag name, from its first part to its last.
-fn jsx_name_range(name: &JsxElementName) -> TextRange {
-    let (start, end) = match name {
-        JsxElementName::Identifier(identifier) => (identifier.range(), identifier.range()),
-        JsxElementName::Namespace(namespaced) => {
-            (namespaced.namespace.range(), namespaced.name.range())
-        }
-        JsxElementName::Member(member) => (jsx_name_range(&member.object), member.property.range()),
-    };
-    TextRange::new(start.start(), end.end()).expect("a JSX name grows forward")
+/// The end of the last part of a JSX tag name.
+fn jsx_name_end(name: &JsxElementName) -> Utf16Pos {
+    match name {
+        JsxElementName::Identifier(identifier) => identifier.range().end(),
+        JsxElementName::Namespace(namespaced) => namespaced.name.range().end(),
+        JsxElementName::Member(member) => member.property.range().end(),
+    }
 }
 
 /// The operator of a unary expression that cannot be the left operand of `**`.
@@ -4375,13 +4372,14 @@ impl Parser {
         self.expect(TokenKind::GreaterThan, "expected `>`");
         let opening = self.node(start, JsxOpeningElement { name, attributes });
         let children = self.parse_jsx_children();
-        let closing = self.parse_jsx_closing_element();
+        let (closing, name_start) = self.parse_jsx_closing_element();
         let open_text = self.jsx_name_text(&opening.data().name);
         let close_text = self.jsx_name_text(&closing.data().name);
         if open_text != close_text {
+            let name_end = jsx_name_end(&closing.data().name);
             self.error_at(
                 EXPECTED_TOKEN,
-                jsx_name_range(&closing.data().name),
+                TextRange::new(name_start, name_end.max(name_start)).expect("ordered by max"),
                 format!("JSX closing tag does not match the opening tag `{open_text}`"),
             );
         }
@@ -4395,13 +4393,16 @@ impl Parser {
         )
     }
 
-    fn parse_jsx_closing_element(&mut self) -> JsxClosingElementNode {
+    /// Parses a closing tag, and returns it with the end of its `</`. TypeScript
+    /// names the text of the tag from there, with any trivia before the name.
+    fn parse_jsx_closing_element(&mut self) -> (JsxClosingElementNode, Utf16Pos) {
         let start = self.cur_start();
         self.expect(TokenKind::LessThan, "expected `</`");
         self.expect(TokenKind::Slash, "expected `/`");
+        let name_start = Utf16Pos::new(self.prev_end.max(start.get()));
         let name = self.parse_jsx_element_name();
         self.expect(TokenKind::GreaterThan, "expected `>`");
-        self.node(start, JsxClosingElement { name })
+        (self.node(start, JsxClosingElement { name }), name_start)
     }
 
     /// Parses a JSX name identifier. JSX names are always lexed as
@@ -7005,8 +7006,8 @@ mod tests {
         }
     }
 
-    /// `tsc` 7.0.2 reports TS17006 over the unary operand and TS17002 over the
-    /// name of the closing tag.
+    /// `tsc` 7.0.2 reports TS17006 over the unary operand and TS17002 from the
+    /// end of `</` to the end of the name of the closing tag.
     #[test]
     fn an_operand_or_a_tag_error_is_where_tsc_reports_it() {
         for (source, script_kind, range) in [
@@ -7025,6 +7026,16 @@ mod tests {
                 "const e = <a.b></a.c>;",
                 ScriptKind::TypeScriptReact,
                 (17, 20),
+            ),
+            (
+                "const f = <a></ /*c*/ b>;",
+                ScriptKind::TypeScriptReact,
+                (15, 23),
+            ),
+            (
+                "const f = <é𝑥></  é𝑥y >;",
+                ScriptKind::TypeScriptReact,
+                (17, 23),
             ),
         ] {
             let parsed = parse_text(source, script_kind);
