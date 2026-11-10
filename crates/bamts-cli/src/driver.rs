@@ -1879,10 +1879,7 @@ fn run_jit_program(
         executable.wire(),
         &program,
         &mut host,
-        &Limits {
-            max_stack_bytes: Limits::program().max_stack_bytes,
-            ..Limits::default()
-        },
+        &Limits::program(),
         cancel.clone(),
     )
     .map_err(DriverError::Native)?;
@@ -2952,6 +2949,26 @@ mod tests {
             .join()
             .expect("the calling thread does not panic")?;
         assert_eq!(outcome.stdout, b"RangeError\nok\n");
+        assert_eq!(outcome.exit_code, 0);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_jit_runs_a_program_past_the_default_fuel() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = std::env::temp_dir().join(format!("bamts-cli-jit-fuel-{}", process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)?;
+        fs::write(
+            directory.join("main.ts"),
+            "let sum = 0;\n\
+             for (let i = 0; i < 200000; i++) { sum = (sum + i) | 0; }\n\
+             console.log(sum);\n",
+        )?;
+        let context = ExecutionContext::new(&directory, BTreeMap::new())?;
+        let args = parse_args(["run", "--jit", "main.ts"])?;
+        let outcome = execute_in_context(&args, &context)?;
+        assert_eq!(outcome.stdout, b"-1474936480\n");
         assert_eq!(outcome.exit_code, 0);
         fs::remove_dir_all(directory)?;
         Ok(())
