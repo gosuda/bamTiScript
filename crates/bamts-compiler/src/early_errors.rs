@@ -331,6 +331,11 @@ pub(crate) fn in_optional_chain(expression: &Expr) -> bool {
     }
 }
 
+/// A number with a leading `0` and a digit, which strict code does not allow.
+fn is_legacy_octal_number(text: &str) -> bool {
+    text.len() > 1 && text.starts_with('0') && text.as_bytes()[1].is_ascii_digit()
+}
+
 const fn is_mixed_logical(outer: LogicalOperator, inner: LogicalOperator) -> bool {
     matches!(outer, LogicalOperator::Nullish) != matches!(inner, LogicalOperator::Nullish)
 }
@@ -546,7 +551,7 @@ impl Walker<'_> {
                     if let PropertyName::Computed(key) = &property.name {
                         self.expression(key, context);
                     }
-                    self.string_name(&property.name, context);
+                    self.literal_name(&property.name, context);
                     if let BindingPattern::Rest(rest) = property.binding.data() {
                         if position != last || self.comma_follows(property.binding.range()) {
                             self.error(property.binding.range(), "a rest property must come last");
@@ -1360,7 +1365,7 @@ impl Walker<'_> {
                     self.callable(&constructor.parameters, Some(&body), inner);
                 }
                 ClassMember::Method(method) => {
-                    self.string_name(&method.name, context);
+                    self.literal_name(&method.name, context);
                     self.check_method_name(method, member.range());
                     self.accessor_parameters(
                         method.modifier,
@@ -1373,7 +1378,7 @@ impl Walker<'_> {
                     self.function(&method.function, true, false, context);
                 }
                 ClassMember::Property(property) => {
-                    self.string_name(&property.name, context);
+                    self.literal_name(&property.name, context);
                     self.check_field_name(
                         &property.name,
                         property.modifiers.is_static,
@@ -1387,7 +1392,7 @@ impl Walker<'_> {
                     }
                 }
                 ClassMember::AutoAccessor(accessor) => {
-                    self.string_name(&accessor.name, context);
+                    self.literal_name(&accessor.name, context);
                     self.check_field_name(
                         &accessor.name,
                         accessor.modifiers.is_static,
@@ -1547,7 +1552,7 @@ impl Walker<'_> {
                     if let PropertyName::Computed(key) = &property.name {
                         self.expression(key, context);
                     }
-                    self.string_name(&property.name, context);
+                    self.literal_name(&property.name, context);
                     self.pattern_target(&property.target, context);
                     if let Some(initializer) = &property.initializer {
                         self.expression(initializer, context);
@@ -1655,17 +1660,26 @@ impl Walker<'_> {
         }
     }
 
-    /// A string that names a property is still a string literal in strict code.
-    fn string_name(&mut self, name: &PropertyName, context: Context) {
-        if let PropertyName::String(literal) = name
-            && context.strict
-            && has_legacy_escape(self.token_of(literal.data().token()))
-        {
-            self.error(
-                literal.range(),
-                "legacy octal is not allowed in strict code",
-            );
+    /// A string or a number that names a property is still a literal in strict
+    /// code.
+    fn literal_name(&mut self, name: &PropertyName, context: Context) {
+        if !context.strict {
+            return;
         }
+        let range = match name {
+            PropertyName::String(literal)
+                if has_legacy_escape(self.token_of(literal.data().token())) =>
+            {
+                literal.range()
+            }
+            PropertyName::Number(literal)
+                if is_legacy_octal_number(self.token_of(literal.data().token())) =>
+            {
+                literal.range()
+            }
+            _ => return,
+        };
+        self.error(range, "legacy octal is not allowed in strict code");
     }
 
     fn object(&mut self, members: &[crate::syntax::ObjectMemberNode], context: Context) {
@@ -1673,7 +1687,7 @@ impl Walker<'_> {
         for member in members {
             match member.data() {
                 ObjectMember::Property(property) => {
-                    self.string_name(&property.name, context);
+                    self.literal_name(&property.name, context);
                     if property.shorthand
                         && (!matches!(property.name, PropertyName::Identifier(_))
                             || matches!(property.value.data(), Expression::Assignment(_)))
@@ -1694,7 +1708,7 @@ impl Walker<'_> {
                     self.expression(&property.value, context);
                 }
                 ObjectMember::Method(method) => {
-                    self.string_name(&method.name, context);
+                    self.literal_name(&method.name, context);
                     self.accessor_parameters(
                         method.modifier,
                         &method.function.parameters,
@@ -1716,8 +1730,7 @@ impl Walker<'_> {
             Expression::Identifier(identifier) => self.reference(identifier, context),
             Expression::Super => self.error(expression.range(), "`super` is not available here"),
             Expression::Literal(Literal::Number(literal)) if context.strict => {
-                let text = self.token_of(literal.data().token());
-                if text.len() > 1 && text.starts_with('0') && text.as_bytes()[1].is_ascii_digit() {
+                if is_legacy_octal_number(self.token_of(literal.data().token())) {
                     self.error(
                         expression.range(),
                         "legacy octal is not allowed in strict code",
@@ -2353,6 +2366,28 @@ mod tests {
         }
         for source in ["[a?.b()] = [];", "({ x: a?.b() } = {});"] {
             assert_eq!(errors(source).len(), 1, "one error for {source}");
+        }
+    }
+
+    #[test]
+    fn a_number_that_names_a_property_follows_strict_code() {
+        for source in [
+            r#""use strict"; ({ 01: 1 });"#,
+            r#""use strict"; ({ 08: 1 });"#,
+            r#""use strict"; ({ 00() {} });"#,
+            r#""use strict"; var { 01: x } = {};"#,
+            r#""use strict"; ({ 01: x } = {});"#,
+            "class C { 01() {} }",
+            "class C { 07 = 1; }",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "({ 01: 1 });",
+            "var { 01: x } = {};",
+            r#""use strict"; ({ 0: 1, 0.5: 2, 1e3: 3, 0x10: 4, 0o7: 5 });"#,
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
     }
 
