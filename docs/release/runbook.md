@@ -110,7 +110,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-Run the package, corpus, formal, target, and performance checks required by the affected gate ledgers. A leaf test or one execution tier does not prove a product root.
+Run the package, corpus, formal, and performance checks that the affected gates require. A leaf test or one execution tier does not prove a product root.
 
 `.outline/GATES.md` also requires:
 
@@ -169,15 +169,13 @@ Compare the output with the expected line in `.outline/GATES.md`. A non-zero exi
 
 Before release, confirm all of these facts:
 
-- Every required leaf and integration ledger is complete.
+- Every required leaf, cluster, and root check passes.
 - Every selected obligation has one current receipt.
 - The receipt binds the selected release commit and required execution mode.
 - The ledger contains no blocking, external-blocked, catalog-error, timeout, crash, skip, or missing-receipt state in release scope.
 - BH1 evidence matches `perf/hosts/bh1.toml` exactly.
 - Every generated-file `--check` command reports identical bytes.
 - The product root reports the exact expected completion line.
-
-Record evidence paths and digests in the owning gate ledger. Do not paste a raw local result into a sibling gate.
 
 ## Prepare release notes
 

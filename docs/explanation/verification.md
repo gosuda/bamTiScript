@@ -10,7 +10,7 @@ bamTiScript records three types of evidence:
 
 1. A pinned TypeScript 7.0.2 conformance suite for diagnostic and static type-checking comparisons.
 2. A differential corpus over selected code from pinned package repositories.
-3. Formal source artifacts and gate ledgers for named state, lifecycle, bytecode, and ABI properties.
+3. Formal source artifacts and root gates for named state, lifecycle, bytecode, and ABI properties.
 
 ```mermaid
 flowchart TD
