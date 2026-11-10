@@ -2990,12 +2990,27 @@ impl Parser {
     }
 
     fn parse_string_literal(&mut self) -> StringLiteralNode {
+        self.parse_string_literal_or(EXPECTED_EXPRESSION, "expected an expression")
+    }
+
+    /// TypeScript reads an expression, or in an `import()` type a type, where a
+    /// string literal belongs. A token that cannot start one is reported as
+    /// `missing`, and any other token as a missing string literal.
+    fn parse_string_literal_or(
+        &mut self,
+        missing: DiagnosticCode,
+        message: &'static str,
+    ) -> StringLiteralNode {
         if self.at(TokenKind::StringLiteral) {
             let token = self.bump();
             let range = token.range();
             return self.node_at(range, StringLiteral::new(token));
         }
-        self.error_here(EXPECTED_TOKEN, "expected a string literal");
+        if self.can_start_expression() {
+            self.error_here(EXPECTED_TOKEN, "expected a string literal");
+        } else {
+            self.error_here(missing, message);
+        }
         let token = self.missing_token(TokenKind::StringLiteral);
         let range = token.range();
         self.node_at(range, StringLiteral::new(token))
@@ -6393,7 +6408,7 @@ impl Parser {
     fn parse_import_type(&mut self, start: Utf16Pos) -> Ty {
         self.bump();
         self.expect(TokenKind::LParen, "expected `(`");
-        let argument = self.parse_string_literal();
+        let argument = self.parse_string_literal_or(EXPECTED_TYPE, "expected a type");
         let attributes = if self.eat(TokenKind::Comma).is_some() {
             // `import("x", { with: {...} })`: the AST stores attributes only.
             if self.at(TokenKind::LBrace) {
@@ -7181,6 +7196,32 @@ mod tests {
             found_in("const e = <a b   ", ScriptKind::TypeScriptReact),
             [(17, "'/' expected.".to_owned())]
         );
+    }
+
+    /// `tsc` 7.0.2 reads an expression, or in an `import()` type a type, where a
+    /// module name belongs.
+    #[test]
+    fn a_missing_module_name_is_a_missing_expression_or_type() {
+        let found = |text: &str| -> Vec<(usize, String)> {
+            errors(&parse_ts(text))
+                .iter()
+                .map(|d| {
+                    let mapped = crate::diagnostics_parser::map_parse_diagnostic(d);
+                    (d.range().start().get(), mapped.message().to_owned())
+                })
+                .collect()
+        };
+        for (text, at, message) in [
+            ("import x from ;", 14, "Expression expected."),
+            ("import x from   // c", 13, "Expression expected."),
+            ("import x = require();", 19, "Expression expected."),
+            ("export * as x from ;", 19, "Expression expected."),
+            ("export { a } from 1;", 18, "String literal expected."),
+            ("import x from y;", 14, "String literal expected."),
+            ("type T = import();", 16, "Type expected."),
+        ] {
+            assert_eq!(found(text), [(at, message.to_owned())], "{text}");
+        }
     }
 
     /// A tag accepts any escape, also in JSX, where the parser scans the template
