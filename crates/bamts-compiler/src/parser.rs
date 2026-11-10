@@ -4385,15 +4385,16 @@ impl Parser {
         }
         let name = self.parse_jsx_element_name();
         let attributes = self.parse_jsx_attributes();
-        if self.at(TokenKind::Slash) {
-            self.bump();
+        // TypeScript reads a tag that does not end with `>` as one that closes
+        // itself, so it then expects `/>`.
+        if self.eat(TokenKind::GreaterThan).is_none() {
+            self.expect(TokenKind::Slash, "expected `/`");
             self.expect(TokenKind::GreaterThan, "expected `>`");
             return self.node(
                 start,
                 Expression::JsxSelfClosingElement(JsxSelfClosingElement { name, attributes }),
             );
         }
-        self.expect(TokenKind::GreaterThan, "expected `>`");
         let opening = self.node(start, JsxOpeningElement { name, attributes });
         let children = self.parse_jsx_children();
         let (closing, name_start) = self.parse_jsx_closing_element();
@@ -7080,8 +7081,8 @@ mod tests {
     /// lexical error comes first.
     #[test]
     fn one_parse_error_is_reported_at_a_position() {
-        let found = |text: &str| -> Vec<(usize, String)> {
-            errors(&parse_ts(text))
+        let found_in = |text: &str, script_kind: ScriptKind| -> Vec<(usize, String)> {
+            errors(&parse_text(text, script_kind))
                 .iter()
                 .map(|d| {
                     let mapped = crate::diagnostics_parser::map_parse_diagnostic(d);
@@ -7089,6 +7090,7 @@ mod tests {
                 })
                 .collect()
         };
+        let found = |text: &str| found_in(text, ScriptKind::TypeScript);
         assert_eq!(
             found("const o = { a: 1;\n"),
             [
@@ -7155,16 +7157,17 @@ mod tests {
         ] {
             assert_eq!(found(text), [(end, "'{' expected.".to_owned())], "{text}");
         }
-        let jsx = parse_text("const e = <a b= ", ScriptKind::TypeScriptReact);
-        let value: Vec<usize> = errors(&jsx)
-            .iter()
-            .filter(|d| d.code() == EXPECTED_EXPRESSION)
-            .map(|d| d.range().start().get())
-            .collect();
+        // A JSX attribute value is expected at the token, and a tag that does not
+        // end with `>` closes itself.
+        let attribute: Vec<usize> =
+            errors(&parse_text("const e = <a b= ", ScriptKind::TypeScriptReact))
+                .iter()
+                .map(|d| d.range().start().get())
+                .collect();
+        assert_eq!(attribute, [16]);
         assert_eq!(
-            value,
-            [16],
-            "a JSX attribute value is expected at the token"
+            found_in("const e = <a b   ", ScriptKind::TypeScriptReact),
+            [(17, "'/' expected.".to_owned())]
         );
     }
 
