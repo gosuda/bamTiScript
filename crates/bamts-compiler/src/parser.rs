@@ -6421,7 +6421,8 @@ impl Parser {
                     self.expect(TokenKind::Colon, "expected `:`");
                     self.parse_attribute_object()
                 } else {
-                    self.error_here(EXPECTED_TOKEN, "expected with or assert");
+                    // TypeScript names only `with`, which it also expects here.
+                    self.error_here(EXPECTED_TOKEN, "expected `with`");
                     ImportAttributes::default()
                 };
                 while !self.at_eof() && !self.at(TokenKind::RBrace) {
@@ -7222,6 +7223,10 @@ mod tests {
         ] {
             assert_eq!(found(text), [(at, message.to_owned())], "{text}");
         }
+        assert_eq!(
+            found(r#"type T = import("x", { 1 });"#)[0],
+            (23, "'with' expected.".to_owned())
+        );
     }
 
     /// A tag accepts any escape, also in JSX, where the parser scans the template

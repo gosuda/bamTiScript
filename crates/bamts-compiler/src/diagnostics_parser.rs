@@ -483,11 +483,7 @@ mod tests {
                 "expected a string literal",
                 "String literal expected.",
             ),
-            (
-                "BAMTS-P001",
-                "expected with or assert",
-                "expected with or assert",
-            ),
+            ("BAMTS-P001", "expected `with`", "'with' expected."),
             (
                 "BAMTS-L001",
                 "unterminated `string`",
