@@ -320,11 +320,13 @@ fn has_legacy_escape(text: &str) -> bool {
 }
 
 /// Whether a member chain passes through `?.`. A tag cannot do this, and a call
-/// that does is not an assignment target, even at run time.
+/// that does is not an assignment target, even at run time. A `!` stays in the
+/// chain: TypeScript erases it.
 pub(crate) fn in_optional_chain(expression: &Expr) -> bool {
     match expression.data() {
         Expression::Member(member) => member.optional || in_optional_chain(&member.object),
         Expression::Call(call) => call.optional || in_optional_chain(&call.callee),
+        Expression::NonNull(non_null) => in_optional_chain(&non_null.expression),
         _ => false,
     }
 }
@@ -1579,8 +1581,12 @@ impl Walker<'_> {
                 }
             }
             AssignmentTarget::Invalid(expression) => {
-                // Annex B keeps `f() = 1` a runtime error in sloppy code.
-                if context.strict || !matches!(expression.data(), Expression::Call(_)) {
+                // Annex B keeps `f() = 1` a runtime error in sloppy code, but not a
+                // call in an optional chain.
+                if context.strict
+                    || !matches!(expression.data(), Expression::Call(_))
+                    || in_optional_chain(expression)
+                {
                     self.error(target.range(), "this cannot be assigned to");
                 }
                 self.expression(expression, context);
@@ -1610,9 +1616,11 @@ impl Walker<'_> {
     /// A target inside a pattern. Annex B covers `f() = 1` alone, so a call here
     /// is an early error in sloppy code too.
     fn pattern_target(&mut self, target: &AssignmentTargetNode, context: Context) {
+        // `target` reports a call in an optional chain itself.
         if !context.strict
             && let AssignmentTarget::Invalid(expression) = target.data()
             && matches!(expression.data(), Expression::Call(_))
+            && !in_optional_chain(expression)
         {
             self.error(target.range(), "this cannot be assigned to");
         }
@@ -2321,6 +2329,30 @@ mod tests {
             "({ a: f().x } = {});",
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    /// Annex B keeps a plain call a target in sloppy code, but Node refuses a call
+    /// in an optional chain before the program runs.
+    #[test]
+    fn a_call_in_an_optional_chain_is_never_a_target() {
+        for source in [
+            "a?.b() = 1;",
+            "f?.() = 1;",
+            "a.b?.c() += 1;",
+            "a?.b()++;",
+            "--a?.b();",
+            "for (a?.b() of []) ;",
+            "for (a?.b() in {}) ;",
+            "a?.b().c = 1;",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in ["(a?.b)() = 1;", "(a?.b)()++;"] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+        for source in ["[a?.b()] = [];", "({ x: a?.b() } = {});"] {
+            assert_eq!(errors(source).len(), 1, "one error for {source}");
         }
     }
 

@@ -5681,7 +5681,8 @@ impl Parser {
                 Node::new(id, range, AssignmentTarget::Identifier(name))
             }
             Expression::Member(member) => {
-                if member.optional {
+                // No link of an optional chain is a target, even past its `?.`.
+                if member.optional || crate::early_errors::in_optional_chain(&member.object) {
                     let original = Node::new(id, range, Expression::Member(member));
                     return Node::new(id, range, AssignmentTarget::Invalid(Box::new(original)));
                 }
