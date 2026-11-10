@@ -12,8 +12,6 @@ pub mod formal_bridge;
 pub mod formal_gates;
 pub(crate) mod fsync;
 pub mod historical;
-#[cfg(unix)]
-pub mod jit_runner;
 pub mod lane;
 pub mod ledger;
 #[path = "../../../formal/ledger_wiring.rs"]
@@ -21,9 +19,6 @@ pub mod ledger_wiring;
 pub mod oracle_pins;
 pub mod oracles;
 pub mod perf;
-pub mod perf_guard;
-pub mod perf_jit;
-pub mod perf_stage0;
 pub mod rebuild;
 pub(crate) mod schema;
 pub mod shard;

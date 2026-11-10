@@ -438,11 +438,6 @@ jobs:
   perf-bh1:
     name: Performance (BH1)
     needs: [quality, preflight, corpus, formal, conformance-accounting]
-    # Fork pull-request code never reaches BH1. After the upstream jobs succeed, run on BH1:
-    # cargo run --locked -p bamts-verification --bin bh1_jit -- provision --repo metaphorics/bamTiScript --pr PR --run RUN_ID --attempt RUN_ATTEMPT --head-sha HEAD_SHA --runner-group-id GROUP_ID
-    # The host tool provisions the unique run-attempt label and a one-job JIT runner.
-    # Its generated job-start hook revalidates the exact run, workflow, same-repository PR,
-    # PR number, and head SHA before GitHub permits any workflow step to execute.
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64, bh1, "bh1-perf-${{ github.run_id }}-${{ github.run_attempt }}"]
     timeout-minutes: 120

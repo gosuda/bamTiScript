@@ -17,8 +17,8 @@
 //! Runner bindings between the parsed key mode and the workflow-declared
 //! runner follow the matrix the four workflows declare:
 //! TypeScript→compiler, test262→interpreter|jit|aot, formal-quint→quint,
-//! formal-lean→lean, formal-redex→redex, and benchmarks→perf.  Runners
-//! that do not name a runtime mode bind
+//! formal-lean→lean, formal-redex→redex.
+//! Runners that do not name a runtime mode bind
 //! [`ExecutionMode::Aot`]: their obligations execute the AOT candidate
 //! substrate, so every (catalog, mode) pair recovers exactly one runner.
 
@@ -106,7 +106,6 @@ pub enum SuiteRunner {
     Quint,
     Lean,
     Redex,
-    Perf,
 }
 
 impl SuiteRunner {
@@ -120,7 +119,6 @@ impl SuiteRunner {
             Self::Quint => "quint",
             Self::Lean => "lean",
             Self::Redex => "redex",
-            Self::Perf => "perf",
         }
     }
 
@@ -131,7 +129,7 @@ impl SuiteRunner {
         match self {
             Self::Interpreter => crate::shard::ExecutionMode::Interpreter,
             Self::Jit => crate::shard::ExecutionMode::Jit,
-            Self::Compiler | Self::Aot | Self::Quint | Self::Lean | Self::Redex | Self::Perf => {
+            Self::Compiler | Self::Aot | Self::Quint | Self::Lean | Self::Redex => {
                 crate::shard::ExecutionMode::Aot
             }
         }
@@ -148,7 +146,6 @@ fn allowed_runners(catalog: &str) -> Result<&'static [SuiteRunner]> {
         "formal-quint" => Ok(&[SuiteRunner::Quint]),
         "formal-lean" => Ok(&[SuiteRunner::Lean]),
         "formal-redex" => Ok(&[SuiteRunner::Redex]),
-        "benchmarks" => Ok(&[SuiteRunner::Perf]),
         _ => Err(VerificationError::new(
             ErrorCode::Usage,
             format!("unknown catalog `{catalog}` for suite selection"),
@@ -222,7 +219,6 @@ fn runner_for_mode(catalog: &str, mode: crate::shard::ExecutionMode) -> Option<S
                     "formal-quint" => SuiteRunner::Quint,
                     "formal-lean" => SuiteRunner::Lean,
                     "formal-redex" => SuiteRunner::Redex,
-                    "benchmarks" => SuiteRunner::Perf,
                     _ => return None,
                 }
             }
@@ -329,10 +325,10 @@ pub struct LogicalObligation {
 /// obligation key and declared observable set, in canonical sorted order.
 ///
 /// TypeScript/test262 identifiers are `authority/runner/case#config#observable`;
-/// formal and target identifiers are `locator::name`; benchmark identifiers
-/// are the plain rule name.  Keys are built injectively: the observable is
-/// folded into the configuration token so one case can carry several
-/// observables without colliding.
+/// formal and target identifiers are `locator::name`, with a plain name
+/// falling back to the `default` configuration.  Keys are built injectively:
+/// the observable is folded into the configuration token so one case can
+/// carry several observables without colliding.
 pub fn materialize_obligations(
     catalog: &str,
     identifiers: &[String],
@@ -1967,7 +1963,7 @@ mod tests {
             .join(", ");
         format!(
             "{{\"schema\": \"{MANIFEST_SCHEMA}\", \"source_ledger_sha256\": \"{source_ledger}\", \
-             \"catalogs\": [{{\"extractor\": {{}}, \"id\": \"benchmarks\", \
+             \"catalogs\": [{{\"extractor\": {{}}, \"id\": \"formal-redex\", \
              \"identifier_count\": {}, \"identifiers\": [{}], \
              \"identifiers_sha256\": \"{}\", \
              \"source\": {{\"pin\": \"p\", \"url\": \"u\", \"digest_algorithm\": \"sha256\", \
@@ -2079,7 +2075,7 @@ mod tests {
             .expect("one worker selects");
         assert_eq!(chosen, worker);
 
-        let harness = select_candidate_binary("benchmarks", BTreeSet::new())
+        let harness = select_candidate_binary("formal-quint", BTreeSet::new())
             .expect("no worker falls back to the harness");
         assert_eq!(
             harness,
@@ -2198,8 +2194,8 @@ mod tests {
     #[test]
     fn manifest_identity_parsing_is_strict() {
         let (scratch, sorted) = manifest_root("identity", &["jit.c", "jit.a", "jit.b"]);
-        let loaded = load_catalog_manifest(&scratch.root, "benchmarks").expect("loads");
-        assert_eq!(loaded.catalog, "benchmarks");
+        let loaded = load_catalog_manifest(&scratch.root, "formal-redex").expect("loads");
+        assert_eq!(loaded.catalog, "formal-redex");
         assert_eq!(loaded.identifiers, sorted);
         assert_eq!(
             loaded.identifiers_sha256,
@@ -2209,7 +2205,7 @@ mod tests {
 
         // Sources-ledger drift is rejected as stale, not parsed over.
         scratch.write("vendor/sources.toml", b"[[source]]\n# drift\n");
-        let error = load_catalog_manifest(&scratch.root, "benchmarks")
+        let error = load_catalog_manifest(&scratch.root, "formal-redex")
             .expect_err("stale sources ledger must fail");
         assert_eq!(error.code(), ErrorCode::Schema);
 
@@ -2222,7 +2218,7 @@ mod tests {
         // duplicate identifier itself is caught by the digest.
         assert!(text.contains("\"jit.a\", \"jit.a\""));
         fs::write(mutated.root.join(schema::MANIFEST_PATH), text).expect("write");
-        assert!(load_catalog_manifest(&mutated.root, "benchmarks").is_err());
+        assert!(load_catalog_manifest(&mutated.root, "formal-redex").is_err());
 
         let (bad_tag, _) = manifest_root("identity-tag", &["jit.a"]);
         let bytes = fs::read(bad_tag.root.join(schema::MANIFEST_PATH)).expect("read");
@@ -2230,7 +2226,7 @@ mod tests {
             .expect("utf8")
             .replace(MANIFEST_SCHEMA, "bamti.other/v9");
         fs::write(bad_tag.root.join(schema::MANIFEST_PATH), text).expect("write");
-        assert!(load_catalog_manifest(&bad_tag.root, "benchmarks").is_err());
+        assert!(load_catalog_manifest(&bad_tag.root, "formal-redex").is_err());
     }
 
     #[test]
@@ -2244,7 +2240,6 @@ mod tests {
             ("formal-quint", "quint", SuiteRunner::Quint),
             ("formal-lean", "lean", SuiteRunner::Lean),
             ("formal-redex", "redex", SuiteRunner::Redex),
-            ("benchmarks", "perf", SuiteRunner::Perf),
         ];
         for (catalog, runner, expected) in declared {
             assert_eq!(
@@ -2257,11 +2252,10 @@ mod tests {
             ("typescript-7.0.2", "aot"),
             ("typescript-7.0.2", "interpreter"),
             ("test262", "compiler"),
-            ("test262", "perf"),
+            ("test262", "quint"),
             ("formal-quint", "lean"),
             ("formal-lean", "quint"),
             ("formal-redex", "compiler"),
-            ("benchmarks", "aot"),
         ] {
             let error = resolve_runner(catalog, runner).expect_err("undeclared runner must fail");
             assert_eq!(error.code(), ErrorCode::Schema, "{catalog}/{runner}");
@@ -2269,8 +2263,8 @@ mod tests {
             assert!(text.contains(catalog) && text.contains(runner), "{text}");
         }
         assert_eq!(
-            resolve_runner("benchmarks", "").expect("sole runner"),
-            SuiteRunner::Perf
+            resolve_runner("formal-redex", "").expect("sole runner"),
+            SuiteRunner::Redex
         );
         assert!(resolve_runner("test262", "").is_err());
         assert_eq!(
@@ -2280,7 +2274,7 @@ mod tests {
             ErrorCode::Usage
         );
         assert_eq!(
-            resolve_runner("benchmarks", "Perf")
+            resolve_runner("formal-redex", "Redex")
                 .expect_err("case mismatch")
                 .code(),
             ErrorCode::Schema
@@ -2293,12 +2287,12 @@ mod tests {
             "jit.a", "jit.b", "jit.c", "jit.d", "jit.e", "jit.f", "jit.g",
         ];
         let obligations = materialize_obligations(
-            "benchmarks",
+            "formal-redex",
             &identifiers
                 .iter()
                 .map(|entry| (*entry).to_owned())
                 .collect::<Vec<_>>(),
-            SuiteRunner::Perf,
+            SuiteRunner::Redex,
             "ubuntu-latest",
         )
         .expect("obligations");
@@ -2347,7 +2341,7 @@ mod tests {
             required_modes("test262").expect("modes"),
             [Mode::Interpreter, Mode::Jit, Mode::Aot]
         );
-        for catalog in ["typescript-7.0.2", "formal-redex", "benchmarks"] {
+        for catalog in ["typescript-7.0.2", "formal-redex"] {
             assert_eq!(required_modes(catalog).expect("modes"), [Mode::Aot]);
         }
     }
@@ -2356,7 +2350,7 @@ mod tests {
     fn suite_never_mints_pass_without_exact_observables() {
         fn key(case: &str) -> ObligationKey {
             ObligationKey::new(
-                "benchmarks",
+                "formal-redex",
                 case,
                 "default",
                 ExecutionMode::Aot,
@@ -2434,7 +2428,7 @@ mod tests {
             .ancestors()
             .find(|candidate| candidate.join(".git").is_dir())
             .expect("fixture git repository");
-        current_run_binding(repository, "benchmarks").expect("current binding")
+        current_run_binding(repository, "formal-redex").expect("current binding")
     }
 
     fn write_shard(root: &Path, name: &str, keys: &[ObligationKey], spec: ShardSpec) -> PathBuf {
@@ -2500,7 +2494,7 @@ mod tests {
         );
         let root = scratch.root.clone();
         let obligations =
-            materialize_obligations("benchmarks", &sorted, SuiteRunner::Perf, "ubuntu-latest")
+            materialize_obligations("formal-redex", &sorted, SuiteRunner::Redex, "ubuntu-latest")
                 .expect("obligations");
         let keys: Vec<ObligationKey> = obligations.into_iter().map(|entry| entry.key).collect();
         let receipts = root.join("receipts");
@@ -2513,12 +2507,12 @@ mod tests {
             );
         }
         let out = root.join("merged.jsonl");
-        let report = merge_for_tests(&root, "benchmarks", &receipts, &out, PublishMode::Replace)
+        let report = merge_for_tests(&root, "formal-redex", &receipts, &out, PublishMode::Replace)
             .expect("complete merge");
         assert_eq!(report.rows, keys.len());
         assert_eq!(report.documents, 3);
         assert_eq!(report.platform, "ubuntu-latest");
-        assert_eq!(report.runner, "perf");
+        assert_eq!(report.runner, "redex");
         assert_eq!(report.states.get("BLOCKING_FAIL"), Some(&keys.len()));
         assert_eq!(
             report.obligation_set_digest,
@@ -2539,7 +2533,7 @@ mod tests {
         assert!(
             merge_for_tests(
                 &root,
-                "benchmarks",
+                "formal-redex",
                 &partial,
                 &root.join("out.jsonl"),
                 PublishMode::Replace
@@ -2601,7 +2595,7 @@ mod tests {
         }
         let error = merge_for_tests(
             &root,
-            "benchmarks",
+            "formal-redex",
             &stale,
             &root.join("out2.jsonl"),
             PublishMode::Replace,
@@ -2621,7 +2615,7 @@ mod tests {
             );
         }
         let foreign = ObligationKey::new(
-            "benchmarks",
+            "formal-redex",
             "aaa.foreign",
             "default",
             ExecutionMode::Aot,
@@ -2639,7 +2633,7 @@ mod tests {
         assert!(
             merge_for_tests(
                 &root,
-                "benchmarks",
+                "formal-redex",
                 &extra,
                 &root.join("out3.jsonl"),
                 PublishMode::Replace
@@ -2655,7 +2649,7 @@ mod tests {
             .iter()
             .map(|identifier| {
                 ObligationKey::new(
-                    "benchmarks",
+                    "formal-redex",
                     identifier,
                     "default",
                     ExecutionMode::Jit,
@@ -2693,7 +2687,7 @@ mod tests {
         assert_eq!(
             merge_for_tests(
                 &root,
-                "benchmarks",
+                "formal-redex",
                 &wrong_mode,
                 &root.join("out4.jsonl"),
                 PublishMode::Replace
@@ -2709,7 +2703,7 @@ mod tests {
         let (scratch, sorted) = manifest_root("two-half", &["jit.a", "jit.b", "jit.c", "jit.d"]);
         let root = scratch.root.clone();
         let obligations =
-            materialize_obligations("benchmarks", &sorted, SuiteRunner::Perf, "ubuntu-latest")
+            materialize_obligations("formal-redex", &sorted, SuiteRunner::Redex, "ubuntu-latest")
                 .expect("obligations");
         let keys: Vec<ObligationKey> = obligations.into_iter().map(|entry| entry.key).collect();
         let receipts = root.join("two");
@@ -2722,12 +2716,12 @@ mod tests {
             );
         }
         let out = root.join("two-halves.jsonl");
-        let report = merge_for_tests(&root, "benchmarks", &receipts, &out, PublishMode::Replace)
+        let report = merge_for_tests(&root, "formal-redex", &receipts, &out, PublishMode::Replace)
             .expect("two-half closure");
         assert_eq!(report.documents, 2);
         assert_eq!(report.rows, keys.len());
         let canonical = fs::read(&out).expect("canonical output");
-        merge_for_tests(&root, "benchmarks", &receipts, &out, PublishMode::Replace)
+        merge_for_tests(&root, "formal-redex", &receipts, &out, PublishMode::Replace)
             .expect("deterministic replacement");
         assert_eq!(fs::read(&out).expect("replacement"), canonical);
 
@@ -2747,7 +2741,14 @@ mod tests {
         )
         .expect("shard 1");
         assert!(
-            merge_for_tests(&root, "benchmarks", &duplicate, &out, PublishMode::Replace).is_err(),
+            merge_for_tests(
+                &root,
+                "formal-redex",
+                &duplicate,
+                &out,
+                PublishMode::Replace
+            )
+            .is_err(),
             "duplicate row must be rejected"
         );
         assert_eq!(
@@ -2760,18 +2761,18 @@ mod tests {
     #[test]
     fn missing_adapter_records_typed_blocking_rows_and_continues() {
         assert!(
-            std::env::var_os("BAMTS_SUITE_PERF_ADAPTER").is_none(),
-            "test requires no injected perf adapter"
+            std::env::var_os("BAMTS_SUITE_REDEX_ADAPTER").is_none(),
+            "test requires no injected redex adapter"
         );
         let (scratch, _) = manifest_root("closed", &["jit.a", "jit.b"]);
         let receipt = scratch.root.join("receipt.jsonl");
         let report = run_suite(
             &scratch.root,
             &SuiteRunRequest {
-                catalog: "benchmarks".to_owned(),
+                catalog: "formal-redex".to_owned(),
                 shard: ShardSpec::unsharded(),
                 receipt: receipt.clone(),
-                runner: "perf".to_owned(),
+                runner: "redex".to_owned(),
                 platform: "ubuntu-latest".to_owned(),
                 execution: ExecutionBinding::local_for_tests(),
             },
@@ -2798,22 +2799,22 @@ mod tests {
         run_suite(
             &scratch.root,
             &SuiteRunRequest {
-                catalog: "benchmarks".to_owned(),
+                catalog: "formal-redex".to_owned(),
                 shard: ShardSpec::unsharded(),
                 receipt: baseline.clone(),
-                runner: "perf".to_owned(),
+                runner: "redex".to_owned(),
                 platform: "ubuntu-latest".to_owned(),
                 execution: ExecutionBinding::local_for_tests(),
             },
         )
         .expect("baseline run");
-        // Every benchmark names its own observable, which would give each row a
+        // Every case names its own observable, which would give each row a
         // facet, and so a family, of its own. Share one so rows can group.
         let mut text = fs::read_to_string(&baseline).expect("baseline text");
         for identifier in identifiers {
             text = text.replace(
                 &format!("\"observables\":[\"{identifier}\"]"),
-                "\"observables\":[\"perf\"]",
+                "\"observables\":[\"redex\"]",
             );
         }
         let detail = text
@@ -2845,8 +2846,8 @@ mod tests {
 
     fn recount_request(baseline: &Path, family: &str) -> SuiteRecountRequest {
         SuiteRecountRequest {
-            catalog: "benchmarks".to_owned(),
-            runner: "perf".to_owned(),
+            catalog: "formal-redex".to_owned(),
+            runner: "redex".to_owned(),
             baseline: baseline.to_owned(),
             family: family.to_owned(),
             guard: 0,
@@ -2892,7 +2893,7 @@ mod tests {
                 let is_row = value["body"]["key"].to_string().contains("jit.c");
                 if is_row {
                     value["body"]["state"] = serde_json::Value::from("PASS");
-                    value["body"]["artifacts"] = serde_json::json!({"perf": "0".repeat(64)});
+                    value["body"]["artifacts"] = serde_json::json!({"redex": "0".repeat(64)});
                 }
                 value.to_string()
             })
@@ -2919,14 +2920,14 @@ mod tests {
         let rows: Vec<ReportRow> = (0..10)
             .map(|index| {
                 let key = ObligationKey::new(
-                    "benchmarks",
+                    "formal-redex",
                     format!("case-{index}"),
                     "default",
                     ExecutionMode::Interpreter,
                     "ubuntu-latest",
                 )
                 .expect("key");
-                ReportRow::new(key, "perf", TerminalState::Pass, "")
+                ReportRow::new(key, "redex", TerminalState::Pass, "")
             })
             .collect();
         for count in 0..=12 {

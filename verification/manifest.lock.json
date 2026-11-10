@@ -248714,7 +248714,7 @@
         "pin": "catalog-inputs/v1",
         "url": "local://verification/catalog-inputs.json",
         "digest_algorithm": "sha256",
-        "digest": "fa2586ac403e9e5db9e7e28a7586bbab575b7a8d6bdb4dc39b2ec4e21e44eae0"
+        "digest": "56c588c7f69135962e3338a7ca9fd447302903af5989d74e74733ff0a4e7c819"
       }
     },
     {
@@ -248830,7 +248830,7 @@
         "pin": "catalog-inputs/v1",
         "url": "local://verification/catalog-inputs.json",
         "digest_algorithm": "sha256",
-        "digest": "fa2586ac403e9e5db9e7e28a7586bbab575b7a8d6bdb4dc39b2ec4e21e44eae0"
+        "digest": "56c588c7f69135962e3338a7ca9fd447302903af5989d74e74733ff0a4e7c819"
       }
     },
     {
@@ -249016,33 +249016,7 @@
         "pin": "catalog-inputs/v1",
         "url": "local://verification/catalog-inputs.json",
         "digest_algorithm": "sha256",
-        "digest": "fa2586ac403e9e5db9e7e28a7586bbab575b7a8d6bdb4dc39b2ec4e21e44eae0"
-      }
-    },
-    {
-      "extractor": {
-        "kind": "closed-plan-inventory",
-        "section": "Performance evidence"
-      },
-      "id": "benchmarks",
-      "identifier_count": 9,
-      "identifiers": [
-        "jit.compile-cost",
-        "jit.payback",
-        "jit.queue-tail-latency",
-        "stage0.aot-no-jit-allocator",
-        "stage0.correctness",
-        "stage0.event-completeness",
-        "stage0.integrity",
-        "stage0.no-rwx",
-        "stage1.pre-registered-regression"
-      ],
-      "identifiers_sha256": "8c2dbef8a9ea7a8ab3973cf5a006da16e93678fa2a875cad4d4b5ece1c199a22",
-      "source": {
-        "pin": "catalog-inputs/v1",
-        "url": "local://verification/catalog-inputs.json",
-        "digest_algorithm": "sha256",
-        "digest": "fa2586ac403e9e5db9e7e28a7586bbab575b7a8d6bdb4dc39b2ec4e21e44eae0"
+        "digest": "56c588c7f69135962e3338a7ca9fd447302903af5989d74e74733ff0a4e7c819"
       }
     }
   ]

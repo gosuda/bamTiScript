@@ -71,14 +71,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bamts-bench"
-version = "0.2.0"
-dependencies = [
- "bamts-verification",
- "serde_json",
-]
-
-[[package]]
 name = "bamts-bytecode"
 version = "0.2.0"
 

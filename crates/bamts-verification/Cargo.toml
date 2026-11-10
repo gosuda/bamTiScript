@@ -47,10 +47,6 @@ name = "perf_budget"
 path = "src/bin/perf_budget.rs"
 
 [[bin]]
-name = "bh1_jit"
-path = "src/bin/bh1_jit.rs"
-
-[[bin]]
 name = "ts_lane_worker"
 path = "src/bin/ts_lane_worker.rs"
 

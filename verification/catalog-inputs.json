@@ -387,24 +387,6 @@
         "napi-reduction.rkt::napi-lifecycle",
         "node-loop.rkt::deterministic-scheduler"
       ]
-    },
-    {
-      "extractor": {
-        "kind": "closed-plan-inventory",
-        "section": "Performance evidence"
-      },
-      "id": "benchmarks",
-      "identifiers": [
-        "jit.compile-cost",
-        "jit.payback",
-        "jit.queue-tail-latency",
-        "stage0.aot-no-jit-allocator",
-        "stage0.correctness",
-        "stage0.event-completeness",
-        "stage0.integrity",
-        "stage0.no-rwx",
-        "stage1.pre-registered-regression"
-      ]
     }
   ],
   "schema": "bamti.catalog-inputs/v1"

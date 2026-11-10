@@ -23,8 +23,6 @@ use bamts_verification::{
     },
     formal_gates::audit_formal_gates,
     ledger::verify_ledger_g0,
-    perf_guard::{self, Verdict},
-    perf_jit, perf_stage0,
     rebuild::{RebuildMode, discover_receipts, rebuild_ledger},
     shard::ShardSpec,
     source_fetch::{CommandBackend, materialize_named},
@@ -71,13 +69,6 @@ enum Command {
     },
     DiagnosticsRegenerate {
         check: bool,
-    },
-    PerfStage0,
-    PerfJit,
-    PerfCompare {
-        rules: PathBuf,
-        baseline: PathBuf,
-        scorecard: PathBuf,
     },
     FormalAudit(Vec<Gate>),
     RegenerateFixtures,
@@ -133,13 +124,6 @@ fn dispatch(root: &Path, command: Command) -> Result<()> {
         Command::CompletionVerify { scope } => verify_completion_command(root, &scope),
         Command::CompletionRegenerate { check } => regenerate_completion_command(root, check),
         Command::DiagnosticsRegenerate { check } => regenerate_diagnostics(root, check),
-        Command::PerfStage0 => run_perf_stage0(),
-        Command::PerfJit => run_perf_jit(),
-        Command::PerfCompare {
-            rules,
-            baseline,
-            scorecard,
-        } => compare_perf(&rules, &baseline, &scorecard),
         Command::FormalAudit(gates) => audit_formal(root, &gates),
         Command::RegenerateFixtures => regenerate_fixtures(root),
         Command::SourceFetch { name, destination } => fetch_source(root, &name, &destination),
@@ -196,7 +180,6 @@ fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Comman
         "ledger" => parse_ledger_command(&mut arguments),
         "completion" => parse_completion_command(&mut arguments),
         "diagnostics" => parse_diagnostics_command(&mut arguments),
-        "perf" => parse_perf_command(&mut arguments),
         "formal" => parse_formal_command(&mut arguments),
         "source" => parse_source_command(&mut arguments),
         "unicode" => parse_unicode_command(&mut arguments),
@@ -546,35 +529,6 @@ fn parse_diagnostics_command(arguments: &mut impl Iterator<Item = OsString>) -> 
     let flags = parse_flags(arguments, &[], &["--check"])?;
     let check = flags.switches.contains("--check");
     Ok(Command::DiagnosticsRegenerate { check })
-}
-
-fn parse_perf_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
-    let subcommand = required_argument(arguments, "perf subcommand")?;
-    match subcommand.as_str() {
-        "stage0" => {
-            reject_extra_arguments(arguments, &[])?;
-            Ok(Command::PerfStage0)
-        }
-        "jit" => {
-            reject_extra_arguments(arguments, &[])?;
-            Ok(Command::PerfJit)
-        }
-        "compare" => {
-            let flags = parse_flags(arguments, &["--rules", "--baseline", "--scorecard"], &[])?;
-            let rules = PathBuf::from(required_flag(&flags.values, "--rules", "perf compare")?);
-            let baseline =
-                PathBuf::from(required_flag(&flags.values, "--baseline", "perf compare")?);
-            let scorecard =
-                PathBuf::from(required_flag(&flags.values, "--scorecard", "perf compare")?);
-            Ok(Command::PerfCompare {
-                rules,
-                baseline,
-                scorecard,
-            })
-        }
-        _ if subcommand.starts_with("--") => Err(usage(format!("unknown flag `{subcommand}`"))),
-        _ => Err(usage(format!("unknown perf subcommand `{subcommand}`"))),
-    }
 }
 
 /// Parsed `--flag value` pairs and bare `--flag` switches, in any order.
@@ -997,80 +951,6 @@ fn diagnostic_catalog_error(error: CatalogError) -> VerificationError {
     }
 }
 
-fn run_perf_stage0() -> Result<()> {
-    let receipt = perf_stage0::run();
-    emit_perf_receipt("STAGE0", receipt)
-}
-
-fn run_perf_jit() -> Result<()> {
-    let receipt = perf_jit::run().map_err(|error| {
-        VerificationError::new(
-            ErrorCode::ToolFailed,
-            format!("perf jit measurement failed: {error:#}"),
-        )
-    })?;
-    let receipt = serde_json::from_str(&receipt).map_err(|error| {
-        VerificationError::new(
-            ErrorCode::Json,
-            format!("perf jit returned invalid JSON: {error}"),
-        )
-    })?;
-    emit_perf_receipt("JIT", receipt)
-}
-
-fn emit_perf_receipt(name: &str, receipt: serde_json::Value) -> Result<()> {
-    let state = receipt
-        .get("state")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            VerificationError::new(
-                ErrorCode::Schema,
-                format!("perf {} receipt omits `state`", name.to_ascii_lowercase()),
-            )
-        })?;
-    if state != "ACCEPTED" {
-        return Err(VerificationError::new(
-            ErrorCode::ToolFailed,
-            format!(
-                "perf {} receipt state={state}: {receipt}",
-                name.to_ascii_lowercase()
-            ),
-        ));
-    }
-    let receipt = serde_json::to_string(&receipt).map_err(|error| {
-        VerificationError::new(
-            ErrorCode::Json,
-            format!(
-                "cannot encode perf {} receipt: {error}",
-                name.to_ascii_lowercase()
-            ),
-        )
-    })?;
-    emit(&format!("PERF {name} PASS receipt={receipt}\n"))
-}
-
-fn compare_perf(rules: &Path, baseline: &Path, scorecard: &Path) -> Result<()> {
-    match perf_guard::evaluate_stage1_guard_from_paths(rules, baseline, scorecard).map_err(
-        |error| {
-            VerificationError::new(
-                ErrorCode::ToolFailed,
-                format!("perf comparison failed: {error}"),
-            )
-        },
-    )? {
-        Verdict::Pass {
-            current_median,
-            bound,
-        } => emit(&format!(
-            "PERF COMPARE PASS current_median={current_median} bound={bound}\n"
-        )),
-        Verdict::Fail(detail) => Err(VerificationError::new(
-            ErrorCode::SetMismatch,
-            format!("perf comparison rejected: {detail}"),
-        )),
-    }
-}
-
 fn ordered_report_checks(reports: Vec<GateReport>, expected: &[Gate]) -> Result<Vec<usize>> {
     if reports.len() != expected.len() {
         return Err(VerificationError::new(
@@ -1292,6 +1172,17 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "bamts-verification: E_USAGE: unknown command `leaf-evidence`"
+        );
+    }
+
+    #[test]
+    fn rejects_perf_command() {
+        let error =
+            parse(&["bamts-verification", "perf", "stage0"]).expect_err("perf command is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert_eq!(
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown command `perf`"
         );
     }
 
@@ -1663,7 +1554,7 @@ mod tests {
             "--catalog",
             "test262",
             "--catalog",
-            "benchmarks",
+            "test262",
             "--receipts",
             "receipts",
             "--out",

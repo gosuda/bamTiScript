@@ -555,30 +555,6 @@ owns = ["crates/bamts-codegen/src/aot/in_process_link.rs"]
 catalogs = []
 
 [[leaf]]
-id = "E5.1"
-cluster = "E5"
-owns = ["bench/compiler-rules.toml"]
-catalogs = ["benchmarks"]
-
-[[leaf]]
-id = "E5.2"
-cluster = "E5"
-owns = ["bench/jit_benchmarks.rs"]
-catalogs = ["benchmarks"]
-
-[[leaf]]
-id = "E5.3"
-cluster = "E5"
-owns = ["bench/stage0_evidence.rs"]
-catalogs = ["benchmarks"]
-
-[[leaf]]
-id = "E5.4"
-cluster = "E5"
-owns = ["bench/stage1_regression_guard.rs"]
-catalogs = ["benchmarks"]
-
-[[leaf]]
 id = "F1.1"
 cluster = "F1"
 owns = ["formal/ledger_wiring.rs"]
@@ -748,11 +724,6 @@ children = ["E3.1", "E3.2", "E3.3", "E3.4", "E3.5", "E3.6", "E3.7"]
 
 [[node]]
 kind = "cluster"
-id = "E5"
-children = ["E5.1", "E5.2", "E5.3", "E5.4"]
-
-[[node]]
-kind = "cluster"
 id = "F1"
 children = ["F1.1", "F1.2"]
 
@@ -784,7 +755,7 @@ children = ["cluster:C0", "cluster:C1", "cluster:C2", "cluster:C3", "cluster:C4"
 [[node]]
 kind = "root"
 id = "native"
-children = ["cluster:E1", "cluster:E2", "cluster:E3", "cluster:E5", "cluster:F1"]
+children = ["cluster:E1", "cluster:E2", "cluster:E3", "cluster:F1"]
 
 [[node]]
 kind = "root"

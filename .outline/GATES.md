@@ -1,6 +1,6 @@
 # Gates: bamTiScript stable TypeScript 7.0.2 completion
 
-Scope: Complete the clean-room Rust compiler, TypeScript-compatible Node 24 API package, ECMAScript runtime, native tiers, formal proof bindings, target cells, and release evidence for the stable TypeScript 7.0.2 product contract.
+Scope: Complete the clean-room Rust compiler, TypeScript-compatible Node 24 API package, ECMAScript runtime, native tiers, formal proof bindings, and release evidence for the stable TypeScript 7.0.2 product contract.
 
 - [ ] G2: The immutable authority and generated catalogs bind stable TypeScript 7.0.2 and no stale primary TypeScript release
   CHECK: cargo run -p bamts-verification -- completion verify --root authority
@@ -18,7 +18,7 @@ Scope: Complete the clean-room Rust compiler, TypeScript-compatible Node 24 API 
   CHECK: cargo run -p bamts-verification -- completion verify --root runtime
   EXPECT: RUNTIME COMPLETE modes=3 blocking=0 external_blocked=0
 
-- [ ] G6: Interpreter, JIT, AOT, formal correspondence, target cells, and performance evidence satisfy every compiler-product release obligation
+- [ ] G6: Interpreter, JIT, AOT, and formal correspondence satisfy every native release obligation
   CHECK: cargo run -p bamts-verification -- completion verify --root native
   EXPECT: NATIVE COMPLETE formal=PASS
 

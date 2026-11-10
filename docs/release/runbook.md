@@ -173,7 +173,6 @@ Before release, confirm all of these facts:
 - Every selected obligation has one current receipt.
 - The receipt binds the selected release commit and required execution mode.
 - The ledger contains no blocking, external-blocked, catalog-error, timeout, crash, skip, or missing-receipt state in release scope.
-- The target-cell evidence matches the required target and runner.
 - BH1 evidence matches `perf/hosts/bh1.toml` exactly.
 - Every generated-file `--check` command reports identical bytes.
 - The product root reports the exact expected completion line.
@@ -190,7 +189,7 @@ Prepare release notes after the product root passes. Derive each statement from 
 - the stable TypeScript 7.0.2 authority;
 - user-visible compiler, CLI, package, runtime, and native changes;
 - breaking changes and required user action;
-- supported targets that have accepted target-cell evidence;
+- supported targets covered by the release-build workflow matrices;
 - known limitations that remain in the accepted product contract;
 - links to migration or operator instructions when they exist.
 

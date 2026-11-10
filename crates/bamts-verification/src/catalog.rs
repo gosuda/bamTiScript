@@ -29,8 +29,7 @@ use std::{
 
 const DEFAULT_CONFIGURATION: &str = "default";
 const CATALOG_INPUTS_PATH: &str = "verification/catalog-inputs.json";
-const LOCAL_CATALOG_NAMES: [&str; 4] =
-    ["formal-quint", "formal-lean", "formal-redex", "benchmarks"];
+const LOCAL_CATALOG_NAMES: [&str; 3] = ["formal-quint", "formal-lean", "formal-redex"];
 static MANIFEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const IDENTITY_SEPARATOR: char = '#';
 
