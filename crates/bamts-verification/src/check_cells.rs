@@ -421,6 +421,44 @@ fn is_option_directive_line(line: &str) -> bool {
     rest[name_len..].trim_start().starts_with(':')
 }
 
+/// The preamble text is directive-stripped already, so only comments,
+/// blanks, strings, and compiled lines remain; block comments may span
+/// lines, and a quote hides comment openers.
+fn preamble_has_compiled_content(text: &str) -> bool {
+    let stripped = strip_directive_lines(text);
+    let bytes = stripped.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            b'"' | b'\'' | b'`' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    index += usize::from(bytes[index] == b'\\') + 1;
+                }
+                index += 1;
+            }
+            byte if byte.is_ascii_whitespace() => index += 1,
+            _ => return true,
+        }
+    }
+    false
+}
+
 /// Split a case blob at `// @filename:` boundaries.
 ///
 /// A directive must be a whole-line comment. Text before the first directive
@@ -514,7 +552,7 @@ pub fn split_case_units(logical_path: &str, text: &str) -> Vec<CaseUnit> {
                 // phantom `//// [<case>.ts]` section and emits a phantom
                 // `//// [<case>.js]`/`.d.ts` output that shifts every
                 // baseline section the emit facets compare.
-                if end > 0 && !strip_directive_lines(&text[..end]).trim().is_empty() {
+                if end > 0 && preamble_has_compiled_content(&text[..end]) {
                     push_unit(case_name.to_owned(), &text[..end], &mut units);
                 }
             }
@@ -4480,6 +4518,64 @@ error TS5107: Option 'moduleResolution=classic' is deprecated and will stop func
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].virtual_path, "tests/cases/compiler/a.ts");
         assert_eq!(units[0].text, "const b: string = a;\n");
+    }
+
+    /// Upstream drops a comment-only or directive-only preamble before the
+    /// first `@filename:` marker: global settings are not a compiled unit, so
+    /// the first baseline section is the first named file
+    /// (`exportDefaultProperty2.types` opens with `=== a.ts ===`, no
+    /// `=== exportDefaultProperty2.ts ===`). A preamble holding code does
+    /// keep the implicit case-named unit.
+    #[test]
+    fn comment_only_preamble_is_not_a_unit() {
+        let case = "\
+// @module: commonjs
+// @target: es2015
+// This test is just like exportEqualsProperty2, but with `export default`.
+
+// @filename: a.ts
+class C {
+    static B: number;
+}
+
+// @filename: b.ts
+import B from \"./a\";
+";
+        let units = split_case_units("tests/cases/compiler/exportDefaultProperty2.ts", case);
+        assert_eq!(units.len(), 2, "{units:#?}");
+        assert_eq!(units[0].display_name, "a.ts");
+        assert_eq!(units[1].display_name, "b.ts");
+
+        let compiled = "let x = 1;\n// @filename: b.ts\nlet y = 2;\n";
+        let units = split_case_units("tests/cases/compiler/preambleCode.ts", compiled);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].display_name, "preambleCode.ts");
+        assert_eq!(units[1].display_name, "b.ts");
+    }
+
+    /// Code on a preamble line keeps the implicit unit even when a block
+    /// comment follows it on the same line or opens after it and closes
+    /// later, and a `/*` inside a string literal or after `//` opens no
+    /// comment.
+    #[test]
+    fn preamble_block_comment_edges() {
+        let cases: [(&str, usize); 4] = [
+            ("let x = 1; /* note */\n// @filename: b.ts\nlet y = 2;\n", 2),
+            (
+                "let x = 1; /* open\nstill open */\n// @filename: b.ts\nlet y = 2;\n",
+                2,
+            ),
+            ("const s = \"a /* b\";\n// @filename: b.ts\nlet y = 2;\n", 2),
+            ("// note /* not open\n// @filename: b.ts\nlet y = 2;\n", 1),
+        ];
+        for (index, (case, expected)) in cases.into_iter().enumerate() {
+            let units = split_case_units(&format!("tests/cases/compiler/edge{index}.ts"), case);
+            assert_eq!(
+                units.len(),
+                expected,
+                "case {index}: {case:?} -> {units:#?}"
+            );
+        }
     }
 
     #[test]
