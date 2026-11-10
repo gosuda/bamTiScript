@@ -2057,7 +2057,12 @@ impl Parser {
             let token = self.bump();
             Some(self.ident_from(token))
         } else {
-            if require_name && !self.at(TokenKind::LBrace) && !self.at(TokenKind::KwExtends) {
+            // At the end of the text, TypeScript reports only the missing `{`.
+            if require_name
+                && !self.at(TokenKind::LBrace)
+                && !self.at(TokenKind::KwExtends)
+                && !self.at_eof()
+            {
                 self.error_here(EXPECTED_IDENTIFIER, "expected a class name");
             }
             None
@@ -2072,6 +2077,11 @@ impl Parser {
             }
             if self.at(TokenKind::KwExtends) && extends.is_none() {
                 self.bump();
+                // A heritage list ends at the end of the text, with no missing
+                // element.
+                if self.at_eof() {
+                    break;
+                }
                 let expression = self.parse_lhs_expression(LhsContext::Expression);
                 let type_arguments = self.try_parse_type_arguments_in_heritage();
                 extends = Some(ClassHeritage {
@@ -2083,7 +2093,7 @@ impl Parser {
                 self.note_typescript_syntax(range);
                 self.bump();
                 loop {
-                    if self.is_cancelled() {
+                    if self.is_cancelled() || self.at_eof() {
                         break;
                     }
                     implements.push(self.parse_type());
@@ -2468,7 +2478,9 @@ impl Parser {
         let mut extends = Vec::new();
         if self.eat(TokenKind::KwExtends).is_some() {
             loop {
-                if self.is_cancelled() {
+                // A heritage list ends at the end of the text, with no missing
+                // element.
+                if self.is_cancelled() || self.at_eof() {
                     break;
                 }
                 let entity = self.parse_entity_name();
@@ -7131,6 +7143,18 @@ mod tests {
             found("declare let a: any; a?.   // c"),
             [(30, "Identifier expected.".to_owned())]
         );
+        // At the end of the text, a class has no missing name, and a heritage
+        // list has no missing element.
+        for (text, end) in [
+            ("class   // c", 12),
+            ("class C extends   // c", 22),
+            ("class C implements   // c", 25),
+            ("class C implements A,   // c", 28),
+            ("interface I extends   // c", 26),
+            ("interface I extends A,   // c", 29),
+        ] {
+            assert_eq!(found(text), [(end, "'{' expected.".to_owned())], "{text}");
+        }
         let jsx = parse_text("const e = <a b= ", ScriptKind::TypeScriptReact);
         let value: Vec<usize> = errors(&jsx)
             .iter()
