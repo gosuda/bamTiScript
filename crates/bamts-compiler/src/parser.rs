@@ -4043,7 +4043,7 @@ impl Parser {
                         }),
                     )
                 } else {
-                    let property = self.parse_member_property_name();
+                    let property = self.parse_optional_member_property_name();
                     self.node(
                         start,
                         Expression::Member(MemberExpression {
@@ -4055,7 +4055,7 @@ impl Parser {
                 }
             }
             _ => {
-                let property = self.parse_member_property_name();
+                let property = self.parse_optional_member_property_name();
                 self.node(
                     start,
                     Expression::Member(MemberExpression {
@@ -4066,6 +4066,16 @@ impl Parser {
                 )
             }
         }
+    }
+
+    /// The name after `?.`. TypeScript reports a missing one at the token, also at
+    /// the end of the text.
+    fn parse_optional_member_property_name(&mut self) -> MemberProperty {
+        if self.at(TokenKind::PrivateIdentifier) || is_any_word(self.kind()) {
+            return self.parse_member_property_name();
+        }
+        self.error_at_token(EXPECTED_IDENTIFIER, "expected a property name");
+        MemberProperty::Named(self.missing_ident())
     }
 
     fn parse_member_property_name(&mut self) -> MemberProperty {
@@ -7094,6 +7104,11 @@ mod tests {
         assert_eq!(
             found("/* 😀 */ a.  // c"),
             [(11, "Identifier expected.".to_owned())]
+        );
+        // After `?.`, a missing name is reported at the token.
+        assert_eq!(
+            found("declare let a: any; a?.   // c"),
+            [(30, "Identifier expected.".to_owned())]
         );
         let jsx = parse_text("const e = <a b= ", ScriptKind::TypeScriptReact);
         let value: Vec<usize> = errors(&jsx)
