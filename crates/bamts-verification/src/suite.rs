@@ -253,7 +253,6 @@ pub struct RunFilterOptions {
 pub enum CiMode {
     Pr,
     Nightly,
-    WeeklyAudit,
 }
 
 /// Options for [`run_ci`].
@@ -570,7 +569,7 @@ pub fn run_suite_with_telemetry(
 /// CI entrypoint: same filters, mode retained for future policy differences.
 pub fn run_ci(options: &CiOptions) -> Result<SuiteRunReport> {
     match options.mode {
-        CiMode::Pr | CiMode::Nightly | CiMode::WeeklyAudit => run_suite(
+        CiMode::Pr | CiMode::Nightly => run_suite(
             &options.workspace_root,
             &options.snapshot_root,
             &options.filters,

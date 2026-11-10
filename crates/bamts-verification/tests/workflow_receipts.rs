@@ -46,7 +46,7 @@ fn compiler_receipt_jobs_use_pinned_authority_and_shared_tools() {
         path: String,
     }
 
-    for name in ["ci.yml", "nightly.yml", "weekly-audit.yml"] {
+    for name in ["ci.yml", "nightly.yml"] {
         let parsed: Workflow = serde_saphyr::from_str(&workflow(name))
             .unwrap_or_else(|error| panic!("cannot parse {name}: {error}"));
         let producer = parsed.jobs.get("preflight").expect("preflight job");
@@ -128,12 +128,6 @@ fn receipt_workflows_bind_attempt_and_merge_complete_matrices() {
             "verification/evidence/nightly-merged/",
             30,
         ),
-        (
-            "weekly-audit.yml",
-            "verification/evidence/weekly/",
-            "verification/evidence/weekly-merged/",
-            30,
-        ),
     ] {
         let text = workflow(name);
         let retention_line = format!("retention-days: {retention}");
@@ -166,7 +160,7 @@ fn receipt_workflows_bind_attempt_and_merge_complete_matrices() {
 
 #[test]
 fn workers_cannot_mint_pass_or_upload_logs_as_receipts() {
-    for name in ["ci.yml", "nightly.yml", "weekly-audit.yml"] {
+    for name in ["ci.yml", "nightly.yml"] {
         let text = workflow(name);
         assert!(text.contains("target/receipt-tools/bamts-verification suite run"));
         assert!(
@@ -185,13 +179,6 @@ fn workers_cannot_mint_pass_or_upload_logs_as_receipts() {
             }
         }
     }
-}
-
-#[test]
-fn high_and_low_level_shard_coordinates_are_documented_at_the_boundary() {
-    let weekly = workflow("weekly-audit.yml");
-    assert!(weekly.contains("ts_conformance --shards is one-based"));
-    assert!(weekly.contains("suite --shard is zero-based"));
 }
 
 #[test]

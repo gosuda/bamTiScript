@@ -550,9 +550,8 @@ fn parse_ci_mode(value: &str) -> Result<CiMode> {
     match value {
         "pr" => Ok(CiMode::Pr),
         "nightly" => Ok(CiMode::Nightly),
-        "weekly-audit" => Ok(CiMode::WeeklyAudit),
         _ => Err(usage(format!(
-            "unsupported --mode `{value}`; expected pr|nightly|weekly-audit"
+            "unsupported --mode `{value}`; expected pr|nightly"
         ))),
     }
 }

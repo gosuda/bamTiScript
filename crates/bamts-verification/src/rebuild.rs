@@ -60,11 +60,10 @@ pub const RECEIPTS_DIR: &str = "verification/receipts";
 /// completion program's `owns` list and the A3.1 gate ledger. The same list
 /// defines the generated-run-output boundary shared by receipt discovery and
 /// the candidate-source projection, so the two can never drift apart.
-pub(crate) const RECEIPT_SET_DIRS: [&str; 6] = [
+pub(crate) const RECEIPT_SET_DIRS: [&str; 5] = [
     RECEIPTS_DIR,
     "verification/evidence/pr-merged",
     "verification/evidence/nightly-merged",
-    "verification/evidence/weekly-merged",
     "verification/evidence/release",
     "verification/evidence/typescript-7.0.2",
 ];
@@ -2606,21 +2605,21 @@ mod tests {
     #[test]
     fn discovers_canonical_merged_receipts() {
         let root = scratch("discover");
-        let weekly = root.join("verification/evidence/weekly-merged");
-        fs::create_dir_all(&weekly).expect("weekly merged");
-        let later = weekly.join("z-test262-interpreter-linux.jsonl");
-        let earlier = weekly.join("a-typescript-interpreter-linux.jsonl");
+        let nightly = root.join("verification/evidence/nightly-merged");
+        fs::create_dir_all(&nightly).expect("nightly merged");
+        let later = nightly.join("z-test262-interpreter-linux.jsonl");
+        let earlier = nightly.join("a-typescript-interpreter-linux.jsonl");
         fs::write(&later, b"later").expect("later receipt");
         fs::write(&earlier, b"earlier").expect("earlier receipt");
 
         // Raw shards are deliberately nested below a non-owner and must not be
         // discovered or conflict with the merged canonical set.
-        let raw = root.join("verification/evidence/weekly/test262/interpreter/linux");
+        let raw = root.join("verification/evidence/nightly/test262/interpreter/linux");
         fs::create_dir_all(&raw).expect("raw shards");
         let raw_receipt = raw.join("0.jsonl");
         fs::write(&raw_receipt, b"raw").expect("raw receipt");
 
-        let receipts = discover_receipts(&root).expect("discover weekly merged");
+        let receipts = discover_receipts(&root).expect("discover nightly merged");
         assert_eq!(receipts, vec![earlier.clone(), later.clone()]);
         assert_eq!(fs::read(&earlier).expect("earlier unchanged"), b"earlier");
         assert_eq!(fs::read(&later).expect("later unchanged"), b"later");
@@ -2628,16 +2627,13 @@ mod tests {
 
         // Two populated owners are ambiguous; discovery never concatenates or
         // silently chooses one run over another.
-        let nightly = root.join("verification/evidence/nightly-merged");
-        fs::create_dir_all(&nightly).expect("nightly merged");
-        let nightly_receipt = nightly.join("test262-interpreter-linux.jsonl");
-        fs::write(&nightly_receipt, b"nightly").expect("nightly receipt");
+        let pr = root.join("verification/evidence/pr-merged");
+        fs::create_dir_all(&pr).expect("pr merged");
+        let pr_receipt = pr.join("test262-interpreter-linux.jsonl");
+        fs::write(&pr_receipt, b"pr").expect("pr receipt");
         let error = discover_receipts(&root).expect_err("ambiguous owners");
         assert_eq!(error.code(), ErrorCode::SetMismatch);
-        assert_eq!(
-            fs::read(&nightly_receipt).expect("nightly unchanged"),
-            b"nightly"
-        );
+        assert_eq!(fs::read(&pr_receipt).expect("pr unchanged"), b"pr");
 
         let _ = fs::remove_dir_all(&root);
     }

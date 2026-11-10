@@ -59,7 +59,7 @@ catalogs = []
 [[leaf]]
 id = "A2.7"
 cluster = "A2"
-owns = [".github/workflows/ci.yml", ".github/workflows/nightly.yml", ".github/workflows/weekly-audit.yml", ".github/workflows/release.yml"]
+owns = [".github/workflows/ci.yml", ".github/workflows/nightly.yml", ".github/workflows/release.yml"]
 catalogs = []
 
 [[leaf]]
