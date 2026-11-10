@@ -51,7 +51,7 @@ pub const DIAGNOSTIC_CODE_MAP_PATH: &str = "verification/diagnostic-code-map.jso
 pub const DIAGNOSTIC_CODE_MAP_SCHEMA_VERSION: u32 = 1;
 
 /// Every current BAMTS diagnostic code the map must cover exactly once.
-pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 108] = [
+pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 131] = [
     "BAMTS-L001",
     "BAMTS-L002",
     "BAMTS-L003",
@@ -78,6 +78,9 @@ pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 108] = [
     "BAMTS-P010",
     "BAMTS-P011",
     "BAMTS-P012",
+    "BAMTS-P017",
+    "BAMTS-P018",
+    "BAMTS-P019",
     "BAMTS-C001",
     "BAMTS-C002",
     "BAMTS-C003",
@@ -136,12 +139,29 @@ pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 108] = [
     "BAMTS-C057",
     "BAMTS-C058",
     "BAMTS-C059",
+    "BAMTS-C060",
+    "BAMTS-C061",
+    "BAMTS-C062",
+    "BAMTS-C063",
+    "BAMTS-C064",
+    "BAMTS-C065",
     "BAMTS-C066",
+    "BAMTS-C067",
+    "BAMTS-C068",
+    "BAMTS-C069",
     "BAMTS-C070",
     "BAMTS-C071",
     "BAMTS-C072",
+    "BAMTS-C073",
+    "BAMTS-C074",
+    "BAMTS-C075",
+    "BAMTS-C076",
+    "BAMTS-C077",
+    "BAMTS-C078",
+    "BAMTS-C079",
     "BAMTS-C080",
     "BAMTS-C081",
+    "BAMTS-C082",
     "BAMTS-C086",
     "BAMTS-C087",
     "BAMTS-C088",
@@ -160,6 +180,9 @@ pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 108] = [
     "BAMTS-C101",
     "BAMTS-C102",
     "BAMTS-C103",
+    "BAMTS-C104",
+    "BAMTS-C105",
+    "BAMTS-C106",
 ];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FacetVerdict {
@@ -2974,11 +2997,40 @@ interface A {
 
         // S1 mapped scanner (L) codes and U2.6 mapped checker (C) codes;
         // parser (P) codes are still unmapped and will be resolved by later
-        // slices.
+        // slices. Checker codes emitted without a tsc-verified counterpart
+        // stay unmapped: the registry rows name their compiler constants
+        // (verification/diagnostic-code-map.json).
+        const UNMAPPED_CHECKER_CODES: [&str; 20] = [
+            "BAMTS-C060",
+            "BAMTS-C061",
+            "BAMTS-C062",
+            "BAMTS-C063",
+            "BAMTS-C064",
+            "BAMTS-C065",
+            "BAMTS-C067",
+            "BAMTS-C068",
+            "BAMTS-C069",
+            "BAMTS-C073",
+            "BAMTS-C074",
+            "BAMTS-C075",
+            "BAMTS-C076",
+            "BAMTS-C077",
+            "BAMTS-C078",
+            "BAMTS-C079",
+            "BAMTS-C082",
+            "BAMTS-C104",
+            "BAMTS-C105",
+            "BAMTS-C106",
+        ];
         let mut mapped = 0;
         for code in REQUIRED_BAMTS_DIAGNOSTIC_CODES {
             let entry = map.get(code).expect(code);
             assert!(!entry.evidence.trim().is_empty());
+            if UNMAPPED_CHECKER_CODES.contains(&code) {
+                assert_eq!(entry.status, DiagnosticMappingStatus::Unmapped, "{code}");
+                assert!(entry.ts_code.is_none());
+                continue;
+            }
             if code.starts_with("BAMTS-L") || code.starts_with("BAMTS-C") {
                 assert_eq!(
                     entry.status,

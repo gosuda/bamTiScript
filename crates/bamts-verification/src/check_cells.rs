@@ -50,9 +50,8 @@ use bamts_compiler::syntax::{Token, TokenKind};
 use crate::catalog::CaseConfiguration;
 use crate::facets::{
     DiagnosticCategory, DiagnosticCodeMap, FacetDiagnostic, FacetSeverity, FacetVerdict,
-    SourcePosition, compare_diagnostics, compare_declaration_emit, compare_js_emit,
-    compare_source_map, compare_symbols,
-    compare_types,
+    SourcePosition, compare_declaration_emit, compare_diagnostics, compare_js_emit,
+    compare_source_map, compare_symbols, compare_types,
 };
 use crate::suite::{
     CellResult, FailureClass, IndexEntry, PlannedCell, SnapshotAssets, SuiteIndex, TempDir,
@@ -1304,7 +1303,6 @@ pub fn collect_facet_diagnostics(case: &CheckedCase) -> Vec<FacetDiagnostic> {
 /// The unit basename printed by the baseline is carried through so a
 /// cross-unit position collision cannot pass the check.
 pub fn expected_facet_diagnostics(
-    _snapshot: &(impl SnapshotAssets + ?Sized),
     baselines: &DiagnosticsBaselines,
 ) -> Result<Vec<FacetDiagnostic>> {
     let mut expected = Vec::new();
@@ -1350,13 +1348,12 @@ pub fn expected_facet_diagnostics(
 /// `BAMTS-W…` lint warnings never fail a row.
 pub fn check_diagnostics(
     ctx: &CheckContext,
-    snapshot: &(impl SnapshotAssets + ?Sized),
     case: &CheckedCase,
     baselines: &DiagnosticsBaselines,
 ) -> Result<DiagnosticsOutcome> {
     let mut actual = collect_facet_diagnostics(case);
-    actual.retain(|diagnostic| ctx.code_map.get(&diagnostic.code).is_some());
-    let expected = expected_facet_diagnostics(snapshot, baselines)?;
+    actual.retain(|diagnostic| !diagnostic.code.starts_with("BAMTS-W"));
+    let expected = expected_facet_diagnostics(baselines)?;
     let verdict = compare_diagnostics(&expected, &actual, &ctx.code_map);
     Ok(DiagnosticsOutcome {
         actual,
@@ -1453,7 +1450,7 @@ pub(crate) fn observe_diagnostics(
     match compile_case_with_pragmas(&units, &entry, pragmas) {
         Err(error) => compile_failure_observation(error),
         Ok(case) => {
-            let outcome = match check_diagnostics(ctx, snapshot, &case, &baselines) {
+            let outcome = match check_diagnostics(ctx, &case, &baselines) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     return CompilerCheckObservation {
@@ -3853,6 +3850,46 @@ mod tests {
         }];
         let verdict = compare_diagnostics(&expected, &actual, &code_map);
         assert_eq!(verdict, FacetVerdict::Pass);
+    }
+
+    /// Every emitted diagnostic counts: a raw `TS....` spelling compares as
+    /// itself (`asyncAwaitIsolatedModules_es2017.errors.txt` expects
+    /// `error TS2307: Cannot find module 'missing'.`, and the pipeline emits
+    /// the raw spelling), and a BAMTS code without a map row still counts
+    /// instead of vanishing before the comparison.
+    #[test]
+    fn diagnostics_count_raw_ts_and_unmapped_bamts_codes() {
+        let code_map = repo_code_map();
+        let ctx = CheckContext {
+            code_map: code_map.clone(),
+            baseline_groups: BaselineGroups::default(),
+        };
+
+        let import_case = "import { helper } from \"./missing\";\nexport const user = helper;\n";
+        let units = split_case_units("tests/cases/compiler/rawTsCodePin.ts", import_case);
+        let entry = entry_virtual_path("tests/cases/compiler/rawTsCodePin.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let baselines = DiagnosticsBaselines {
+            owned: vec!["rawTsCodePin.errors.txt".to_owned()],
+            contents: BTreeMap::from([("rawTsCodePin.errors.txt".to_owned(), String::new())]),
+        };
+        let outcome = check_diagnostics(&ctx, &case, &baselines).expect("diagnostics outcome");
+        assert!(
+            outcome.actual.iter().any(|d| d.code == "TS2307"),
+            "a raw TS spelling must count as itself: {:?}",
+            outcome.actual
+        );
+
+        let decorator_case = "const frozen = 1;\nfrozen = 2;\n";
+        let units = split_case_units("tests/cases/compiler/unmappedCodePin.ts", decorator_case);
+        let entry = entry_virtual_path("tests/cases/compiler/unmappedCodePin.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let outcome = check_diagnostics(&ctx, &case, &baselines).expect("diagnostics outcome");
+        assert!(
+            outcome.actual.iter().any(|d| d.code == "BAMTS-C060"),
+            "a checker code must count even before correspondence: {:?}",
+            outcome.actual
+        );
     }
 
     /// Multi-unit cases with an empty leading unit must still load every file,
