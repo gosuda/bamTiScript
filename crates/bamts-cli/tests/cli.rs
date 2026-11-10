@@ -948,6 +948,43 @@ fn jit_throws_range_error_for_builtins_that_call_builtins_without_end() {
     assert_eq!(output.stdout, b"RangeError\nok\n");
 }
 
+/// Node does not load a JavaScript module that breaks an early error, in the
+/// entrypoint or in a module that it imports. The CLI does not run one either.
+#[test]
+fn a_javascript_module_with_an_early_error_does_not_run() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.js",
+        "import { a } from \"./m.js\";\nconsole.log(a);\n",
+    );
+    project.write("m.js", "export const a;\n");
+    project.write(
+        "class.js",
+        "class C { constructor() {} \"constructor\"() {} }\nconsole.log(1);\n",
+    );
+    for (entrypoint, message) in [
+        ("main.js", "this declaration needs a value"),
+        ("class.js", "a class has one constructor"),
+    ] {
+        for target in ["--jit", "--aot"] {
+            let output = project
+                .command()
+                .args(["--run", target, "--js-compat", entrypoint])
+                .current_dir(&project.path)
+                .output()
+                .expect("bamts run starts");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{entrypoint} {target}: {stderr}"
+            );
+            assert!(output.stdout.is_empty(), "{entrypoint} {target}");
+            assert!(stderr.contains(message), "{entrypoint} {target}: {stderr}");
+        }
+    }
+}
+
 #[test]
 fn aot_throws_range_error_for_builtins_that_call_builtins_without_end() {
     let project = ScratchDirectory::new();

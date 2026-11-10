@@ -261,8 +261,10 @@ fn compile_entry(
 }
 
 /// The early errors of every JavaScript module about to run. TypeScript sources
-/// answer to the checker instead.
-fn early_errors(program: &ResolvedProgram, script_entry: bool) -> Vec<Diagnostic> {
+/// answer to the checker instead. Node refuses to load a module that has one, so
+/// a caller that runs or compiles `program` stops on any of them. `script_entry`
+/// says that the host runs the entrypoint as a Script.
+pub fn early_errors(program: &ResolvedProgram, script_entry: bool) -> Vec<Diagnostic> {
     let entrypoint = program.entrypoint().source_id();
     program
         .modules()

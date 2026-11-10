@@ -2761,6 +2761,14 @@ fn render_program_diagnostics(
         .iter()
         .flat_map(|module| module.diagnostics().iter().cloned())
         .collect::<Vec<_>>();
+    render_diagnostics(args, frontend, &diagnostics)
+}
+
+fn render_diagnostics(
+    args: &CliArgs,
+    frontend: &LoadedProgramFrontend,
+    diagnostics: &[Diagnostic],
+) -> RenderedDiagnostics {
     let names = frontend
         .program
         .modules()
@@ -2780,7 +2788,7 @@ fn render_program_diagnostics(
         .collect::<Vec<_>>();
     let (text, truncation) = diagnostics::render_report(
         args.diagnostics_format,
-        &DiagnosticReport::new(&diagnostics),
+        &DiagnosticReport::new(diagnostics),
         &sources,
         args.error_limit,
     );
@@ -2829,10 +2837,20 @@ fn render_tsc_program_diagnostics(
     )
 }
 
+/// Renders the diagnostics of a program about to run or compile. Node does not load
+/// a JavaScript module that breaks an early error, so one of those stops it.
 fn require_clean_frontend(
     args: &CliArgs,
     frontend: &LoadedProgramFrontend,
 ) -> Result<RenderedDiagnostics, DriverError> {
+    let early = bamts::early_errors(&frontend.program, false);
+    if !early.is_empty() {
+        let rendered = render_diagnostics(args, frontend, &early);
+        return Err(DriverError::Diagnostics {
+            rendered: rendered.text,
+            truncation: rendered.truncation,
+        });
+    }
     Ok(render_program_diagnostics(args, frontend))
 }
 
