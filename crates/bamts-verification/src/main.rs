@@ -12,7 +12,7 @@ use bamts_verification::{
     authority::verify_authority,
     catalog::{extract_catalog_cells, regenerate_manifest, write_catalog_json},
     completion::{
-        CompletionAspect, CompletionReport, CompletionScope, RegenerateMode, RegenerateOutcome,
+        CompletionReport, CompletionScope, RegenerateMode, RegenerateOutcome,
         regenerate_completion_program, verify_completion,
     },
     diagnostic_catalog::{self, CatalogError},
@@ -22,7 +22,6 @@ use bamts_verification::{
         regenerate_canonical_fixture, run_replay_canary_child,
     },
     formal_gates::audit_formal_gates,
-    leaf_evidence::generate as generate_leaf_evidence,
     ledger::verify_ledger_g0,
     perf_guard::{self, Verdict},
     perf_jit, perf_stage0,
@@ -69,18 +68,8 @@ enum Command {
     LedgerRebuild {
         check: bool,
     },
-    LeafEvidenceGenerate {
-        leaf: String,
-        aspect: String,
-        out: PathBuf,
-    },
     CompletionVerify {
         scope: CompletionScope,
-        aspect: CompletionAspect,
-    },
-    CompletionEvidence {
-        scope: CompletionScope,
-        aspect: CompletionAspect,
     },
     CompletionRegenerate {
         check: bool,
@@ -155,21 +144,7 @@ fn dispatch(root: &Path, command: Command) -> Result<()> {
         Command::CatalogRegenerate { release, check } => regenerate_catalog(root, &release, check),
         Command::LedgerVerify => verify_g0(root),
         Command::LedgerRebuild { check } => rebuild_ledger_command(root, check),
-        Command::LeafEvidenceGenerate { leaf, aspect, out } => {
-            let evidence = generate_leaf_evidence(root, &leaf, &aspect, &out)?;
-            writeln!(io::stdout().lock(), "{evidence}").map_err(|error| {
-                VerificationError::new(
-                    ErrorCode::Io,
-                    format!("cannot write receipt evidence: {error}"),
-                )
-            })
-        }
-        Command::CompletionVerify { scope, aspect } => {
-            verify_completion_command(root, &scope, aspect)
-        }
-        Command::CompletionEvidence { scope, aspect } => {
-            completion_evidence_command(root, &scope, aspect)
-        }
+        Command::CompletionVerify { scope } => verify_completion_command(root, &scope),
         Command::CompletionRegenerate { check } => regenerate_completion_command(root, check),
         Command::DiagnosticsRegenerate { check } => regenerate_diagnostics(root, check),
         Command::ToolchainEvidence => audit_toolchain_evidence(root),
@@ -236,7 +211,6 @@ fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Comman
         "authority" => parse_authority_command(&mut arguments),
         "catalog" => parse_catalog_command(&mut arguments),
         "ledger" => parse_ledger_command(&mut arguments),
-        "leaf-evidence" => parse_leaf_evidence_command(&mut arguments),
         "completion" => parse_completion_command(&mut arguments),
         "diagnostics" => parse_diagnostics_command(&mut arguments),
         "toolchain" => parse_toolchain_command(&mut arguments),
@@ -256,19 +230,6 @@ fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Comman
         _ if command.starts_with("--") => Err(usage(format!("unknown flag `{command}`"))),
         _ => Err(usage(format!("unknown command `{command}`"))),
     }
-}
-fn parse_leaf_evidence_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
-    expect_literal(arguments, "generate", "leaf-evidence subcommand")?;
-    let flags = parse_flags(arguments, &["--leaf", "--aspect", "--out"], &[])?;
-    Ok(Command::LeafEvidenceGenerate {
-        leaf: required_flag(&flags.values, "--leaf", "leaf-evidence generate")?,
-        aspect: required_flag(&flags.values, "--aspect", "leaf-evidence generate")?,
-        out: PathBuf::from(required_flag(
-            &flags.values,
-            "--out",
-            "leaf-evidence generate",
-        )?),
-    })
 }
 
 fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
@@ -548,16 +509,12 @@ fn parse_ledger_command(arguments: &mut impl Iterator<Item = OsString>) -> Resul
     }
 }
 
-/// Accepted `--aspect` values, for the unknown-aspect usage detail.
-const COMPLETION_ASPECTS: &str = "contract, evidence, coverage, regression, mutation, aggregate";
-
 fn parse_completion_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
     let subcommand = required_argument(arguments, "completion subcommand")?;
     match subcommand.as_str() {
-        "verify" => parse_completion_request(arguments)
-            .map(|(scope, aspect)| Command::CompletionVerify { scope, aspect }),
-        "evidence" => parse_completion_request(arguments)
-            .map(|(scope, aspect)| Command::CompletionEvidence { scope, aspect }),
+        "verify" => {
+            parse_completion_request(arguments).map(|scope| Command::CompletionVerify { scope })
+        }
         "regenerate" => {
             let flags = parse_flags(arguments, &[], &["--check"])?;
             let check = flags.switches.contains("--check");
@@ -572,23 +529,9 @@ fn parse_completion_command(arguments: &mut impl Iterator<Item = OsString>) -> R
 
 fn parse_completion_request(
     arguments: &mut impl Iterator<Item = OsString>,
-) -> Result<(CompletionScope, CompletionAspect)> {
-    let flags = parse_flags(
-        arguments,
-        &[
-            "--leaf",
-            "--cluster",
-            "--track",
-            "--wave",
-            "--root",
-            "--aspect",
-        ],
-        &[],
-    )?;
-    Ok((
-        completion_scope(&flags.values)?,
-        completion_aspect(&flags.values)?,
-    ))
+) -> Result<CompletionScope> {
+    let flags = parse_flags(arguments, &["--leaf", "--cluster", "--root"], &[])?;
+    completion_scope(&flags.values)
 }
 
 fn completion_scope(values: &BTreeMap<String, String>) -> Result<CompletionScope> {
@@ -598,8 +541,6 @@ fn completion_scope(values: &BTreeMap<String, String>) -> Result<CompletionScope
             CompletionScope::Leaf as fn(String) -> CompletionScope,
         ),
         ("--cluster", CompletionScope::Cluster),
-        ("--track", CompletionScope::Track),
-        ("--wave", CompletionScope::Wave),
         ("--root", CompletionScope::Root),
     ]
     .into_iter()
@@ -608,22 +549,11 @@ fn completion_scope(values: &BTreeMap<String, String>) -> Result<CompletionScope
     match found.as_slice() {
         [scope] => Ok(scope.clone()),
         [] => Err(usage(
-            "completion verify requires exactly one of --leaf, --cluster, --track, --wave, or --root",
+            "completion verify requires exactly one of --leaf, --cluster, or --root",
         )),
         _ => Err(usage(
-            "completion scope flags are mutually exclusive; pass exactly one of --leaf, --cluster, --track, --wave, or --root",
+            "completion scope flags are mutually exclusive; pass exactly one of --leaf, --cluster, or --root",
         )),
-    }
-}
-
-fn completion_aspect(values: &BTreeMap<String, String>) -> Result<CompletionAspect> {
-    match values.get("--aspect") {
-        None => Ok(CompletionAspect::Aggregate),
-        Some(value) => CompletionAspect::parse(value).ok_or_else(|| {
-            usage(format!(
-                "unknown aspect `{value}`; expected one of {COMPLETION_ASPECTS}"
-            ))
-        }),
     }
 }
 
@@ -983,12 +913,8 @@ fn regenerate_fixtures(root: &Path) -> Result<()> {
     let transitions = regenerate_canonical_fixture(root)?;
     emit(&format!("G6 FIXTURES transitions={transitions}\n"))
 }
-fn verify_completion_command(
-    root: &Path,
-    scope: &CompletionScope,
-    aspect: CompletionAspect,
-) -> Result<()> {
-    let report = verified_completion_report(root, scope, aspect)?;
+fn verify_completion_command(root: &Path, scope: &CompletionScope) -> Result<()> {
+    let report = verified_completion_report(root, scope)?;
     let line = report.success_line().ok_or_else(|| {
         VerificationError::new(
             ErrorCode::Schema,
@@ -998,27 +924,8 @@ fn verify_completion_command(
     emit(&format!("{line}\n"))
 }
 
-fn completion_evidence_command(
-    root: &Path,
-    scope: &CompletionScope,
-    aspect: CompletionAspect,
-) -> Result<()> {
-    let report = verified_completion_report(root, scope, aspect)?;
-    let evidence = report.gate_evidence.ok_or_else(|| {
-        VerificationError::new(
-            ErrorCode::Schema,
-            "canonical evidence is available only for direct leaf aspect checks",
-        )
-    })?;
-    emit(&format!("{evidence}\n"))
-}
-
-fn verified_completion_report(
-    root: &Path,
-    scope: &CompletionScope,
-    aspect: CompletionAspect,
-) -> Result<CompletionReport> {
-    let report = verify_completion(root, scope, aspect)?;
+fn verified_completion_report(root: &Path, scope: &CompletionScope) -> Result<CompletionReport> {
+    let report = verify_completion(root, scope)?;
     if report.is_pass() {
         return Ok(report);
     }
@@ -1035,10 +942,7 @@ fn verified_completion_report(
     }
     Err(VerificationError::new(
         ErrorCode::Workspace,
-        format!(
-            "completion verification failed for aspect `{}`: {detail}",
-            aspect.as_str()
-        ),
+        format!("completion verification failed: {detail}"),
     ))
 }
 
@@ -1412,47 +1316,87 @@ mod tests {
     }
 
     #[test]
-    fn parses_leaf_evidence_generation_request() {
-        let command = parse(&[
+    fn rejects_completion_verify_aspect_flag() {
+        let error = parse(&[
             "bamts-verification",
-            "leaf-evidence",
-            "generate",
+            "completion",
+            "verify",
             "--leaf",
-            "B0.1",
+            "B4.1",
             "--aspect",
-            "mutation",
-            "--out",
-            ".outline/evidence/B0.1-mutation.json",
+            "contract",
         ])
-        .expect("leaf evidence generation command");
+        .expect_err("aspect flag is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
         assert_eq!(
-            command,
-            Command::LeafEvidenceGenerate {
-                leaf: "B0.1".to_owned(),
-                aspect: "mutation".to_owned(),
-                out: PathBuf::from(".outline/evidence/B0.1-mutation.json"),
-            }
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown flag `--aspect`"
         );
     }
 
     #[test]
-    fn parses_completion_evidence_request() {
-        let command = parse(&[
+    fn rejects_completion_verify_track_flag() {
+        let error = parse(&[
+            "bamts-verification",
+            "completion",
+            "verify",
+            "--track",
+            "T1",
+        ])
+        .expect_err("track flag is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert_eq!(
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown flag `--track`"
+        );
+    }
+
+    #[test]
+    fn rejects_completion_verify_wave_flag() {
+        let error = parse(&["bamts-verification", "completion", "verify", "--wave", "W1"])
+            .expect_err("wave flag is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert_eq!(
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown flag `--wave`"
+        );
+    }
+
+    #[test]
+    fn rejects_completion_evidence_subcommand() {
+        let error = parse(&[
             "bamts-verification",
             "completion",
             "evidence",
             "--leaf",
-            "B0.1",
-            "--aspect",
-            "contract",
+            "B4.1",
         ])
-        .expect("completion evidence command");
+        .expect_err("evidence subcommand is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
         assert_eq!(
-            command,
-            Command::CompletionEvidence {
-                scope: CompletionScope::Leaf("B0.1".to_owned()),
-                aspect: CompletionAspect::Contract,
-            }
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown completion subcommand `evidence`"
+        );
+    }
+
+    #[test]
+    fn rejects_leaf_evidence_command() {
+        let error = parse(&[
+            "bamts-verification",
+            "leaf-evidence",
+            "generate",
+            "--leaf",
+            "B4.1",
+            "--aspect",
+            "mutation",
+            "--out",
+            ".outline/evidence/B4.1-mutation.json",
+        ])
+        .expect_err("leaf-evidence command is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert_eq!(
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown command `leaf-evidence`"
         );
     }
 

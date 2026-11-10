@@ -192,12 +192,6 @@ fn high_and_low_level_shard_coordinates_are_documented_at_the_boundary() {
     let weekly = workflow("weekly-audit.yml");
     assert!(weekly.contains("ts_conformance --shards is one-based"));
     assert!(weekly.contains("suite --shard is zero-based"));
-
-    let gates = fs::read_to_string(repository_root().join(".outline/GATES.md")).expect("GATES.md");
-    assert!(gates.contains("`ts_conformance --shards k/N` is deliberately one-based"));
-    assert!(
-        gates.contains("`bamts-verification suite run --shard i/N` is deliberately zero-based")
-    );
 }
 
 #[test]

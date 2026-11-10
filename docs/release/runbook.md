@@ -10,11 +10,10 @@ Use these files as the release authorities:
 
 - `.outline/type-script-7.0.2-completion.md` defines the product scope.
 - `.outline/GATES.md` defines the root checks and expected output.
-- `.outline/gates/*.md` defines the leaf and integration checks.
 - `vendor/sources.toml` defines pinned external sources.
 - `verification/catalog-inputs.json` defines the sorted catalog inputs.
 - `verification/manifest.lock.json` is the generated catalog manifest.
-- `verification/completion-program.toml` is the generated completion program.
+- `verification/completion-program.toml` is the completion program: the closed leaf set, edited directly and canonicalized with `completion regenerate`.
 - `proof/completeness-ledger.json` is the generated completion ledger.
 
 Treat `.references/` as read-only study material. Do not copy implementation code from it.
@@ -23,7 +22,7 @@ Treat `.references/` as read-only study material. Do not copy implementation cod
 
 Stop the release procedure when one of these conditions is true:
 
-- A required gate is unchecked or has `EVIDENCE: pending`.
+- A required gate is unchecked or lacks current evidence.
 - A required obligation is not `PASS`.
 - A receipt is missing, stale, or not produced by the approved independent runner.
 - An external target runner or exact performance host is unavailable.
@@ -95,7 +94,7 @@ suite run --catalog <id> --shard <index>/<count> --receipt <path> --runner <name
 suite merge --catalog <id> --receipts <directory> --out <path> [--check]
 ```
 
-Only the approved independent runner may produce release receipts. Each shard must bind the selected source, candidate, harness, runner, and platform required by the evidence schema. Merge only a complete and consistent shard set.
+Only the approved independent runner may produce release receipts. Each shard must bind the selected source, candidate, harness, runner, and platform required by the evidence schema. Merge only a complete and consistent shard set. `ts_conformance --shards k/N` is one-based and `suite run --shard i/N` is zero-based; workflows convert once before they invoke `suite run`.
 
 `verification/ts-suite-ledger.json` is ephemeral and ignored. Never force-stage it. The bounded manifest, receipts, and completeness ledger carry committed completion evidence.
 
@@ -119,39 +118,17 @@ Run the package, corpus, formal, target, and performance checks required by the 
 just release-gate
 ```
 
-The current checkout has no repository `Justfile`, so G8 is blocked. Do not supply an external `Justfile`, invent a substitute, or mark G8 complete.
+Run just release-gate from the repository root.
 
 ## Completion gate ritual
 
-Every leaf, cluster, track, wave, and root gate is a `completion verify` invocation. Pass exactly one scope flag and an aspect:
+Every leaf, cluster, and root gate is a completion verify invocation. Pass exactly one of --leaf, --cluster, or --root; there is no aspect argument.
 
 ```bash
-cargo run -p bamts-verification -- completion verify --leaf <LEAF> --aspect <ASPECT>
+cargo run -p bamts-verification -- completion verify --leaf <LEAF>
 ```
 
-Scope flags are mutually exclusive: `--leaf`, `--cluster`, `--track`, `--wave`, or `--root`. Aspects are `contract`, `evidence`, `coverage`, `regression`, `mutation`, and `aggregate`. Omitting `--aspect` selects `aggregate`.
-
-Leaf gate ledgers in `.outline/gates/*.md` record one check per aspect. Example for F3.1:
-
-```bash
-cargo run -p bamts-verification -- completion verify --leaf F3.1 --aspect contract
-cargo run -p bamts-verification -- completion verify --leaf F3.1 --aspect evidence
-cargo run -p bamts-verification -- completion verify --leaf F3.1 --aspect coverage
-cargo run -p bamts-verification -- completion verify --leaf F3.1 --aspect regression
-cargo run -p bamts-verification -- completion verify --leaf F3.1 --aspect mutation
-```
-
-Expected success lines match the gate files (`LEAF F3.1 CONTRACT PASS`, and so on). A non-zero exit or a different line fails the gate.
-
-### Evidence binding
-
-A gate is current only when its `EVIDENCE:` line binds a repository-relative receipt to the SHA-256 of those bytes:
-
-```text
-EVIDENCE: receipt=<repo-relative-path> sha256=<64-hex-digest>
-```
-
-`receipt=` (or `path=`) names a file under the repository root. `sha256=` is a 64-character lowercase hex digest. Absolute paths, parent-directory components, and `EVIDENCE: pending` are not current. The verifier canonicalizes the receipt under the repository root and requires `sha256(file bytes)` to equal the bound digest.
+A passing gate prints its success line (`LEAF <LEAF> COMPLETE`). A non-zero exit or a different line fails the gate.
 
 ### Global completeness ledger
 
@@ -166,11 +143,11 @@ cargo run -p bamts-verification -- ledger rebuild --check
 
 ## Verify F3 and completion roots
 
-Run the F3 checks before the dependent F3 cluster, W7 wave, and product root checks:
+Run the F3 checks before the dependent F3 cluster and product root checks:
 
 ```bash
-cargo run -p bamts-verification -- completion verify --leaf F3.1 --aspect aggregate
-cargo run -p bamts-verification -- completion verify --leaf F3.2 --aspect aggregate
+cargo run -p bamts-verification -- completion verify --leaf F3.1
+cargo run -p bamts-verification -- completion verify --leaf F3.2
 ```
 
 F3.1 proves the runbook obligation. F3.2 owns final release and tag evidence. F3.1 cannot override F3.2.

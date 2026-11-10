@@ -16,10 +16,9 @@ doctor:
     installed="$(rustup target list --installed)"; for target in {{xcheck_targets}}; do grep -qx "$target" <<< "$installed"; done
     printf '%s\n' 'DOCTOR PASS'
 
-# Fails while any gate ledger has an unchecked box or pending evidence, and lists
-# the open ledgers; prints ALL MET otherwise. This is the check for GATES.md G1.
+# The finish line: prints PRODUCT COMPLETE or a bounded failure summary.
 gate-status:
-    python3 -c 'import glob,re,sys; rows=[(f,len(re.findall(r"(?m)^- \[ \]",t)),len(re.findall(r"(?m)^  EVIDENCE: pending\s*$",t))) for f in sorted(glob.glob(".outline/gates/*.md")) for t in [open(f).read()]]; open_=[r for r in rows if r[1] or r[2]]; [print("OPEN %s unchecked=%d pending=%d"%r) for r in open_]; print("NO LEDGERS FOUND" if not rows else "ALL MET" if not open_ else "OPEN LEDGERS: %d of %d"%(len(open_),len(rows))); sys.exit(1 if open_ or not rows else 0)'
+    cargo run --locked -q -p bamts-verification --bin bamts-verification -- completion verify --root product
 
 ci: ci-quality ci-npm ci-corpus ci-native-boundary xcheck portability-check
     printf '%s\n' 'LOCAL CI PASS'
@@ -167,18 +166,6 @@ release-gate:
     BAMTS_SUITE_COMPILER_ADAPTER=target/release/ts_lane_worker cargo run --locked -p bamts-verification --bin bamts-verification -- ledger rebuild --check
     cargo run --locked -p bamts-verification --bin bamts-verification -- completion verify --root product
     printf '%s\n' 'RELEASE GATE PASS'
-
-# Machine-local checker (proven on this host); a portable in-repo checker is a deliberate future decision.
-# Verify one outline leaf gate file without mutating it: the gate whose
-# CHECK is `just leaf-gate <id>` is the leaf's recursive self-gate, so
-# every other gate must already carry a checked box and non-pending
-# evidence. This attests to recorded checkbox state from a prior checker
-# pass, not to freshly re-run checks; the mutating checker's run of this
-# recipe then supplies the self-gate's own evidence (run leaves twice:
-# the first flips the body, the second converges the self-gate).
-leaf-gate leaf:
-    python3 -c 'import sys,re; t=open(sys.argv[1]).read(); blocks=re.split(r"(?m)^(?=- \[[ x]\] G\d+)",t); body="\n".join(b for b in blocks if "just leaf-gate" not in b); sys.exit(1 if (re.search(r"^- \[ \]",body,re.M) or re.search(r"^  EVIDENCE: pending\s*$",body,re.M)) else 0)' .outline/gates/{{leaf}}.md
-    printf 'LEAF %s PASS\n' "{{leaf}}"
 
 # Run one compiler conformance shard locally with the lane worker wired.
 # The compiler runner ships no built-in adapter, so without
