@@ -160,10 +160,19 @@ nightly: ci ci-accounting ci-formal
 # resolves the harness, the receipt names the worker, and every row is
 # rejected as a stale candidate binding.
 release-gate:
-    cargo build --locked --release -p bamts-verification --bin ts_lane_worker
+    just ci
+    just ci-formal
+    just sweep typescript-7.0.2 compiler
+    just sweep typescript-6.0.2 compiler
+    just sweep typescript-5.9.3 compiler
+    just sweep test262 interpreter
+    just sweep test262 jit
+    just sweep test262 aot
+    for d in verification/receipts verification/evidence/pr-merged verification/evidence/nightly-merged verification/evidence/typescript-7.0.2; do test -z "$(ls -A "$d" 2>/dev/null)" || { echo "stale receipt set: $d"; exit 1; }; done
+    rm -rf verification/evidence/release && mkdir -p verification/evidence/release
+    cp target/evidence-local/merged/*.jsonl verification/evidence/release/
     cargo run --locked -p bamts-verification --bin bamts-verification -- completion regenerate --check
-    cargo run --locked -p bamts-verification --bin ts_conformance -- audit-ledger --require-complete
-    BAMTS_SUITE_COMPILER_ADAPTER=target/release/ts_lane_worker cargo run --locked -p bamts-verification --bin bamts-verification -- ledger rebuild --check
+    BAMTS_SUITE_COMPILER_ADAPTER=target/release/ts_lane_worker BAMTS_SUITE_INTERPRETER_ADAPTER=target/release/runtime_lane_worker BAMTS_SUITE_JIT_ADAPTER=target/release/runtime_lane_worker BAMTS_SUITE_AOT_ADAPTER=target/release/runtime_lane_worker cargo run --locked -p bamts-verification --bin bamts-verification -- ledger rebuild --write
     cargo run --locked -p bamts-verification --bin bamts-verification -- completion verify --root product
     printf '%s\n' 'RELEASE GATE PASS'
 

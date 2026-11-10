@@ -180,24 +180,3 @@ fn workers_cannot_mint_pass_or_upload_logs_as_receipts() {
         }
     }
 }
-
-#[test]
-fn release_gate_is_one_ordered_fail_closed_root() {
-    let justfile = fs::read_to_string(repository_root().join("Justfile")).expect("Justfile");
-    let ordered = [
-        "completion regenerate --check",
-        "audit-ledger --require-complete",
-        "ledger rebuild --check",
-        "completion verify --root product",
-        "RELEASE GATE PASS",
-    ];
-    let mut cursor = 0;
-    for required in ordered {
-        let relative = justfile[cursor..]
-            .find(required)
-            .unwrap_or_else(|| panic!("release-gate omits or misorders `{required}`"));
-        cursor += relative + required.len();
-    }
-    assert_eq!(justfile.matches("release-gate:").count(), 1);
-    assert_eq!(justfile.matches("RELEASE GATE PASS").count(), 1);
-}

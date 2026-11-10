@@ -77,7 +77,7 @@ The Quint sources model named state-machine properties. The configuration files 
 Lean sources and ledgers record the theorem inventory and its assumptions.
 
 * Kernel assumptions: [`proof/lean-assumptions.json`](../../proof/lean-assumptions.json) lists the assumptions used by the recorded proofs.
-* Proof ledger: [`proof/completeness-ledger.json`](../../proof/completeness-ledger.json) records the acceptance state of every named catalog row, including open blocking gates.
+* Proof ledger: `proof/completeness-ledger.json`, an ignored build output that `just release-gate` generates, records the acceptance state of every named catalog row, including open blocking gates.
 
 ### Racket/Redex models
 

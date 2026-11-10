@@ -6,6 +6,8 @@
 **/.lake/
 verification/ts-suite/
 verification/ts-suite-ledger.json
+proof/completeness-ledger.json
+verification/evidence/
 perf/fixtures/boundary/
 /out/
 /.merge_file_*

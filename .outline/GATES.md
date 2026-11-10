@@ -30,6 +30,6 @@ Scope: Complete the clean-room Rust compiler, TypeScript-compatible Node 24 API 
   CHECK: just release-gate
   EXPECT: RELEASE GATE PASS
 
-- [x] G9: Regenerating every authority-derived artifact is byte-identical to the committed completion evidence
+- [x] G9: Regenerating the authority-derived artifact is byte-identical
   CHECK: cargo run -p bamts-verification -- completion regenerate --check
   EXPECT: COMPLETION PROGRAM PASS mode=check

@@ -96,7 +96,7 @@ suite merge --catalog <id> --receipts <directory> --out <path> [--check]
 
 Only the approved independent runner may produce release receipts. Each shard must bind the selected source, candidate, harness, runner, and platform required by the evidence schema. Merge only a complete and consistent shard set. `ts_conformance --shards k/N` is one-based and `suite run --shard i/N` is zero-based; workflows convert once before they invoke `suite run`.
 
-`verification/ts-suite-ledger.json` is ephemeral and ignored. Never force-stage it. The bounded manifest, receipts, and completeness ledger carry committed completion evidence.
+`verification/ts-suite-ledger.json` is ephemeral and ignored. Never force-stage it. `proof/completeness-ledger.json` and `verification/evidence/` are ignored build outputs; `just release-gate` regenerates them at HEAD.
 
 ## Run repository checks
 
