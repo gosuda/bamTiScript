@@ -1009,6 +1009,34 @@ fn jit_reads_a_nested_array_as_deep_as_node_does() {
     assert_eq!(output.stdout, b"\"\"\n");
 }
 
+/// Node parses JSON of any depth and writes it several thousand levels deep. Both
+/// tiers do too, past the 256 levels where they stopped before.
+#[test]
+fn json_reads_and_writes_text_far_deeper_than_256_levels() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        "const deep = (depth: number): string => \"[\".repeat(depth) + \"]\".repeat(depth);\n\
+         JSON.parse(deep(100000));\n\
+         console.log(\"parsed\");\n\
+         console.log(JSON.stringify(JSON.parse(deep(3000))) === deep(3000));\n",
+    );
+    for target in ["--jit", "--aot"] {
+        let output = project
+            .command()
+            .args(["--run", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .expect("bamts run starts");
+        assert!(
+            output.status.success(),
+            "{target}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"parsed\ntrue\n", "{target}");
+    }
+}
+
 #[test]
 fn aot_throws_range_error_for_builtins_that_call_builtins_without_end() {
     let project = ScratchDirectory::new();

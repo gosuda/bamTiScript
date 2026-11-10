@@ -43,8 +43,9 @@ const MAX_GAP_UNITS: usize = 10;
 /// Largest ToLength result; array-like JSON traversal snapshots this bound.
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
-/// Whether one more level of JSON nesting passes the stack. A machine that measures
-/// its native stack stops only where that stack is full.
+/// Whether one more level of a recursive JSON walk, `JSON.stringify` or a reviver,
+/// passes the stack. A machine that measures its native stack stops only where that
+/// stack is full, so both go at least as deep as in V8. The parser does not recurse.
 fn json_nesting_overflows<H: Host>(machine: &Machine<'_, H>, depth: usize) -> bool {
     if machine.limits.max_stack_bytes == usize::MAX {
         depth >= UNMEASURED_JSON_DEPTH
@@ -354,7 +355,7 @@ fn parse_root<H: Host>(
     let mut parser = Parser::new(source.as_units());
     (|| -> ParseResult<JsonNode> {
         parser.ws();
-        let root = parser.value(machine, 0)?;
+        let root = parser.value(machine)?;
         parser.ws();
         if parser.pos != parser.source.len() {
             return Err(ParseFailure::Syntax(parser.error_unexpected()));
@@ -401,6 +402,88 @@ impl JsonNode {
         match self {
             JsonNode::Primitive { source, .. } => Some(*source),
             _ => None,
+        }
+    }
+
+    /// Moves the children of this node into `pending`.
+    fn release_children(&mut self, pending: &mut Vec<JsonNode>) {
+        match self {
+            JsonNode::Primitive { .. } => {}
+            JsonNode::Array { children, .. } => pending.append(children),
+            JsonNode::Object { children, .. } => {
+                pending.extend(children.drain(..).map(|(_, node)| node));
+            }
+        }
+    }
+}
+
+impl Drop for JsonNode {
+    /// Drops the subtree from a list, not by recursion, so that a tree of any depth
+    /// drops on a small stack.
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        self.release_children(&mut pending);
+        while let Some(mut node) = pending.pop() {
+            node.release_children(&mut pending);
+        }
+    }
+}
+
+/// An array or object that the parser has opened and not closed, with the members
+/// that it has read.
+enum OpenContainer {
+    Array {
+        values: Vec<Value>,
+        children: Vec<JsonNode>,
+    },
+    /// `key` names the member that the parser reads next.
+    Object {
+        value: Value,
+        children: Vec<(EcmaString, JsonNode)>,
+        key: EcmaString,
+    },
+}
+
+impl OpenContainer {
+    fn push<H: Host>(&mut self, machine: &mut Machine<'_, H>, child: JsonNode) -> ParseResult<()> {
+        match self {
+            OpenContainer::Array { values, children } => {
+                values.push(child.value());
+                children.push(child);
+            }
+            OpenContainer::Object {
+                value,
+                children,
+                key,
+            } => {
+                let key = std::mem::take(key);
+                create_data_property(
+                    machine,
+                    *value,
+                    PropertyKey::Named(key.clone()),
+                    child.value(),
+                )
+                .map_err(ParseFailure::Runtime)?;
+                // Mirror the property map: a duplicate key overwrites in place,
+                // keeping its first-insertion position in enumeration order.
+                match children.iter().position(|(name, _)| *name == key) {
+                    Some(existing) => children[existing] = (key, child),
+                    None => children.push((key, child)),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn close<H: Host>(self, machine: &mut Machine<'_, H>) -> ParseResult<JsonNode> {
+        match self {
+            OpenContainer::Array { values, children } => {
+                let value = allocate_array(machine, values).map_err(ParseFailure::Runtime)?;
+                Ok(JsonNode::Array { value, children })
+            }
+            OpenContainer::Object {
+                value, children, ..
+            } => Ok(JsonNode::Object { value, children }),
         }
     }
 }
@@ -938,12 +1021,110 @@ impl<'a> Parser<'a> {
         self.source.get(self.pos).copied()
     }
 
-    fn value<H: Host>(
-        &mut self,
-        machine: &mut Machine<'_, H>,
-        depth: usize,
-    ) -> ParseResult<JsonNode> {
+    /// Reads one JSON value. The arrays and objects that are open wait in a list, not
+    /// on the Rust stack, so text of any depth parses, as in V8.
+    fn value<H: Host>(&mut self, machine: &mut Machine<'_, H>) -> ParseResult<JsonNode> {
+        let mut open: Vec<OpenContainer> = Vec::new();
+        loop {
+            self.ws();
+            let mut node = match self.peek() {
+                Some(unit) if unit == u16::from(b'[') => {
+                    self.pos += 1;
+                    self.ws();
+                    if self.peek() != Some(u16::from(b']')) {
+                        open.push(OpenContainer::Array {
+                            values: Vec::new(),
+                            children: Vec::new(),
+                        });
+                        continue;
+                    }
+                    self.pos += 1;
+                    let value =
+                        allocate_array(machine, Vec::new()).map_err(ParseFailure::Runtime)?;
+                    JsonNode::Array {
+                        value,
+                        children: Vec::new(),
+                    }
+                }
+                Some(unit) if unit == u16::from(b'{') => {
+                    self.pos += 1;
+                    self.ws();
+                    let object = machine
+                        .allocate(HeapEntry::Object {
+                            properties: PropertyMap::default(),
+                            prototype: Some(machine.intrinsics.object_prototype),
+                            extensible: true,
+                            boxed_primitive: None,
+                        })
+                        .map_err(EvalFailure::Runtime)
+                        .map_err(ParseFailure::Runtime)?;
+                    if self.peek() != Some(u16::from(b'}')) {
+                        let key = self.member_key()?;
+                        open.push(OpenContainer::Object {
+                            value: object,
+                            children: Vec::new(),
+                            key,
+                        });
+                        continue;
+                    }
+                    self.pos += 1;
+                    JsonNode::Object {
+                        value: object,
+                        children: Vec::new(),
+                    }
+                }
+                _ => self.primitive(machine)?,
+            };
+            // `node` is the next member of the innermost open container. Close
+            // every container that ends after it.
+            loop {
+                let Some(container) = open.last_mut() else {
+                    return Ok(node);
+                };
+                container.push(machine, node)?;
+                self.ws();
+                let close = match container {
+                    OpenContainer::Array { .. } => b']',
+                    OpenContainer::Object { .. } => b'}',
+                };
+                match self.peek() {
+                    Some(unit) if unit == u16::from(b',') => {
+                        self.pos += 1;
+                        self.ws();
+                        if let OpenContainer::Object { key, .. } = container {
+                            *key = self.member_key()?;
+                        }
+                        break;
+                    }
+                    Some(unit) if unit == u16::from(close) => {
+                        self.pos += 1;
+                        node = open.pop().expect("a container is open").close(machine)?;
+                    }
+                    _ => return Err(ParseFailure::Syntax(self.error_unexpected())),
+                }
+            }
+        }
+    }
+
+    /// Reads the key of an object member and the `:` after it.
+    fn member_key(&mut self) -> ParseResult<EcmaString> {
+        if self.peek() != Some(u16::from(b'"')) {
+            return Err(ParseFailure::Syntax(
+                self.at("Expected property name or '}' in JSON"),
+            ));
+        }
+        let key = self.string()?;
         self.ws();
+        if self.peek() != Some(u16::from(b':')) {
+            return Err(ParseFailure::Syntax(
+                self.at("Expected ':' after property name in JSON"),
+            ));
+        }
+        self.pos += 1;
+        Ok(key)
+    }
+
+    fn primitive<H: Host>(&mut self, machine: &mut Machine<'_, H>) -> ParseResult<JsonNode> {
         let start = self.pos;
         match self.peek() {
             Some(unit) if unit == u16::from(b'n') => {
@@ -975,8 +1156,6 @@ impl<'a> Parser<'a> {
                     })
                     .map_err(ParseFailure::Runtime)
             }),
-            Some(unit) if unit == u16::from(b'[') => self.array(machine, depth),
-            Some(unit) if unit == u16::from(b'{') => self.object(machine, depth),
             Some(unit)
                 if unit == u16::from(b'-')
                     || (u16::from(b'0')..=u16::from(b'9')).contains(&unit) =>
@@ -1119,118 +1298,6 @@ impl<'a> Parser<'a> {
         (self.pos != start)
             .then_some(())
             .ok_or_else(|| ParseFailure::Syntax(self.error_unexpected()))
-    }
-
-    fn array<H: Host>(
-        &mut self,
-        machine: &mut Machine<'_, H>,
-        depth: usize,
-    ) -> ParseResult<JsonNode> {
-        if json_nesting_overflows(machine, depth) {
-            return Err(ParseFailure::Runtime(json_depth_error()));
-        }
-        self.pos += 1;
-        self.ws();
-        let mut values = Vec::new();
-        let mut children = Vec::new();
-        if self.peek() == Some(u16::from(b']')) {
-            self.pos += 1;
-            let value = allocate_array(machine, values).map_err(ParseFailure::Runtime)?;
-            return Ok(JsonNode::Array { value, children });
-        }
-        loop {
-            let child = self.value(machine, depth + 1)?;
-            values.push(child.value());
-            children.push(child);
-            self.ws();
-            match self.peek() {
-                Some(unit) if unit == u16::from(b',') => {
-                    self.pos += 1;
-                    self.ws();
-                }
-                Some(unit) if unit == u16::from(b']') => {
-                    self.pos += 1;
-                    break;
-                }
-                _ => return Err(ParseFailure::Syntax(self.error_unexpected())),
-            }
-        }
-        let value = allocate_array(machine, values).map_err(ParseFailure::Runtime)?;
-        Ok(JsonNode::Array { value, children })
-    }
-
-    fn object<H: Host>(
-        &mut self,
-        machine: &mut Machine<'_, H>,
-        depth: usize,
-    ) -> ParseResult<JsonNode> {
-        if json_nesting_overflows(machine, depth) {
-            return Err(ParseFailure::Runtime(json_depth_error()));
-        }
-        self.pos += 1;
-        self.ws();
-        let object = machine
-            .allocate(HeapEntry::Object {
-                properties: PropertyMap::default(),
-                prototype: Some(machine.intrinsics.object_prototype),
-                extensible: true,
-                boxed_primitive: None,
-            })
-            .map_err(EvalFailure::Runtime)
-            .map_err(ParseFailure::Runtime)?;
-        let mut children: Vec<(EcmaString, JsonNode)> = Vec::new();
-        if self.peek() == Some(u16::from(b'}')) {
-            self.pos += 1;
-            return Ok(JsonNode::Object {
-                value: object,
-                children,
-            });
-        }
-        loop {
-            if self.peek() != Some(u16::from(b'"')) {
-                return Err(ParseFailure::Syntax(
-                    self.at("Expected property name or '}' in JSON"),
-                ));
-            }
-            let key = self.string()?;
-            self.ws();
-            if self.peek() != Some(u16::from(b':')) {
-                return Err(ParseFailure::Syntax(
-                    self.at("Expected ':' after property name in JSON"),
-                ));
-            }
-            self.pos += 1;
-            let child = self.value(machine, depth + 1)?;
-            create_data_property(
-                machine,
-                object,
-                PropertyKey::Named(key.clone()),
-                child.value(),
-            )
-            .map_err(ParseFailure::Runtime)?;
-            // Mirror the property map: a duplicate key overwrites in place,
-            // keeping its first-insertion position in enumeration order.
-            match children.iter().position(|(name, _)| *name == key) {
-                Some(existing) => children[existing] = (key, child),
-                None => children.push((key, child)),
-            }
-            self.ws();
-            match self.peek() {
-                Some(unit) if unit == u16::from(b',') => {
-                    self.pos += 1;
-                    self.ws();
-                }
-                Some(unit) if unit == u16::from(b'}') => {
-                    self.pos += 1;
-                    break;
-                }
-                _ => return Err(ParseFailure::Syntax(self.error_unexpected())),
-            }
-        }
-        Ok(JsonNode::Object {
-            value: object,
-            children,
-        })
     }
 
     fn error_unexpected(&self) -> String {
@@ -2341,6 +2408,31 @@ mod tests {
         assert!(json_stringify(&mut machine, &[fits]).is_ok());
         let deep = nested_array(&mut machine, UNMEASURED_JSON_DEPTH + 1);
         assert!(is_stack_overflow(&json_stringify(&mut machine, &[deep])));
+    }
+
+    #[test]
+    fn text_of_any_depth_parses_on_a_small_stack() {
+        with_measured_stack(1 << 20, |machine| {
+            let depth = 1 << 18;
+            let mut source = "[{\"a\":".repeat(depth);
+            source.push('0');
+            source.push_str(&"}]".repeat(depth));
+            let deep = text(machine, &source);
+            let mut value =
+                json_parse(machine, &[deep]).unwrap_or_else(|error| panic!("{error:?}"));
+            for _ in 0..depth {
+                let object = machine
+                    .get_named_property(value, "0")
+                    .expect("element exists");
+                value = machine
+                    .get_named_property(object, "a")
+                    .expect("member exists");
+            }
+            assert_eq!(value, Value::int32(0));
+        });
+        test_machine!(program, host, machine);
+        let deep = text(&mut machine, &nested_text(UNMEASURED_JSON_DEPTH + 1));
+        assert!(json_parse(&mut machine, &[deep]).is_ok());
     }
 
     /// Runs `body` with a machine that measures its native stack, on a thread whose
