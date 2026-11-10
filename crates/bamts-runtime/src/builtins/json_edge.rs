@@ -22,7 +22,7 @@
 //!   loading: it parses module source text into the fresh JSON tree that the
 //!   default export of a JSON module namespace binds.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
@@ -518,10 +518,27 @@ pub(crate) fn evaluate_json_module_source<H: Host>(
 
 // ---- JSON.stringify -------------------------------------------------------
 
-struct SerializeOptions<'a> {
+/// One run of `JSON.stringify`. It writes the whole text into one builder, so a
+/// deep value costs time in proportion to its text.
+struct Serializer<'a> {
     replacer: Option<Value>,
     property_list: Option<&'a [EcmaString]>,
     gap: &'a EcmaString,
+    /// The objects that the serializer is inside. A value that is in it again is a
+    /// cycle.
+    stack: HashSet<Value>,
+    output: EcmaStringBuilder,
+}
+
+/// What a property gives after `toJSON`, the replacer and the unwrapping of a
+/// primitive wrapper, before it is written.
+enum Serialized {
+    /// `undefined`, a function or a symbol: an object leaves the property out, and
+    /// an array writes `null`.
+    Omitted,
+    Text(EcmaString),
+    Array(Value),
+    Object(Value),
 }
 
 fn stringify<H: Host>(
@@ -623,15 +640,20 @@ fn stringify<H: Host>(
         PropertyKey::Named(root_key.clone()),
         value,
     )?;
-    let options = SerializeOptions {
+    let mut serializer = Serializer {
         replacer: replacer_function,
         property_list: property_list.as_deref(),
         gap: &gap,
+        stack: HashSet::new(),
+        output: EcmaStringBuilder::new(),
     };
-    let mut stack = Vec::new();
-    match serialize_property(machine, wrapper, root_key, &options, 0, &mut stack)? {
-        Some(text) => Ok(BuiltinOutcome::Value(allocate_string(machine, text)?)),
-        None => Ok(BuiltinOutcome::Value(Value::UNDEFINED)),
+    match serializer.property(machine, wrapper, root_key, 0)? {
+        Serialized::Omitted => Ok(BuiltinOutcome::Value(Value::UNDEFINED)),
+        root => {
+            serializer.write(machine, root, 0)?;
+            let text = serializer.output.finish();
+            Ok(BuiltinOutcome::Value(allocate_string(machine, text)?))
+        }
     }
 }
 
@@ -651,175 +673,181 @@ fn gap_from_string(text: EcmaString) -> EcmaString {
         .expect("range is bounded by the string length")
 }
 
-fn serialize_property<H: Host>(
-    machine: &mut Machine<'_, H>,
-    holder: Value,
-    key: EcmaString,
-    options: &SerializeOptions<'_>,
-    depth: usize,
-    stack: &mut Vec<Value>,
-) -> Result<Option<EcmaString>, EvalFailure> {
-    if depth >= MAX_JSON_DEPTH {
-        return Err(json_depth_error());
-    }
-    let mut value = machine.get_property_key(holder, &PropertyKey::Named(key.clone()))?;
-    if machine.is_object(value) || super::bigint::is_bigint(machine, value)? {
-        let to_json = machine.get_named_property(value, "toJSON")?;
-        if machine.is_callable(to_json)? {
-            let key_value = allocate_string(machine, key.clone())?;
-            value = machine.call_value(to_json, value, &[key_value])?;
+impl Serializer<'_> {
+    /// SerializeJSONProperty up to its text: every step that the program can
+    /// observe, in the order of the spec. An object writes the key of a member only
+    /// when this gives more than [`Serialized::Omitted`].
+    fn property<H: Host>(
+        &self,
+        machine: &mut Machine<'_, H>,
+        holder: Value,
+        key: EcmaString,
+        depth: usize,
+    ) -> Result<Serialized, EvalFailure> {
+        if depth >= MAX_JSON_DEPTH {
+            return Err(json_depth_error());
         }
-    }
-    if let Some(replacer) = options.replacer {
-        let key_value = allocate_string(machine, key)?;
-        value = machine.call_value(replacer, holder, &[key_value, value])?;
-    }
-    let value = machine.unbox_primitive_or_self(value)?;
-    super::bigint::json_reject(machine, value)?;
-    match value.decode() {
-        Some(Decoded::Null) => Ok(Some(EcmaString::encode("null"))),
-        Some(Decoded::Boolean(value)) => Ok(Some(EcmaString::encode(if value {
-            "true"
-        } else {
-            "false"
-        }))),
-        Some(Decoded::Int32(value)) => Ok(Some(EcmaString::encode(&(value as i32).to_string()))),
-        Some(Decoded::Number(value)) => {
-            let text = if value.is_finite() {
-                crate::format_number(value)
-            } else {
-                "null".to_owned()
-            };
-            Ok(Some(EcmaString::encode(&text)))
+        let mut value = machine.get_property_key(holder, &PropertyKey::Named(key.clone()))?;
+        if machine.is_object(value) || super::bigint::is_bigint(machine, value)? {
+            let to_json = machine.get_named_property(value, "toJSON")?;
+            if machine.is_callable(to_json)? {
+                let key_value = allocate_string(machine, key.clone())?;
+                value = machine.call_value(to_json, value, &[key_value])?;
+            }
         }
-        Some(Decoded::HeapRef(_)) => {
-            if let Some(text) = machine.string_value(value) {
-                return Ok(Some(quote(&text)));
-            }
-            if let Some(raw) = raw_json_text(machine, value) {
-                return Ok(Some(raw));
-            }
-            if !machine.is_object(value) {
-                return Ok(None);
-            }
-            let is_array = machine.array_elements(value)?.is_some();
-            if machine.is_callable(value)? && !is_array {
-                return Ok(None);
-            }
-            if stack.contains(&value) {
-                return Err(type_error("Converting circular structure to JSON"));
-            }
-            stack.push(value);
-            let result = if is_array {
-                serialize_array(machine, value, options, depth, stack)
-            } else {
-                serialize_object(machine, value, options, depth, stack)
-            };
-            stack.pop();
-            result.map(Some)
+        if let Some(replacer) = self.replacer {
+            let key_value = allocate_string(machine, key)?;
+            value = machine.call_value(replacer, holder, &[key_value, value])?;
         }
-        Some(Decoded::Undefined | Decoded::Hole | Decoded::Uninitialized) | None => Ok(None),
+        let value = machine.unbox_primitive_or_self(value)?;
+        super::bigint::json_reject(machine, value)?;
+        let text = |text: &str| Serialized::Text(EcmaString::encode(text));
+        Ok(match value.decode() {
+            Some(Decoded::Null) => text("null"),
+            Some(Decoded::Boolean(value)) => text(if value { "true" } else { "false" }),
+            Some(Decoded::Int32(value)) => text(&(value as i32).to_string()),
+            Some(Decoded::Number(value)) if value.is_finite() => text(&crate::format_number(value)),
+            Some(Decoded::Number(_)) => text("null"),
+            Some(Decoded::HeapRef(_)) => {
+                if let Some(string) = machine.string_value(value) {
+                    Serialized::Text(quote(&string))
+                } else if let Some(raw) = raw_json_text(machine, value) {
+                    Serialized::Text(raw)
+                } else if !machine.is_object(value) {
+                    Serialized::Omitted
+                } else {
+                    let is_array = machine.array_elements(value)?.is_some();
+                    if machine.is_callable(value)? && !is_array {
+                        Serialized::Omitted
+                    } else if is_array {
+                        Serialized::Array(value)
+                    } else {
+                        Serialized::Object(value)
+                    }
+                }
+            }
+            Some(Decoded::Undefined | Decoded::Hole | Decoded::Uninitialized) | None => {
+                Serialized::Omitted
+            }
+        })
     }
-}
 
-fn serialize_array<H: Host>(
-    machine: &mut Machine<'_, H>,
-    array: Value,
-    options: &SerializeOptions<'_>,
-    depth: usize,
-    stack: &mut Vec<Value>,
-) -> Result<EcmaString, EvalFailure> {
-    let length = length_of_array_like(machine, array)?;
-    let mut partial = Vec::new();
-    for index in 0..length {
-        partial.push(
-            serialize_property(
+    /// Writes a value that [`Self::property`] gave at `depth`. An array element
+    /// that was left out is `null`.
+    fn write<H: Host>(
+        &mut self,
+        machine: &mut Machine<'_, H>,
+        value: Serialized,
+        depth: usize,
+    ) -> Result<(), EvalFailure> {
+        let (container, is_array) = match value {
+            Serialized::Omitted => {
+                self.output.push_utf8("null");
+                return Ok(());
+            }
+            Serialized::Text(text) => {
+                append(&mut self.output, &text);
+                return Ok(());
+            }
+            Serialized::Array(array) => (array, true),
+            Serialized::Object(object) => (object, false),
+        };
+        if !self.stack.insert(container) {
+            return Err(type_error("Converting circular structure to JSON"));
+        }
+        let result = if is_array {
+            self.array(machine, container, depth)
+        } else {
+            self.object(machine, container, depth)
+        };
+        self.stack.remove(&container);
+        result
+    }
+
+    fn array<H: Host>(
+        &mut self,
+        machine: &mut Machine<'_, H>,
+        array: Value,
+        depth: usize,
+    ) -> Result<(), EvalFailure> {
+        let length = length_of_array_like(machine, array)?;
+        self.output.push_unit(u16::from(b'['));
+        for index in 0..length {
+            self.open_member(index == 0, depth);
+            let element = self.property(
                 machine,
                 array,
                 EcmaString::encode(&index.to_string()),
-                options,
                 depth + 1,
-                stack,
-            )?
-            .unwrap_or_else(|| EcmaString::encode("null")),
-        );
+            )?;
+            self.write(machine, element, depth + 1)?;
+        }
+        self.close(b']', length != 0, depth);
+        Ok(())
     }
-    Ok(compose(b'[', b']', partial, options.gap, depth))
-}
 
-fn serialize_object<H: Host>(
-    machine: &mut Machine<'_, H>,
-    object: Value,
-    options: &SerializeOptions<'_>,
-    depth: usize,
-    stack: &mut Vec<Value>,
-) -> Result<EcmaString, EvalFailure> {
-    let keys = options
-        .property_list
-        .map_or_else(|| machine.enumerable_keys(object), |keys| Ok(keys.to_vec()))?;
-    let mut partial = Vec::new();
-    for key in keys {
-        if let Some(value) =
-            serialize_property(machine, object, key.clone(), options, depth + 1, stack)?
-        {
-            let mut member = EcmaStringBuilder::new();
-            append(&mut member, &quote(&key));
-            member.push_unit(u16::from(b':'));
-            if !options.gap.is_empty() {
-                member.push_unit(u16::from(b' '));
+    fn object<H: Host>(
+        &mut self,
+        machine: &mut Machine<'_, H>,
+        object: Value,
+        depth: usize,
+    ) -> Result<(), EvalFailure> {
+        let keys = self
+            .property_list
+            .map_or_else(|| machine.enumerable_keys(object), |keys| Ok(keys.to_vec()))?;
+        self.output.push_unit(u16::from(b'{'));
+        let mut empty = true;
+        for key in keys {
+            let member = self.property(machine, object, key.clone(), depth + 1)?;
+            if matches!(member, Serialized::Omitted) {
+                continue;
             }
-            append(&mut member, &value);
-            partial.push(member.finish());
+            self.open_member(empty, depth);
+            empty = false;
+            append(&mut self.output, &quote(&key));
+            self.output.push_unit(u16::from(b':'));
+            if !self.gap.is_empty() {
+                self.output.push_unit(u16::from(b' '));
+            }
+            self.write(machine, member, depth + 1)?;
+        }
+        self.close(b'}', !empty, depth);
+        Ok(())
+    }
+
+    /// Writes what comes before a member of a container at `depth`: a comma after
+    /// the first member, and with a gap a new line and the indent of the member.
+    fn open_member(&mut self, first: bool, depth: usize) {
+        if !first {
+            self.output.push_unit(u16::from(b','));
+        }
+        if !self.gap.is_empty() {
+            self.output.push_unit(u16::from(b'\n'));
+            self.indent(depth + 1);
         }
     }
-    Ok(compose(b'{', b'}', partial, options.gap, depth))
+
+    /// Ends a container at `depth`. With a gap, the close of a container that has
+    /// members goes on a new line at the indent of the container.
+    fn close(&mut self, close: u8, has_members: bool, depth: usize) {
+        if has_members && !self.gap.is_empty() {
+            self.output.push_unit(u16::from(b'\n'));
+            self.indent(depth);
+        }
+        self.output.push_unit(u16::from(close));
+    }
+
+    fn indent(&mut self, depth: usize) {
+        for _ in 0..depth {
+            append(&mut self.output, self.gap);
+        }
+    }
 }
 
 fn append(output: &mut EcmaStringBuilder, text: &EcmaString) {
     for &unit in text.as_units() {
         output.push_unit(unit);
     }
-}
-
-fn compose(
-    open: u8,
-    close: u8,
-    parts: Vec<EcmaString>,
-    gap: &EcmaString,
-    depth: usize,
-) -> EcmaString {
-    let mut output = EcmaStringBuilder::new();
-    output.push_unit(u16::from(open));
-    if parts.is_empty() {
-        output.push_unit(u16::from(close));
-        return output.finish();
-    }
-    if gap.is_empty() {
-        for (index, part) in parts.iter().enumerate() {
-            if index != 0 {
-                output.push_unit(u16::from(b','));
-            }
-            append(&mut output, part);
-        }
-    } else {
-        output.push_unit(u16::from(b'\n'));
-        for (index, part) in parts.iter().enumerate() {
-            if index != 0 {
-                output.push_unit(u16::from(b','));
-                output.push_unit(u16::from(b'\n'));
-            }
-            for _ in 0..=depth {
-                append(&mut output, gap);
-            }
-            append(&mut output, part);
-        }
-        output.push_unit(u16::from(b'\n'));
-        for _ in 0..depth {
-            append(&mut output, gap);
-        }
-    }
-    output.push_unit(u16::from(close));
-    output.finish()
 }
 
 fn push_escape(output: &mut EcmaStringBuilder, escape: &str) {
@@ -2284,5 +2312,26 @@ mod tests {
                 limit: MAX_JSON_DEPTH
             }))
         ));
+    }
+
+    #[test]
+    fn an_indented_value_is_written_as_before() {
+        test_machine!(program, host, machine);
+        let script = r#"{"a":[1,[],{},[{"b":null}],"x"],"c":{},"d":{"e":[true]}}"#;
+        let source = text(&mut machine, script);
+        let Ok(value) = json_parse(&mut machine, &[source]) else {
+            panic!("the text parses");
+        };
+        let gap = text(&mut machine, "--");
+        let Ok(output) = json_stringify(&mut machine, &[value, Value::UNDEFINED, gap]) else {
+            panic!("the value serializes");
+        };
+        let output = machine
+            .string_value(output)
+            .expect("stringify gives a string");
+        assert_eq!(
+            output.to_utf8_lossy(),
+            "{\n--\"a\": [\n----1,\n----[],\n----{},\n----[\n------{\n--------\"b\": null\n------}\n----],\n----\"x\"\n--],\n--\"c\": {},\n--\"d\": {\n----\"e\": [\n------true\n----]\n--}\n}"
+        );
     }
 }
