@@ -156,6 +156,8 @@ pub enum DriverError {
     UnsafeFallbackCacheRoot {
         path: PathBuf,
     },
+    /// The system did not start the thread that runs a program in the JIT.
+    ProgramThread(io::Error),
 }
 
 impl DriverError {
@@ -301,6 +303,12 @@ impl fmt::Display for DriverError {
                 "fallback cache root `{}` is not a private directory owned by the current user",
                 path.display()
             ),
+            Self::ProgramThread(source) => {
+                write!(
+                    formatter,
+                    "could not start the thread of the program: {source}"
+                )
+            }
         }
     }
 }
@@ -317,7 +325,8 @@ impl Error for DriverError {
             | Self::ShowConfigRender { source, .. }
             | Self::ToolchainProbe { source, .. }
             | Self::LinkStart { source, .. }
-            | Self::PublishExecutable { source, .. } => Some(source),
+            | Self::PublishExecutable { source, .. }
+            | Self::ProgramThread(source) => Some(source),
             Self::Lower(error) => Some(error),
             Self::ProgramLoad(error) => Some(error),
             Self::Jit(error) => Some(error),
@@ -1816,14 +1825,34 @@ fn run_in_context_with_cancel(
     }
 }
 
-/// The native stack that a program in the JIT can use before it throws
-/// `RangeError`. The program runs on the main thread, also for the API server.
-/// That thread has 8 MiB of stack: the linker sets this on Windows, and it is the
-/// usual default on Linux and macOS. A builtin that calls builtins adds no guest frame,
-/// so only this limit stops it before that stack overflows.
-const JIT_STACK_BYTES: usize = 5 << 20;
-
+/// Runs a program in the JIT on a thread of its own, with the stack that the AOT tier
+/// gives a program. The thread that calls the driver can have much less, as the
+/// worker of the npm package does. A builtin that calls builtins adds no guest
+/// frame, so only the native stack bound stops it, and both tiers stop it at the
+/// same depth.
 fn run_jit(
+    args: &CliArgs,
+    entrypoint: &Path,
+    warnings: RenderedDiagnostics,
+    executable: &bamts_compiler::program::ExecutableProgram,
+    context: &ExecutionContext,
+    cancel: &CancellationToken,
+) -> Result<CommandOutcome, DriverError> {
+    std::thread::scope(|scope| {
+        let program = std::thread::Builder::new()
+            .name("bamts-jit".to_owned())
+            .stack_size(Limits::PROGRAM_STACK)
+            .spawn_scoped(scope, || {
+                run_jit_program(args, entrypoint, warnings, executable, context, cancel)
+            })
+            .map_err(DriverError::ProgramThread)?;
+        program
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+fn run_jit_program(
     args: &CliArgs,
     entrypoint: &Path,
     warnings: RenderedDiagnostics,
@@ -1851,7 +1880,7 @@ fn run_jit(
         &program,
         &mut host,
         &Limits {
-            max_stack_bytes: JIT_STACK_BYTES,
+            max_stack_bytes: Limits::program().max_stack_bytes,
             ..Limits::default()
         },
         cancel.clone(),
@@ -2899,6 +2928,34 @@ mod tests {
     };
     #[cfg(unix)]
     use super::{capture_process_with_cancel, link_executable, probe_toolchain_in_context};
+
+    /// The JIT gives a program a stack of its own. A caller on a thread with the
+    /// 2 MiB that Rust gives a new thread, as the worker of the npm package is,
+    /// still sees `RangeError` for builtins that call builtins without end.
+    #[test]
+    fn the_jit_runs_a_program_on_a_stack_of_its_own() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = std::env::temp_dir().join(format!("bamts-cli-jit-stack-{}", process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)?;
+        fs::write(
+            directory.join("main.ts"),
+            "const cycle: any = [];\n\
+             cycle.join = Array.prototype.toString;\n\
+             try { String(cycle); } catch (error) { console.log((error as Error).name); }\n\
+             console.log(\"ok\");\n",
+        )?;
+        let context = ExecutionContext::new(&directory, BTreeMap::new())?;
+        let args = parse_args(["run", "--jit", "main.ts"])?;
+        let outcome = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || execute_in_context(&args, &context))?
+            .join()
+            .expect("the calling thread does not panic")?;
+        assert_eq!(outcome.stdout, b"RangeError\nok\n");
+        assert_eq!(outcome.exit_code, 0);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]

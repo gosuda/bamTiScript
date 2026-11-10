@@ -938,13 +938,20 @@ const NESTED_STRING_PROGRAM: &str = "let nested: unknown[] = [];\n\
      try { String(nested); } catch (error) { console.log((error as Error).name); }\n\
      console.log(\"ok\");\n";
 
+/// An array whose `join` is `toString` calls itself through builtins alone, so it
+/// passes any stack bound, however deep that is.
+const BUILTIN_CYCLE_PROGRAM: &str = "const cycle: any = [];\n\
+     cycle.join = Array.prototype.toString;\n\
+     try { String(cycle); } catch (error) { console.log((error as Error).name); }\n\
+     console.log(\"ok\");\n";
+
 #[test]
 fn jit_throws_range_error_for_builtins_that_call_builtins_without_end() {
     let project = ScratchDirectory::new();
-    project.write("main.ts", &NESTED_STRING_PROGRAM.replace("DEPTH", "50000"));
+    project.write("main.ts", BUILTIN_CYCLE_PROGRAM);
 
     let output = project.execute("jit", "main.ts", &[]);
-    assert_execution_success(&output, "compiler/execute nested String JIT");
+    assert_execution_success(&output, "compiler/execute builtin cycle JIT");
     assert_eq!(output.stdout, b"RangeError\nok\n");
 }
 
@@ -983,6 +990,23 @@ fn a_javascript_module_with_an_early_error_does_not_run() {
             assert!(stderr.contains(message), "{entrypoint} {target}: {stderr}");
         }
     }
+}
+
+/// Node and the AOT tier both read an array nested 2,000 deep, so the JIT reads
+/// it too.
+#[test]
+fn jit_reads_a_nested_array_as_deep_as_node_does() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        "let nested: unknown[] = [];\n\
+         for (let i = 0; i < 2000; i++) nested = [nested];\n\
+         console.log(JSON.stringify(String(nested)));\n",
+    );
+
+    let output = project.execute("jit", "main.ts", &[]);
+    assert_execution_success(&output, "compiler/execute deep String JIT");
+    assert_eq!(output.stdout, b"\"\"\n");
 }
 
 #[test]

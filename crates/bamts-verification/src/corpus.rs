@@ -913,6 +913,7 @@ impl CorpusFailure {
             | driver::DriverError::LinkFailed { .. }
             | driver::DriverError::PublishExecutable { .. }
             | driver::DriverError::CrossTargetLink { .. } => CorpusStage::Link,
+            driver::DriverError::ProgramThread(_) => CorpusStage::Spawn,
         };
         Self {
             stage,
