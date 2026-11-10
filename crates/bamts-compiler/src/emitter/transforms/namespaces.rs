@@ -11,10 +11,10 @@ use std::collections::BTreeSet;
 use crate::checker::{SymbolId, SymbolKind};
 use crate::emitter::{enum_number_lexeme, enum_string_lexeme};
 use crate::enum_plan::{EnumMemberPlan, EnumScalar};
-use crate::source::TextRange;
+use crate::source::{TextRange, Utf16Pos};
 use crate::syntax::*;
 
-use super::{RestExcludeKey, Rewriter, property_key_text};
+use super::{RestExcludeKey, Rewriter, ScriptTarget, property_key_text};
 
 /// One namespace body being lowered.
 pub(super) struct NamespaceFrame {
@@ -66,7 +66,7 @@ impl Rewriter<'_> {
         let parameter = self.namespace_parameter(&local, namespace.body.range());
         let body = self.lower_namespace_body(namespace, plan.container(), &parameter);
         let mut out = Vec::new();
-        out.extend(self.container_declaration(&local, &binding, range));
+        out.extend(self.container_declaration(&local, &binding, range, statement.range().start()));
         let argument = self.container_argument(&local, &binding, range);
         out.push(self.container_call(&parameter, body, argument, range));
         out
@@ -96,7 +96,7 @@ impl Rewriter<'_> {
             .filter_map(|(member, plan)| self.enum_member_statement(&local, member, plan))
             .collect();
         let mut out = Vec::new();
-        out.extend(self.container_declaration(&local, &binding, range));
+        out.extend(self.container_declaration(&local, &binding, range, statement.range().start()));
         let argument = self.container_argument(&local, &binding, range);
         out.push(self.container_call(&local, body, argument, range));
         out
@@ -359,10 +359,17 @@ impl Rewriter<'_> {
     }
 
     fn rewrite_namespace_member(&mut self, member: &Stmt, parameter: &str) -> Vec<Stmt> {
-        let Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner))) =
-            member.data()
-        else {
-            return self.rewrite_statement(member);
+        let inner = match member.data() {
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => inner,
+            Statement::Namespace(namespace)
+                if self.starts_with_dotted_segment(member.range().start()) =>
+            {
+                let binding = ContainerBinding::Member(parameter.to_owned());
+                return self.lower_namespace(member, namespace, binding, member.range());
+            }
+            _ => return self.rewrite_statement(member),
         };
         let range = member.range();
         let exported = match inner.data() {
@@ -686,18 +693,27 @@ impl Rewriter<'_> {
         }
     }
 
-    /// `var N;` for the first declaration of `local` in this scope. Below the
-    /// top level the binding is block scoped.
+    fn starts_with_dotted_segment(&self, start: Utf16Pos) -> bool {
+        self.file
+            .tokens()
+            .binary_search_by(|token| token.range().start().cmp(&start))
+            .is_ok_and(|index| self.file.tokens()[index].kind() == TokenKind::Dot)
+    }
     fn container_declaration(
         &mut self,
         local: &str,
         binding: &ContainerBinding,
         range: TextRange,
+        declaration_start: Utf16Pos,
     ) -> Option<Stmt> {
         if !self.declared_names.last_mut()?.insert(local.to_owned()) {
             return None;
         }
-        let kind = if self.declared_names.len() > 1 {
+        let dotted = self.starts_with_dotted_segment(declaration_start);
+        let kind = if self.declared_names.len() > 1
+            && !dotted
+            && self.options.target >= ScriptTarget::Es2015
+        {
             VariableKind::Let
         } else {
             VariableKind::Var

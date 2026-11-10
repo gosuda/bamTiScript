@@ -11992,6 +11992,84 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
     }
 
     #[test]
+    fn dotted_segments_bind_with_var_like_class_and_module_with_same_name_and_common_root() {
+        let output = emit_at(
+            "namespace X.Y {\n\
+             \x20   export var origin = 1;\n\
+             }\n\
+             namespace Outer {\n\
+             \x20   export namespace Inner {\n\
+             \x20       export var center = 2;\n\
+             \x20   }\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var X;\n\
+             (function (X) {\n\
+             \x20   var Y;\n\
+             \x20   (function (Y) {\n\
+             \x20       Y.origin = 1;\n\
+             \x20   })(Y = X.Y || (X.Y = {}));\n\
+             })(X || (X = {}));\n\
+             var Outer;\n\
+             (function (Outer) {\n\
+             \x20   let Inner;\n\
+             \x20   (function (Inner) {\n\
+             \x20       Inner.center = 2;\n\
+             \x20   })(Inner = Outer.Inner || (Outer.Inner = {}));\n\
+             })(Outer || (Outer = {}));\n"
+        );
+    }
+
+    #[test]
+    fn unexported_nested_namespaces_stay_local_like_nested_module_private_access() {
+        let output = emit_at(
+            "namespace a {\n\
+             \x20   var x: number;\n\
+             \x20   namespace b {\n\
+             \x20       var y = x;\n\
+             \x20   }\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var a;\n\
+             (function (a) {\n\
+             \x20   var x;\n\
+             \x20   let b;\n\
+             \x20   (function (b) {\n\
+             \x20       var y = x;\n\
+             \x20   })(b || (b = {}));\n\
+             })(a || (a = {}));\n"
+        );
+    }
+
+    #[test]
+    fn nested_containers_bind_with_var_below_es2015_like_comments_external_modules() {
+        let output = emit_at(
+            "namespace M {\n\
+             \x20   export namespace N {\n\
+             \x20       export var c = 3;\n\
+             \x20   }\n\
+             }\n",
+            ScriptTarget::Es5,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var M;\n\
+             (function (M) {\n\
+             \x20   var N;\n\
+             \x20   (function (N) {\n\
+             \x20       N.c = 3;\n\
+             \x20   })(N = M.N || (M.N = {}));\n\
+             })(M || (M = {}));\n"
+        );
+    }
+
+    #[test]
     fn an_exported_enum_publishes_its_container() {
         let source = "export enum E { A }\nexport const enum F { B }\n";
         let esm = emit_at(source, ScriptTarget::Es2015);
