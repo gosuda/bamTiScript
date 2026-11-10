@@ -466,6 +466,24 @@ mod tests {
     }
 
     #[test]
+    fn public_accessibility_is_omitted_in_declarations_like_class_constructor_accessibility() {
+        let output = emit_dts(
+            "export class C {\n\
+             \x20   public p: number;\n\
+             \x20   public static s: number;\n\
+             \x20   public m(): void {}\n\
+             \x20   protected q: number;\n\
+             \x20   constructor(public x: number, protected y: number) {}\n\
+             }\n",
+            DeclarationOptions::default(),
+        );
+        assert_eq!(
+            output.declaration.as_ref().unwrap().code,
+            "export declare class C {\n    p: number;\n    static s: number;\n    m(): void;\n    protected q: number;\n    x: number;\n    protected y: number;\n    constructor(x: number, y: number);\n}\n"
+        );
+    }
+
+    #[test]
     fn parameter_properties_are_lifted_before_the_constructor() {
         let output = emit_dts(
             "export class C { constructor(public x: number) {} }\n",
@@ -474,7 +492,7 @@ mod tests {
         assert!(!output.has_errors(), "{:?}", output.diagnostics);
         assert_eq!(
             output.declaration.as_ref().unwrap().code,
-            "export declare class C {\n    public x: number;\n    constructor(x: number);\n}\n"
+            "export declare class C {\n    x: number;\n    constructor(x: number);\n}\n"
         );
     }
 

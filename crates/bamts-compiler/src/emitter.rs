@@ -4551,7 +4551,9 @@ impl<'a> Emitter<'a> {
     fn emit_class_member_decl(&mut self, member: &ClassMember) -> bool {
         match member {
             ClassMember::Constructor(constructor) => {
-                if let Some(accessibility) = constructor.modifiers.accessibility {
+                if let Some(accessibility) = constructor.modifiers.accessibility
+                    && accessibility != Accessibility::Public
+                {
                     self.raw(accessibility_str(accessibility));
                     self.raw(" ");
                 }
@@ -4647,7 +4649,9 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_member_modifiers_decl(&mut self, modifiers: &DeclarationModifiers) {
-        if let Some(accessibility) = modifiers.accessibility {
+        if let Some(accessibility) = modifiers.accessibility
+            && accessibility != Accessibility::Public
+        {
             self.raw(accessibility_str(accessibility));
             self.raw(" ");
         }
