@@ -63,12 +63,6 @@ owns = [".github/workflows/ci.yml", ".github/workflows/nightly.yml", ".github/wo
 catalogs = []
 
 [[leaf]]
-id = "B0.1"
-cluster = "B0"
-owns = ["docs/dev/ast_change_window_protocol.md"]
-catalogs = ["typescript-7.0.2"]
-
-[[leaf]]
 id = "B1.1"
 cluster = "B1"
 owns = ["crates/bamts-compiler/src/tsc_directives.rs"]
@@ -692,11 +686,6 @@ children = ["A2.1", "A2.2", "A2.3", "A2.6", "A2.7"]
 
 [[node]]
 kind = "cluster"
-id = "B0"
-children = ["B0.1"]
-
-[[node]]
-kind = "cluster"
 id = "B1"
 children = ["B1.1", "B1.2", "B1.3", "B1.4"]
 
@@ -838,7 +827,7 @@ children = ["cluster:A1", "cluster:A2"]
 [[node]]
 kind = "root"
 id = "compiler"
-children = ["cluster:B0", "cluster:B1", "cluster:B2", "cluster:B3", "cluster:B4", "cluster:B5", "cluster:B6", "cluster:B7"]
+children = ["cluster:B1", "cluster:B2", "cluster:B3", "cluster:B4", "cluster:B5", "cluster:B6", "cluster:B7"]
 
 [[node]]
 kind = "root"

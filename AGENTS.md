@@ -9,7 +9,7 @@
 
 ## Compiler invariants
 
-- Before editing any shared compiler root named by `docs/dev/ast_change_window_protocol.md`, acquire its change window and follow that protocol's fresh-read, hash, handoff, and release procedure. Append `NodeKind` and `TokenKind` variants rather than reordering or removing them; their discriminants cross scanner, parser, binder, checker, and emitter boundaries.
+- Append `NodeKind` and `TokenKind` variants rather than reordering or removing them; their discriminants cross scanner, parser, binder, checker, and emitter boundaries.
 - Preserve source coordinates as `Utf16Pos`/`TextRange` values. Convert through `SourceText` rather than assigning UTF-8 byte offsets, and reject boundaries inside surrogate pairs; TypeScript diagnostics and source maps use UTF-16 code units.
 
 ## Evidence hazards

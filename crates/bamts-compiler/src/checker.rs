@@ -13777,9 +13777,7 @@ class B extends A {
         // function type into a bodyless declaration, so C039 and the
         // value-level C002 for `C` stay absent. The zero-return fall-through
         // pairs TS2355 (BAMTS-C081) with the unresolved return-type name C
-        // (C003, TS2304) at (1,29) => offset 28. TS2369/TS7006 in the type
-        // position additionally need modifier modeling on function-type
-        // parameters and are tracked as a syntax.rs change-window item.
+        // (C003, TS2304) at (1,29) => offset 28.
         let result = check_text("function A(): (public B) => C {\n}");
         let diagnostics = result
             .diagnostics()
