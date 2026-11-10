@@ -46,3 +46,6 @@ unsafe_code = "forbid"
 # Optimize the checker so those budgets measure compiler work, not debug codegen.
 [profile.test.package.bamts-compiler]
 opt-level = 2
+
+[profile.release.build-override]
+opt-level = 3
