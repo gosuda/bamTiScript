@@ -50,7 +50,8 @@ use bamts_compiler::syntax::{Token, TokenKind};
 use crate::catalog::CaseConfiguration;
 use crate::facets::{
     DiagnosticCategory, DiagnosticCodeMap, FacetDiagnostic, FacetSeverity, FacetVerdict,
-    SourcePosition, compare_diagnostics, compare_js_emit, compare_source_map, compare_symbols,
+    SourcePosition, compare_diagnostics, compare_declaration_emit, compare_js_emit,
+    compare_source_map, compare_symbols,
     compare_types,
 };
 use crate::suite::{
@@ -2456,7 +2457,7 @@ pub(crate) fn observe_declaration(
                 }
             };
             let expected = extract_dts_sections(&String::from_utf8_lossy(&bytes), units.len());
-            match compare_js_emit(&expected, &emitted) {
+            match compare_declaration_emit(&expected, &emitted) {
                 FacetVerdict::Pass => CompilerCheckObservation {
                     class: FailureClass::Pass,
                     detail: "declaration parity".to_owned(),
@@ -6041,6 +6042,26 @@ export const t = 1;
             ],
             "{emitted}"
         );
+    }
+
+    #[test]
+    fn declaration_facet_labels_its_own_failures() {
+        let baseline_doc = "//// [tests/cases/compiler/declPin.ts] ////\n\
+            \n\
+            //// [declPin.ts]\nvar x: number = 1;\n\
+            \n\
+            //// [declPin.d.ts]\ndeclare var x: number;\n";
+        let emitted = "//// [declPin.d.ts]\ndeclare var x: number;\nlet y: number;\n";
+        let verdict = compare_declaration_emit(&extract_dts_sections(baseline_doc, 1), emitted);
+        match verdict {
+            FacetVerdict::Fail { reason } => {
+                assert!(
+                    reason.starts_with("declaration structural mismatch"),
+                    "declaration rows must carry the declaration facet label: {reason}"
+                );
+            }
+            other => panic!("expected a Fail verdict, got {other:?}"),
+        }
     }
 
     #[test]

@@ -641,6 +641,16 @@ pub fn compare_js_emit(expected: &str, actual: &str) -> FacetVerdict {
     compare_structural("javascript", expected, actual, canonicalize_js_emit)
 }
 
+/// Line-wise comparator for the `.d.ts` sections of declaration baselines.
+///
+/// The declaration facet reads the same document shape as the JavaScript
+/// facet (upstream keeps the `.d.ts` sections inside the owned `.js`
+/// baseline), so the canonicalization matches; the label names its own
+/// facet.
+pub fn compare_declaration_emit(expected: &str, actual: &str) -> FacetVerdict {
+    compare_structural("declaration", expected, actual, canonicalize_js_emit)
+}
+
 fn canonicalize_js_emit(text: &str) -> Result<Vec<String>, ()> {
     Ok(text
         .replace("\r\n", "\n")
