@@ -831,17 +831,17 @@ fn a_read_before_a_module_binding_is_initialized_can_be_caught() {
 }
 
 /// A fatal error before the first `await` aborts the module in the turn that runs
-/// it, and then settles it again on the way out. JSON nested past the depth of the
-/// parser is such an error.
+/// it, and then settles it again on the way out. A call with more arguments than
+/// the runtime takes is such an error.
 #[test]
 fn a_fatal_error_before_the_first_await_is_reported() {
     let output = run_compiled_module(
-        "JSON.parse(\"[\".repeat(300) + \"]\".repeat(300));\n\
+        "Math.max(...new Array(70000).fill(0));\n\
          await 1;\n",
     );
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("call depth limit"), "{stderr}");
+    assert!(stderr.contains("exceeds runtime limit"), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
 }
 

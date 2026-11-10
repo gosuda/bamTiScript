@@ -31,9 +31,10 @@ use super::{allocate_array, allocate_string, define_data, install_function, type
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
 
-// JSON input and callbacks are untrusted; stop recursive Rust traversal well
-// before stack exhaustion. Mirrors the core JSON module's budget.
-const MAX_JSON_DEPTH: usize = 256;
+/// The JSON nesting where a machine that does not measure its native stack stops, as
+/// in a test or an embedded script on a thread of unknown size. Each level is one
+/// Rust frame, so this stays far below a small stack.
+const UNMEASURED_JSON_DEPTH: usize = 256;
 
 /// `space` never contributes more than ten indentation units (ECMA-262
 /// clamp), and string gaps truncate to their first ten code units.
@@ -42,10 +43,19 @@ const MAX_GAP_UNITS: usize = 10;
 /// Largest ToLength result; array-like JSON traversal snapshots this bound.
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
+/// Whether one more level of JSON nesting passes the stack. A machine that measures
+/// its native stack stops only where that stack is full.
+fn json_nesting_overflows<H: Host>(machine: &Machine<'_, H>, depth: usize) -> bool {
+    if machine.limits.max_stack_bytes == usize::MAX {
+        depth >= UNMEASURED_JSON_DEPTH
+    } else {
+        machine.native_stack_overflows()
+    }
+}
+
+/// The `RangeError` of a call that passes the stack, which the program can catch.
 fn json_depth_error() -> EvalFailure {
-    EvalFailure::Runtime(crate::RuntimeErrorKind::CallDepthExceeded {
-        limit: MAX_JSON_DEPTH,
-    })
+    EvalFailure::Throw(crate::STACK_OVERFLOW)
 }
 
 fn syntax_error<H: Host>(machine: &mut Machine<'_, H>, message: String) -> EvalFailure {
@@ -418,7 +428,7 @@ fn walk_reviver<H: Host>(
     let matched = node.is_some_and(|node| node.value() == live);
     let matched_node = if matched { node } else { None };
     if machine.array_elements(live)?.is_some() {
-        if depth >= MAX_JSON_DEPTH {
+        if json_nesting_overflows(machine, depth) {
             return Err(json_depth_error());
         }
         let child_nodes: Option<&[JsonNode]> = match matched_node {
@@ -449,7 +459,7 @@ fn walk_reviver<H: Host>(
             }
         }
     } else if machine.is_object(live) {
-        if depth >= MAX_JSON_DEPTH {
+        if json_nesting_overflows(machine, depth) {
             return Err(json_depth_error());
         }
         let child_nodes: Option<&[(EcmaString, JsonNode)]> = match matched_node {
@@ -684,7 +694,7 @@ impl Serializer<'_> {
         key: EcmaString,
         depth: usize,
     ) -> Result<Serialized, EvalFailure> {
-        if depth >= MAX_JSON_DEPTH {
+        if json_nesting_overflows(machine, depth) {
             return Err(json_depth_error());
         }
         let mut value = machine.get_property_key(holder, &PropertyKey::Named(key.clone()))?;
@@ -1116,7 +1126,7 @@ impl<'a> Parser<'a> {
         machine: &mut Machine<'_, H>,
         depth: usize,
     ) -> ParseResult<JsonNode> {
-        if depth >= MAX_JSON_DEPTH {
+        if json_nesting_overflows(machine, depth) {
             return Err(ParseFailure::Runtime(json_depth_error()));
         }
         self.pos += 1;
@@ -1154,7 +1164,7 @@ impl<'a> Parser<'a> {
         machine: &mut Machine<'_, H>,
         depth: usize,
     ) -> ParseResult<JsonNode> {
-        if depth >= MAX_JSON_DEPTH {
+        if json_nesting_overflows(machine, depth) {
             return Err(ParseFailure::Runtime(json_depth_error()));
         }
         self.pos += 1;
@@ -1257,7 +1267,7 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
     use crate::intrinsics::{BuiltinDef, BuiltinHandler, native_function};
-    use crate::{Limits, RuntimeErrorKind, ThrowOrigin};
+    use crate::{Limits, ThrowOrigin};
 
     macro_rules! test_machine {
         ($program:ident, $host:ident, $machine:ident) => {
@@ -2287,31 +2297,102 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deep_nesting_hits_the_shared_depth_budget() {
-        test_machine!(program, host, machine);
-        let source = format!(
-            "{}0{}",
-            "[".repeat(MAX_JSON_DEPTH + 1),
-            "]".repeat(MAX_JSON_DEPTH + 1)
-        );
-        let source = text(&mut machine, &source);
-        assert!(matches!(
-            json_parse(&mut machine, &[source]),
-            Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
-                limit: MAX_JSON_DEPTH
-            }))
-        ));
+    fn nested_text(depth: usize) -> String {
+        format!("{}0{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    fn nested_array(machine: &mut Machine<'_, TestHost>, depth: usize) -> Value {
         let mut value = Value::int32(0);
-        for _ in 0..(MAX_JSON_DEPTH + 1) {
-            value = allocate_array(&mut machine, vec![value]).expect("array allocation succeeds");
+        for _ in 0..depth {
+            value = allocate_array(machine, vec![value]).expect("array allocation succeeds");
         }
-        assert!(matches!(
-            json_stringify(&mut machine, &[value]),
-            Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
-                limit: MAX_JSON_DEPTH
-            }))
-        ));
+        value
+    }
+
+    fn is_stack_overflow(result: &Result<Value, EvalFailure>) -> bool {
+        matches!(result, Err(EvalFailure::Throw(origin)) if *origin == crate::STACK_OVERFLOW)
+    }
+
+    fn identity_reviver(machine: &mut Machine<'_, TestHost>) -> Value {
+        native(
+            machine,
+            "identityReviver",
+            2,
+            |_: &mut Machine<'_, TestHost>, _: Value, args: &[Value], _: bool| {
+                Ok(BuiltinOutcome::Value(
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                ))
+            },
+        )
+    }
+
+    #[test]
+    fn a_recursive_walk_without_a_measured_stack_throws_range_error() {
+        test_machine!(program, host, machine);
+        let reviver = identity_reviver(&mut machine);
+        let fits = text(&mut machine, &nested_text(UNMEASURED_JSON_DEPTH - 1));
+        assert!(json_parse(&mut machine, &[fits, reviver]).is_ok());
+        let deep = text(&mut machine, &nested_text(UNMEASURED_JSON_DEPTH + 1));
+        assert!(is_stack_overflow(&json_parse(
+            &mut machine,
+            &[deep, reviver]
+        )));
+        let fits = nested_array(&mut machine, UNMEASURED_JSON_DEPTH - 1);
+        assert!(json_stringify(&mut machine, &[fits]).is_ok());
+        let deep = nested_array(&mut machine, UNMEASURED_JSON_DEPTH + 1);
+        assert!(is_stack_overflow(&json_stringify(&mut machine, &[deep])));
+    }
+
+    /// Runs `body` with a machine that measures its native stack, on a thread whose
+    /// stack holds `max_stack_bytes` and the slack past it.
+    fn with_measured_stack(max_stack_bytes: usize, body: fn(&mut Machine<'_, TestHost>)) {
+        std::thread::Builder::new()
+            .stack_size(max_stack_bytes + (8 << 20))
+            .spawn(move || {
+                let program = blank_program("<json-edge>");
+                let mut host = TestHost;
+                let limits = Limits {
+                    max_stack_bytes,
+                    ..Limits::default()
+                };
+                let mut machine = Machine::new(&program, &mut host, limits);
+                install(
+                    &mut machine.heap,
+                    &mut machine.intrinsics.globals,
+                    &mut machine.intrinsics.builtins,
+                );
+                body(&mut machine);
+            })
+            .expect("the thread starts")
+            .join()
+            .expect("the body does not panic");
+    }
+
+    #[test]
+    fn a_measured_stack_holds_json_as_deep_as_it_fits() {
+        with_measured_stack(64 << 20, |machine| {
+            let deep = text(machine, &nested_text(4_000));
+            assert!(json_parse(machine, &[deep]).is_ok());
+            let deep = nested_array(machine, 4_000);
+            let Ok(output) = json_stringify(machine, &[deep]) else {
+                panic!("a nesting of 4,000 arrays fits the stack");
+            };
+            let output = machine
+                .string_value(output)
+                .expect("stringify gives a string");
+            assert_eq!(output.to_utf8_lossy(), nested_text(4_000));
+        });
+    }
+
+    #[test]
+    fn a_recursive_walk_past_a_measured_stack_throws_range_error() {
+        with_measured_stack(1 << 20, |machine| {
+            let reviver = identity_reviver(machine);
+            let deep = text(machine, &nested_text(1 << 16));
+            assert!(is_stack_overflow(&json_parse(machine, &[deep, reviver])));
+            let deep = nested_array(machine, 1 << 16);
+            assert!(is_stack_overflow(&json_stringify(machine, &[deep])));
+        });
     }
 
     #[test]
