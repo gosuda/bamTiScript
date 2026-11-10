@@ -555,54 +555,6 @@ owns = ["crates/bamts-codegen/src/aot/in_process_link.rs"]
 catalogs = []
 
 [[leaf]]
-id = "E4.1"
-cluster = "E4"
-owns = ["crates/bamts-verification/src/toolchain_schema.rs"]
-catalogs = ["target-cells"]
-
-[[leaf]]
-id = "E4.2"
-cluster = "E4"
-owns = ["verification/toolchains/x86_64-unknown-linux-gnu.json"]
-catalogs = ["target-cells"]
-
-[[leaf]]
-id = "E4.3"
-cluster = "E4"
-owns = ["verification/toolchains/aarch64-unknown-linux-gnu.json"]
-catalogs = ["target-cells"]
-
-[[leaf]]
-id = "E4.4"
-cluster = "E4"
-owns = ["verification/toolchains/s390x-unknown-linux-gnu.json"]
-catalogs = ["target-cells"]
-
-[[leaf]]
-id = "E4.5"
-cluster = "E4"
-owns = ["verification/toolchains/riscv64gc-unknown-linux-gnu.json"]
-catalogs = ["target-cells"]
-
-[[leaf]]
-id = "E4.6"
-cluster = "E4"
-owns = ["verification/toolchains/aarch64-apple-darwin.json"]
-catalogs = ["target-cells"]
-
-[[leaf]]
-id = "E4.7"
-cluster = "E4"
-owns = ["verification/toolchains/x86_64-apple-darwin.json"]
-catalogs = ["target-cells"]
-
-[[leaf]]
-id = "E4.8"
-cluster = "E4"
-owns = ["verification/toolchains/x86_64-pc-windows-msvc.json"]
-catalogs = ["target-cells"]
-
-[[leaf]]
 id = "E5.1"
 cluster = "E5"
 owns = ["bench/compiler-rules.toml"]
@@ -796,11 +748,6 @@ children = ["E3.1", "E3.2", "E3.3", "E3.4", "E3.5", "E3.6", "E3.7"]
 
 [[node]]
 kind = "cluster"
-id = "E4"
-children = ["E4.1", "E4.2", "E4.3", "E4.4", "E4.5", "E4.6", "E4.7", "E4.8"]
-
-[[node]]
-kind = "cluster"
 id = "E5"
 children = ["E5.1", "E5.2", "E5.3", "E5.4"]
 
@@ -837,7 +784,7 @@ children = ["cluster:C0", "cluster:C1", "cluster:C2", "cluster:C3", "cluster:C4"
 [[node]]
 kind = "root"
 id = "native"
-children = ["cluster:E1", "cluster:E2", "cluster:E3", "cluster:E4", "cluster:E5", "cluster:F1"]
+children = ["cluster:E1", "cluster:E2", "cluster:E3", "cluster:E5", "cluster:F1"]
 
 [[node]]
 kind = "root"

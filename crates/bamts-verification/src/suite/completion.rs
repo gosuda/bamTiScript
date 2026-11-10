@@ -17,8 +17,8 @@
 //! Runner bindings between the parsed key mode and the workflow-declared
 //! runner follow the matrix the four workflows declare:
 //! TypeScript→compiler, test262→interpreter|jit|aot, formal-quint→quint,
-//! formal-lean→lean, formal-redex→redex, target-cells→aot, and
-//! benchmarks→perf.  Runners that do not name a runtime mode bind
+//! formal-lean→lean, formal-redex→redex, and benchmarks→perf.  Runners
+//! that do not name a runtime mode bind
 //! [`ExecutionMode::Aot`]: their obligations execute the AOT candidate
 //! substrate, so every (catalog, mode) pair recovers exactly one runner.
 
@@ -40,7 +40,7 @@ use crate::{
     classification::{self, ClassificationState, NonPassState},
     evidence::{
         EvidenceHeader, EvidenceReader, EvidenceRow, EvidenceWriter, ExecutionBinding, PublishMode,
-        RunBinding, TerminalState, ToolchainPin, WorkingDirectoryPolicy, merge_shards,
+        RunBinding, ToolchainPin, WorkingDirectoryPolicy, merge_shards,
     },
     fsync,
     lane::{
@@ -51,7 +51,6 @@ use crate::{
     shard::{ObligationKey, ShardIdentity, ShardSpec, validate_catalog},
     suite::{DEFAULT_SNAPSHOT_REL, verify_snapshot},
     sweep_report::{ReportRow, read_receipt},
-    toolchain_schema::load_committed_cells,
 };
 
 /// Per-obligation wall-clock bound handed to the lane.
@@ -149,7 +148,6 @@ fn allowed_runners(catalog: &str) -> Result<&'static [SuiteRunner]> {
         "formal-quint" => Ok(&[SuiteRunner::Quint]),
         "formal-lean" => Ok(&[SuiteRunner::Lean]),
         "formal-redex" => Ok(&[SuiteRunner::Redex]),
-        "target-cells" => Ok(&[SuiteRunner::Aot]),
         "benchmarks" => Ok(&[SuiteRunner::Perf]),
         _ => Err(VerificationError::new(
             ErrorCode::Usage,
@@ -224,7 +222,6 @@ fn runner_for_mode(catalog: &str, mode: crate::shard::ExecutionMode) -> Option<S
                     "formal-quint" => SuiteRunner::Quint,
                     "formal-lean" => SuiteRunner::Lean,
                     "formal-redex" => SuiteRunner::Redex,
-                    "target-cells" => SuiteRunner::Aot,
                     "benchmarks" => SuiteRunner::Perf,
                     _ => return None,
                 }
@@ -514,7 +511,6 @@ fn load_obligation_classifications(
 /// Executor backing: an internal adapter, an injected lane worker, or a typed
 /// unavailable adapter. An unavailable adapter is evidence, not a suite abort.
 enum SuiteAdapter {
-    TargetCells(BTreeMap<String, crate::toolchain_schema::TargetCellRecord>),
     External(Box<dyn LaneExecutor>),
     Missing(String),
 }
@@ -544,11 +540,7 @@ fn lane_program(root: &Path, runner: SuiteRunner) -> Option<PathBuf> {
 }
 
 impl SuiteAdapter {
-    fn build(root: &Path, catalog: &str, runner: SuiteRunner) -> Result<Self> {
-        if runner == SuiteRunner::Aot && catalog == "target-cells" {
-            return Ok(Self::TargetCells(load_committed_cells(root)?));
-        }
-
+    fn build(root: &Path, _catalog: &str, runner: SuiteRunner) -> Result<Self> {
         let variable = lane_adapter_variable(runner);
         let Some(configured) = std::env::var_os(&variable).filter(|value| !value.is_empty()) else {
             return Ok(Self::Missing(format!(
@@ -589,71 +581,8 @@ impl SuiteAdapter {
 
     /// Executes one obligation through an internal path. Result is a worker
     /// outcome; the parent — never this function — derives PASS from it.
-    fn evaluate(&self, request: &LaneRequest) -> Result<LaneOutcome> {
+    fn evaluate(&self, _request: &LaneRequest) -> Result<LaneOutcome> {
         match self {
-            Self::TargetCells(cells) => {
-                let Some(record) = cells.get(request.key().case()) else {
-                    return Ok(LaneOutcome::BlockingFail {
-                        detail: format!(
-                            "target cell `{}` has not been measured; no committed record",
-                            request.key().case()
-                        ),
-                    });
-                };
-                let obligation = record
-                    .obligations()
-                    .get(request.key().configuration())
-                    .ok_or_else(|| {
-                        VerificationError::new(
-                            ErrorCode::Schema,
-                            format!(
-                                "target cell `{}` has no `{}` obligation evidence",
-                                request.key().case(),
-                                request.key().configuration()
-                            ),
-                        )
-                    })?;
-                Ok(match obligation.status() {
-                    TerminalState::Pass => LaneOutcome::Completed {
-                        artifacts: request
-                            .observables()
-                            .iter()
-                            .map(|observable| {
-                                (
-                                    observable.clone(),
-                                    schema::sha256_hex(obligation.evidence().as_bytes()),
-                                )
-                            })
-                            .collect(),
-                    },
-                    TerminalState::BlockingFail => LaneOutcome::BlockingFail {
-                        detail: format!(
-                            "{}; missing artifact `{}`",
-                            obligation.reason(),
-                            obligation.missing_artifact()
-                        ),
-                    },
-                    TerminalState::ExternalBlocked => LaneOutcome::ExternalBlocked {
-                        detail: format!(
-                            "{}; host must supply `{}`",
-                            obligation.reason(),
-                            obligation.missing_artifact()
-                        ),
-                    },
-                    TerminalState::InapplicableOutOfScopeHostFeature => {
-                        LaneOutcome::InapplicableOutOfScopeHostFeature {
-                            detail: obligation.reason().to_owned(),
-                        }
-                    }
-                    other => LaneOutcome::BlockingFail {
-                        detail: format!(
-                            "target-cell obligation `{}` records non-lane terminal state `{}`",
-                            request.key().configuration(),
-                            other.as_str()
-                        ),
-                    },
-                })
-            }
             Self::Missing(detail) => Ok(LaneOutcome::BlockingFail {
                 detail: detail.clone(),
             }),
@@ -1983,7 +1912,7 @@ fn discover_jsonl(root: &Path, found: &mut Vec<PathBuf>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shard::ExecutionMode;
+    use crate::{evidence::TerminalState, shard::ExecutionMode};
 
     struct Scratch {
         root: PathBuf,
@@ -2315,7 +2244,6 @@ mod tests {
             ("formal-quint", "quint", SuiteRunner::Quint),
             ("formal-lean", "lean", SuiteRunner::Lean),
             ("formal-redex", "redex", SuiteRunner::Redex),
-            ("target-cells", "aot", SuiteRunner::Aot),
             ("benchmarks", "perf", SuiteRunner::Perf),
         ];
         for (catalog, runner, expected) in declared {
@@ -2333,7 +2261,6 @@ mod tests {
             ("formal-quint", "lean"),
             ("formal-lean", "quint"),
             ("formal-redex", "compiler"),
-            ("target-cells", "perf"),
             ("benchmarks", "aot"),
         ] {
             let error = resolve_runner(catalog, runner).expect_err("undeclared runner must fail");
@@ -2420,47 +2347,9 @@ mod tests {
             required_modes("test262").expect("modes"),
             [Mode::Interpreter, Mode::Jit, Mode::Aot]
         );
-        for catalog in [
-            "typescript-7.0.2",
-            "formal-redex",
-            "target-cells",
-            "benchmarks",
-        ] {
+        for catalog in ["typescript-7.0.2", "formal-redex", "benchmarks"] {
             assert_eq!(required_modes(catalog).expect("modes"), [Mode::Aot]);
         }
-    }
-
-    #[test]
-    fn an_unmeasured_target_cell_is_a_row_not_a_lane_abort() {
-        let key = ObligationKey::new(
-            "target-cells",
-            "x86_64-pc-windows-msvc",
-            "target-object",
-            ExecutionMode::Aot,
-            "ubuntu-latest",
-        )
-        .expect("key");
-        let binding = LaneBinding::unbound(
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
-        .expect("binding");
-        let request = LaneRequest::new(
-            binding,
-            7,
-            key,
-            BTreeSet::from(["target-object".to_owned()]),
-            vec!["bamts-verification::suite::worker".to_owned()],
-            WorkingDirectoryPolicy::RepositoryRoot,
-            CASE_TIMEOUT_MS,
-        )
-        .expect("request");
-        let outcome = SuiteAdapter::TargetCells(BTreeMap::new())
-            .evaluate(&request)
-            .expect("an unmeasured cell is an outcome");
-        assert!(matches!(
-            outcome,
-            LaneOutcome::BlockingFail { detail } if detail.contains("has not been measured")
-        ));
     }
 
     #[test]

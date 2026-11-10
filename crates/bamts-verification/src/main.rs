@@ -36,11 +36,6 @@ use bamts_verification::{
         DiffRequest, FamiliesRequest, StatusRequest, diff as diff_receipts, families,
         render_recount, status_report,
     },
-    toolchain_measure::measure_cell,
-    toolchain_schema::{
-        blocking_obligations, catalog_identifiers, emit_probe_object, load_target_cells,
-        write_committed_record,
-    },
     unicode,
     workspace_guard::audit_workspace,
 };
@@ -76,15 +71,6 @@ enum Command {
     },
     DiagnosticsRegenerate {
         check: bool,
-    },
-    ToolchainEvidence,
-    ToolchainMeasure {
-        target: String,
-        write: bool,
-    },
-    ToolchainObject {
-        target: String,
-        out: PathBuf,
     },
     PerfStage0,
     PerfJit,
@@ -147,9 +133,6 @@ fn dispatch(root: &Path, command: Command) -> Result<()> {
         Command::CompletionVerify { scope } => verify_completion_command(root, &scope),
         Command::CompletionRegenerate { check } => regenerate_completion_command(root, check),
         Command::DiagnosticsRegenerate { check } => regenerate_diagnostics(root, check),
-        Command::ToolchainEvidence => audit_toolchain_evidence(root),
-        Command::ToolchainMeasure { target, write } => measure_toolchain_cell(root, &target, write),
-        Command::ToolchainObject { target, out } => emit_toolchain_object(&target, &out),
         Command::PerfStage0 => run_perf_stage0(),
         Command::PerfJit => run_perf_jit(),
         Command::PerfCompare {
@@ -213,7 +196,6 @@ fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Comman
         "ledger" => parse_ledger_command(&mut arguments),
         "completion" => parse_completion_command(&mut arguments),
         "diagnostics" => parse_diagnostics_command(&mut arguments),
-        "toolchain" => parse_toolchain_command(&mut arguments),
         "perf" => parse_perf_command(&mut arguments),
         "formal" => parse_formal_command(&mut arguments),
         "source" => parse_source_command(&mut arguments),
@@ -566,32 +548,6 @@ fn parse_diagnostics_command(arguments: &mut impl Iterator<Item = OsString>) -> 
     Ok(Command::DiagnosticsRegenerate { check })
 }
 
-fn parse_toolchain_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
-    let subcommand = required_argument(arguments, "toolchain subcommand")?;
-    match subcommand.as_str() {
-        "evidence" => {
-            reject_extra_arguments(arguments, &[])?;
-            Ok(Command::ToolchainEvidence)
-        }
-        "measure" => {
-            let flags = parse_flags(arguments, &["--target"], &["--write"])?;
-            let target = required_flag(&flags.values, "--target", "toolchain measure")?;
-            Ok(Command::ToolchainMeasure {
-                target,
-                write: flags.switches.contains("--write"),
-            })
-        }
-        "object" => {
-            let flags = parse_flags(arguments, &["--target", "--out"], &[])?;
-            let target = required_flag(&flags.values, "--target", "toolchain object")?;
-            let out = PathBuf::from(required_flag(&flags.values, "--out", "toolchain object")?);
-            Ok(Command::ToolchainObject { target, out })
-        }
-        _ => Err(usage(format!(
-            "unknown toolchain subcommand `{subcommand}`"
-        ))),
-    }
-}
 fn parse_perf_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
     let subcommand = required_argument(arguments, "perf subcommand")?;
     match subcommand.as_str() {
@@ -1041,67 +997,6 @@ fn diagnostic_catalog_error(error: CatalogError) -> VerificationError {
     }
 }
 
-fn audit_toolchain_evidence(root: &Path) -> Result<()> {
-    let cells = load_target_cells(root)?;
-    let blocked = blocking_obligations(&cells);
-    if !blocked.is_empty() {
-        let identifiers: Vec<&str> = blocked
-            .iter()
-            .map(|(identifier, _)| identifier.as_str())
-            .collect();
-        return Err(VerificationError::new(
-            ErrorCode::SetMismatch,
-            format!(
-                "toolchain evidence declares {} non-PASS obligations: {}",
-                identifiers.len(),
-                identifiers.join(", ")
-            ),
-        ));
-    }
-    emit(&format!(
-        "TOOLCHAIN EVIDENCE PASS cells={} obligations={} blocking=0 external_blocked=0\n",
-        cells.len(),
-        catalog_identifiers().len(),
-    ))
-}
-fn measure_toolchain_cell(root: &Path, target: &str, write: bool) -> Result<()> {
-    let work = root.join("target/toolchain-measure").join(target);
-    let measured = measure_cell(target, &work)?;
-    for note in &measured.notes {
-        emit(&format!("NOTE {note}\n"))?;
-    }
-    for (obligation, evidence) in measured.record.obligations() {
-        emit(&format!(
-            "{obligation} {} {}\n",
-            evidence.status().as_str(),
-            evidence.reason()
-        ))?;
-    }
-    if write {
-        let path = write_committed_record(root, &measured.record)?;
-        emit(&format!("TOOLCHAIN MEASURE WROTE {}\n", path.display()))
-    } else if measured.record.is_closed() {
-        emit(&format!("TOOLCHAIN MEASURE PASS target={target}\n"))
-    } else {
-        Err(VerificationError::new(
-            ErrorCode::SetMismatch,
-            format!("target cell `{target}` did not close"),
-        ))
-    }
-}
-
-fn emit_toolchain_object(target: &str, out: &Path) -> Result<()> {
-    let object = emit_probe_object(target, out)?;
-    emit(&format!(
-        "TOOLCHAIN OBJECT PASS target={} sha256={} bytes={} entry={} helpers={}\n",
-        object.target,
-        object.sha256,
-        object.byte_len,
-        object.entry_symbol,
-        object.required_helpers.join(","),
-    ))
-}
-
 fn run_perf_stage0() -> Result<()> {
     let receipt = perf_stage0::run();
     emit_perf_receipt("STAGE0", receipt)
@@ -1397,6 +1292,17 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "bamts-verification: E_USAGE: unknown command `leaf-evidence`"
+        );
+    }
+
+    #[test]
+    fn rejects_toolchain_command() {
+        let error = parse(&["bamts-verification", "toolchain", "x"])
+            .expect_err("toolchain command is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert_eq!(
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown command `toolchain`"
         );
     }
 
