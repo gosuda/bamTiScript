@@ -744,9 +744,11 @@ impl Parser {
     }
 
     fn error_here(&mut self, code: DiagnosticCode, message: &'static str) {
-        // At the end of the text, TypeScript reports a missing name or expression
-        // where the trivia before the end starts.
-        if self.at_eof() && [EXPECTED_EXPRESSION, EXPECTED_IDENTIFIER].contains(&code) {
+        // At the end of the text, TypeScript reports a missing name, expression or
+        // type where the trivia before the end starts.
+        if self.at_eof()
+            && [EXPECTED_EXPRESSION, EXPECTED_IDENTIFIER, EXPECTED_TYPE].contains(&code)
+        {
             self.error_at(code, empty_range(Utf16Pos::new(self.prev_end)), message);
         } else {
             self.error_at_token(code, message);
@@ -5881,7 +5883,10 @@ impl Parser {
             }
             if self.at(TokenKind::LBracket) && !self.has_newline_before() {
                 self.bump();
-                if self.eat(TokenKind::RBracket).is_some() {
+                // At the end of the text, TypeScript reads an array type, so only
+                // the `]` is missing.
+                if self.at(TokenKind::RBracket) || self.at_eof() {
+                    self.expect(TokenKind::RBracket, "expected `]`");
                     type_node = self.node(start, TypeNode::Array(Box::new(type_node)));
                 } else {
                     let index_type = self.parse_type();
@@ -6665,9 +6670,11 @@ impl Parser {
             }
             let before = self.cursor;
             members.push(self.parse_type_member());
+            // The end of the text also ends a member, so only the `}` is missing.
             if self.eat(TokenKind::Semicolon).is_none()
                 && self.eat(TokenKind::Comma).is_none()
                 && !self.at(TokenKind::RBrace)
+                && !self.at_eof()
                 && !self.has_newline_before()
             {
                 self.error_here(EXPECTED_TOKEN, "expected `;` or `,`");
@@ -7104,6 +7111,20 @@ mod tests {
         assert_eq!(
             found("/* 😀 */ a.  // c"),
             [(11, "Identifier expected.".to_owned())]
+        );
+        // A missing type is reported there too, but `A[` is an array type that
+        // misses its `]`.
+        assert_eq!(found("let x:   // c"), [(6, "Type expected.".to_owned())]);
+        assert_eq!(
+            found("let x: A[   // c"),
+            [(16, "']' expected.".to_owned())]
+        );
+        assert_eq!(
+            found("interface I { a:   // c"),
+            [
+                (16, "Type expected.".to_owned()),
+                (23, "'}' expected.".to_owned())
+            ]
         );
         // After `?.`, a missing name is reported at the token.
         assert_eq!(
