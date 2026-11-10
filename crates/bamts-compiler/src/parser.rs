@@ -232,16 +232,22 @@ pub fn parse_with_cancel(
     let jsx_spans = &parser.jsx_spans;
     // A tag accepts any escape and reads a value of `undefined` for a bad one, so the
     // text of a tagged template keeps no escape diagnostic.
+    // This also holds for the escapes that a JSX rescan finds.
     let tagged_spans = &parser.tagged_spans;
+    let tagged_escape = |diagnostic: &Diagnostic| {
+        let start = diagnostic.range().start().get();
+        is_escape_diagnostic(diagnostic.code())
+            && tagged_spans
+                .iter()
+                .any(|span| start >= span.start().get() && start < span.end().get())
+    };
     let mut diagnostics = lexical;
     diagnostics.retain(|diagnostic| {
         let start = diagnostic.range().start().get();
         let in_span = |span: &TextRange| start >= span.start().get() && start < span.end().get();
-        let code = diagnostic.code();
-        let escape = is_escape_diagnostic(code);
         !regex_spans.iter().any(in_span)
             && !jsx_spans.iter().any(in_span)
-            && !(escape && tagged_spans.iter().any(in_span))
+            && !tagged_escape(diagnostic)
     });
     // TypeScript reports no parse error at the start of an earlier one. Its
     // scanner runs as it parses, so at one position a lexical error comes first,
@@ -254,17 +260,23 @@ pub fn parse_with_cancel(
             let diagnostic = at_reported_position(diagnostic);
             (diagnostic.range().start().get(), rank, diagnostic)
         })
-        .chain(parser.diagnostics.iter().map(|diagnostic| {
-            // A literal that the parser scans again, such as a JSX attribute
-            // string, is not closed at the same place as a scanned one.
-            let rank = if is_unterminated_diagnostic(diagnostic.code()) {
-                1
-            } else {
-                2
-            };
-            let diagnostic = at_reported_position(diagnostic.clone());
-            (diagnostic.range().start().get(), rank, diagnostic)
-        }))
+        .chain(
+            parser
+                .diagnostics
+                .iter()
+                .filter(|d| !tagged_escape(d))
+                .map(|diagnostic| {
+                    // A literal that the parser scans again, such as a JSX attribute
+                    // string, is not closed at the same place as a scanned one.
+                    let rank = if is_unterminated_diagnostic(diagnostic.code()) {
+                        1
+                    } else {
+                        2
+                    };
+                    let diagnostic = at_reported_position(diagnostic.clone());
+                    (diagnostic.range().start().get(), rank, diagnostic)
+                }),
+        )
         .collect();
     ordered.sort_by_key(|(start, rank, _)| (*start, *rank));
     let mut starts = std::collections::BTreeSet::new();
@@ -7169,6 +7181,29 @@ mod tests {
             found_in("const e = <a b   ", ScriptKind::TypeScriptReact),
             [(17, "'/' expected.".to_owned())]
         );
+    }
+
+    /// A tag accepts any escape, also in JSX, where the parser scans the template
+    /// again.
+    #[test]
+    fn a_tagged_template_in_jsx_keeps_no_escape_error() {
+        for (text, script_kind) in [
+            (r"const e = <a b={tag`\1`} />;", ScriptKind::JavaScriptReact),
+            (
+                r"const e = <a>{tag`${1}\8`}</a>;",
+                ScriptKind::JavaScriptReact,
+            ),
+            (r"const e = <a b={tag`\1`} />;", ScriptKind::TypeScriptReact),
+        ] {
+            let parsed = parse_text(text, script_kind);
+            assert_eq!(errors(&parsed), Vec::<&Diagnostic>::new(), "{text}");
+        }
+        let plain = parse_text(r"const e = <a b={`\1`} />;", ScriptKind::JavaScriptReact);
+        let starts: Vec<usize> = errors(&plain)
+            .iter()
+            .map(|d| d.range().start().get())
+            .collect();
+        assert_eq!(starts, [17], "a template with no tag keeps its error");
     }
 
     /// `tsc` 7.0.2 reports a string, a template or a comment that is not closed
