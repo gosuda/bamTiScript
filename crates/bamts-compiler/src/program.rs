@@ -3045,6 +3045,7 @@ pub fn lower_program_with_cancel(
                     synthetic,
                     LowerOptions {
                         script_entry: false,
+                        javascript_compatibility: true,
                         ..options
                     },
                     &strings,
@@ -3132,7 +3133,7 @@ pub fn lower_program_with_cancel(
         )?;
         let mut linked_modules = Vec::with_capacity(raw_modules.len());
         let mut provenance = Vec::with_capacity(raw_modules.len());
-        let mut module_failed: Option<(SourceId, ProgramLowerError)> = None;
+        let mut module_failures: Vec<(SourceId, ProgramLowerError)> = Vec::new();
         for (index, (kept_module, raw)) in kept.iter().zip(raw_modules.iter()).enumerate() {
             check_lower_cancel(cancel, kept_module.path(), ProgramLowerPhase::Module)?;
             let code = if let Some(stub) = stub_codes.remove(&kept_module.source_id()) {
@@ -3163,7 +3164,7 @@ pub fn lower_program_with_cancel(
                 }) {
                     Ok(code) => code,
                     Err(error) => {
-                        module_failed = Some((
+                        module_failures.push((
                             kept_module.source_id(),
                             program_lower_error(
                                 kept_module.path(),
@@ -3171,7 +3172,7 @@ pub fn lower_program_with_cancel(
                                 ProgramLowerErrorKind::Lower(error),
                             ),
                         ));
-                        break;
+                        continue;
                     }
                 }
             };
@@ -3183,17 +3184,26 @@ pub fn lower_program_with_cancel(
                 edges: Arc::from(kept_module.dependencies()),
             });
         }
-        if let Some((failing, failure)) = module_failed {
-            if static_reachable.contains(&failing) {
-                return Err(failure);
+        if !module_failures.is_empty() {
+            if let Some((_, failure)) = module_failures
+                .iter()
+                .find(|(source, _)| static_reachable.contains(source))
+            {
+                return Err(failure.clone());
             }
+            let failing: Vec<SourceId> =
+                module_failures.iter().map(|(source, _)| *source).collect();
+            let (_, failure) = module_failures
+                .into_iter()
+                .next()
+                .expect("a non-empty failure list has a first failure");
             let mut quarantine = DynamicQuarantine {
                 resolved,
                 static_reachable: &static_reachable,
                 stubbed: &mut stubbed,
                 excluded: &mut excluded,
             };
-            if !quarantine.quarantine(failing) {
+            if !quarantine.quarantine_all(&failing) {
                 return Err(failure);
             }
             continue;
@@ -3245,7 +3255,7 @@ pub fn lower_program_with_cancel(
                     stubbed: &mut stubbed,
                     excluded: &mut excluded,
                 };
-                if !quarantine.quarantine(failing) {
+                if !quarantine.quarantine_all(&[failing]) {
                     let path = resolved
                         .module(failing)
                         .map_or_else(|| resolved.entrypoint().path(), ResolvedModule::path);
@@ -3263,14 +3273,14 @@ pub fn lower_program_with_cancel(
 
 fn live_without(
     resolved: &ResolvedProgram,
-    failing: SourceId,
+    failing: &HashSet<SourceId>,
     excluded: &HashSet<SourceId>,
     stubbed: &HashSet<SourceId>,
 ) -> HashSet<SourceId> {
     let mut protected = HashSet::new();
     let mut stack = vec![resolved.entrypoint_id()];
     while let Some(current) = stack.pop() {
-        if current == failing || !protected.insert(current) {
+        if failing.contains(&current) || !protected.insert(current) {
             continue;
         }
 
@@ -3282,7 +3292,7 @@ fn live_without(
         };
         for dependency in node.dependencies() {
             if let ModuleTarget::Local(target) = dependency.target() {
-                if *target != failing {
+                if !failing.contains(target) {
                     stack.push(*target);
                 }
             }
@@ -3299,10 +3309,17 @@ struct DynamicQuarantine<'a> {
 }
 
 impl DynamicQuarantine<'_> {
-    fn quarantine(&mut self, failing: SourceId) -> bool {
-        let mut progressed = self.stubbed.insert(failing);
-        let protected = live_without(self.resolved, failing, self.excluded, self.stubbed);
-        progressed |= self.exclude_transitive(failing, &protected);
+
+    fn quarantine_all(&mut self, failing: &[SourceId]) -> bool {
+        let mut progressed = false;
+        for source in failing {
+            progressed |= self.stubbed.insert(*source);
+        }
+        let failing: HashSet<SourceId> = failing.iter().copied().collect();
+        let protected = live_without(self.resolved, &failing, self.excluded, self.stubbed);
+        for source in &failing {
+            progressed |= self.exclude_transitive(*source, &protected);
+        }
         progressed
     }
 
@@ -5517,6 +5534,42 @@ mod tests {
             "the shared dependency stays local instead of being excluded with the failure"
         );
         module(&executable, "shared.ts");
+    }
+
+    #[test]
+    fn dynamic_assemble_failures_quarantine_every_failing_module_together() {
+        let fixture = Fixture::new();
+        fixture.write("good.ts", "export const got = 1;\n");
+        fixture.write("bad1.js", "export const bad = 1;\n");
+        fixture.write("bad2.js", "export const bad = 2;\n");
+        fixture.write(
+            "main.ts",
+            "const good = import('./good.js');\n\
+             const one = import('./bad1.js');\n\
+             const two = import('./bad2.js');\n\
+             good;\none;\ntwo;\n",
+        );
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+        let executable = lower_program(
+            &resolved,
+            &frontend,
+            LowerOptions {
+                javascript_compatibility: false,
+                ..LowerOptions::default()
+            },
+        )
+        .expect("two dynamic-only assemble failures quarantine without failing the run");
+        let main = module(&executable, "main.ts");
+        assert_eq!(main.edges().len(), 3);
+        assert!(main.edges().iter().all(|edge| edge.kind == EdgeKind::Dynamic));
+        for name in ["bad1.js", "bad2.js"] {
+            assert!(
+                module(&executable, name).edges().is_empty(),
+                "{name} is stubbed instead of failing the run"
+            );
+        }
+        module(&executable, "good.ts");
     }
 
     #[test]
