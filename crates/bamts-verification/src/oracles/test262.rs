@@ -11,8 +11,11 @@
 use bamts_bytecode::EcmaString;
 use bamts_compiler::diagnostic::Diagnostic;
 use bamts_compiler::lint::{LintLevel, LintOverride, LintProfile, LintTable};
+use bamts_compiler::lower::LowerOptions;
+use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend_with_cancel};
 use bamts_compiler::program::{
     ModuleEdgeKind, ProgramLoadError, ProgramLowerError, ProgramLowerErrorKind,
+    lower_program_with_cancel,
 };
 use bamts_runtime::{
     CancellationToken, RuntimeErrorKind, ThrowOrigin, WarmupPolicy, run_linked_program,
@@ -1025,16 +1028,13 @@ impl Test262Runner for InterpreterRunner {
 
         let lints = conformance_lints();
         let cancel = CancellationToken::new();
-        let compiled = if request.script.kind == SourceKind::Module {
-            bamts::compile_source_file_with_lints(&script, &lints, &cancel)
-        } else {
-            bamts::compile_script_file(&script, &lints, &cancel)
-        };
-        let executable = match compiled {
-            Ok(executable) => executable,
-            Err(bamts::Error::Diagnostics { diagnostics }) => {
-                return parse_phase_outcome(&diagnostics);
-            }
+        let script_entry = request.script.kind != SourceKind::Module;
+        let fallback_root = script
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let resolved = match bamts::resolve_project_with_cancel(&script, fallback_root, &cancel) {
+            Ok(resolved) => resolved,
             Err(bamts::Error::ProgramLoad(error)) => {
                 if let Some(outcome) = resolution_load_outcome(&error) {
                     return outcome;
@@ -1043,15 +1043,43 @@ impl Test262Runner for InterpreterRunner {
                     detail: format!("compile pipeline failed: {error}"),
                 };
             }
-            Err(bamts::Error::Lower(error)) => {
-                if let Some(outcome) = resolution_lower_outcome(&error) {
-                    return outcome;
-                }
+            Err(error) => {
                 return RunOutcome::Blocked {
                     detail: format!("compile pipeline failed: {error}"),
                 };
             }
+        };
+        let frontend = match compile_program_frontend_with_cancel(
+            &resolved.program,
+            FrontendMode::Check,
+            &lints,
+            &cancel,
+        ) {
+            Ok(frontend) => frontend,
             Err(error) => {
+                return RunOutcome::Blocked {
+                    detail: format!("compile pipeline failed: {error}"),
+                };
+            }
+        };
+        let blocking = bamts::run_blocking_diagnostics(&resolved.program, &frontend, script_entry);
+        if !blocking.is_empty() {
+            return parse_phase_outcome(&blocking);
+        }
+        let executable = match lower_program_with_cancel(
+            &resolved.program,
+            &frontend,
+            LowerOptions {
+                javascript_compatibility: true,
+                script_entry,
+            },
+            &cancel,
+        ) {
+            Ok(executable) => executable,
+            Err(error) => {
+                if let Some(outcome) = resolution_lower_outcome(&error) {
+                    return outcome;
+                }
                 return RunOutcome::Blocked {
                     detail: format!("compile pipeline failed: {error}"),
                 };
@@ -1584,6 +1612,162 @@ function $ERROR(message) {\n\
         let left = fs::read_dir(&scratch).map_or(0, |entries| entries.count());
         fs::remove_dir_all(root).expect("remove scratch");
         (outcome, left)
+    }
+    #[test]
+    fn dynamic_missing_import_rejects_at_run() {
+        let harness = runner_scratch("dyn-missing-harness");
+        let scratch = runner_scratch("dyn-missing-scratch");
+        write_harness(
+            &harness,
+            "assert.js",
+            "var assert;\n(function () {\n  assert = {\n    sameValue: function (actual, expected, message) {\n      if (actual !== expected) {\n        $ERROR(message);\n      }\n    },\n    notSameValue: function (actual, unexpected, message) {\n      if (actual === unexpected) {\n        $ERROR(message);\n      }\n    },\n  };\n})();\n",
+        );
+        write_harness(&harness, "sta.js", STA_JS);
+        write_harness(&harness, "doneprintHandle.js", DONEPRINT_JS);
+        let source = wrap(
+            "description: missing dynamic import rejects at run\nfeatures: [dynamic-import]\nflags: [generated, async]",
+            "let f = () => {\n  import('./THIS_FILE_DOES_NOT_EXIST.js').catch(error => {\n    assert.notSameValue(typeof error, 'undefined');\n  }).then($DONE, $DONE);\n};\n\nf();\n",
+        );
+        let parsed = parse_test(&source).expect("the missing-import case parses");
+        let plan = plan_execution(&parsed.frontmatter, &harness).expect("the plan builds");
+        let sources =
+            load_harness_sources(&plan, &FileHarnessLoader).expect("the harness loads");
+        let runner =
+            backend_runner(ExecutionMode::Interpreter, &scratch).expect("the runner builds");
+        let report = evaluate_in_mode(
+            &runner,
+            ExecutionMode::Interpreter,
+            &parsed,
+            &plan,
+            &sources,
+            Duration::from_secs(10),
+        );
+        assert!(
+            report.is_ok(),
+            "test/language/expressions/dynamic-import/catch/nested-arrow-import-catch-file-does-not-exist.js runs and passes: {report:?}"
+        );
+    }
+
+    #[test]
+    fn valid_dynamic_import_syntax_passes() {
+        let harness = runner_scratch("dyn-valid-harness");
+        let scratch = runner_scratch("dyn-valid-scratch");
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        let source = wrap(
+            "description: dynamic import is valid script code\nfeatures: [dynamic-import]\nflags: [generated]",
+            "var smoosh; function smoosh() {}\n\n\nlet f = () => {\n  import('./empty_FIXTURE.js');\n};\n",
+        );
+        let parsed = parse_test(&source).expect("the valid case parses");
+        let plan = plan_execution(&parsed.frontmatter, &harness).expect("the plan builds");
+        let sources =
+            load_harness_sources(&plan, &FileHarnessLoader).expect("the harness loads");
+        let runner =
+            backend_runner(ExecutionMode::Interpreter, &scratch).expect("the runner builds");
+        let report = evaluate_in_mode(
+            &runner,
+            ExecutionMode::Interpreter,
+            &parsed,
+            &plan,
+            &sources,
+            Duration::from_secs(10),
+        );
+        assert!(
+            report.is_ok(),
+            "test/language/expressions/dynamic-import/syntax/valid/nested-arrow-script-code-valid.js passes: {report:?}"
+        );
+    }
+
+    #[test]
+    fn static_parse_error_still_reports_parse_phase() {
+        let harness = runner_scratch("dyn-static-parse-harness");
+        let scratch = runner_scratch("dyn-static-parse-scratch");
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        let source = wrap(
+            "description: static import-call assignment is a parse error\nfeatures: [dynamic-import]\nnegative:\n  phase: parse\n  type: SyntaxError",
+            "$DONOTEVALUATE();\n\nimport('')++\n",
+        );
+        let parsed = parse_test(&source).expect("the negative case parses its frontmatter");
+        let plan = plan_execution(&parsed.frontmatter, &harness).expect("the plan builds");
+        let sources =
+            load_harness_sources(&plan, &FileHarnessLoader).expect("the harness loads");
+        let runner =
+            backend_runner(ExecutionMode::Interpreter, &scratch).expect("the runner builds");
+        let report = evaluate_in_mode(
+            &runner,
+            ExecutionMode::Interpreter,
+            &parsed,
+            &plan,
+            &sources,
+            Duration::from_secs(10),
+        );
+        assert!(
+            report.is_ok(),
+            "test/language/expressions/dynamic-import/syntax/invalid/invalid-assignmenttargettype-syntax-error-1-update-expression.js still reports parse: {report:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_target_link_error_rejects_with_syntax_error() {
+        let root =
+            std::env::temp_dir()
+                .join(format!("bamts-test262-dyn-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let tests = root.join("tests");
+        let scratch = root.join("scratch");
+        fs::create_dir_all(&tests).expect("tests directory");
+        let fixture_header = "// Copyright (C) 2016 the V8 project authors. All rights reserved.\n\
+             // This code is governed by the BSD license found in the LICENSE file.\n\n";
+        fs::write(
+            tests.join("instn-iee-err-ambiguous-export_FIXTURE.js"),
+            format!("{fixture_header}export {{ x }} from './instn-iee-err-ambiguous_FIXTURE.js';\n"),
+        )
+        .expect("export fixture");
+        fs::write(
+            tests.join("instn-iee-err-ambiguous_FIXTURE.js"),
+            format!(
+                "{fixture_header}export * from './instn-iee-err-ambiguous-1_FIXTURE.js';\nexport * from './instn-iee-err-ambiguous-2_FIXTURE.js';\n"
+            ),
+        )
+        .expect("star fixture");
+        fs::write(
+            tests.join("instn-iee-err-ambiguous-1_FIXTURE.js"),
+            format!("{fixture_header}export var x;\n"),
+        )
+        .expect("star source one");
+        fs::write(
+            tests.join("instn-iee-err-ambiguous-2_FIXTURE.js"),
+            format!("{fixture_header}export var x;\n"),
+        )
+        .expect("star source two");
+        let harness = runner_scratch("dyn-link-harness");
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        write_harness(&harness, "doneprintHandle.js", DONEPRINT_JS);
+        let source = wrap(
+            "description: dynamic import of an ambiguously exporting module rejects\nfeatures: [dynamic-import]\nflags: [generated, async]",
+            "async function f() {\n  await import('./instn-iee-err-ambiguous-export_FIXTURE.js').catch(error => {\n    assert.sameValue(error.name, 'SyntaxError');\n  }).then($DONE, $DONE);\n}\n\nf();\n",
+        );
+        let parsed = parse_test(&source).expect("the rejection case parses");
+        let plan = plan_execution(&parsed.frontmatter, &harness).expect("the plan builds");
+        let sources =
+            load_harness_sources(&plan, &FileHarnessLoader).expect("the harness loads");
+        let runner =
+            InterpreterRunner::new(&scratch).for_test_file(tests.join("case.js"));
+        let report = evaluate_in_mode(
+            &runner,
+            ExecutionMode::Interpreter,
+            &parsed,
+            &plan,
+            &sources,
+            Duration::from_secs(10),
+        );
+        fs::remove_dir_all(&root).expect("remove scratch");
+        assert!(
+            report.is_ok(),
+            "test/language/expressions/dynamic-import/catch/nested-async-function-await-instn-iee-err-ambiguous-import.js passes on SyntaxError rejection: {report:?}"
+        );
     }
 
     #[test]
@@ -3355,8 +3539,10 @@ function $ERROR(message) {\n\
         };
         let outcome = runner.run(&request);
         match &outcome {
-            RunOutcome::Blocked { .. } => {}
-            other => panic!("dynamic load failure must stay blocked, got {other:?}"),
+            RunOutcome::Completed { thrown: None } => {}
+            other => panic!(
+                "import('./THIS_FILE_DOES_NOT_EXIST.js') (test/language/expressions/dynamic-import/catch/nested-arrow-import-catch-file-does-not-exist.js) must run instead of resolving, got {other:?}"
+            ),
         }
         fs::remove_dir_all(root).expect("remove scratch");
     }
