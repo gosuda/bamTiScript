@@ -497,7 +497,7 @@ catalogs = []
 [[leaf]]
 id = "E2.2"
 cluster = "E2"
-owns = ["crates/bamts-codegen/src/jit/tiering.rs"]
+owns = ["crates/bamts-native/src/tiering.rs"]
 catalogs = []
 
 [[leaf]]

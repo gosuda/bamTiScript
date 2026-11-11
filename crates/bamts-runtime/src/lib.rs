@@ -55,8 +55,8 @@ mod vm;
 pub(crate) use intrinsics::builtins;
 
 pub use native::{
-    NativeEngine, NativeError, TieredRunReport, UnitTieringSummary, run_linked_program,
-    run_linked_program_tiered, run_linked_program_with_cancel,
+    NativeEngine, NativeError, TieredRunReport, UnitTieringSummary, WarmupPolicy,
+    run_linked_program, run_linked_program_tiered, run_linked_program_with_cancel,
 };
 
 /// Callback results a builtin keeps rooted, for the locals it still holds.

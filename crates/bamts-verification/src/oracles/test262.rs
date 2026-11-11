@@ -11,7 +11,10 @@
 use bamts_bytecode::EcmaString;
 use bamts_compiler::diagnostic::Diagnostic;
 use bamts_compiler::lint::{LintLevel, LintOverride, LintProfile, LintTable};
-use bamts_runtime::{CancellationToken, RuntimeErrorKind, ThrowOrigin, run_linked_program};
+use bamts_runtime::{
+    CancellationToken, RuntimeErrorKind, ThrowOrigin, WarmupPolicy, run_linked_program,
+    run_linked_program_tiered,
+};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -1052,12 +1055,20 @@ impl Test262Runner for InterpreterRunner {
                         };
                     }
                 };
-                run_linked_program(executable.wire(), &jit_program, &mut host, &limits)
-                    .map(|_| ())
-                    .map_err(|native_error| match native_error {
-                        bamts_runtime::NativeError::Runtime(runtime_error) => runtime_error,
-                        other => synthetic_runtime_error(other),
-                    })
+                run_linked_program_tiered(
+                    executable.wire(),
+                    &jit_program,
+                    &mut host,
+                    &limits,
+                    WarmupPolicy::STRESS,
+                    CancellationToken::new(),
+                )
+                .map(|(outcome, _)| outcome.map(|_| ()))
+                .unwrap_or_else(Err)
+                .map_err(|native_error| match native_error {
+                    bamts_runtime::NativeError::Runtime(runtime_error) => runtime_error,
+                    other => synthetic_runtime_error(other),
+                })
             }
             ExecutionMode::Aot => {
                 // Compile to a relocatable object for the host target.

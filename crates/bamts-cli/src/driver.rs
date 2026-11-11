@@ -27,7 +27,7 @@ use bamts_compiler::{
     },
     service::filesystem::OsFileSystem,
 };
-use bamts_runtime::{Limits, run_linked_program_with_cancel};
+use bamts_runtime::{Limits, WarmupPolicy, run_linked_program_tiered};
 use serde::{
     Serialize,
     ser::{SerializeMap, SerializeSeq, Serializer},
@@ -1875,14 +1875,16 @@ fn run_jit_program(
             .into_iter()
             .chain(args.program_args.iter().cloned()),
     );
-    let outcome = run_linked_program_with_cancel(
+    let (tiered, _) = run_linked_program_tiered(
         executable.wire(),
         &program,
         &mut host,
         &Limits::program(),
+        WarmupPolicy::DEFAULT,
         cancel.clone(),
     )
     .map_err(DriverError::Native)?;
+    let outcome = tiered.map_err(DriverError::Native)?;
     let mut stdout = host.stdout().to_vec();
     stdout.extend_from_slice(&outcome.stdout);
     let exit_code = host.completion_exit_code(outcome.exit_code);

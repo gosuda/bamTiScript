@@ -190,9 +190,6 @@ mod jit;
 #[allow(unsafe_code)]
 mod jit_memory;
 #[cfg(feature = "host-jit")]
-#[path = "jit/tiering.rs"]
-pub mod tiering;
-#[cfg(feature = "host-jit")]
 pub use jit::{
     JitError, JitProgram, JitTelemetry, compile_jit, compile_jit_with_cancel,
     compile_jit_with_telemetry, compile_jit_with_telemetry_cancel,
@@ -1459,7 +1456,7 @@ impl<'a> Lowering<'a> {
                 self.resume_blocks.insert(pc, block);
             }
         }
-        self.emit_dispatch();
+        self.emit_dispatch(code, reachable);
         for &pc in reachable {
             self.emit_instruction(pc, code[pc]);
         }
@@ -1486,25 +1483,19 @@ impl<'a> Lowering<'a> {
         helpers
     }
 
-    /// Emits the entry block: select the starting block from the resume token in
-    /// `frame.bytecode_pc`. Token `0` is a fresh call (pc-0 block); token `P + 1`
-    /// enters the resume prologue for the suspend at pc `P`.
-    fn emit_dispatch(&mut self) {
-        // A function with no suspends has a single entry (token 0): fresh calls
-        // always begin at pc 0, so no token comparison is emitted.
-        if self.resume_blocks.is_empty() {
+    fn emit_dispatch(&mut self, code: &[Instruction], reachable: &BTreeSet<usize>) {
+        let loop_headers = self.loop_headers(code, reachable);
+        if self.resume_blocks.is_empty() && loop_headers.is_empty() {
             let target = self.pc_blocks[0].expect("entry pc is reachable");
             self.builder.ins().jump(target, &[]);
             return;
         }
-
         let token = self.builder.ins().load(
             types::I32,
             MemFlagsData::trusted(),
             self.frame,
             SHADOW_FRAME_PC_OFFSET,
         );
-        // Fresh entry (token 0).
         let fresh = self.pc_blocks[0].expect("entry pc is reachable");
         let after_fresh = self.builder.create_block();
         let is_fresh = self.builder.ins().icmp_imm_u(IntCC::Equal, token, 0);
@@ -1512,14 +1503,13 @@ impl<'a> Lowering<'a> {
             .ins()
             .brif(is_fresh, fresh, &[], after_fresh, &[]);
         self.builder.switch_to_block(after_fresh);
-        // Resume tokens (P + 1), in ascending pc order for deterministic IR.
         let resume: Vec<(usize, Block)> = self
             .resume_blocks
             .iter()
             .map(|(&pc, &block)| (pc, block))
             .collect();
         for (pc, block) in resume {
-            let token_value = i64::from(pc as u32 + 1);
+            let token_value = i64::from(u32::try_from(pc).expect("reachable pc fits in u32") + 1);
             let matches = self
                 .builder
                 .ins()
@@ -1528,8 +1518,38 @@ impl<'a> Lowering<'a> {
             self.builder.ins().brif(matches, block, &[], next, &[]);
             self.builder.switch_to_block(next);
         }
-        // Resumed at an unrecognized token: fatal trap back to the runtime.
+        for header in loop_headers {
+            let target = self.pc_blocks[header].expect("loop header is reachable");
+            let header_u32 = u32::try_from(header).expect("reachable pc fits in u32");
+            let token_value = i64::from(0x8000_0000u32 | header_u32);
+            let matches = self
+                .builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, token, token_value);
+            let next = self.builder.create_block();
+            self.builder.ins().brif(matches, target, &[], next, &[]);
+            self.builder.switch_to_block(next);
+        }
         self.emit_trap(TRAP_INVALID_RESUME);
+    }
+
+    fn loop_headers(&self, code: &[Instruction], reachable: &BTreeSet<usize>) -> Vec<usize> {
+        let mut headers = BTreeSet::new();
+        for &pc in reachable {
+            let target = match code[pc] {
+                Instruction::Jump { target } => Some(target.get() as usize),
+                Instruction::JumpIfTrue { target, .. }
+                | Instruction::JumpIfFalse { target, .. } => Some(target.get() as usize),
+                _ => None,
+            };
+            if let Some(target) = target
+                && target <= pc
+                && reachable.contains(&target)
+            {
+                headers.insert(target);
+            }
+        }
+        headers.into_iter().collect()
     }
 
     fn emit_instruction(&mut self, pc: usize, instruction: Instruction) {

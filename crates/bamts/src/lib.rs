@@ -768,13 +768,16 @@ mod tests {
             let executable = compile_source_file(&entrypoint).expect("the fixture compiles");
             let compiled = bamts_codegen::compile_jit(executable.wire()).expect("the JIT compiles");
             let mut host = bamts_node::NodeHost::new();
-            let outcome = bamts_runtime::run_linked_program(
+            let (tiered, _) = bamts_runtime::run_linked_program_tiered(
                 executable.wire(),
                 &compiled,
                 &mut host,
                 &small_guest_stack(),
+                bamts_runtime::WarmupPolicy::DEFAULT,
+                bamts_cancel::CancellationToken::new(),
             )
-            .expect("the program runs");
+            .expect("the tiered program links");
+            let outcome = tiered.expect("the program runs");
             remove_fixture(&directory).expect("the fixture is removed");
             let mut stdout = host.stdout().to_vec();
             stdout.extend_from_slice(&outcome.stdout);

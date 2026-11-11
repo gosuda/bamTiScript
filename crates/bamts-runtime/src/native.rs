@@ -58,7 +58,8 @@ use bamts_bytecode::{
     Verified,
 };
 pub use bamts_native::AbiError;
-use bamts_native::tiering::{DeoptReason, Tier, TieringState, WarmupPolicy, deopt_reason};
+pub use bamts_native::tiering::WarmupPolicy;
+use bamts_native::tiering::{DeoptReason, Tier, TieringState, deopt_reason};
 use bamts_native::{
     Completion, CompletionTag, Decoded, HelperCall, HelperResult, NativeEntryTable, NativeFrame,
     NativeOps, ShadowFrame, Value, with_native_ops, with_native_ops_ref,
@@ -2880,7 +2881,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         let tag = with_native_ops_ref(self, || {
             entries.invoke(module.get(), function_id.get(), shadow, &mut out)
         });
-        let fault_pc = shadow.bytecode_pc as usize;
+        let fault_pc = if shadow.bytecode_pc & 0x8000_0000 != 0 {
+            osr_pc as usize
+        } else {
+            shadow.bytecode_pc as usize
+        };
         match tag {
             Ok(CompletionTag::Normal) => {
                 self.pending_throw.take();
