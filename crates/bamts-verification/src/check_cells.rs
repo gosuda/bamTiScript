@@ -3031,12 +3031,28 @@ pub(crate) fn collect_resolution_trace(
     program: &ResolvedProgram,
     options: &CompilerOptions,
 ) -> ResolutionTraceLog {
+    collect_trace_with_skip(program, options, None)
+}
+
+pub(crate) fn collect_case_resolution_trace(case: &CheckedCase) -> ResolutionTraceLog {
+    let program = case.program();
+    collect_trace_with_skip(program, case.options(), Some(program.entrypoint_id()))
+}
+
+fn collect_trace_with_skip(
+    program: &ResolvedProgram,
+    options: &CompilerOptions,
+    skip: Option<SourceId>,
+) -> ResolutionTraceLog {
     let root = program.root();
     let kind = resolution_kind(options);
     let host = FilesystemResolutionHost;
     let mut cache = ResolutionCache::new();
     let mut log = ResolutionTraceLog::default();
     for module in program.modules() {
+        if Some(module.source_id()) == skip {
+            continue;
+        }
         let importer = module.path();
         for edge in module.dependencies() {
             if edge.kind() == ModuleEdgeKind::DynamicRuntime {
@@ -3101,7 +3117,7 @@ pub(crate) fn observe_trace(
             artifact: None,
         };
     };
-    let log = collect_resolution_trace(case.program(), case.options());
+    let log = collect_case_resolution_trace(&case);
     let unsupported: Vec<&str> = log
         .unsupported()
         .iter()
@@ -6445,6 +6461,20 @@ let x = b1;
         assert!(
             emitted.contains(&format!("//// [b.json]\n{compiler_body}")),
             "the json output section carries the compiler's emit for that unit, not the raw unit text (requireOfJsonFileWithNoContent.js prints an empty out/b.json body; the compiler has no json output mapping, crates/bamts-compiler/src/project/output.rs:417, and emits its own prelude instead): {emitted}"
+        );
+    }
+    #[test]
+    fn trace_lib_replacement_case_requests_no_resolutions() {
+        let logical = "tests/cases/compiler/libReplacement.ts";
+        let case_text = "// @target: es2015\n// @lib: esnext\n// @traceResolution: true\n// @noTypesAndSymbols: true\n// @noEmit: true\n// @libReplacement: true,false\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let log = collect_case_resolution_trace(&case);
+        assert!(
+            log.lines().is_empty(),
+            "libReplacement(libreplacement=false).trace.json is []: a case with no imports requests no resolutions: {:?}",
+            log.lines()
         );
     }
 
