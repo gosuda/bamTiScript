@@ -1738,6 +1738,13 @@ impl Walker<'_> {
                     );
                 }
             }
+            Expression::Literal(Literal::Regex(literal)) => {
+                if let Some(text) = self.file.token_text(literal.data().token()) {
+                    if crate::regexp::validate_regex_literal(text).is_some() {
+                        self.error(expression.range(), "invalid regular expression");
+                    }
+                }
+            }
             Expression::Literal(Literal::String(literal)) if context.strict => {
                 if has_legacy_escape(self.token_of(literal.data().token())) {
                     self.error(
@@ -2571,5 +2578,15 @@ mod tests {
             assert!(!errors(source).is_empty(), "{source:?} must be rejected");
         }
         assert_eq!(errors("export {}; import.meta;"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn invalid_regex_flags_are_rejected() {
+        for source in ["/./gig;", "/./G;", "/./uv;", "/./uu;", "/./sG;"] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in ["/./g;", "/./gi;", "/./d;", "/./s;", "/./y;", "/./v;", "/./u;"] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
     }
 }

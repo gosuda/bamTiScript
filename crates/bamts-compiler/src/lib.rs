@@ -15,6 +15,7 @@ pub mod pipeline;
 pub mod program;
 pub mod project;
 pub mod public_ast;
+pub mod regexp;
 pub mod rules;
 pub mod scanner;
 pub mod script;
