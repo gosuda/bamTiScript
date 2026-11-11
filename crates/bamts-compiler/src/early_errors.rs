@@ -2755,6 +2755,71 @@ mod tests {
     }
 
     #[test]
+    fn unicode_sets_class_operands_are_validated() {
+        for source in [
+            "/[a--]/v;",
+            "/[--a]/v;",
+            "/[a&&]/v;",
+            "/[&&b]/v;",
+            "/[a-]/v;",
+            "/[-]/v;",
+            "/[a--b&&c]/v;",
+            "/[a&&b--c]/v;",
+            "/[a-b--c]/v;",
+            "/[0-9--_]/v;",
+            "/[a-z-b]/v;",
+            "/[a-z-_]/v;",
+            "/[a-b-c]/v;",
+            "/[a-b&&b]/v;",
+            "/[a-\\d]/v;",
+            "/[\\d-\\d]/v;",
+            "/[[a]-[b]]/v;",
+            "/[a-[b]]/v;",
+            "/[a-&&b]/v;",
+            "/[a&&bc]/v;",
+            "/[a--bc]/v;",
+            "/[a&&b\\d]/v;",
+            "/[[a]c&&a]/v;",
+            "/[a{2}]/v;",
+            "/[\\q{]}]/v;",
+            "/[\\q{-}]/v;",
+            "/[\\q{[}]/v;",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "/[a--b]/v;",
+            "/[a--b--c]/v;",
+            "/[a--b--c--d]/v;",
+            "/[a&&b&&c]/v;",
+            "/[a-z]/v;",
+            "/[[a]--[b]]/v;",
+            "/[\\w--a]/v;",
+            "/[\\d&&\\w]/v;",
+            "/[\\q{a}&&b]/v;",
+            "/[b--\\q{ab}]/v;",
+            "/[\\q{ab}--\\q{cd}]/v;",
+            "/[\\-a]/v;",
+            "/[\\-]/v;",
+            "/[a^]/v;",
+            "/[a*b]/v;",
+            "/[\\x41-\\x45]/v;",
+            "/[\\n-\\x7F]/v;",
+            "/[𐀀-𐫫]/v;",
+            "/[\\q{}]/v;",
+            "/[\\q{a}]/v;",
+            "/[\\q{a|}]/v;",
+            "/[\\q{ab|c}]/v;",
+            "/[\\q{^}]/v;",
+            "/[\\q{ }]/v;",
+            "/[\\q{\\uD800}]/v;",
+            "/[\\q{𐀀}]/v;",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    #[test]
     fn sloppy_var_initializer_in_for_in_follows_annex_b() {
         assert_eq!(errors("for (var a = 0 in {});"), Vec::<String>::new());
         assert!(!errors("\"use strict\"; for (var a = 0 in {});").is_empty());
