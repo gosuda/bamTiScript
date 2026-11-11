@@ -15,6 +15,7 @@ use std::{
 };
 
 use bamts_compiler::diagnostic::Diagnostic;
+use bamts_compiler::diagnostic::DiagnosticSeverity;
 use bamts_compiler::parser::parse;
 use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend};
 use bamts_compiler::program::ProgramLoader;
@@ -34,6 +35,7 @@ use crate::corpus::{
     NODE_VERSION, OracleLimits, Provenance, bounded_output, cli_args, drain_stream, normalized_env,
     run_process,
 };
+use crate::facets;
 use crate::lane::{LaneBinding, LaneOutcome, LaneRequest};
 use crate::oracle_pins::{
     COMPILER_COMMIT, COMPILER_DIGEST, COMPILER_REPOSITORY, COMPILER_TAG, COMPILER_URL,
@@ -2932,7 +2934,10 @@ fn project_trace_lane(
         );
     }
     let kind = observable_kind(observable);
-    if kind != Some(ObservableKind::Trace) && kind != Some(ObservableKind::Declaration) {
+    if kind != Some(ObservableKind::Trace)
+        && kind != Some(ObservableKind::Declaration)
+        && kind != Some(ObservableKind::Diagnostics)
+    {
         return CompilerLaneObservation::blocking(
             input,
             variant,
@@ -2953,6 +2958,9 @@ fn project_trace_lane(
     let check = match kind {
         Some(ObservableKind::Trace) => observe_project_trace(snapshot, index_entry),
         Some(ObservableKind::Declaration) => observe_project_declaration(snapshot, index_entry),
+        Some(ObservableKind::Diagnostics) => {
+            observe_project_diagnostics(snapshot, _ctx, index_entry)
+        }
         _ => {
             return CompilerLaneObservation::blocking(
                 input,
@@ -3257,8 +3265,7 @@ fn produce_project_declaration(
             ProjectEmitError::InvalidFixture("project fixture has no projectRoot".to_owned())
         })?
         .to_owned();
-    if !project_root.starts_with("tests/cases/projects/") || !is_safe_logical_path(&project_root)
-    {
+    if !project_root.starts_with("tests/cases/projects/") || !is_safe_logical_path(&project_root) {
         return Err(ProjectEmitError::UnsafeProjectRoot(format!(
             "project fixture has unsafe projectRoot `{project_root}`"
         )));
@@ -3273,10 +3280,7 @@ fn produce_project_declaration(
                 .collect()
         })
         .unwrap_or_default();
-    if input_files
-        .iter()
-        .any(|path| !is_safe_logical_path(path))
-    {
+    if input_files.iter().any(|path| !is_safe_logical_path(path)) {
         return Err(ProjectEmitError::UnsafeInputFiles(
             "project fixture has unsafe inputFiles".to_owned(),
         ));
@@ -3318,10 +3322,7 @@ fn produce_project_declaration(
         .map_err(|error| ProjectEmitError::Harness(format!("project temp root: {error}")))?;
     let project_dir = temp.path().join(&project_root);
     fs::create_dir_all(&project_dir).map_err(|error| {
-        ProjectEmitError::Harness(format!(
-            "project root `{}`: {error}",
-            project_dir.display()
-        ))
+        ProjectEmitError::Harness(format!("project root `{}`: {error}", project_dir.display()))
     })?;
     let project_prefix = format!("{}/", project_root.trim_end_matches('/'));
     for entry in snapshot.index().entries.values() {
@@ -3362,10 +3363,8 @@ fn produce_project_declaration(
     } else {
         "{}".to_owned()
     };
-    let mut disk_value: serde_json::Value =
-        serde_json::from_str(&on_disk).map_err(|error| {
-            ProjectEmitError::Harness(format!("project config parse: {error}"))
-        })?;
+    let mut disk_value: serde_json::Value = serde_json::from_str(&on_disk)
+        .map_err(|error| ProjectEmitError::Harness(format!("project config parse: {error}")))?;
     if !disk_value.is_object() {
         return Err(ProjectEmitError::Harness(
             "project config is not an object".to_owned(),
@@ -3381,9 +3380,9 @@ fn produce_project_declaration(
         "resolvedInputFiles",
         "emittedFiles",
     ];
-    let disk_object = disk_value.as_object_mut().ok_or_else(|| {
-        ProjectEmitError::Harness("project config is not an object".to_owned())
-    })?;
+    let disk_object = disk_value
+        .as_object_mut()
+        .ok_or_else(|| ProjectEmitError::Harness("project config is not an object".to_owned()))?;
     let compiler_options = disk_object
         .entry("compilerOptions")
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
@@ -3395,9 +3394,8 @@ fn produce_project_declaration(
             map.insert(key.clone(), value.clone());
         }
     }
-    let merged_source = serde_json::to_string(&disk_value).map_err(|error| {
-        ProjectEmitError::Harness(format!("project config serialize: {error}"))
-    })?;
+    let merged_source = serde_json::to_string(&disk_value)
+        .map_err(|error| ProjectEmitError::Harness(format!("project config serialize: {error}")))?;
     let config = ProjectConfig::parse(&root, &config_path, &merged_source)
         .map_err(|error| ProjectEmitError::Harness(format!("project config: {error}")))?;
     if !config.options().declaration() {
@@ -3423,9 +3421,9 @@ fn produce_project_declaration(
     }
     let loader = ProgramLoader::new(&root, config.options())
         .map_err(|error| ProjectEmitError::Harness(format!("project loader: {error}")))?;
-    let loaded = loader.load_roots(&roots).map_err(|error| {
-        ProjectEmitError::Compile(format!("project load failed: {error}"))
-    })?;
+    let loaded = loader
+        .load_roots(&roots)
+        .map_err(|error| ProjectEmitError::Compile(format!("project load failed: {error}")))?;
     let frontend = compile_program_frontend(&loaded, FrontendMode::Declaration);
     let mut produced_by_source: BTreeMap<String, String> = BTreeMap::new();
     for module in loaded.modules() {
@@ -3491,10 +3489,8 @@ fn produce_project_declaration(
     }
     let mut artifact = String::new();
     for name in &expected_dts {
-        let amd_path =
-            format!("tests/baselines/reference/project/{relative_case}/amd/{name}");
-        let node_path =
-            format!("tests/baselines/reference/project/{relative_case}/node/{name}");
+        let amd_path = format!("tests/baselines/reference/project/{relative_case}/amd/{name}");
+        let node_path = format!("tests/baselines/reference/project/{relative_case}/node/{name}");
         let amd_bytes = read_verified_snapshot_asset(snapshot, &amd_path).map_err(|error| {
             ProjectEmitError::MissingBaseline(format!(
                 "missing declaration baseline `{amd_path}`: {error}"
@@ -3528,6 +3524,375 @@ fn produce_project_declaration(
     }
     Ok((artifact.into_bytes(), expected_dts.len()))
 }
+fn observe_project_diagnostics(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    ctx: &CheckContext,
+    index_entry: &IndexEntry,
+) -> check_cells::CompilerCheckObservation {
+    match produce_project_diagnostics(snapshot, ctx, index_entry) {
+        Ok(produced) => check_cells::CompilerCheckObservation {
+            class: FailureClass::Pass,
+            detail: String::new(),
+            artifact: Some(produced),
+        },
+        Err(
+            err @ (ProjectEmitError::Harness(_)
+            | ProjectEmitError::InvalidFixture(_)
+            | ProjectEmitError::InvalidPath(_)),
+        ) => check_cells::CompilerCheckObservation {
+            class: FailureClass::HarnessError,
+            detail: err.detail(),
+            artifact: None,
+        },
+        Err(err) => check_cells::CompilerCheckObservation {
+            class: FailureClass::FailBehavior,
+            detail: err.detail(),
+            artifact: None,
+        },
+    }
+}
+
+fn produce_project_diagnostics(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    ctx: &CheckContext,
+    index_entry: &IndexEntry,
+) -> std::result::Result<Vec<u8>, ProjectEmitError> {
+    let (fixture, project_root, input_files, relative_case) =
+        project_diagnostic_case(snapshot, index_entry)?;
+    let ProjectDiagnosticBaseline {
+        file_rows: expected,
+        amd_globals,
+        node_globals,
+        node_path,
+    } = project_diagnostic_expected(snapshot, &relative_case)?;
+    let actual = project_diagnostic_actual(snapshot, &fixture, &project_root, &input_files)?;
+    match facets::compare_diagnostics(&expected, &actual, &ctx.code_map) {
+        facets::FacetVerdict::Pass => {}
+        facets::FacetVerdict::Fail { reason } => {
+            return Err(ProjectEmitError::Compile(format!(
+                "diagnostic mismatch against `{node_path}`: {reason}"
+            )));
+        }
+        facets::FacetVerdict::Unproven { reason } => {
+            return Err(ProjectEmitError::Harness(format!(
+                "diagnostic oracle could not prove parity against `{node_path}`: {reason}"
+            )));
+        }
+    }
+    if !amd_globals.is_empty() || !node_globals.is_empty() {
+        let amd_codes: Vec<&str> = amd_globals.iter().map(|(code, _)| code.as_str()).collect();
+        let node_codes: Vec<&str> = node_globals.iter().map(|(code, _)| code.as_str()).collect();
+        return Err(ProjectEmitError::Compile(format!(
+            "missing global diagnostics against `{node_path}`: expected amd [{}] node [{}], produced []",
+            amd_codes.join(", "),
+            node_codes.join(", ")
+        )));
+    }
+    serde_json::to_vec(&actual)
+        .map_err(|error| ProjectEmitError::Harness(format!("diagnostic artifact: {error}")))
+}
+
+fn project_diagnostic_case(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    index_entry: &IndexEntry,
+) -> std::result::Result<(serde_json::Value, String, Vec<String>, String), ProjectEmitError> {
+    let descriptor = read_verified_snapshot_asset(snapshot, &index_entry.logical_path)
+        .map_err(|error| ProjectEmitError::Harness(error.to_string()))?;
+    let fixture: serde_json::Value = serde_json::from_slice(&descriptor).map_err(|error| {
+        ProjectEmitError::InvalidFixture(format!("invalid project fixture: {error}"))
+    })?;
+    let project_root = fixture
+        .get("projectRoot")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            ProjectEmitError::InvalidFixture("project fixture has no projectRoot".to_owned())
+        })?
+        .to_owned();
+    if !project_root.starts_with("tests/cases/projects/") || !is_safe_logical_path(&project_root) {
+        return Err(ProjectEmitError::UnsafeProjectRoot(format!(
+            "project fixture has unsafe projectRoot `{project_root}`"
+        )));
+    }
+    let input_files: Vec<String> = fixture
+        .get("inputFiles")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if input_files.iter().any(|path| !is_safe_logical_path(path)) {
+        return Err(ProjectEmitError::UnsafeInputFiles(
+            "project fixture has unsafe inputFiles".to_owned(),
+        ));
+    }
+    let relative_case = index_entry
+        .logical_path
+        .strip_prefix("tests/cases/project/")
+        .and_then(|path| path.strip_suffix(".json"))
+        .ok_or_else(|| {
+            ProjectEmitError::InvalidPath(format!(
+                "project fixture path `{}` has no project baseline stem",
+                index_entry.logical_path
+            ))
+        })?
+        .to_owned();
+    Ok((fixture, project_root, input_files, relative_case))
+}
+
+struct ProjectDiagnosticBaseline {
+    file_rows: Vec<facets::FacetDiagnostic>,
+    amd_globals: Vec<(String, String)>,
+    node_globals: Vec<(String, String)>,
+    node_path: String,
+}
+
+fn project_diagnostic_expected(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    relative_case: &str,
+) -> std::result::Result<ProjectDiagnosticBaseline, ProjectEmitError> {
+    let amd_path =
+        format!("tests/baselines/reference/project/{relative_case}/amd/{relative_case}.errors.txt");
+    let node_path = format!(
+        "tests/baselines/reference/project/{relative_case}/node/{relative_case}.errors.txt"
+    );
+    let amd_bytes = read_verified_snapshot_asset(snapshot, &amd_path).map_err(|error| {
+        ProjectEmitError::MissingBaseline(format!(
+            "missing diagnostic baseline `{amd_path}`: {error}"
+        ))
+    })?;
+    let node_bytes = read_verified_snapshot_asset(snapshot, &node_path).map_err(|error| {
+        ProjectEmitError::MissingBaseline(format!(
+            "missing diagnostic baseline `{node_path}`: {error}"
+        ))
+    })?;
+    let amd_parsed = check_cells::parse_errors_baseline(&String::from_utf8_lossy(&amd_bytes));
+    let node_parsed = check_cells::parse_errors_baseline(&String::from_utf8_lossy(&node_bytes));
+    let mut amd_rows: Vec<facets::FacetDiagnostic> = amd_parsed
+        .diagnostics
+        .iter()
+        .map(facet_from_errors_row)
+        .collect();
+    let mut node_rows: Vec<facets::FacetDiagnostic> = node_parsed
+        .diagnostics
+        .iter()
+        .map(facet_from_errors_row)
+        .collect();
+    amd_rows.sort();
+    node_rows.sort();
+    if amd_rows != node_rows {
+        return Err(ProjectEmitError::Compile(format!(
+            "amd/node file diagnostics differ for `{relative_case}`"
+        )));
+    }
+    let amd_globals: Vec<(String, String)> = amd_parsed
+        .globals
+        .iter()
+        .map(|global| (global.code.clone(), global.message.clone()))
+        .collect();
+    let node_globals: Vec<(String, String)> = node_parsed
+        .globals
+        .iter()
+        .map(|global| (global.code.clone(), global.message.clone()))
+        .collect();
+    Ok(ProjectDiagnosticBaseline {
+        file_rows: node_rows,
+        amd_globals,
+        node_globals,
+        node_path,
+    })
+}
+
+fn facet_from_errors_row(row: &check_cells::ErrorsDiagnostic) -> facets::FacetDiagnostic {
+    let category = if row.category == "warning" {
+        facets::DiagnosticCategory::Warning
+    } else {
+        facets::DiagnosticCategory::Error
+    };
+    let severity = if row.category == "warning" {
+        facets::FacetSeverity::Warning
+    } else {
+        facets::FacetSeverity::Error
+    };
+    facets::FacetDiagnostic {
+        unit: row.unit.clone(),
+        position: facets::SourcePosition {
+            line: row.line,
+            character: row.character,
+        },
+        category,
+        severity,
+        code: row.code.clone(),
+    }
+}
+
+fn project_diagnostic_actual(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    fixture: &serde_json::Value,
+    project_root: &str,
+    input_files: &[String],
+) -> std::result::Result<Vec<facets::FacetDiagnostic>, ProjectEmitError> {
+    let temp = TempDir::new("bamts-project-diag")
+        .map_err(|error| ProjectEmitError::Harness(format!("project temp root: {error}")))?;
+    let project_dir = temp.path().join(project_root);
+    fs::create_dir_all(&project_dir).map_err(|error| {
+        ProjectEmitError::Harness(format!("project root `{}`: {error}", project_dir.display()))
+    })?;
+    let project_prefix = format!("{}/", project_root.trim_end_matches('/'));
+    for entry in snapshot.index().entries.values() {
+        let Some(relative) = entry.logical_path.strip_prefix(&project_prefix) else {
+            continue;
+        };
+        if entry.asset_kind != AssetKind::CaseInput || !is_safe_logical_path(relative) {
+            continue;
+        }
+        let bytes = read_verified_snapshot_asset(snapshot, &entry.logical_path)
+            .map_err(|error| ProjectEmitError::Harness(error.to_string()))?;
+        let destination = project_dir.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                ProjectEmitError::Harness(format!(
+                    "project directory `{}`: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        fs::write(&destination, bytes).map_err(|error| {
+            ProjectEmitError::Harness(format!(
+                "project source `{}`: {error}",
+                destination.display()
+            ))
+        })?;
+    }
+    let root = ProjectRoot::new(&project_dir)
+        .map_err(|error| ProjectEmitError::Harness(format!("project root: {error}")))?;
+    let config_path = project_dir.join("tsconfig.json");
+    let on_disk = if config_path.exists() {
+        fs::read_to_string(&config_path).map_err(|error| {
+            ProjectEmitError::Harness(format!(
+                "project config `{}`: {error}",
+                config_path.display()
+            ))
+        })?
+    } else {
+        "{}".to_owned()
+    };
+    let merged_source = merged_fixture_config(&on_disk, fixture)?;
+    let config = ProjectConfig::parse(&root, &config_path, &merged_source)
+        .map_err(|error| ProjectEmitError::Harness(format!("project config: {error}")))?;
+    let mut roots: Vec<PathBuf> = input_files.iter().map(PathBuf::from).collect();
+    if roots.is_empty() {
+        roots = config.files().to_vec();
+    }
+    if roots.is_empty() {
+        roots = collect_project_sources(&project_dir).map_err(ProjectEmitError::Harness)?;
+    }
+    if roots.is_empty() {
+        return Err(ProjectEmitError::Compile(
+            "project has no roots to compile".to_owned(),
+        ));
+    }
+    let loader = ProgramLoader::new(&root, config.options())
+        .map_err(|error| ProjectEmitError::Harness(format!("project loader: {error}")))?;
+    let loaded = loader
+        .load_roots(&roots)
+        .map_err(|error| ProjectEmitError::Compile(format!("project load failed: {error}")))?;
+    let frontend = compile_program_frontend(&loaded, FrontendMode::Check);
+    let mut actual = Vec::new();
+    for module in loaded.modules() {
+        let Ok(relative) = module.path().strip_prefix(&project_dir) else {
+            continue;
+        };
+        let name = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if name.ends_with(".d.ts") {
+            continue;
+        }
+        let relative_posix = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let Some(output) = frontend
+            .modules()
+            .iter()
+            .find(|item| item.source_file().source_id() == module.source_id())
+        else {
+            continue;
+        };
+        let Ok(text) = SourceText::new(output.source_file().source_text().as_str().to_owned())
+        else {
+            continue;
+        };
+        for diagnostic in output.diagnostics() {
+            if diagnostic.code().as_str().starts_with("BAMTS-W") {
+                continue;
+            }
+            let (line, character) = text
+                .line_column(diagnostic.range().start())
+                .map(|(line, character)| ((line + 1) as u32, character as u32))
+                .unwrap_or((0, 0));
+            let (category, severity) = match diagnostic.severity() {
+                DiagnosticSeverity::Warning => (
+                    facets::DiagnosticCategory::Warning,
+                    facets::FacetSeverity::Warning,
+                ),
+                DiagnosticSeverity::Error => (
+                    facets::DiagnosticCategory::Error,
+                    facets::FacetSeverity::Error,
+                ),
+            };
+            actual.push(facets::FacetDiagnostic {
+                unit: relative_posix.clone(),
+                position: facets::SourcePosition { line, character },
+                category,
+                severity,
+                code: diagnostic.code().as_str().to_owned(),
+            });
+        }
+    }
+    actual.sort();
+    Ok(actual)
+}
+
+fn merged_fixture_config(
+    on_disk: &str,
+    fixture: &serde_json::Value,
+) -> std::result::Result<String, ProjectEmitError> {
+    let mut disk_value: serde_json::Value = serde_json::from_str(on_disk)
+        .map_err(|error| ProjectEmitError::Harness(format!("project config parse: {error}")))?;
+    let disk_object = disk_value
+        .as_object_mut()
+        .ok_or_else(|| ProjectEmitError::Harness("project config is not an object".to_owned()))?;
+    let compiler_options = disk_object
+        .entry("compilerOptions")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let (Some(map), Some(fixture_object)) =
+        (compiler_options.as_object_mut(), fixture.as_object())
+    {
+        let ignored = [
+            "scenario",
+            "projectRoot",
+            "inputFiles",
+            "baselineCheck",
+            "runTest",
+            "resolvedInputFiles",
+            "emittedFiles",
+        ];
+        for (key, value) in fixture_object {
+            if ignored.contains(&key.as_str()) {
+                continue;
+            }
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::to_string(&disk_value)
+        .map_err(|error| ProjectEmitError::Harness(format!("project config serialize: {error}")))
+}
 
 fn collect_project_sources(project_dir: &Path) -> std::result::Result<Vec<PathBuf>, String> {
     let mut sources = Vec::new();
@@ -3548,13 +3913,16 @@ fn collect_project_sources(project_dir: &Path) -> std::result::Result<Vec<PathBu
                 if name.ends_with(".d.ts") {
                     continue;
                 }
-                let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or_default();
+                let ext = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or_default();
                 if !matches!(ext, "ts" | "tsx" | "js" | "jsx") {
                     continue;
                 }
-                let relative = path.strip_prefix(project_dir).map_err(|error| {
-                    format!("project source prefix: {error}")
-                })?;
+                let relative = path
+                    .strip_prefix(project_dir)
+                    .map_err(|error| format!("project source prefix: {error}"))?;
                 sources.push(relative.to_path_buf());
             }
         }
@@ -5301,14 +5669,14 @@ File 'tests/cases/projects/trace/util.ts' exists - use it as a name resolution r
         assert!(observation.artifacts.contains_key("trace"));
 
         // A project row routed with a still-unrouted observable stays a closed
-        // blocking fail (declaration now routes alongside trace; diagnostics
-        // and javascript do not yet).
+        // blocking fail (trace, declaration, and diagnostics now route;
+        // javascript needs AMD emit and does not yet).
         let request = compiler_lane_request(
             &fixture.snapshot,
             COMPILER_CATALOG,
             "project/tests/cases/project/traceFix.json",
-            "default#diagnostics",
-            &["diagnostics"],
+            "default#javascript",
+            &["javascript"],
         );
         let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
         closed_non_pass(&observation);
@@ -5320,9 +5688,7 @@ File 'tests/cases/projects/trace/util.ts' exists - use it as a name resolution r
     }
     fn project_declaration_fixture(label: &str) -> CompilerLaneFixture {
         let extracted = TestDir::new(&format!("{label}-src"));
-        let case = extracted
-            .path()
-            .join("tests/cases/project/declFix.json");
+        let case = extracted.path().join("tests/cases/project/declFix.json");
         fs::create_dir_all(case.parent().unwrap()).unwrap();
         fs::write(
             &case,
@@ -5337,8 +5703,11 @@ File 'tests/cases/projects/trace/util.ts' exists - use it as a name resolution r
         )
         .unwrap();
         fs::create_dir_all(project.join("subfolder")).unwrap();
-        fs::write(project.join("subfolder/b.ts"), "export class B {\n    \n}\n")
-            .unwrap();
+        fs::write(
+            project.join("subfolder/b.ts"),
+            "export class B {\n    \n}\n",
+        )
+        .unwrap();
         fs::write(
             project.join("subfolder/c.ts"),
             "import {A} from '../a';\n\nexport class C {\n    a: A;\n}\n",
@@ -5403,6 +5772,77 @@ File 'tests/cases/projects/trace/util.ts' exists - use it as a name resolution r
         );
         assert_eq!(observation.detail, "");
         assert!(observation.artifacts.contains_key("declaration"));
+    }
+    fn project_diagnostic_fixture(label: &str) -> CompilerLaneFixture {
+        let extracted = TestDir::new(&format!("{label}-src"));
+        let case = extracted.path().join("tests/cases/project/diagFix.json");
+        fs::create_dir_all(case.parent().unwrap()).unwrap();
+        fs::write(
+            &case,
+            r#"{"scenario":"baseline","projectRoot":"tests/cases/projects/diagproj","inputFiles":["emit.ts"],"baselineCheck":true,"runTest":true}"#,
+        )
+        .unwrap();
+        let project = extracted.path().join("tests/cases/projects/diagproj");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("decl.ts"),
+            "export interface Point { x: number; y: number; };\nexport function point (x: number, y: number): Point {\n\treturn { x: x, y: y };\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join("emit.ts"),
+            "import g = require(\"./decl\");\nvar p = g.point(10,20);\n",
+        )
+        .unwrap();
+        let node_errors = "error TS5107: Option 'moduleResolution=classic' is deprecated and will stop functioning in TypeScript 7.0. Specify compilerOption '\"ignoreDeprecations\": \"6.0\"' to silence this error.\n\n\n!!! error TS5107: Option 'moduleResolution=classic' is deprecated and will stop functioning in TypeScript 7.0. Specify compilerOption '\"ignoreDeprecations\": \"6.0\"' to silence this error.\n==== decl.ts (0 errors) ====\n==== emit.ts (0 errors) ====\n";
+        let amd_errors = "error TS5107: Option 'module=AMD' is deprecated and will stop functioning in TypeScript 7.0. Specify compilerOption '\"ignoreDeprecations\": \"6.0\"' to silence this error.\nerror TS5107: Option 'moduleResolution=classic' is deprecated and will stop functioning in TypeScript 7.0. Specify compilerOption '\"ignoreDeprecations\": \"6.0\"' to silence this error.\n\n\n!!! error TS5107: Option 'module=AMD' is deprecated and will stop functioning in TypeScript 7.0. Specify compilerOption '\"ignoreDeprecations\": \"6.0\"' to silence this error.\n!!! error TS5107: Option 'moduleResolution=classic' is deprecated and will stop functioning in TypeScript 7.0. Specify compilerOption '\"ignoreDeprecations\": \"6.0\"' to silence this error.\n==== decl.ts (0 errors) ====\n==== emit.ts (0 errors) ====\n";
+        for (variant, errors) in [("amd", amd_errors), ("node", node_errors)] {
+            let dir = extracted.path().join(format!(
+                "tests/baselines/reference/project/diagFix/{variant}"
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("diagFix.errors.txt"), errors).unwrap();
+        }
+        fs::write(extracted.path().join("LICENSE"), b"Apache-2.0\n").unwrap();
+        let snap = TestDir::new(&format!("{label}-snap"));
+        materialize_from_extracted(snap.path(), extracted.path()).unwrap();
+        let verified = verify_snapshot(snap.path()).unwrap();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let ctx = CheckContext {
+            code_map: crate::facets::load_diagnostic_code_map(&repo).expect("code map"),
+            baseline_groups: crate::check_cells::baseline_groups(&verified.snapshot.index),
+        };
+        CompilerLaneFixture {
+            _extracted: extracted,
+            _snap: snap,
+            snapshot: verified.snapshot,
+            ctx,
+        }
+    }
+
+    #[test]
+    fn project_diagnostic_lane_reports_missing_globals() {
+        let fixture = project_diagnostic_fixture("project-diag-route");
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "project/tests/cases/project/diagFix.json",
+            "default#diagnostics",
+            &["diagnostics"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert_eq!(
+            observation.class,
+            FailureClass::FailBehavior,
+            "{}",
+            observation.detail
+        );
+        assert!(
+            observation.detail.contains("missing global diagnostics")
+                && observation.detail.contains("diagFix.errors.txt"),
+            "{}",
+            observation.detail
+        );
     }
 
     /// A project fixture with no owned `.trace.json` baseline is
