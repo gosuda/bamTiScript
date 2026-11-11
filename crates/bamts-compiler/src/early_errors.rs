@@ -2627,4 +2627,23 @@ mod tests {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
     }
+
+    #[test]
+    fn invalid_regex_named_groups_are_rejected() {
+        for source in [
+            "/(?<a>.)\\k<b>/;",
+            "/(?<a>a)(?<a>a)/u;",
+            "/(?<>a)/u;",
+            "/(?<a>.)\\k/u;",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "/(?<a>a)/;",
+            "/\\k<a>(?<a>x)/;",
+            "/^(?:(?<a>x)|(?<a>y)|z)\\k<a>$/;",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
 }
