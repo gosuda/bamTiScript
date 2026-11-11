@@ -344,8 +344,8 @@ fn build_plan<H: Host>(
                 properties,
                 ..
             } => {
-                let source_value = regexp_property(&properties, &mut machine.atoms, "source")?;
-                let canonical_flags = regexp_property(&properties, &mut machine.atoms, "flags")?;
+                let source_value = regexp_property(&properties, &machine.shapes, &mut machine.atoms, "source")?;
+                let canonical_flags = regexp_property(&properties, &machine.shapes, &mut machine.atoms, "flags")?;
                 PlannedNode::RegExp {
                     pattern,
                     flags,
@@ -459,10 +459,11 @@ fn build_plan<H: Host>(
 }
 fn regexp_property(
     properties: &PropertyMap,
+    shapes: &crate::ShapeTable,
     atoms: &mut crate::AtomTable,
     name: &'static str,
 ) -> Result<Value, StructuredCloneFailure> {
-    match properties.get(&PropertyKey::Named(atoms.intern_str(name))) {
+    match properties.get(shapes, &PropertyKey::Named(atoms.intern_str(name))) {
         Some(Property::Data { value, .. }) => Ok(*value),
         _ => Err(StructuredCloneFailure::Evaluation(type_error(
             "invalid RegExp internal state",
@@ -524,7 +525,7 @@ fn append_error_state<H: Host>(
     ] {
         let key = PropertyKey::Named(machine.intern_str(name));
         if properties.iter().any(|property| property.key == key)
-            || !source_properties.contains_key(&key)
+            || !source_properties.contains_key(&machine.shapes, &key)
         {
             continue;
         }
@@ -947,8 +948,10 @@ mod tests {
             ("flags", flags_text, false),
             ("lastIndex", Value::int32(12), true),
         ] {
+            let key = PropertyKey::Named(machine.intern_str(name));
             properties.insert(
-                PropertyKey::Named(machine.intern_str(name)),
+                &mut machine.shapes,
+                key,
                 Property::Data {
                     value,
                     writable,
@@ -981,7 +984,7 @@ mod tests {
         assert!(pattern.eq_ascii("a"));
         assert!(flags.eq_ascii("g"));
         assert!(matches!(
-            properties.get(&last_index_key),
+            properties.get(&machine.shapes, &last_index_key),
             Some(Property::Data {
                 value,
                 writable: true,

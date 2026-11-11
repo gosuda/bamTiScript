@@ -4525,9 +4525,14 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     let pattern = self.constant_text(module, pattern);
                     let flags = self.constant_text(module, flags);
                     let prototype = self.machine.borrow().intrinsics.regexp_prototype();
-                    let properties = crate::intrinsics::builtins::initial_regexp_properties(
-                        &mut self.machine.borrow_mut().atoms,
-                    );
+                    let properties = {
+                        let mut borrowed = self.machine.borrow_mut();
+                        let machine: &mut Machine<'_, H> = &mut borrowed;
+                        crate::intrinsics::builtins::initial_regexp_properties(
+                            &mut machine.atoms,
+                            &mut machine.shapes,
+                        )
+                    };
                     self.allocated(HeapEntry::RegExp {
                         pattern,
                         flags,
@@ -11737,7 +11742,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
     }
 
     #[test]

@@ -15,6 +15,7 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, Proper
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
     constructor: Value,
 ) {
@@ -51,14 +52,15 @@ pub(super) fn install<H: Host>(
         ("setPrototypeOf", 2, set_prototype_of::<H>),
         ("values", 1, values::<H>),
     ] {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
-        define_static(heap, atoms, constructor, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_static(heap, atoms, shapes, constructor, name, function);
     }
 }
 
 fn define_static(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     constructor: Value,
     name: &str,
     value: Value,
@@ -68,6 +70,7 @@ fn define_static(
         panic!("Object constructor must be a native function");
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern_str(name)),
         super::builtin_property(value),
     );
@@ -895,13 +898,9 @@ mod tests {
                 length: 2,
                 handler: parity::<TestHost>,
             });
-            let callback = native_function(
-                &mut machine.heap,
-                &mut machine.atoms,
-                callback_id,
-                "parity",
-                2,
-            );
+            let callback = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, callback_id,
+            "parity",
+            2,);
             let grouped =
                 value(group_by(machine, Value::UNDEFINED, &[iterable, callback], false).unwrap());
             assert_eq!(machine.internal_get_prototype_of(grouped).unwrap(), None);
@@ -970,13 +969,9 @@ mod tests {
                 length: 0,
                 handler: throwing_getter::<TestHost>,
             });
-            let getter = native_function(
-                &mut machine.heap,
-                &mut machine.atoms,
-                getter_id,
-                "throw key",
-                0,
-            );
+            let getter = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, getter_id,
+            "throw key",
+            0,);
             let __key_0_5 = PropertyKey::Named(machine.intern_str("0"));
             machine
                 .define_descriptor(
@@ -1008,7 +1003,7 @@ mod tests {
                     length: 0,
                     handler,
                 });
-                let function = native_function(&mut machine.heap, &mut machine.atoms, id, name, 0);
+                let function = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0);
                 machine.set_data_property(iterator, name, function).unwrap();
             }
             let iterator_id = machine.intrinsics.builtins.register(BuiltinDef {
@@ -1016,15 +1011,10 @@ mod tests {
                 length: 0,
                 handler: iterator_self::<TestHost>,
             });
-            let iterator_function = native_function(
-                &mut machine.heap,
-                &mut machine.atoms,
-                iterator_id,
-                "iterator",
-                0,
-            );
-            let iterator_key = machine
-                .property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
+            let iterator_function = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, iterator_id,
+            "iterator",
+            0,);
+            let iterator_key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
                 .unwrap();
             machine
                 .set_data_property_key(iterator, iterator_key, iterator_function)
@@ -1075,6 +1065,7 @@ mod tests {
             install(
                 &mut machine.heap,
                 &mut machine.atoms,
+                &mut machine.shapes,
                 &mut machine.intrinsics.builtins,
                 constructor,
             );
@@ -1122,13 +1113,9 @@ mod tests {
                 length: 1,
                 handler: capture_assignment::<TestHost>,
             });
-            let setter = native_function(
-                &mut machine.heap,
-                &mut machine.atoms,
-                setter_id,
-                "capture assignment",
-                1,
-            );
+            let setter = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, setter_id,
+            "capture assignment",
+            1,);
             let __key_x_8 = PropertyKey::Named(machine.intern_str("x"));
             machine
                 .define_descriptor(
@@ -1189,13 +1176,9 @@ mod tests {
                 length: 0,
                 handler: key_to_string::<TestHost>,
             });
-            let to_string = native_function(
-                &mut machine.heap,
-                &mut machine.atoms,
-                to_string_id,
-                "key toString",
-                0,
-            );
+            let to_string = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, to_string_id,
+            "key toString",
+            0,);
             machine
                 .set_data_property(key_object, "toString", to_string)
                 .unwrap();

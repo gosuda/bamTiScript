@@ -8,6 +8,7 @@ use crate::{CollectionIndex, CollectionKind, EvalFailure, HeapEntry, Host, Machi
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
     set_prototype: Value,
 ) {
@@ -20,8 +21,8 @@ pub(super) fn install<H: Host>(
         ("isSupersetOf", is_superset_of::<H>),
         ("isDisjointFrom", is_disjoint_from::<H>),
     ] {
-        let function = install_function(heap, atoms, builtins, name, 1, handler);
-        define_data(heap, atoms, set_prototype, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 1, handler: handler });
+        define_data(heap, atoms, shapes, set_prototype, name, function);
     }
 }
 
@@ -477,7 +478,7 @@ mod tests {
             length,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
     }
 
     fn make_set(machine: &mut Machine<'_, TestHost>, values: &[Value]) -> Value {
@@ -1274,6 +1275,7 @@ mod tests {
             unreachable!()
         };
         properties.insert(
+            &mut machine.shapes,
             key,
             Property::Accessor {
                 getter: Some(getter),
@@ -1356,7 +1358,7 @@ mod tests {
                     writable,
                     enumerable,
                     configurable,
-                }) = properties.get_ascii(&machine.atoms, name)
+                }) = properties.get_ascii(&machine.shapes, &machine.atoms, name)
                 else {
                     panic!("{name} is installed as data property")
                 };

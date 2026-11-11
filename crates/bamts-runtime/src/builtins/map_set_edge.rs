@@ -10,6 +10,7 @@ use super::{
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
     CollectionKind, EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap,
+    ShapeTable,
 };
 
 /// Installs the collection algorithms whose observable ordering and iterator-close
@@ -17,14 +18,16 @@ use crate::{
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let map = replace_constructor(heap, atoms, globals, builtins, "Map", map_constructor::<H>);
-    let set = replace_constructor(heap, atoms, globals, builtins, "Set", set_constructor::<H>);
+    let map = replace_constructor(heap, atoms, shapes, globals, builtins, "Map", map_constructor::<H>);
+    let set = replace_constructor(heap, atoms, shapes, globals, builtins, "Set", set_constructor::<H>);
     let weak_map = replace_constructor(
         heap,
         atoms,
+        shapes,
         globals,
         builtins,
         "WeakMap",
@@ -33,6 +36,7 @@ pub(super) fn install<H: Host>(
     let weak_set = replace_constructor(
         heap,
         atoms,
+        shapes,
         globals,
         builtins,
         "WeakSet",
@@ -40,31 +44,21 @@ pub(super) fn install<H: Host>(
     );
 
     for constructor in [map.constructor, set.constructor] {
-        let species = install_function(
-            heap,
-            atoms,
-            builtins,
-            "get [Symbol.species]",
-            0,
-            super::regexp_protocol::species_getter::<H>,
-        );
-        super::define_symbol_property(
-            heap,
-            constructor,
-            builtins.symbol_species(),
-            crate::Property::Accessor {
-                getter: Some(species),
-                setter: None,
-                enumerable: false,
-                configurable: true,
-            },
-        );
+        let species = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get [Symbol.species]", length: 0, handler: super::regexp_protocol::species_getter::<H> });
+        super::define_symbol_property(heap, shapes, constructor,
+        builtins.symbol_species(),
+        crate::Property::Accessor {
+            getter: Some(species),
+            setter: None,
+            enumerable: false,
+            configurable: true,
+        },);
     }
 
-    let group_by = install_function(heap, atoms, builtins, "groupBy", 2, map_group_by::<H>);
-    define_constructor_data(heap, atoms, map.constructor, "groupBy", group_by);
-    let map_set = install_function(heap, atoms, builtins, "set", 2, strong_map_set::<H>);
-    define_data(heap, atoms, map.prototype, "set", map_set);
+    let group_by = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "groupBy", length: 2, handler: map_group_by::<H> });
+    define_constructor_data(heap, atoms, shapes, map.constructor, "groupBy", group_by);
+    let map_set = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "set", length: 2, handler: strong_map_set::<H> });
+    define_data(heap, atoms, shapes, map.prototype, "set", map_set);
     for (target, name, handler) in [
         (
             map.prototype,
@@ -87,25 +81,27 @@ pub(super) fn install<H: Host>(
             weak_map_get_or_insert_computed::<H>,
         ),
     ] {
-        let function = install_function(heap, atoms, builtins, name, 2, handler);
-        define_data(heap, atoms, target, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 2, handler: handler });
+        define_data(heap, atoms, shapes, target, name, function);
     }
-    let set_add = install_function(heap, atoms, builtins, "add", 1, strong_set_add::<H>);
-    define_data(heap, atoms, set.prototype, "add", set_add);
+    let set_add = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "add", length: 1, handler: strong_set_add::<H> });
+    define_data(heap, atoms, shapes, set.prototype, "add", set_add);
 
     // Set.prototype.keys and Set.prototype.values are the same function object.
-    let set_prototype = prototype_of(heap, atoms, "Set", globals);
-    let values = own_data_property(heap, atoms, set_prototype, "values");
-    define_data(heap, atoms, set_prototype, "keys", values);
+    let set_prototype = prototype_of(heap, atoms, shapes, "Set", globals);
+    let values = own_data_property(heap, atoms, shapes, set_prototype, "values");
+    define_data(heap, atoms, shapes, set_prototype, "keys", values);
 
     define_collection_tag(
         heap,
+        shapes,
         weak_map.prototype,
         builtins.symbol_to_string_tag(),
         "WeakMap",
     );
     define_collection_tag(
         heap,
+        shapes,
         weak_set.prototype,
         builtins.symbol_to_string_tag(),
         "WeakSet",
@@ -121,14 +117,15 @@ struct InstalledConstructor {
 fn replace_constructor<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
     name: &'static str,
     handler: BuiltinHandler<H>,
 ) -> InstalledConstructor {
-    let prototype = prototype_of(heap, atoms, name, globals);
-    let constructor = install_constructor_function(heap, atoms, builtins, name, 0, handler);
-    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
+    let prototype = prototype_of(heap, atoms, shapes, name, globals);
+    let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 0, handler: handler });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode(name), constructor);
     InstalledConstructor {
         constructor,
@@ -138,6 +135,7 @@ fn replace_constructor<H: Host>(
 fn prototype_of(
     heap: &[HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &ShapeTable,
     name: &str,
     globals: &BTreeMap<EcmaString, Value>,
 ) -> Value {
@@ -145,12 +143,13 @@ fn prototype_of(
         .get(&EcmaString::encode(name))
         .copied()
         .expect("baseline collection constructor is installed first");
-    own_data_property(heap, atoms, constructor, "prototype")
+    own_data_property(heap, atoms, shapes, constructor, "prototype")
 }
 
 fn own_data_property(
     heap: &[HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &ShapeTable,
     object: Value,
     name: &str,
 ) -> Value {
@@ -160,7 +159,7 @@ fn own_data_property(
         | HeapEntry::NativeFunction { properties, .. } => properties,
         _ => panic!("collection intrinsic property owner must be an object"),
     };
-    match properties.get(&PropertyKey::Named(atoms.intern(EcmaString::encode(name)))) {
+    match properties.get(shapes, &PropertyKey::Named(atoms.intern(EcmaString::encode(name)))) {
         Some(Property::Data { value, .. }) => *value,
         _ => panic!("collection intrinsic data property must exist"),
     }
@@ -169,6 +168,7 @@ fn own_data_property(
 fn define_constructor_data(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     constructor: Value,
     name: &str,
     value: Value,
@@ -177,6 +177,7 @@ fn define_constructor_data(
         panic!("collection constructor must be a native function")
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern(EcmaString::encode(name))),
         Property::Data {
             value,
@@ -189,6 +190,7 @@ fn define_constructor_data(
 
 fn define_collection_tag(
     heap: &mut Vec<HeapEntry>,
+    shapes: &mut crate::ShapeTable,
     prototype: Value,
     tag_symbol: Value,
     name: &str,
@@ -198,6 +200,7 @@ fn define_collection_tag(
         panic!("collection prototype must be an ordinary object")
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(heap_index(tag_symbol) as u32),
         Property::Data {
             value,
@@ -739,7 +742,7 @@ mod tests {
             length: 1,
             handler,
         });
-        crate::intrinsics::native_function(&mut machine.heap, &mut machine.atoms, id, name, 1)
+        crate::intrinsics::native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 1)
     }
 
     fn new_collection(machine: &mut Machine<'_, TestHost>, name: &str) -> Value {
@@ -894,7 +897,7 @@ mod tests {
                 panic!("Map.groupBy is a native function")
             };
             assert!(matches!(
-                properties.get(&length_key),
+                properties.get(&machine.shapes, &length_key),
                 Some(Property::Data {
                     value,
                     writable: false,
@@ -1008,6 +1011,7 @@ mod tests {
         let next = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             next_id,
             "edge next",
             0,
@@ -1015,6 +1019,7 @@ mod tests {
         let close = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             close_id,
             "edge return",
             0,
@@ -1022,6 +1027,7 @@ mod tests {
         let iterator_fn = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             iterator_id,
             "edge iterator",
             0,
@@ -1082,6 +1088,7 @@ mod tests {
             let reject = crate::intrinsics::native_function(
                 &mut machine.heap,
                 &mut machine.atoms,
+                &mut machine.shapes,
                 id,
                 "reject set",
                 2,
@@ -1148,6 +1155,7 @@ mod tests {
             let callback = crate::intrinsics::native_function(
                 &mut machine.heap,
                 &mut machine.atoms,
+                &mut machine.shapes,
                 id,
                 "mutate map",
                 3,
@@ -1277,6 +1285,7 @@ mod tests {
             let callback = crate::intrinsics::native_function(
                 &mut machine.heap,
                 &mut machine.atoms,
+                &mut machine.shapes,
                 id,
                 "parity",
                 2,

@@ -181,8 +181,10 @@ fn tracing_follows_composed_production_heap_edges() {
 
     let array_property = stress.object();
     let mut array_properties = PropertyMap::default();
-    array_properties.insert(
-        PropertyKey::Named(stress.machine.intern_str("edge")),
+        let edge_key = PropertyKey::Named(stress.machine.intern_str("edge"));
+        array_properties.insert(
+            &mut stress.machine.shapes,
+            edge_key,
         Property::Data {
             value: array_property,
             writable: true,
@@ -205,8 +207,10 @@ fn tracing_follows_composed_production_heap_edges() {
     let setter_edge = stress.object();
     let prototype_edge = stress.object();
     let mut root_properties = PropertyMap::default();
-    root_properties.insert(
-        PropertyKey::Named(stress.machine.intern_str("data")),
+        let data_key = PropertyKey::Named(stress.machine.intern_str("data"));
+        root_properties.insert(
+            &mut stress.machine.shapes,
+            data_key,
         Property::Data {
             value: array,
             writable: true,
@@ -214,8 +218,10 @@ fn tracing_follows_composed_production_heap_edges() {
             configurable: true,
         },
     );
-    root_properties.insert(
-        PropertyKey::Named(stress.machine.intern_str("accessor")),
+        let accessor_key = PropertyKey::Named(stress.machine.intern_str("accessor"));
+        root_properties.insert(
+            &mut stress.machine.shapes,
+            accessor_key,
         Property::Accessor {
             getter: Some(getter_edge),
             setter: Some(setter_edge),
@@ -387,7 +393,7 @@ fn allocation_pressure_requests_collection_and_recomputes_watermarks() {
         extensible: true,
         boxed_primitive: None,
     };
-    let allocation_bytes = entry.initial_bytes(&stress.machine.atoms);
+    let allocation_bytes = entry.initial_bytes(&stress.machine.shapes, &stress.machine.atoms);
     let byte_boundary = stress.machine.heap_bytes + allocation_bytes;
     stress
         .machine

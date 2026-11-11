@@ -13,6 +13,7 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey};
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -50,12 +51,12 @@ pub(super) fn install<H: Host>(
     builtins.set_symbol_prototype(prototype);
 
     let constructor =
-        install_constructor_function(heap, atoms, builtins, "Symbol", 0, constructor::<H>);
-    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
-    let symbol_for = install_function(heap, atoms, builtins, "for", 1, symbol_for::<H>);
-    define_native_property(heap, atoms, constructor, "for", symbol_for);
-    let key_for = install_function(heap, atoms, builtins, "keyFor", 1, key_for::<H>);
-    define_native_property(heap, atoms, constructor, "keyFor", key_for);
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Symbol", length: 0, handler: constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
+    let symbol_for = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "for", length: 1, handler: symbol_for::<H> });
+    define_native_property(heap, atoms, shapes, constructor, "for", symbol_for);
+    let key_for = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "keyFor", length: 1, handler: key_for::<H> });
+    define_native_property(heap, atoms, shapes, constructor, "keyFor", key_for);
     for (name, value) in [
         ("iterator", iterator),
         ("asyncIterator", async_iterator),
@@ -73,34 +74,21 @@ pub(super) fn install<H: Host>(
         ("asyncDispose", async_dispose),
         ("unscopables", unscopables),
     ] {
-        define_readonly_property(heap, atoms, constructor, name, value);
+        define_readonly_property(heap, atoms, shapes, constructor, name, value);
     }
 
-    let to_string = install_function(heap, atoms, builtins, "toString", 0, to_string::<H>);
-    let value_of_method = install_function(heap, atoms, builtins, "valueOf", 0, value_of::<H>);
-    let description = install_function(
-        heap,
-        atoms,
-        builtins,
-        "get description",
-        0,
-        description::<H>,
-    );
-    define_data(heap, atoms, prototype, "toString", to_string);
-    define_data(heap, atoms, prototype, "valueOf", value_of_method);
-    let to_primitive_method = install_function(
-        heap,
-        atoms,
-        builtins,
-        "[Symbol.toPrimitive]",
-        1,
-        value_of::<H>,
-    );
-    define_to_string_tag(heap, prototype, to_string_tag, "Symbol");
+    let to_string = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "toString", length: 0, handler: to_string::<H> });
+    let value_of_method = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "valueOf", length: 0, handler: value_of::<H> });
+    let description = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get description", length: 0, handler: description::<H> });
+    define_data(heap, atoms, shapes, prototype, "toString", to_string);
+    define_data(heap, atoms, shapes, prototype, "valueOf", value_of_method);
+    let to_primitive_method = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "[Symbol.toPrimitive]", length: 1, handler: value_of::<H> });
+    define_to_string_tag(heap, shapes, prototype, to_string_tag, "Symbol");
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
         unreachable!()
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern_str("description")),
         Property::Accessor {
             getter: Some(description),
@@ -110,6 +98,7 @@ pub(super) fn install<H: Host>(
         },
     );
     properties.insert(
+        shapes,
         PropertyKey::Symbol(heap_index(to_primitive) as u32),
         Property::Data {
             value: to_primitive_method,
@@ -134,6 +123,7 @@ fn symbol(heap: &mut Vec<HeapEntry>, description: &str) -> Value {
 fn define_native_property(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     object: Value,
     name: &str,
     value: Value,
@@ -142,6 +132,7 @@ fn define_native_property(
         unreachable!()
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern_str(name)),
         builtin_property(value),
     );
@@ -150,6 +141,7 @@ fn define_native_property(
 fn define_readonly_property(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     object: Value,
     name: &str,
     value: Value,
@@ -158,6 +150,7 @@ fn define_readonly_property(
         unreachable!()
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern_str(name)),
         Property::Data {
             value,
@@ -383,7 +376,7 @@ mod tests {
             length: 1,
             handler: echo_hint,
         });
-        let method = native_function(&mut machine.heap, &mut machine.atoms, id, "echo hint", 1);
+        let method = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "echo hint", 1);
         let object = with_to_primitive(&mut machine, method);
 
         let string = machine.coerce_primitive_observable(object, true).unwrap();
@@ -418,7 +411,7 @@ mod tests {
             length: 0,
             handler: return_seven,
         });
-        let method = native_function(&mut machine.heap, &mut machine.atoms, id, "return seven", 0);
+        let method = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "return seven", 0);
         let object = with_to_primitive(&mut machine, method);
         assert_eq!(
             machine.eval_unary(UnaryOp::Plus, object).unwrap(),
@@ -436,7 +429,7 @@ mod tests {
             length: 0,
             handler: return_this,
         });
-        let method = native_function(&mut machine.heap, &mut machine.atoms, id, "return this", 0);
+        let method = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "return this", 0);
         for method in [method, Value::int32(1)] {
             let object = with_to_primitive(&mut machine, method);
             assert!(matches!(
@@ -739,9 +732,11 @@ mod tests {
     /// function body is the blank program's halt entry; `instanceof` only
     /// reads `.prototype`, it never calls the constructor.
     fn constructor_with_prototype(machine: &mut Machine<'_, TestHost>, prototype: Value) -> Value {
+        let prototype_key = PropertyKey::Named(machine.intern_str("prototype"));
         let mut properties = PropertyMap::default();
         properties.insert(
-            PropertyKey::Named(machine.intern_str("prototype")),
+            &mut machine.shapes,
+            prototype_key,
             Property::Data {
                 value: prototype,
                 writable: true,
@@ -780,13 +775,9 @@ mod tests {
             length: 1,
             handler: custom_has_instance::<TestHost>,
         });
-        let handler = native_function(
-            &mut machine.heap,
-            &mut machine.atoms,
-            handler_id,
-            "custom hasInstance",
-            1,
-        );
+        let handler = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, handler_id,
+        "custom hasInstance",
+        1,);
         machine
             .set_data_property(constructor, "_hasInstanceResult", Value::TRUE)
             .unwrap();
@@ -852,13 +843,9 @@ mod tests {
             length: 1,
             handler: custom_has_instance::<TestHost>,
         });
-        let handler = native_function(
-            &mut machine.heap,
-            &mut machine.atoms,
-            handler_id,
-            "custom hasInstance override",
-            1,
-        );
+        let handler = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, handler_id,
+        "custom hasInstance override",
+        1,);
         machine
             .set_data_property(constructor, "_hasInstanceResult", Value::FALSE)
             .unwrap();

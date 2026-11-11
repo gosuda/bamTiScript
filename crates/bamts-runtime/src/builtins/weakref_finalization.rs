@@ -29,40 +29,24 @@ impl FinalizationCell {
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let weak_ref_prototype = ordinary(heap, Some(builtins.object_prototype()));
-    let weak_ref = install_constructor_function(
-        heap,
-        atoms,
-        builtins,
-        "WeakRef",
-        1,
-        weak_ref_constructor::<H>,
-    );
-    builtins.set_constructor_prototype(heap, atoms, weak_ref, weak_ref_prototype);
+    let weak_ref = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "WeakRef", length: 1, handler: weak_ref_constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, weak_ref, weak_ref_prototype);
     builtins.set_weak_ref_prototype(weak_ref_prototype);
-    let deref = install_function(heap, atoms, builtins, "deref", 0, weak_ref_deref::<H>);
-    define_data(heap, atoms, weak_ref_prototype, "deref", deref);
-    define_to_string_tag(
-        heap,
-        weak_ref_prototype,
-        builtins.symbol_to_string_tag(),
-        "WeakRef",
-    );
+    let deref = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "deref", length: 0, handler: weak_ref_deref::<H> });
+    define_data(heap, atoms, shapes, weak_ref_prototype, "deref", deref);
+    define_to_string_tag(heap, shapes, weak_ref_prototype,
+    builtins.symbol_to_string_tag(),
+    "WeakRef",);
     globals.insert(EcmaString::encode("WeakRef"), weak_ref);
 
     let registry_prototype = ordinary(heap, Some(builtins.object_prototype()));
-    let registry = install_constructor_function(
-        heap,
-        atoms,
-        builtins,
-        "FinalizationRegistry",
-        1,
-        finalization_registry_constructor::<H>,
-    );
-    builtins.set_constructor_prototype(heap, atoms, registry, registry_prototype);
+    let registry = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "FinalizationRegistry", length: 1, handler: finalization_registry_constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, registry, registry_prototype);
     builtins.set_finalization_registry_prototype(registry_prototype);
     for (name, length, handler) in [
         (
@@ -72,15 +56,12 @@ pub(super) fn install<H: Host>(
         ),
         ("unregister", 1, finalization_registry_unregister::<H>),
     ] {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
-        define_data(heap, atoms, registry_prototype, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, registry_prototype, name, function);
     }
-    define_to_string_tag(
-        heap,
-        registry_prototype,
-        builtins.symbol_to_string_tag(),
-        "FinalizationRegistry",
-    );
+    define_to_string_tag(heap, shapes, registry_prototype,
+    builtins.symbol_to_string_tag(),
+    "FinalizationRegistry",);
     globals.insert(EcmaString::encode("FinalizationRegistry"), registry);
 }
 
@@ -582,14 +563,7 @@ mod tests {
     }
 
     fn callback(machine: &mut Machine<'_, TestHost>, handler: BuiltinHandler<TestHost>) -> Value {
-        install_function(
-            &mut machine.heap,
-            &mut machine.atoms,
-            &mut machine.intrinsics.builtins,
-            "cleanup",
-            1,
-            handler,
-        )
+        install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "cleanup", length: 1, handler: handler })
     }
 
     #[test]

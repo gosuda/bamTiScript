@@ -20,6 +20,7 @@ pub(crate) mod import_attributes;
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
     object_prototype: Value,
 ) -> InstalledModule {
@@ -39,22 +40,20 @@ pub(crate) fn install<H: Host>(
             extensible: true,
         },
     );
-    let script = register_constructor(heap, atoms, builtins, "Script", 1, script_constructor::<H>);
+    let script = register_constructor(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Script", length: 1, handler: script_constructor::<H> });
     let run_in_this_context = register_constructor(
         heap,
         atoms,
+        shapes,
         builtins,
-        "runInThisContext",
-        2,
-        run_in_this_context::<H>,
+        crate::intrinsics::BuiltinDef { name: "runInThisContext", length: 2, handler: run_in_this_context::<H> },
     );
     let run_in_new_context = register_constructor(
         heap,
         atoms,
+        shapes,
         builtins,
-        "runInNewContext",
-        3,
-        run_in_new_context::<H>,
+        crate::intrinsics::BuiltinDef { name: "runInNewContext", length: 3, handler: run_in_new_context::<H> },
     );
     let run_prototype = intrinsics::push(
         heap,
@@ -65,10 +64,11 @@ pub(crate) fn install<H: Host>(
             extensible: true,
         },
     );
-    builtins.set_function_prototype(heap, atoms, run_in_this_context, run_prototype);
+    builtins.set_function_prototype(heap, atoms, shapes, run_in_this_context, run_prototype);
     crate::intrinsics::builtins::define_data(
         heap,
         atoms,
+        shapes,
         run_prototype,
         "constructor",
         run_in_this_context,
@@ -85,12 +85,14 @@ pub(crate) fn install<H: Host>(
     builtins.set_function_prototype(
         heap,
         atoms,
+        shapes,
         run_in_new_context,
         run_in_new_context_prototype,
     );
     crate::intrinsics::builtins::define_data(
         heap,
         atoms,
+        shapes,
         run_in_new_context_prototype,
         "constructor",
         run_in_new_context,
@@ -98,17 +100,17 @@ pub(crate) fn install<H: Host>(
     let script_run_in_this_context = register(
         heap,
         atoms,
+        shapes,
         builtins,
-        "runInThisContext",
-        1,
-        script_run_in_this_context::<H>,
+        crate::intrinsics::BuiltinDef { name: "runInThisContext", length: 1, handler: script_run_in_this_context::<H> },
     );
 
-    builtins.set_constructor_prototype(heap, atoms, script, script_prototype);
-    crate::intrinsics::builtins::define_data(heap, atoms, script_prototype, "constructor", script);
+    builtins.set_constructor_prototype(heap, atoms, shapes, script, script_prototype);
+    crate::intrinsics::builtins::define_data(heap, atoms, shapes, script_prototype, "constructor", script);
     crate::intrinsics::builtins::define_data(
         heap,
         atoms,
+        shapes,
         script_prototype,
         "runInThisContext",
         script_run_in_this_context,
@@ -129,17 +131,13 @@ pub(crate) fn install<H: Host>(
 fn register<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
-    name: &'static str,
-    length: u32,
-    handler: intrinsics::BuiltinHandler<H>,
+    definition: BuiltinDef<H>,
 ) -> Value {
-    let id = builtins.register(BuiltinDef {
-        name,
-        length,
-        handler,
-    });
-    intrinsics::native_function(heap, atoms, id, name, length)
+    let id = builtins.register(definition);
+    let installed = builtins.get(id);
+    intrinsics::native_function(heap, atoms, shapes, id, installed.name, installed.length)
 }
 
 /// Registers a function `new` can reach. Node's `runIn*Context` are plain
@@ -147,17 +145,13 @@ fn register<H: Host>(
 fn register_constructor<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
-    name: &'static str,
-    length: u32,
-    handler: intrinsics::BuiltinHandler<H>,
+    definition: BuiltinDef<H>,
 ) -> Value {
-    let id = builtins.register_constructor(BuiltinDef {
-        name,
-        length,
-        handler,
-    });
-    intrinsics::native_function(heap, atoms, id, name, length)
+    let id = builtins.register_constructor(definition);
+    let installed = builtins.get(id);
+    intrinsics::native_function(heap, atoms, shapes, id, installed.name, installed.length)
 }
 
 fn type_error(operation: &'static str) -> EvalFailure {
@@ -835,7 +829,7 @@ mod tests {
             unreachable!();
         };
         assert!(matches!(
-            properties.get_ascii(&machine.atoms, "constructor"),
+            properties.get_ascii(&machine.shapes, &machine.atoms, "constructor"),
             Some(crate::Property::Data {
                 value,
                 writable: true,
@@ -852,7 +846,7 @@ mod tests {
             unreachable!();
         };
         assert!(matches!(
-            script_properties.get_ascii(&machine.atoms, "prototype"),
+            script_properties.get_ascii(&machine.shapes, &machine.atoms, "prototype"),
             Some(crate::Property::Data {
                 value,
                 writable: false,
@@ -873,7 +867,7 @@ mod tests {
             writable: true,
             enumerable: false,
             configurable: false,
-        }) = run_properties.get_ascii(&machine.atoms, "prototype")
+        }) = run_properties.get_ascii(&machine.shapes, &machine.atoms, "prototype")
         else {
             panic!("runInThisContext has an ordinary function prototype");
         };
@@ -1806,7 +1800,7 @@ mod tests {
         let HeapEntry::Script { properties, .. } = &machine.heap[index] else {
             unreachable!();
         };
-        assert_eq!(properties.iter().count(), 0);
+        assert_eq!(properties.iter(&machine.shapes).count(), 0);
     }
 
     fn options_with_timeout<H: Host>(machine: &mut Machine<'_, H>, timeout: Value) -> Value {

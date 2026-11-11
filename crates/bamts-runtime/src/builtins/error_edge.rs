@@ -31,6 +31,7 @@ const ERROR_TYPES: [(&str, u32); 9] = [
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -41,31 +42,18 @@ pub(super) fn install<H: Host>(
         },
     );
     builtins.set_error_brand(brand);
-    let error_prototype = prototype_of(heap, atoms, globals, "Error");
-    let stack_getter = install_function(heap, atoms, builtins, "get stack", 0, stack_get::<H>);
-    let stack_setter = install_function(heap, atoms, builtins, "set stack", 1, stack_set::<H>);
-    define_hidden(heap, atoms, error_prototype, STACK_GETTER, stack_getter);
-    define_hidden(heap, atoms, error_prototype, STACK_SETTER, stack_setter);
-    let getter = install_function(
-        heap,
-        atoms,
-        builtins,
-        "get stack",
-        0,
-        prototype_stack_get::<H>,
-    );
-    let setter = install_function(
-        heap,
-        atoms,
-        builtins,
-        "set stack",
-        1,
-        prototype_stack_set::<H>,
-    );
+    let error_prototype = prototype_of(heap, atoms, shapes, globals, "Error");
+    let stack_getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get stack", length: 0, handler: stack_get::<H> });
+    let stack_setter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "set stack", length: 1, handler: stack_set::<H> });
+    define_hidden(heap, atoms, shapes, error_prototype, STACK_GETTER, stack_getter);
+    define_hidden(heap, atoms, shapes, error_prototype, STACK_SETTER, stack_setter);
+    let getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get stack", length: 0, handler: prototype_stack_get::<H> });
+    let setter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "set stack", length: 1, handler: prototype_stack_set::<H> });
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(error_prototype)] else {
         panic!("Error.prototype is an ordinary object")
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern(EcmaString::encode("stack"))),
         Property::Accessor {
             getter: Some(getter),
@@ -76,29 +64,15 @@ pub(super) fn install<H: Host>(
     );
 
     for (name, length) in ERROR_TYPES {
-        let prototype = prototype_of(heap, atoms, globals, name);
-        let constructor = install_constructor_function(
-            heap,
-            atoms,
-            builtins,
-            name,
-            length,
-            error_constructor::<H>,
-        );
-        builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
+        let prototype = prototype_of(heap, atoms, shapes, globals, name);
+        let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: error_constructor::<H> });
+        builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
         builtins.set_error_prototype(heap, constructor, prototype);
         if name == "Error" {
-            let capture = install_function(
-                heap,
-                atoms,
-                builtins,
-                "captureStackTrace",
-                1,
-                capture_stack_trace::<H>,
-            );
-            define_static(heap, atoms, constructor, "captureStackTrace", capture);
-            let is_error = install_function(heap, atoms, builtins, "isError", 1, is_error::<H>);
-            define_static(heap, atoms, constructor, "isError", is_error);
+            let capture = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "captureStackTrace", length: 1, handler: capture_stack_trace::<H> });
+            define_static(heap, atoms, shapes, constructor, "captureStackTrace", capture);
+            let is_error = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "isError", length: 1, handler: is_error::<H> });
+            define_static(heap, atoms, shapes, constructor, "isError", is_error);
         } else {
             let HeapEntry::NativeFunction { prototype, .. } = &mut heap[heap_index(constructor)]
             else {
@@ -113,6 +87,7 @@ pub(super) fn install<H: Host>(
 fn prototype_of(
     heap: &[HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &crate::ShapeTable,
     globals: &BTreeMap<EcmaString, Value>,
     name: &str,
 ) -> Value {
@@ -120,17 +95,17 @@ fn prototype_of(
         .get(&EcmaString::encode(name))
         .copied()
         .expect("baseline error constructor is installed first");
-    own_data(heap, atoms, constructor, "prototype")
+    own_data(heap, atoms, shapes, constructor, "prototype")
 }
 
-fn own_data(heap: &[HeapEntry], atoms: &mut crate::AtomTable, object: Value, name: &str) -> Value {
+fn own_data(heap: &[HeapEntry], atoms: &mut crate::AtomTable, shapes: &crate::ShapeTable, object: Value, name: &str) -> Value {
     let properties = match &heap[heap_index(object)] {
         HeapEntry::Object { properties, .. } | HeapEntry::NativeFunction { properties, .. } => {
             properties
         }
         _ => panic!("error intrinsic property owner is an object"),
     };
-    match properties.get(&PropertyKey::Named(atoms.intern(EcmaString::encode(name)))) {
+    match properties.get(shapes, &PropertyKey::Named(atoms.intern(EcmaString::encode(name)))) {
         Some(Property::Data { value, .. }) => *value,
         _ => panic!("error intrinsic data property exists"),
     }
@@ -139,6 +114,7 @@ fn own_data(heap: &[HeapEntry], atoms: &mut crate::AtomTable, object: Value, nam
 fn define_static(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     constructor: Value,
     name: &str,
     value: Value,
@@ -147,6 +123,7 @@ fn define_static(
         panic!("error constructor is a native function")
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern(EcmaString::encode(name))),
         super::builtin_property(value),
     );
@@ -155,6 +132,7 @@ fn define_static(
 fn define_hidden(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     object: Value,
     name: &str,
     value: Value,
@@ -163,6 +141,7 @@ fn define_hidden(
         panic!("Error.prototype is an ordinary object")
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern(EcmaString::encode(name))),
         Property::Data {
             value,
@@ -200,7 +179,7 @@ fn has_error_brand<H: Host>(machine: &Machine<'_, H>, value: Value) -> Result<bo
         .is_some_and(|index| {
             matches!(
                 &machine.heap[index],
-                HeapEntry::Object { properties, .. } if properties.contains_key(&brand)
+                HeapEntry::Object { properties, .. } if properties.contains_key(&machine.shapes, &brand)
             )
         }))
 }
@@ -759,7 +738,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
     }
 
     #[test]

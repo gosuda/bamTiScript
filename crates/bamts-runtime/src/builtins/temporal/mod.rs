@@ -159,40 +159,35 @@ struct Class<'a, H: Host> {
 fn install_class<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
     namespace: Value,
     class: &Class<'_, H>,
 ) {
     let prototype = builtins.temporal_prototype(class.kind);
-    let constructor = install_constructor_function(
-        heap,
-        atoms,
-        builtins,
-        class.name,
-        class.length,
-        class.constructor,
-    );
-    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
+    let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: class.name, length: class.length, handler: class.constructor });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     for &(name, length, handler) in class.statics {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
-        define_data(heap, atoms, constructor, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, constructor, name, function);
     }
     for &(property, name, handler) in class.getters {
-        let getter = install_function(heap, atoms, builtins, name, 0, handler);
-        define_getter(heap, atoms, prototype, property, getter);
+        let getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 0, handler: handler });
+        define_getter(heap, atoms, shapes, prototype, property, getter);
     }
     for &(name, length, handler) in class.methods {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
-        define_data(heap, atoms, prototype, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, prototype, name, function);
     }
     let tag_symbol = builtins.symbol_to_string_tag();
-    super::define_to_string_tag(heap, prototype, tag_symbol, class.tag);
-    define_data(heap, atoms, namespace, class.name, constructor);
+    super::define_to_string_tag(heap, shapes, prototype, tag_symbol, class.tag);
+    define_data(heap, atoms, shapes, namespace, class.name, constructor);
 }
 
 pub(in crate::intrinsics::builtins) fn define_getter(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     object: Value,
     name: &str,
     getter: Value,
@@ -204,6 +199,7 @@ pub(in crate::intrinsics::builtins) fn define_getter(
         panic!("accessor target is an ordinary object");
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern_str(name)),
         Property::Accessor {
             getter: Some(getter),
@@ -217,27 +213,28 @@ pub(in crate::intrinsics::builtins) fn define_getter(
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let namespace = super::super::ordinary_prototype(heap, builtins.object_prototype());
     let tag_symbol = builtins.symbol_to_string_tag();
-    super::define_to_string_tag(heap, namespace, tag_symbol, "Temporal");
+    super::define_to_string_tag(heap, shapes, namespace, tag_symbol, "Temporal");
     // Classes refer to each other's instances, so every prototype exists before
     // any class is populated.
     for kind in TemporalKind::ALL {
         let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
         builtins.set_temporal_prototype(kind, prototype);
     }
-    duration::install(heap, atoms, builtins, namespace);
-    instant::install(heap, atoms, builtins, namespace);
-    plain_time::install(heap, atoms, builtins, namespace);
-    plain_date::install(heap, atoms, builtins, namespace);
-    plain_date_time::install(heap, atoms, builtins, namespace);
-    plain_year_month::install(heap, atoms, builtins, namespace);
-    plain_month_day::install(heap, atoms, builtins, namespace);
-    zoned_date_time::install(heap, atoms, builtins, namespace);
-    now::install(heap, atoms, builtins, namespace);
+    duration::install(heap, atoms, shapes, builtins, namespace);
+    instant::install(heap, atoms, shapes, builtins, namespace);
+    plain_time::install(heap, atoms, shapes, builtins, namespace);
+    plain_date::install(heap, atoms, shapes, builtins, namespace);
+    plain_date_time::install(heap, atoms, shapes, builtins, namespace);
+    plain_year_month::install(heap, atoms, shapes, builtins, namespace);
+    plain_month_day::install(heap, atoms, shapes, builtins, namespace);
+    zoned_date_time::install(heap, atoms, shapes, builtins, namespace);
+    now::install(heap, atoms, shapes, builtins, namespace);
     globals.insert(EcmaString::encode("Temporal"), namespace);
 }
 

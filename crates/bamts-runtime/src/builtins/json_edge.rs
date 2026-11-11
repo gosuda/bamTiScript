@@ -76,6 +76,7 @@ fn syntax_error<H: Host>(machine: &mut Machine<'_, H>, message: String) -> EvalF
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -98,8 +99,8 @@ pub(super) fn install<H: Host>(
         ("rawJSON", 1, raw_json::<H>),
         ("isRawJSON", 1, is_raw_json::<H>),
     ] {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
-        define_data(heap, atoms, json, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, json, name, function);
     }
     let brand_index = heap.len() as u32;
     let brand = super::push(
@@ -113,6 +114,7 @@ pub(super) fn install<H: Host>(
         panic!("JSON builtin installs a namespace object")
     };
     properties.insert(
+        shapes,
         PropertyKey::Private(brand_index),
         Property::Data {
             value: brand,
@@ -121,7 +123,7 @@ pub(super) fn install<H: Host>(
             configurable: false,
         },
     );
-    super::define_to_string_tag(heap, json, builtins.symbol_to_string_tag(), "JSON");
+    super::define_to_string_tag(heap, shapes, json, builtins.symbol_to_string_tag(), "JSON");
     globals.insert(EcmaString::encode("JSON"), json);
 }
 
@@ -135,7 +137,7 @@ fn raw_json_brand<H: Host>(machine: &Machine<'_, H>) -> Option<(u32, Value)> {
     let HeapEntry::Object { properties, .. } = &machine.heap[json_index] else {
         return None;
     };
-    properties.iter().find_map(|(key, property)| {
+    properties.iter(&machine.shapes).find_map(|(key, property)| {
         if let (PropertyKey::Private(slot), Property::Data { value, .. }) = (key, property) {
             Some((*slot, *value))
         } else {
@@ -164,7 +166,7 @@ fn has_raw_json_brand<H: Host>(machine: &Machine<'_, H>, value: Value) -> bool {
     else {
         return false;
     };
-    if !properties.contains_key(&PropertyKey::Private(brand_slot)) {
+    if !properties.contains_key(&machine.shapes, &PropertyKey::Private(brand_slot)) {
         return false;
     }
     let Some(Property::Data {
@@ -172,7 +174,7 @@ fn has_raw_json_brand<H: Host>(machine: &Machine<'_, H>, value: Value) -> bool {
         writable: false,
         configurable: false,
         ..
-    }) = properties.get_ascii(&machine.atoms, "rawJSON")
+    }) = properties.get_ascii(&machine.shapes, &machine.atoms, "rawJSON")
     else {
         return false;
     };
@@ -190,7 +192,7 @@ fn raw_json_text<H: Host>(machine: &Machine<'_, H>, value: Value) -> Option<Ecma
     };
     let Some(Property::Data {
         value: text_value, ..
-    }) = properties.get_ascii(&machine.atoms, "rawJSON")
+    }) = properties.get_ascii(&machine.shapes, &machine.atoms, "rawJSON")
     else {
         return None;
     };
@@ -268,9 +270,11 @@ fn raw_json<H: Host>(
     let (brand_slot, brand) =
         raw_json_brand(machine).expect("json_edge::install runs before any handler");
     let text_value = allocate_string(machine, text)?;
+    let raw_json_key = PropertyKey::Named(machine.intern_str("rawJSON"));
     let mut properties = PropertyMap::default();
     properties.insert(
-        PropertyKey::Named(machine.intern_str("rawJSON")),
+        &mut machine.shapes,
+        raw_json_key,
         Property::Data {
             value: text_value,
             writable: false,
@@ -279,6 +283,7 @@ fn raw_json<H: Host>(
         },
     );
     properties.insert(
+        &mut machine.shapes,
         PropertyKey::Private(brand_slot),
         Property::Data {
             value: brand,
@@ -1341,6 +1346,7 @@ mod tests {
             install(
                 &mut $machine.heap,
                 &mut $machine.atoms,
+                &mut $machine.shapes,
                 &mut $machine.intrinsics.globals,
                 &mut $machine.intrinsics.builtins,
             );
@@ -1372,7 +1378,7 @@ mod tests {
             length,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
     }
 
     fn json_parse(
@@ -1414,6 +1420,7 @@ mod tests {
             _ => panic!("prototype must be an ordinary object"),
         };
         properties.insert(
+            &mut machine.shapes,
             key,
             Property::Accessor {
                 getter: None,
@@ -1507,6 +1514,7 @@ mod tests {
                 panic!("object member holder must be an object");
             };
             properties.insert(
+                &mut machine.shapes,
                 b_key,
                 Property::Data {
                     value: Value::int32(7),
@@ -1564,7 +1572,7 @@ mod tests {
                 enumerable: false,
                 configurable: true,
                 ..
-            }) = properties.get_ascii(&machine.atoms, name)
+            }) = properties.get_ascii(&machine.shapes, &machine.atoms, name)
             else {
                 panic!("{name} must keep builtin data-property attributes");
             };
@@ -1924,21 +1932,20 @@ mod tests {
         // A structurally similar forgery without the private brand is rejected.
         let text_property = text(&mut machine, "1");
         let raw_json_key = PropertyKey::Named(machine.intern_str("rawJSON"));
+        let mut forgery_properties = PropertyMap::default();
+        forgery_properties.insert(
+            &mut machine.shapes,
+            raw_json_key,
+            Property::Data {
+                value: text_property,
+                writable: false,
+                enumerable: true,
+                configurable: false,
+            },
+        );
         let forgery = machine
             .allocate(HeapEntry::Object {
-                properties: {
-                    let mut properties = PropertyMap::default();
-                    properties.insert(
-                        raw_json_key,
-                        Property::Data {
-                            value: text_property,
-                            writable: false,
-                            enumerable: true,
-                            configurable: false,
-                        },
-                    );
-                    properties
-                },
+                properties: forgery_properties,
                 prototype: None,
                 extensible: false,
                 boxed_primitive: None,
@@ -1992,7 +1999,7 @@ mod tests {
             enumerable: true,
             configurable: false,
             ..
-        }) = properties.get_ascii(&machine.atoms, "rawJSON")
+        }) = properties.get_ascii(&machine.shapes, &machine.atoms, "rawJSON")
         else {
             panic!("rawJSON property must be frozen but enumerable");
         };
@@ -2443,6 +2450,7 @@ mod tests {
                 install(
                     &mut machine.heap,
                     &mut machine.atoms,
+                    &mut machine.shapes,
                     &mut machine.intrinsics.globals,
                     &mut machine.intrinsics.builtins,
                 );

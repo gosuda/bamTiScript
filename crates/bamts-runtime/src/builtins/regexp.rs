@@ -23,26 +23,27 @@ const COMPILE_CACHE_ENTRIES: usize = 8;
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
     let constructor =
-        install_constructor_function(heap, atoms, builtins, "RegExp", 2, constructor::<H>);
-    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "RegExp", length: 2, handler: constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     for (name, length, handler) in [
         ("exec", 1, exec::<H> as BuiltinHandler<H>),
         ("test", 1, test::<H>),
         ("toString", 0, to_string::<H>),
     ] {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
-        define_data(heap, atoms, prototype, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, prototype, name, function);
     }
-    let source_get = install_function(heap, atoms, builtins, "get source", 0, source_getter::<H>);
-    define_getter(heap, atoms, prototype, "source", source_get);
-    let flags_get = install_function(heap, atoms, builtins, "get flags", 0, flags_getter::<H>);
-    define_getter(heap, atoms, prototype, "flags", flags_get);
-    super::regexp_protocol::install(heap, atoms, builtins, prototype, constructor);
+    let source_get = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get source", length: 0, handler: source_getter::<H> });
+    define_getter(heap, atoms, shapes, prototype, "source", source_get);
+    let flags_get = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get flags", length: 0, handler: flags_getter::<H> });
+    define_getter(heap, atoms, shapes, prototype, "flags", flags_get);
+    super::regexp_protocol::install(heap, atoms, shapes, builtins, prototype, constructor);
     builtins.set_regexp_prototype(prototype);
     globals.insert(EcmaString::encode("RegExp"), constructor);
 }
@@ -124,7 +125,7 @@ fn regexp_initialize<H: Host>(
         machine.coerce_string_observable(flags)?
     };
     compile(machine, &pattern, &flags)?;
-    let properties = initial_regexp_properties(&mut machine.atoms);
+    let properties = initial_regexp_properties(&mut machine.atoms, &mut machine.shapes);
     machine
         .allocate(HeapEntry::RegExp {
             pattern,
@@ -190,9 +191,10 @@ pub(super) fn compile<H: Host>(
 /// ECMA-262 §22.2.3.3: only `lastIndex` is an own data property.
 /// Called from the constructor, the bytecode literal path, and the native
 /// helper path so all three agree by construction.
-pub(crate) fn initial_regexp_properties(atoms: &mut crate::AtomTable) -> PropertyMap {
+pub(crate) fn initial_regexp_properties(atoms: &mut crate::AtomTable, shapes: &mut crate::ShapeTable) -> PropertyMap {
     let mut properties = PropertyMap::default();
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern_str("lastIndex")),
         Property::Data {
             value: Value::int32(0),
@@ -327,6 +329,7 @@ fn source_getter<H: Host>(
 pub(super) fn define_getter(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     object: Value,
     name: &str,
     getter: Value,
@@ -335,6 +338,7 @@ pub(super) fn define_getter(
         panic!("accessor target must be an ordinary object");
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern_str(name)),
         Property::Accessor {
             getter: Some(getter),
@@ -783,8 +787,8 @@ mod tests {
         // Comparing against the shared helper (not a hand-copied duplicate)
         // means the test's expected set drifts with the helper. If a call
         // site stops using the helper, this assertion catches the divergence.
-        let expected = initial_regexp_properties(&mut constructed_machine.atoms);
-        let expected_keys: Vec<PropertyKey> = expected.iter().map(|(k, _)| k.clone()).collect();
+        let expected = initial_regexp_properties(&mut constructed_machine.atoms, &mut constructed_machine.shapes);
+        let expected_keys: Vec<PropertyKey> = expected.iter(&constructed_machine.shapes).map(|(k, _)| k.clone()).collect();
         assert_eq!(
             texts(&constructed_machine, &constructed_keys),
             texts(&constructed_machine, &expected_keys),
@@ -832,7 +836,7 @@ mod tests {
                 enumerable,
                 configurable,
             } = properties
-                .get(&keys[0])
+                .get(&machine.shapes, &keys[0])
                 .unwrap_or_else(|| panic!("{label} owns lastIndex"))
             else {
                 panic!("{label} lastIndex is a data property");
@@ -987,14 +991,7 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
         // Install a getter on new_target.prototype that throws.
-        let getter = install_function(
-            &mut machine.heap,
-            &mut machine.atoms,
-            &mut machine.intrinsics.builtins,
-            "throwing prototype getter",
-            0,
-            throw_prototype_getter::<TestHost>,
-        );
+        let getter = install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "throwing prototype getter", length: 0, handler: throw_prototype_getter::<TestHost> });
         let new_target = super::super::ordinary_runtime(&mut machine, None).unwrap();
         let prototype_key = PropertyKey::Named(machine.intern_str("prototype"));
         machine
@@ -1040,7 +1037,7 @@ mod tests {
             length: 1,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, id, name, 1)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 1)
     }
 
     fn counting_exec_override(

@@ -1,7 +1,8 @@
 use super::{BuiltinDef, BuiltinOutcome, BuiltinTable, native_function, push};
 use crate::GetOutcome;
 use crate::{
-    EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap, ThrowOrigin,
+    EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap, ShapeTable,
+    ThrowOrigin,
 };
 use bamts_bytecode::{DescriptorSlot, EcmaString};
 use bamts_native::{Decoded, Value};
@@ -51,58 +52,69 @@ pub(crate) mod typedarray_all;
 mod uri;
 pub(crate) mod weakref_finalization;
 pub(crate) use collections::ordinary_runtime;
+pub(crate) struct InstallOptions {
+    pub(crate) timers_available: bool,
+    pub(crate) script_compiler: bool,
+}
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
-    timers_available: bool,
-    script_compiler: bool,
+    options: InstallOptions,
 ) {
-    object::install_function_prototype(heap, atoms, builtins);
-    symbol::install(heap, atoms, globals, builtins);
-    let bigint_prototype = bigint::install(heap, atoms, globals, builtins);
+    object::install_function_prototype(heap, atoms, shapes, builtins);
+    symbol::install(heap, atoms, shapes, globals, builtins);
+    let bigint_prototype = bigint::install(heap, atoms, shapes, globals, builtins);
     builtins.set_bigint_prototype(bigint_prototype);
-    promise::install(heap, atoms, globals, builtins);
-    if timers_available {
-        timers::install(heap, atoms, globals, builtins);
+    promise::install(heap, atoms, shapes, globals, builtins);
+    if options.timers_available {
+        timers::install(heap, atoms, shapes, globals, builtins);
     }
-    collections::install_iterator_prototype(heap, atoms, builtins);
-    iterator_helpers::install(heap, atoms, globals, builtins);
-    collections::install_async_iterator_prototype(heap, atoms, builtins);
-    collections::install_generator_prototype(heap, atoms, builtins);
-    collections::install_async_generator_prototype(heap, atoms, builtins);
-    collections::install(heap, atoms, globals, builtins);
-    function_constructor::install(heap, atoms, globals, builtins, script_compiler);
-    map_set_edge::install(heap, atoms, globals, builtins);
-    date_full::install(heap, atoms, globals, builtins);
-    object::install(heap, atoms, globals, builtins);
-    array::install(heap, atoms, globals, builtins);
-    string::install(heap, atoms, globals, builtins);
-    number::install(heap, atoms, globals, builtins);
-    install_boolean(heap, atoms, globals, builtins);
-    install_math(heap, atoms, globals, builtins);
-    regexp::install(heap, atoms, globals, builtins);
-    string_edge::install(heap, atoms, globals, builtins);
-    annex_b::install(heap, atoms, globals, builtins);
-    weakref_finalization::install(heap, atoms, globals, builtins);
-    arraybuffer::install(heap, atoms, globals, builtins);
-    atomics::install(heap, atoms, globals, builtins);
-    typedarray_all::install(heap, atoms, globals, builtins);
-    dataview::install(heap, atoms, globals, builtins);
-    install_globals(heap, atoms, globals, builtins);
-    json_edge::install(heap, atoms, globals, builtins);
-    install_errors(heap, atoms, globals, builtins);
-    error_edge::install(heap, atoms, globals, builtins);
-    proxy::install(heap, atoms, globals, builtins);
+    collections::install_iterator_prototype(heap, atoms, shapes, builtins);
+    iterator_helpers::install(heap, atoms, shapes, globals, builtins);
+    collections::install_async_iterator_prototype(heap, atoms, shapes, builtins);
+    collections::install_generator_prototype(heap, atoms, shapes, builtins);
+    collections::install_async_generator_prototype(heap, atoms, shapes, builtins);
+    collections::install(heap, atoms, shapes, globals, builtins);
+    function_constructor::install(
+        heap,
+        atoms,
+        shapes,
+        globals,
+        builtins,
+        options.script_compiler,
+    );
+    map_set_edge::install(heap, atoms, shapes, globals, builtins);
+    date_full::install(heap, atoms, shapes, globals, builtins);
+    object::install(heap, atoms, shapes, globals, builtins);
+    array::install(heap, atoms, shapes, globals, builtins);
+    string::install(heap, atoms, shapes, globals, builtins);
+    number::install(heap, atoms, shapes, globals, builtins);
+    install_boolean(heap, atoms, shapes, globals, builtins);
+    install_math(heap, atoms, shapes, globals, builtins);
+    regexp::install(heap, atoms, shapes, globals, builtins);
+    string_edge::install(heap, atoms, shapes, globals, builtins);
+    annex_b::install(heap, atoms, shapes, globals, builtins);
+    weakref_finalization::install(heap, atoms, shapes, globals, builtins);
+    arraybuffer::install(heap, atoms, shapes, globals, builtins);
+    atomics::install(heap, atoms, shapes, globals, builtins);
+    typedarray_all::install(heap, atoms, shapes, globals, builtins);
+    dataview::install(heap, atoms, shapes, globals, builtins);
+    install_globals(heap, atoms, shapes, globals, builtins);
+    json_edge::install(heap, atoms, shapes, globals, builtins);
+    install_errors(heap, atoms, shapes, globals, builtins);
+    error_edge::install(heap, atoms, shapes, globals, builtins);
+    proxy::install(heap, atoms, shapes, globals, builtins);
     if let Some(id) = builtins.id_named("Proxy") {
         builtins.set_constructable(id, true);
     }
-    reflect::install(heap, atoms, globals, builtins);
-    uri::install(heap, atoms, globals, builtins);
-    disposable_stack::install(heap, atoms, globals, builtins);
-    temporal::install(heap, atoms, globals, builtins);
-    intl::install(heap, atoms, globals, builtins);
+    reflect::install(heap, atoms, shapes, globals, builtins);
+    uri::install(heap, atoms, shapes, globals, builtins);
+    disposable_stack::install(heap, atoms, shapes, globals, builtins);
+    temporal::install(heap, atoms, shapes, globals, builtins);
+    intl::install(heap, atoms, shapes, globals, builtins);
 }
 /// Runs `body` with `roots` kept alive across any user code it reaches. The
 /// frame's depth is passed in, so `keep_root` can add values found along the way.
@@ -132,18 +144,13 @@ fn release_roots<H: Host>(machine: &mut Machine<'_, H>, depth: usize, count: usi
 fn install_function<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
-    name: &'static str,
-    length: u32,
-    handler: super::BuiltinHandler<H>,
+    definition: BuiltinDef<H>,
 ) -> Value {
-    let id = builtins.register(BuiltinDef {
-        name,
-        length,
-        handler,
-    });
-    let definition = builtins.get(id);
-    native_function(heap, atoms, id, definition.name, definition.length)
+    let id = builtins.register(definition);
+    let installed = builtins.get(id);
+    native_function(heap, atoms, shapes, id, installed.name, installed.length)
 }
 
 /// Installs a builtin **constructor** (`[[Construct]]` present). Method,
@@ -152,22 +159,18 @@ fn install_function<H: Host>(
 pub(crate) fn install_constructor_function<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
-    name: &'static str,
-    length: u32,
-    handler: super::BuiltinHandler<H>,
+    definition: BuiltinDef<H>,
 ) -> Value {
-    let id = builtins.register_constructor(BuiltinDef {
-        name,
-        length,
-        handler,
-    });
-    let definition = builtins.get(id);
-    native_function(heap, atoms, id, definition.name, definition.length)
+    let id = builtins.register_constructor(definition);
+    let installed = builtins.get(id);
+    native_function(heap, atoms, shapes, id, installed.name, installed.length)
 }
 pub(crate) fn define_data(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     object: Value,
     name: &str,
     value: Value,
@@ -184,6 +187,7 @@ pub(crate) fn define_data(
         | HeapEntry::Temporal { properties, .. }
         | HeapEntry::Intl { properties, .. } => {
             properties.insert(
+                shapes,
                 PropertyKey::Named(atoms.intern_str(name)),
                 builtin_property(value),
             );
@@ -194,6 +198,7 @@ pub(crate) fn define_data(
 /// Installs a symbol-keyed property on an intrinsic object of any shape.
 pub(crate) fn define_symbol_property(
     heap: &mut [HeapEntry],
+    shapes: &mut crate::ShapeTable,
     object: Value,
     symbol: Value,
     property: Property,
@@ -207,13 +212,14 @@ pub(crate) fn define_symbol_property(
         | HeapEntry::NativeFunction { properties, .. }
         | HeapEntry::RegExp { properties, .. }
         | HeapEntry::Date { properties, .. } => {
-            properties.insert(key, property);
+            properties.insert(shapes, key, property);
         }
         _ => panic!("intrinsic property target must be an ordinary object"),
     }
 }
 pub(super) fn define_to_string_tag(
     heap: &mut Vec<HeapEntry>,
+    shapes: &mut crate::ShapeTable,
     object: Value,
     symbol: Value,
     tag: &str,
@@ -224,6 +230,7 @@ pub(super) fn define_to_string_tag(
         panic!("namespace tag target must be an ordinary object");
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(heap_index(symbol) as u32),
         Property::Data {
             value,
@@ -238,6 +245,7 @@ pub(super) fn define_to_string_tag(
 pub(crate) fn define_frozen_data(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     object: Value,
     name: &str,
     value: Value,
@@ -253,6 +261,7 @@ pub(crate) fn define_frozen_data(
         _ => panic!("frozen property target must be an ordinary object"),
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern_str(name)),
         Property::Data {
             value,
@@ -393,12 +402,13 @@ fn define_array_length(
     properties: &mut PropertyMap,
     atoms: &crate::AtomTable,
     length_writable: bool,
+    shapes: &crate::ShapeTable,
     length: usize,
 ) -> Result<(), EvalFailure> {
     if !length_writable && length != elements.len() {
         return Err(type_error("Cannot redefine non-writable array length"));
     }
-    if crate::apply_array_length(elements, properties, atoms, length) {
+    if crate::apply_array_length(elements, properties, atoms, length, shapes) {
         Ok(())
     } else {
         Err(type_error("define array length"))
@@ -407,24 +417,18 @@ fn define_array_length(
 fn install_boolean<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.boolean_prototype();
-    let constructor = install_constructor_function(
-        heap,
-        atoms,
-        builtins,
-        "Boolean",
-        1,
-        boolean_constructor::<H>,
-    );
-    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
+    let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Boolean", length: 1, handler: boolean_constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode("Boolean"), constructor);
-    let value_of = install_function(heap, atoms, builtins, "valueOf", 0, boolean_value_of::<H>);
-    define_data(heap, atoms, prototype, "valueOf", value_of);
-    let to_string = install_function(heap, atoms, builtins, "toString", 0, boolean_to_string::<H>);
-    define_data(heap, atoms, prototype, "toString", to_string);
+    let value_of = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "valueOf", length: 0, handler: boolean_value_of::<H> });
+    define_data(heap, atoms, shapes, prototype, "valueOf", value_of);
+    let to_string = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "toString", length: 0, handler: boolean_to_string::<H> });
+    define_data(heap, atoms, shapes, prototype, "toString", to_string);
 }
 fn boolean_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -472,6 +476,7 @@ fn boolean_to_string<H: Host>(
 fn install_math<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -500,12 +505,12 @@ fn install_math<H: Host>(
         ("log2", 1, math_log2::<H>),
         ("imul", 2, math_imul::<H>),
     ] {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
-        define_data(heap, atoms, math, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, math, name, function);
     }
-    define_to_string_tag(heap, math, builtins.symbol_to_string_tag(), "Math");
+    define_to_string_tag(heap, shapes, math, builtins.symbol_to_string_tag(), "Math");
     globals.insert(EcmaString::encode("Math"), math);
-    math_edge::install(heap, atoms, builtins, math);
+    math_edge::install(heap, atoms, shapes, builtins, math);
 }
 fn numeric_args<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -685,6 +690,7 @@ fn math_imul<H: Host>(
 fn install_globals<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -706,7 +712,7 @@ fn install_globals<H: Host>(
             structured_clone::structured_clone::<H>,
         ),
     ] {
-        let value = install_function(heap, atoms, builtins, name, length, handler);
+        let value = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
         globals.insert(EcmaString::encode(name), value);
     }
     globals.insert(
@@ -715,11 +721,12 @@ fn install_globals<H: Host>(
     );
     globals.insert(EcmaString::encode("NaN"), crate::number_value(f64::NAN));
     globals.insert(EcmaString::encode("undefined"), Value::UNDEFINED);
-    number::share_global_parsers(heap, atoms, globals);
+    number::share_global_parsers(heap, atoms, shapes, globals);
 }
 fn install_errors<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -733,8 +740,8 @@ fn install_errors<H: Host>(
         },
     );
     let error_to_string =
-        install_function(heap, atoms, builtins, "toString", 0, error_to_string::<H>);
-    define_data(heap, atoms, error_prototype, "toString", error_to_string);
+        install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "toString", length: 0, handler: error_to_string::<H> });
+    define_data(heap, atoms, shapes, error_prototype, "toString", error_to_string);
     install_error_type(
         InstallContext {
             heap: &mut *heap,
@@ -742,6 +749,7 @@ fn install_errors<H: Host>(
             globals: &mut *globals,
             builtins: &mut *builtins,
         },
+        &mut *shapes,
         "Error",
         1,
         error_prototype,
@@ -778,6 +786,7 @@ fn install_errors<H: Host>(
                 globals: &mut *globals,
                 builtins: &mut *builtins,
             },
+            &mut *shapes,
             name,
             length,
             prototype,
@@ -794,6 +803,7 @@ struct InstallContext<'a, H: Host> {
 
 fn install_error_type<H: Host>(
     ctx: InstallContext<'_, H>,
+    shapes: &mut crate::ShapeTable,
     name: &'static str,
     length: u32,
     prototype: Value,
@@ -811,6 +821,7 @@ fn install_error_type<H: Host>(
         unreachable!()
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern_str("name")),
         Property::Data {
             value: name_value,
@@ -820,6 +831,7 @@ fn install_error_type<H: Host>(
         },
     );
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern_str("message")),
         Property::Data {
             value: empty,
@@ -829,8 +841,8 @@ fn install_error_type<H: Host>(
         },
     );
     let constructor =
-        install_constructor_function(heap, atoms, builtins, name, length, error_constructor::<H>);
-    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: error_constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     builtins.set_error_prototype(heap, constructor, prototype);
     globals.insert(EcmaString::encode(name), constructor);
 }
@@ -1334,19 +1346,17 @@ impl<'a, H: Host> Machine<'a, H> {
             _ => return Ok(()),
         };
         *extensible = false;
-        for (_, property) in &mut properties.0 {
-            match property {
-                Property::Data {
-                    writable,
-                    configurable,
-                    ..
-                } => {
-                    *writable = false;
-                    *configurable = false;
-                }
-                Property::Accessor { configurable, .. } => *configurable = false,
+        properties.for_each_property_mut(|property| match property {
+            Property::Data {
+                writable,
+                configurable,
+                ..
+            } => {
+                *writable = false;
+                *configurable = false;
             }
-        }
+            Property::Accessor { configurable, .. } => *configurable = false,
+        });
         Ok(())
     }
     pub(crate) fn own_descriptor(
@@ -1390,7 +1400,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         configurable: false,
                     }));
                 }
-                if let Some(property) = properties.get(key) {
+                if let Some(property) = properties.get(&self.shapes, key) {
                     return Ok(Some(property.clone()));
                 }
                 if let PropertyKey::Named(name) = key
@@ -1452,7 +1462,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::ProxyRevoker { properties, .. } => properties,
             _ => return Ok(None),
         };
-        Ok(properties.get(key).cloned())
+        Ok(properties.get(&self.shapes, key).cloned())
     }
     /// ECMA-262 §7.2.10 SameValue(x, y) — like `same_value_zero` except that
     /// `+0` and `-0` are distinct. Mirrors the helper in `object.rs`; kept here
@@ -1635,7 +1645,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     ..
                 } => (
                     elements.len(),
-                    properties.charge_bytes(&self.atoms),
+                    properties.charge_bytes(&self.shapes, &self.atoms),
                     *length_writable,
                 ),
                 _ => unreachable!("array checked above"),
@@ -1663,6 +1673,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     properties,
                     &self.atoms,
                     *length_writable,
+                    &self.shapes,
                     length,
                 );
                 if !writable {
@@ -1675,7 +1686,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     elements,
                     properties,
                     ..
-                } => (elements.len(), properties.charge_bytes(&self.atoms)),
+                } => (elements.len(), properties.charge_bytes(&self.shapes, &self.atoms)),
                 _ => unreachable!("array checked above"),
             };
             let released = old_length
@@ -1797,9 +1808,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     extensible,
                     ..
                 } => {
-                    let exists = properties.contains_key(&key);
+                    let exists = properties.contains_key(&self.shapes, &key);
                     let (property_growth, property_refund) =
-                        property_definition_charges(properties, &self.atoms, &key, &descriptor);
+                        property_definition_charges(properties, &self.shapes, &self.atoms, &key, &descriptor);
                     (
                         *extensible,
                         exists,
@@ -1820,7 +1831,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         .as_string(&self.atoms)
                         .and_then(crate::array_index)
                         .map(|offset| offset as usize);
-                    let exists = properties.contains_key(&key)
+                    let exists = properties.contains_key(&self.shapes, &key)
                         || array_index.is_some_and(|offset| {
                             elements
                                 .get(offset)
@@ -1845,7 +1856,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             .saturating_mul(std::mem::size_of::<Value>())
                     });
                     let (property_growth, property_refund) =
-                        property_definition_charges(properties, &self.atoms, &key, &descriptor);
+                        property_definition_charges(properties, &self.shapes, &self.atoms, &key, &descriptor);
                     (
                         *extensible,
                         exists,
@@ -1882,11 +1893,12 @@ impl<'a, H: Host> Machine<'a, H> {
                             *length_writable,
                             crate::number_value((offset + 1) as f64),
                             "define array index",
+                    &self.shapes,
                         )?;
                     }
                     elements[offset] = Value::HOLE;
                 }
-                properties.insert(key, descriptor);
+                properties.insert(&mut self.shapes, key, descriptor);
             }
             HeapEntry::Object { properties, .. }
             | HeapEntry::Function { properties, .. }
@@ -1909,7 +1921,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Promise { properties, .. }
             | HeapEntry::Generator { properties, .. }
             | HeapEntry::AsyncGenerator { properties, .. } => {
-                properties.insert(key, descriptor);
+                properties.insert(&mut self.shapes, key, descriptor);
             }
             _ => unreachable!("validated object cannot change heap entry kind"),
         }
@@ -1992,7 +2004,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::Timeout { properties, .. }
                 | HeapEntry::DisposableStack { properties, .. }
                 | HeapEntry::Array { properties, .. } => {
-                    property_definition_charges(properties, &self.atoms, key, descriptor)
+                    property_definition_charges(properties, &self.shapes, &self.atoms, key, descriptor)
                 }
                 _ => unreachable!("validated object cannot change heap entry kind"),
             };
@@ -2022,7 +2034,7 @@ impl<'a, H: Host> Machine<'a, H> {
             _ => unreachable!("validated object cannot change heap entry kind"),
         };
         for (key, descriptor) in descriptors {
-            properties.insert(key, descriptor);
+            properties.insert(&mut self.shapes, key, descriptor);
         }
         self.refund_slot(index, refund);
         Ok(())
@@ -2154,11 +2166,12 @@ impl<'a, H: Host> Machine<'a, H> {
 }
 fn property_definition_charges(
     properties: &PropertyMap,
+    shapes: &ShapeTable,
     atoms: &crate::AtomTable,
     key: &PropertyKey,
     descriptor: &Property,
 ) -> (usize, usize) {
-    match properties.get(key) {
+    match properties.get(shapes, key) {
         None => (
             key.charge_bytes(atoms)
                 .saturating_add(descriptor.charge_bytes()),
@@ -2195,17 +2208,12 @@ mod tests {
         let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let getter = install_function(
-            &mut machine.heap,
-            &mut machine.atoms,
-            &mut machine.intrinsics.builtins,
-            "inherited message getter",
-            0,
-            inherited_message_getter::<TestHost>,
-        );
+        let getter = install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "inherited message getter", length: 0, handler: inherited_message_getter::<TestHost> });
         let mut properties = PropertyMap::default();
+        let key = PropertyKey::Named(machine.intern_str("message"));
         properties.insert(
-            PropertyKey::Named(machine.intern_str("message")),
+            &mut machine.shapes,
+            key,
             Property::Accessor {
                 getter: Some(getter),
                 setter: None,
@@ -3154,16 +3162,9 @@ mod tests {
             Value::UNDEFINED,
             "inherited prototype data must not be visible to own-slot load"
         );
-        let getter = install_function(
-            &mut machine.heap,
-            &mut machine.atoms,
-            &mut machine.intrinsics.builtins,
-            "counting getter",
-            0,
-            |_machine, _this, _args, _constructing| {
-                panic!("LoadOwnDescriptorSlot must not invoke accessors");
-            },
-        );
+        let getter = install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "counting getter", length: 0, handler: |_machine, _this, _args, _constructing| {
+            panic!("LoadOwnDescriptorSlot must not invoke accessors");
+        } });
         machine
             .define_descriptor(
                 object,
@@ -3240,14 +3241,7 @@ mod tests {
         machine
             .set_data_property(key_object, "produced", produced)
             .unwrap();
-        let to_string = install_function(
-            &mut machine.heap,
-            &mut machine.atoms,
-            &mut machine.intrinsics.builtins,
-            "descriptor key toString",
-            0,
-            key_to_string::<TestHost>,
-        );
+        let to_string = install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "descriptor key toString", length: 0, handler: key_to_string::<TestHost> });
         machine
             .set_data_property(key_object, "toString", to_string)
             .unwrap();
@@ -3410,6 +3404,7 @@ mod tests {
         define_data(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             object,
             "bootstrap",
             Value::int32(42),
@@ -3417,6 +3412,7 @@ mod tests {
         define_frozen_data(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             object,
             "sealed",
             Value::int32(99),

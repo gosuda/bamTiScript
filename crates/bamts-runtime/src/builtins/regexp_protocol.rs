@@ -929,6 +929,7 @@ fn escape<H: Host>(
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
     prototype: Value,
     constructor: Value,
@@ -946,8 +947,8 @@ pub(super) fn install<H: Host>(
         ("unicode", "get unicode", unicode::<H>),
         ("unicodeSets", "get unicodeSets", unicode_sets::<H>),
     ] {
-        let getter = install_function(heap, atoms, builtins, getter_name, 0, handler);
-        super::regexp::define_getter(heap, atoms, prototype, property, getter);
+        let getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: getter_name, length: 0, handler: handler });
+        super::regexp::define_getter(heap, atoms, shapes, prototype, property, getter);
     }
     let symbols = [
         (
@@ -982,30 +983,20 @@ pub(super) fn install<H: Host>(
         ),
     ];
     for (symbol, name, length, handler) in symbols {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
-        define_symbol_property(heap, prototype, symbol, super::builtin_property(function));
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_symbol_property(heap, shapes, prototype, symbol, super::builtin_property(function));
     }
-    let escape_function = install_function(heap, atoms, builtins, "escape", 1, escape::<H>);
-    super::define_data(heap, atoms, constructor, "escape", escape_function);
-    let species = install_function(
-        heap,
-        atoms,
-        builtins,
-        "get [Symbol.species]",
-        0,
-        species_getter::<H>,
-    );
-    define_symbol_property(
-        heap,
-        constructor,
-        builtins.symbol_species(),
-        Property::Accessor {
-            getter: Some(species),
-            setter: None,
-            enumerable: false,
-            configurable: true,
-        },
-    );
+    let escape_function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "escape", length: 1, handler: escape::<H> });
+    super::define_data(heap, atoms, shapes, constructor, "escape", escape_function);
+    let species = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get [Symbol.species]", length: 0, handler: species_getter::<H> });
+    define_symbol_property(heap, shapes, constructor,
+    builtins.symbol_species(),
+    Property::Accessor {
+        getter: Some(species),
+        setter: None,
+        enumerable: false,
+        configurable: true,
+    },);
     let iterator_prototype = crate::intrinsics::push(
         heap,
         HeapEntry::Object {
@@ -1015,21 +1006,11 @@ pub(super) fn install<H: Host>(
             boxed_primitive: None,
         },
     );
-    let next = install_function(
-        heap,
-        atoms,
-        builtins,
-        "next",
-        0,
-        regexp_string_iterator_next::<H>,
-    );
-    super::define_data(heap, atoms, iterator_prototype, "next", next);
-    super::define_to_string_tag(
-        heap,
-        iterator_prototype,
-        builtins.symbol_to_string_tag(),
-        "RegExp String Iterator",
-    );
+    let next = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "next", length: 0, handler: regexp_string_iterator_next::<H> });
+    super::define_data(heap, atoms, shapes, iterator_prototype, "next", next);
+    super::define_to_string_tag(heap, shapes, iterator_prototype,
+    builtins.symbol_to_string_tag(),
+    "RegExp String Iterator",);
     builtins.set_regexp_string_iterator_prototype(iterator_prototype);
 }
 
@@ -1139,7 +1120,7 @@ mod tests {
             length: 1,
             handler: fixed_exec,
         });
-        let exec = native_function(&mut machine.heap, &mut machine.atoms, id, "fixed exec", 1);
+        let exec = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "fixed exec", 1);
         machine.set_data_property(rx, "exec", exec).unwrap();
         let (string, replacement) = (text(&mut machine, "abc"), text(&mut machine, "[$&]"));
         let result =
@@ -1189,7 +1170,7 @@ mod tests {
             length: 1,
             handler,
         });
-        let exec = native_function(&mut machine.heap, &mut machine.atoms, id, "claiming exec", 1);
+        let exec = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "claiming exec", 1);
         let prototype = machine.intrinsics.regexp_prototype();
         machine.set_data_property(prototype, "exec", exec).unwrap();
     }

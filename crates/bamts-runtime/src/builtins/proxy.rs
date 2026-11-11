@@ -90,12 +90,13 @@ impl ProxyRevokerRecord {
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut std::collections::BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let constructor = install_function(heap, atoms, builtins, "Proxy", 2, constructor::<H>);
-    let revocable = install_function(heap, atoms, builtins, "revocable", 2, revocable::<H>);
-    define_data(heap, atoms, constructor, "revocable", revocable);
+    let constructor = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Proxy", length: 2, handler: constructor::<H> });
+    let revocable = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "revocable", length: 2, handler: revocable::<H> });
+    define_data(heap, atoms, shapes, constructor, "revocable", revocable);
     globals.insert(EcmaString::encode("Proxy"), constructor);
 }
 
@@ -162,6 +163,7 @@ fn proxy_revoker<H: Host>(
     let mut properties = PropertyMap::default();
     let length_atom = PropertyKey::Named(machine.intern_str("length"));
     properties.insert(
+        &mut machine.shapes,
         length_atom,
         Property::Data {
             value: Value::int32(0),
@@ -172,6 +174,7 @@ fn proxy_revoker<H: Host>(
     );
     let name_atom = PropertyKey::Named(machine.intern_str("name"));
     properties.insert(
+        &mut machine.shapes,
         name_atom,
         Property::Data {
             value: name,
@@ -775,7 +778,7 @@ mod tests {
                 length,
                 handler,
             });
-        native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
     }
 
     fn is_type_error<T>(result: Result<T, EvalFailure>) -> bool {

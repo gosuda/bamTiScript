@@ -1663,33 +1663,27 @@ pub(crate) fn json_reject<H: Host>(
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) -> Value {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
     let constructor =
-        install_constructor_function(heap, atoms, builtins, "BigInt", 1, constructor::<H>);
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "BigInt", length: 1, handler: constructor::<H> });
     builtins.set_bigint_constructor(constructor);
-    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
 
-    let as_int_n = install_function(heap, atoms, builtins, "asIntN", 2, as_int_n::<H>);
-    let as_uint_n = install_function(heap, atoms, builtins, "asUintN", 2, as_uint_n::<H>);
-    define_native_property(heap, atoms, constructor, "asIntN", as_int_n);
-    define_native_property(heap, atoms, constructor, "asUintN", as_uint_n);
+    let as_int_n = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "asIntN", length: 2, handler: as_int_n::<H> });
+    let as_uint_n = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "asUintN", length: 2, handler: as_uint_n::<H> });
+    define_native_property(heap, atoms, shapes, constructor, "asIntN", as_int_n);
+    define_native_property(heap, atoms, shapes, constructor, "asUintN", as_uint_n);
 
-    let to_string = install_function(heap, atoms, builtins, "toString", 0, to_string::<H>);
-    let value_of = install_function(heap, atoms, builtins, "valueOf", 0, value_of::<H>);
-    let to_locale_string = install_function(
-        heap,
-        atoms,
-        builtins,
-        "toLocaleString",
-        0,
-        to_locale_string::<H>,
-    );
-    define_data(heap, atoms, prototype, "toString", to_string);
-    define_data(heap, atoms, prototype, "valueOf", value_of);
-    define_data(heap, atoms, prototype, "toLocaleString", to_locale_string);
+    let to_string = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "toString", length: 0, handler: to_string::<H> });
+    let value_of = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "valueOf", length: 0, handler: value_of::<H> });
+    let to_locale_string = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "toLocaleString", length: 0, handler: to_locale_string::<H> });
+    define_data(heap, atoms, shapes, prototype, "toString", to_string);
+    define_data(heap, atoms, shapes, prototype, "valueOf", value_of);
+    define_data(heap, atoms, shapes, prototype, "toLocaleString", to_locale_string);
 
     let tag = super::super::push(heap, HeapEntry::String(EcmaString::encode("BigInt")));
     let to_string_tag = builtins.symbol_to_string_tag();
@@ -1697,6 +1691,7 @@ pub(super) fn install<H: Host>(
         unreachable!("prototype is an ordinary object");
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(heap_index(to_string_tag) as u32),
         Property::Data {
             value: tag,
@@ -1713,6 +1708,7 @@ pub(super) fn install<H: Host>(
 fn define_native_property(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     object: Value,
     name: &str,
     value: Value,
@@ -1721,6 +1717,7 @@ fn define_native_property(
         unreachable!("constructor is a native function");
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern_str(name)),
         Property::Data {
             value,
@@ -1875,14 +1872,7 @@ mod tests {
     }
 
     fn observable_object(machine: &mut Machine<'_, TestHost>, primitive: Value) -> Value {
-        let value_of = install_function(
-            &mut machine.heap,
-            &mut machine.atoms,
-            &mut machine.intrinsics.builtins,
-            "valueOf",
-            0,
-            observable_value_of,
-        );
+        let value_of = install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "valueOf", length: 0, handler: observable_value_of });
         let object = machine
             .allocate(HeapEntry::Object {
                 properties: Default::default(),

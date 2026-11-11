@@ -25,6 +25,7 @@ use crate::{
 pub(super) fn install_function_prototype<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
 ) {
     let id = builtins.register(BuiltinDef {
@@ -32,7 +33,7 @@ pub(super) fn install_function_prototype<H: Host>(
         length: 0,
         handler: function_prototype_call::<H>,
     });
-    let properties = native_function_properties(heap, atoms, "", 0);
+    let properties = native_function_properties(heap, atoms, shapes, "", 0);
     heap[heap_index(builtins.function_prototype())] = HeapEntry::native_function(
         NativeCallable::Builtin(id),
         properties,
@@ -52,16 +53,17 @@ fn function_prototype_call<H: Host>(
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.object_prototype();
     let constructor =
-        install_constructor_function(heap, atoms, builtins, "Object", 1, constructor::<H>);
-    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Object", length: 1, handler: constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode("Object"), constructor);
 
-    super::object_statics::install(heap, atoms, builtins, constructor);
+    super::object_statics::install(heap, atoms, shapes, builtins, constructor);
 
     for (name, length, handler) in [
         ("toString", 0, prototype_to_string::<H> as BuiltinHandler<H>),
@@ -71,8 +73,8 @@ pub(super) fn install<H: Host>(
         ("valueOf", 0, value_of::<H>),
         ("propertyIsEnumerable", 1, property_is_enumerable::<H>),
     ] {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
-        define_data(heap, atoms, prototype, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, prototype, name, function);
         if name == "toString" {
             builtins.set_object_to_string(function);
         }
@@ -83,10 +85,10 @@ pub(super) fn install<H: Host>(
         ("bind", 1, function_bind::<H>),
         ("toString", 0, function_to_string::<H>),
     ] {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
-        define_data(heap, atoms, builtins.function_prototype(), name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, builtins.function_prototype(), name, function);
     }
-    install_restricted_function_properties(heap, atoms, builtins);
+    install_restricted_function_properties(heap, atoms, shapes, builtins);
     let reified = crate::intrinsics::push(
         heap,
         HeapEntry::PrivateName {
@@ -94,25 +96,15 @@ pub(super) fn install<H: Host>(
         },
     );
     builtins.set_function_reified_brand(reified);
-    let has_instance = install_function(
-        heap,
-        atoms,
-        builtins,
-        "[Symbol.hasInstance]",
-        1,
-        function_has_instance::<H>,
-    );
-    define_symbol_property(
-        heap,
-        builtins.function_prototype(),
-        builtins.symbol_has_instance(),
-        Property::Data {
-            value: has_instance,
-            writable: false,
-            enumerable: false,
-            configurable: false,
-        },
-    );
+    let has_instance = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "[Symbol.hasInstance]", length: 1, handler: function_has_instance::<H> });
+    define_symbol_property(heap, shapes, builtins.function_prototype(),
+    builtins.symbol_has_instance(),
+    Property::Data {
+        value: has_instance,
+        writable: false,
+        enumerable: false,
+        configurable: false,
+    },);
 }
 
 /// `AddRestrictedFunctionProperties` for %Function.prototype%, around a frozen
@@ -120,9 +112,10 @@ pub(super) fn install<H: Host>(
 fn install_restricted_function_properties<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let thrower = install_function(heap, atoms, builtins, "", 0, throw_type_error::<H>);
+    let thrower = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "", length: 0, handler: throw_type_error::<H> });
     builtins.set_throw_type_error(thrower);
     let HeapEntry::NativeFunction {
         properties,
@@ -133,11 +126,11 @@ fn install_restricted_function_properties<H: Host>(
         panic!("%ThrowTypeError% must be native");
     };
     *extensible = false;
-    for (_, property) in &mut properties.0 {
+    properties.for_each_property_mut(|property| {
         if let Property::Data { configurable, .. } = property {
             *configurable = false;
         }
-    }
+    });
     let HeapEntry::NativeFunction { properties, .. } =
         &mut heap[heap_index(builtins.function_prototype())]
     else {
@@ -146,6 +139,7 @@ fn install_restricted_function_properties<H: Host>(
     for name in ["caller", "arguments"] {
         let atom = atoms.intern_str(name);
         properties.insert(
+            shapes,
             PropertyKey::Named(atom),
             Property::Accessor {
                 getter: Some(thrower),
@@ -635,6 +629,7 @@ fn function_bind<H: Host>(
     let name = allocate_string(machine, name.finish())?;
     let mut properties = PropertyMap::default();
     properties.insert(
+        &mut machine.shapes,
         length_key,
         Property::Data {
             value: crate::number_value(length),
@@ -645,6 +640,7 @@ fn function_bind<H: Host>(
     );
     let name_key = PropertyKey::Named(machine.intern_str("name"));
     properties.insert(
+        &mut machine.shapes,
         name_key,
         Property::Data {
             value: name,
@@ -1357,6 +1353,7 @@ mod tests {
         let getter = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             getter_id,
             "delete next",
             0,
@@ -1417,6 +1414,7 @@ mod tests {
         let getter = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             getter_id,
             "delete later index",
             0,
@@ -2119,7 +2117,7 @@ mod tests {
                 length,
                 handler: probe_handler::<TestHost>,
             });
-        crate::intrinsics::native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
+        crate::intrinsics::native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
     }
 
     fn call_method(
@@ -2272,6 +2270,7 @@ mod tests {
             let getter = crate::intrinsics::native_function(
                 &mut machine.heap,
                 &mut machine.atoms,
+            &mut machine.shapes,
                 id,
                 name,
                 0,
@@ -2333,6 +2332,7 @@ mod tests {
         let getter = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             getter_id,
             "mark length",
             0,
@@ -2444,6 +2444,7 @@ mod tests {
         let value_of_fn = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             value_of_id,
             "valueOf",
             0,
@@ -2463,6 +2464,7 @@ mod tests {
         let to_string_fn = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             to_string_id,
             "toString",
             0,
@@ -2482,6 +2484,7 @@ mod tests {
         let index_zero_getter_fn = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             index_zero_id,
             "index 0 getter",
             0,
@@ -2511,6 +2514,7 @@ mod tests {
         let index_one_getter_fn = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             index_one_id,
             "index 1 getter",
             0,
@@ -2585,6 +2589,7 @@ mod tests {
         let value_of_fn = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             value_of_id,
             "throwing valueOf",
             0,
@@ -2604,6 +2609,7 @@ mod tests {
         let index_zero_getter_fn = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             index_zero_id,
             "index 0 getter",
             0,
@@ -2718,6 +2724,7 @@ mod tests {
         let mut properties = PropertyMap::default();
         let __key_prototype_54 = PropertyKey::Named(machine.intern_str("prototype"));
         properties.insert(
+            &mut machine.shapes,
             __key_prototype_54,
             Property::Data {
                 value: prototype,
@@ -2775,6 +2782,7 @@ mod tests {
         let mut properties = PropertyMap::default();
         let __key_prototype_55 = PropertyKey::Named(machine.intern_str("prototype"));
         properties.insert(
+            &mut machine.shapes,
             __key_prototype_55,
             Property::Data {
                 value: custom_prototype,
@@ -2921,6 +2929,7 @@ mod tests {
         let mut bare_properties = PropertyMap::default();
         let __key_prototype_57 = PropertyKey::Named(machine.intern_str("prototype"));
         bare_properties.insert(
+            &mut machine.shapes,
             __key_prototype_57,
             Property::Data {
                 value: Value::int32(1),
@@ -3011,6 +3020,7 @@ mod tests {
         let mut properties = PropertyMap::default();
         let __key_prototype_58 = PropertyKey::Named(machine.intern_str("prototype"));
         properties.insert(
+            &mut machine.shapes,
             __key_prototype_58,
             Property::Data {
                 value: custom_prototype,
@@ -3340,6 +3350,7 @@ mod tests {
         let next_fn = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             next_id,
             "from entries next",
             0,
@@ -3355,6 +3366,7 @@ mod tests {
         let return_fn = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             return_id,
             "from entries return",
             0,
@@ -3370,6 +3382,7 @@ mod tests {
         let create_fn = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             create_id,
             "from entries iterator",
             0,
@@ -3552,6 +3565,7 @@ mod tests {
         let getter = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             getter_id,
             "from entries throwing value getter",
             0,
@@ -3599,6 +3613,7 @@ mod tests {
         let key_getter = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             key_getter_id,
             "from entries collecting key getter",
             0,
@@ -3627,6 +3642,7 @@ mod tests {
         let getter = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             getter_id,
             "from entries collecting value getter",
             0,
@@ -3677,6 +3693,7 @@ mod tests {
         let setter = crate::intrinsics::native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             setter_id,
             "from entries inherited setter",
             1,

@@ -248,7 +248,7 @@ fn native(
         length,
         handler,
     });
-    native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
+    native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
 }
 
 /// Callable-and-constructable builtin (construct targets for ProxyCreate).
@@ -266,7 +266,7 @@ fn native_ctor(
             length,
             handler,
         });
-    native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
+    native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
 }
 
 fn global_method(machine: &mut Machine<'_, TestHost>, namespace: &str, name: &str) -> Value {

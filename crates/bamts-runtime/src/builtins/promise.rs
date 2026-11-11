@@ -13,6 +13,7 @@ use crate::{
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -26,151 +27,47 @@ pub(super) fn install<H: Host>(
         },
     );
     builtins.set_promise_prototype(prototype);
-    let resolve_target = install_function(
-        heap,
-        atoms,
-        builtins,
-        "Promise resolve target",
-        1,
-        resolve_target::<H>,
-    );
-    let reject_target = install_function(
-        heap,
-        atoms,
-        builtins,
-        "Promise reject target",
-        1,
-        reject_target::<H>,
-    );
+    let resolve_target = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise resolve target", length: 1, handler: resolve_target::<H> });
+    let reject_target = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise reject target", length: 1, handler: reject_target::<H> });
     builtins.set_promise_resolver_targets(resolve_target, reject_target);
-    let all_fulfill = install_function(
-        heap,
-        atoms,
-        builtins,
-        "Promise all fulfill",
-        1,
-        all_fulfill::<H>,
-    );
+    let all_fulfill = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise all fulfill", length: 1, handler: all_fulfill::<H> });
     builtins.set_promise_all_target(all_fulfill);
-    let capability_executor = install_function(
-        heap,
-        atoms,
-        builtins,
-        "Promise capability executor",
-        2,
-        capability_executor::<H>,
-    );
-    let finally_value = install_function(
-        heap,
-        atoms,
-        builtins,
-        "Promise finally value",
-        1,
-        finally_value::<H>,
-    );
-    let finally_throw = install_function(
-        heap,
-        atoms,
-        builtins,
-        "Promise finally throw",
-        1,
-        finally_throw::<H>,
-    );
-    let species = install_function(
-        heap,
-        atoms,
-        builtins,
-        "get [Symbol.species]",
-        0,
-        species::<H>,
-    );
-    let finally_return = install_function(
-        heap,
-        atoms,
-        builtins,
-        "Promise finally return",
-        0,
-        finally_return::<H>,
-    );
-    let finally_rethrow = install_function(
-        heap,
-        atoms,
-        builtins,
-        "Promise finally rethrow",
-        0,
-        finally_rethrow::<H>,
-    );
-    let then_fulfill = install_function(
-        heap,
-        atoms,
-        builtins,
-        "Promise capability fulfill",
-        1,
-        then_fulfill::<H>,
-    );
-    let then_reject = install_function(
-        heap,
-        atoms,
-        builtins,
-        "Promise capability reject",
-        1,
-        then_reject::<H>,
-    );
+    let capability_executor = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise capability executor", length: 2, handler: capability_executor::<H> });
+    let finally_value = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise finally value", length: 1, handler: finally_value::<H> });
+    let finally_throw = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise finally throw", length: 1, handler: finally_throw::<H> });
+    let species = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get [Symbol.species]", length: 0, handler: species::<H> });
+    let finally_return = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise finally return", length: 0, handler: finally_return::<H> });
+    let finally_rethrow = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise finally rethrow", length: 0, handler: finally_rethrow::<H> });
+    let then_fulfill = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise capability fulfill", length: 1, handler: then_fulfill::<H> });
+    let then_reject = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise capability reject", length: 1, handler: then_reject::<H> });
 
     let constructor =
-        install_constructor_function(heap, atoms, builtins, "Promise", 1, constructor::<H>);
-    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise", length: 1, handler: constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode("Promise"), constructor);
-    let queue_microtask = install_function(
-        heap,
-        atoms,
-        builtins,
-        "queueMicrotask",
-        1,
-        queue_microtask::<H>,
-    );
+    let queue_microtask = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "queueMicrotask", length: 1, handler: queue_microtask::<H> });
     globals.insert(EcmaString::encode("queueMicrotask"), queue_microtask);
 
-    let resolve = install_function(heap, atoms, builtins, "resolve", 1, resolve::<H>);
-    let reject = install_function(heap, atoms, builtins, "reject", 1, reject::<H>);
-    let all = install_function(heap, atoms, builtins, "all", 1, all::<H>);
-    let race = install_function(heap, atoms, builtins, "race", 1, race::<H>);
-    let all_settled = install_function(heap, atoms, builtins, "allSettled", 1, all_settled::<H>);
-    let any = install_function(heap, atoms, builtins, "any", 1, any::<H>);
-    let all_keyed = install_function(heap, atoms, builtins, "allKeyed", 1, all_keyed::<H>);
-    let all_settled_keyed = install_function(
-        heap,
-        atoms,
-        builtins,
-        "allSettledKeyed",
-        1,
-        all_settled_keyed::<H>,
-    );
-    let try_method = install_function(heap, atoms, builtins, "try", 1, promise_try::<H>);
-    let with_resolvers = install_function(
-        heap,
-        atoms,
-        builtins,
-        "withResolvers",
-        0,
-        with_resolvers::<H>,
-    );
-    define_static(heap, atoms, constructor, "resolve", resolve);
-    define_static(heap, atoms, constructor, "reject", reject);
-    define_static(heap, atoms, constructor, "all", all);
-    define_static(heap, atoms, constructor, "race", race);
-    define_static(heap, atoms, constructor, "allSettled", all_settled);
-    define_static(heap, atoms, constructor, "any", any);
-    define_static(heap, atoms, constructor, "allKeyed", all_keyed);
-    define_static(
-        heap,
-        atoms,
-        constructor,
-        "allSettledKeyed",
-        all_settled_keyed,
-    );
-    define_static(heap, atoms, constructor, "try", try_method);
-    define_static(heap, atoms, constructor, "withResolvers", with_resolvers);
+    let resolve = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "resolve", length: 1, handler: resolve::<H> });
+    let reject = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "reject", length: 1, handler: reject::<H> });
+    let all = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "all", length: 1, handler: all::<H> });
+    let race = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "race", length: 1, handler: race::<H> });
+    let all_settled = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "allSettled", length: 1, handler: all_settled::<H> });
+    let any = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "any", length: 1, handler: any::<H> });
+    let all_keyed = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "allKeyed", length: 1, handler: all_keyed::<H> });
+    let all_settled_keyed = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "allSettledKeyed", length: 1, handler: all_settled_keyed::<H> });
+    let try_method = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "try", length: 1, handler: promise_try::<H> });
+    let with_resolvers = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "withResolvers", length: 0, handler: with_resolvers::<H> });
+    define_static(heap, atoms, shapes, constructor, "resolve", resolve);
+    define_static(heap, atoms, shapes, constructor, "reject", reject);
+    define_static(heap, atoms, shapes, constructor, "all", all);
+    define_static(heap, atoms, shapes, constructor, "race", race);
+    define_static(heap, atoms, shapes, constructor, "allSettled", all_settled);
+    define_static(heap, atoms, shapes, constructor, "any", any);
+    define_static(heap, atoms, shapes, constructor, "allKeyed", all_keyed);
+    define_static(heap, atoms, shapes, constructor, "allSettledKeyed", all_settled_keyed);
+    define_static(heap, atoms, shapes, constructor, "try", try_method);
+    define_static(heap, atoms, shapes, constructor, "withResolvers", with_resolvers);
     builtins.set_promise_capability_executor(capability_executor);
     builtins.set_promise_finally_value(finally_value);
     builtins.set_promise_finally_throw(finally_throw);
@@ -183,6 +80,7 @@ pub(super) fn install<H: Host>(
         unreachable!("Promise constructor is native")
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(super::heap_index(builtins.symbol_species()) as u32),
         crate::Property::Accessor {
             getter: Some(species),
@@ -191,19 +89,20 @@ pub(super) fn install<H: Host>(
             configurable: true,
         },
     );
-    let then = install_function(heap, atoms, builtins, "then", 2, then::<H>);
-    let catch = install_function(heap, atoms, builtins, "catch", 1, catch::<H>);
-    let finally = install_function(heap, atoms, builtins, "finally", 1, finally::<H>);
-    define_data(heap, atoms, prototype, "constructor", constructor);
-    define_data(heap, atoms, prototype, "then", then);
-    define_data(heap, atoms, prototype, "catch", catch);
-    define_data(heap, atoms, prototype, "finally", finally);
-    define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), "Promise");
+    let then = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "then", length: 2, handler: then::<H> });
+    let catch = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "catch", length: 1, handler: catch::<H> });
+    let finally = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "finally", length: 1, handler: finally::<H> });
+    define_data(heap, atoms, shapes, prototype, "constructor", constructor);
+    define_data(heap, atoms, shapes, prototype, "then", then);
+    define_data(heap, atoms, shapes, prototype, "catch", catch);
+    define_data(heap, atoms, shapes, prototype, "finally", finally);
+    define_to_string_tag(heap, shapes, prototype, builtins.symbol_to_string_tag(), "Promise");
 }
 
 fn define_static(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     constructor: Value,
     name: &str,
     value: Value,
@@ -213,6 +112,7 @@ fn define_static(
         panic!("Promise constructor must be native")
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern(EcmaString::encode(name))),
         super::builtin_property(value),
     );
@@ -1655,14 +1555,7 @@ mod tests {
         name: &'static str,
         handler: BuiltinHandler<TestHost>,
     ) -> Value {
-        install_function(
-            &mut machine.heap,
-            &mut machine.atoms,
-            &mut machine.intrinsics.builtins,
-            name,
-            0,
-            handler,
-        )
+        install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: name, length: 0, handler: handler })
     }
 
     fn return_undefined(
@@ -2392,7 +2285,7 @@ mod tests {
         let HeapEntry::NativeFunction { properties, .. } = &machine.heap[idx] else {
             panic!("Promise constructor is native");
         };
-        for (key, _) in properties.iter() {
+        for (key, _) in properties.iter(&machine.shapes) {
             if let PropertyKey::Named(name) = key {
                 assert!(
                     !machine.atoms.resolve(*name).as_units().starts_with(&[0]),
@@ -2410,7 +2303,7 @@ mod tests {
         let HeapEntry::Object { properties, .. } = &machine.heap[proto_idx] else {
             panic!("Promise prototype is object");
         };
-        for (key, _) in properties.iter() {
+        for (key, _) in properties.iter(&machine.shapes) {
             if let PropertyKey::Named(name) = key {
                 assert!(
                     !machine.atoms.resolve(*name).as_units().starts_with(&[0]),

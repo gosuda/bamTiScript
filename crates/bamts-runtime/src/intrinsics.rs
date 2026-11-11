@@ -734,6 +734,7 @@ impl<H: Host> BuiltinTable<H> {
         &mut self,
         heap: &mut [HeapEntry],
         atoms: &mut crate::AtomTable,
+        shapes: &mut crate::ShapeTable,
         constructor: Value,
         prototype: Value,
     ) {
@@ -742,6 +743,7 @@ impl<H: Host> BuiltinTable<H> {
             panic!("builtin constructor is a native function");
         };
         properties.insert(
+            shapes,
             crate::PropertyKey::Named(atoms.intern_str("prototype")),
             crate::Property::Data {
                 value: prototype,
@@ -764,6 +766,7 @@ impl<H: Host> BuiltinTable<H> {
             | HeapEntry::Temporal { properties, .. }
             | HeapEntry::Intl { properties, .. } => {
                 properties.insert(
+                    shapes,
                     crate::PropertyKey::Named(atoms.intern_str("constructor")),
                     constructor_property,
                 );
@@ -775,6 +778,7 @@ impl<H: Host> BuiltinTable<H> {
         &mut self,
         heap: &mut [HeapEntry],
         atoms: &mut crate::AtomTable,
+        shapes: &mut crate::ShapeTable,
         function: Value,
         prototype: Value,
     ) {
@@ -783,6 +787,7 @@ impl<H: Host> BuiltinTable<H> {
             panic!("builtin function is a native function");
         };
         properties.insert(
+            shapes,
             crate::PropertyKey::Named(atoms.intern_str("prototype")),
             crate::Property::Data {
                 value: prototype,
@@ -1038,6 +1043,7 @@ impl<H: Host> Intrinsics<H> {
     pub(crate) fn initialize(
         heap: &mut Vec<HeapEntry>,
         atoms: &mut crate::AtomTable,
+        shapes: &mut crate::ShapeTable,
         timers_available: bool,
         script_compiler: bool,
     ) -> Self {
@@ -1077,12 +1083,12 @@ impl<H: Host> Intrinsics<H> {
         builtins::install(
             heap,
             atoms,
+            shapes,
             &mut globals,
             &mut builtins,
-            timers_available,
-            script_compiler,
+            builtins::InstallOptions { timers_available, script_compiler },
         );
-        crate::host_objects::install(heap, atoms, &mut globals, &mut builtins);
+        crate::host_objects::install(heap, atoms, shapes, &mut globals, &mut builtins);
         Self {
             globals,
             symbol_registry: BTreeMap::new(),
@@ -1173,14 +1179,16 @@ fn ordinary_prototype(heap: &mut Vec<HeapEntry>, object_prototype: Value) -> Val
 pub(crate) fn native_function_properties(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     name: &'static str,
     length: u32,
 ) -> PropertyMap {
     let name_value = push(heap, HeapEntry::String(EcmaString::encode(name)));
-    function_properties(atoms, length, name_value)
+    function_properties(atoms, shapes, length, name_value)
 }
 pub(crate) fn function_properties(
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     length: u32,
     name: Value,
 ) -> PropertyMap {
@@ -1190,6 +1198,7 @@ pub(crate) fn function_properties(
         ("name", name),
     ] {
         properties.insert(
+            shapes,
             crate::PropertyKey::Named(atoms.intern_str(key)),
             crate::Property::Data {
                 value,
@@ -1204,11 +1213,12 @@ pub(crate) fn function_properties(
 pub(crate) fn native_function(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     id: BuiltinId,
     name: &'static str,
     length: u32,
 ) -> Value {
-    let properties = native_function_properties(heap, atoms, name, length);
+    let properties = native_function_properties(heap, atoms, shapes, name, length);
     push(
         heap,
         HeapEntry::native_function(NativeCallable::Builtin(id), properties, None),
@@ -1287,7 +1297,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     },
                     HeapEntry::Object { properties, .. }
                         if properties
-                            .get(&self.intrinsics.builtins.error_brand_key())
+                            .get(&self.shapes, &self.intrinsics.builtins.error_brand_key())
                             .is_some() =>
                     {
                         "Error"
@@ -1381,7 +1391,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             } => {
                 if let Some(Property::Data { value, .. }) =
-                    properties.get_ascii(&self.atoms, "name")
+                    properties.get_ascii(&self.shapes, &self.atoms, "name")
                     && let Some(text) = self.string_from_value(*value)
                 {
                     return Some(text);
@@ -1393,7 +1403,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             HeapEntry::NativeFunction { properties, .. } => {
                 if let Some(Property::Data { value, .. }) =
-                    properties.get_ascii(&self.atoms, "name")
+                    properties.get_ascii(&self.shapes, &self.atoms, "name")
                 {
                     self.string_from_value(*value)
                 } else {
@@ -1673,6 +1683,7 @@ mod tests {
                 unreachable!()
             };
             properties.insert(
+                &mut machine.shapes,
                 atom,
                 Property::Data {
                     value: Value::int32(value),

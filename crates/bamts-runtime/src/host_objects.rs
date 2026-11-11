@@ -9,6 +9,7 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, Proper
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -21,26 +22,12 @@ pub(crate) fn install<H: Host>(
         ("debug", console_debug::<H> as _),
         ("info", console_info::<H> as _),
     ] {
-        let function = register(heap, atoms, builtins, name, 0, handler);
-        put(heap, atoms, console, name, function);
+        let function = register(heap, atoms, shapes, builtins, BuiltinDef { name, length: 0, handler });
+        put(heap, atoms, shapes, console, name, function);
     }
 
-    let stdout = stream(
-        heap,
-        atoms,
-        builtins,
-        object_prototype,
-        "stdout",
-        stdout_write::<H>,
-    );
-    let stderr = stream(
-        heap,
-        atoms,
-        builtins,
-        object_prototype,
-        "stderr",
-        stderr_write::<H>,
-    );
+    let stdout = stream(heap, atoms, shapes, builtins, "stdout", stdout_write::<H>);
+    let stderr = stream(heap, atoms, shapes, builtins, "stderr", stderr_write::<H>);
     let env = intrinsics::push(
         heap,
         HeapEntry::ProcessEnv {
@@ -59,25 +46,25 @@ pub(crate) fn install<H: Host>(
         },
     );
     let versions = object(heap, object_prototype);
-    put_text(heap, atoms, versions, "node", "24.18.0");
+    put_text(heap, atoms, shapes, versions, "node", "24.18.0");
 
     let process = object(heap, object_prototype);
-    put(heap, atoms, process, "stdout", stdout);
-    put(heap, atoms, process, "stderr", stderr);
-    put(heap, atoms, process, "env", env);
-    put(heap, atoms, process, "argv", argv);
-    put_text(heap, atoms, process, "platform", std::env::consts::OS);
-    put_text(heap, atoms, process, "version", "v24.18.0");
-    put(heap, atoms, process, "versions", versions);
+    put(heap, atoms, shapes, process, "stdout", stdout);
+    put(heap, atoms, shapes, process, "stderr", stderr);
+    put(heap, atoms, shapes, process, "env", env);
+    put(heap, atoms, shapes, process, "argv", argv);
+    put_text(heap, atoms, shapes, process, "platform", std::env::consts::OS);
+    put_text(heap, atoms, shapes, process, "version", "v24.18.0");
+    put(heap, atoms, shapes, process, "versions", versions);
     for (name, length, handler) in [
         ("exit", 1, process_exit::<H> as _),
         ("nextTick", 1, process_next_tick::<H> as _),
     ] {
-        let function = register(heap, atoms, builtins, name, length, handler);
-        put(heap, atoms, process, name, function);
+        let function = register(heap, atoms, shapes, builtins, BuiltinDef { name, length, handler });
+        put(heap, atoms, shapes, process, name, function);
     }
 
-    let print_fn = register(heap, atoms, builtins, "print", 1, print_fn::<H> as _);
+    let print_fn = register(heap, atoms, shapes, builtins, BuiltinDef { name: "print", length: 1, handler: print_fn::<H> as _ });
     globals.insert(EcmaString::encode("print"), print_fn);
     globals.insert(EcmaString::encode("console"), console);
     globals.insert(EcmaString::encode("process"), process);
@@ -88,6 +75,7 @@ pub(crate) fn install<H: Host>(
             crate::intrinsics::builtins::define_frozen_data(
                 heap,
                 atoms,
+                shapes,
                 global_this,
                 "Infinity",
                 *value,
@@ -96,6 +84,7 @@ pub(crate) fn install<H: Host>(
             crate::intrinsics::builtins::define_frozen_data(
                 heap,
                 atoms,
+                shapes,
                 global_this,
                 "NaN",
                 *value,
@@ -104,17 +93,19 @@ pub(crate) fn install<H: Host>(
             crate::intrinsics::builtins::define_frozen_data(
                 heap,
                 atoms,
+                shapes,
                 global_this,
                 "undefined",
                 *value,
             );
         } else {
-            define_global_data(heap, atoms, global_this, name.clone(), *value);
+            define_global_data(heap, atoms, shapes, global_this, name.clone(), *value);
         }
     }
     define_global_data(
         heap,
         atoms,
+        shapes,
         global_this,
         EcmaString::encode("globalThis"),
         global_this,
@@ -122,6 +113,7 @@ pub(crate) fn install<H: Host>(
     define_global_data(
         heap,
         atoms,
+        shapes,
         global_this,
         EcmaString::encode("global"),
         global_this,
@@ -132,32 +124,28 @@ pub(crate) fn install<H: Host>(
 fn stream<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
-    object_prototype: Value,
     name: &'static str,
     handler: crate::intrinsics::BuiltinHandler<H>,
 ) -> Value {
-    let stream = object(heap, object_prototype);
-    let write = register(heap, atoms, builtins, "write", 1, handler);
-    put(heap, atoms, stream, "write", write);
-    put_text(heap, atoms, stream, "_name", name);
+    let stream = object(heap, builtins.object_prototype());
+    let write = register(heap, atoms, shapes, builtins, BuiltinDef { name: "write", length: 1, handler });
+    put(heap, atoms, shapes, stream, "write", write);
+    put_text(heap, atoms, shapes, stream, "_name", name);
     stream
 }
 
 fn register<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
-    name: &'static str,
-    length: u32,
-    handler: crate::intrinsics::BuiltinHandler<H>,
+    definition: BuiltinDef<H>,
 ) -> Value {
-    let id = builtins.register(BuiltinDef {
-        name,
-        length,
-        handler,
-    });
-    intrinsics::native_function(heap, atoms, id, name, length)
+    let id = builtins.register(definition);
+    let installed = builtins.get(id);
+    intrinsics::native_function(heap, atoms, shapes, id, installed.name, installed.length)
 }
 
 fn object(heap: &mut Vec<HeapEntry>, prototype: Value) -> Value {
@@ -174,20 +162,20 @@ fn object(heap: &mut Vec<HeapEntry>, prototype: Value) -> Value {
 fn put(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     object: Value,
     name: &str,
     value: Value,
 ) {
-    put_ecma(heap, atoms, object, EcmaString::encode(name), value);
+    put_ecma(heap, atoms, shapes, object, EcmaString::encode(name), value);
 }
 
 fn define_data(
     heap: &mut [HeapEntry],
-    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     object: Value,
-    name: EcmaString,
-    value: Value,
-    enumerable: bool,
+    key: PropertyKey,
+    property: Property,
 ) {
     let index = heap_index(object);
     let properties = match &mut heap[index] {
@@ -196,46 +184,63 @@ fn define_data(
         | HeapEntry::NativeFunction { properties, .. } => properties,
         _ => unreachable!("host object installation target owns properties"),
     };
-    properties.insert(
-        PropertyKey::Named(atoms.intern(name)),
-        Property::Data {
-            value,
-            writable: true,
-            enumerable,
-            configurable: true,
-        },
-    );
+    properties.insert(shapes, key, property);
 }
 
 fn put_ecma(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     object: Value,
     name: EcmaString,
     value: Value,
 ) {
-    define_data(heap, atoms, object, name, value, true);
+    define_data(
+        heap,
+        shapes,
+        object,
+        PropertyKey::Named(atoms.intern(name)),
+        Property::Data {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        },
+    );
 }
 
 fn define_global_data(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     object: Value,
     name: EcmaString,
     value: Value,
 ) {
-    define_data(heap, atoms, object, name, value, false);
+    define_data(
+        heap,
+        shapes,
+        object,
+        PropertyKey::Named(atoms.intern(name)),
+        Property::Data {
+            value,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        },
+    );
 }
 
 fn put_text(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     object: Value,
     name: &str,
     text: &str,
 ) {
     let value = intrinsics::push(heap, HeapEntry::String(EcmaString::encode(text)));
-    put(heap, atoms, object, name, value);
+    put(heap, atoms, shapes, object, name, value);
 }
 
 fn heap_index(value: Value) -> usize {
@@ -480,7 +485,7 @@ impl<H: Host> Machine<'_, H> {
                             return Ok("[Object]".to_owned());
                         }
                         let mut parts = Vec::new();
-                        for (key, property) in properties {
+                        for (key, property) in properties.iter(&self.shapes) {
                             let (
                                 PropertyKey::Named(name),
                                 Property::Data {

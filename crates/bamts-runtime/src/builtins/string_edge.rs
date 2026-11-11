@@ -18,6 +18,7 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -35,12 +36,13 @@ pub(super) fn install<H: Host>(
         ),
         ("raw", 1, raw::<H>),
     ] {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
         let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)]
         else {
             panic!("String constructor must be native")
         };
         properties.insert(
+            shapes,
             PropertyKey::Named(atoms.intern_str(name)),
             builtin_property(function),
         );
@@ -59,8 +61,8 @@ pub(super) fn install<H: Host>(
         ("trimEnd", 0, trim_end::<H>),
         ("repeat", 1, repeat::<H>),
     ] {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
-        super::define_data(heap, atoms, prototype, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        super::define_data(heap, atoms, shapes, prototype, name, function);
     }
 }
 
@@ -870,7 +872,7 @@ mod tests {
             length: 2,
             handler: symbol_replace_hook::<TestHost>,
         });
-        let hook = native_function(&mut machine.heap, &mut machine.atoms, id, "replace hook", 2);
+        let hook = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "replace hook", 2);
         let symbol = machine.intrinsics.builtins.symbol_replace();
         let key = machine.property_key_from_value(symbol).unwrap();
         machine.set_data_property_key(search, key, hook).unwrap();
@@ -883,6 +885,7 @@ mod tests {
         let coercion = native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             coercion_id,
             "throwing toString",
             0,
@@ -993,6 +996,7 @@ mod tests {
         let replacer = native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             id,
             "literal dollar replacer",
             3,
@@ -1013,7 +1017,7 @@ mod tests {
             length: 2,
             handler: symbol_replace_hook::<TestHost>,
         });
-        let hook = native_function(&mut machine.heap, &mut machine.atoms, id, "replace hook", 2);
+        let hook = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "replace hook", 2);
         let match_symbol = machine.intrinsics.builtins.symbol_match();
         let match_key = machine.property_key_from_value(match_symbol).unwrap();
         let replace_symbol = machine.intrinsics.builtins.symbol_replace();
@@ -1158,6 +1162,7 @@ mod tests {
         let coercion = native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             coercion_id,
             "unused filler toString",
             0,

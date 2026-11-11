@@ -20,21 +20,14 @@ pub(super) fn install<H: Host>(
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
     builtins.set_uint8array_prototype(prototype);
-    let constructor = install_function(heap, atoms, builtins, "Uint8Array", 1, constructor::<H>);
+    let constructor = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Uint8Array", length: 1, handler: constructor::<H> });
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    define_data(heap, atoms, prototype, "constructor", constructor);
-    let length = install_function(heap, atoms, builtins, "get length", 0, length_getter::<H>);
+    define_data(heap, atoms, shapes, prototype, "constructor", constructor);
+    let length = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get length", length: 0, handler: length_getter::<H> });
     define_getter(heap, atoms, prototype, "length", length);
-    let join = install_function(heap, atoms, builtins, "join", 1, join::<H> as BuiltinHandler<H>);
-    define_data(heap, atoms, prototype, "join", join);
-    let iterator = install_function(
-        heap,
-        atoms,
-        builtins,
-        "[Symbol.iterator]",
-        0,
-        values::<H> as BuiltinHandler<H>,
-    );
+    let join = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "join", length: 1, handler: join::<H> as BuiltinHandler<H> });
+    define_data(heap, atoms, shapes, prototype, "join", join);
+    let iterator = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "[Symbol.iterator]", length: 0, handler: values::<H> as BuiltinHandler<H> });
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
         unreachable!("Uint8Array prototype is ordinary")
     };
@@ -353,7 +346,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
     }
 
     fn iterator_method(

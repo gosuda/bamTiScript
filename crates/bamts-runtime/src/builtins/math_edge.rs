@@ -18,17 +18,18 @@ use crate::{EvalFailure, HeapEntry, Host, Machine};
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
     math: Value,
 ) {
     // 21.3.1: every value property is non-writable, non-enumerable, and
     // non-configurable.
     for (name, value) in CONSTANTS {
-        define_frozen_data(heap, atoms, math, name, crate::number_value(value));
+        define_frozen_data(heap, atoms, shapes, math, name, crate::number_value(value));
     }
     for (name, length, handler) in functions::<H>() {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
-        define_data(heap, atoms, math, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, math, name, function);
     }
 }
 
@@ -782,7 +783,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, id, "math valueOf", 0)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "math valueOf", 0)
     }
 
     fn coercible(
@@ -1171,6 +1172,7 @@ mod tests {
         install(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             &mut machine.intrinsics.builtins,
             math,
         );

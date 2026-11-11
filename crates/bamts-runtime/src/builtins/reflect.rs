@@ -17,6 +17,7 @@ use crate::{
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -48,10 +49,10 @@ pub(super) fn install<H: Host>(
         ("set", 3, set::<H>),
         ("setPrototypeOf", 2, set_prototype_of::<H>),
     ] {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
-        define_data(heap, atoms, reflect, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, reflect, name, function);
     }
-    define_to_string_tag(heap, reflect, builtins.symbol_to_string_tag(), "Reflect");
+    define_to_string_tag(heap, shapes, reflect, builtins.symbol_to_string_tag(), "Reflect");
     globals.insert(EcmaString::encode("Reflect"), reflect);
 }
 
@@ -378,7 +379,7 @@ mod tests {
             length,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
     }
 
     fn return_this(
@@ -629,8 +630,10 @@ mod tests {
 
         let prototype = ordinary_object(&mut machine);
         let mut properties = PropertyMap::default();
+        let key = PropertyKey::Named(machine.intern_str("prototype"));
         properties.insert(
-            PropertyKey::Named(machine.intern_str("prototype")),
+            &mut machine.shapes,
+            key,
             Property::Data {
                 value: prototype,
                 writable: true,

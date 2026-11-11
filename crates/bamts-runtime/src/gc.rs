@@ -118,8 +118,8 @@ impl GcState {
         self.weak_holders.clear();
 
         self.trace_roots(machine);
-        self.drain(&machine.heap);
-        self.ephemeron_fixed_point(&machine.heap);
+        self.drain(&machine.heap, &machine.shapes);
+        self.ephemeron_fixed_point(&machine.heap, &machine.shapes);
         self.weak_holders.sort_unstable();
         machine.process_weak_targets_after_marking(&self.marks, &self.weak_holders);
         self.purge_weak_entries(machine);
@@ -248,6 +248,14 @@ impl GcState {
         for roots in &machine.native_roots {
             self.mark_values(&machine.heap, roots);
         }
+        for key in machine.shapes.live_keys() {
+            match key {
+                PropertyKey::Symbol(index) | PropertyKey::Private(index) => {
+                    mark_index(&machine.heap, &mut self.marks, &mut self.work, *index as usize);
+                }
+                PropertyKey::Named(_) => {}
+            }
+        }
     }
 
     fn mark_value(&mut self, heap: &[HeapEntry], value: Value) {
@@ -260,7 +268,7 @@ impl GcState {
         }
     }
 
-    fn drain(&mut self, heap: &[HeapEntry]) {
+    fn drain(&mut self, heap: &[HeapEntry], shapes: &ShapeTable) {
         while let Some(index) = self.work.pop() {
             if matches!(
                 heap[index],
@@ -271,6 +279,7 @@ impl GcState {
             trace_entry(
                 &heap[index],
                 index,
+                shapes,
                 heap,
                 &mut self.marks,
                 &mut self.work,
@@ -279,7 +288,7 @@ impl GcState {
         }
     }
 
-    fn ephemeron_fixed_point(&mut self, heap: &[HeapEntry]) {
+    fn ephemeron_fixed_point(&mut self, heap: &[HeapEntry], shapes: &ShapeTable) {
         loop {
             let weak_count = self.weak_collections.len();
             for list_index in 0..weak_count {
@@ -301,7 +310,7 @@ impl GcState {
             if self.work.is_empty() {
                 break;
             }
-            self.drain(heap);
+            self.drain(heap, shapes);
         }
     }
 
@@ -406,11 +415,12 @@ fn mark_index(heap: &[HeapEntry], marks: &mut [bool], work: &mut Vec<usize>, ind
 
 fn trace_property_map(
     properties: &PropertyMap,
+    shapes: &ShapeTable,
     heap: &[HeapEntry],
     marks: &mut [bool],
     work: &mut Vec<usize>,
 ) {
-    for (key, property) in properties {
+    for (key, property) in properties.iter(shapes) {
         match key {
             PropertyKey::Named(_) => {}
             PropertyKey::Symbol(index) | PropertyKey::Private(index) => {
@@ -433,12 +443,13 @@ fn trace_property_map(
 
 fn trace_properties_and_prototype(
     properties: &PropertyMap,
+    shapes: &ShapeTable,
     prototype: Option<Value>,
     heap: &[HeapEntry],
     marks: &mut [bool],
     work: &mut Vec<usize>,
 ) {
-    trace_property_map(properties, heap, marks, work);
+    trace_property_map(properties, shapes, heap, marks, work);
     if let Some(value) = prototype {
         mark_value(heap, marks, work, value);
     }
@@ -705,6 +716,7 @@ fn trace_runtime_error(
 fn trace_entry(
     entry: &HeapEntry,
     index: usize,
+    shapes: &ShapeTable,
     heap: &[HeapEntry],
     marks: &mut [bool],
     work: &mut Vec<usize>,
@@ -725,7 +737,7 @@ fn trace_entry(
             record, properties, ..
         } => {
             record.for_each_value(|value| mark_value(heap, marks, work, value));
-            trace_properties_and_prototype(properties, None, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, None, heap, marks, work);
         }
         HeapEntry::WeakRef { .. } | HeapEntry::FinalizationRegistry { .. } => {
             crate::intrinsics::builtins::weakref_finalization::trace_strong_edges(entry, |value| {
@@ -738,7 +750,7 @@ fn trace_entry(
             boxed_primitive,
             ..
         } => {
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
             if let Some(value) = boxed_primitive {
                 mark_value(heap, marks, work, *value);
             }
@@ -750,7 +762,7 @@ fn trace_entry(
             ..
         } => {
             trace_values(heap, marks, work, elements);
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
         }
         HeapEntry::Function {
             captures,
@@ -763,7 +775,7 @@ fn trace_entry(
             if let Some(value) = context {
                 mark_value(heap, marks, work, *value);
             }
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
         }
         HeapEntry::Script {
             entry,
@@ -772,7 +784,7 @@ fn trace_entry(
             ..
         } => {
             mark_value(heap, marks, work, *entry);
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
         }
         HeapEntry::HashState { update, digest, .. } => {
             mark_value(heap, marks, work, *update);
@@ -802,7 +814,7 @@ fn trace_entry(
             properties,
             prototype,
             ..
-        } => trace_properties_and_prototype(properties, *prototype, heap, marks, work),
+        } => trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work),
         HeapEntry::Intl {
             bound,
             properties,
@@ -812,7 +824,7 @@ fn trace_entry(
             if let Some(bound) = bound {
                 mark_value(heap, marks, work, *bound);
             }
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
         }
         HeapEntry::TypedArray {
             buffer,
@@ -821,7 +833,7 @@ fn trace_entry(
             ..
         } => {
             mark_value(heap, marks, work, *buffer);
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
         }
         HeapEntry::DataView {
             buffer,
@@ -830,7 +842,7 @@ fn trace_entry(
             ..
         } => {
             mark_value(heap, marks, work, *buffer);
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
         }
         HeapEntry::ArrayBuffer {
             data,
@@ -839,7 +851,7 @@ fn trace_entry(
             ..
         } => {
             mark_value(heap, marks, work, data.detach_key());
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
         }
         HeapEntry::Collection {
             kind,
@@ -848,7 +860,7 @@ fn trace_entry(
             prototype,
             ..
         } => {
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
             match kind {
                 CollectionKind::Map | CollectionKind::Set => {
                     for entry in entries.iter().filter(|entry| entry.live) {
@@ -868,7 +880,7 @@ fn trace_entry(
             ..
         } => {
             mark_value(heap, marks, work, *source);
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
         }
         HeapEntry::Iterator { state } => match state {
             IteratorState::Keys(for_in) => {
@@ -890,7 +902,7 @@ fn trace_entry(
         } => {
             mark_value(heap, marks, work, *iterator);
             mark_value(heap, marks, work, *next);
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
         }
         HeapEntry::Generator {
             state,
@@ -899,7 +911,7 @@ fn trace_entry(
             ..
         } => {
             trace_generator_state(state, heap, marks, work);
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
         }
         HeapEntry::AsyncGenerator {
             state,
@@ -915,7 +927,7 @@ fn trace_entry(
                     .visit_roots(|value| mark_value(heap, marks, work, value));
                 mark_value(heap, marks, work, request.capability);
             }
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
         }
         HeapEntry::DisposableStack {
             state,
@@ -924,7 +936,7 @@ fn trace_entry(
             ..
         } => {
             state.visit_roots(|value| mark_value(heap, marks, work, value));
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
         }
         HeapEntry::ProcessEnv { prototype, .. } => {
             if let Some(value) = prototype {
@@ -938,7 +950,7 @@ fn trace_entry(
             ..
         } => {
             trace_promise_state(state, heap, marks, work);
-            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+            trace_properties_and_prototype(properties, shapes, *prototype, heap, marks, work);
         }
         HeapEntry::PromiseResolver { promise, .. } => {
             mark_value(heap, marks, work, *promise);
@@ -987,7 +999,7 @@ fn trace_entry(
                     trace_values(heap, marks, work, &bound.arguments);
                 }
             }
-            trace_property_map(properties, heap, marks, work);
+            trace_property_map(properties, shapes, heap, marks, work);
             if let Some(prototype) = prototype {
                 mark_value(heap, marks, work, *prototype);
             }

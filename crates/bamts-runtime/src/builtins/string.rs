@@ -14,20 +14,21 @@ use crate::{EvalFailure, HeapEntry, Host, IterationKind, Machine, PropertyKey};
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.string_prototype();
     let constructor =
-        install_constructor_function(heap, atoms, builtins, "String", 1, constructor::<H>);
-    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "String", length: 1, handler: constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode("String"), constructor);
     for (name, length, handler) in [
         ("fromCharCode", 1, from_char_code::<H> as BuiltinHandler<H>),
         ("raw", 1, raw::<H>),
     ] {
-        let f = install_function(heap, atoms, builtins, name, length, handler);
-        define_static(heap, atoms, constructor, name, f)
+        let f = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_static(heap, atoms, shapes, constructor, name, f)
     }
     for (name, length, handler) in [
         ("toString", 0, this_string_value::<H> as BuiltinHandler<H>),
@@ -62,21 +63,21 @@ pub(super) fn install<H: Host>(
         ("search", 1, search::<H>),
         ("localeCompare", 1, locale_compare::<H>),
     ] {
-        let f = install_function(heap, atoms, builtins, name, length, handler);
-        define_data(heap, atoms, prototype, name, f)
+        let f = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, prototype, name, f)
     }
     let iterator = install_function(
         heap,
         atoms,
+        shapes,
         builtins,
-        "[Symbol.iterator]",
-        0,
-        string_iterator::<H>,
+        crate::intrinsics::BuiltinDef { name: "[Symbol.iterator]", length: 0, handler: string_iterator::<H> },
     );
     let HeapEntry::Object { properties, .. } = &mut heap[super::heap_index(prototype)] else {
         unreachable!()
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(super::heap_index(builtins.symbol_iterator()) as u32),
         super::builtin_property(iterator),
     );
@@ -84,6 +85,7 @@ pub(super) fn install<H: Host>(
 fn define_static(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     constructor: Value,
     name: &str,
     value: Value,
@@ -93,6 +95,7 @@ fn define_static(
         panic!("String constructor must be native")
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern_str(name)),
         super::builtin_property(value),
     );
@@ -1252,7 +1255,7 @@ mod unescape_tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
     }
 
     #[test]
@@ -1576,6 +1579,7 @@ mod split_replace_tests {
         native_function(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             id,
             "replacementArgumentCount",
             0,

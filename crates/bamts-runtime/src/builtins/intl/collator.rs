@@ -21,6 +21,7 @@ const COMPARE: &str = "Intl.Collator compare";
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
     namespace: Value,
 ) {
@@ -28,6 +29,7 @@ pub(super) fn install<H: Host>(
     install_class(
         heap,
         atoms,
+        shapes,
         builtins,
         namespace,
         &Class {

@@ -18,6 +18,7 @@ pub(crate) struct InstalledModule {
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
     object_prototype: Value,
     script_compiler: bool,
@@ -29,7 +30,7 @@ pub(crate) fn install<H: Host>(
             specifier: util_specifier.clone(),
         },
     );
-    let parse_args = register(heap, atoms, builtins, "parseArgs", 0, parse_args::<H>);
+    let parse_args = register(heap, atoms, shapes, builtins, BuiltinDef { name: "parseArgs", length: 0, handler: parse_args::<H> });
 
     let crypto_specifier = EcmaString::encode("node:crypto");
     let crypto_namespace = intrinsics::push(
@@ -38,9 +39,9 @@ pub(crate) fn install<H: Host>(
             specifier: crypto_specifier.clone(),
         },
     );
-    let create_hash = register(heap, atoms, builtins, "createHash", 2, create_hash::<H>);
-    let hash_update = register(heap, atoms, builtins, "update", 2, hash_update::<H>);
-    let hash_digest = register(heap, atoms, builtins, "digest", 1, hash_digest::<H>);
+    let create_hash = register(heap, atoms, shapes, builtins, BuiltinDef { name: "createHash", length: 2, handler: create_hash::<H> });
+    let hash_update = register(heap, atoms, shapes, builtins, BuiltinDef { name: "update", length: 2, handler: hash_update::<H> });
+    let hash_digest = register(heap, atoms, shapes, builtins, BuiltinDef { name: "digest", length: 1, handler: hash_digest::<H> });
 
     let mut modules = vec![
         InstalledModule {
@@ -57,7 +58,7 @@ pub(crate) fn install<H: Host>(
         },
     ];
     if script_compiler {
-        modules.push(crate::vm::install(heap, atoms, builtins, object_prototype));
+        modules.push(crate::vm::install(heap, atoms, shapes, builtins, object_prototype));
     }
     modules
 }
@@ -65,17 +66,13 @@ pub(crate) fn install<H: Host>(
 fn register<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
-    name: &'static str,
-    length: u32,
-    handler: crate::intrinsics::BuiltinHandler<H>,
+    definition: BuiltinDef<H>,
 ) -> Value {
-    let id = builtins.register(BuiltinDef {
-        name,
-        length,
-        handler,
-    });
-    intrinsics::native_function(heap, atoms, id, name, length)
+    let id = builtins.register(definition);
+    let installed = builtins.get(id);
+    intrinsics::native_function(heap, atoms, shapes, id, installed.name, installed.length)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -408,7 +405,7 @@ fn object_properties<H: Host>(
     let HeapEntry::Object { properties, .. } = &machine.heap[index] else {
         return Err(type_error("parseArgs configuration must be an object"));
     };
-    let keys: Vec<PropertyKey> = properties.iter().map(|(key, _)| key.clone()).collect();
+    let keys: Vec<PropertyKey> = properties.iter(&machine.shapes).map(|(key, _)| key.clone()).collect();
     let mut result = BTreeMap::new();
     for key in keys {
         let PropertyKey::Named(name) = &key else {
@@ -660,6 +657,7 @@ fn put<H: Host>(
         _ => unreachable!("external module result is object-like"),
     };
     properties.insert(
+        &mut machine.shapes,
         key,
         Property::Data {
             value,
@@ -1200,6 +1198,7 @@ mod tests {
             unreachable!()
         };
         properties.insert(
+            &mut machine.shapes,
             strict_key,
             Property::Accessor {
                 getter: Some(boolean),

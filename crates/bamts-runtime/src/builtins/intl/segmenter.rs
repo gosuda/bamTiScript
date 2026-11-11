@@ -23,12 +23,14 @@ use crate::{EvalFailure, HeapEntry, Host, Machine};
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
     namespace: Value,
 ) {
     install_class(
         heap,
         atoms,
+        shapes,
         builtins,
         namespace,
         &Class {
@@ -46,27 +48,48 @@ pub(super) fn install<H: Host>(
         },
     );
     let segments = builtins.intl_prototype(IntlKind::Segments);
-    let containing =
-        super::install_function(heap, atoms, builtins, "containing", 1, containing::<H>);
-    super::define_data(heap, atoms, segments, "containing", containing);
+    let containing = super::install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "containing",
+            length: 1,
+            handler: containing::<H>,
+        },
+    );
+    super::define_data(heap, atoms, shapes, segments, "containing", containing);
     let iterator = builtins.symbol_iterator();
     let function = super::install_function(
         heap,
         atoms,
+        shapes,
         builtins,
-        "[Symbol.iterator]",
-        0,
-        create_iterator::<H>,
+        crate::intrinsics::BuiltinDef {
+            name: "[Symbol.iterator]",
+            length: 0,
+            handler: create_iterator::<H>,
+        },
     );
-    super::define_symbol_method(heap, segments, iterator, function);
+    super::define_symbol_method(heap, shapes, segments, iterator, function);
 
     let prototype = builtins.intl_prototype(IntlKind::SegmentIterator);
     let iterator_prototype = builtins.iterator_prototype();
     super::set_prototype(heap, prototype, iterator_prototype);
-    let next = super::install_function(heap, atoms, builtins, "next", 0, next::<H>);
-    super::define_data(heap, atoms, prototype, "next", next);
-    let tag_symbol = builtins.symbol_to_string_tag();
-    super::define_tag(heap, prototype, tag_symbol, "Segmenter String Iterator");
+    let next = super::install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "next",
+            length: 0,
+            handler: next::<H>,
+        },
+    );
+    super::define_data(heap, atoms, shapes, prototype, "next", next);
+    super::define_tag(heap, shapes, prototype, builtins.symbol_to_string_tag(), "Segmenter String Iterator");
 }
 
 fn constructor<H: Host>(

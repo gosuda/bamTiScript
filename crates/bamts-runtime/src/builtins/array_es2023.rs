@@ -23,6 +23,7 @@ const MAX_ARRAY_LENGTH: usize = u32::MAX as usize;
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
     array_prototype: Value,
     array_constructor: Value,
@@ -36,11 +37,11 @@ pub(super) fn install<H: Host>(
         ("toSpliced", 2, to_spliced::<H>),
         ("with", 2, with::<H>),
     ] {
-        let function = install_function(heap, atoms, builtins, name, length, handler);
-        define_data(heap, atoms, array_prototype, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, array_prototype, name, function);
     }
-    let from_async = install_function(heap, atoms, builtins, "fromAsync", 3, from_async::<H>);
-    define_static(heap, atoms, array_constructor, "fromAsync", from_async);
+    let from_async = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "fromAsync", length: 3, handler: from_async::<H> });
+    define_static(heap, atoms, shapes, array_constructor, "fromAsync", from_async);
     let mut targets = Vec::new();
     for (name, handler) in [
         (
@@ -54,7 +55,7 @@ pub(super) fn install<H: Host>(
         ("Array.fromAsync close settled", close_settled::<H>),
         ("Array.fromAsync array-like mapped", arraylike_mapped::<H>),
     ] {
-        targets.push(install_function(heap, atoms, builtins, name, 1, handler));
+        targets.push(install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 1, handler: handler }));
     }
     let target_table = crate::intrinsics::push(
         heap,
@@ -66,7 +67,7 @@ pub(super) fn install<H: Host>(
             length_writable: true,
         },
     );
-    define_data(heap, atoms, array_prototype, TARGETS_PROPERTY, target_table);
+    define_data(heap, atoms, shapes, array_prototype, TARGETS_PROPERTY, target_table);
 }
 
 fn argument(args: &[Value], index: usize) -> Value {
@@ -165,7 +166,7 @@ pub(super) fn create_data_property<H: Host>(
             properties,
             extensible,
             ..
-        } => Some((elements.len(), properties.contains_key(&key), *extensible)),
+        } => Some((elements.len(), properties.contains_key(&machine.shapes, &key), *extensible)),
         _ => None,
     };
     let Some((length, explicit_descriptor, extensible)) = array_state else {
@@ -523,6 +524,7 @@ const FIELD_CAP: &str = "\0cap";
 fn define_static(
     heap: &mut [HeapEntry],
     atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     constructor: Value,
     name: &str,
     value: Value,
@@ -532,6 +534,7 @@ fn define_static(
         panic!("Array fromAsync attaches to a native-function constructor")
     };
     properties.insert(
+        shapes,
         PropertyKey::Named(atoms.intern_str(name)),
         super::builtin_property(value),
     );
@@ -1078,7 +1081,7 @@ mod tests {
             length,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
     }
 
     fn is_seven<H: Host>(
@@ -1699,6 +1702,7 @@ mod tests {
             install(
                 &mut machine.heap,
                 &mut machine.atoms,
+            &mut machine.shapes,
                 &mut machine.intrinsics.builtins,
                 prototype,
                 constructor,
@@ -1763,6 +1767,7 @@ mod tests {
         install(
             &mut machine.heap,
             &mut machine.atoms,
+            &mut machine.shapes,
             &mut machine.intrinsics.builtins,
             prototype,
             constructor,
