@@ -1151,6 +1151,16 @@ impl Walker<'_> {
     fn for_binding(&mut self, binding: &ForBinding, body: &Stmt, context: Context) {
         match binding {
             ForBinding::Variable(declaration) => {
+                if context.strict
+                    && declaration.kind == VariableKind::Var
+                    && declaration.declarations.len() == 1
+                    && declaration.declarations[0].data().initializer.is_some()
+                {
+                    self.error(
+                        declaration.declarations[0].range(),
+                        "a for-in head cannot have an initializer in strict mode",
+                    );
+                }
                 self.check_for_head(declaration, body);
                 self.variable(declaration, context);
             }
@@ -2689,5 +2699,11 @@ mod tests {
         ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
+    }
+
+    #[test]
+    fn sloppy_var_initializer_in_for_in_follows_annex_b() {
+        assert_eq!(errors("for (var a = 0 in {});"), Vec::<String>::new());
+        assert!(!errors("\"use strict\"; for (var a = 0 in {});").is_empty());
     }
 }

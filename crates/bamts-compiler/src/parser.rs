@@ -1719,6 +1719,36 @@ impl Parser {
             let kind_start = self.cur().range().start();
             let kind = self.variable_kind();
             let first = self.parse_for_head_declarator();
+            let first = if kind == VariableKind::Var
+                && matches!(first.data().binding.data(), BindingPattern::Identifier(_))
+                && first.data().type_annotation.is_none()
+                && self.at(TokenKind::Eq)
+            {
+                let finished = self.finish_for_declarator(first);
+                if self.at(TokenKind::KwIn) {
+                    self.bump();
+                    let object = self.parse_expression(false);
+                    let body = self.finish_for_body();
+                    let range = TextRange::new(kind_start, finished.range().end())
+                        .expect("for-in head range is ordered");
+                    let binding = ForBinding::Variable(VariableDeclaration {
+                        range,
+                        kind,
+                        declarations: vec![finished],
+                    });
+                    return self.node(
+                        start,
+                        Statement::ForIn(ForInStatement {
+                            binding,
+                            object: Box::new(object),
+                            body: Box::new(body),
+                        }),
+                    );
+                }
+                finished
+            } else {
+                first
+            };
             match self.kind() {
                 TokenKind::KwIn => {
                     self.bump();
@@ -8922,6 +8952,21 @@ mod tests {
 
         let await_in = parse_ts("async function f() { for (await using x in obj) {} }");
         assert_eq!(stmt_kind(&await_in, 0), NodeKind::FunctionDeclaration);
+    }
+    #[test]
+    fn sloppy_var_initializer_in_for_in_parses() {
+        let recovered = assert_clean("for (var x = 1 in obj) {}");
+        let Statement::ForIn(for_in) = recovered.product().statements()[0].data() else {
+            panic!("expected for-in");
+        };
+        let ForBinding::Variable(decl) = &for_in.binding else {
+            panic!("expected a variable binding");
+        };
+        assert_eq!(decl.kind, VariableKind::Var);
+        assert!(decl.declarations[0].data().initializer.is_some());
+
+        assert!(!errors(&parse_ts("for (let x = 1 in obj) {}")).is_empty());
+        assert!(!errors(&parse_ts("for (var {a} = b in obj) {}")).is_empty());
     }
 
     #[test]
