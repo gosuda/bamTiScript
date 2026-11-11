@@ -2622,136 +2622,338 @@ pub fn lower_program_with_cancel(
         }
     }
 
-    let module_ids: HashMap<_, _> = resolved
-        .modules()
-        .iter()
-        .enumerate()
-        .map(|(index, module)| (module.source_id(), ModuleId::new(index as u32)))
-        .collect();
-    let mut raw_modules = Vec::with_capacity(resolved.modules().len());
-    for module in resolved.modules() {
-        check_lower_cancel(cancel, module.path(), ProgramLowerPhase::Metadata)?;
-        let output = frontend.module(module.source_id()).ok_or_else(|| {
-            program_lower_error(
-                module.path(),
-                ProgramLowerPhase::Frontend,
-                ProgramLowerErrorKind::MissingFrontend {
-                    source: module.source_id(),
-                },
-            )
-        })?;
-        let name = normalized_module_name(resolved.root(), module.path()).ok_or_else(|| {
-            program_lower_error(
-                module.path(),
-                ProgramLowerPhase::Metadata,
-                ProgramLowerErrorKind::InvalidModuleName,
-            )
-        })?;
-        let mut raw = collect_raw_module(
-            module,
-            output.source_file(),
-            output.semantic_model().enum_facts(),
-            output.semantic_model().namespace_facts(),
-            name,
-            &module_ids,
-        )?;
-        if runs_as_script(resolved, module, output.source_file(), options) {
-            // Its `var` and function names belong to the global object, so a
-            // module cell must not capture them.
-            raw.bindings
-                .retain(|binding| !matches!(binding.kind, RawBindingKind::Hoisted));
-        }
-        raw_modules.push(raw);
-        check_lower_cancel(cancel, module.path(), ProgramLowerPhase::Metadata)?;
-    }
-    check_lower_cancel(
-        cancel,
-        resolved.entrypoint().path(),
-        ProgramLowerPhase::Metadata,
-    )?;
-    resolve_import_equals_bindings(&mut raw_modules);
-    check_lower_cancel(
-        cancel,
-        resolved.entrypoint().path(),
-        ProgramLowerPhase::Metadata,
-    )?;
-    expand_star_exports(&mut raw_modules);
-    check_lower_cancel(
-        cancel,
-        resolved.entrypoint().path(),
-        ProgramLowerPhase::Metadata,
-    )?;
-
-    let mut linked_modules = Vec::with_capacity(raw_modules.len());
-    let mut provenance = Vec::with_capacity(raw_modules.len());
-    for (index, (resolved_module, raw)) in resolved
-        .modules()
-        .iter()
-        .zip(raw_modules.iter())
-        .enumerate()
+    let mut static_reachable: HashSet<SourceId> = HashSet::new();
     {
-        check_lower_cancel(cancel, resolved_module.path(), ProgramLowerPhase::Module)?;
-        let output = frontend
-            .module(resolved_module.source_id())
-            .expect("frontend presence checked above");
-        let file = output.source_file();
-        let strings = linkage_strings(raw);
-        let code = lower::assemble_program_module(
-            file,
-            LowerOptions {
-                script_entry: runs_as_script(resolved, resolved_module, file, options),
-                ..options
-            },
-            &strings,
-            raw.jsx_plan.as_ref(),
-            output.semantic_model().enum_facts(),
-            output.semantic_model().namespace_facts(),
-        )
-        .and_then(|module| {
-            module.verify().map_err(|error| LowerError {
-                source: file.source_id(),
-                range: file.range(),
-                kind: lower::LowerErrorKind::Verify(error),
-            })
-        })
-        .map_err(|error| {
-            program_lower_error(
-                resolved_module.path(),
-                ProgramLowerPhase::Module,
-                ProgramLowerErrorKind::Lower(error),
-            )
-        })?;
-        check_lower_cancel(cancel, resolved_module.path(), ProgramLowerPhase::Module)?;
-        linked_modules.push(materialize_program_module(code, raw));
-        provenance.push(ExecutableModuleProvenance {
-            module: ModuleId::new(index as u32),
-            source: resolved_module.identity().clone(),
-            edges: Arc::from(resolved_module.dependencies()),
-        });
+        let mut worklist = vec![resolved.entrypoint_id()];
+        static_reachable.insert(resolved.entrypoint_id());
+        while let Some(id) = worklist.pop() {
+            let Some(current) = resolved.module(id) else {
+                continue;
+            };
+            for dep in current.dependencies() {
+                if dep.kind() != ModuleEdgeKind::StaticRuntime {
+                    continue;
+                }
+                if let ModuleTarget::Local(target) = dep.target() {
+                    if static_reachable.insert(*target) {
+                        worklist.push(*target);
+                    }
+                }
+            }
+        }
     }
-    let entry = module_ids[&resolved.entrypoint_id()];
-    check_lower_cancel(
-        cancel,
-        resolved.entrypoint().path(),
-        ProgramLowerPhase::Link,
-    )?;
-    let wire = BytecodeProgram::link(linked_modules, entry).map_err(|error| {
-        let path = error
-            .module
-            .and_then(|module| resolved.modules().get(module.get() as usize))
-            .map_or_else(|| resolved.entrypoint().path(), ResolvedModule::path);
-        program_lower_error(
-            path,
+    let mut excluded: HashSet<SourceId> = HashSet::new();
+    let mut stubbed: HashSet<SourceId> = HashSet::new();
+    loop {
+        let kept: Vec<&ResolvedModule> = resolved
+            .modules()
+            .iter()
+            .filter(|module| !excluded.contains(&module.source_id()))
+            .collect();
+        let new_ids: HashMap<SourceId, ModuleId> = kept
+            .iter()
+            .enumerate()
+            .map(|(index, module)| {
+                (
+                    module.source_id(),
+                    ModuleId::new(u32::try_from(index).expect("kept fits u32")),
+                )
+            })
+            .collect();
+        let orig_ids: HashMap<SourceId, ModuleId> = resolved
+            .modules()
+            .iter()
+            .enumerate()
+            .map(|(index, module)| {
+                (
+                    module.source_id(),
+                    ModuleId::new(u32::try_from(index).expect("resolved fits u32")),
+                )
+            })
+            .collect();
+        let mut raw_modules: Vec<RawModule> = Vec::with_capacity(kept.len());
+        let mut stub_codes: HashMap<SourceId, bamts_bytecode::Module<bamts_bytecode::Verified>> =
+            HashMap::new();
+        for module in &kept {
+            check_lower_cancel(cancel, module.path(), ProgramLowerPhase::Metadata)?;
+            if stubbed.contains(&module.source_id()) {
+                let name =
+                    normalized_module_name(resolved.root(), module.path()).ok_or_else(|| {
+                        program_lower_error(
+                            module.path(),
+                            ProgramLowerPhase::Metadata,
+                            ProgramLowerErrorKind::InvalidModuleName,
+                        )
+                    })?;
+                let stub_raw = RawModule {
+                    name: name.clone(),
+                    edges: Vec::new(),
+                    bindings: Vec::new(),
+                    exports: Vec::new(),
+                    stars: Vec::new(),
+                    jsx_plan: None,
+                };
+                let stub_source = SourceText::new(
+                    "throw new SyntaxError(\"dynamic import target failed to link\");",
+                )
+                .expect("stub fits budget");
+                let stub_arc = Arc::new(stub_source);
+                let scanned = scanner::scan_with_cancel(
+                    module.source_id(),
+                    module.script_kind(),
+                    Arc::clone(&stub_arc),
+                    cancel.clone(),
+                )
+                .map_err(|error| {
+                    let cancelled = match error {
+                        scanner::ScanError::Cancelled(cancelled) => cancelled,
+                    };
+                    program_lower_error(
+                        module.path(),
+                        ProgramLowerPhase::Module,
+                        ProgramLowerErrorKind::Cancelled(cancelled),
+                    )
+                })?;
+                let parsed =
+                    parser::parse_with_cancel(scanned, cancel.clone()).map_err(|error| {
+                        let cancelled = match error {
+                            parser::ParseError::Cancelled(cancelled) => cancelled,
+                        };
+                        program_lower_error(
+                            module.path(),
+                            ProgramLowerPhase::Module,
+                            ProgramLowerErrorKind::Cancelled(cancelled),
+                        )
+                    })?;
+                let synthetic = parsed.product();
+                let strings = linkage_strings(&stub_raw);
+                let enum_facts = crate::enum_plan::EnumFacts::unchecked();
+                let namespace_facts = crate::namespace_plan::NamespaceFacts::unchecked();
+                let code = lower::assemble_program_module(
+                    synthetic,
+                    LowerOptions {
+                        script_entry: false,
+                        ..options
+                    },
+                    &strings,
+                    None,
+                    &enum_facts,
+                    &namespace_facts,
+                )
+                .and_then(|unverified| {
+                    unverified.verify().map_err(|error| LowerError {
+                        source: synthetic.source_id(),
+                        range: synthetic.range(),
+                        kind: lower::LowerErrorKind::Verify(error),
+                    })
+                })
+                .map_err(|error| {
+                    program_lower_error(
+                        module.path(),
+                        ProgramLowerPhase::Module,
+                        ProgramLowerErrorKind::Lower(error),
+                    )
+                })?;
+                stub_codes.insert(module.source_id(), code);
+                raw_modules.push(stub_raw);
+                check_lower_cancel(cancel, module.path(), ProgramLowerPhase::Metadata)?;
+                continue;
+            }
+            let output = frontend.module(module.source_id()).ok_or_else(|| {
+                program_lower_error(
+                    module.path(),
+                    ProgramLowerPhase::Frontend,
+                    ProgramLowerErrorKind::MissingFrontend {
+                        source: module.source_id(),
+                    },
+                )
+            })?;
+            let name = normalized_module_name(resolved.root(), module.path()).ok_or_else(|| {
+                program_lower_error(
+                    module.path(),
+                    ProgramLowerPhase::Metadata,
+                    ProgramLowerErrorKind::InvalidModuleName,
+                )
+            })?;
+            let mut raw = collect_raw_module(
+                module,
+                output.source_file(),
+                output.semantic_model().enum_facts(),
+                output.semantic_model().namespace_facts(),
+                name,
+                &orig_ids,
+            )?;
+            for edge in &mut raw.edges {
+                if let EdgeTarget::Local(orig) = edge.target {
+                    let target_source = resolved.modules()[orig.get() as usize].source_id();
+                    if excluded.contains(&target_source) {
+                        edge.target = EdgeTarget::External;
+                        edge.external_identity = Some(edge.specifier.clone());
+                    } else if let Some(remapped) = new_ids.get(&target_source) {
+                        edge.target = EdgeTarget::Local(*remapped);
+                    }
+                }
+            }
+            if runs_as_script(resolved, module, output.source_file(), options) {
+                raw.bindings
+                    .retain(|binding| !matches!(binding.kind, RawBindingKind::Hoisted));
+            }
+            raw_modules.push(raw);
+            check_lower_cancel(cancel, module.path(), ProgramLowerPhase::Metadata)?;
+        }
+        check_lower_cancel(
+            cancel,
+            resolved.entrypoint().path(),
+            ProgramLowerPhase::Metadata,
+        )?;
+        resolve_import_equals_bindings(&mut raw_modules);
+        check_lower_cancel(
+            cancel,
+            resolved.entrypoint().path(),
+            ProgramLowerPhase::Metadata,
+        )?;
+        expand_star_exports(&mut raw_modules);
+        check_lower_cancel(
+            cancel,
+            resolved.entrypoint().path(),
+            ProgramLowerPhase::Metadata,
+        )?;
+        let mut linked_modules = Vec::with_capacity(raw_modules.len());
+        let mut provenance = Vec::with_capacity(raw_modules.len());
+        let mut module_failed: Option<ProgramLowerError> = None;
+        for (index, (kept_module, raw)) in kept.iter().zip(raw_modules.iter()).enumerate() {
+            check_lower_cancel(cancel, kept_module.path(), ProgramLowerPhase::Module)?;
+            let code = if let Some(stub) = stub_codes.remove(&kept_module.source_id()) {
+                stub
+            } else {
+                let output = frontend
+                    .module(kept_module.source_id())
+                    .expect("frontend presence checked above");
+                let file = output.source_file();
+                let strings = linkage_strings(raw);
+                match lower::assemble_program_module(
+                    file,
+                    LowerOptions {
+                        script_entry: runs_as_script(resolved, kept_module, file, options),
+                        ..options
+                    },
+                    &strings,
+                    raw.jsx_plan.as_ref(),
+                    output.semantic_model().enum_facts(),
+                    output.semantic_model().namespace_facts(),
+                )
+                .and_then(|unverified| {
+                    unverified.verify().map_err(|error| LowerError {
+                        source: file.source_id(),
+                        range: file.range(),
+                        kind: lower::LowerErrorKind::Verify(error),
+                    })
+                }) {
+                    Ok(code) => code,
+                    Err(error) => {
+                        module_failed = Some(program_lower_error(
+                            kept_module.path(),
+                            ProgramLowerPhase::Module,
+                            ProgramLowerErrorKind::Lower(error),
+                        ));
+                        break;
+                    }
+                }
+            };
+            check_lower_cancel(cancel, kept_module.path(), ProgramLowerPhase::Module)?;
+            linked_modules.push(materialize_program_module(code, raw));
+            provenance.push(ExecutableModuleProvenance {
+                module: ModuleId::new(u32::try_from(index).expect("kept fits u32")),
+                source: kept_module.identity().clone(),
+                edges: Arc::from(kept_module.dependencies()),
+            });
+        }
+        if let Some(failure) = module_failed {
+            return Err(failure);
+        }
+        let entry = new_ids[&resolved.entrypoint_id()];
+        check_lower_cancel(
+            cancel,
+            resolved.entrypoint().path(),
             ProgramLowerPhase::Link,
-            ProgramLowerErrorKind::Link(error),
-        )
-    })?;
-    check_lower_cancel(
-        cancel,
-        resolved.entrypoint().path(),
-        ProgramLowerPhase::Link,
-    )?;
-    Ok(ExecutableProgram { wire, provenance })
+        )?;
+        match BytecodeProgram::link(linked_modules, entry) {
+            Ok(wire) => {
+                check_lower_cancel(
+                    cancel,
+                    resolved.entrypoint().path(),
+                    ProgramLowerPhase::Link,
+                )?;
+                return Ok(ExecutableProgram { wire, provenance });
+            }
+            Err(link_error) => {
+                let failing_source = link_error
+                    .module
+                    .and_then(|mid| kept.get(mid.get() as usize))
+                    .map(|module| module.source_id());
+                let Some(failing) = failing_source else {
+                    let path = link_error
+                        .module
+                        .and_then(|module| resolved.modules().get(module.get() as usize))
+                        .map_or_else(|| resolved.entrypoint().path(), ResolvedModule::path);
+                    return Err(program_lower_error(
+                        path,
+                        ProgramLowerPhase::Link,
+                        ProgramLowerErrorKind::Link(link_error),
+                    ));
+                };
+                if static_reachable.contains(&failing) {
+                    let path = resolved
+                        .module(failing)
+                        .map_or_else(|| resolved.entrypoint().path(), ResolvedModule::path);
+                    return Err(program_lower_error(
+                        path,
+                        ProgramLowerPhase::Link,
+                        ProgramLowerErrorKind::Link(link_error),
+                    ));
+                }
+                let mut progressed = false;
+                if stubbed.insert(failing) {
+                    progressed = true;
+                }
+                {
+                    let mut stack = vec![failing];
+                    let mut seen: HashSet<SourceId> = HashSet::new();
+                    while let Some(current) = stack.pop() {
+                        if !seen.insert(current) {
+                            continue;
+                        }
+                        let Some(node) = resolved.module(current) else {
+                            continue;
+                        };
+                        for dep in node.dependencies() {
+                            if let ModuleTarget::Local(target) = dep.target() {
+                                if *target != failing
+                                    && !static_reachable.contains(target)
+                                    && !stubbed.contains(target)
+                                    && excluded.insert(*target)
+                                {
+                                    progressed = true;
+                                }
+                                stack.push(*target);
+                            }
+                        }
+                    }
+                }
+                if !progressed {
+                    let path = resolved
+                        .module(failing)
+                        .map_or_else(|| resolved.entrypoint().path(), ResolvedModule::path);
+                    return Err(program_lower_error(
+                        path,
+                        ProgramLowerPhase::Link,
+                        ProgramLowerErrorKind::Link(link_error),
+                    ));
+                }
+                continue;
+            }
+        }
+    }
 }
 fn check_lower_cancel(
     cancel: &CancellationToken,
@@ -4871,6 +5073,28 @@ mod tests {
         let executable = lower_fixture(&fixture, "main.ts");
         let main_wire = module(&executable, "main.ts");
         assert_eq!(main_wire.edges()[0].kind, EdgeKind::Dynamic);
+    }
+    #[test]
+    fn dynamic_link_failure_does_not_fail_program_link() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "circular-1.ts",
+            "export { x } from './circular-2.js';",
+        );
+        fixture.write(
+            "circular-2.ts",
+            "export { x } from './circular-1.js';",
+        );
+        fixture.write(
+            "main.ts",
+            "const pending = import('./circular-1.js'); pending;",
+        );
+        let resolved = fixture.loader().load("main.ts").expect("dynamic link fixture loads");
+        let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+        let executable = lower_program(&resolved, &frontend, LowerOptions::default())
+            .expect("dynamic link failure becomes runtime rejection");
+        let main_wire = module(&executable, "main.ts");
+        assert!(main_wire.edges().iter().any(|edge| edge.kind == EdgeKind::Dynamic));
     }
 
 
