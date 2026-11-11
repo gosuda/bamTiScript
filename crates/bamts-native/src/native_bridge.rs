@@ -323,13 +323,18 @@ pub enum HelperCall {
     CreateCell,
     /// A closure over `function_id` binding the `captures` array value.
     CreateClosure { function_id: u32, captures: Value },
-    /// `object[key]`.
-    GetProperty { object: Value, key: Value },
-    /// `object[key] = value`.
+    /// `object[key]`. `site` names the instruction for the inline cache.
+    GetProperty {
+        object: Value,
+        key: Value,
+        site: u32,
+    },
+    /// `object[key] = value`. `site` names the instruction for the inline cache.
     SetProperty {
         object: Value,
         key: Value,
         value: Value,
+        site: u32,
     },
     /// `delete object[key]`.
     DeleteProperty { object: Value, key: Value },
@@ -1119,12 +1124,13 @@ pub unsafe extern "C" fn bamts_create_closure(
 /// range is disjoint from its header, and a live, aligned, writable `out` when
 /// this helper has one. Both remain valid and unaliased for the full call.
 ///
-/// `bamts_get_property(frame, object, key, out)`.
+/// `bamts_get_property(frame, object, key, site, out)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bamts_get_property(
     frame: *mut ShadowFrame,
     object: u64,
     key: u64,
+    site: u32,
     out: *mut Completion,
 ) -> u32 {
     dispatch_simple(
@@ -1133,6 +1139,7 @@ pub unsafe extern "C" fn bamts_get_property(
         HelperCall::GetProperty {
             object: Value::from_bits(object),
             key: Value::from_bits(key),
+            site,
         },
     )
 }
@@ -1143,13 +1150,14 @@ pub unsafe extern "C" fn bamts_get_property(
 /// range is disjoint from its header, and a live, aligned, writable `out` when
 /// this helper has one. Both remain valid and unaliased for the full call.
 ///
-/// `bamts_set_property(frame, object, key, value, out)`.
+/// `bamts_set_property(frame, object, key, value, site, out)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bamts_set_property(
     frame: *mut ShadowFrame,
     object: u64,
     key: u64,
     value: u64,
+    site: u32,
     out: *mut Completion,
 ) -> u32 {
     dispatch_simple(
@@ -1159,6 +1167,7 @@ pub unsafe extern "C" fn bamts_set_property(
             object: Value::from_bits(object),
             key: Value::from_bits(key),
             value: Value::from_bits(value),
+            site,
         },
     )
 }
@@ -2213,9 +2222,9 @@ const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_
 const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_create_array; // 4
 const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u64, *mut Completion) -> u32 =
     bamts_create_closure; // 5
-const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u32, *mut Completion) -> u32 =
     bamts_get_property; // 6
-const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, *mut Completion) -> u32 =
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, u32, *mut Completion) -> u32 =
     bamts_set_property; // 7
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
     bamts_delete_property; // 8

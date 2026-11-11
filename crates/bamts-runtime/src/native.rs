@@ -1136,7 +1136,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 }
                 other => {
                     frame.set_resume(pc as u32);
-                    let (call, dst) = self.lower(other, &frame);
+                    let (call, dst) = self.lower(other, &frame, pc);
                     let result = self.dispatch(&mut frame, call);
                     match self.apply(&mut frame, target, code, pc, dst, result)? {
                         Flow::Next => pc += 1,
@@ -1157,8 +1157,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         &self,
         instruction: Instruction,
         frame: &NativeFrame<'_>,
+        pc: usize,
     ) -> (HelperCall, Option<u32>) {
         let register = |r: bamts_bytecode::Register| frame.register(r.get());
+        let site = || u32::try_from(pc).expect("instruction index fits u32");
         match instruction {
             Instruction::LoadConst { dst, constant } => (
                 HelperCall::LoadConstant {
@@ -1210,6 +1212,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 HelperCall::GetProperty {
                     object: register(object),
                     key: register(key),
+                    site: site(),
                 },
                 Some(dst.get()),
             ),
@@ -1218,6 +1221,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     object: register(object),
                     key: register(key),
                     value: register(value),
+                    site: site(),
                 },
                 None,
             ),
@@ -4126,7 +4130,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         Err(failure) => self.fail(failure),
                     }
                 }
-                HelperCall::GetProperty { object, key } => {
+                HelperCall::GetProperty {
+                    object,
+                    key,
+                    site,
+                } => {
                     let key = {
                         let coerced = self.machine.borrow_mut().computed_property_key(object, key);
                         match coerced {
@@ -4134,13 +4142,38 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                             Err(failure) => break 'result self.fail(failure),
                         }
                     };
+                    let target = self.running_function();
+                    let cached = self.machine.borrow_mut().property_site_hit_get(
+                        target.module,
+                        target.function,
+                        site as usize,
+                        object,
+                        &key,
+                    );
+                    if let Some(value) = cached {
+                        break 'result self.validated(value);
+                    }
                     let outcome = self.machine.borrow_mut().internal_get(object, &key, object);
+                    if outcome.is_ok() {
+                        self.machine.borrow_mut().property_site_record_get(
+                            target.module,
+                            target.function,
+                            site as usize,
+                            object,
+                            &key,
+                        );
+                    }
                     match outcome {
                         Ok(value) => self.validated(value),
                         Err(failure) => self.fail(failure),
                     }
                 }
-                HelperCall::SetProperty { object, key, value } => {
+                HelperCall::SetProperty {
+                    object,
+                    key,
+                    value,
+                    site,
+                } => {
                     let key = {
                         let coerced = self.machine.borrow_mut().computed_property_key(object, key);
                         match coerced {
@@ -4148,10 +4181,31 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                             Err(failure) => break 'result self.fail(failure),
                         }
                     };
+                    let target = self.running_function();
+                    let cached = self.machine.borrow_mut().property_site_hit_set(
+                        target.module,
+                        target.function,
+                        site as usize,
+                        object,
+                        &key,
+                        value,
+                    );
+                    if cached.is_some() {
+                        break 'result HelperResult::normal(Value::UNDEFINED);
+                    }
                     let outcome = self
                         .machine
                         .borrow_mut()
-                        .internal_set(object, key, value, object);
+                        .internal_set(object, key.clone(), value, object);
+                    if matches!(outcome, Ok(true)) {
+                        self.machine.borrow_mut().property_site_record_set(
+                            target.module,
+                            target.function,
+                            site as usize,
+                            object,
+                            &key,
+                        );
+                    }
                     match outcome {
                         Ok(true) => HelperResult::normal(Value::UNDEFINED),
                         Ok(false) if self.running_is_sloppy() => {
@@ -8024,6 +8078,7 @@ mod tests {
                 arguments: reg(3),
             },
             &frame,
+            0,
         );
         assert_eq!(
             call,
@@ -9440,6 +9495,7 @@ mod tests {
             HelperCall::GetProperty {
                 object: created.value,
                 key: Value::int32(0),
+                site: u32::MAX,
             },
         );
         assert_eq!(read.tag, CompletionTag::Throw);
@@ -10439,6 +10495,7 @@ mod tests {
             HelperCall::GetProperty {
                 object: created.value,
                 key: Value::int32(0),
+                site: u32::MAX,
             },
         );
         assert_eq!(read.tag, CompletionTag::Throw);
@@ -10507,6 +10564,7 @@ mod tests {
             HelperCall::GetProperty {
                 object: object.value,
                 key,
+                site: u32::MAX,
             },
         );
         assert_eq!(read.tag, CompletionTag::Normal);
@@ -10632,7 +10690,7 @@ mod tests {
         ];
         for (instruction, expected_call, expected_dst) in cases {
             assert!(!super::is_inline_instruction(instruction));
-            let (call, dst) = engine.lower(instruction, &frame);
+            let (call, dst) = engine.lower(instruction, &frame, 0);
             assert_eq!(call, expected_call);
             assert_eq!(dst, expected_dst);
         }
@@ -10974,6 +11032,7 @@ mod tests {
                         object: object.value,
                         key: unscopables,
                         value: blocklist.value,
+                        site: u32::MAX,
                     },
                 )
                 .tag,
@@ -11003,6 +11062,7 @@ mod tests {
                         object: object.value,
                         key: unscopables,
                         value: primitive,
+                        site: u32::MAX,
                     },
                 )
                 .tag,

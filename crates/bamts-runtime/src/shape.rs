@@ -1,6 +1,8 @@
 use std::cell::OnceCell;
 use std::collections::HashMap;
 
+use bamts_bytecode::Instruction;
+
 use crate::PropertyKey;
 
 pub(crate) const SHAPED_CAPACITY: usize = 64;
@@ -110,6 +112,77 @@ impl ShapeTable {
             current = shape.parent;
         }
         table
+    }
+}
+/// Which cache table a site index addresses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Which {
+    Get,
+    Set,
+}
+/// One inline cache site for named property get or set.
+#[derive(Clone, Debug)]
+pub(crate) struct PropertySite {
+    pub(crate) entries: [(ShapeId, PropertyKey); 4],
+    pub(crate) len: u8,
+}
+impl PropertySite {
+    const fn new() -> Self {
+        Self {
+            entries: [
+                (ShapeId::ROOT, PropertyKey::Private(u32::MAX)),
+                (ShapeId::ROOT, PropertyKey::Private(u32::MAX)),
+                (ShapeId::ROOT, PropertyKey::Private(u32::MAX)),
+                (ShapeId::ROOT, PropertyKey::Private(u32::MAX)),
+            ],
+            len: 0,
+        }
+    }
+    pub(crate) fn matches(&self, shape: ShapeId, key: &PropertyKey) -> bool {
+        self.entries[..usize::from(self.len)]
+            .iter()
+            .any(|(cached_shape, cached_key)| *cached_shape == shape && cached_key == key)
+    }
+    pub(crate) fn record(&mut self, shape: ShapeId, key: PropertyKey) {
+        if usize::from(self.len) < self.entries.len() {
+            self.entries[usize::from(self.len)] = (shape, key);
+            self.len += 1;
+        } else {
+            self.len = u8::MAX;
+        }
+    }
+    pub(crate) fn usable(&self) -> bool {
+        self.len != u8::MAX
+    }
+}
+/// Per-function inline cache sites: one entry per get or set instruction.
+#[derive(Debug, Default)]
+pub(crate) struct FunctionSites {
+    pub(crate) gets: Vec<PropertySite>,
+    pub(crate) sets: Vec<PropertySite>,
+}
+impl FunctionSites {
+    pub(crate) fn build(code: &[Instruction]) -> Self {
+        Self {
+            gets: (0..code.len())
+                .map(|pc| match code[pc] {
+                    Instruction::GetProperty { .. } => PropertySite::new(),
+                    _ => PropertySite {
+                        len: u8::MAX,
+                        ..PropertySite::new()
+                    },
+                })
+                .collect(),
+            sets: (0..code.len())
+                .map(|pc| match code[pc] {
+                    Instruction::SetProperty { .. } => PropertySite::new(),
+                    _ => PropertySite {
+                        len: u8::MAX,
+                        ..PropertySite::new()
+                    },
+                })
+                .collect(),
+        }
     }
 }
 #[cfg(test)]

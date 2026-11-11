@@ -54,7 +54,7 @@ mod shape;
 mod temporal;
 mod vm;
 pub(crate) use intrinsics::builtins;
-pub(crate) use shape::{SHAPED_CAPACITY, ShapeId, ShapeTable};
+pub(crate) use shape::{SHAPED_CAPACITY, FunctionSites, Which, ShapeId, ShapeTable};
 
 pub use native::{
     NativeEngine, NativeError, TieredRunReport, UnitTieringSummary, WarmupPolicy,
@@ -2227,6 +2227,7 @@ pub struct Machine<'a, H: Host> {
     cancel: CancellationToken,
     atoms: AtomTable,
     shapes: ShapeTable,
+    property_sites: BTreeMap<(ModuleId, FunctionId), FunctionSites>,
 }
 
 #[derive(Clone, Debug)]
@@ -2618,6 +2619,7 @@ impl<'a, H: Host> Machine<'a, H> {
             cancel,
             atoms,
             shapes,
+            property_sites: BTreeMap::new(),
         }
     }
 
@@ -6094,7 +6096,30 @@ impl<'a, H: Host> Machine<'a, H> {
                             continue;
                         }
                     };
-                    match self.internal_get(object, &key, object) {
+                    let hit = self.property_site_hit_get(
+                        module_id,
+                        FunctionId::new(function_index as u32),
+                        pc,
+                        object,
+                        &key,
+                    );
+                    let result = match hit {
+                        Some(value) => Ok(value),
+                        None => {
+                            let value = self.internal_get(object, &key, object);
+                            if value.is_ok() {
+                                self.property_site_record_get(
+                                    module_id,
+                                    FunctionId::new(function_index as u32),
+                                    pc,
+                                    object,
+                                    &key,
+                                );
+                            }
+                            value
+                        }
+                    };
+                    match result {
                         Ok(value) => {
                             self.write_register(frame_index, dst.get(), value);
                             self.frames[frame_index].pc = pc + 1;
@@ -6113,7 +6138,30 @@ impl<'a, H: Host> Machine<'a, H> {
                             continue;
                         }
                     };
-                    match self.internal_set(object, key, value, object) {
+                    let hit = self.property_site_hit_set(
+                        module_id,
+                        FunctionId::new(function_index as u32),
+                        pc,
+                        object,
+                        &key,
+                        value,
+                    );
+                    let result = if hit.is_some() {
+                        Ok(true)
+                    } else {
+                        let stored = self.internal_set(object, key.clone(), value, object);
+                        if matches!(stored, Ok(true)) {
+                            self.property_site_record_set(
+                                module_id,
+                                FunctionId::new(function_index as u32),
+                                pc,
+                                object,
+                                &key,
+                            );
+                        }
+                        stored
+                    };
+                    match result {
                         Ok(true) => self.frames[frame_index].pc = pc + 1,
                         Ok(false) if self.is_sloppy(module_id, function_index) => {
                             self.frames[frame_index].pc = pc + 1;
@@ -9912,6 +9960,225 @@ impl<'a, H: Host> Machine<'a, H> {
                 HeapEntry::String(_) | HeapEntry::BigInt(_) | HeapEntry::Symbol { .. }
             )
         }))
+    }
+
+    /// The site index of the instruction at `pc` in `(module, function)`.
+    /// A non-site instruction, an unknown function, or an out-of-range pc
+    /// yields none and the caller stays on the generic path.
+    fn get_cache_slot(
+        &mut self,
+        module: ModuleId,
+        function: FunctionId,
+        pc: usize,
+        which: Which,
+    ) -> Option<usize> {
+        if !self.property_sites.contains_key(&(module, function)) {
+            let code = self.module_code(module).functions()[function.get() as usize].code();
+            self.property_sites.insert((module, function), FunctionSites::build(code));
+        }
+        let sites = self.property_sites.get_mut(&(module, function))?;
+        let index = match which {
+            Which::Get => sites.gets.get_mut(pc)?,
+            Which::Set => sites.sets.get_mut(pc)?,
+        };
+        if !index.usable() {
+            return None;
+        }
+        Some(pc)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn function_sites(
+        &mut self,
+        module: ModuleId,
+        function: FunctionId,
+    ) -> &mut FunctionSites {
+        if !self.property_sites.contains_key(&(module, function)) {
+            let code = self.module_code(module).functions()[function.get() as usize].code();
+            self.property_sites.insert((module, function), FunctionSites::build(code));
+        }
+        self.property_sites
+            .get_mut(&(module, function))
+            .expect("site table was just built")
+    }
+
+    /// The cached own-data value of `key` on `receiver` at `site`, or none
+    /// when the site is empty, megamorphic, or the receiver does not match
+    /// a cached shape and key.
+    pub(crate) fn property_site_hit_get(
+        &mut self,
+        module: ModuleId,
+        function: FunctionId,
+        site: usize,
+        receiver: Value,
+        key: &PropertyKey,
+    ) -> Option<Value> {
+        let site_index = self.get_cache_slot(module, function, site, Which::Get)?;
+        let index = self.runtime_slot(receiver).ok().flatten()?;
+        let found = {
+            let HeapEntry::Object {
+                properties,
+                boxed_primitive: None,
+                ..
+            } = &self.heap[index]
+            else {
+                return None;
+            };
+            let PropertyMap::Shaped { shape, slots } = properties else {
+                return None;
+            };
+            let site_state = &self.property_sites[&(module, function)].gets[site_index];
+            if !site_state.matches(*shape, key) {
+                return None;
+            }
+            let slot = self.shapes.slot_of(*shape, key)?;
+            match slots.get(slot as usize) {
+                Some(Property::Data { value, .. }) if *value != Value::UNINITIALIZED => {
+                    Some(*value)
+                }
+                _ => None,
+            }
+        };
+        found
+    }
+
+    /// Records `(shape, key)` at `site` when the generic read found the key
+    /// as an own data property of a plain shaped object.
+    pub(crate) fn property_site_record_get(
+        &mut self,
+        module: ModuleId,
+        function: FunctionId,
+        site: usize,
+        receiver: Value,
+        key: &PropertyKey,
+    ) {
+        let Some(site_index) = self.get_cache_slot(module, function, site, Which::Get) else {
+            return;
+        };
+        let Some(index) = self.runtime_slot(receiver).ok().flatten() else {
+            return;
+        };
+        let Some(shape) = (match &self.heap[index] {
+            HeapEntry::Object {
+                properties: PropertyMap::Shaped { shape, .. },
+                boxed_primitive: None,
+                ..
+            } => Some(*shape),
+            _ => None,
+        }) else {
+            return;
+        };
+        match self.own_get(index, key) {
+            Some(Found::Value(value)) if value != Value::UNINITIALIZED => {}
+            Some(Found::Text(_)) => {}
+            _ => return,
+        }
+        let sites = self
+            .property_sites
+            .get_mut(&(module, function))
+            .expect("site table was built above");
+        sites.gets[site_index].record(shape, key.clone());
+    }
+
+    /// Writes `value` through the cache at `site` when the receiver matches
+    /// a cached shape and key holding own writable data. Returns whether
+    /// the cache handled the store.
+    pub(crate) fn property_site_hit_set(
+        &mut self,
+        module: ModuleId,
+        function: FunctionId,
+        site: usize,
+        receiver: Value,
+        key: &PropertyKey,
+        value: Value,
+    ) -> Option<()> {
+        let site_index = self.get_cache_slot(module, function, site, Which::Set)?;
+        let index = self.runtime_slot(receiver).ok().flatten()?;
+        let (shape, slot, property) = {
+            let HeapEntry::Object {
+                properties,
+                boxed_primitive: None,
+                ..
+            } = &self.heap[index]
+            else {
+                return None;
+            };
+            let PropertyMap::Shaped { shape, slots } = properties else {
+                return None;
+            };
+            let site_state = &self.property_sites[&(module, function)].sets[site_index];
+            if !site_state.matches(*shape, key) {
+                return None;
+            }
+            let slot = self.shapes.slot_of(*shape, key)?;
+            match slots.get(slot as usize)? {
+                Property::Data {
+                    writable: true,
+                    enumerable,
+                    configurable,
+                    ..
+                } => (
+                    *shape,
+                    slot,
+                    Property::Data {
+                        value,
+                        writable: true,
+                        enumerable: *enumerable,
+                        configurable: *configurable,
+                    },
+                ),
+                _ => return None,
+            }
+        };
+        let HeapEntry::Object { properties, .. } = &mut self.heap[index] else {
+            unreachable!("object brand was checked above")
+        };
+        let PropertyMap::Shaped { shape: current, slots } = properties else {
+            unreachable!("shaped map was checked above")
+        };
+        debug_assert_eq!(*current, shape);
+        slots[slot as usize] = property;
+        Some(())
+    }
+
+    /// Records `(shape, key)` at `site` when the key is already an own
+    /// writable data property of a plain shaped object, so a later store
+    /// keeps its attributes and never adds a property.
+    pub(crate) fn property_site_record_set(
+        &mut self,
+        module: ModuleId,
+        function: FunctionId,
+        site: usize,
+        receiver: Value,
+        key: &PropertyKey,
+    ) {
+        let Some(site_index) = self.get_cache_slot(module, function, site, Which::Set) else {
+            return;
+        };
+        let Some(index) = self.runtime_slot(receiver).ok().flatten() else {
+            return;
+        };
+        let mut cacheable = None;
+        if let HeapEntry::Object {
+            properties: PropertyMap::Shaped { shape, slots },
+            boxed_primitive: None,
+            ..
+        } = &self.heap[index]
+        {
+            if let Some(slot) = self.shapes.slot_of(*shape, key)
+                && let Some(Property::Data { writable: true, .. }) = slots.get(slot as usize)
+            {
+                cacheable = Some((*shape, slot));
+            }
+        }
+        let Some((shape, _slot)) = cacheable else {
+            return;
+        };
+        let sites = self
+            .property_sites
+            .get_mut(&(module, function))
+            .expect("site table was built above");
+        sites.sets[site_index].record(shape, key.clone());
     }
 
     pub(crate) fn set_super(
@@ -31128,6 +31395,291 @@ mod tests {
             }
             assert_eq!(machine.atoms.strings.len(), before);
         });
+    }
+    fn site_program() -> Program<Verified> {
+        verified(
+            vec![
+                Constant::String(EcmaString::encode("a")),
+                Constant::String(EcmaString::encode("b")),
+            ],
+            vec![function(
+                2,
+                3,
+                vec![
+                    Instruction::GetProperty {
+                        dst: reg(2),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::SetProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+        )
+    }
+    fn site_object(machine: &mut Machine<'_, TestHost>, entries: &[(&str, Value)]) -> Value {
+        let object = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        for (name, value) in entries {
+            machine.set_data_property(object, name, *value).unwrap();
+        }
+        object
+    }
+    #[test]
+    fn site_hit_get_caches_shaped_own_data() {
+        let program = site_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let module = ModuleId::new(0);
+        let function = FunctionId::new(0);
+        let object = site_object(&mut machine, &[("a", Value::int32(1))]);
+        let key = PropertyKey::Named(machine.intern_str("a"));
+        assert_eq!(
+            machine.property_site_hit_get(module, function, 0, object, &key),
+            None
+        );
+        machine.property_site_record_get(module, function, 0, object, &key);
+        assert_eq!(machine.function_sites(module, function).gets[0].len, 1);
+        assert_eq!(
+            machine.property_site_hit_get(module, function, 0, object, &key),
+            Some(Value::int32(1))
+        );
+    }
+    #[test]
+    fn site_cache_distinguishes_keys_on_one_shape() {
+        let program = site_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let module = ModuleId::new(0);
+        let function = FunctionId::new(0);
+        let object =
+            site_object(&mut machine, &[("a", Value::int32(1)), ("b", Value::int32(2))]);
+        let key_a = PropertyKey::Named(machine.intern_str("a"));
+        let key_b = PropertyKey::Named(machine.intern_str("b"));
+        machine.property_site_record_get(module, function, 0, object, &key_a);
+        machine.property_site_record_get(module, function, 0, object, &key_b);
+        assert_eq!(machine.function_sites(module, function).gets[0].len, 2);
+        assert_eq!(
+            machine.property_site_hit_get(module, function, 0, object, &key_a),
+            Some(Value::int32(1))
+        );
+        assert_eq!(
+            machine.property_site_hit_get(module, function, 0, object, &key_b),
+            Some(Value::int32(2))
+        );
+    }
+    #[test]
+    fn site_cache_ignores_prototype_values() {
+        let program = site_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let module = ModuleId::new(0);
+        let function = FunctionId::new(0);
+        let parent = site_object(&mut machine, &[("a", Value::int32(7))]);
+        let child = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(parent),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        assert_eq!(
+            machine.get_named_property(child, "a").unwrap(),
+            Value::int32(7)
+        );
+        let key = PropertyKey::Named(machine.intern_str("a"));
+        machine.property_site_record_get(module, function, 0, child, &key);
+        assert_eq!(machine.function_sites(module, function).gets[0].len, 0);
+        assert_eq!(
+            machine.property_site_hit_get(module, function, 0, child, &key),
+            None
+        );
+    }
+    #[test]
+    fn site_cache_ignores_accessors_and_uninitialized() {
+        let program = site_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let module = ModuleId::new(0);
+        let function = FunctionId::new(0);
+        let key_acc = PropertyKey::Named(machine.intern_str("acc"));
+        let mut properties = PropertyMap::default();
+        properties.insert(
+            &mut machine.shapes,
+            key_acc.clone(),
+            Property::Accessor {
+                getter: None,
+                setter: None,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        let key_uninit = PropertyKey::Named(machine.intern_str("u"));
+        properties.insert(
+            &mut machine.shapes,
+            key_uninit.clone(),
+            Property::Data {
+                value: Value::UNINITIALIZED,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        let object = machine
+            .allocate(HeapEntry::Object {
+                properties,
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine.property_site_record_get(module, function, 0, object, &key_acc);
+        machine.property_site_record_get(module, function, 0, object, &key_uninit);
+        assert_eq!(machine.function_sites(module, function).gets[0].len, 0);
+        assert_eq!(
+            machine.property_site_hit_get(module, function, 0, object, &key_acc),
+            None
+        );
+        assert_eq!(
+            machine.property_site_hit_get(module, function, 0, object, &key_uninit),
+            None
+        );
+    }
+    #[test]
+    fn site_cache_goes_megamorphic_on_fifth_shape() {
+        let program = site_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let module = ModuleId::new(0);
+        let function = FunctionId::new(0);
+        for index in 0..5u32 {
+            let name = format!("m{index}");
+            let object = site_object(&mut machine, &[(name.as_str(), Value::int32(index))]);
+            let key = PropertyKey::Named(machine.intern_str(&name));
+            machine.property_site_record_get(module, function, 0, object, &key);
+        }
+        assert_eq!(
+            machine.function_sites(module, function).gets[0].len,
+            u8::MAX
+        );
+        let extra = site_object(&mut machine, &[("extra", Value::int32(9))]);
+        let extra_key = PropertyKey::Named(machine.intern_str("extra"));
+        machine.property_site_record_get(module, function, 0, extra, &extra_key);
+        assert_eq!(
+            machine.property_site_hit_get(module, function, 0, extra, &extra_key),
+            None
+        );
+    }
+    #[test]
+    fn site_hit_set_updates_writable_data() {
+        let program = site_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let module = ModuleId::new(0);
+        let function = FunctionId::new(0);
+        let object = site_object(&mut machine, &[("a", Value::int32(1))]);
+        let key = PropertyKey::Named(machine.intern_str("a"));
+        assert_eq!(
+            machine.property_site_hit_set(module, function, 1, object, &key, Value::int32(2)),
+            None
+        );
+        machine.property_site_record_set(module, function, 1, object, &key);
+        assert_eq!(machine.function_sites(module, function).sets[1].len, 1);
+        assert_eq!(
+            machine.property_site_hit_set(module, function, 1, object, &key, Value::int32(2)),
+            Some(())
+        );
+        assert_eq!(
+            machine.get_named_property(object, "a").unwrap(),
+            Value::int32(2)
+        );
+    }
+    #[test]
+    fn site_set_ignores_readonly_and_absent_keys() {
+        let program = site_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let module = ModuleId::new(0);
+        let function = FunctionId::new(0);
+        let key = PropertyKey::Named(machine.intern_str("ro"));
+        let mut properties = PropertyMap::default();
+        properties.insert(
+            &mut machine.shapes,
+            key.clone(),
+            Property::Data {
+                value: Value::int32(1),
+                writable: false,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        let object = machine
+            .allocate(HeapEntry::Object {
+                properties,
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine.property_site_record_set(module, function, 1, object, &key);
+        let absent = PropertyKey::Named(machine.intern_str("absent"));
+        machine.property_site_record_set(module, function, 1, object, &absent);
+        assert_eq!(machine.function_sites(module, function).sets[1].len, 0);
+        assert_eq!(
+            machine.property_site_hit_set(module, function, 1, object, &key, Value::int32(2)),
+            None
+        );
+    }
+    #[test]
+    fn site_cache_ignores_dictionary_maps() {
+        let program = site_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let module = ModuleId::new(0);
+        let function = FunctionId::new(0);
+        let mut properties = PropertyMap::default();
+        for index in 0..70u32 {
+            let key = PropertyKey::Named(machine.atoms.intern_str(&format!("w{index}")));
+            properties.insert(
+                &mut machine.shapes,
+                key,
+                Property::Data {
+                    value: Value::int32(index),
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            );
+        }
+        let object = machine
+            .allocate(HeapEntry::Object {
+                properties,
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let key = PropertyKey::Named(machine.intern_str("w0"));
+        machine.property_site_record_get(module, function, 0, object, &key);
+        machine.property_site_record_set(module, function, 1, object, &key);
+        assert_eq!(machine.function_sites(module, function).gets[0].len, 0);
+        assert_eq!(machine.function_sites(module, function).sets[1].len, 0);
+        assert_eq!(
+            machine.property_site_hit_get(module, function, 0, object, &key),
+            None
+        );
     }
 }
 #[cfg(test)]

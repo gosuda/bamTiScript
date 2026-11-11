@@ -746,13 +746,30 @@ impl Helper {
             // (frame, function_id, captures, out)
             Helper::CreateClosure => &[types::I64, types::I32, types::I64, types::I64],
             // (frame, object, key, out)
-            Helper::GetProperty | Helper::DeleteProperty | Helper::WithHasBinding => {
+            Helper::DeleteProperty | Helper::WithHasBinding => {
                 &[types::I64, types::I64, types::I64, types::I64]
             }
+            // (frame, object, key, site, out)
+            Helper::GetProperty => &[
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I32,
+                types::I64,
+            ],
             // (frame, object, key, value, out)
-            Helper::SetProperty | Helper::DefineDataProperty => {
+            Helper::DefineDataProperty => {
                 &[types::I64, types::I64, types::I64, types::I64, types::I64]
             }
+            // (frame, object, key, value, site, out)
+            Helper::SetProperty => &[
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I32,
+                types::I64,
+            ],
             // (frame, object, key, accessor, kind, out) or
             // (frame, object, key, src, slot, out)
             Helper::DefineAccessor | Helper::DefineOwnDescriptorSlot => &[
@@ -1639,9 +1656,11 @@ impl<'a> Lowering<'a> {
                 let handles = self.load_handles();
                 let object_value = self.load_register(handles, object);
                 let key_value = self.load_register(handles, key);
+                let site = i64::from(u32::try_from(pc).unwrap_or(u32::MAX));
+                let site_word = self.iconst32(site);
                 let tag = self.call_helper(
                     Helper::GetProperty,
-                    &[self.frame, object_value, key_value, self.out],
+                    &[self.frame, object_value, key_value, site_word, self.out],
                 );
                 self.route_completion(pc, tag, Some(dst));
             }
@@ -1650,9 +1669,18 @@ impl<'a> Lowering<'a> {
                 let object_value = self.load_register(handles, object);
                 let key_value = self.load_register(handles, key);
                 let value_value = self.load_register(handles, value);
+                let site = i64::from(u32::try_from(pc).unwrap_or(u32::MAX));
+                let site_word = self.iconst32(site);
                 let tag = self.call_helper(
                     Helper::SetProperty,
-                    &[self.frame, object_value, key_value, value_value, self.out],
+                    &[
+                        self.frame,
+                        object_value,
+                        key_value,
+                        value_value,
+                        site_word,
+                        self.out,
+                    ],
                 );
                 self.route_completion(pc, tag, None);
             }
@@ -3520,14 +3548,16 @@ mod tests {
             clif.contains("u1:8"),
             "delete-property import missing:\n{clif}"
         );
-        // Register key: get/delete take (frame, object, key, out) all i64 ops.
+        assert!(
+            clif.contains("(i64, i64, i64, i32, i64) -> i32"),
+            "get property sig wrong (register key):\n{clif}"
+        );
         assert!(
             clif.contains("(i64, i64, i64, i64) -> i32"),
-            "get/delete property sig wrong (register key):\n{clif}"
+            "delete property sig wrong (register key):\n{clif}"
         );
-        // Set takes (frame, object, key, value, out).
         assert!(
-            clif.contains("(i64, i64, i64, i64, i64) -> i32"),
+            clif.contains("(i64, i64, i64, i64, i32, i64) -> i32"),
             "set property sig wrong (register key):\n{clif}"
         );
     }
