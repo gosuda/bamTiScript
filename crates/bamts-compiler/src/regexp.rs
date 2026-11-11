@@ -593,6 +593,7 @@ fn validate_pattern(pattern: &[u16], mode: RegexMode) -> Option<String> {
         incomplete_k: 0,
         captures: 0,
         decimals: Vec::new(),
+        negated_classes: Vec::new(),
     };
     parser.parse_top()
 }
@@ -640,6 +641,7 @@ struct Parser<'a> {
     incomplete_k: usize,
     captures: usize,
     decimals: Vec<usize>,
+    negated_classes: Vec<bool>,
 }
 
 impl<'a> Parser<'a> {
@@ -995,12 +997,20 @@ impl<'a> Parser<'a> {
         if negated {
             self.pos += 1;
         }
-        if matches!(self.mode, RegexMode::UnicodeSets) {
-            return self.parse_class_sets(negated);
-        }
-        if matches!(self.mode, RegexMode::Unicode) {
-            return self.parse_class_unicode();
-        }
+        self.negated_classes.push(negated);
+        let result = if matches!(self.mode, RegexMode::UnicodeSets) {
+            self.parse_class_sets(negated)
+        } else if matches!(self.mode, RegexMode::Unicode) {
+            self.parse_class_unicode()
+        } else {
+            self.parse_class_annex_b()
+        };
+        self.negated_classes.pop();
+        result
+    }
+
+    fn parse_class_annex_b(&mut self) -> Option<String> {
+        let mut strings = false;
         loop {
             match self.peek() {
                 None => return Some(invalid_pattern()),
@@ -1009,7 +1019,6 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 Some(0x5C) if self.is_property_prefix() => {
-                    let mut strings = false;
                     if let Some(message) = self.parse_property_escape(&mut strings) {
                         return Some(message);
                     }
@@ -1230,8 +1239,11 @@ impl<'a> Parser<'a> {
         if negated {
             self.pos += 1;
         }
+        self.negated_classes.push(negated);
         let mut inner = false;
-        if let Some(message) = self.parse_class_set_body(&mut inner) {
+        let result = self.parse_class_set_body(&mut inner);
+        self.negated_classes.pop();
+        if let Some(message) = result {
             return Some(message);
         }
         if negated && inner {
@@ -1757,6 +1769,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_property_escape(&mut self, strings: &mut bool) -> Option<String> {
+        let negated_escape = self.peek_at(1) == Some(0x50);
         self.pos += 2;
         if self.peek() != Some(0x7B) {
             return Some(invalid_pattern());
@@ -1774,6 +1787,9 @@ impl<'a> Parser<'a> {
             return Some(message);
         }
         if STRING_PROPS.iter().any(|cand| units_eq_str(content, cand)) {
+            if negated_escape || self.negated_classes.iter().any(|negated| *negated) {
+                return Some(invalid_pattern());
+            }
             *strings = true;
         }
         self.pos += 1;

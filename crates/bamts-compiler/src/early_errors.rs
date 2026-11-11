@@ -2755,6 +2755,30 @@ mod tests {
     }
 
     #[test]
+    fn string_property_escapes_are_rejected_when_negated() {
+        for source in [
+            "/\\P{RGI_Emoji}/v;",
+            "/[\\P{RGI_Emoji}]/v;",
+            "/[^\\p{RGI_Emoji}]/v;",
+            "/[[^\\p{RGI_Emoji}]]/v;",
+            "/[^\\p{Basic_Emoji}]/v;",
+            "/[^\\p{RGI_Emoji_Flag_Sequence}]/v;",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "/\\p{RGI_Emoji}/v;",
+            "/[\\p{RGI_Emoji}]/v;",
+            "/[[\\p{RGI_Emoji}]]/v;",
+            "/[\\p{Basic_Emoji}]/v;",
+            "/[\\P{Hex}]/u;",
+            "/[^\\p{Hex}]/v;",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    #[test]
     fn unicode_sets_class_operands_are_validated() {
         for source in [
             "/[a--]/v;",
