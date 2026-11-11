@@ -2646,4 +2646,28 @@ mod tests {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
     }
+
+    #[test]
+    fn invalid_regex_unicode_escapes_are_rejected() {
+        for source in [
+            "/\\c0/u;",
+            "/\\8/u;",
+            "/\\M/u;",
+            "/.(?=.)?/u;",
+            "/.(?<=.)?/;",
+            "/{2}/;",
+            "/\\u{110000}/u;",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "/\\cA/u;",
+            "/\\n/u;",
+            "/\\d/u;",
+            "/a{2,3}/;",
+            "/(?=a)/;",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
 }
