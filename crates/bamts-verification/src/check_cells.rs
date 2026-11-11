@@ -20,10 +20,8 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(test)]
-use bamts_compiler::checker::Type;
 use bamts_compiler::checker::{
-    DeclarationOccurrence, SemanticModel, SymbolId, SymbolKind, render_type,
+    DeclarationOccurrence, SemanticModel, SymbolId, SymbolKind, Type, TypeId, render_type,
 };
 use bamts_compiler::diagnostic::DiagnosticSeverity;
 use bamts_compiler::emitter::{EmitFileNames, EmitOptions, ModuleKind, emit_checked};
@@ -1563,6 +1561,7 @@ struct TypeAnnotation {
     line: usize,
     display: String,
     rendered: String,
+    caret: bool,
 }
 
 /// Emit the `.types` baseline for a compiled case in the upstream framing:
@@ -1574,6 +1573,12 @@ struct TypeAnnotation {
 #[must_use]
 pub fn emit_types_baseline(case: &CheckedCase, logical_path: &str) -> String {
     let mut out = format!("//// [{logical_path}] ////\n\n");
+    let has_diagnostics = case.reached_units().any(|(_, output)| {
+        output
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| !diagnostic.code().as_str().starts_with("BAMTS-W"))
+    });
     for (unit, output) in case.units_in_document_order() {
         if is_config_unit_name(&unit.display_name) {
             continue;
@@ -1594,6 +1599,7 @@ pub fn emit_types_baseline(case: &CheckedCase, logical_path: &str) -> String {
             output.semantic_model(),
             output.source_file().source_text(),
             &unit.display_name,
+            has_diagnostics,
             &mut out,
         );
     }
@@ -1634,7 +1640,13 @@ fn dedup_type_records(mut records: Vec<TypeAnnotation>) -> Vec<TypeAnnotation> {
     records
 }
 
-fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, out: &mut String) {
+fn emit_unit_types(
+    model: &SemanticModel,
+    source: &SourceText,
+    section: &str,
+    has_diagnostics: bool,
+    out: &mut String,
+) {
     let mut records: Vec<TypeAnnotation> = Vec::new();
     // Symbols covered by interface-member declaration occurrences emit one
     // record per written occurrence below; the covered symbol's own row is
@@ -1684,6 +1696,7 @@ fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, ou
             range,
             symbol.name().to_owned(),
             render_type(model, type_id),
+            writes_caret(model, type_id, has_diagnostics),
         ) {
             records.push(annotation);
         }
@@ -1715,6 +1728,11 @@ fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, ou
             range,
             slice_source(source, range),
             render_type(model, model.symbol_type(occurrence.symbol)),
+            writes_caret(
+                model,
+                model.symbol_type(occurrence.symbol),
+                has_diagnostics,
+            ),
         ) {
             records.push(annotation);
         }
@@ -1722,9 +1740,13 @@ fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, ou
     // Expression records come from the checker's expression-type index.
     for (range, type_id) in model.typed_expressions() {
         let display = slice_source(source, *range);
-        if let Some(annotation) =
-            annotation_for(source, *range, display, render_type(model, *type_id))
-        {
+        if let Some(annotation) = annotation_for(
+            source,
+            *range,
+            display,
+            render_type(model, *type_id),
+            writes_caret(model, *type_id, has_diagnostics),
+        ) {
             records.push(annotation);
         }
     }
@@ -1745,11 +1767,13 @@ fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, ou
         for record in line_records {
             let display = collapse_whitespace(&record.display);
             out.push_str(&format!(">{display} : {}\n", record.rendered));
-            out.push_str(&format!(
-                ">{} : {}\n",
-                " ".repeat(display.chars().count()),
-                "^".repeat(record.rendered.chars().count())
-            ));
+            if record.caret {
+                out.push_str(&format!(
+                    ">{} : {}\n",
+                    " ".repeat(display.chars().count()),
+                    "^".repeat(record.rendered.chars().count())
+                ));
+            }
         }
     }
 }
@@ -1761,6 +1785,7 @@ fn annotation_for(
     range: TextRange,
     display: String,
     rendered: String,
+    caret: bool,
 ) -> Option<TypeAnnotation> {
     let (line, _) = source.line_column(range.start()).ok()?;
     Some(TypeAnnotation {
@@ -1769,7 +1794,12 @@ fn annotation_for(
         line,
         display,
         rendered,
+        caret,
     })
+}
+
+fn writes_caret(model: &SemanticModel, type_id: TypeId, has_diagnostics: bool) -> bool {
+    has_diagnostics || !matches!(model.types().get(type_id), Type::Error)
 }
 
 /// Slice the raw source text covered by a UTF-16 range.
@@ -2084,7 +2114,12 @@ pub fn emit_javascript_baseline(
                 if !imported.contains(&output.source_file().source_id()) {
                     continue;
                 }
-                push_output_section(&mut out, &name, &unit.text);
+                let body = output
+                    .emit()
+                    .and_then(|emit| emit.javascript.as_ref())
+                    .map(|javascript| javascript.code.as_str())
+                    .unwrap_or("");
+                push_output_section(&mut out, &name, body);
                 outputs += 1;
                 continue;
             }
@@ -4600,6 +4635,56 @@ error TS5107: Option 'moduleResolution=classic' is deprecated and will stop func
     /// `=== exportDefaultProperty2.ts ===`). A preamble holding code does
     /// keep the implicit case-named unit.
     #[test]
+    fn any_typed_records_keep_caret_line() {
+        let case_text = "var ANY: any;\nvar n: number;\n++ANY;\n";
+        let units = split_case_units("tests/cases/compiler/anyCaretPin.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/anyCaretPin.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, "tests/cases/compiler/anyCaretPin.ts");
+        assert!(
+            emitted.contains(">ANY : any\n>    : ^^^\n"),
+            "clean any keeps its caret, as jsxPreserveWithJsInput.types shows for >b : any: {emitted}"
+        );
+        assert!(
+            emitted.contains(">n : number\n>  : ^^^^^^\n"),
+            "full-width caret under a number record: {emitted}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_keep_full_width_caret_lines() {
+        let error_text = "var p: any = missingRef;\n";
+        let units = split_case_units("tests/cases/compiler/anyCaretErrorsPin.ts", error_text);
+        let entry = entry_virtual_path("tests/cases/compiler/anyCaretErrorsPin.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, "tests/cases/compiler/anyCaretErrorsPin.ts");
+        assert!(
+            emitted.contains(">p : any\n>  : ^^^\n"),
+            "diagnostics keep the underline under an any record: {emitted}"
+        );
+        let clean_text = "var p: any = 1;\n";
+        let units = split_case_units("tests/cases/compiler/anyCaretCleanPin.ts", clean_text);
+        let entry = entry_virtual_path("tests/cases/compiler/anyCaretCleanPin.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, "tests/cases/compiler/anyCaretCleanPin.ts");
+        assert!(
+            emitted.contains(">p : any\n>  : ^^^\n"),
+            "clean any keeps its caret, as tsxEmitSpreadAttribute(target=es2015).types shows for >div : any (its >a : any parameter records are bare): {emitted}"
+        );
+    }
+
+    #[test]
+    fn error_records_stay_bare_without_diagnostics() {
+        with_model("var x: any;\n", "tests/cases/compiler/errorBarePin.ts", |model| {
+            let any = model.types().any();
+            let error = model.types().error_type();
+            assert!(writes_caret(model, any, false));
+            assert!(writes_caret(model, any, true));
+            assert!(!writes_caret(model, error, false));
+            assert!(writes_caret(model, error, true));
+        });
+    }
+    #[test]
     fn comment_only_preamble_is_not_a_unit() {
         let case = "\
 // @module: commonjs
@@ -5061,7 +5146,9 @@ export const a2 = 3;
 
     /// H4 pin: an annotated scalar case the checker fully types reproduces its
     /// upstream `.types` baseline (marker, section, source echo, `>expr : type`
-    /// records, and underline widths) under `compare_types`.
+    /// records, and underline widths) under `compare_types`. The declared-any
+    /// record keeps its caret, as the clean `ambientShorthand_reExport.types`
+    /// prints `>x : any` with a `>  : ^^^` underline.
     #[test]
     fn emit_types_baseline_matches_fully_typed_scalar_case() {
         let logical = "tests/cases/compiler/scalarPin.ts";
@@ -5076,7 +5163,6 @@ export const a2 = 3;
             var x: any;\n\
             >x : any\n\
             >  : ^^^\n\
-            \n\
             var s: string = \"hi\";\n\
             >s : string\n\
             >  : ^^^^^^\n\
@@ -5085,7 +5171,7 @@ export const a2 = 3;
         assert_eq!(
             compare_types(baseline, &emitted),
             FacetVerdict::Pass,
-            "emitted:\n{emitted}"
+            "clean any keeps its caret, as ambientShorthand_reExport.types shows for >x : any: emitted:\n{emitted}"
         );
     }
 
@@ -5137,6 +5223,7 @@ export const a2 = 3;
             line: 0,
             display: display.to_owned(),
             rendered: rendered.to_owned(),
+            caret: true,
         };
         let records = vec![
             record(4, 5, "x", "any"),
@@ -5169,6 +5256,7 @@ export const a2 = 3;
             line: 0,
             display: display.to_owned(),
             rendered: rendered.to_owned(),
+            caret: true,
         };
         let deduped = dedup_type_records(vec![
             record("Foo", "Foo<T>"),
@@ -5185,13 +5273,12 @@ export const a2 = 3;
         );
     }
 
-    /// Authority pin from `witness.types` (case
-    /// `tests/cases/conformance/types/witness/witness.ts`, line 7): upstream
-    /// prints TWO identical `>varInit : any` pairs for `var varInit =
-    /// varInit;` — declaration name and resolving reference at different
-    /// ranges are both legitimate records. Only exact (start, end, display,
-    /// rendered) tuples collapse; text-identical records at distinct
-    /// positions stay.
+    /// A clean self-reference carries two `>varInit : any` records for
+    /// `var varInit = varInit;`: declaration name and resolving reference at
+    /// different ranges are both legitimate records. Only exact (start, end,
+    /// display, rendered) tuples collapse; text-identical records at distinct
+    /// positions stay. Each record keeps its caret, as `witness.types` prints
+    /// both `>varInit : any` records with a `>        : ^^^` underline.
     #[test]
     fn emit_types_baseline_keeps_distinct_position_records() {
         let logical = "tests/cases/conformance/types/witness/witnessPin.ts";
@@ -5210,7 +5297,7 @@ export const a2 = 3;
         assert_eq!(
             compare_types(baseline, &emitted),
             FacetVerdict::Pass,
-            "distinct-position identical records must both stay; emitted:\n{emitted}"
+            "distinct-position identical records must both stay, each with its caret as witness.types shows for >varInit : any; emitted:\n{emitted}"
         );
     }
 
@@ -6289,6 +6376,75 @@ import * as c from \"./c.json\";
                 "//// [a.js]"
             ],
             "requireOfJsonFileWithoutExtensionResolvesToTs.js emits only the imported c.json: {emitted}"
+        );
+    }
+    #[test]
+    fn javascript_baseline_json_section_carries_compiler_emit() {
+        let logical = "tests/cases/compiler/emptyJsonPin.ts";
+        let case_text = "\
+// @resolveJsonModule: true
+// @outDir: dist
+// @module: commonjs
+// @filename: file1.ts
+import * as b1 from \"./b.json\";
+let x = b1;
+// @filename: b.json
+{
+}";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let compiler_body = case
+            .reached_units_in_module_order()
+            .into_iter()
+            .find(|(unit, _)| unit.virtual_path.ends_with("b.json"))
+            .and_then(|(_, output)| output.emit().and_then(|emit| emit.javascript.as_ref()))
+            .map(|javascript| javascript.code.clone())
+            .expect("json module carries compiler emit");
+        assert!(
+            !compiler_body.is_empty(),
+            "the harness must have compiler output to carry: {emitted}"
+        );
+        assert!(
+            emitted.contains(&format!("//// [b.json]\n{compiler_body}")),
+            "the json output section carries the compiler's emit for that unit, not the raw unit text (requireOfJsonFileWithEmptyObject.js re-serializes that input to {{}}; the compiler has no json output mapping, crates/bamts-compiler/src/project/output.rs:417, and emits the file through the TS transform instead, crates/bamts-compiler/src/emitter/transforms.rs:231): {emitted}"
+        );
+    }
+    #[test]
+    fn javascript_baseline_empty_json_section_carries_compiler_emit() {
+        let logical = "tests/cases/compiler/emptyJsonContentPin.ts";
+        let case_text = "\
+// @resolveJsonModule: true
+// @outDir: dist
+// @module: commonjs
+// @filename: file1.ts
+import * as b1 from \"./b.json\";
+let x = b1;
+// @filename: b.json
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let compiler_body = case
+            .reached_units_in_module_order()
+            .into_iter()
+            .find(|(unit, _)| unit.virtual_path.ends_with("b.json"))
+            .and_then(|(_, output)| output.emit().and_then(|emit| emit.javascript.as_ref()))
+            .map(|javascript| javascript.code.clone())
+            .expect("json module carries compiler emit");
+        assert!(
+            !compiler_body.is_empty(),
+            "the harness must have compiler output to carry: {emitted}"
+        );
+        assert!(
+            emitted.contains(&format!("//// [b.json]\n{compiler_body}")),
+            "the json output section carries the compiler's emit for that unit, not the raw unit text (requireOfJsonFileWithNoContent.js prints an empty out/b.json body; the compiler has no json output mapping, crates/bamts-compiler/src/project/output.rs:417, and emits its own prelude instead): {emitted}"
         );
     }
 
