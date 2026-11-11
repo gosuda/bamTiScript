@@ -1243,6 +1243,16 @@ fn resolution_lower_outcome(error: &ProgramLowerError) -> Option<RunOutcome> {
         ProgramLowerErrorKind::InvalidModuleName
             | ProgramLowerErrorKind::MissingRuntimeEdge { .. }
             | ProgramLowerErrorKind::ConflictingRuntimeEdge { .. }
+    ) || matches!(
+        &error.kind,
+        ProgramLowerErrorKind::Link(inner)
+            if matches!(
+                inner.kind,
+                bamts_bytecode::ProgramVerifyErrorKind::DuplicateExport { .. }
+                    | bamts_bytecode::ProgramVerifyErrorKind::MissingImportedExport { .. }
+                    | bamts_bytecode::ProgramVerifyErrorKind::MissingIndirectExport { .. }
+                    | bamts_bytecode::ProgramVerifyErrorKind::IndirectExportCycle { .. }
+            )
     );
     link.then(|| RunOutcome::Completed {
         thrown: Some(ThrownError {
@@ -3324,6 +3334,33 @@ function $ERROR(message) {\n\
             }
             other => panic!("link failure must report Resolution/SyntaxError, got {other:?}"),
         }
+        let instantiated = bamts_compiler::program::ProgramLowerError {
+            module: PathBuf::from("case.js"),
+            phase: bamts_compiler::program::ProgramLowerPhase::Link,
+            kind: ProgramLowerErrorKind::Link(bamts_bytecode::ProgramVerifyError {
+                module: None,
+                kind: bamts_bytecode::ProgramVerifyErrorKind::DuplicateExport {
+                    first: 0,
+                    second: 1,
+                },
+            }),
+        };
+        match resolution_lower_outcome(&instantiated) {
+            Some(RunOutcome::Completed { thrown: Some(thrown) }) => {
+                assert_eq!(thrown.phase, NegativePhase::Resolution);
+                assert_eq!(thrown.error_type, NegativeType::SyntaxError);
+            }
+            other => panic!("link failure must report Resolution/SyntaxError, got {other:?}"),
+        }
+        let capped = bamts_compiler::program::ProgramLowerError {
+            module: PathBuf::from("case.js"),
+            phase: bamts_compiler::program::ProgramLowerPhase::Link,
+            kind: ProgramLowerErrorKind::Link(bamts_bytecode::ProgramVerifyError {
+                module: None,
+                kind: bamts_bytecode::ProgramVerifyErrorKind::EmptyProgram,
+            }),
+        };
+        assert!(resolution_lower_outcome(&capped).is_none());
         let other = bamts_compiler::program::ProgramLowerError {
             module: PathBuf::from("case.js"),
             phase: bamts_compiler::program::ProgramLowerPhase::Metadata,
