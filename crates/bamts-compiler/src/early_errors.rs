@@ -2770,6 +2770,16 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_braced_quantifiers_are_rejected() {
+        for source in ["/0{2,1}/;", "/0{2,1}/u;", "/0{2,1}/v;"] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in ["/0{2,1/;", "/0{,2}/;", "/0{/;", "/0{2,1", "/a{2,3}/;"] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    #[test]
     fn using_at_script_top_level_is_rejected() {
         for source in ["using x = null;", "await using x = null;"] {
             assert!(!script_errors(source).is_empty(), "{source}");

@@ -744,7 +744,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         if let Some(hi) = high {
-            if hi < low && matches!(self.mode, RegexMode::Unicode | RegexMode::UnicodeSets) {
+            if hi < low {
                 return Some(format!("invalid regular expression"));
             }
         }
