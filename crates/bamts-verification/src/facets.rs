@@ -664,12 +664,6 @@ pub fn compare_js_emit(expected: &str, actual: &str) -> FacetVerdict {
     compare_structural("javascript", expected, actual, canonicalize_js_emit)
 }
 
-/// Line-wise comparator for the `.d.ts` sections of declaration baselines.
-///
-/// The declaration facet reads the same document shape as the JavaScript
-/// facet (upstream keeps the `.d.ts` sections inside the owned `.js`
-/// baseline), so the canonicalization matches; the label names its own
-/// facet.
 pub fn compare_declaration_emit(expected: &str, actual: &str) -> FacetVerdict {
     compare_structural("declaration", expected, actual, canonicalize_js_emit)
 }
@@ -711,7 +705,7 @@ fn compare_structural(
         FacetVerdict::Fail {
             reason: format!(
                 "{facet} structural mismatch {}",
-                describe_difference(&expected_norm, &actual_norm)
+                describe_difference(&expected_norm, &actual_norm, facet)
             ),
         }
     }
@@ -723,23 +717,37 @@ const EXCERPT_CHARS: usize = 100;
 /// `[category]: where`, naming the first difference between two normalized
 /// outputs. The category is a plain word, so rows that differ the same way group
 /// together. The lines themselves sit in backticks, so a family ignores them.
-fn describe_difference(expected: &[String], actual: &[String]) -> String {
+fn describe_difference(expected: &[String], actual: &[String], facet: &str) -> String {
     let common = expected
         .iter()
         .zip(actual)
         .take_while(|(left, right)| left == right)
         .count();
     match (expected.get(common), actual.get(common)) {
-        (None, Some(extra)) => format!(
-            "[extra-lines]: actual has {} extra line(s) from line {}: `{}`",
-            actual.len() - common,
-            common + 1,
-            excerpt(extra)
-        ),
-        (Some(missing), None) => format!(
-            "[missing-lines]: actual ends at line {common}; expected continues with `{}`",
-            excerpt(missing)
-        ),
+        (None, Some(extra)) => {
+            let kind = match facet {
+                "types" => "extra-record",
+                "symbols" => "extra-row",
+                _ => "extra-lines",
+            };
+            format!(
+                "[{kind}]: actual has {} extra line(s) from line {}: `{}`",
+                actual.len() - common,
+                common + 1,
+                excerpt(extra)
+            )
+        }
+        (Some(missing), None) => {
+            let kind = match facet {
+                "types" => "missing-record",
+                "symbols" => "missing-row",
+                _ => "missing-lines",
+            };
+            format!(
+                "[{kind}]: actual ends at line {common}; expected continues with `{}`",
+                excerpt(missing)
+            )
+        }
         (Some(left), Some(right)) => {
             let mut sorted_expected = expected.to_vec();
             let mut sorted_actual = actual.to_vec();
@@ -748,7 +756,7 @@ fn describe_difference(expected: &[String], actual: &[String]) -> String {
             let category = if sorted_expected == sorted_actual {
                 "order".to_owned()
             } else {
-                line_difference(left, right)
+                line_difference(left, right, facet)
             };
             format!(
                 "[{category}]: line {} expected `{}` actual `{}`",
@@ -762,12 +770,14 @@ fn describe_difference(expected: &[String], actual: &[String]) -> String {
     }
 }
 
-/// How two lines at the same position differ, from the most to the least
-/// specific. Lines that differ in kind are named by the pair, such as
-/// `comment-vs-binding`: a baseline comment that the output replaced with code.
-fn line_difference(expected: &str, actual: &str) -> String {
+fn line_difference(expected: &str, actual: &str, facet: &str) -> String {
     let unquoted = |text: &str| text.replace('\'', "\"");
     let unpunctuated = |text: &str| text.trim_end_matches([';', ',']).to_owned();
+    if (facet == "types" || facet == "symbols")
+        && let (Some(left), Some(right)) = (canonical_tokens(expected), canonical_tokens(actual))
+    {
+        return canvas_difference(facet, &left, &right).to_owned();
+    }
     if expected.split_whitespace().eq(actual.split_whitespace()) {
         return "spacing".to_owned();
     }
@@ -786,6 +796,105 @@ fn line_difference(expected: &str, actual: &str) -> String {
     } else {
         format!("{left}-vs-{right}")
     }
+}
+
+fn canonical_tokens(line: &str) -> Option<Vec<(&str, &str)>> {
+    let mut tokens = Vec::new();
+    for part in line.split('|') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (length, token) = part.split_once(':')?;
+        if length.is_empty() || !length.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        tokens.push((length, token));
+    }
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(tokens)
+}
+
+fn canvas_difference(facet: &str, left: &[(&str, &str)], right: &[(&str, &str)]) -> &'static str {
+    if left.iter().any(|(_, token)| *token == "===")
+        || right.iter().any(|(_, token)| *token == "===")
+    {
+        return "section-header";
+    }
+    if strip_caret_tail(left) == strip_caret_tail(right) && left != right {
+        return "caret-line";
+    }
+    let (Some(sep_left), Some(sep_right)) = (separator_index(left), separator_index(right)) else {
+        return "type-text";
+    };
+    if name_range(left, sep_left) != name_range(right, sep_right) {
+        return if facet == "symbols" {
+            "symbol-name"
+        } else {
+            "record-name"
+        };
+    }
+    if facet == "symbols" && decl_skeleton(left) == decl_skeleton(right) && left != right {
+        return "decl-position";
+    }
+    if rendered_has_any(right, sep_right) && !rendered_has_any(left, sep_left) {
+        return "type-any";
+    }
+    "type-text"
+}
+
+fn strip_caret_tail<'t>(tokens: &'t [(&'t str, &'t str)]) -> &'t [(&'t str, &'t str)] {
+    let mut end = tokens.len();
+    while end > 0 && tokens[end - 1].1 == "^" {
+        end -= 1;
+    }
+    if end > 0 && tokens[end - 1].1 == ":" {
+        end -= 1;
+    }
+    &tokens[..end]
+}
+
+fn separator_index(tokens: &[(&str, &str)]) -> Option<usize> {
+    tokens.iter().position(|(_, token)| *token == ":")
+}
+
+fn name_range<'t>(tokens: &'t [(&'t str, &'t str)], sep: usize) -> &'t [(&'t str, &'t str)] {
+    let start = usize::from(!tokens.is_empty() && tokens[0].1 == ">");
+    &tokens[start..sep]
+}
+
+fn rendered_has_any(tokens: &[(&str, &str)], sep: usize) -> bool {
+    tokens[sep..].iter().any(|(_, token)| *token == "any")
+}
+
+fn decl_skeleton<'t>(tokens: &[(&'t str, &'t str)]) -> Vec<&'t str> {
+    let mut skeleton = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index].1 == "Decl" && tokens.get(index + 1).is_some_and(|next| next.1 == "(") {
+            skeleton.push("Decl(..)");
+            let mut depth = 0;
+            while index < tokens.len() {
+                if tokens[index].1 == "(" {
+                    depth += 1;
+                }
+                if tokens[index].1 == ")" {
+                    depth -= 1;
+                    if depth == 0 {
+                        index += 1;
+                        break;
+                    }
+                }
+                index += 1;
+            }
+            continue;
+        }
+        skeleton.push(tokens[index].1);
+        index += 1;
+    }
+    skeleton
 }
 
 /// The kind of JavaScript line, from its first token. A small closed set, so
@@ -2538,17 +2647,122 @@ mod tests {
     }
 
     #[test]
-    fn structural_types_survive_formatting_and_order_normalization() {
-        let expected = "=== a.ts ===\n> var x: number\n> var y: string\n";
-        let actual = "=== a.ts ===\n\n>   var   y:   string\n> var x: number\n";
-        assert!(compare_types(expected, actual).is_pass());
+    fn types_labels_name_the_kind_but_keep_the_verdict() {
+        let passing = compare_types(
+            "=== anyPropertyAccess.ts ===\n>var x: any\n",
+            "=== anyPropertyAccess.ts ===\n>var x: any\n",
+        );
+        assert!(passing.is_pass());
+        let failing = compare_types(">a : any\n", ">b : any\n");
+        match &failing {
+            FacetVerdict::Fail { reason } => {
+                assert!(reason.contains("[record-name]"), "{reason}")
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        assert!(failing.is_fail());
+        let passing = compare_symbols(
+            "=== aliasUsedAsNameValue_2.ts ===\n>b : Symbol(b, Decl(aliasUsedAsNameValue_2.ts, 2, 49))\n",
+            "=== aliasUsedAsNameValue_2.ts ===\n>b : Symbol(b, Decl(aliasUsedAsNameValue_2.ts, 2, 49))\n",
+        );
+        assert!(passing.is_pass());
+        let failing = compare_symbols(
+            ">a : Symbol(a, Decl(aliasUsedAsNameValue_2.ts, 5, 10))\n",
+            ">a : Symbol(a, Decl(aliasUsedAsNameValue_1.ts, 0, 18))\n",
+        );
+        match &failing {
+            FacetVerdict::Fail { reason } => {
+                assert!(reason.contains("[decl-position]"), "{reason}")
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        assert!(failing.is_fail());
     }
 
     #[test]
-    fn structural_types_reject_semantic_differences() {
-        let expected = "> var x: number\n";
-        let actual = "> var x: string\n";
-        assert!(compare_types(expected, actual).is_fail());
+    fn types_differences_name_their_kind() {
+        let cases: [(&str, &str, &str); 7] = [
+            (
+                "section-header",
+                "=== anyPropertyAccess.ts ===\n",
+                "=== incrementOperatorWithAnyOtherType.ts ===\n",
+            ),
+            (
+                "caret-line",
+                ">x : any\n>  : ^^^\n",
+                ">x : any\n>  : ^^^^^^\n",
+            ),
+            ("record-name", ">a : any\n", ">b : any\n"),
+            ("type-any", ">y : null\n", ">y : any\n"),
+            ("type-text", ">x : number\n", ">x : string\n"),
+            (
+                "missing-record",
+                "=== anyPropertyAccess.ts ===\n>a : any\n",
+                "=== anyPropertyAccess.ts ===\n",
+            ),
+            (
+                "extra-record",
+                "=== anyPropertyAccess.ts ===\n",
+                "=== anyPropertyAccess.ts ===\n>a : any\n",
+            ),
+        ];
+        for (label, expected, actual) in cases {
+            let verdict = compare_types(expected, actual);
+            match &verdict {
+                FacetVerdict::Fail { reason } => {
+                    assert!(
+                        reason.contains(&format!("[{label}]")),
+                        "expected [{label}] in {reason}"
+                    );
+                }
+                other => panic!("{label}: expected Fail, got {other:?}"),
+            }
+            assert!(verdict.is_fail());
+        }
+    }
+
+    #[test]
+    fn symbols_differences_name_their_kind() {
+        let cases: [(&str, &str, &str); 5] = [
+            (
+                "section-header",
+                "=== anyPropertyAccess.ts ===\n",
+                "=== aliasUsedAsNameValue_2.ts ===\n",
+            ),
+            (
+                "symbol-name",
+                ">b : Symbol(b, Decl(aliasUsedAsNameValue_2.ts, 2, 49))\n",
+                ">mod : Symbol(mod, Decl(aliasUsedAsNameValue_2.ts, 0, 0))\n",
+            ),
+            (
+                "decl-position",
+                ">a : Symbol(a, Decl(aliasUsedAsNameValue_2.ts, 5, 10))\n",
+                ">a : Symbol(a, Decl(aliasUsedAsNameValue_1.ts, 0, 18))\n",
+            ),
+            (
+                "missing-row",
+                "=== anyPropertyAccess.ts ===\n>d : Symbol(d, Decl(anyPropertyAccess.ts, 4, 3))\n",
+                "=== anyPropertyAccess.ts ===\n",
+            ),
+            (
+                "extra-row",
+                "=== anyPropertyAccess.ts ===\n",
+                "=== anyPropertyAccess.ts ===\n>d : Symbol(d, Decl(anyPropertyAccess.ts, 4, 3))\n",
+            ),
+        ];
+        for (label, expected, actual) in cases {
+            let verdict = compare_symbols(expected, actual);
+            match &verdict {
+                FacetVerdict::Fail { reason } => {
+                    assert!(
+                        reason.contains(&format!("[{label}]")),
+                        "expected [{label}] in {reason}"
+                    );
+                }
+                other => panic!("{label}: expected Fail, got {other:?}"),
+            }
+            assert!(verdict.is_fail());
+        }
     }
 
     #[test]
