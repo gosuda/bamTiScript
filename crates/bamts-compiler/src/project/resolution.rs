@@ -493,6 +493,7 @@ fn resolve_module_name_inner(
                 &importer,
                 specifier,
                 (kind, mode, flavor),
+                options.module_resolution().is_some(),
                 true,
                 &result,
             );
@@ -561,6 +562,7 @@ fn resolve_module_name_inner(
             &importer,
             specifier,
             (kind, mode, flavor),
+            options.module_resolution().is_some(),
             false,
             &stored,
         );
@@ -1790,6 +1792,55 @@ mod tests {
         let _mappings: &[PathMapping] = options.paths();
         let _object_ty: Option<&JsonObject> = None;
         let _value_ty: Option<&JsonValue> = None;
+    }
+    #[test]
+    fn trace_kind_line_marks_unspecified_resolution_kind() {
+        let unspecified = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/tsconfig.json"),
+            r#"{"compilerOptions":{}}"#,
+        )
+        .expect("config")
+        .options()
+        .clone();
+        let specified = options_with_resolution("bundler");
+        let mut host = MemoryHost::default();
+        host.file(abs("/workspace/other.ts"), "export {};\n");
+        for (options, expected) in [
+            (
+                unspecified,
+                "Module resolution kind is not specified, using 'Bundler'.",
+            ),
+            (
+                specified,
+                "Explicitly specified module resolution kind: 'Bundler'.",
+            ),
+        ] {
+            let mut cache = ResolutionCache::new();
+            let mut log = ResolutionTraceLog::default();
+            resolve_module_name_with_trace(
+                &root(),
+                &options,
+                abs("/workspace/main.ts"),
+                "./other",
+                (
+                    ModuleResolutionKind::Bundler,
+                    ResolutionMode::Import,
+                    ResolutionFlavor::Runtime,
+                ),
+                TraceResolutionServices {
+                    host: &host,
+                    cache: &mut cache,
+                    log: &mut log,
+                },
+            )
+            .expect("relative resolution");
+            assert!(
+                log.lines().iter().any(|line| line == expected),
+                "missing `{expected}` in {:?}",
+                log.lines()
+            );
+        }
     }
     #[test]
     fn trace_log_matches_upstream_bundler_relative_blob() {

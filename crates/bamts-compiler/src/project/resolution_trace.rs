@@ -44,13 +44,13 @@ impl ResolutionTraceLog {
     pub fn unsupported(&self) -> &BTreeSet<UnsupportedTraceKind> {
         &self.unsupported
     }
-
     pub(crate) fn record_module(
         &mut self,
         root: &ProjectRoot,
         importer: &Path,
         specifier: &str,
         strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
+        explicit_kind: bool,
         cached: bool,
         result: &Result<ResolvedModule, ResolutionError>,
     ) {
@@ -85,10 +85,17 @@ impl ResolutionTraceLog {
                 display_path(directory)
             ));
         } else {
-            self.lines.push(format!(
-                "Explicitly specified module resolution kind: '{}'.",
-                strategy.0.trace_name()
-            ));
+            if explicit_kind {
+                self.lines.push(format!(
+                    "Explicitly specified module resolution kind: '{}'.",
+                    strategy.0.trace_name()
+                ));
+            } else {
+                self.lines.push(format!(
+                    "Module resolution kind is not specified, using '{}'.",
+                    strategy.0.trace_name()
+                ));
+            }
             self.lines.push(format!(
                 "Resolving in {} mode with conditions '{}', 'types'.",
                 match strategy.1 {
@@ -114,14 +121,10 @@ impl ResolutionTraceLog {
             )),
         }
         if resolved_parent.is_some_and(|parent| parent == candidate_location) {
-            // The specifier resolved to a directory package; only its file-level
-            // probes are rendered above and the package walk stays unrendered.
             self.unsupported
                 .insert(UnsupportedTraceKind::DirectoryPackage);
         }
         if extension.is_none() && !result.is_ok() {
-            // A failed extensionless lookup continues into directory probes that
-            // this tracer does not render; report the gap instead of truncating.
             self.unsupported
                 .insert(UnsupportedTraceKind::DirectoryPackage);
         }
