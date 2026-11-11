@@ -1783,6 +1783,58 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn static_early_error_still_fails_the_run() -> Result<(), Box<dyn Error>> {
+        let (directory, entrypoint) = dynamic_fixture(
+            "static-early-error",
+            &[
+                (
+                    "main.ts",
+                    "import './early-error_FIXTURE.js';\nconsole.log(\"after\");\n",
+                ),
+                (
+                    "early-error_FIXTURE.js",
+                    "let wired = 1;\nlet wired = 2;\n",
+                ),
+            ],
+        )?;
+        let error =
+            run_program(&entrypoint).expect_err("a static early error still fails the run");
+        let super::Error::Diagnostics { diagnostics } = error else {
+            remove_fixture(&directory)?;
+            panic!("expected diagnostics, got {error:?}");
+        };
+        assert!(!diagnostics.is_empty());
+        remove_fixture(&directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compile_path_still_reports_dynamic_only_early_error() -> Result<(), Box<dyn Error>> {
+        let (directory, entrypoint) = dynamic_fixture(
+            "compile-pin-early",
+            &[
+                (
+                    "main.ts",
+                    "const pending = import(\"./early-error_FIXTURE.js\");\npending;\n",
+                ),
+                (
+                    "early-error_FIXTURE.js",
+                    "let wired = 1;\nlet wired = 2;\n",
+                ),
+            ],
+        )?;
+        let error = compile_source_file(&entrypoint)
+            .expect_err("the compile path still reports the dynamic-only early error");
+        let super::Error::Diagnostics { diagnostics } = error else {
+            panic!("expected diagnostics, got {error:?}");
+        };
+        assert!(!diagnostics.is_empty());
+        remove_fixture(&directory)?;
+        Ok(())
+    }
+
     #[test]
     fn compile_path_still_reports_dynamic_only_parse_error() -> Result<(), Box<dyn Error>> {
         let (directory, entrypoint) = dynamic_fixture(
