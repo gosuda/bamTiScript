@@ -6,7 +6,7 @@
 //! resolution-mode conditions, deterministic trace, and cycle-safe package lookup.
 //! It does not introduce a second path, options, or diagnostics model.
 
-use super::resolution_trace::ResolutionTraceLog;
+use super::resolution_trace::{ResolutionRequest, ResolutionTraceLog};
 use crate::project::{
     CompilerOptions, ModuleResolutionError, PackageError, PackageJson, PackageMode, PackageTarget,
     PathError, PathMapping, ProjectRoot, ResolutionConditions, ResolutionFlavor, parse_jsonc,
@@ -504,9 +504,11 @@ fn resolve_module_name_inner(
         if let Some(log) = log {
             log.record_module(
                 root,
-                &importer,
-                specifier,
-                (kind, mode, flavor),
+                ResolutionRequest {
+                    importer: &importer,
+                    specifier,
+                    strategy: (kind, mode, flavor),
+                },
                 options.module_resolution().is_some(),
                 true,
                 &result,
@@ -573,9 +575,11 @@ fn resolve_module_name_inner(
     if let Some(log) = log {
         log.record_module(
             root,
-            &importer,
-            specifier,
-            (kind, mode, flavor),
+            ResolutionRequest {
+                importer: &importer,
+                specifier,
+                strategy: (kind, mode, flavor),
+            },
             options.module_resolution().is_some(),
             false,
             &stored,
@@ -1160,7 +1164,7 @@ fn resolve_installed_package(
     let mut chain: Vec<(PathBuf, Option<Arc<str>>)> = Vec::new();
     let mut cursor = walk_start.clone();
     loop {
-        let confined = match root.confine(&cursor.join("package.json")) {
+        let confined = match root.confine(cursor.join("package.json")) {
             Ok(path) => path,
             Err(PathError::PathEscapesRoot { path, root }) => {
                 if cursor == package_root {

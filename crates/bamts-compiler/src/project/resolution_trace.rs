@@ -34,6 +34,15 @@ pub struct ResolutionTraceLog {
     unsupported: BTreeSet<UnsupportedTraceKind>,
 }
 
+/// One module-resolution request: the importing file, the specifier it names,
+/// and the kind, mode, and flavor the specifier resolves under.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResolutionRequest<'a> {
+    pub(crate) importer: &'a Path,
+    pub(crate) specifier: &'a str,
+    pub(crate) strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
+}
+
 impl ResolutionTraceLog {
     #[must_use]
     pub fn lines(&self) -> &[String] {
@@ -47,13 +56,16 @@ impl ResolutionTraceLog {
     pub(crate) fn record_module(
         &mut self,
         root: &ProjectRoot,
-        importer: &Path,
-        specifier: &str,
-        strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
+        request: ResolutionRequest<'_>,
         explicit_kind: bool,
         cached: bool,
         result: &Result<ResolvedModule, ResolutionError>,
     ) {
+        let ResolutionRequest {
+            importer,
+            specifier,
+            strategy,
+        } = request;
         if !(specifier.starts_with("./") || specifier.starts_with("../")) {
             if specifier.starts_with('#') {
                 self.unsupported.insert(UnsupportedTraceKind::PackageImport);
