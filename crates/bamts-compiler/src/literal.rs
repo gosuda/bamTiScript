@@ -22,24 +22,27 @@ pub(crate) fn number_value(lexeme: &str) -> Option<f64> {
     }
     if lexeme.len() > 1 && lexeme.as_bytes()[0] == b'0' {
         let rest = &lexeme[1..];
-        if !rest.contains(['.', 'e', 'E']) {
-            let mut has_octal_digit = false;
-            let mut all_octal = true;
-            for ch in rest.chars() {
-                if ch == '_' {
-                    continue;
-                }
-                if ('0'..='7').contains(&ch) {
-                    has_octal_digit = true;
-                    continue;
-                }
-                all_octal = false;
-                break;
+        let int_end = rest.find(['.', 'e', 'E']).unwrap_or(rest.len());
+        let int_part = &rest[..int_end];
+        let mut has_octal_digit = false;
+        let mut all_octal = true;
+        for ch in int_part.chars() {
+            if ch == '_' {
+                continue;
             }
-            if has_octal_digit && all_octal {
-                if let Some(value) = radix_value(rest, 8) {
-                    return Some(value);
-                }
+            if ('0'..='7').contains(&ch) {
+                has_octal_digit = true;
+                continue;
+            }
+            all_octal = false;
+            break;
+        }
+        if has_octal_digit && all_octal {
+            if int_end != rest.len() {
+                return None;
+            }
+            if let Some(value) = radix_value(rest, 8) {
+                return Some(value);
             }
         }
     }
@@ -622,6 +625,18 @@ mod tests {
         assert_eq!(number_value("08"), Some(8.0), "test262/language/literals/numeric/non-octal-decimal-integer.js 08 stays decimal");
         assert_eq!(number_value("0708"), Some(708.0), "non-octal-decimal-integer.js 0708 stays decimal");
     }
+    #[test]
+    fn legacy_octal_integer_literal_rejects_fraction_and_exponent() {
+        assert_eq!(number_value("010.5"), None);
+        assert_eq!(number_value("010e1"), None);
+    }
+
+    #[test]
+    fn non_octal_decimal_integer_literal_allows_fraction_and_exponent() {
+        assert_eq!(number_value("08.5"), Some(8.5));
+        assert_eq!(number_value("09e1"), Some(90.0));
+    }
+
 
     #[test]
     fn cooks_line_continuations() {
