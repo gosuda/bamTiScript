@@ -20,6 +20,29 @@ pub(crate) fn number_value(lexeme: &str) -> Option<f64> {
     {
         return radix_value(rest, 2);
     }
+    if lexeme.len() > 1 && lexeme.as_bytes()[0] == b'0' {
+        let rest = &lexeme[1..];
+        if !rest.contains(['.', 'e', 'E']) {
+            let mut has_octal_digit = false;
+            let mut all_octal = true;
+            for ch in rest.chars() {
+                if ch == '_' {
+                    continue;
+                }
+                if ('0'..='7').contains(&ch) {
+                    has_octal_digit = true;
+                    continue;
+                }
+                all_octal = false;
+                break;
+            }
+            if has_octal_digit && all_octal {
+                if let Some(value) = radix_value(rest, 8) {
+                    return Some(value);
+                }
+            }
+        }
+    }
     if !lexeme.contains('_') {
         return lexeme.parse().ok();
     }
@@ -590,6 +613,14 @@ mod tests {
         ] {
             assert!(!has_cooked_value(interior), "{interior}");
         }
+    }
+
+    #[test]
+    fn legacy_octal_integer_value_is_base_eight() {
+        assert_eq!(number_value("070"), Some(56.0), "test262/language/literals/numeric/legacy-octal-integer.js 070 must be 56");
+        assert_eq!(number_value("077"), Some(63.0), "legacy-octal-integer.js 077 must be 63");
+        assert_eq!(number_value("08"), Some(8.0), "test262/language/literals/numeric/non-octal-decimal-integer.js 08 stays decimal");
+        assert_eq!(number_value("0708"), Some(708.0), "non-octal-decimal-integer.js 0708 stays decimal");
     }
 
     #[test]
