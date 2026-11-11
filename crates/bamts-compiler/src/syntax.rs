@@ -1242,12 +1242,19 @@ pub struct ImportAttributes {
     pub entries: Vec<ImportAttribute>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ImportPhase {
+    Defer,
+    Source,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportDeclaration {
     pub type_only: bool,
     pub clause: Option<ImportClause>,
     pub source: StringLiteralNode,
     pub attributes: Option<ImportAttributes>,
+    pub phase: Option<ImportPhase>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

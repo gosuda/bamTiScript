@@ -64,7 +64,7 @@ use crate::syntax::{
     ForInitializer, ForOfMode, ForOfStatement, ForStatement, FunctionBody, FunctionDeclaration,
     FunctionExpression, FunctionLike, FunctionType, FunctionTypeParameter, Identifier,
     IdentifierNode, IfStatement, ImportAttribute, ImportAttributes, ImportBinding, ImportClause,
-    ImportDeclaration, ImportEqualsDeclaration, ImportExpression, ImportSpecifier,
+    ImportDeclaration, ImportEqualsDeclaration, ImportExpression, ImportPhase, ImportSpecifier,
     ImportSpecifierMode, ImportSpecifierNode, ImportType, IndexSignature, IndexedAccessType,
     InferType, InterfaceDeclaration, JsxAttribute, JsxAttributeInitializer, JsxAttributeItem,
     JsxAttributeName, JsxChild, JsxClosingElement, JsxClosingElementNode, JsxElement,
@@ -2804,6 +2804,7 @@ impl Parser {
                     clause: None,
                     source,
                     attributes,
+                    phase: None,
                 }),
             );
         }
@@ -2833,7 +2834,51 @@ impl Parser {
                 }),
             );
         }
-
+        if self.cur_lexeme() == "defer" && self.nth_kind(1) == TokenKind::Star {
+            self.bump();
+            let binding = self.parse_namespace_import();
+            self.expect(TokenKind::KwFrom, "expected `from`");
+            let source = self.parse_string_literal();
+            let attributes = self.parse_optional_import_attributes();
+            self.expect_semicolon();
+            return self.node(
+                start,
+                Statement::Import(ImportDeclaration {
+                    type_only,
+                    clause: Some(ImportClause {
+                        default: None,
+                        binding: Some(binding),
+                    }),
+                    source,
+                    attributes,
+                    phase: Some(ImportPhase::Defer),
+                }),
+            );
+        }
+        if self.cur_lexeme() == "source"
+            && is_identifier_like(self.nth_kind(1))
+            && self.nth_kind(2) == TokenKind::KwFrom
+        {
+            self.bump();
+            let local = self.expect_identifier("expected an import name");
+            self.expect(TokenKind::KwFrom, "expected `from`");
+            let source = self.parse_string_literal();
+            let attributes = self.parse_optional_import_attributes();
+            self.expect_semicolon();
+            return self.node(
+                start,
+                Statement::Import(ImportDeclaration {
+                    type_only,
+                    clause: Some(ImportClause {
+                        default: Some(local),
+                        binding: None,
+                    }),
+                    source,
+                    attributes,
+                    phase: Some(ImportPhase::Source),
+                }),
+            );
+        }
         let clause = self.parse_import_clause();
         self.expect(TokenKind::KwFrom, "expected `from`");
         let source = self.parse_module_name(false);
@@ -2846,6 +2891,7 @@ impl Parser {
                 clause: Some(clause),
                 source,
                 attributes,
+                phase: None,
             }),
         )
     }
@@ -7721,6 +7767,17 @@ mod tests {
         let source = "const a = <p>, /x</p>;\nconst b = <p>= /'</p>;\n";
         let parsed = parse_text(source, ScriptKind::TypeScriptReact);
         assert!(errors(&parsed).is_empty(), "{:?}", errors(&parsed));
+    }
+    #[test]
+    fn import_phase_syntax_parses() {
+        for source in [
+            "import defer * as ns from \"x\";",
+            "import source x from \"x\";",
+            "import source from from \"x\";",
+        ] {
+            assert_clean(source);
+        }
+        assert!(!errors(&parse_ts("import defer { a } from \"x\";")).is_empty());
     }
 
     #[test]
