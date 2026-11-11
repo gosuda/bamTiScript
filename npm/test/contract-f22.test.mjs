@@ -1,34 +1,15 @@
-// F2.2 Contract: sync, async, filesystem, protocol, project, checker,
-// snapshot, completion, and reference API behavior.
-//
-// Asserts the sync/async/fs/proto subpaths import and expose the expected
-// API surface, and that the protocol framing roundtrips correctly.
-
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const npmRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-let pass = 0;
-const fail = [];
-
-function check(name, fn) {
-  try {
-    fn();
-    pass++;
-  } catch (err) {
-    fail.push(`${name}: ${err.message}`);
-  }
-}
-
-// --- sync subpath ---
-const sync = await import("bamti/unstable/sync");
-check("sync.createSerialService is function", () => {
+const sync = await import("../bamti/unstable/sync.js");
+test("sync.createSerialService is function", () => {
   assert.ok(typeof sync.createSerialService === "function");
 });
-check("sync has 10 service methods + request/dispose", () => {
+test("sync has 10 service methods + request/dispose", () => {
   const svc = sync.createSerialService({ root: "/tmp" });
   const methods = ["open", "update", "close", "snapshot", "completions",
     "definition", "quickInfo", "references", "rename", "diagnostics"];
@@ -40,12 +21,11 @@ check("sync has 10 service methods + request/dispose", () => {
   svc.dispose();
 });
 
-// --- async subpath ---
-const asyncMod = await import("bamti/unstable/async");
-check("async.createAsyncService is function", () => {
+const asyncMod = await import("../bamti/unstable/async.js");
+test("async.createAsyncService is function", () => {
   assert.ok(typeof asyncMod.createAsyncService === "function");
 });
-check("async has 10 service methods + request/dispose", () => {
+test("async has 10 service methods + request/dispose", () => {
   const svc = asyncMod.createAsyncService({ root: "/tmp" });
   const methods = ["open", "update", "close", "snapshot", "completions",
     "definition", "quickInfo", "references", "rename", "diagnostics"];
@@ -57,43 +37,41 @@ check("async has 10 service methods + request/dispose", () => {
   svc.dispose();
 });
 
-// --- fs subpath ---
-const fs = await import("bamti/unstable/fs");
-check("fs.osFileSystem is function", () => {
+const fs = await import("../bamti/unstable/fs.js");
+test("fs.osFileSystem is function", () => {
   assert.ok(typeof fs.osFileSystem === "function");
 });
-check("fs.osFileSystem returns frozen descriptor", () => {
+test("fs.osFileSystem returns frozen descriptor", () => {
   const fsys = fs.osFileSystem("/tmp");
   assert.equal(fsys.kind, "os");
   assert.ok(typeof fsys.root === "string");
   assert.ok(Object.isFrozen(fsys));
 });
 
-// --- proto subpath ---
-const proto = await import("bamti/unstable/proto");
-check("proto.encodeFrame is function", () => {
+const proto = await import("../bamti/unstable/proto.js");
+test("proto.encodeFrame is function", () => {
   assert.ok(typeof proto.encodeFrame === "function");
 });
-check("proto.FrameDecoder is function", () => {
+test("proto.FrameDecoder is function", () => {
   assert.ok(typeof proto.FrameDecoder === "function");
 });
-check("proto.MAX_FRAME_BYTES is number", () => {
+test("proto.MAX_FRAME_BYTES is number", () => {
   assert.ok(typeof proto.MAX_FRAME_BYTES === "number");
 });
-check("proto.MAX_HEADER_BYTES is number", () => {
+test("proto.MAX_HEADER_BYTES is number", () => {
   assert.ok(typeof proto.MAX_HEADER_BYTES === "number");
 });
-check("proto.Transport is function", () => {
+test("proto.Transport is function", () => {
   assert.ok(typeof proto.Transport === "function");
 });
-check("proto exports 7 error classes", () => {
+test("proto exports 7 error classes", () => {
   for (const e of ["BamtiError", "DisposedError", "ProtocolError",
     "RestartLimitError", "ServiceRequestError", "TransportBusyError",
     "TransportCrashError"]) {
     assert.ok(proto[e], `proto.${e} missing`);
   }
 });
-check("encodeFrame/FrameDecoder roundtrip", () => {
+test("encodeFrame/FrameDecoder roundtrip", () => {
   const message = { method: "service/open", params: {} };
   const frame = proto.encodeFrame(message);
   assert.ok(frame instanceof Uint8Array);
@@ -105,15 +83,7 @@ check("encodeFrame/FrameDecoder roundtrip", () => {
   assert.deepEqual(msgs[0], message, "decoded message must match original");
 });
 
-check("encodeFrame rejects oversized payload", () => {
+test("encodeFrame rejects oversized payload", () => {
   const huge = "x".repeat(proto.MAX_FRAME_BYTES + 1);
   assert.throws(() => proto.encodeFrame({ data: huge }), /frame/);
 });
-
-// --- Report ---
-const total = pass + fail.length;
-process.stdout.write(`F2.2_CONTRACT ${pass}/${total} pass\n`);
-if (fail.length > 0) {
-  for (const f of fail) process.stdout.write(`FAIL: ${f}\n`);
-  process.exit(1);
-}
