@@ -73,6 +73,7 @@ pub enum ModuleEdgeKind {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ReferenceDirectiveKind {
     Path,
+    Types,
 }
 
 /// The canonical identity of a resolved module dependency.
@@ -987,22 +988,72 @@ impl ProgramLoader {
         directive: ReferenceDirectiveKind,
         cancel: &CancellationToken,
     ) -> Result<ResolvedEdge, ProgramLoadError> {
-        let ReferenceDirectiveKind::Path = directive;
         let flavor = ResolutionFlavor::Types;
-        if let Some(target) = self.resolve_local(importer, edge, flavor, cancel)? {
-            let type_overlay = self.type_overlay(importer, edge, &target, cancel)?;
-            return Ok(ResolvedEdge {
-                target,
-                type_overlay,
-                flavor,
-            });
+        match directive {
+            ReferenceDirectiveKind::Types => {
+                if let Some(path) = self.resolve_type_directive(importer, &edge.specifier, edge.mode)?
+                {
+                    return Ok(ResolvedEdge {
+                        target: ResolvedEdgeTarget::Local(path),
+                        type_overlay: None,
+                        flavor,
+                    });
+                }
+                Err(ProgramLoadError::UnresolvedModule(diagnostic(
+                    importer,
+                    &edge.specifier,
+                    edge.kind,
+                    edge.range,
+                )))
+            }
+            ReferenceDirectiveKind::Path => {
+                if let Some(target) = self.resolve_local(importer, edge, flavor, cancel)? {
+                    let type_overlay = self.type_overlay(importer, edge, &target, cancel)?;
+                    return Ok(ResolvedEdge {
+                        target,
+                        type_overlay,
+                        flavor,
+                    });
+                }
+                Err(ProgramLoadError::UnresolvedModule(diagnostic(
+                    importer,
+                    &edge.specifier,
+                    edge.kind,
+                    edge.range,
+                )))
+            }
         }
-        Err(ProgramLoadError::UnresolvedModule(diagnostic(
+    }
+
+    fn resolve_type_directive(
+        &self,
+        importer: &Path,
+        specifier: &str,
+        mode: ResolutionMode,
+    ) -> Result<Option<PathBuf>, ProgramLoadError> {
+        let kind = ModuleResolutionKind::from_options(&self.options)
+            .unwrap_or(ModuleResolutionKind::Bundler);
+        let host = LoaderResolutionHost(self.fs.as_ref());
+        let mut cache = ResolutionCache::new();
+        match resolve_type_reference(
+            &self.root,
+            &self.options,
             importer,
-            &edge.specifier,
-            edge.kind,
-            edge.range,
-        )))
+            specifier,
+            (kind, mode),
+            &host,
+            &mut cache,
+        ) {
+            Ok(resolved) => self
+                .fs
+                .normalize(resolved.path())
+                .map(Some)
+                .map_err(|error| ProgramLoadError::Read {
+                    path: resolved.path().to_path_buf(),
+                    source: file_system_io(error),
+                }),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Reads a package or specifier the runtime rules refused as not found.
@@ -1840,6 +1891,7 @@ fn parse_reference_directive(
         };
         let kind = match attribute.name {
             "path" => ReferenceDirectiveKind::Path,
+            "types" => ReferenceDirectiveKind::Types,
             _ => continue,
         };
         edges.push(UnresolvedEdge {
@@ -5546,6 +5598,39 @@ mod tests {
             .expect("trailing comment loads");
         assert_eq!(resolved.modules().len(), 1);
         assert!(resolved.entrypoint().dependencies().is_empty());
+    }
+
+    #[test]
+    fn reference_types_directive_resolves_at_types_package() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "node_modules/@types/foo/index.d.ts",
+            "export const value: number;\n",
+        );
+        fixture.write(
+            "main.ts",
+            "/// <reference types=\"foo\" />\nexport const x = 1;\n",
+        );
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("types directive loads");
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(edge.kind(), ModuleEdgeKind::TypeOnly);
+        assert_eq!(
+            edge.reference_directive(),
+            Some(ReferenceDirectiveKind::Types)
+        );
+        assert!(!edge.is_unresolved());
+        assert!(matches!(edge.target(), ModuleTarget::Local(_)));
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main_wire = module(&executable, "main.ts");
+        assert!(
+            main_wire.edges().is_empty(),
+            "a reference directive creates no runtime edge"
+        );
     }
 
 
