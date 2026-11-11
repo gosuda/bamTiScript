@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const npmRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier === "bamti-cli") {
+      return {
+        shortCircuit: true,
+        url: pathToFileURL(join(npmRoot, "bamti-cli", "index.js")).href,
+      };
+    }
+    return nextResolve(specifier);
+  },
+});
 const sync = await import("../bamti/unstable/sync.js");
 test("sync.createSerialService is function", () => {
   assert.ok(typeof sync.createSerialService === "function");

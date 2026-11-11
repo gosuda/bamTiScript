@@ -1,5 +1,22 @@
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const npmRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier === "bamti-cli") {
+      return {
+        shortCircuit: true,
+        url: pathToFileURL(join(npmRoot, "bamti-cli", "index.js")).href,
+      };
+    }
+    return nextResolve(specifier);
+  },
+});
 
 const ast = await import("../bamti/unstable/ast/index.js");
 test("ast.nodeId is function", () => assert.ok(typeof ast.nodeId === "function"));
