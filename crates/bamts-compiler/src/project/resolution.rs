@@ -860,6 +860,46 @@ fn pathdiff_relative(from_dir: &Path, to: &Path) -> String {
     }
 }
 
+fn probe_loose_files(
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+    node_modules: &Path,
+    package_name: &str,
+    subpath: &str,
+    extensions: &[&str],
+) -> Option<PathBuf> {
+    if package_name.starts_with('@') {
+        return None;
+    }
+    if !host.directory_exists(node_modules) {
+        return None;
+    }
+    let mut stem = node_modules.join(package_name);
+    if !subpath.is_empty() {
+        stem.push(subpath);
+    }
+    if stem.extension().is_some() {
+        return None;
+    }
+    for root in [stem.clone(), stem.join("index")] {
+        for extension in extensions {
+            let mut name = root.clone().into_os_string();
+            name.push(".");
+            name.push(extension);
+            let candidate = PathBuf::from(name);
+            let exists = host.file_exists(&candidate);
+            trace.push(ResolutionTraceStep::Candidate {
+                path: candidate.clone(),
+                exists,
+            });
+            if exists {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 fn try_node_modules(
     context: (&ProjectRoot, &CompilerOptions),
     importer: &Path,
@@ -883,6 +923,19 @@ fn try_node_modules(
             path: package_json.clone(),
             exists: host.file_exists(&package_json),
         });
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        if parent == directory {
+            break;
+        }
+        directory = parent.to_path_buf();
+    }
+    let mut directory = containing.to_path_buf();
+    loop {
+        if !directory.starts_with(root.path()) {
+            break;
+        }
         let node_modules = directory.join("node_modules");
         trace.push(ResolutionTraceStep::NodeModulesWalk {
             directory: directory.clone(),
@@ -904,6 +957,32 @@ fn try_node_modules(
         {
             return Ok(Some(resolved));
         }
+        if kind == ModuleResolutionKind::Bundler
+            && let Some(found) = probe_loose_files(
+                host,
+                trace,
+                &node_modules,
+                &package_name,
+                &subpath,
+                &["ts", "tsx", "d.ts"],
+            )
+        {
+            let path = root.confine(&found).map_err(|error| match error {
+                PathError::PathEscapesRoot { path, root } => ResolutionError::EscapesRoot {
+                    path,
+                    root,
+                    trace: trace.clone(),
+                },
+                other => ResolutionError::Path(other),
+            })?;
+            return Ok(Some(ResolvedModule {
+                path,
+                kind,
+                mode,
+                package_json: None,
+                trace: ResolutionTrace::default(),
+            }));
+        }
         let Some(parent) = directory.parent() else {
             break;
         };
@@ -923,6 +1002,32 @@ fn try_node_modules(
             exists: host.directory_exists(&node_modules),
             fallback: true,
         });
+        if kind == ModuleResolutionKind::Bundler
+            && let Some(found) = probe_loose_files(
+                host,
+                trace,
+                &node_modules,
+                &package_name,
+                &subpath,
+                &["js", "jsx", "json"],
+            )
+        {
+            let path = root.confine(&found).map_err(|error| match error {
+                PathError::PathEscapesRoot { path, root } => ResolutionError::EscapesRoot {
+                    path,
+                    root,
+                    trace: trace.clone(),
+                },
+                other => ResolutionError::Path(other),
+            })?;
+            return Ok(Some(ResolvedModule {
+                path,
+                kind,
+                mode,
+                package_json: None,
+                trace: ResolutionTrace::default(),
+            }));
+        }
         let Some(parent) = directory.parent() else {
             break;
         };
@@ -1334,7 +1439,7 @@ mod tests {
         }
 
         fn directory_exists(&self, path: &Path) -> bool {
-            self.directories.contains(path) || self.files.keys().any(|file| file.starts_with(path))
+            self.directories.contains(path)
         }
 
         fn read_file(&self, path: &Path) -> Option<Arc<str>> {
@@ -1918,6 +2023,64 @@ mod tests {
             "Directory '/workspace/a/node_modules' does not exist, skipping all lookups in it.",
             "Directory '/workspace/node_modules' does not exist, skipping all lookups in it.",
             "======== Module name 'foo' was not resolved. ========",
+        ];
+        let drive = trace_drive();
+        let expected: Vec<String> = expected
+            .iter()
+            .map(|line| line.replace("'/workspace", &format!("'{drive}/workspace")))
+            .collect();
+        let produced: Vec<&str> = log.lines().iter().map(String::as_str).collect();
+        assert_eq!(produced, expected);
+        assert!(log.unsupported().is_empty());
+    }
+    #[test]
+    fn trace_bundler_loose_file_hit_matches_upstream_probes() {
+        let options = options_with_resolution("bundler");
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/a/b/node_modules/foo.d.ts"),
+            "export declare const x: number;\n",
+        );
+        let mut cache = ResolutionCache::new();
+        let mut log = ResolutionTraceLog::default();
+        let resolved = resolve_module_name_with_trace(
+            &root(),
+            &options,
+            abs("/workspace/a/b/c/d/e/app.ts"),
+            "foo",
+            (
+                ModuleResolutionKind::Bundler,
+                ResolutionMode::Import,
+                ResolutionFlavor::Runtime,
+            ),
+            TraceResolutionServices {
+                host: &host,
+                cache: &mut cache,
+                log: &mut log,
+            },
+        )
+        .expect("loose declaration hit");
+        assert_eq!(resolved.path(), abs("/workspace/a/b/node_modules/foo.d.ts").as_path());
+        let expected: &[&str] = &[
+            "======== Resolving module 'foo' from '/workspace/a/b/c/d/e/app.ts'. ========",
+            "Explicitly specified module resolution kind: 'Bundler'.",
+            "Resolving in CJS mode with conditions 'import', 'types'.",
+            "File '/workspace/a/b/c/d/e/package.json' does not exist.",
+            "File '/workspace/a/b/c/d/package.json' does not exist.",
+            "File '/workspace/a/b/c/package.json' does not exist.",
+            "File '/workspace/a/b/package.json' does not exist.",
+            "File '/workspace/a/package.json' does not exist.",
+            "File '/workspace/package.json' does not exist.",
+            "Loading module 'foo' from 'node_modules' folder, target file types: TypeScript, JavaScript, Declaration, JSON.",
+            "Searching all ancestor node_modules directories for preferred extensions: TypeScript, Declaration.",
+            "Directory '/workspace/a/b/c/d/e/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/a/b/c/d/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/a/b/c/node_modules' does not exist, skipping all lookups in it.",
+            "File '/workspace/a/b/node_modules/foo.ts' does not exist.",
+            "File '/workspace/a/b/node_modules/foo.tsx' does not exist.",
+            "File '/workspace/a/b/node_modules/foo.d.ts' exists - use it as a name resolution result.",
+            "Resolving real path for '/workspace/a/b/node_modules/foo.d.ts', result '/workspace/a/b/node_modules/foo.d.ts'.",
+            "======== Module name 'foo' was successfully resolved to '/workspace/a/b/node_modules/foo.d.ts'. ========",
         ];
         let drive = trace_drive();
         let expected: Vec<String> = expected

@@ -34,6 +34,10 @@ pub struct ResolutionTraceLog {
     unsupported: BTreeSet<UnsupportedTraceKind>,
 }
 
+enum BareItem<'a> {
+    Skip(&'a PathBuf),
+    File(&'a PathBuf, bool),
+}
 impl ResolutionTraceLog {
     #[must_use]
     pub fn lines(&self) -> &[String] {
@@ -143,6 +147,7 @@ impl ResolutionTraceLog {
         }
     }
 
+
     fn render_bundler_bare(
         &mut self,
         importer: &Path,
@@ -156,12 +161,14 @@ impl ResolutionTraceLog {
             Err(error) => error.trace(),
         };
         let Some(trace) = trace else { return false };
-        if result.is_ok() {
+        if Path::new(specifier).extension().is_some() || specifier.starts_with('@') {
             return false;
         }
         let mut probes = Vec::new();
         let mut preferred = Vec::new();
         let mut fallback = Vec::new();
+        let mut realpath = None;
+        let mut in_fallback = false;
         for step in trace.steps() {
             match step {
                 ResolutionTraceStep::PackageJsonProbe { path, exists } => {
@@ -175,17 +182,24 @@ impl ResolutionTraceLog {
                     exists,
                     fallback: is_fallback,
                 } => {
-                    if *exists {
-                        return false;
-                    }
                     if *is_fallback {
-                        fallback.push(directory);
-                    } else {
-                        preferred.push(directory);
+                        in_fallback = true;
+                    }
+                    if !*exists {
+                        let items = if *is_fallback { &mut fallback } else { &mut preferred };
+                        items.push(BareItem::Skip(directory));
                     }
                 }
+                ResolutionTraceStep::Candidate { path, exists } => {
+                    let items = if in_fallback { &mut fallback } else { &mut preferred };
+                    items.push(BareItem::File(path, *exists));
+                }
+                ResolutionTraceStep::Resolved { path } => {
+                    realpath = Some(path);
+                }
                 ResolutionTraceStep::PackageJson { .. }
-                | ResolutionTraceStep::PathsMatch { .. } => return false,
+                | ResolutionTraceStep::PathsMatch { .. }
+                | ResolutionTraceStep::TypesFallback { .. } => return false,
                 _ => {}
             }
         }
@@ -212,10 +226,7 @@ impl ResolutionTraceLog {
             "Resolving in CJS mode with conditions '{condition}', 'types'."
         ));
         for path in &probes {
-            self.lines.push(format!(
-                "File '{}' does not exist.",
-                display_path(path)
-            ));
+            self.lines.push(format!("File '{}' does not exist.", display_path(path)));
         }
         self.lines.push(format!(
             "Loading module '{specifier}' from 'node_modules' folder, target file types: TypeScript, JavaScript, Declaration, JSON."
@@ -224,25 +235,57 @@ impl ResolutionTraceLog {
             "Searching all ancestor node_modules directories for preferred extensions: TypeScript, Declaration."
                 .to_string(),
         );
-        for directory in &preferred {
+        for item in &preferred {
+            match item {
+                BareItem::Skip(directory) => self.lines.push(format!(
+                    "Directory '{}/node_modules' does not exist, skipping all lookups in it.",
+                    display_path(directory)
+                )),
+                BareItem::File(path, true) => self.lines.push(format!(
+                    "File '{}' exists - use it as a name resolution result.",
+                    display_path(path)
+                )),
+                BareItem::File(path, false) => {
+                    self.lines.push(format!("File '{}' does not exist.", display_path(path)))
+                }
+            }
+        }
+        if realpath.is_none() || !fallback.is_empty() {
+            self.lines.push(
+                "Searching all ancestor node_modules directories for fallback extensions: JavaScript, JSON."
+                    .to_string(),
+            );
+            for item in &fallback {
+                match item {
+                    BareItem::Skip(directory) => self.lines.push(format!(
+                        "Directory '{}/node_modules' does not exist, skipping all lookups in it.",
+                        display_path(directory)
+                    )),
+                    BareItem::File(path, true) => self.lines.push(format!(
+                        "File '{}' exists - use it as a name resolution result.",
+                        display_path(path)
+                    )),
+                    BareItem::File(path, false) => self
+                        .lines
+                        .push(format!("File '{}' does not exist.", display_path(path))),
+                }
+            }
+        }
+        if let Some(path) = realpath {
             self.lines.push(format!(
-                "Directory '{}/node_modules' does not exist, skipping all lookups in it.",
-                display_path(directory)
+                "Resolving real path for '{}', result '{}'.",
+                display_path(path),
+                display_path(path)
+            ));
+            self.lines.push(format!(
+                "======== Module name '{specifier}' was successfully resolved to '{}'. ========",
+                display_path(path)
+            ));
+        } else {
+            self.lines.push(format!(
+                "======== Module name '{specifier}' was not resolved. ========"
             ));
         }
-        self.lines.push(
-            "Searching all ancestor node_modules directories for fallback extensions: JavaScript, JSON."
-                .to_string(),
-        );
-        for directory in &fallback {
-            self.lines.push(format!(
-                "Directory '{}/node_modules' does not exist, skipping all lookups in it.",
-                display_path(directory)
-            ));
-        }
-        self.lines.push(format!(
-            "======== Module name '{specifier}' was not resolved. ========"
-        ));
         true
     }
 
