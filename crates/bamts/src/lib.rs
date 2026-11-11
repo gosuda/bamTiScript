@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
@@ -16,14 +17,15 @@ use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
 use bamts_compiler::lint::{LintProfile, LintTable};
 use bamts_compiler::lower::LowerOptions;
 use bamts_compiler::parser::parse;
-use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend_with_cancel};
 use bamts_compiler::program::{
-    ProgramLoadError, ProgramLoader, ProgramLowerError, ResolvedProgram, lower_program_with_cancel,
+    ModuleEdgeKind, ModuleTarget, ProgramLoadError, ProgramLoader, ProgramLowerError,
+    ResolvedProgram, lower_program_with_cancel,
 };
+use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend_with_cancel};
 use bamts_compiler::project::canonical::canonicalize;
 use bamts_compiler::project::{ConfigError, ProjectConfig, ProjectRoot};
 use bamts_compiler::scanner::scan;
-use bamts_compiler::source::ScriptKind;
+use bamts_compiler::source::{ScriptKind, SourceId, TextRange};
 
 pub use bamts_bytecode as bytecode;
 pub use bamts_compiler as compiler;
@@ -220,20 +222,7 @@ fn compile_entry(
     script_entry: bool,
     cancel: &CancellationToken,
 ) -> Result<bamts_compiler::program::ExecutableProgram> {
-    let path = canonical_entrypoint_with_cancel(path, cancel)?;
-    let fallback_root = path.parent().map(Path::to_path_buf).ok_or_else(|| {
-        Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "entrypoint has no parent directory",
-        )))
-    })?;
-    let resolved = resolve_project_with_cancel(&path, fallback_root, cancel)?;
-    let frontend = compile_program_frontend_with_cancel(
-        &resolved.program,
-        FrontendMode::Check,
-        lints,
-        cancel,
-    )?;
+    let (resolved, frontend) = load_checked_frontend(path, lints, cancel)?;
     let diagnostics = frontend
         .modules()
         .iter()
@@ -260,15 +249,134 @@ fn compile_entry(
     .map_err(Error::from)
 }
 
+fn load_checked_frontend(
+    path: &Path,
+    lints: &LintTable,
+    cancel: &CancellationToken,
+) -> Result<(
+    ResolvedProject,
+    bamts_compiler::pipeline::ProgramFrontendOutput,
+)> {
+    let path = canonical_entrypoint_with_cancel(path, cancel)?;
+    let fallback_root = path.parent().map(Path::to_path_buf).ok_or_else(|| {
+        Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "entrypoint has no parent directory",
+        )))
+    })?;
+    let resolved = resolve_project_with_cancel(&path, fallback_root, cancel)?;
+    let frontend = compile_program_frontend_with_cancel(
+        &resolved.program,
+        FrontendMode::Check,
+        lints,
+        cancel,
+    )?;
+    Ok((resolved, frontend))
+}
+
+fn static_reachable_sources(program: &ResolvedProgram) -> HashSet<SourceId> {
+    let mut reachable = HashSet::new();
+    let mut worklist = vec![program.entrypoint_id()];
+    reachable.insert(program.entrypoint_id());
+    while let Some(id) = worklist.pop() {
+        let Some(current) = program.module(id) else {
+            continue;
+        };
+        for dependency in current.dependencies() {
+            if dependency.kind() != ModuleEdgeKind::StaticRuntime {
+                continue;
+            }
+            if let ModuleTarget::Local(target) = dependency.target() {
+                if reachable.insert(*target) {
+                    worklist.push(*target);
+                }
+            }
+        }
+    }
+    reachable
+}
+
+#[cfg(feature = "node-host")]
+fn compile_entry_for_run(
+    path: &Path,
+    lints: &LintTable,
+    script_entry: bool,
+    cancel: &CancellationToken,
+) -> Result<bamts_compiler::program::ExecutableProgram> {
+    let (resolved, frontend) = load_checked_frontend(path, lints, cancel)?;
+    let reachable = static_reachable_sources(&resolved.program);
+    let dynamic_ranges: HashSet<(SourceId, TextRange)> = resolved
+        .program
+        .modules()
+        .iter()
+        .flat_map(|module| {
+            module.dependencies().iter().filter_map(|edge| {
+                (edge.kind() == ModuleEdgeKind::DynamicRuntime && edge.is_unresolved())
+                    .then_some((module.source_id(), edge.range()))
+            })
+        })
+        .collect();
+    let diagnostics = frontend
+        .modules()
+        .iter()
+        .filter(|module| reachable.contains(&module.source_file().source_id()))
+        .flat_map(|module| module.diagnostics().iter())
+        .filter(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Error)
+        .filter(|diagnostic| {
+            !dynamic_ranges.contains(&(diagnostic.source_id(), diagnostic.range()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !diagnostics.is_empty() {
+        return Err(Error::Diagnostics { diagnostics });
+    }
+    let diagnostics = execution_early_errors(&resolved.program, script_entry);
+    if !diagnostics.is_empty() {
+        return Err(Error::Diagnostics { diagnostics });
+    }
+    lower_program_with_cancel(
+        &resolved.program,
+        &frontend,
+        LowerOptions {
+            javascript_compatibility: true,
+            script_entry,
+        },
+        cancel,
+    )
+    .map_err(Error::from)
+}
+
 /// The early errors of every JavaScript module about to run. TypeScript sources
 /// answer to the checker instead. Node refuses to load a module that has one, so
 /// a caller that runs or compiles `program` stops on any of them. `script_entry`
 /// says that the host runs the entrypoint as a Script.
 pub fn early_errors(program: &ResolvedProgram, script_entry: bool) -> Vec<Diagnostic> {
+    collect_early_errors(program, script_entry, None)
+}
+
+/// The early errors that stop execution: only static-reachable modules count.
+/// A module reachable only through `import()` rejects that `import()` at run
+/// time instead, per ECMA-262 13.3.10, so its early errors never fail the run.
+pub fn execution_early_errors(
+    program: &ResolvedProgram,
+    script_entry: bool,
+) -> Vec<Diagnostic> {
+    let reachable = static_reachable_sources(program);
+    collect_early_errors(program, script_entry, Some(&reachable))
+}
+
+fn collect_early_errors(
+    program: &ResolvedProgram,
+    script_entry: bool,
+    reachable: Option<&HashSet<SourceId>>,
+) -> Vec<Diagnostic> {
     let entrypoint = program.entrypoint().source_id();
     program
         .modules()
         .iter()
+        .filter(|module| {
+            reachable.is_none_or(|sources| sources.contains(&module.source_id()))
+        })
         .filter(|module| {
             matches!(
                 module.script_kind(),
@@ -294,7 +402,6 @@ pub fn early_errors(program: &ResolvedProgram, script_entry: bool) -> Vec<Diagno
 /// Runs an entrypoint and its complete local module graph with the deterministic
 /// Node-compatible host.
 ///
-/// ```
 /// # fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 /// let path = std::env::temp_dir().join(format!(
 ///     "bamts-facade-run-{}.ts",
@@ -310,7 +417,12 @@ pub fn early_errors(program: &ResolvedProgram, script_entry: bool) -> Vec<Diagno
 /// ```
 #[cfg(feature = "node-host")]
 pub fn run_program(path: impl AsRef<Path>) -> Result<ProgramOutput> {
-    let executable = compile_source_file_with_cancel(path, &CancellationToken::new())?;
+    let executable = compile_entry_for_run(
+        path.as_ref(),
+        &LintTable::new(LintProfile::Default),
+        false,
+        &CancellationToken::new(),
+    )?;
     let mut host = bamts_node::NodeHost::new();
     host.set_script_compiler(Box::new(ScriptCompiler));
     let outcome = bamts_runtime::run(
@@ -1480,6 +1592,245 @@ mod tests {
         }
         remove_fixture(&directory)
     }
+
+    fn dynamic_fixture(
+        name: &str,
+        files: &[(&str, &str)],
+    ) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+        let directory = std::env::temp_dir().join(format!(
+            "bamts-facade-dynamic-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        for (file, source) in files {
+            std::fs::write(directory.join(file), source)?;
+        }
+        let entrypoint = directory.join("main.ts");
+        Ok((directory, entrypoint))
+    }
+
+    #[cfg(feature = "node-host")]
+    fn run_dynamic_program(
+        name: &str,
+        files: &[(&str, &str)],
+    ) -> Result<super::ProgramOutput, Box<dyn Error>> {
+        let (directory, entrypoint) = dynamic_fixture(name, files)?;
+        let output = run_program(&entrypoint)?;
+        remove_fixture(&directory)?;
+        Ok(output)
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn dynamic_missing_file_runs_importer_and_rejects() -> Result<(), Box<dyn Error>> {
+        let output = run_dynamic_program(
+            "missing-file",
+            &[(
+                "main.ts",
+                "console.log(\"before\");\n\
+                 const pending = import(\"./THIS_FILE_DOES_NOT_EXIST.js\");\n\
+                 console.log(\"pending:\" + typeof pending.then);\n\
+                 pending.then(\n\
+                 () => console.log(\"fulfilled\"),\n\
+                 (error) => console.log(\"rejected:\" + typeof error),\n\
+                 );\n\
+                 console.log(\"after\");\n",
+            )],
+        )?;
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, b"before\npending:function\nafter\nrejected:object\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn dynamic_ambiguous_export_rejects_with_syntax_error() -> Result<(), Box<dyn Error>> {
+        let output = run_dynamic_program(
+            "ambiguous-export",
+            &[
+                (
+                    "main.ts",
+                    "console.log(\"before\");\n\
+                     import(\"./ambiguous-mid_FIXTURE.js\").then(\n\
+                     () => console.log(\"fulfilled\"),\n\
+                     (error) => console.log(\"rejected:\" + error.name),\n\
+                     );\n\
+                     console.log(\"after\");\n",
+                ),
+                (
+                    "ambiguous-mid_FIXTURE.js",
+                    "export { x } from './ambiguous-export_FIXTURE.js';\n",
+                ),
+                (
+                    "ambiguous-export_FIXTURE.js",
+                    "export * from './ambiguous-1_FIXTURE.js';\n\
+                     export * from './ambiguous-2_FIXTURE.js';\n",
+                ),
+                ("ambiguous-1_FIXTURE.js", "export var x;\n"),
+                ("ambiguous-2_FIXTURE.js", "export var x;\n"),
+            ],
+        )?;
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, b"before\nafter\nrejected:SyntaxError\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn dynamic_circular_export_rejects_with_syntax_error() -> Result<(), Box<dyn Error>> {
+        let output = run_dynamic_program(
+            "circular-export",
+            &[
+                (
+                    "main.ts",
+                    "console.log(\"before\");\n\
+                     import(\"./circular-1_FIXTURE.js\").then(\n\
+                     () => console.log(\"fulfilled\"),\n\
+                     (error) => console.log(\"rejected:\" + error.name),\n\
+                     );\n\
+                     console.log(\"after\");\n",
+                ),
+                (
+                    "circular-1_FIXTURE.js",
+                    "export { x } from './circular-2_FIXTURE.js';\n",
+                ),
+                (
+                    "circular-2_FIXTURE.js",
+                    "export { x } from './circular-1_FIXTURE.js';\n",
+                ),
+            ],
+        )?;
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, b"before\nafter\nrejected:SyntaxError\n");
+        Ok(())
+    }
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn dynamic_parse_error_rejects_with_syntax_error() -> Result<(), Box<dyn Error>> {
+        let output = run_dynamic_program(
+            "parse-error",
+            &[
+                (
+                    "main.ts",
+                    "console.log(\"before\");\n\
+                     import(\"./parse-error_FIXTURE.js\").then(\n\
+                     () => console.log(\"fulfilled\"),\n\
+                     (error) => console.log(\"rejected:\" + error.name),\n\
+                     );\n\
+                     console.log(\"after\");\n",
+                ),
+                (
+                    "parse-error_FIXTURE.js",
+                    "export const value = ;\n",
+                ),
+            ],
+        )?;
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, b"before\nafter\nrejected:SyntaxError\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn dynamic_early_error_rejects_with_syntax_error() -> Result<(), Box<dyn Error>> {
+        let output = run_dynamic_program(
+            "early-error",
+            &[
+                (
+                    "main.ts",
+                    "console.log(\"before\");\n\
+                     import(\"./script-code_FIXTURE.js\").then(\n\
+                     () => console.log(\"fulfilled\"),\n\
+                     (error) => console.log(\"rejected:\" + error.name),\n\
+                     );\n\
+                     console.log(\"after\");\n",
+                ),
+                (
+                    "script-code_FIXTURE.js",
+                    "let wired = 1;\nlet wired = 2;\n",
+                ),
+            ],
+        )?;
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, b"before\nafter\nrejected:SyntaxError\n");
+        Ok(())
+    }
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn static_parse_error_still_fails_the_run() -> Result<(), Box<dyn Error>> {
+        let (directory, entrypoint) = dynamic_fixture(
+            "static-parse-error",
+            &[
+                (
+                    "main.ts",
+                    "import { value } from './parse-error_FIXTURE.js';\nconsole.log(value);\n",
+                ),
+                (
+                    "parse-error_FIXTURE.js",
+                    "export const value = ;\n",
+                ),
+            ],
+        )?;
+        let error =
+            run_program(&entrypoint).expect_err("a static parse error still fails the run");
+        let super::Error::Diagnostics { diagnostics } = error else {
+            remove_fixture(&directory)?;
+            panic!("expected diagnostics, got {error:?}");
+        };
+        assert!(!diagnostics.is_empty());
+        remove_fixture(&directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compile_path_still_reports_dynamic_only_parse_error() -> Result<(), Box<dyn Error>> {
+        let (directory, entrypoint) = dynamic_fixture(
+            "compile-pin-parse",
+            &[
+                (
+                    "main.ts",
+                    "const pending = import(\"./parse-error_FIXTURE.js\");\npending;\n",
+                ),
+                (
+                    "parse-error_FIXTURE.js",
+                    "export const value = ;\n",
+                ),
+            ],
+        )?;
+        let error = compile_source_file(&entrypoint)
+            .expect_err("the compile path still reports the dynamic-only parse error");
+        let super::Error::Diagnostics { diagnostics } = error else {
+            panic!("expected diagnostics, got {error:?}");
+        };
+        assert!(!diagnostics.is_empty());
+        remove_fixture(&directory)?;
+        Ok(())
+    }
+
+
+    #[test]
+    fn compile_path_still_reports_dynamic_only_missing_import() -> Result<(), Box<dyn Error>> {
+        let (directory, entrypoint) = dynamic_fixture(
+            "compile-pin-missing",
+            &[(
+                "main.ts",
+                "const pending = import(\"./THIS_FILE_DOES_NOT_EXIST.js\");\npending;\n",
+            )],
+        )?;
+        let error = compile_source_file(&entrypoint)
+            .expect_err("the compile path still reports the missing dynamic import");
+        let super::Error::Diagnostics { diagnostics } = error else {
+            panic!("expected diagnostics, got {error:?}");
+        };
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code()
+                == bamts_compiler::diagnostic::DiagnosticCode::new("TS2307")
+        }));
+        remove_fixture(&directory)?;
+        Ok(())
+    }
+
 
     #[cfg(feature = "aot")]
     #[test]
