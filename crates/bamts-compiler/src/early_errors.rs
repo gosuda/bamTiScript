@@ -958,6 +958,18 @@ impl Walker<'_> {
         };
         match statement.data() {
             Statement::Variable(declaration) => {
+                if program_level
+                    && context.script
+                    && matches!(
+                        declaration.kind,
+                        VariableKind::Using | VariableKind::AwaitUsing
+                    )
+                {
+                    self.error(
+                        statement.range(),
+                        "`using` is not allowed at the top level of a script",
+                    );
+                }
                 self.check_declarators(declaration);
                 self.variable(declaration, context);
             }
@@ -2746,5 +2758,28 @@ mod tests {
     fn sloppy_var_initializer_in_for_in_follows_annex_b() {
         assert_eq!(errors("for (var a = 0 in {});"), Vec::<String>::new());
         assert!(!errors("\"use strict\"; for (var a = 0 in {});").is_empty());
+    }
+
+    fn script_errors(source: &str) -> Vec<String> {
+        let text = Arc::new(SourceText::new(source).expect("source fits"));
+        let parsed = parse(scan(SourceId::new(0), ScriptKind::JavaScript, text));
+        check_script(parsed.product())
+            .iter()
+            .map(|diagnostic| diagnostic.message().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn using_at_script_top_level_is_rejected() {
+        for source in ["using x = null;", "await using x = null;"] {
+            assert!(!script_errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "{ using x = null; }",
+            "function f() { using x = null; }",
+        ] {
+            assert_eq!(script_errors(source), Vec::<String>::new(), "{source}");
+        }
+        assert_eq!(errors("using x = null;"), Vec::<String>::new());
     }
 }
