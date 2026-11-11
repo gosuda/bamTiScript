@@ -818,6 +818,7 @@ impl PropertyMap {
                         .expect("dictionary index names a live entry");
                     return Some(std::mem::replace(current, property));
                 }
+                Self::compact_dictionary(entries, index);
                 let position = u32::try_from(entries.len()).expect("property count fits u32");
                 entries.push(Some((key.clone(), property)));
                 index.insert(key, position);
@@ -927,6 +928,23 @@ impl PropertyMap {
             entries.push(Some((key, property)));
         }
         PropertyMap::Dictionary { entries, index }
+    }
+    fn compact_dictionary(
+        entries: &mut Vec<Option<(PropertyKey, Property)>>,
+        index: &mut HashMap<PropertyKey, u32>,
+    ) {
+        let live = index.len();
+        if entries.len().saturating_sub(live) <= live {
+            return;
+        }
+        let mut compacted: Vec<Option<(PropertyKey, Property)>> = Vec::with_capacity(live + 1);
+        index.clear();
+        for slot in entries.drain(..).flatten() {
+            let position = u32::try_from(compacted.len()).expect("property count fits u32");
+            index.insert(slot.0.clone(), position);
+            compacted.push(Some(slot));
+        }
+        *entries = compacted;
     }
 }
 enum PropertyMapIter<'a> {
@@ -31169,6 +31187,51 @@ mod shape_property_tests {
         }
     }
 
+    #[test]
+    fn dictionary_compacts_tombstones_under_add_delete_churn() {
+        let mut atoms = AtomTable::default();
+        let mut shapes = ShapeTable::new();
+        let mut map = PropertyMap::default();
+        let mut oracle = Oracle(Vec::new());
+        for index in 0..70 {
+            let key = PropertyKey::Named(atoms.intern_str(&format!("w{index}")));
+            let property = Property::Data {
+                value: Value::int32(u32::try_from(index).expect("sequence index fits u32")),
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            };
+            map.insert(&mut shapes, key.clone(), property.clone());
+            oracle.insert(key, property);
+        }
+        let churn = PropertyKey::Named(atoms.intern_str("churn"));
+        for round in 0..100_000 {
+            let property = Property::Data {
+                value: Value::int32(u32::try_from(round % 100).expect("churn value fits u32")),
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            };
+            map.insert(&mut shapes, churn.clone(), property.clone());
+            oracle.insert(churn.clone(), property);
+            map.remove(&shapes, &churn);
+            oracle.remove(&churn);
+            if round % 1000 == 0 {
+                check(&map, &shapes, &oracle);
+            }
+        }
+        check(&map, &shapes, &oracle);
+        let PropertyMap::Dictionary { entries, index } = &map else {
+            panic!("past capacity stays dictionary");
+        };
+        let live = index.len();
+        assert_eq!(live, oracle.0.len());
+        assert!(
+            entries.len() <= 2 * live + 1,
+            "entries {} with live {live}",
+            entries.len()
+        );
+    }
     #[test]
     fn equal_insertion_orders_share_one_shape() {
         let mut atoms = AtomTable::default();
