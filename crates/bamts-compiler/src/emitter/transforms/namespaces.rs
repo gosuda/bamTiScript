@@ -542,7 +542,7 @@ impl Rewriter<'_> {
     }
 
     /// The next free `_a`-style name in the innermost body, declared with it.
-    fn namespace_temp(&mut self) -> IdentifierNode {
+    pub(super) fn namespace_temp(&mut self) -> IdentifierNode {
         const LETTERS: &[u8] = b"abcdefghjklmopqrstuvwxyz";
         let file = self.file;
         let occupied = self

@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::checker::SemanticModel;
+use crate::checker::{SemanticModel, SymbolId};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::jsx_desugar::{
     JsxEmitOptions, JsxRuntimeBinding, JsxRuntimeImportStyle, JsxSourceDesugarPlan,
@@ -3647,7 +3647,8 @@ impl<'a> Rewriter<'a> {
                 }
                 ClassMember::Method(method) => {
                     let mut method = method.clone();
-                    method.name = if matches!(mode, FieldMode::Native) {
+                    let has_heritage = class.extends.is_some();
+                    method.name = if matches!(mode, FieldMode::Native) || !has_heritage {
                         self.rewrite_property_name(&method.name)
                     } else {
                         self.lower_class_member_name(&method.name, &mut prelude, member.range())
@@ -3678,7 +3679,12 @@ impl<'a> Rewriter<'a> {
                     members.push(self.node(member.range(), ClassMember::StaticBlock(rewritten)));
                 }
                 ClassMember::StaticBlock(block) => {
-                    let statements = self.rewrite_statements(&block.data().statements);
+                    self.expression_temp_scopes.push(Vec::new());
+                    let mut statements = self.rewrite_statements(&block.data().statements);
+                    let temps = self.expression_temp_scopes.pop().unwrap_or_default();
+                    if let Some(declaration) = self.temp_declaration(temps, block.range()) {
+                        statements.insert(0, declaration);
+                    }
                     static_steps.push(StaticStep::Block(
                         self.node(block.range(), Block { statements }),
                     ));
@@ -7071,6 +7077,1227 @@ impl<'a> Rewriter<'a> {
         self.node(range, Expression::Array(ArrayLiteral { elements }))
     }
 
+    fn is_class_self_reference(
+        &self,
+        id: NodeId,
+        name: &IdentifierNode,
+        original: &str,
+        class: Option<SymbolId>,
+    ) -> bool {
+        if self.identifier_name(name).as_deref() != Some(original) {
+            return false;
+        }
+        match (
+            class,
+            self.model.and_then(|model| model.reference(id)),
+        ) {
+            (Some(expected), Some(actual)) => expected == actual,
+            _ => true,
+        }
+    }
+
+    fn rename_class_self_in_name(
+        &mut self,
+        name: PropertyName,
+        _original: &str,
+        _class: Option<SymbolId>,
+        _temp: &IdentifierNode,
+    ) -> PropertyName {
+        name
+    }
+
+    fn rename_class_self_in_members(
+        &mut self,
+        members: Vec<ClassMemberNode>,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> Vec<ClassMemberNode> {
+        members
+            .into_iter()
+            .map(|member| {
+                let (id, range) = (member.id(), member.range());
+                let data = match member.into_data() {
+                    ClassMember::Constructor(mut constructor) => {
+                        constructor.parameters = self.rename_class_self_in_parameters(
+                            constructor.parameters,
+                            original,
+                            class,
+                            temp,
+                        );
+                        constructor.decorators = self.rename_class_self_in_decorators(
+                            constructor.decorators,
+                            original,
+                            class,
+                            temp,
+                        );
+                        constructor.body = self.rename_class_self_in_block(
+                            constructor.body,
+                            original,
+                            class,
+                            temp,
+                        );
+                        ClassMember::Constructor(constructor)
+                    }
+                    ClassMember::Method(mut method) => {
+                        method.name = self.rename_class_self_in_name(
+                            method.name,
+                            original,
+                            class,
+                            temp,
+                        );
+                        method.function = self.rename_class_self_in_function(
+                            method.function,
+                            original,
+                            class,
+                            temp,
+                        );
+                        ClassMember::Method(method)
+                    }
+                    ClassMember::Property(mut property) => {
+                        property.name = self.rename_class_self_in_name(
+                            property.name,
+                            original,
+                            class,
+                            temp,
+                        );
+                        property.initializer = property.initializer.map(|init| {
+                            Box::new(self.rename_class_self_in_expression(
+                                *init, original, class, temp,
+                            ))
+                        });
+                        ClassMember::Property(property)
+                    }
+                    ClassMember::AutoAccessor(mut accessor) => {
+                        accessor.name = self.rename_class_self_in_name(
+                            accessor.name,
+                            original,
+                            class,
+                            temp,
+                        );
+                        accessor.initializer = accessor.initializer.map(|init| {
+                            Box::new(self.rename_class_self_in_expression(
+                                *init, original, class, temp,
+                            ))
+                        });
+                        ClassMember::AutoAccessor(accessor)
+                    }
+                    ClassMember::StaticBlock(block) => ClassMember::StaticBlock(
+                        self.rename_class_self_in_block(block, original, class, temp),
+                    ),
+                    other => other,
+                };
+                Node::new(id, range, data)
+            })
+            .collect()
+    }
+
+    fn rename_class_self_in_decorators(
+        &mut self,
+        decorators: Vec<DecoratorNode>,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> Vec<DecoratorNode> {
+        decorators
+            .into_iter()
+            .map(|decorator| {
+                let (id, range) = (decorator.id(), decorator.range());
+                let mut decorator = decorator.into_data();
+                decorator.expression = Box::new(self.rename_class_self_in_expression(
+                    *decorator.expression,
+                    original,
+                    class,
+                    temp,
+                ));
+                Node::new(id, range, decorator)
+            })
+            .collect()
+    }
+
+    fn rename_class_self_in_function(
+        &mut self,
+        mut function: FunctionLike,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> FunctionLike {
+        function.decorators = self.rename_class_self_in_decorators(
+            function.decorators,
+            original,
+            class,
+            temp,
+        );
+        function.parameters = self.rename_class_self_in_parameters(
+            function.parameters,
+            original,
+            class,
+            temp,
+        );
+        function.body = function.body.map(|body| match body {
+            FunctionBody::Block(block) => {
+                FunctionBody::Block(self.rename_class_self_in_block(block, original, class, temp))
+            }
+            FunctionBody::Expression(expression) => FunctionBody::Expression(Box::new(
+                self.rename_class_self_in_expression(*expression, original, class, temp),
+            )),
+            FunctionBody::Missing(missing) => FunctionBody::Missing(missing),
+        });
+        function
+    }
+
+    fn rename_class_self_in_parameters(
+        &mut self,
+        parameters: Vec<ParameterNode>,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> Vec<ParameterNode> {
+        parameters
+            .into_iter()
+            .map(|parameter| {
+                let (id, range) = (parameter.id(), parameter.range());
+                let mut parameter = parameter.into_data();
+                parameter.decorators = self.rename_class_self_in_decorators(
+                    parameter.decorators,
+                    original,
+                    class,
+                    temp,
+                );
+                parameter.binding =
+                    self.rename_class_self_in_pattern(parameter.binding, original, class, temp);
+                parameter.initializer = parameter.initializer.map(|init| {
+                    Box::new(
+                        self.rename_class_self_in_expression(*init, original, class, temp),
+                    )
+                });
+                Node::new(id, range, parameter)
+            })
+            .collect()
+    }
+
+    fn rename_class_self_in_pattern(
+        &mut self,
+        pattern: Pattern,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> Pattern {
+        let (id, range) = (pattern.id(), pattern.range());
+        let data = match pattern.into_data() {
+            BindingPattern::Object(object) => {
+                BindingPattern::Object(ObjectBindingPattern {
+                    properties: object
+                        .properties
+                        .into_iter()
+                        .map(|mut property| {
+                            property.name = self.rename_class_self_in_name(
+                                property.name,
+                                original,
+                                class,
+                                temp,
+                            );
+                            property.binding = self.rename_class_self_in_pattern(
+                                property.binding,
+                                original,
+                                class,
+                                temp,
+                            );
+                            property.initializer = property.initializer.map(|init| {
+                                Box::new(self.rename_class_self_in_expression(
+                                    *init, original, class, temp,
+                                ))
+                            });
+                            property
+                        })
+                        .collect(),
+                })
+            }
+            BindingPattern::Array(array) => BindingPattern::Array(ArrayBindingPattern {
+                elements: array
+                    .elements
+                    .into_iter()
+                    .map(|element| match element {
+                        ArrayBindingElement::Binding(binding) => {
+                            ArrayBindingElement::Binding(self.rename_class_self_in_pattern(
+                                binding, original, class, temp,
+                            ))
+                        }
+                        other => other,
+                    })
+                    .collect(),
+            }),
+            BindingPattern::Rest(rest) => {
+                BindingPattern::Rest(RestBindingPattern {
+                    argument: Box::new(self.rename_class_self_in_pattern(
+                        *rest.argument,
+                        original,
+                        class,
+                        temp,
+                    )),
+                })
+            }
+            BindingPattern::Assignment(assignment) => {
+                BindingPattern::Assignment(AssignmentBindingPattern {
+                    left: Box::new(self.rename_class_self_in_pattern(
+                        *assignment.left,
+                        original,
+                        class,
+                        temp,
+                    )),
+                    right: Box::new(self.rename_class_self_in_expression(
+                        *assignment.right,
+                        original,
+                        class,
+                        temp,
+                    )),
+                })
+            }
+            other => other,
+        };
+        Node::new(id, range, data)
+    }
+
+    fn rename_class_self_in_block(
+        &mut self,
+        block: BlockNode,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> BlockNode {
+        let (id, range) = (block.id(), block.range());
+        let statements = self.rename_class_self_in_statements(
+            block.into_data().statements,
+            original,
+            class,
+            temp,
+        );
+        Node::new(id, range, Block { statements })
+    }
+
+    fn rename_class_self_in_statements(
+        &mut self,
+        statements: Vec<Stmt>,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> Vec<Stmt> {
+        statements
+            .into_iter()
+            .map(|statement| {
+                let (id, range) = (statement.id(), statement.range());
+                let data = match statement.into_data() {
+                    Statement::Expression(value) => {
+                        Statement::Expression(ExpressionStatement {
+                            expression: Box::new(self.rename_class_self_in_expression(
+                                *value.expression,
+                                original,
+                                class,
+                                temp,
+                            )),
+                        })
+                    }
+                    Statement::Variable(declaration) => {
+                        Statement::Variable(VariableDeclaration {
+                            declarations: declaration
+                                .declarations
+                                .into_iter()
+                                .map(|declarator| {
+                                    let (id, range) = (declarator.id(), declarator.range());
+                                    let mut declarator = declarator.into_data();
+                                    declarator.binding = self.rename_class_self_in_pattern(
+                                        declarator.binding,
+                                        original,
+                                        class,
+                                        temp,
+                                    );
+                                    declarator.initializer = declarator.initializer.map(|init| {
+                                        Box::new(self.rename_class_self_in_expression(
+                                            *init, original, class, temp,
+                                        ))
+                                    });
+                                    Node::new(id, range, declarator)
+                                })
+                                .collect(),
+                            ..declaration
+                        })
+                    }
+                    Statement::Function(declaration) => Statement::Function(FunctionDeclaration {
+                        function: self.rename_class_self_in_function(
+                            declaration.function,
+                            original,
+                            class,
+                            temp,
+                        ),
+                    }),
+                    Statement::Class(mut declaration) => {
+                        declaration.members = self.rename_class_self_in_members(
+                            declaration.members,
+                            original,
+                            class,
+                            temp,
+                        );
+                        declaration.extends = declaration.extends.map(|mut heritage| {
+                            heritage.expression = Box::new(
+                                self.rename_class_self_in_expression(
+                                    *heritage.expression,
+                                    original,
+                                    class,
+                                    temp,
+                                ),
+                            );
+                            heritage
+                        });
+                        Statement::Class(declaration)
+                    }
+                    Statement::Block(block) => Statement::Block(
+                        self.rename_class_self_in_block(block, original, class, temp),
+                    ),
+                    Statement::If(value) => Statement::If(IfStatement {
+                        test: Box::new(self.rename_class_self_in_expression(
+                            *value.test,
+                            original,
+                            class,
+                            temp,
+                        )),
+                        consequent: Box::new(self.rename_class_self_in_statement(
+                            *value.consequent,
+                            original,
+                            class,
+                            temp,
+                        )),
+                        alternate: value.alternate.map(|alternate| {
+                            Box::new(self.rename_class_self_in_statement(
+                                *alternate, original, class, temp,
+                            ))
+                        }),
+                    }),
+                    Statement::Switch(value) => Statement::Switch(SwitchStatement {
+                        discriminant: Box::new(self.rename_class_self_in_expression(
+                            *value.discriminant,
+                            original,
+                            class,
+                            temp,
+                        )),
+                        cases: value
+                            .cases
+                            .into_iter()
+                            .map(|case| {
+                                let (id, range) = (case.id(), case.range());
+                                let mut case = case.into_data();
+                                case.test = case.test.map(|test| {
+                                    Box::new(self.rename_class_self_in_expression(
+                                        *test, original, class, temp,
+                                    ))
+                                });
+                                case.consequent = self.rename_class_self_in_statements(
+                                    case.consequent,
+                                    original,
+                                    class,
+                                    temp,
+                                );
+                                Node::new(id, range, case)
+                            })
+                            .collect(),
+                    }),
+                    Statement::For(value) => Statement::For(ForStatement {
+                        initializer: value.initializer.map(|initializer| match initializer {
+                            ForInitializer::Variable(declaration) => {
+                                ForInitializer::Variable(VariableDeclaration {
+                                    declarations: declaration
+                                        .declarations
+                                        .into_iter()
+                                        .map(|declarator| {
+                                            let (id, range) =
+                                                (declarator.id(), declarator.range());
+                                            let mut declarator = declarator.into_data();
+                                            declarator.binding =
+                                                self.rename_class_self_in_pattern(
+                                                    declarator.binding,
+                                                    original,
+                                                    class,
+                                                    temp,
+                                                );
+                                            declarator.initializer =
+                                                declarator.initializer.map(|init| {
+                                                    Box::new(
+                                                        self.rename_class_self_in_expression(
+                                                            *init, original, class, temp,
+                                                        ),
+                                                    )
+                                                });
+                                            Node::new(id, range, declarator)
+                                        })
+                                        .collect(),
+                                    ..declaration
+                                })
+                            }
+                            ForInitializer::Expression(expression) => {
+                                ForInitializer::Expression(Box::new(
+                                    self.rename_class_self_in_expression(
+                                        *expression,
+                                        original,
+                                        class,
+                                        temp,
+                                    ),
+                                ))
+                            }
+                        }),
+                        test: value.test.map(|test| {
+                            Box::new(
+                                self.rename_class_self_in_expression(*test, original, class, temp),
+                            )
+                        }),
+                        update: value.update.map(|update| {
+                            Box::new(
+                                self.rename_class_self_in_expression(
+                                    *update, original, class, temp,
+                                ),
+                            )
+                        }),
+                        body: Box::new(self.rename_class_self_in_statement(
+                            *value.body,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::ForIn(value) => Statement::ForIn(ForInStatement {
+                        binding: self.rename_class_self_in_for_binding(
+                            value.binding,
+                            original,
+                            class,
+                            temp,
+                        ),
+                        object: Box::new(self.rename_class_self_in_expression(
+                            *value.object,
+                            original,
+                            class,
+                            temp,
+                        )),
+                        body: Box::new(self.rename_class_self_in_statement(
+                            *value.body,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::ForOf(value) => Statement::ForOf(ForOfStatement {
+                        mode: value.mode,
+                        binding: self.rename_class_self_in_for_binding(
+                            value.binding,
+                            original,
+                            class,
+                            temp,
+                        ),
+                        iterable: Box::new(self.rename_class_self_in_expression(
+                            *value.iterable,
+                            original,
+                            class,
+                            temp,
+                        )),
+                        body: Box::new(self.rename_class_self_in_statement(
+                            *value.body,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::While(value) => Statement::While(WhileStatement {
+                        test: Box::new(self.rename_class_self_in_expression(
+                            *value.test,
+                            original,
+                            class,
+                            temp,
+                        )),
+                        body: Box::new(self.rename_class_self_in_statement(
+                            *value.body,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::DoWhile(value) => Statement::DoWhile(DoWhileStatement {
+                        body: Box::new(self.rename_class_self_in_statement(
+                            *value.body,
+                            original,
+                            class,
+                            temp,
+                        )),
+                        test: Box::new(self.rename_class_self_in_expression(
+                            *value.test,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::Try(value) => Statement::Try(TryStatement {
+                        block: self.rename_class_self_in_block(
+                            value.block,
+                            original,
+                            class,
+                            temp,
+                        ),
+                        handler: value.handler.map(|handler| {
+                            let (id, range) = (handler.id(), handler.range());
+                            let mut handler = handler.into_data();
+                            handler.binding = handler.binding.map(|binding| {
+                                self.rename_class_self_in_pattern(
+                                    binding,
+                                    original,
+                                    class,
+                                    temp,
+                                )
+                            });
+                            handler.body = self.rename_class_self_in_block(
+                                handler.body,
+                                original,
+                                class,
+                                temp,
+                            );
+                            Node::new(id, range, handler)
+                        }),
+                        finalizer: value.finalizer.map(|finalizer| {
+                            self.rename_class_self_in_block(finalizer, original, class, temp)
+                        }),
+                    }),
+                    Statement::With(value) => Statement::With(WithStatement {
+                        object: Box::new(self.rename_class_self_in_expression(
+                            *value.object,
+                            original,
+                            class,
+                            temp,
+                        )),
+                        body: Box::new(self.rename_class_self_in_statement(
+                            *value.body,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::Labeled(value) => Statement::Labeled(LabeledStatement {
+                        label: value.label,
+                        body: Box::new(self.rename_class_self_in_statement(
+                            *value.body,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::Return(value) => Statement::Return(ReturnStatement {
+                        argument: value.argument.map(|argument| {
+                            Box::new(self.rename_class_self_in_expression(
+                                *argument, original, class, temp,
+                            ))
+                        }),
+                    }),
+                    Statement::Throw(value) => Statement::Throw(ThrowStatement {
+                        argument: Box::new(self.rename_class_self_in_expression(
+                            *value.argument,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::Namespace(mut declaration) => {
+                        declaration.body = self.rename_class_self_in_block(
+                            declaration.body,
+                            original,
+                            class,
+                            temp,
+                        );
+                        Statement::Namespace(declaration)
+                    }
+                    Statement::Enum(mut declaration) => {
+                        declaration.members = declaration
+                            .members
+                            .into_iter()
+                            .map(|member| {
+                                let (id, range) = (member.id(), member.range());
+                                let mut member = member.into_data();
+                                member.initializer = member.initializer.map(|init| {
+                                    Box::new(self.rename_class_self_in_expression(
+                                        *init, original, class, temp,
+                                    ))
+                                });
+                                Node::new(id, range, member)
+                            })
+                            .collect();
+                        Statement::Enum(declaration)
+                    }
+                    Statement::Declare(inner) => Statement::Declare(Box::new(
+                        self.rename_class_self_in_statement(*inner, original, class, temp),
+                    )),
+                    other => other,
+                };
+                Node::new(id, range, data)
+            })
+            .collect()
+    }
+
+    fn rename_class_self_in_statement(
+        &mut self,
+        statement: Stmt,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> Stmt {
+        let mut renamed =
+            self.rename_class_self_in_statements(vec![statement], original, class, temp);
+        match renamed.pop() {
+            Some(statement) => statement,
+            None => unreachable!("renaming preserves statement count"),
+        }
+    }
+
+    fn rename_class_self_in_for_binding(
+        &mut self,
+        binding: ForBinding,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> ForBinding {
+        match binding {
+            ForBinding::Variable(declaration) => {
+                ForBinding::Variable(VariableDeclaration {
+                    declarations: declaration
+                        .declarations
+                        .into_iter()
+                        .map(|declarator| {
+                            let (id, range) = (declarator.id(), declarator.range());
+                            let mut declarator = declarator.into_data();
+                            declarator.binding = self.rename_class_self_in_pattern(
+                                declarator.binding,
+                                original,
+                                class,
+                                temp,
+                            );
+                            declarator.initializer = declarator.initializer.map(|init| {
+                                Box::new(self.rename_class_self_in_expression(
+                                    *init, original, class, temp,
+                                ))
+                            });
+                            Node::new(id, range, declarator)
+                        })
+                        .collect(),
+                    ..declaration
+                })
+            }
+            ForBinding::Target(target) => {
+                ForBinding::Target(self.rename_class_self_in_target(target, original, class, temp))
+            }
+        }
+    }
+
+    fn rename_class_self_in_target(
+        &mut self,
+        target: AssignmentTargetNode,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> AssignmentTargetNode {
+        let (id, range) = (target.id(), target.range());
+        let data = match target.into_data() {
+            AssignmentTarget::Identifier(name) => {
+                if self.is_class_self_reference(id, &name, original, class) {
+                    AssignmentTarget::Identifier(temp.clone())
+                } else {
+                    AssignmentTarget::Identifier(name)
+                }
+            }
+            AssignmentTarget::Member(member) => {
+                AssignmentTarget::Member(AssignmentMemberTarget {
+                    object: Box::new(self.rename_class_self_in_expression(
+                        *member.object,
+                        original,
+                        class,
+                        temp,
+                    )),
+                    property: match member.property {
+                        MemberProperty::Computed(key) => MemberProperty::Computed(Box::new(
+                            self.rename_class_self_in_expression(*key, original, class, temp),
+                        )),
+                        other => other,
+                    },
+                })
+            }
+            AssignmentTarget::Invalid(expression) => AssignmentTarget::Invalid(Box::new(
+                self.rename_class_self_in_expression(*expression, original, class, temp),
+            )),
+            other => other,
+        };
+        Node::new(id, range, data)
+    }
+
+    fn rename_class_self_in_expression(
+        &mut self,
+        expression: Expr,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> Expr {
+        let (id, range) = (expression.id(), expression.range());
+        let data = match expression.into_data() {
+            Expression::Identifier(name) => {
+                if self.is_class_self_reference(id, &name, original, class) {
+                    Expression::Identifier(temp.clone())
+                } else {
+                    Expression::Identifier(name)
+                }
+            }
+            Expression::Template(template) => {
+                Expression::Template(TemplateLiteral {
+                    expressions: template
+                        .expressions
+                        .into_iter()
+                        .map(|element| {
+                            self.rename_class_self_in_expression(element, original, class, temp)
+                        })
+                        .collect(),
+                    ..template
+                })
+            }
+            Expression::TaggedTemplate(tagged) => {
+                Expression::TaggedTemplate(TaggedTemplateExpression {
+                    tag: Box::new(self.rename_class_self_in_expression(
+                        *tagged.tag,
+                        original,
+                        class,
+                        temp,
+                    )),
+                    template: TemplateLiteral {
+                        expressions: tagged
+                            .template
+                            .expressions
+                            .into_iter()
+                            .map(|element| {
+                                self.rename_class_self_in_expression(element, original, class, temp)
+                            })
+                            .collect(),
+                        ..tagged.template
+                    },
+                })
+            }
+            Expression::Array(array) => Expression::Array(ArrayLiteral {
+                elements: array
+                    .elements
+                    .into_iter()
+                    .map(|element| match element {
+                        ArrayElement::Expression(element) => ArrayElement::Expression(Box::new(
+                            self.rename_class_self_in_expression(
+                                *element, original, class, temp,
+                            ),
+                        )),
+                        ArrayElement::Spread(spread) => ArrayElement::Spread(SpreadElement {
+                            argument: Box::new(self.rename_class_self_in_expression(
+                                *spread.argument,
+                                original,
+                                class,
+                                temp,
+                            )),
+                        }),
+                        other => other,
+                    })
+                    .collect(),
+            }),
+            Expression::Object(object) => Expression::Object(ObjectLiteral {
+                members: object
+                    .members
+                    .into_iter()
+                    .map(|member| {
+                        let (id, range) = (member.id(), member.range());
+                        let data = match member.into_data() {
+                            ObjectMember::Property(mut property) => {
+                                if property.shorthand
+                                    && matches!(property.value.data(), Expression::Identifier(name) if self.is_class_self_reference(property.value.id(), name, original, class))
+                                {
+                                    property.shorthand = false;
+                                }
+                                property.name = self.rename_class_self_in_name(
+                                    property.name,
+                                    original,
+                                    class,
+                                    temp,
+                                );
+                                property.value = Box::new(
+                                    self.rename_class_self_in_expression(
+                                        *property.value,
+                                        original,
+                                        class,
+                                        temp,
+                                    ),
+                                );
+                                ObjectMember::Property(property)
+                            }
+                            ObjectMember::Method(method) => {
+                                ObjectMember::Method(ObjectMethod {
+                                    name: self.rename_class_self_in_name(
+                                        method.name,
+                                        original,
+                                        class,
+                                        temp,
+                                    ),
+                                    function: self.rename_class_self_in_function(
+                                        method.function,
+                                        original,
+                                        class,
+                                        temp,
+                                    ),
+                                    ..method
+                                })
+                            }
+                            ObjectMember::Spread(spread) => {
+                                ObjectMember::Spread(SpreadElement {
+                                    argument: Box::new(
+                                        self.rename_class_self_in_expression(
+                                            *spread.argument,
+                                            original,
+                                            class,
+                                            temp,
+                                        ),
+                                    ),
+                                })
+                            }
+                            other => other,
+                        };
+                        Node::new(id, range, data)
+                    })
+                    .collect(),
+            }),
+            Expression::Function(function) => Expression::Function(FunctionExpression {
+                function: self.rename_class_self_in_function(
+                    function.function,
+                    original,
+                    class,
+                    temp,
+                ),
+            }),
+            Expression::Class(nested) => Expression::Class(ClassExpression {
+                class: self.rename_class_self_in_nested_class(nested.class, original, class, temp),
+            }),
+            Expression::Arrow(arrow) => Expression::Arrow(ArrowFunction {
+                parameters: self.rename_class_self_in_parameters(
+                    arrow.parameters,
+                    original,
+                    class,
+                    temp,
+                ),
+                body: match arrow.body {
+                    FunctionBody::Block(block) => FunctionBody::Block(
+                        self.rename_class_self_in_block(block, original, class, temp),
+                    ),
+                    FunctionBody::Expression(expression) => FunctionBody::Expression(Box::new(
+                        self.rename_class_self_in_expression(*expression, original, class, temp),
+                    )),
+                    FunctionBody::Missing(missing) => FunctionBody::Missing(missing),
+                },
+                ..arrow
+            }),
+            Expression::Call(call) => Expression::Call(CallExpression {
+                callee: Box::new(self.rename_class_self_in_expression(
+                    *call.callee,
+                    original,
+                    class,
+                    temp,
+                )),
+                arguments: call
+                    .arguments
+                    .into_iter()
+                    .map(|argument| match argument {
+                        CallArgument::Expression(value) => CallArgument::Expression(Box::new(
+                            self.rename_class_self_in_expression(*value, original, class, temp),
+                        )),
+                        CallArgument::Spread(spread) => CallArgument::Spread(SpreadElement {
+                            argument: Box::new(self.rename_class_self_in_expression(
+                                *spread.argument,
+                                original,
+                                class,
+                                temp,
+                            )),
+                        }),
+                        other => other,
+                    })
+                    .collect(),
+                ..call
+            }),
+            Expression::Member(member) => Expression::Member(MemberExpression {
+                object: Box::new(self.rename_class_self_in_expression(
+                    *member.object,
+                    original,
+                    class,
+                    temp,
+                )),
+                property: match member.property {
+                    MemberProperty::Computed(key) => MemberProperty::Computed(Box::new(
+                        self.rename_class_self_in_expression(*key, original, class, temp),
+                    )),
+                    other => other,
+                },
+                ..member
+            }),
+            Expression::New(call) => Expression::New(NewExpression {
+                callee: Box::new(self.rename_class_self_in_expression(
+                    *call.callee,
+                    original,
+                    class,
+                    temp,
+                )),
+                arguments: call
+                    .arguments
+                    .into_iter()
+                    .map(|argument| match argument {
+                        CallArgument::Expression(value) => CallArgument::Expression(Box::new(
+                            self.rename_class_self_in_expression(*value, original, class, temp),
+                        )),
+                        CallArgument::Spread(spread) => CallArgument::Spread(SpreadElement {
+                            argument: Box::new(self.rename_class_self_in_expression(
+                                *spread.argument,
+                                original,
+                                class,
+                                temp,
+                            )),
+                        }),
+                        other => other,
+                    })
+                    .collect(),
+                ..call
+            }),
+            Expression::Await(awaited) => Expression::Await(AwaitExpression {
+                argument: Box::new(self.rename_class_self_in_expression(
+                    *awaited.argument,
+                    original,
+                    class,
+                    temp,
+                )),
+            }),
+            Expression::Yield(yielded) => Expression::Yield(YieldExpression {
+                argument: yielded.argument.map(|argument| {
+                    Box::new(
+                        self.rename_class_self_in_expression(*argument, original, class, temp),
+                    )
+                }),
+                ..yielded
+            }),
+            Expression::Unary(unary) => Expression::Unary(UnaryExpression {
+                argument: Box::new(self.rename_class_self_in_expression(
+                    *unary.argument,
+                    original,
+                    class,
+                    temp,
+                )),
+                ..unary
+            }),
+            Expression::Update(update) => Expression::Update(UpdateExpression {
+                argument: Box::new(
+                    self.rename_class_self_in_target(*update.argument, original, class, temp),
+                ),
+                ..update
+            }),
+            Expression::Binary(binary) => Expression::Binary(BinaryExpression {
+                left: Box::new(self.rename_class_self_in_expression(
+                    *binary.left,
+                    original,
+                    class,
+                    temp,
+                )),
+                right: Box::new(self.rename_class_self_in_expression(
+                    *binary.right,
+                    original,
+                    class,
+                    temp,
+                )),
+                ..binary
+            }),
+            Expression::Logical(logical) => Expression::Logical(LogicalExpression {
+                left: Box::new(self.rename_class_self_in_expression(
+                    *logical.left,
+                    original,
+                    class,
+                    temp,
+                )),
+                right: Box::new(self.rename_class_self_in_expression(
+                    *logical.right,
+                    original,
+                    class,
+                    temp,
+                )),
+                ..logical
+            }),
+            Expression::Conditional(conditional) => {
+                Expression::Conditional(ConditionalExpression {
+                    test: Box::new(self.rename_class_self_in_expression(
+                        *conditional.test,
+                        original,
+                        class,
+                        temp,
+                    )),
+                    consequent: Box::new(self.rename_class_self_in_expression(
+                        *conditional.consequent,
+                        original,
+                        class,
+                        temp,
+                    )),
+                    alternate: Box::new(self.rename_class_self_in_expression(
+                        *conditional.alternate,
+                        original,
+                        class,
+                        temp,
+                    )),
+                })
+            }
+            Expression::Assignment(assignment) => Expression::Assignment(AssignmentExpression {
+                left: self.rename_class_self_in_target(assignment.left, original, class, temp),
+                right: Box::new(self.rename_class_self_in_expression(
+                    *assignment.right,
+                    original,
+                    class,
+                    temp,
+                )),
+                ..assignment
+            }),
+            Expression::Sequence(sequence) => Expression::Sequence(SequenceExpression {
+                expressions: sequence
+                    .expressions
+                    .into_iter()
+                    .map(|element| {
+                        self.rename_class_self_in_expression(element, original, class, temp)
+                    })
+                    .collect(),
+            }),
+            Expression::Parenthesized(inner) => Expression::Parenthesized(Box::new(
+                self.rename_class_self_in_expression(*inner, original, class, temp),
+            )),
+            Expression::As(cast) => Expression::As(AsExpression {
+                expression: Box::new(self.rename_class_self_in_expression(
+                    *cast.expression,
+                    original,
+                    class,
+                    temp,
+                )),
+                ..cast
+            }),
+            Expression::Satisfies(satisfies) => Expression::Satisfies(SatisfiesExpression {
+                expression: Box::new(self.rename_class_self_in_expression(
+                    *satisfies.expression,
+                    original,
+                    class,
+                    temp,
+                )),
+                ..satisfies
+            }),
+            Expression::TypeAssertion(assertion) => {
+                Expression::TypeAssertion(TypeAssertionExpression {
+                    expression: Box::new(self.rename_class_self_in_expression(
+                        *assertion.expression,
+                        original,
+                        class,
+                        temp,
+                    )),
+                    ..assertion
+                })
+            }
+            Expression::NonNull(assertion) => Expression::NonNull(NonNullExpression {
+                expression: Box::new(self.rename_class_self_in_expression(
+                    *assertion.expression,
+                    original,
+                    class,
+                    temp,
+                )),
+            }),
+            Expression::Import(import) => Expression::Import(ImportExpression {
+                source: Box::new(self.rename_class_self_in_expression(
+                    *import.source,
+                    original,
+                    class,
+                    temp,
+                )),
+                options: import.options.map(|options| {
+                    Box::new(
+                        self.rename_class_self_in_expression(*options, original, class, temp),
+                    )
+                }),
+            }),
+            other => other,
+        };
+        Node::new(id, range, data)
+    }
+
+    fn rename_class_self_in_nested_class(
+        &mut self,
+        mut class: ClassDeclaration,
+        original: &str,
+        class_symbol: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> ClassDeclaration {
+        class.members = self.rename_class_self_in_members(
+            class.members,
+            original,
+            class_symbol,
+            temp,
+        );
+        class.extends = class.extends.map(|mut heritage| {
+            heritage.expression = Box::new(self.rename_class_self_in_expression(
+                *heritage.expression,
+                original,
+                class_symbol,
+                temp,
+            ));
+            heritage
+        });
+        class
+    }
+
+    fn class_needs_static_temp(class: &ClassDeclaration, mode: FieldMode) -> bool {
+        class.members.iter().any(|member| match member.data() {
+            ClassMember::StaticBlock(_) => true,
+            ClassMember::Property(property) => {
+                property.modifiers.is_static
+                    && !property.modifiers.is_declare
+                    && !property.modifiers.is_abstract
+                    && !matches!(property.name, PropertyName::Private(_))
+                    && (!matches!(mode, FieldMode::Assign) || property.initializer.is_some())
+            }
+            _ => false,
+        })
+    }
+
+    fn sequence_part(&mut self, statement: Stmt) -> Expr {
+        match statement.into_data() {
+            Statement::Expression(value) => *value.expression,
+            Statement::Variable(declaration) => {
+                let mut declarations = declaration.declarations;
+                if declarations.len() == 1 {
+                    if let Some(declarator) = declarations.pop() {
+                        let range = declarator.range();
+                        if let VariableDeclarator {
+                            binding,
+                            initializer: Some(init),
+                            ..
+                        } = declarator.into_data()
+                        {
+                            if let BindingPattern::Identifier(name) = binding.into_data() {
+                                let left = self.syn_node(
+                                    name.range(),
+                                    AssignmentTarget::Identifier(name),
+                                );
+                                return self.syn_node(
+                                    range,
+                                    Expression::Assignment(AssignmentExpression {
+                                        operator: AssignmentOperator::Assign,
+                                        left,
+                                        right: init,
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+                unreachable!("class lowering sequences single declarator temps");
+            }
+            _ => unreachable!("class lowering sequences expression statements"),
+        }
+    }
+
     fn lower_class_expression(
         &mut self,
         expression: &Expr,
@@ -7089,14 +8316,33 @@ impl<'a> Rewriter<'a> {
                 child_marked,
             );
         }
-        let temp = self.temp_ident();
-        let mut lowered =
-            self.lower_class(&class_expression.class, expression.range(), Some(&temp));
+        let hoists_statics = Self::class_needs_static_temp(
+            &class_expression.class,
+            FieldMode::for_options(self.options),
+        );
+        let temp = self.namespace_temp();
+        let mut class = class_expression.class.clone();
+        if hoists_statics
+            && let Some(name) = class.name.as_ref()
+            && let Some(original) = self.identifier_name(name)
+        {
+            let class_symbol = self.model.and_then(|model| model.reference(name.id()));
+            class.members = self.rename_class_self_in_members(
+                class.members,
+                &original,
+                class_symbol,
+                &temp,
+            );
+        }
+        let mut lowered = self.lower_class(&class, expression.range(), Some(&temp));
         // Nothing needed the temp — no field statements, computed keys,
         // heritage temps, or static steps — so tsc keeps the class
         // expression inline (classExpressionTest2 emits `var m = class C {`
-        // with type parameters stripped, never a temp IIFE).
+        // with type parameters stripped, with no hoisted temp).
         if lowered.prelude.is_empty() && lowered.postlude.is_empty() {
+            if let Some(scope) = self.expression_temp_scopes.last_mut() {
+                scope.retain(|candidate| candidate.id() != temp.id());
+            }
             let child_marked = self.any_marked(lowered.class.members.iter().map(|m| m.id()));
             return self.wrap_marked(
                 expression.range(),
@@ -7106,15 +8352,12 @@ impl<'a> Rewriter<'a> {
                 child_marked,
             );
         }
-        // A suspending computed key cannot live inside the IIFE: the
-        // arrow is a plain function, so a yield there is a SyntaxError
-        // (tsc 6.0.2 emits exactly that broken shape). Where the caller
-        // drains key_prelude into an enclosing statement list, the
-        // suspending key temps hoist out and the machine splits them;
-        // expression contexts cannot hoist, so they keep the IIFE and
-        // signal the requires-es2015 refusal instead of breaking
-        // silently. Static-field postludes reference the constructed
-        // temp and can never hoist; they refuse the same way.
+        // A suspending computed key cannot hoist out of an expression, so
+        // expression contexts refuse the conversion loudly instead of
+        // breaking silently. Where the caller drains key_prelude into an
+        // enclosing statement list, the suspending key temps hoist out and
+        // the machine splits them; static-field postludes reference the
+        // constructed temp and can never hoist, so they refuse the same way.
         // Whole-prelude move only: partitioning the prelude would
         // reorder mixed suspending and clean keys, and computed keys
         // evaluate in member order. Entries never reference the class
@@ -7141,11 +8384,7 @@ impl<'a> Rewriter<'a> {
             // Returning the unlowered class keeps the failure loud and
             // honest: the machine's class walker (heritage, computed
             // names, field initializers) sees the suspension, refuses
-            // the conversion, and the generator stays native under the
-            // diagnostic. Lowering anyway would bury a raw yield or
-            // await inside a synthesized plain arrow the machine
-            // cannot see through - the postlude (static-field
-            // initializers) included, not just the key prelude.
+            // the conversion, and the generator stays native.
             return expression.clone();
         }
         let class = self.syn_node(
@@ -7154,58 +8393,36 @@ impl<'a> Rewriter<'a> {
                 class: lowered.class,
             }),
         );
-        let declaration = self.make_declarator(temp.clone(), Some(class), expression.range());
-        lowered.prelude.push(self.syn_node(
-            expression.range(),
-            Statement::Variable(VariableDeclaration {
-                range: expression.range(),
-                kind: if self.options.target >= ScriptTarget::Es2015 {
-                    VariableKind::Let
-                } else {
-                    VariableKind::Var
-                },
-                declarations: vec![declaration],
-            }),
-        ));
-        if class_expression.class.name.is_none() {
-            lowered.prelude.push(self.restore_class_name(
-                &temp,
-                inferred_name.unwrap_or(""),
-                expression.range(),
-            ));
+        if class_expression.class.name.is_none()
+            && let Some(inferred) = inferred_name
+        {
+            lowered.postlude.insert(
+                0,
+                self.restore_class_name(&temp, inferred, expression.range()),
+            );
         }
-        lowered.prelude.extend(lowered.postlude);
-        let result = self.syn_node(temp.range(), Expression::Identifier(temp));
-        lowered.prelude.push(self.syn_node(
-            expression.range(),
-            Statement::Return(ReturnStatement {
-                argument: Some(Box::new(result)),
-            }),
+        let mut parts =
+            Vec::with_capacity(lowered.prelude.len() + lowered.postlude.len() + 2);
+        parts.extend(
+            lowered
+                .prelude
+                .into_iter()
+                .map(|statement| self.sequence_part(statement)),
+        );
+        parts.push(self.store_temp(&temp, class, expression.range()));
+        parts.extend(
+            lowered
+                .postlude
+                .into_iter()
+                .map(|statement| self.sequence_part(statement)),
+        );
+        parts.push(self.syn_node(
+            temp.range(),
+            Expression::Identifier(temp.clone()),
         ));
-        let body = self.syn_node(
-            expression.range(),
-            Block {
-                statements: lowered.prelude,
-            },
-        );
-        let arrow = self.syn_node(
-            expression.range(),
-            Expression::Arrow(ArrowFunction {
-                is_async: false,
-                type_parameters: None,
-                parameters: Vec::new(),
-                return_type: None,
-                body: FunctionBody::Block(body),
-            }),
-        );
         self.syn_node(
             expression.range(),
-            Expression::Call(CallExpression {
-                callee: Box::new(arrow),
-                optional: false,
-                type_arguments: None,
-                arguments: Vec::new(),
-            }),
+            Expression::Sequence(SequenceExpression { expressions: parts }),
         )
     }
 
@@ -11518,13 +12735,16 @@ mod tests {
     }
 
     #[test]
-    fn class_expressions_lower_inside_call_arguments() {
+    fn class_expressions_lower_inside_call_arguments_like_class_expression_with_static_properties1() {
         let output = emit_at(
             "consume(class { static x = 1; y = 2; });\n",
             ScriptTarget::Es2015,
         );
         let code = javascript(&output);
-        assert!(code.contains("consume((() =>"), "{code}");
+        assert!(code.contains("_a = class {"), "{code}");
+        assert!(code.contains("_a.x = 1,"), "{code}");
+        assert!(code.contains(",\n    _a))"), "{code}");
+        assert!(!code.contains(", _a))"), "{code}");
         assert!(code.contains("this.y = 2"), "{code}");
         assert!(code.contains(".x = 1"), "{code}");
         assert!(!code.contains("static x"), "{code}");
@@ -12022,6 +13242,140 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
              })(Outer || (Outer = {}));\n"
         );
     }
+
+    #[test]
+    fn class_expression_static_fields_use_a_hoisted_temp_like_class_expression_with_static_properties1() {
+        let output = emit_at(
+            "var v = class C {\n\
+             \x20   static a = 1;\n\
+             \x20   static b = 2;\n\
+             \x20   static c = C.a + C.b;\n\
+             };\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var _a;\n\
+             var v = (_a = class C {\n\
+             \x20   },\n\
+             \x20   _a.a = 1,\n\
+             \x20   _a.b = 2,\n\
+             \x20   _a.c = _a.a + _a.b,\n\
+             \x20   _a);\n"
+        );
+    }
+    #[test]
+    fn anonymous_class_expression_with_static_fields_has_no_name_restore_like_es64() {
+        let output = emit_at(
+            "(class { static x = 0; });\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(!code.contains("defineProperty"), "{code}");
+        assert!(!code.contains("__setFunctionName"), "{code}");
+        assert!(code.contains("_a.x = 0"), "{code}");
+    }
+    #[test]
+    fn anonymous_class_expression_assigned_to_variable_restores_inferred_name() {
+        let output = emit_at(
+            "var v = class { static x = 1; };\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("value: \"v\""), "{code}");
+        let assign = code.find("_a = class").expect("temp assignment: {code}");
+        let restore = code.find("value: \"v\"").expect("restore: {code}");
+        let field = code.find("_a.x = 1").expect("field: {code}");
+        assert!(assign < restore && restore < field, "{code}");
+    }
+    #[test]
+    fn class_expression_computed_keys_keep_class_name_like_computed_with_static() {
+        let output = emit_at(
+            "(class C2 {\n\
+             \x20   static staticProp = 10;\n\
+             \x20   get [C2.staticProp]() { return \"hello\"; }\n\
+             \x20   [C2.staticProp]() {}\n\
+             });\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("[C2.staticProp]"), "{code}");
+        assert!(!code.contains("[_a.staticProp]"), "{code}");
+        assert!(code.contains("_a.staticProp = 10"), "{code}");
+    }
+
+
+
+
+    #[test]
+    fn class_declaration_static_fields_assign_through_the_class_name() {
+        let output = emit_at(
+            "class C {\n\
+             \x20   static a = 1;\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "class C {\n}\nC.a = 1;\n"
+        );
+    }
+    #[test]
+    fn plain_sequence_with_multiline_function_keeps_inline_separators() {
+        let output = emit_at(
+            "var x = (function foo() {\n return 1;\n}, 2);\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("}, 2)"), "{code}");
+    }
+
+    #[test]
+    fn class_expression_temp_is_function_scoped_like_class_block_scoping() {
+        let output = emit_at(
+            "function f(b: boolean) {\n\
+             \x20   let Foo: any;\n\
+             \x20   if (b) {\n\
+             \x20       Foo = class Foo {\n\
+             \x20           static y = new Foo();\n\
+             \x20       };\n\
+             \x20   }\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        let fn_pos = code.find("function f").expect("function: {code}");
+        let var_pos = code.find("var _a").expect("temp declaration: {code}");
+        assert!(fn_pos < var_pos, "{code}");
+        assert!(!code.lines().next().unwrap_or("").contains("var _a"), "{code}");
+    }
+    #[test]
+    fn nested_class_expression_temp_is_inner_function_scoped_like_static_block18() {
+        let output = emit_at(
+            "function foo() {\n\
+             \x20   return class {\n\
+             \x20       static foo = 1;\n\
+             \x20       static {\n\
+             \x20           const c = class {\n\
+             \x20               static bar = 2;\n\
+             \x20           };\n\
+             \x20       }\n\
+             \x20   };\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        let foo_pos = code.find("function foo").expect("foo");
+        assert!(foo_pos < code.find("var _a").unwrap_or(usize::MAX), "{code}");
+        let b_pos = code.find("var _b").unwrap_or(usize::MAX);
+        assert!(b_pos != usize::MAX, "missing var _b in:\n{code}");
+        assert!(code.find("var _a").unwrap() < b_pos, "inner temp follows outer:\n{code}");
+        let iife_pos = code.find("() =>").or_else(|| code.find("function (")).unwrap_or(usize::MAX);
+        assert!(iife_pos != usize::MAX, "missing static block function in:\n{code}");
+        assert!(iife_pos < b_pos, "inner temp inside static block function:\n{code}");
+    }
+
+
 
     #[test]
     fn unexported_nested_namespaces_stay_local_like_nested_module_private_access() {

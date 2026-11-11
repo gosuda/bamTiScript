@@ -2937,7 +2937,7 @@ impl<'a> Emitter<'a> {
             Expression::Logical(logical) => self.emit_logical(logical),
             Expression::Conditional(conditional) => self.emit_conditional(conditional),
             Expression::Assignment(assignment) => self.emit_assignment(assignment),
-            Expression::Sequence(sequence) => self.emit_sequence(sequence),
+            Expression::Sequence(_) => self.emit_sequence(expression),
             Expression::Parenthesized(inner) => {
                 self.raw("(");
                 self.emit_expression_prec(inner, 0);
@@ -3660,15 +3660,41 @@ impl<'a> Emitter<'a> {
         self.emit_expression_prec(&assignment.right, P_ASSIGN);
     }
 
-    fn emit_sequence(&mut self, sequence: &SequenceExpression) {
-        let mut previous_end: Option<Utf16Pos> = None;
-        for expression in sequence.expressions.iter() {
-            if let Some(end) = previous_end {
-                self.mapped_list_separator_from(end, expression.range().start());
+    fn emit_sequence(&mut self, expression: &Expr) {
+        let Expression::Sequence(sequence) = expression.data() else {
+            unreachable!("emit_sequence takes a sequence expression");
+        };
+        let lowered = self.is_synthesized(expression.id());
+        let multiline = lowered
+            && sequence.expressions.iter().any(|element| {
+                matches!(
+                    element.data(),
+                    Expression::Assignment(assignment)
+                        if matches!(assignment.right.data(), Expression::Class(_))
+                )
+            });
+        if !multiline {
+            let mut previous_end: Option<Utf16Pos> = None;
+            for element in sequence.expressions.iter() {
+                if let Some(end) = previous_end {
+                    self.mapped_list_separator_from(end, element.range().start());
+                }
+                self.emit_expression_prec(element, P_ASSIGN);
+                previous_end = Some(element.range().end());
             }
-            self.emit_expression_prec(expression, P_ASSIGN);
-            previous_end = Some(expression.range().end());
+            return;
         }
+        self.indent += 1;
+        let mut first = true;
+        for element in sequence.expressions.iter() {
+            if !first {
+                self.raw(",");
+                self.newline();
+            }
+            self.emit_expression_prec(element, P_ASSIGN);
+            first = false;
+        }
+        self.indent -= 1;
     }
 
     // ---- assignment targets / patterns ------------------------------------
@@ -7674,11 +7700,11 @@ var c = () => 1;
             "the key's suspension must split:\n{code}"
         );
         assert!(
-            code.contains("_t1 = _a.sent()"),
+            code.contains("_t0 = _a.sent()"),
             "the key temp binds from sent():\n{code}"
         );
         assert!(
-            code.contains("[_t1]()"),
+            code.contains("[_t0]()"),
             "the member reads the hoisted temp:\n{code}"
         );
         assert!(live_yield_leak(&code).is_none(), "live yield leaked");
