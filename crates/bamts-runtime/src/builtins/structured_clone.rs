@@ -318,7 +318,7 @@ fn build_plan<H: Host>(
                 let mut element_values = Vec::new();
                 let mut properties = Vec::new();
                 for property in enumerable_properties(machine, plan, source)? {
-                    let Some(name) = property.key.as_string() else {
+                    let Some(name) = property.key.as_string(&machine.atoms) else {
                         continue;
                     };
                     if let Some(index) = crate::array_index(name) {
@@ -344,8 +344,8 @@ fn build_plan<H: Host>(
                 properties,
                 ..
             } => {
-                let source_value = regexp_property(&properties, "source")?;
-                let canonical_flags = regexp_property(&properties, "flags")?;
+                let source_value = regexp_property(&properties, &mut machine.atoms, "source")?;
+                let canonical_flags = regexp_property(&properties, &mut machine.atoms, "flags")?;
                 PlannedNode::RegExp {
                     pattern,
                     flags,
@@ -459,9 +459,10 @@ fn build_plan<H: Host>(
 }
 fn regexp_property(
     properties: &PropertyMap,
+    atoms: &mut crate::AtomTable,
     name: &'static str,
 ) -> Result<Value, StructuredCloneFailure> {
-    match properties.get(&PropertyKey::Named(EcmaString::encode(name))) {
+    match properties.get(&PropertyKey::Named(atoms.intern_str(name))) {
         Some(Property::Data { value, .. }) => Ok(*value),
         _ => Err(StructuredCloneFailure::Evaluation(type_error(
             "invalid RegExp internal state",
@@ -487,7 +488,9 @@ fn enumerable_properties_excluding<H: Host>(
         let PropertyKey::Named(name) = &key else {
             continue;
         };
-        if excluded.iter().any(|excluded| name.eq_ascii(excluded))
+        if excluded
+            .iter()
+            .any(|excluded| machine.atoms.eq_ascii(*name, excluded))
             || !machine.own_property_is_enumerable(source, &key)?
         {
             continue;
@@ -519,7 +522,7 @@ fn append_error_state<H: Host>(
         "suppressed",
         "stack",
     ] {
-        let key = PropertyKey::Named(EcmaString::encode(name));
+        let key = PropertyKey::Named(machine.intern_str(name));
         if properties.iter().any(|property| property.key == key)
             || !source_properties.contains_key(&key)
         {
@@ -683,9 +686,10 @@ fn materialize<H: Host>(
                     ("flags", resolve(*canonical_flags, &targets), false),
                     ("lastIndex", Value::int32(0), true),
                 ] {
+                    let key = PropertyKey::Named(machine.intern_str(name));
                     machine.define_descriptor(
                         target,
-                        PropertyKey::Named(EcmaString::encode(name)),
+                        key,
                         Property::Data {
                             value,
                             writable,
@@ -813,10 +817,11 @@ mod tests {
                 length_writable: true,
             })
             .unwrap();
+        let hidden_key = PropertyKey::Named(machine.intern_str("hidden"));
         machine
             .define_descriptor(
                 array,
-                PropertyKey::Named(EcmaString::encode("hidden")),
+                hidden_key,
                 Property::Data {
                     value: Value::int32(9),
                     writable: false,
@@ -825,10 +830,11 @@ mod tests {
                 },
             )
             .unwrap();
+        let visible_key = PropertyKey::Named(machine.intern_str("visible"));
         machine
             .define_descriptor(
                 array,
-                PropertyKey::Named(EcmaString::encode("visible")),
+                visible_key,
                 Property::Data {
                     value: Value::int32(7),
                     writable: false,
@@ -842,15 +848,17 @@ mod tests {
             machine.array_elements(cloned).unwrap().unwrap(),
             [Value::int32(1), Value::HOLE, Value::int32(3)]
         );
+        let hidden_check_key = PropertyKey::Named(machine.intern_str("hidden"));
         assert!(
             !machine
-                .has_own_property_key(cloned, &PropertyKey::Named(EcmaString::encode("hidden")))
+                .has_own_property_key(cloned, &hidden_check_key)
                 .unwrap()
         );
+        let visible_key = PropertyKey::Named(machine.intern_str("visible"));
         assert!(matches!(
             machine.own_descriptor(
                 cloned,
-                &PropertyKey::Named(EcmaString::encode("visible"))
+                &visible_key
             ).unwrap(),
             Some(Property::Data {
                 value,
@@ -940,7 +948,7 @@ mod tests {
             ("lastIndex", Value::int32(12), true),
         ] {
             properties.insert(
-                PropertyKey::Named(EcmaString::encode(name)),
+                PropertyKey::Named(machine.intern_str(name)),
                 Property::Data {
                     value,
                     writable,
@@ -960,6 +968,7 @@ mod tests {
             .unwrap();
         let cloned = clone(&mut machine, regexp);
         let cloned_slot = slot(&machine, cloned);
+        let last_index_key = PropertyKey::Named(machine.intern_str("lastIndex"));
         let HeapEntry::RegExp {
             pattern,
             flags,
@@ -972,7 +981,7 @@ mod tests {
         assert!(pattern.eq_ascii("a"));
         assert!(flags.eq_ascii("g"));
         assert!(matches!(
-            properties.get(&PropertyKey::Named(EcmaString::encode("lastIndex"))),
+            properties.get(&last_index_key),
             Some(Property::Data {
                 value,
                 writable: true,
@@ -1004,15 +1013,11 @@ mod tests {
         );
         let cloned_cause = machine.get_named_property(cloned, "cause").unwrap();
         assert_ne!(slot(&machine, cloned_cause), slot(&machine, cause));
-        assert!(
-            machine
-                .has_own_property_key(cloned, &PropertyKey::Named(EcmaString::encode("stack")))
-                .unwrap()
-        );
+        let stack_key = PropertyKey::Named(machine.intern_str("stack"));
+        assert!(machine.has_own_property_key(cloned, &stack_key).unwrap());
+        let message_key = PropertyKey::Named(machine.intern_str("message"));
         assert!(matches!(
-            machine
-                .own_descriptor(cloned, &PropertyKey::Named(EcmaString::encode("message")))
-                .unwrap(),
+            machine.own_descriptor(cloned, &message_key).unwrap(),
             Some(Property::Data {
                 writable: true,
                 enumerable: false,

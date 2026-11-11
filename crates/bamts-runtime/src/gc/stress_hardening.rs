@@ -182,7 +182,7 @@ fn tracing_follows_composed_production_heap_edges() {
     let array_property = stress.object();
     let mut array_properties = PropertyMap::default();
     array_properties.insert(
-        PropertyKey::Named(EcmaString::encode("edge")),
+        PropertyKey::Named(stress.machine.intern_str("edge")),
         Property::Data {
             value: array_property,
             writable: true,
@@ -206,7 +206,7 @@ fn tracing_follows_composed_production_heap_edges() {
     let prototype_edge = stress.object();
     let mut root_properties = PropertyMap::default();
     root_properties.insert(
-        PropertyKey::Named(EcmaString::encode("data")),
+        PropertyKey::Named(stress.machine.intern_str("data")),
         Property::Data {
             value: array,
             writable: true,
@@ -215,7 +215,7 @@ fn tracing_follows_composed_production_heap_edges() {
         },
     );
     root_properties.insert(
-        PropertyKey::Named(EcmaString::encode("accessor")),
+        PropertyKey::Named(stress.machine.intern_str("accessor")),
         Property::Accessor {
             getter: Some(getter_edge),
             setter: Some(setter_edge),
@@ -387,7 +387,7 @@ fn allocation_pressure_requests_collection_and_recomputes_watermarks() {
         extensible: true,
         boxed_primitive: None,
     };
-    let allocation_bytes = entry.initial_bytes();
+    let allocation_bytes = entry.initial_bytes(&stress.machine.atoms);
     let byte_boundary = stress.machine.heap_bytes + allocation_bytes;
     stress
         .machine

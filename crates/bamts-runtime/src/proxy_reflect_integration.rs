@@ -200,10 +200,11 @@ fn allocate_array<H: Host>(machine: &mut Machine<'_, H>, elements: Vec<Value>) -
 }
 
 fn data_property<H: Host>(machine: &mut Machine<'_, H>, object: Value, name: &str, value: Value) {
+    let key = key(machine, name);
     machine
         .define_descriptor(
             object,
-            key(name),
+            key,
             Property::Data {
                 value,
                 writable: true,
@@ -220,10 +221,11 @@ fn fixed_data_property<H: Host>(
     name: &str,
     value: Value,
 ) {
+    let key = key(machine, name);
     machine
         .define_descriptor(
             object,
-            key(name),
+            key,
             Property::Data {
                 value,
                 writable: false,
@@ -246,7 +248,7 @@ fn native(
         length,
         handler,
     });
-    native_function(&mut machine.heap, id, name, length)
+    native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
 }
 
 /// Callable-and-constructable builtin (construct targets for ProxyCreate).
@@ -264,7 +266,7 @@ fn native_ctor(
             length,
             handler,
         });
-    native_function(&mut machine.heap, id, name, length)
+    native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
 }
 
 fn global_method(machine: &mut Machine<'_, TestHost>, namespace: &str, name: &str) -> Value {
@@ -303,8 +305,8 @@ fn cid(raw: u32) -> ConstantId {
     ConstantId::new(raw)
 }
 
-fn key(name: &str) -> PropertyKey {
-    PropertyKey::Named(EcmaString::encode(name))
+fn key<H: Host>(machine: &mut Machine<'_, H>, name: &str) -> PropertyKey {
+    PropertyKey::Named(machine.intern_str(name))
 }
 
 /// Builds a descriptor object a gOPD trap can return, mirroring
@@ -476,7 +478,8 @@ fn it01_bytecode_property_ops_fire_exactly_their_trap() {
         data_property(machine, handler, "has", has);
         let proxy_value = proxy::create(machine, target, handler).unwrap();
 
-        let x = key("x");
+        let x = key(machine, "x");
+
         // GetProperty.
         assert_eq!(
             machine.internal_get(proxy_value, &x, proxy_value).unwrap(),
@@ -557,9 +560,8 @@ fn it02_proxy_prototype_traps_see_the_original_receiver() {
             .internal_set_prototype_of(instance, Some(proto))
             .unwrap();
 
-        // `instance.x` in a for-in loop body: the get head walks the prototype
+        let x = key(machine, "x");
         // chain and the trap must observe `instance`, never the proxy.
-        let x = key("x");
         assert_eq!(
             machine.internal_get(instance, &x, instance).unwrap(),
             Value::int32(7)
@@ -601,10 +603,11 @@ static IT3: StampLog = StampLog::new();
 fn it03_for_in_over_proxy_orders_own_keys_descriptors_gets() {
     with_machine(|machine| {
         let target = ordinary_object(machine);
+        let a_key = key(machine, "a");
         machine
             .define_descriptor(
                 target,
-                key("a"),
+                a_key,
                 Property::Data {
                     value: Value::int32(1),
                     writable: true,
@@ -613,10 +616,11 @@ fn it03_for_in_over_proxy_orders_own_keys_descriptors_gets() {
                 },
             )
             .unwrap();
+        let hidden_key = key(machine, "hidden");
         machine
             .define_descriptor(
                 target,
-                key("hidden"),
+                hidden_key,
                 Property::Data {
                     value: Value::int32(2),
                     writable: true,
@@ -686,9 +690,8 @@ fn it03_for_in_over_proxy_orders_own_keys_descriptors_gets() {
         assert_eq!(names.len(), 1);
         assert!(names[0].eq_ascii("a"));
         assert_logged(&IT3, &[OP_OWN_KEYS, OP_GOPD, OP_GOPD]);
-
+        let a = key(machine, "a");
         IT3.reset();
-        let a = key("a");
         machine.internal_get(proxy_value, &a, proxy_value).unwrap();
         assert_logged(&IT3, &[OP_GET]);
     });
@@ -725,7 +728,7 @@ fn it4_own_keys<H: Host>(
         .iter()
         .map(|key| match key {
             PropertyKey::Named(name) => Ok(machine
-                .allocate(HeapEntry::String(name.clone()))
+                .allocate(HeapEntry::String(machine.atoms.resolve(*name).clone()))
                 .map_err(EvalFailure::Runtime)?),
             PropertyKey::Symbol(_) | PropertyKey::Private(_) => {
                 Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -745,7 +748,7 @@ fn it4_gopd<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     IT4.stamp(OP_GOPD);
     // Report the target's real descriptor for the requested key.
-    let key = machine.to_property_key(args[1])?;
+    let key = machine.property_key_from_value(args[1])?;
     let descriptor = machine
         .internal_get_own_property(args[0], &key)?
         .expect("it4 target holds the probed key");
@@ -1091,7 +1094,8 @@ fn it06_call_and_construct_entries_route_proxies() {
             machine.call_value(revoker, Value::UNDEFINED, &[]).unwrap(),
             Value::UNDEFINED
         );
-        let dead = machine.internal_get(revoked_proxy, &key("x"), revoked_proxy);
+        let dead_key = key(machine, "x");
+        let dead = machine.internal_get(revoked_proxy, &dead_key, revoked_proxy);
         assert!(is_type_error(&dead), "revoked proxy is dead after one call");
     });
 
@@ -1304,9 +1308,8 @@ fn it08_super_property_proxy_chain_preserves_receiver() {
         // super_base resolves the home's [[GetPrototypeOf]] — the proxy head.
         let base = machine.super_base(home).unwrap();
         assert_eq!(base, home_base);
-
+        let x = key(machine, "x");
         let receiver = ordinary_object(machine);
-        let x = key("x");
         assert_eq!(
             machine.internal_get(base, &x, receiver).unwrap(),
             Value::int32(7)
@@ -1735,8 +1738,8 @@ fn it11_reflect_set_receiver_matrix_matches_descriptor_algebra() {
     with_machine(|machine| {
         let fresh1 = ordinary_object(machine);
         let fresh2 = ordinary_object(machine);
+        let x = key(machine, "x");
         let proxy_value = proxy::create(machine, fresh1, fresh2).unwrap();
-        let x = key("x");
         let arg_key = allocate_string(machine, "x");
 
         // (a) writable non-configurable data: value updates, attributes stay.
@@ -1903,14 +1906,16 @@ fn it12_nested_trap_reentry_and_midtrap_revocation_are_safe() {
                 IT12.stamp(OP_OUTER);
                 // Re-enter the same proxy: no borrow is held across the trap.
                 let self_proxy = machine.get_named_property(this, "self")?;
-                let inner = machine.internal_get(self_proxy, &key("y"), args[2])?;
+                let y_key = key(machine, "y");
+                let inner = machine.internal_get(self_proxy, &y_key, args[2])?;
                 assert_eq!(inner, Value::int32(7));
                 // Revoke a sibling proxy mid-trap.
                 let sibling = machine.get_named_property(this, "sibling")?;
                 let revoker = machine.get_named_property(this, "siblingRevoke")?;
                 machine.call_value(revoker, Value::UNDEFINED, &[])?;
                 IT12.stamp(OP_REVOKED);
-                let dead = machine.internal_get(sibling, &key("z"), sibling);
+                let z_key = key(machine, "z");
+                let dead = machine.internal_get(sibling, &z_key, sibling);
                 assert!(is_type_error(&dead), "sibling dies mid-trap");
                 IT12.stamp(OP_SIBLING_THROWN);
                 Ok(BuiltinOutcome::Value(Value::int32(42)))
@@ -1926,8 +1931,9 @@ fn it12_nested_trap_reentry_and_midtrap_revocation_are_safe() {
         data_property(machine, handler, "sibling", sibling);
         data_property(machine, handler, "siblingRevoke", sibling_revoker);
 
+        let x_key = key(machine, "x");
         let result = machine
-            .internal_get(proxy_value, &key("x"), proxy_value)
+            .internal_get(proxy_value, &x_key, proxy_value)
             .unwrap();
         assert_eq!(result, Value::int32(42));
         assert_logged(&IT12, &[OP_OUTER, OP_INNER, OP_REVOKED, OP_SIBLING_THROWN]);
@@ -2048,7 +2054,10 @@ fn it14_spec_order_pins_is_extensible_then_target_keys() {
         );
         let early = proxy::create(machine, probe, early_handler).unwrap();
 
-        let absent = machine.internal_get_own_property(early, &key("x")).unwrap();
+        let absent_key = key(machine, "x");
+        let absent = machine
+            .internal_get_own_property(early, &absent_key)
+            .unwrap();
         assert!(absent.is_none());
         assert!(IT14_GOPD_TARGET.recorded().is_empty());
     });
@@ -2108,10 +2117,11 @@ fn it16_non_constructor_proxy_rejects_construct_before_trap() {
             |_machine, _this, _args, _constructing| Ok(BuiltinOutcome::Value(Value::int32(1))),
         );
         let accessor_holder = ordinary_object(machine);
+        let x_key = key(machine, "x");
         machine
             .define_descriptor(
                 accessor_holder,
-                key("x"),
+                x_key.clone(),
                 Property::Accessor {
                     getter: Some(getter),
                     setter: None,
@@ -2121,7 +2131,7 @@ fn it16_non_constructor_proxy_rejects_construct_before_trap() {
             )
             .unwrap();
         let accessor = match machine
-            .own_descriptor(accessor_holder, &key("x"))
+            .own_descriptor(accessor_holder, &x_key)
             .unwrap()
             .expect("accessor is own")
         {
@@ -2193,10 +2203,11 @@ fn it17_constructable_targets_forward_new_target_through_proxy() {
             })
             .map_err(EvalFailure::Runtime)
             .unwrap();
+        let prototype_key = key(machine, "prototype");
         machine
             .define_descriptor(
                 user_class,
-                key("prototype"),
+                prototype_key,
                 Property::Data {
                     value: user_class_prototype,
                     writable: true,
@@ -2391,7 +2402,7 @@ fn it19_body() {
     with_machine_limits(limits, |machine| {
         let target = it17_native_target(machine);
         let chain = transparent_chain(machine, 12, target);
-        let x = key("x");
+        let x = key(machine, "x");
         let descriptor = PropertyDescriptor {
             value: Some(Value::int32(1)),
             writable: Some(true),
@@ -2416,12 +2427,11 @@ fn it19_body() {
         assert_eq!(machine.native_depth, 0);
     });
 
-    // (b) Default ceiling: a chain deeper than 64 fails controllably; with a
     // raised ceiling the same ~1500-deep chain succeeds (per D6).
     with_machine_limits(Limits::default(), |machine| {
         let target = it17_native_target(machine);
         let chain = transparent_chain(machine, 100, target);
-        let x = key("x");
+        let x = key(machine, "x");
         let result = machine.internal_get(chain, &x, chain);
         assert!(is_call_depth(&result));
         assert_eq!(machine.native_depth, 0);
@@ -2433,7 +2443,7 @@ fn it19_body() {
     with_machine_limits(raised, |machine| {
         let target = it17_native_target(machine);
         let chain = transparent_chain(machine, 1500, target);
-        let x = key("x");
+        let x = key(machine, "x");
         assert_eq!(
             machine.internal_get(chain, &x, chain).unwrap(),
             Value::UNDEFINED
@@ -2453,8 +2463,8 @@ fn it19_body() {
         data_property(machine, handler, "get", get);
         let fresh = ordinary_object(machine);
         let chain = transparent_chain(machine, 3, fresh);
+        let x = key(machine, "x");
         let front = proxy::create(machine, chain, handler).unwrap();
-        let x = key("x");
         assert_eq!(
             machine.internal_get(front, &x, front).unwrap(),
             Value::int32(1)

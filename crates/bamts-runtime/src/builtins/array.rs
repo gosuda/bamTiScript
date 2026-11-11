@@ -13,13 +13,14 @@ use crate::{
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.array_prototype();
     let constructor =
-        install_constructor_function(heap, builtins, "Array", 1, generic::constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+        install_constructor_function(heap, atoms, builtins, "Array", 1, generic::constructor::<H>);
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     globals.insert(EcmaString::encode("Array"), constructor);
     for (name, length, handler) in [
         (
@@ -30,8 +31,8 @@ pub(super) fn install<H: Host>(
         ("from", 1, generic::from::<H>),
         ("of", 0, generic::of::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_static(heap, constructor, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_static(heap, atoms, constructor, name, function);
     }
     for (name, length, handler) in [
         ("toString", 0, to_string::<H> as BuiltinHandler<H>),
@@ -63,11 +64,12 @@ pub(super) fn install<H: Host>(
         ("flatMap", 1, generic::flat_map::<H>),
         ("fill", 1, generic::fill::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, function);
     }
     let species = install_function(
         heap,
+        atoms,
         builtins,
         "get [Symbol.species]",
         0,
@@ -84,12 +86,12 @@ pub(super) fn install<H: Host>(
             configurable: true,
         },
     );
-    let keys = install_function(heap, builtins, "keys", 0, keys_iterator::<H>);
-    let values = install_function(heap, builtins, "values", 0, values_iterator::<H>);
-    let entries = install_function(heap, builtins, "entries", 0, entries_iterator::<H>);
-    define_data(heap, prototype, "keys", keys);
-    define_data(heap, prototype, "values", values);
-    define_data(heap, prototype, "entries", entries);
+    let keys = install_function(heap, atoms, builtins, "keys", 0, keys_iterator::<H>);
+    let values = install_function(heap, atoms, builtins, "values", 0, values_iterator::<H>);
+    let entries = install_function(heap, atoms, builtins, "entries", 0, entries_iterator::<H>);
+    define_data(heap, atoms, prototype, "keys", keys);
+    define_data(heap, atoms, prototype, "values", values);
+    define_data(heap, atoms, prototype, "entries", entries);
     let unscopables = super::super::push(
         heap,
         HeapEntry::Object {
@@ -122,7 +124,7 @@ pub(super) fn install<H: Host>(
             "values",
         ] {
             properties.insert(
-                PropertyKey::Named(EcmaString::encode(name)),
+                PropertyKey::Named(atoms.intern_str(name)),
                 Property::Data {
                     value: Value::TRUE,
                     writable: true,
@@ -148,16 +150,22 @@ pub(super) fn install<H: Host>(
             configurable: true,
         },
     );
-    super::array_es2023::install(heap, builtins, prototype, constructor);
+    super::array_es2023::install(heap, atoms, builtins, prototype, constructor);
 }
 
-fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
+fn define_static(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    constructor: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[super::heap_index(constructor)]
     else {
         panic!("Array constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern_str(name)),
         super::builtin_property(value),
     );
 }
@@ -188,7 +196,7 @@ pub(super) fn elements<H: Host>(
     }
     let mut values = Vec::with_capacity(length);
     for index in 0..length {
-        let key = array_es2023::index_key(index);
+        let key = array_es2023::index_key(&mut machine.atoms, index);
         values.push(if machine.internal_has_property(object, &key)? {
             machine.get_property_key(object, &key)?
         } else {
@@ -264,7 +272,8 @@ fn locale_join<H: Host>(
         if index != 0 {
             output.push_unit(u16::from(b','));
         }
-        let element = machine.get_property_key(object, &array_es2023::index_key(index))?;
+        let key = array_es2023::index_key(&mut machine.atoms, index);
+        let element = machine.get_property_key(object, &key)?;
         if matches!(element.decode(), Some(Decoded::Undefined | Decoded::Null)) {
             continue;
         }
@@ -315,8 +324,8 @@ fn copy_within_steps<H: Host>(
     }
     while count > 0 {
         generic::tick(machine)?;
-        let from_key = array_es2023::index_key(from);
-        let to_key = array_es2023::index_key(to);
+        let from_key = array_es2023::index_key(&mut machine.atoms, from);
+        let to_key = array_es2023::index_key(&mut machine.atoms, to);
         if machine.internal_has_property(object, &from_key)? {
             let value = machine.get_property_key(object, &from_key)?;
             machine.set_data_property_key(object, to_key, value)?;
@@ -421,7 +430,7 @@ mod fuel_tests {
             length: 2,
             handler: cancel_and_keep_order,
         });
-        let comparator = native_function(&mut machine.heap, id, "cancel", 2);
+        let comparator = native_function(&mut machine.heap, &mut machine.atoms, id, "cancel", 2);
         let elements = (0..4).rev().map(Value::int32).collect();
         let array = super::super::allocate_array(&mut machine, elements).unwrap();
         let method = machine.get_named_property(array, "toSorted").unwrap();
@@ -590,7 +599,7 @@ mod tests {
         machine.set_data_property(backing, "_next", next).unwrap();
 
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let iterator_key = machine.property_key_from_value(iterator_symbol).unwrap();
         let custom_iter_fn = machine.get_property_key(source, &iterator_key).unwrap();
         machine
             .set_data_property_key(backing, iterator_key, custom_iter_fn)
@@ -643,8 +652,13 @@ mod tests {
             length: 1,
             handler: mapper::<TestHost>,
         });
-        let mapper_fn =
-            crate::intrinsics::native_function(&mut machine.heap, mapper_id, "mapper", 1);
+        let mapper_fn = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            mapper_id,
+            "mapper",
+            1,
+        );
         let this_arg = ordinary_object(&mut machine);
         machine
             .set_data_property(this_arg, "offset", Value::int32(1000))
@@ -698,7 +712,7 @@ mod tests {
 
         let source = ordinary_object(&mut machine);
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let iterator_key = machine.property_key_from_value(iterator_symbol).unwrap();
         machine
             .set_data_property_key(source, iterator_key, Value::int32(123))
             .unwrap();
@@ -747,13 +761,14 @@ mod tests {
         });
         let create_func = crate::intrinsics::native_function(
             &mut machine.heap,
+            &mut machine.atoms,
             create_id,
             "test_symbol_iterator",
             0,
         );
 
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let iterator_key = machine.property_key_from_value(iterator_symbol).unwrap();
         machine
             .set_data_property_key(iterable, iterator_key, create_func)
             .unwrap();
@@ -821,7 +836,13 @@ mod tests {
             length: 0,
             handler: next_fn::<TestHost>,
         });
-        let next_func = crate::intrinsics::native_function(&mut machine.heap, next_id, "next", 0);
+        let next_func = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            next_id,
+            "next",
+            0,
+        );
 
         let iter_obj = ordinary_object(&mut machine);
         machine
@@ -838,8 +859,13 @@ mod tests {
             length: 2,
             handler: map_fn::<TestHost>,
         });
-        let mapper_func =
-            crate::intrinsics::native_function(&mut machine.heap, map_id, "mapper", 2);
+        let mapper_func = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            map_id,
+            "mapper",
+            2,
+        );
 
         let result = call_array(&mut machine, "from", &[iterable, mapper_func]).unwrap();
         let elements = machine.array_elements(result).unwrap().unwrap();
@@ -925,15 +951,26 @@ mod tests {
             length: 0,
             handler: next_fn::<TestHost>,
         });
-        let next_func = crate::intrinsics::native_function(&mut machine.heap, next_id, "next", 0);
+        let next_func = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            next_id,
+            "next",
+            0,
+        );
 
         let return_id = machine.intrinsics.builtins.register(BuiltinDef {
             name: "return",
             length: 0,
             handler: return_fn::<TestHost>,
         });
-        let return_func =
-            crate::intrinsics::native_function(&mut machine.heap, return_id, "return", 0);
+        let return_func = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            return_id,
+            "return",
+            0,
+        );
 
         let iter_obj = ordinary_object(&mut machine);
         machine
@@ -953,8 +990,13 @@ mod tests {
             length: 2,
             handler: failing_map_fn::<TestHost>,
         });
-        let mapper_func =
-            crate::intrinsics::native_function(&mut machine.heap, map_id, "failing_mapper", 2);
+        let mapper_func = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            map_id,
+            "failing_mapper",
+            2,
+        );
 
         let result = call_array(&mut machine, "from", &[iterable, mapper_func]);
         assert!(matches!(
@@ -1005,16 +1047,26 @@ mod tests {
             length: 0,
             handler: next_throws_fn::<TestHost>,
         });
-        let next_func =
-            crate::intrinsics::native_function(&mut machine.heap, next_id, "next_throws", 0);
+        let next_func = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            next_id,
+            "next_throws",
+            0,
+        );
 
         let return_id = machine.intrinsics.builtins.register(BuiltinDef {
             name: "return",
             length: 0,
             handler: return_fn::<TestHost>,
         });
-        let return_func =
-            crate::intrinsics::native_function(&mut machine.heap, return_id, "return", 0);
+        let return_func = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            return_id,
+            "return",
+            0,
+        );
 
         let iter_obj = ordinary_object(&mut machine);
         machine
@@ -1044,7 +1096,7 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let iterator_key = machine.property_key_from_value(iterator_symbol).unwrap();
 
         // Null iterator
         let source_null = ordinary_object(&mut machine);
@@ -1103,7 +1155,7 @@ mod tests {
 
         let source_bad_iter = ordinary_object(&mut machine);
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let iterator_key = machine.property_key_from_value(iterator_symbol).unwrap();
         machine
             .set_data_property_key(source_bad_iter, iterator_key, Value::int32(123))
             .unwrap();
@@ -1163,8 +1215,13 @@ mod tests {
             length: 2,
             handler: array_like_map_fn::<TestHost>,
         });
-        let mapper_func =
-            crate::intrinsics::native_function(&mut machine.heap, map_id, "array_like_mapper", 2);
+        let mapper_func = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            map_id,
+            "array_like_mapper",
+            2,
+        );
 
         let result = call_array(&mut machine, "from", &[source, mapper_func]).unwrap();
         let elements = machine.array_elements(result).unwrap().unwrap();
@@ -1190,7 +1247,7 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let array_prototype = machine.intrinsics.array_prototype;
         let unscopables_symbol = machine.intrinsics.builtins.symbol_unscopables();
-        let key = machine.to_property_key(unscopables_symbol).unwrap();
+        let key = machine.property_key_from_value(unscopables_symbol).unwrap();
         let descriptor = machine
             .own_descriptor(array_prototype, &key)
             .expect("descriptor lookup succeeds")
@@ -1244,7 +1301,7 @@ mod tests {
                 .get_named_property(unscopables, name)
                 .unwrap_or_else(|_| panic!("{name} must be present on unscopables"));
             assert_eq!(entry, Value::TRUE, "{name} must be true");
-            let entry_key = PropertyKey::Named(EcmaString::encode(name));
+            let entry_key = PropertyKey::Named(machine.intern_str(name));
             let entry_descriptor = machine
                 .own_descriptor(unscopables, &entry_key)
                 .expect("entry descriptor lookup succeeds")
@@ -1264,8 +1321,7 @@ mod tests {
         }
         let expected: Vec<_> = names
             .into_iter()
-            .map(EcmaString::encode)
-            .map(PropertyKey::Named)
+            .map(|name| PropertyKey::Named(machine.intern_str(name)))
             .collect();
         assert_eq!(
             machine.own_property_keys(unscopables).unwrap(),
@@ -1455,7 +1511,7 @@ mod tests {
 
         let popped = call_prototype(&mut machine, "pop", like, &[]).unwrap();
         assert_eq!(popped, Value::int32(3));
-        let key = array_es2023::index_key(2);
+        let key = array_es2023::index_key(&mut machine.atoms, 2);
         assert!(
             !machine.internal_has_property(like, &key).unwrap(),
             "a removed element is deleted"
@@ -1577,18 +1633,15 @@ mod tests {
         });
         let getter = crate::intrinsics::native_function(
             &mut machine.heap,
+            &mut machine.atoms,
             getter_id,
             "join length getter",
             0,
         );
 
+        let key = PropertyKey::Named(machine.intern_str("1"));
         machine
-            .define_accessor(
-                array,
-                PropertyKey::Named(EcmaString::encode("1")),
-                getter,
-                crate::AccessorKind::Getter,
-            )
+            .define_accessor(array, key, getter, crate::AccessorKind::Getter)
             .unwrap();
 
         let result = call_proto(&mut machine, "join", array);
@@ -1615,8 +1668,13 @@ mod tests {
             length: 0,
             handler: custom_join::<TestHost>,
         });
-        let custom =
-            crate::intrinsics::native_function(&mut machine.heap, custom_id, "custom join", 0);
+        let custom = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            custom_id,
+            "custom join",
+            0,
+        );
         machine.set_data_property(array, "join", custom).unwrap();
         let result = call_proto(&mut machine, "toString", array);
         assert!(

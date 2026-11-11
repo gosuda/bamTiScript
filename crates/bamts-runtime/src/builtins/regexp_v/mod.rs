@@ -461,7 +461,7 @@ pub(super) fn create_result_property<H: Host>(
     name: &str,
     value: Value,
 ) -> Result<(), EvalFailure> {
-    let key = crate::PropertyKey::Named(EcmaString::encode(name));
+    let key = crate::PropertyKey::Named(machine.intern_str(name));
     machine.create_data_property_key(array, key, value)
 }
 

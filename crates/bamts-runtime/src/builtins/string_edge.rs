@@ -17,6 +17,7 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// String constructor and prototype have been created.
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -34,13 +35,13 @@ pub(super) fn install<H: Host>(
         ),
         ("raw", 1, raw::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
         let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)]
         else {
             panic!("String constructor must be native")
         };
         properties.insert(
-            PropertyKey::Named(EcmaString::encode(name)),
+            PropertyKey::Named(atoms.intern_str(name)),
             builtin_property(function),
         );
     }
@@ -58,8 +59,8 @@ pub(super) fn install<H: Host>(
         ("trimEnd", 0, trim_end::<H>),
         ("repeat", 1, repeat::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        super::define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        super::define_data(heap, atoms, prototype, name, function);
     }
 }
 
@@ -171,7 +172,7 @@ fn raw<H: Host>(
 
     let mut output = EcmaStringBuilder::new();
     for index in 0..literal_count {
-        let key = PropertyKey::Named(EcmaString::encode(&index.to_string()));
+        let key = PropertyKey::Named(machine.intern_str(&index.to_string()));
         let literal = machine.get_property_key(literals, &key)?;
         append(&mut output, &machine.coerce_string_observable(literal)?);
         if index + 1 < literal_count && index + 1 < args.len() {
@@ -868,9 +869,9 @@ mod tests {
             length: 2,
             handler: symbol_replace_hook::<TestHost>,
         });
-        let hook = native_function(&mut machine.heap, id, "replace hook", 2);
+        let hook = native_function(&mut machine.heap, &mut machine.atoms, id, "replace hook", 2);
         let symbol = machine.intrinsics.builtins.symbol_replace();
-        let key = machine.to_property_key(symbol).unwrap();
+        let key = machine.property_key_from_value(symbol).unwrap();
         machine.set_data_property_key(search, key, hook).unwrap();
         let receiver = ordinary_object(&mut machine);
         let coercion_id = machine.intrinsics.builtins.register(BuiltinDef {
@@ -878,7 +879,13 @@ mod tests {
             length: 0,
             handler: throwing_to_string::<TestHost>,
         });
-        let coercion = native_function(&mut machine.heap, coercion_id, "throwing toString", 0);
+        let coercion = native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            coercion_id,
+            "throwing toString",
+            0,
+        );
         machine
             .set_data_property(receiver, "toString", coercion)
             .unwrap();
@@ -982,7 +989,13 @@ mod tests {
             length: 3,
             handler: literal_dollar_replacer::<TestHost>,
         });
-        let replacer = native_function(&mut machine.heap, id, "literal dollar replacer", 3);
+        let replacer = native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            id,
+            "literal dollar replacer",
+            3,
+        );
         let replaced = replace_all(&mut machine, source, &[needle, replacer], false).unwrap();
         assert_eq!(
             result_text(&machine, replaced),
@@ -999,11 +1012,11 @@ mod tests {
             length: 2,
             handler: symbol_replace_hook::<TestHost>,
         });
-        let hook = native_function(&mut machine.heap, id, "replace hook", 2);
+        let hook = native_function(&mut machine.heap, &mut machine.atoms, id, "replace hook", 2);
         let match_symbol = machine.intrinsics.builtins.symbol_match();
-        let match_key = machine.to_property_key(match_symbol).unwrap();
+        let match_key = machine.property_key_from_value(match_symbol).unwrap();
         let replace_symbol = machine.intrinsics.builtins.symbol_replace();
-        let replace_key = machine.to_property_key(replace_symbol).unwrap();
+        let replace_key = machine.property_key_from_value(replace_symbol).unwrap();
         machine
             .set_data_property_key(search, match_key.clone(), Value::TRUE)
             .unwrap();
@@ -1044,7 +1057,7 @@ mod tests {
         test_machine!(program, host, machine);
         let source = string(&mut machine, &[0xD83D, 0xDE00, 0xD800, b'x' as u16, 0xDFFF]);
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let iterator_key = machine.property_key_from_value(iterator_symbol).unwrap();
         let iterator_method = machine.get_property_key(source, &iterator_key).unwrap();
         let iterator = machine.call_value(iterator_method, source, &[]).unwrap();
         let next = machine.get_named_property(iterator, "next").unwrap();
@@ -1141,7 +1154,13 @@ mod tests {
             length: 0,
             handler: throwing_to_string::<TestHost>,
         });
-        let coercion = native_function(&mut machine.heap, coercion_id, "unused filler toString", 0);
+        let coercion = native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            coercion_id,
+            "unused filler toString",
+            0,
+        );
         machine
             .set_data_property(unused_filler, "toString", coercion)
             .unwrap();
@@ -1196,9 +1215,8 @@ mod tests {
             let function = machine.get_named_property(owner, name).unwrap();
             assert!(machine.is_callable(function).unwrap());
             for (property, expected) in [("name", None), ("length", Some(length))] {
-                let descriptor = machine
-                    .own_descriptor(function, &PropertyKey::Named(EcmaString::encode(property)))
-                    .unwrap();
+                let descriptor_key = PropertyKey::Named(machine.intern_str(property));
+                let descriptor = machine.own_descriptor(function, &descriptor_key).unwrap();
                 assert!(matches!(
                     descriptor,
                     Some(Property::Data {
@@ -1212,9 +1230,10 @@ mod tests {
                     )
                 ));
             }
+            let owner_key = PropertyKey::Named(machine.intern_str(name));
             assert!(matches!(
                 machine
-                    .own_descriptor(owner, &PropertyKey::Named(EcmaString::encode(name)))
+                    .own_descriptor(owner, &owner_key)
                     .unwrap(),
                 Some(Property::Data {
                     value,

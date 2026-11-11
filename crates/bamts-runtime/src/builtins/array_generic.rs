@@ -57,7 +57,8 @@ fn has_index<H: Host>(
     if dense_element(machine, object, index).is_some() {
         return Ok(true);
     }
-    machine.internal_has_property(object, &index_key(index))
+    let key = index_key(&mut machine.atoms, index);
+    machine.internal_has_property(object, &key)
 }
 
 fn get_index<H: Host>(
@@ -68,7 +69,8 @@ fn get_index<H: Host>(
     if let Some(value) = dense_element(machine, object, index) {
         return Ok(value);
     }
-    machine.get_property_key(object, &index_key(index))
+    let key = index_key(&mut machine.atoms, index);
+    machine.get_property_key(object, &key)
 }
 
 fn set_index<H: Host>(
@@ -87,7 +89,8 @@ fn set_index<H: Host>(
         }
         return Ok(());
     }
-    machine.set_data_property_key(object, index_key(index), value)
+    let key = index_key(&mut machine.atoms, index);
+    machine.set_data_property_key(object, key, value)
 }
 
 fn delete_index<H: Host>(
@@ -95,7 +98,8 @@ fn delete_index<H: Host>(
     object: Value,
     index: usize,
 ) -> Result<(), EvalFailure> {
-    if machine.internal_delete(object, &index_key(index))? {
+    let key = index_key(&mut machine.atoms, index);
+    if machine.internal_delete(object, &key)? {
         Ok(())
     } else {
         Err(type_error("Cannot delete array element"))
@@ -119,7 +123,8 @@ fn create_index<H: Host>(
         enumerable: true,
         configurable: true,
     });
-    if machine.internal_define_own_property(target, index_key(index), descriptor)? {
+    let key = index_key(&mut machine.atoms, index);
+    if machine.internal_define_own_property(target, key, descriptor)? {
         Ok(())
     } else {
         Err(type_error("Cannot define array element"))
@@ -166,7 +171,7 @@ fn array_species_create<H: Host>(
     }
     let mut constructor = machine.get_named_property(original, "constructor")?;
     if machine.is_object(constructor) {
-        let key = machine.to_property_key(machine.intrinsics.builtins.symbol_species())?;
+        let key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_species())?;
         constructor = machine.get_property_key(constructor, &key)?;
         if constructor == Value::NULL {
             constructor = Value::UNDEFINED;
@@ -218,7 +223,8 @@ pub(super) fn push<H: Host>(
             return Err(type_error("Array length exceeds the safe integer limit"));
         }
         for &value in args {
-            machine.set_data_property_key(object, index_key(length), value)?;
+            let key = index_key(&mut machine.atoms, length);
+            machine.set_data_property_key(object, key, value)?;
             length += 1;
         }
         set_length(machine, object, length)?;
@@ -419,7 +425,7 @@ fn is_concat_spreadable<H: Host>(
         return Ok(false);
     }
     let symbol = machine.intrinsics.builtins.symbol_is_concat_spreadable();
-    let key = machine.to_property_key(symbol)?;
+    let key = machine.property_key_from_value(symbol)?;
     let spreadable = machine.get_property_key(value, &key)?;
     if spreadable != Value::UNDEFINED {
         return Ok(machine.to_boolean(spreadable));
@@ -1248,7 +1254,7 @@ fn iterator_method<H: Host>(
     machine: &mut Machine<'_, H>,
     items: Value,
 ) -> Result<Option<Value>, EvalFailure> {
-    let key = machine.to_property_key(machine.intrinsics.builtins.symbol_iterator())?;
+    let key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_iterator())?;
     let method = machine.get_property_key(items, &key)?;
     if matches!(method.decode(), Some(Decoded::Undefined | Decoded::Null)) {
         return Ok(None);
@@ -1370,7 +1376,7 @@ mod tests {
             length: 1,
             handler,
         });
-        native_function(&mut machine.heap, id, name, 1)
+        native_function(&mut machine.heap, &mut machine.atoms, id, name, 1)
     }
 
     fn return_this(
@@ -1421,7 +1427,7 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let key = machine
-            .to_property_key(machine.intrinsics.builtins.symbol_is_concat_spreadable())
+            .property_key_from_value(machine.intrinsics.builtins.symbol_is_concat_spreadable())
             .unwrap();
         let spreadable_object = ordinary_object(&mut machine);
         machine

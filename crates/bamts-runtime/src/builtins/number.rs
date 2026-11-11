@@ -13,12 +13,14 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.number_prototype();
-    let constructor = install_constructor_function(heap, builtins, "Number", 1, constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, builtins, "Number", 1, constructor::<H>);
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     globals.insert(EcmaString::encode("Number"), constructor);
     for (name, length, handler) in [
         ("isInteger", 1, is_integer::<H> as BuiltinHandler<H>),
@@ -26,8 +28,8 @@ pub(super) fn install<H: Host>(
         ("isFinite", 1, is_finite::<H>),
         ("isNaN", 1, is_nan::<H>),
     ] {
-        let f = install_function(heap, builtins, name, length, handler);
-        define_static(heap, constructor, name, f)
+        let f = install_function(heap, atoms, builtins, name, length, handler);
+        define_static(heap, atoms, constructor, name, f)
     }
     for (name, value) in [
         ("MAX_SAFE_INTEGER", 9007199254740991.0),
@@ -45,7 +47,7 @@ pub(super) fn install<H: Host>(
             panic!("Number constructor must be native")
         };
         properties.insert(
-            PropertyKey::Named(EcmaString::encode(name)),
+            PropertyKey::Named(atoms.intern_str(name)),
             crate::Property::Data {
                 value: crate::number_value(value),
                 writable: false,
@@ -62,24 +64,40 @@ pub(super) fn install<H: Host>(
         ("toPrecision", 1, to_precision::<H>),
         ("valueOf", 0, value_of::<H>),
     ] {
-        let f = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, f)
+        let f = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, f)
     }
 }
 /// `Number.parseFloat` and `Number.parseInt` are the global functions themselves.
-pub(super) fn share_global_parsers(heap: &mut [HeapEntry], globals: &BTreeMap<EcmaString, Value>) {
+pub(super) fn share_global_parsers(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    globals: &BTreeMap<EcmaString, Value>,
+) {
     let constructor = globals[&EcmaString::encode("Number")];
     for name in ["parseFloat", "parseInt"] {
-        define_static(heap, constructor, name, globals[&EcmaString::encode(name)]);
+        define_static(
+            heap,
+            atoms,
+            constructor,
+            name,
+            globals[&EcmaString::encode(name)],
+        );
     }
 }
-fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
+fn define_static(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    constructor: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[super::heap_index(constructor)]
     else {
         panic!("Number constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern_str(name)),
         super::builtin_property(value),
     );
 }
@@ -395,7 +413,7 @@ mod tests {
             "NEGATIVE_INFINITY",
             "NaN",
         ] {
-            let key = PropertyKey::Named(EcmaString::encode(name));
+            let key = PropertyKey::Named(machine.intern_str(name));
             assert!(matches!(
                 machine.own_descriptor(constructor, &key).unwrap(),
                 Some(crate::Property::Data {

@@ -222,7 +222,7 @@ pub(super) fn species_constructor<H: Host>(
     if !machine.is_object(constructor) {
         return Err(type_error("constructor property is not an object"));
     }
-    let key = machine.to_property_key(machine.intrinsics.builtins.symbol_species())?;
+    let key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_species())?;
     let species = machine.get_property_key(constructor, &key)?;
     if matches!(species.decode(), Some(Decoded::Undefined | Decoded::Null)) {
         return Ok(default);
@@ -336,7 +336,8 @@ fn split_steps<H: Host>(
         piece_start = end;
         let captures = length_of_array_like(machine, matched)?.saturating_sub(1);
         for index in 1..=captures {
-            let capture = machine.get_property_key(matched, &index_key(index))?;
+            let key = index_key(&mut machine.atoms, index);
+            let capture = machine.get_property_key(matched, &key)?;
             keep_root(machine, depth, capture);
             pieces.push(capture);
             if pieces.len() == limit {
@@ -374,7 +375,8 @@ fn read_replace_step<H: Host>(
     let position = integer_or_infinity(machine, position)?.clamp(0.0, length as f64) as usize;
     let mut captures = Vec::with_capacity(capture_count);
     for index in 1..=capture_count {
-        let capture = machine.get_property_key(result, &index_key(index))?;
+        let key = index_key(&mut machine.atoms, index);
+        let capture = machine.get_property_key(result, &key)?;
         captures.push(if capture == Value::UNDEFINED {
             None
         } else {
@@ -569,7 +571,8 @@ pub(super) fn get_substitution<H: Host>(
                 continue;
             };
             let name = EcmaString::from_units(&units[offset + 2..offset + 2 + close]);
-            let capture = machine.get_property_key(named, &crate::PropertyKey::Named(name))?;
+            let key = crate::PropertyKey::Named(machine.intern(name));
+            let capture = machine.get_property_key(named, &key)?;
             if capture != Value::UNDEFINED {
                 append(
                     &mut output,
@@ -897,6 +900,7 @@ fn escape<H: Host>(
 /// Installs the flag accessors, the `Symbol`-keyed methods and `RegExp.escape`.
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     prototype: Value,
     constructor: Value,
@@ -914,8 +918,8 @@ pub(super) fn install<H: Host>(
         ("unicode", "get unicode", unicode::<H>),
         ("unicodeSets", "get unicodeSets", unicode_sets::<H>),
     ] {
-        let getter = install_function(heap, builtins, getter_name, 0, handler);
-        super::regexp::define_getter(heap, prototype, property, getter);
+        let getter = install_function(heap, atoms, builtins, getter_name, 0, handler);
+        super::regexp::define_getter(heap, atoms, prototype, property, getter);
     }
     let symbols = [
         (
@@ -950,13 +954,14 @@ pub(super) fn install<H: Host>(
         ),
     ];
     for (symbol, name, length, handler) in symbols {
-        let function = install_function(heap, builtins, name, length, handler);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
         define_symbol_property(heap, prototype, symbol, super::builtin_property(function));
     }
-    let escape_function = install_function(heap, builtins, "escape", 1, escape::<H>);
-    super::define_data(heap, constructor, "escape", escape_function);
+    let escape_function = install_function(heap, atoms, builtins, "escape", 1, escape::<H>);
+    super::define_data(heap, atoms, constructor, "escape", escape_function);
     let species = install_function(
         heap,
+        atoms,
         builtins,
         "get [Symbol.species]",
         0,
@@ -982,8 +987,15 @@ pub(super) fn install<H: Host>(
             boxed_primitive: None,
         },
     );
-    let next = install_function(heap, builtins, "next", 0, regexp_string_iterator_next::<H>);
-    super::define_data(heap, iterator_prototype, "next", next);
+    let next = install_function(
+        heap,
+        atoms,
+        builtins,
+        "next",
+        0,
+        regexp_string_iterator_next::<H>,
+    );
+    super::define_data(heap, atoms, iterator_prototype, "next", next);
     super::define_to_string_tag(
         heap,
         iterator_prototype,
@@ -1023,7 +1035,7 @@ mod tests {
             machine.get_named_property(value, "sticky").unwrap(),
             Value::FALSE
         );
-        let key = crate::PropertyKey::Named(EcmaString::encode("global"));
+        let key = crate::PropertyKey::Named(machine.intern_str("global"));
         assert_eq!(
             machine.own_descriptor(value, &key).unwrap(),
             None,
@@ -1099,7 +1111,7 @@ mod tests {
             length: 1,
             handler: fixed_exec,
         });
-        let exec = native_function(&mut machine.heap, id, "fixed exec", 1);
+        let exec = native_function(&mut machine.heap, &mut machine.atoms, id, "fixed exec", 1);
         machine.set_data_property(rx, "exec", exec).unwrap();
         let (string, replacement) = (text(&mut machine, "abc"), text(&mut machine, "[$&]"));
         let result =

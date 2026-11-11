@@ -32,12 +32,14 @@ const FORMAT: &str = "Intl.DateTimeFormat format";
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     namespace: Value,
 ) {
     register_hidden(builtins, FORMAT, 1, format_value::<H>);
     install_class(
         heap,
+        atoms,
         builtins,
         namespace,
         &Class {

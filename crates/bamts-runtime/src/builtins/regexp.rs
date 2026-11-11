@@ -22,25 +22,27 @@ const COMPILE_CACHE_ENTRIES: usize = 8;
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let constructor = install_constructor_function(heap, builtins, "RegExp", 2, constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, builtins, "RegExp", 2, constructor::<H>);
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     for (name, length, handler) in [
         ("exec", 1, exec::<H> as BuiltinHandler<H>),
         ("test", 1, test::<H>),
         ("toString", 0, to_string::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, function);
     }
-    let source_get = install_function(heap, builtins, "get source", 0, source_getter::<H>);
-    define_getter(heap, prototype, "source", source_get);
-    let flags_get = install_function(heap, builtins, "get flags", 0, flags_getter::<H>);
-    define_getter(heap, prototype, "flags", flags_get);
-    super::regexp_protocol::install(heap, builtins, prototype, constructor);
+    let source_get = install_function(heap, atoms, builtins, "get source", 0, source_getter::<H>);
+    define_getter(heap, atoms, prototype, "source", source_get);
+    let flags_get = install_function(heap, atoms, builtins, "get flags", 0, flags_getter::<H>);
+    define_getter(heap, atoms, prototype, "flags", flags_get);
+    super::regexp_protocol::install(heap, atoms, builtins, prototype, constructor);
     builtins.set_regexp_prototype(prototype);
     globals.insert(EcmaString::encode("RegExp"), constructor);
 }
@@ -122,11 +124,12 @@ fn regexp_initialize<H: Host>(
         machine.coerce_string_observable(flags)?
     };
     compile(machine, &pattern, &flags)?;
+    let properties = initial_regexp_properties(&mut machine.atoms);
     machine
         .allocate(HeapEntry::RegExp {
             pattern,
             flags,
-            properties: initial_regexp_properties(),
+            properties,
             prototype: Some(prototype),
             extensible: true,
         })
@@ -187,10 +190,10 @@ pub(super) fn compile<H: Host>(
 /// ECMA-262 §22.2.3.3: only `lastIndex` is an own data property.
 /// Called from the constructor, the bytecode literal path, and the native
 /// helper path so all three agree by construction.
-pub(crate) fn initial_regexp_properties() -> PropertyMap {
+pub(crate) fn initial_regexp_properties(atoms: &mut crate::AtomTable) -> PropertyMap {
     let mut properties = PropertyMap::default();
     properties.insert(
-        PropertyKey::Named(EcmaString::encode("lastIndex")),
+        PropertyKey::Named(atoms.intern_str("lastIndex")),
         Property::Data {
             value: Value::int32(0),
             writable: true,
@@ -321,12 +324,18 @@ fn source_getter<H: Host>(
     ))
 }
 
-pub(super) fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
+pub(super) fn define_getter(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    object: Value,
+    name: &str,
+    getter: Value,
+) {
     let HeapEntry::Object { properties, .. } = &mut heap[super::heap_index(object)] else {
         panic!("accessor target must be an ordinary object");
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern_str(name)),
         Property::Accessor {
             getter: Some(getter),
             setter: None,
@@ -754,8 +763,18 @@ mod tests {
         let literal_keys = literal_machine.own_property_keys(literal).unwrap();
 
         // --- Parity: both paths must produce the same own-property keys ---
+        // Atom ids are per-machine, so the comparison runs on resolved text.
+        let texts = |machine: &Machine<'_, TestHost>, keys: &[PropertyKey]| {
+            keys.iter()
+                .map(|key| match key {
+                    PropertyKey::Named(atom) => machine.atoms.resolve(*atom).to_utf8_lossy(),
+                    _ => String::new(),
+                })
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            constructed_keys, literal_keys,
+            texts(&constructed_machine, &constructed_keys),
+            texts(&literal_machine, &literal_keys),
             "new RegExp('x') and /x/ must have the same own-property set"
         );
 
@@ -764,14 +783,16 @@ mod tests {
         // Comparing against the shared helper (not a hand-copied duplicate)
         // means the test's expected set drifts with the helper. If a call
         // site stops using the helper, this assertion catches the divergence.
-        let expected = initial_regexp_properties();
+        let expected = initial_regexp_properties(&mut constructed_machine.atoms);
         let expected_keys: Vec<PropertyKey> = expected.iter().map(|(k, _)| k.clone()).collect();
         assert_eq!(
-            constructed_keys, expected_keys,
+            texts(&constructed_machine, &constructed_keys),
+            texts(&constructed_machine, &expected_keys),
             "constructor must install exactly `initial_regexp_properties`"
         );
         assert_eq!(
-            literal_keys, expected_keys,
+            texts(&literal_machine, &literal_keys),
+            texts(&constructed_machine, &expected_keys),
             "CreateRegExp must install exactly `initial_regexp_properties`"
         );
 
@@ -783,19 +804,24 @@ mod tests {
         // `enumerable`) would have passed silently because only keys were
         // compared.
         assert_eq!(
-            constructed_keys,
-            vec![PropertyKey::Named(EcmaString::encode("lastIndex"))],
+            texts(&constructed_machine, &constructed_keys),
+            ["lastIndex"],
             "ECMA-262 §22.2.3.3: lastIndex is the only own property"
         );
 
         // Verify the full descriptor on both paths, not just the key set.
         // A descriptor-only mutation (flipping `enumerable`) changes no keys
         // but breaks the spec-mandated attribute.
-        let last_index_key = PropertyKey::Named(EcmaString::encode("lastIndex"));
         for (label, machine, regexp) in [
-            ("constructed", &constructed_machine, constructed),
-            ("literal", &literal_machine, literal),
+            ("constructed", &mut constructed_machine, constructed),
+            ("literal", &mut literal_machine, literal),
         ] {
+            let keys = machine.own_property_keys(regexp).unwrap();
+            assert_eq!(
+                texts(machine, &keys),
+                ["lastIndex"],
+                "{label} owns exactly lastIndex"
+            );
             let index = machine.runtime_slot(regexp).unwrap().unwrap();
             let HeapEntry::RegExp { properties, .. } = &machine.heap[index] else {
                 panic!("{label} is a RegExp");
@@ -806,7 +832,7 @@ mod tests {
                 enumerable,
                 configurable,
             } = properties
-                .get(&last_index_key)
+                .get(&keys[0])
                 .unwrap_or_else(|| panic!("{label} owns lastIndex"))
             else {
                 panic!("{label} lastIndex is a data property");
@@ -821,7 +847,7 @@ mod tests {
         // accessors.
         for key in &constructed_keys {
             if let PropertyKey::Named(name) = key {
-                let text = name.to_utf8_lossy();
+                let text = constructed_machine.atoms.resolve(*name).to_utf8_lossy();
                 assert!(
                     text != "source" && text != "flags",
                     "constructed RegExp must not own '{text}'"
@@ -963,19 +989,16 @@ mod tests {
         // Install a getter on new_target.prototype that throws.
         let getter = install_function(
             &mut machine.heap,
+            &mut machine.atoms,
             &mut machine.intrinsics.builtins,
             "throwing prototype getter",
             0,
             throw_prototype_getter::<TestHost>,
         );
         let new_target = super::super::ordinary_runtime(&mut machine, None).unwrap();
+        let prototype_key = PropertyKey::Named(machine.intern_str("prototype"));
         machine
-            .define_accessor(
-                new_target,
-                PropertyKey::Named(EcmaString::encode("prototype")),
-                getter,
-                AccessorKind::Getter,
-            )
+            .define_accessor(new_target, prototype_key, getter, AccessorKind::Getter)
             .unwrap();
 
         let regexp_id = machine.intrinsics.builtins.id_named("RegExp").unwrap();
@@ -1017,7 +1040,7 @@ mod tests {
             length: 1,
             handler,
         });
-        native_function(&mut machine.heap, id, name, 1)
+        native_function(&mut machine.heap, &mut machine.atoms, id, name, 1)
     }
 
     fn counting_exec_override(

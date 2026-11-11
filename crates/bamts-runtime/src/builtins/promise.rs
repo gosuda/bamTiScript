@@ -12,6 +12,7 @@ use crate::{
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -27,6 +28,7 @@ pub(super) fn install<H: Host>(
     builtins.set_promise_prototype(prototype);
     let resolve_target = install_function(
         heap,
+        atoms,
         builtins,
         "Promise resolve target",
         1,
@@ -34,16 +36,25 @@ pub(super) fn install<H: Host>(
     );
     let reject_target = install_function(
         heap,
+        atoms,
         builtins,
         "Promise reject target",
         1,
         reject_target::<H>,
     );
     builtins.set_promise_resolver_targets(resolve_target, reject_target);
-    let all_fulfill = install_function(heap, builtins, "Promise all fulfill", 1, all_fulfill::<H>);
+    let all_fulfill = install_function(
+        heap,
+        atoms,
+        builtins,
+        "Promise all fulfill",
+        1,
+        all_fulfill::<H>,
+    );
     builtins.set_promise_all_target(all_fulfill);
     let capability_executor = install_function(
         heap,
+        atoms,
         builtins,
         "Promise capability executor",
         2,
@@ -51,6 +62,7 @@ pub(super) fn install<H: Host>(
     );
     let finally_value = install_function(
         heap,
+        atoms,
         builtins,
         "Promise finally value",
         1,
@@ -58,14 +70,23 @@ pub(super) fn install<H: Host>(
     );
     let finally_throw = install_function(
         heap,
+        atoms,
         builtins,
         "Promise finally throw",
         1,
         finally_throw::<H>,
     );
-    let species = install_function(heap, builtins, "get [Symbol.species]", 0, species::<H>);
+    let species = install_function(
+        heap,
+        atoms,
+        builtins,
+        "get [Symbol.species]",
+        0,
+        species::<H>,
+    );
     let finally_return = install_function(
         heap,
+        atoms,
         builtins,
         "Promise finally return",
         0,
@@ -73,6 +94,7 @@ pub(super) fn install<H: Host>(
     );
     let finally_rethrow = install_function(
         heap,
+        atoms,
         builtins,
         "Promise finally rethrow",
         0,
@@ -80,6 +102,7 @@ pub(super) fn install<H: Host>(
     );
     let then_fulfill = install_function(
         heap,
+        atoms,
         builtins,
         "Promise capability fulfill",
         1,
@@ -87,35 +110,50 @@ pub(super) fn install<H: Host>(
     );
     let then_reject = install_function(
         heap,
+        atoms,
         builtins,
         "Promise capability reject",
         1,
         then_reject::<H>,
     );
 
-    let constructor = install_constructor_function(heap, builtins, "Promise", 1, constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, builtins, "Promise", 1, constructor::<H>);
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     globals.insert(EcmaString::encode("Promise"), constructor);
-    let queue_microtask =
-        install_function(heap, builtins, "queueMicrotask", 1, queue_microtask::<H>);
+    let queue_microtask = install_function(
+        heap,
+        atoms,
+        builtins,
+        "queueMicrotask",
+        1,
+        queue_microtask::<H>,
+    );
     globals.insert(EcmaString::encode("queueMicrotask"), queue_microtask);
 
-    let resolve = install_function(heap, builtins, "resolve", 1, resolve::<H>);
-    let reject = install_function(heap, builtins, "reject", 1, reject::<H>);
-    let all = install_function(heap, builtins, "all", 1, all::<H>);
-    let race = install_function(heap, builtins, "race", 1, race::<H>);
-    let all_settled = install_function(heap, builtins, "allSettled", 1, all_settled::<H>);
-    let any = install_function(heap, builtins, "any", 1, any::<H>);
-    let try_method = install_function(heap, builtins, "try", 1, promise_try::<H>);
-    let with_resolvers = install_function(heap, builtins, "withResolvers", 0, with_resolvers::<H>);
-    define_static(heap, constructor, "resolve", resolve);
-    define_static(heap, constructor, "reject", reject);
-    define_static(heap, constructor, "all", all);
-    define_static(heap, constructor, "race", race);
-    define_static(heap, constructor, "allSettled", all_settled);
-    define_static(heap, constructor, "any", any);
-    define_static(heap, constructor, "try", try_method);
-    define_static(heap, constructor, "withResolvers", with_resolvers);
+    let resolve = install_function(heap, atoms, builtins, "resolve", 1, resolve::<H>);
+    let reject = install_function(heap, atoms, builtins, "reject", 1, reject::<H>);
+    let all = install_function(heap, atoms, builtins, "all", 1, all::<H>);
+    let race = install_function(heap, atoms, builtins, "race", 1, race::<H>);
+    let all_settled = install_function(heap, atoms, builtins, "allSettled", 1, all_settled::<H>);
+    let any = install_function(heap, atoms, builtins, "any", 1, any::<H>);
+    let try_method = install_function(heap, atoms, builtins, "try", 1, promise_try::<H>);
+    let with_resolvers = install_function(
+        heap,
+        atoms,
+        builtins,
+        "withResolvers",
+        0,
+        with_resolvers::<H>,
+    );
+    define_static(heap, atoms, constructor, "resolve", resolve);
+    define_static(heap, atoms, constructor, "reject", reject);
+    define_static(heap, atoms, constructor, "all", all);
+    define_static(heap, atoms, constructor, "race", race);
+    define_static(heap, atoms, constructor, "allSettled", all_settled);
+    define_static(heap, atoms, constructor, "any", any);
+    define_static(heap, atoms, constructor, "try", try_method);
+    define_static(heap, atoms, constructor, "withResolvers", with_resolvers);
     builtins.set_promise_capability_executor(capability_executor);
     builtins.set_promise_finally_value(finally_value);
     builtins.set_promise_finally_throw(finally_throw);
@@ -136,23 +174,29 @@ pub(super) fn install<H: Host>(
             configurable: true,
         },
     );
-    let then = install_function(heap, builtins, "then", 2, then::<H>);
-    let catch = install_function(heap, builtins, "catch", 1, catch::<H>);
-    let finally = install_function(heap, builtins, "finally", 1, finally::<H>);
-    define_data(heap, prototype, "constructor", constructor);
-    define_data(heap, prototype, "then", then);
-    define_data(heap, prototype, "catch", catch);
-    define_data(heap, prototype, "finally", finally);
+    let then = install_function(heap, atoms, builtins, "then", 2, then::<H>);
+    let catch = install_function(heap, atoms, builtins, "catch", 1, catch::<H>);
+    let finally = install_function(heap, atoms, builtins, "finally", 1, finally::<H>);
+    define_data(heap, atoms, prototype, "constructor", constructor);
+    define_data(heap, atoms, prototype, "then", then);
+    define_data(heap, atoms, prototype, "catch", catch);
+    define_data(heap, atoms, prototype, "finally", finally);
     define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), "Promise");
 }
 
-fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
+fn define_static(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    constructor: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[super::heap_index(constructor)]
     else {
         panic!("Promise constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern(EcmaString::encode(name))),
         super::builtin_property(value),
     );
 }
@@ -285,7 +329,7 @@ fn species_constructor<H: Host>(
         }));
     }
     let species_symbol = machine.intrinsics.builtins.symbol_species();
-    let species_key = machine.to_property_key(species_symbol)?;
+    let species_key = machine.property_key_from_value(species_symbol)?;
     let species = machine.get_property_key(constructor, &species_key)?;
     if matches!(
         species.decode(),
@@ -518,7 +562,7 @@ fn with_resolvers<H: Host>(
         ("resolve", capability.resolve),
         ("reject", capability.reject),
     ] {
-        let key = PropertyKey::Named(EcmaString::encode(name));
+        let key = PropertyKey::Named(machine.intern_str(name));
         machine.create_data_property_key(result, key, value)?;
     }
     Ok(BuiltinOutcome::Value(result))
@@ -704,11 +748,8 @@ fn perform_ordered_aggregate<H: Host>(
                 Value::UNDEFINED,
                 Some(capability.reject),
             )?;
-            machine.create_data_property_key(
-                record,
-                PropertyKey::Named(EcmaString::encode("constructor")),
-                constructor,
-            )?;
+            let key = PropertyKey::Named(machine.intern_str("constructor"));
+            machine.create_data_property_key(record, key, constructor)?;
             machine.create_promise_resolver_function(
                 machine.intrinsics.builtins.promise_all_target(),
                 record,
@@ -878,22 +919,13 @@ fn reaction_record<H: Host>(
     reject: Option<Value>,
 ) -> Result<Value, EvalFailure> {
     let record = super::ordinary_runtime(machine, None)?;
-    machine.create_data_property_key(
-        record,
-        PropertyKey::Named(EcmaString::encode("kind")),
-        Value::int32(kind as u32),
-    )?;
-    machine.create_data_property_key(
-        record,
-        PropertyKey::Named(EcmaString::encode("element")),
-        element,
-    )?;
+    let kind_key = PropertyKey::Named(machine.intern_str("kind"));
+    machine.create_data_property_key(record, kind_key, Value::int32(kind as u32))?;
+    let element_key = PropertyKey::Named(machine.intern_str("element"));
+    machine.create_data_property_key(record, element_key, element)?;
     if let Some(reject) = reject {
-        machine.create_data_property_key(
-            record,
-            PropertyKey::Named(EcmaString::encode("reject")),
-            reject,
-        )?;
+        let reject_key = PropertyKey::Named(machine.intern_str("reject"));
+        machine.create_data_property_key(record, reject_key, reject)?;
     }
     Ok(record)
 }
@@ -905,11 +937,8 @@ fn completion_record<H: Host>(
     reject: Value,
 ) -> Result<Value, EvalFailure> {
     let record = reaction_record(machine, kind, Value::UNDEFINED, Some(reject))?;
-    machine.create_data_property_key(
-        record,
-        PropertyKey::Named(EcmaString::encode("resolve")),
-        resolve,
-    )?;
+    let resolve_key = PropertyKey::Named(machine.intern_str("resolve"));
+    machine.create_data_property_key(record, resolve_key, resolve)?;
     Ok(record)
 }
 
@@ -1256,16 +1285,10 @@ fn settlement_result<H: Host>(
     let status = machine
         .allocate(HeapEntry::String(EcmaString::encode(status)))
         .map_err(EvalFailure::Runtime)?;
-    machine.create_data_property_key(
-        result,
-        PropertyKey::Named(EcmaString::encode("status")),
-        status,
-    )?;
-    machine.create_data_property_key(
-        result,
-        PropertyKey::Named(EcmaString::encode(field)),
-        value,
-    )?;
+    let status_key = PropertyKey::Named(machine.intern_str("status"));
+    machine.create_data_property_key(result, status_key, status)?;
+    let field_key = PropertyKey::Named(machine.intern_str(field));
+    machine.create_data_property_key(result, field_key, value)?;
     Ok(result)
 }
 
@@ -1374,6 +1397,7 @@ mod tests {
     ) -> Value {
         install_function(
             &mut machine.heap,
+            &mut machine.atoms,
             &mut machine.intrinsics.builtins,
             name,
             0,
@@ -1711,7 +1735,7 @@ mod tests {
         let iterable = super::super::ordinary_runtime(machine, None).unwrap();
         let method = callback(machine, "test iterator method", iterator_method);
         let symbol = machine.intrinsics.builtins.symbol_iterator();
-        let key = machine.to_property_key(symbol).unwrap();
+        let key = machine.property_key_from_value(symbol).unwrap();
         machine
             .set_data_property_key(iterable, key, method)
             .unwrap();
@@ -1727,10 +1751,11 @@ mod tests {
         let resolve = callback(&mut machine, "throwing resolve", throwing_resolve);
         machine.test_set_global("throwingResolve", resolve);
         let getter = callback(&mut machine, "resolve getter", resolve_getter);
+        let resolve_key = PropertyKey::Named(machine.intern_str("resolve"));
         machine
             .define_accessor(
                 constructor,
-                PropertyKey::Named(EcmaString::encode("resolve")),
+                resolve_key,
                 getter,
                 crate::AccessorKind::Getter,
             )
@@ -1762,10 +1787,11 @@ mod tests {
         let constructor = machine.intrinsics.global("Promise").unwrap();
         let prototype = machine.intrinsics.builtins.promise_prototype();
         let throwing_getter = callback(&mut machine, "throwing then getter", throw_99);
+        let then_key = PropertyKey::Named(machine.intern_str("then"));
         machine
             .define_accessor(
                 prototype,
-                PropertyKey::Named(EcmaString::encode("then")),
+                then_key,
                 throwing_getter,
                 crate::AccessorKind::Getter,
             )
@@ -2004,13 +2030,9 @@ mod tests {
         // if the brand check did not short-circuit first.
         let spy = super::super::ordinary_runtime(&mut machine, None).unwrap();
         let getter = callback(&mut machine, "constructor getter", constructor_getter);
+        let constructor_key = PropertyKey::Named(machine.intern_str("constructor"));
         machine
-            .define_accessor(
-                spy,
-                PropertyKey::Named(EcmaString::encode("constructor")),
-                getter,
-                crate::AccessorKind::Getter,
-            )
+            .define_accessor(spy, constructor_key, getter, crate::AccessorKind::Getter)
             .unwrap();
 
         let then = machine
@@ -2113,7 +2135,7 @@ mod tests {
         for (key, _) in properties.iter() {
             if let PropertyKey::Named(name) = key {
                 assert!(
-                    !name.as_units().starts_with(&[0]),
+                    !machine.atoms.resolve(*name).as_units().starts_with(&[0]),
                     "Promise should have no NUL-prefixed own keys, found {:?}",
                     name
                 );
@@ -2131,7 +2153,7 @@ mod tests {
         for (key, _) in properties.iter() {
             if let PropertyKey::Named(name) = key {
                 assert!(
-                    !name.as_units().starts_with(&[0]),
+                    !machine.atoms.resolve(*name).as_units().starts_with(&[0]),
                     "Promise.prototype should have no NUL-prefixed own keys, found {:?}",
                     name
                 );

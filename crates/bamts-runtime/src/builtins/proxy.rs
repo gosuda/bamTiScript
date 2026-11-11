@@ -89,12 +89,13 @@ impl ProxyRevokerRecord {
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut std::collections::BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let constructor = install_function(heap, builtins, "Proxy", 2, constructor::<H>);
-    let revocable = install_function(heap, builtins, "revocable", 2, revocable::<H>);
-    define_data(heap, constructor, "revocable", revocable);
+    let constructor = install_function(heap, atoms, builtins, "Proxy", 2, constructor::<H>);
+    let revocable = install_function(heap, atoms, builtins, "revocable", 2, revocable::<H>);
+    define_data(heap, atoms, constructor, "revocable", revocable);
     globals.insert(EcmaString::encode("Proxy"), constructor);
 }
 
@@ -138,9 +139,10 @@ fn revocable<H: Host>(
         })
         .map_err(EvalFailure::Runtime)?;
     for (name, value) in [("proxy", proxy), ("revoke", revoker)] {
+        let key = PropertyKey::Named(machine.intern_str(name));
         machine.define_descriptor(
             result,
-            PropertyKey::Named(EcmaString::encode(name)),
+            key,
             Property::Data {
                 value,
                 writable: true,
@@ -158,8 +160,9 @@ fn proxy_revoker<H: Host>(
 ) -> Result<Value, EvalFailure> {
     let name = allocate_string(machine, EcmaString::default())?;
     let mut properties = PropertyMap::default();
+    let length_atom = PropertyKey::Named(machine.intern_str("length"));
     properties.insert(
-        PropertyKey::Named(EcmaString::encode("length")),
+        length_atom,
         Property::Data {
             value: Value::int32(0),
             writable: false,
@@ -167,8 +170,9 @@ fn proxy_revoker<H: Host>(
             configurable: true,
         },
     );
+    let name_atom = PropertyKey::Named(machine.intern_str("name"));
     properties.insert(
-        PropertyKey::Named(EcmaString::encode("name")),
+        name_atom,
         Property::Data {
             value: name,
             writable: false,
@@ -258,7 +262,7 @@ fn get_method<H: Host>(
     handler: Value,
     name: &'static str,
 ) -> Result<Option<Value>, EvalFailure> {
-    let key = PropertyKey::Named(EcmaString::encode(name));
+    let key = PropertyKey::Named(machine.intern_str(name));
     let method = machine.internal_get(handler, &key, handler)?;
     if matches!(method.decode(), Some(Decoded::Undefined | Decoded::Null)) {
         return Ok(None);
@@ -274,7 +278,10 @@ fn key_value<H: Host>(
     key: &PropertyKey,
 ) -> Result<Value, EvalFailure> {
     match key {
-        PropertyKey::Named(name) => allocate_string(machine, name.clone()),
+        PropertyKey::Named(name) => {
+            let text = machine.resolve_atom(*name).clone();
+            allocate_string(machine, text)
+        }
         PropertyKey::Symbol(index) | PropertyKey::Private(index) => Ok(Value::heap_ref(
             SlotId::from_parts(RUNTIME_HEAP_SEGMENT, index + 1)
                 .expect("property-key heap slots are nonzero"),
@@ -282,15 +289,21 @@ fn key_value<H: Host>(
     }
 }
 
-fn proxy_key<H: Host>(machine: &Machine<'_, H>, value: Value) -> Result<PropertyKey, EvalFailure> {
+fn proxy_key<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<PropertyKey, EvalFailure> {
     let Some(index) = machine.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
         return Err(type_error("Proxy ownKeys trap returned a non-property key"));
     };
-    match &machine.heap[index] {
-        HeapEntry::String(name) => Ok(PropertyKey::Named(name.clone())),
-        HeapEntry::Symbol { .. } => Ok(PropertyKey::Symbol(index as u32)),
-        _ => Err(type_error("Proxy ownKeys trap returned a non-property key")),
-    }
+    let text = match &machine.heap[index] {
+        HeapEntry::String(name) => name.clone(),
+        HeapEntry::Symbol { .. } => return Ok(PropertyKey::Symbol(index as u32)),
+        _ => {
+            return Err(type_error("Proxy ownKeys trap returned a non-property key"));
+        }
+    };
+    Ok(PropertyKey::Named(machine.intern(text)))
 }
 
 fn trap_property_key_list<H: Host>(
@@ -300,7 +313,7 @@ fn trap_property_key_list<H: Host>(
     if !machine.is_object(source) {
         return Err(type_error("Proxy ownKeys trap result is not an object"));
     }
-    let length_key = PropertyKey::Named(EcmaString::encode("length"));
+    let length_key = PropertyKey::Named(machine.intern_str("length"));
     let length_value = machine.internal_get(source, &length_key, source)?;
     let length = to_integer_or_infinity(machine, length_value)?.clamp(0.0, 9_007_199_254_740_991.0);
     if length > f64::from(machine.limits.max_argument_count) {
@@ -314,7 +327,7 @@ fn trap_property_key_list<H: Host>(
     let mut keys = Vec::with_capacity(length as usize);
     let mut seen = BTreeSet::new();
     for index in 0..length as usize {
-        let index_key = PropertyKey::Named(EcmaString::encode(&index.to_string()));
+        let index_key = PropertyKey::Named(machine.intern_str(&index.to_string()));
         let value = machine.internal_get(source, &index_key, source)?;
         let key = proxy_key(machine, value)?;
         if !seen.insert(key.clone()) {
@@ -762,11 +775,7 @@ mod tests {
                 length,
                 handler,
             });
-        native_function(&mut machine.heap, id, name, length)
-    }
-
-    fn key(name: &str) -> PropertyKey {
-        PropertyKey::Named(EcmaString::encode(name))
+        native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
     }
 
     fn is_type_error<T>(result: Result<T, EvalFailure>) -> bool {
@@ -910,9 +919,11 @@ mod tests {
                     .unwrap(),
                 Value::UNDEFINED
             );
-            assert!(is_type_error(get(machine, proxy_a, &key("x"), proxy_a,)));
+            let __key_x_2 = PropertyKey::Named(machine.intern_str("x"));
+            assert!(is_type_error(get(machine, proxy_a, &__key_x_2, proxy_a,)));
+            let __key_x_3 = PropertyKey::Named(machine.intern_str("x"));
             assert_eq!(
-                get(machine, proxy_b, &key("x"), proxy_b).unwrap(),
+                get(machine, proxy_b, &__key_x_3, proxy_b).unwrap(),
                 Value::UNDEFINED
             );
             assert_eq!(
@@ -921,7 +932,8 @@ mod tests {
                     .unwrap(),
                 Value::UNDEFINED
             );
-            assert!(is_type_error(get(machine, proxy_b, &key("x"), proxy_b,)));
+            let __key_x_4 = PropertyKey::Named(machine.intern_str("x"));
+            assert!(is_type_error(get(machine, proxy_b, &__key_x_4, proxy_b,)));
         });
     }
 
@@ -933,7 +945,7 @@ mod tests {
             let proxy = create(machine, target, handler).unwrap();
             let revoker = proxy_revoker(machine, proxy).unwrap();
             call_revoker(machine, revoker).unwrap();
-            let x = key("x");
+            let x = PropertyKey::Named(machine.intern_str("x"));
             let descriptor = PropertyDescriptor::default();
 
             assert!(is_type_error(get_prototype_of(machine, proxy)));
@@ -967,10 +979,11 @@ mod tests {
     fn frozen_data_and_setterless_invariants_are_enforced() {
         with_machine(|machine| {
             let target = ordinary_object(machine);
+            let __key_x_5 = PropertyKey::Named(machine.intern_str("x"));
             machine
                 .define_descriptor(
                     target,
-                    key("x"),
+                    __key_x_5,
                     Property::Data {
                         value: Value::int32(1),
                         writable: false,
@@ -979,10 +992,11 @@ mod tests {
                     },
                 )
                 .unwrap();
+            let __key_y_6 = PropertyKey::Named(machine.intern_str("y"));
             machine
                 .define_descriptor(
                     target,
-                    key("y"),
+                    __key_y_6,
                     Property::Accessor {
                         getter: None,
                         setter: None,
@@ -998,19 +1012,23 @@ mod tests {
             machine.set_data_property(handler, "set", set_trap).unwrap();
             let proxy = create(machine, target, handler).unwrap();
 
-            assert!(is_type_error(get(machine, proxy, &key("x"), proxy)));
+            let __key_x_7 = PropertyKey::Named(machine.intern_str("x"));
+            assert!(is_type_error(get(machine, proxy, &__key_x_7, proxy)));
+            let __key_x_8 = PropertyKey::Named(machine.intern_str("x"));
             assert!(is_type_error(set(
                 machine,
                 proxy,
-                key("x"),
+                __key_x_8,
                 Value::int32(2),
                 proxy,
             )));
-            assert!(is_type_error(get(machine, proxy, &key("y"), proxy)));
+            let __key_y_9 = PropertyKey::Named(machine.intern_str("y"));
+            assert!(is_type_error(get(machine, proxy, &__key_y_9, proxy)));
+            let __key_y_10 = PropertyKey::Named(machine.intern_str("y"));
             assert!(is_type_error(set(
                 machine,
                 proxy,
-                key("y"),
+                __key_y_10,
                 Value::int32(1),
                 proxy,
             )));
@@ -1021,10 +1039,11 @@ mod tests {
     fn own_keys_rejects_duplicates_missing_fixed_and_extra_fixed_keys() {
         with_machine(|machine| {
             let target = ordinary_object(machine);
+            let __key_fixed_11 = PropertyKey::Named(machine.intern_str("fixed"));
             machine
                 .define_descriptor(
                     target,
-                    key("fixed"),
+                    __key_fixed_11,
                     Property::Data {
                         value: Value::int32(1),
                         writable: true,
@@ -1075,15 +1094,17 @@ mod tests {
             let proxy = create(machine, target, handler).unwrap();
             let receiver = ordinary_object(machine);
 
+            let __key_x_12 = PropertyKey::Named(machine.intern_str("x"));
             assert_eq!(
-                get(machine, proxy, &key("x"), receiver).unwrap(),
+                get(machine, proxy, &__key_x_12, receiver).unwrap(),
                 Value::int32(9)
             );
             assert_eq!(
                 machine.get_named_property(handler, "seenReceiver").unwrap(),
                 receiver
             );
-            assert!(set(machine, proxy, key("x"), Value::int32(4), receiver).unwrap());
+            let __key_x_13 = PropertyKey::Named(machine.intern_str("x"));
+            assert!(set(machine, proxy, __key_x_13, Value::int32(4), receiver).unwrap());
             assert_eq!(
                 machine.get_named_property(handler, "seenReceiver").unwrap(),
                 receiver
@@ -1147,10 +1168,11 @@ mod tests {
             let target = ordinary_object(machine);
             let handler = ordinary_object(machine);
             let getter = native(machine, "abrupt getter", 0, abrupt);
+            let __key_get_14 = PropertyKey::Named(machine.intern_str("get"));
             machine
                 .define_descriptor(
                     handler,
-                    key("get"),
+                    __key_get_14,
                     Property::Accessor {
                         getter: Some(getter),
                         setter: None,
@@ -1160,8 +1182,9 @@ mod tests {
                 )
                 .unwrap();
             let proxy = create(machine, target, handler).unwrap();
+            let __key_x_15 = PropertyKey::Named(machine.intern_str("x"));
             assert!(matches!(
-                get(machine, proxy, &key("x"), proxy),
+                get(machine, proxy, &__key_x_15, proxy),
                 Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "abrupt Proxy trap getter"
                 }))

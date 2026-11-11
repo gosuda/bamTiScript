@@ -1662,26 +1662,34 @@ pub(crate) fn json_reject<H: Host>(
 /// boxing path find `[[Prototype]]` for BigInt values.
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) -> Value {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let constructor = install_constructor_function(heap, builtins, "BigInt", 1, constructor::<H>);
+    let constructor =
+        install_constructor_function(heap, atoms, builtins, "BigInt", 1, constructor::<H>);
     builtins.set_bigint_constructor(constructor);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
 
-    let as_int_n = install_function(heap, builtins, "asIntN", 2, as_int_n::<H>);
-    let as_uint_n = install_function(heap, builtins, "asUintN", 2, as_uint_n::<H>);
-    define_native_property(heap, constructor, "asIntN", as_int_n);
-    define_native_property(heap, constructor, "asUintN", as_uint_n);
+    let as_int_n = install_function(heap, atoms, builtins, "asIntN", 2, as_int_n::<H>);
+    let as_uint_n = install_function(heap, atoms, builtins, "asUintN", 2, as_uint_n::<H>);
+    define_native_property(heap, atoms, constructor, "asIntN", as_int_n);
+    define_native_property(heap, atoms, constructor, "asUintN", as_uint_n);
 
-    let to_string = install_function(heap, builtins, "toString", 0, to_string::<H>);
-    let value_of = install_function(heap, builtins, "valueOf", 0, value_of::<H>);
-    let to_locale_string =
-        install_function(heap, builtins, "toLocaleString", 0, to_locale_string::<H>);
-    define_data(heap, prototype, "toString", to_string);
-    define_data(heap, prototype, "valueOf", value_of);
-    define_data(heap, prototype, "toLocaleString", to_locale_string);
+    let to_string = install_function(heap, atoms, builtins, "toString", 0, to_string::<H>);
+    let value_of = install_function(heap, atoms, builtins, "valueOf", 0, value_of::<H>);
+    let to_locale_string = install_function(
+        heap,
+        atoms,
+        builtins,
+        "toLocaleString",
+        0,
+        to_locale_string::<H>,
+    );
+    define_data(heap, atoms, prototype, "toString", to_string);
+    define_data(heap, atoms, prototype, "valueOf", value_of);
+    define_data(heap, atoms, prototype, "toLocaleString", to_locale_string);
 
     let tag = super::super::push(heap, HeapEntry::String(EcmaString::encode("BigInt")));
     let to_string_tag = builtins.symbol_to_string_tag();
@@ -1702,12 +1710,18 @@ pub(super) fn install<H: Host>(
     prototype
 }
 
-fn define_native_property(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
+fn define_native_property(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    object: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(object)] else {
         unreachable!("constructor is a native function");
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern_str(name)),
         Property::Data {
             value,
             writable: true,
@@ -1863,6 +1877,7 @@ mod tests {
     fn observable_object(machine: &mut Machine<'_, TestHost>, primitive: Value) -> Value {
         let value_of = install_function(
             &mut machine.heap,
+            &mut machine.atoms,
             &mut machine.intrinsics.builtins,
             "valueOf",
             0,
@@ -2111,10 +2126,9 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         install_bigint(&mut machine);
         let bigint = bigint_global(&machine);
-
-        let named = |name: &str| PropertyKey::Named(EcmaString::encode(name));
+        let prototype_key = PropertyKey::Named(machine.intern_str("prototype"));
         let prototype_descriptor = machine
-            .own_descriptor(bigint, &named("prototype"))
+            .own_descriptor(bigint, &prototype_key)
             .expect("descriptor lookup succeeds")
             .expect("BigInt.prototype is defined");
         assert!(
@@ -2133,8 +2147,9 @@ mod tests {
             .get_named_property(bigint, "prototype")
             .expect("prototype readable");
 
+        let constructor_key = PropertyKey::Named(machine.intern_str("constructor"));
         let constructor_descriptor = machine
-            .own_descriptor(prototype, &named("constructor"))
+            .own_descriptor(prototype, &constructor_key)
             .expect("descriptor lookup succeeds")
             .expect("BigInt.prototype.constructor is defined");
         assert!(
@@ -2151,8 +2166,9 @@ mod tests {
         );
 
         for method in ["toString", "valueOf", "toLocaleString"] {
+            let method_key = PropertyKey::Named(machine.intern_str(method));
             let descriptor = machine
-                .own_descriptor(prototype, &named(method))
+                .own_descriptor(prototype, &method_key)
                 .expect("descriptor lookup succeeds")
                 .unwrap_or_else(|| panic!("{method} is defined"));
             assert!(
@@ -2202,10 +2218,10 @@ mod tests {
         };
         assert_eq!(*target, machine.intrinsics.object_prototype);
 
-        // Static converters share the same descriptor profile.
         for method in ["asIntN", "asUintN"] {
+            let method_key = PropertyKey::Named(machine.intern_str(method));
             let descriptor = machine
-                .own_descriptor(bigint, &named(method))
+                .own_descriptor(bigint, &method_key)
                 .expect("descriptor lookup succeeds")
                 .unwrap_or_else(|| panic!("{method} is defined"));
             assert!(

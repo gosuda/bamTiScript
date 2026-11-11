@@ -20,12 +20,14 @@ const COMPARE: &str = "Intl.Collator compare";
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     namespace: Value,
 ) {
     register_hidden(builtins, COMPARE, 2, compare_strings::<H>);
     install_class(
         heap,
+        atoms,
         builtins,
         namespace,
         &Class {

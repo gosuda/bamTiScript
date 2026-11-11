@@ -24,6 +24,7 @@ use crate::{
 /// stated explicitly: a native function without one falls back to this object.
 pub(super) fn install_function_prototype<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
 ) {
     let id = builtins.register(BuiltinDef {
@@ -31,7 +32,7 @@ pub(super) fn install_function_prototype<H: Host>(
         length: 0,
         handler: function_prototype_call::<H>,
     });
-    let properties = native_function_properties(heap, "", 0);
+    let properties = native_function_properties(heap, atoms, "", 0);
     heap[heap_index(builtins.function_prototype())] = HeapEntry::native_function(
         NativeCallable::Builtin(id),
         properties,
@@ -50,15 +51,17 @@ fn function_prototype_call<H: Host>(
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.object_prototype();
-    let constructor = install_constructor_function(heap, builtins, "Object", 1, constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, builtins, "Object", 1, constructor::<H>);
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     globals.insert(EcmaString::encode("Object"), constructor);
 
-    super::object_statics::install(heap, builtins, constructor);
+    super::object_statics::install(heap, atoms, builtins, constructor);
 
     for (name, length, handler) in [
         ("toString", 0, prototype_to_string::<H> as BuiltinHandler<H>),
@@ -68,8 +71,8 @@ pub(super) fn install<H: Host>(
         ("valueOf", 0, value_of::<H>),
         ("propertyIsEnumerable", 1, property_is_enumerable::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, function);
         if name == "toString" {
             builtins.set_object_to_string(function);
         }
@@ -80,10 +83,10 @@ pub(super) fn install<H: Host>(
         ("bind", 1, function_bind::<H>),
         ("toString", 0, function_to_string::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, builtins.function_prototype(), name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, builtins.function_prototype(), name, function);
     }
-    install_restricted_function_properties(heap, builtins);
+    install_restricted_function_properties(heap, atoms, builtins);
     let reified = crate::intrinsics::push(
         heap,
         HeapEntry::PrivateName {
@@ -93,6 +96,7 @@ pub(super) fn install<H: Host>(
     builtins.set_function_reified_brand(reified);
     let has_instance = install_function(
         heap,
+        atoms,
         builtins,
         "[Symbol.hasInstance]",
         1,
@@ -115,9 +119,10 @@ pub(super) fn install<H: Host>(
 /// %ThrowTypeError%.
 fn install_restricted_function_properties<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let thrower = install_function(heap, builtins, "", 0, throw_type_error::<H>);
+    let thrower = install_function(heap, atoms, builtins, "", 0, throw_type_error::<H>);
     builtins.set_throw_type_error(thrower);
     let HeapEntry::NativeFunction {
         properties,
@@ -139,8 +144,9 @@ fn install_restricted_function_properties<H: Host>(
         panic!("%Function.prototype% must be native");
     };
     for name in ["caller", "arguments"] {
+        let atom = atoms.intern_str(name);
         properties.insert(
-            PropertyKey::Named(EcmaString::encode(name)),
+            PropertyKey::Named(atom),
             Property::Accessor {
                 getter: Some(thrower),
                 setter: Some(thrower),
@@ -579,7 +585,7 @@ pub(super) fn create_list_from_array_like<H: Host>(
     let length = length as usize;
     let mut arguments = Vec::with_capacity(length);
     for index in 0..length {
-        let key = PropertyKey::Named(EcmaString::encode(&index.to_string()));
+        let key = PropertyKey::Named(machine.intern_str(&index.to_string()));
         arguments.push(machine.get_property_key(source, &key)?);
     }
     Ok(arguments)
@@ -600,7 +606,7 @@ fn function_bind<H: Host>(
         ));
     }
     let bound_arguments = args.get(1..).unwrap_or_default().to_vec();
-    let length_key = PropertyKey::Named(EcmaString::encode("length"));
+    let length_key = PropertyKey::Named(machine.intern_str("length"));
     let length = if machine.has_own_property_key(this, &length_key)? {
         let target_length = machine.get_property_key(this, &length_key)?;
         match target_length.decode() {
@@ -637,8 +643,9 @@ fn function_bind<H: Host>(
             configurable: true,
         },
     );
+    let name_key = PropertyKey::Named(machine.intern_str("name"));
     properties.insert(
-        PropertyKey::Named(EcmaString::encode("name")),
+        name_key,
         Property::Data {
             value: name,
             writable: false,
@@ -672,10 +679,6 @@ mod tests {
     use crate::{Limits, RuntimeErrorKind, ThrowOrigin};
     use bamts_bytecode::{FunctionId, ModuleId};
 
-    fn named(name: &str) -> PropertyKey {
-        PropertyKey::Named(EcmaString::encode(name))
-    }
-
     fn pinned_element(value: Value) -> Property {
         Property::Data {
             value,
@@ -692,22 +695,25 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let values = vec![Value::int32(1), Value::int32(2), Value::int32(3)];
         let array = allocate_array(&mut machine, values).unwrap();
+        let __key_1_2 = PropertyKey::Named(machine.intern_str("1"));
         machine
-            .define_descriptor(array, named("1"), pinned_element(Value::int32(2)))
+            .define_descriptor(array, __key_1_2, pinned_element(Value::int32(2)))
             .unwrap();
         let zero = CanonicalPropertyDescriptor {
             value: Some(Value::int32(0)),
             ..Default::default()
         };
+        let __key_length_3 = PropertyKey::Named(machine.intern_str("length"));
         assert!(
             !machine
-                .internal_define_own_property(array, named("length"), zero)
+                .internal_define_own_property(array, __key_length_3, zero)
                 .unwrap()
         );
         assert_eq!(machine.array_length(array).unwrap(), 2);
+        let __key_length_4 = PropertyKey::Named(machine.intern_str("length"));
         assert!(
             !machine
-                .internal_set(array, named("length"), Value::int32(0), array)
+                .internal_set(array, __key_length_4, Value::int32(0), array)
                 .unwrap()
         );
         assert_eq!(machine.array_length(array).unwrap(), 2);
@@ -724,8 +730,9 @@ mod tests {
             configurable: Some(true),
             ..Default::default()
         };
+        let __key_length_5 = PropertyKey::Named(machine.intern_str("length"));
         assert!(matches!(
-            machine.internal_define_own_property(array, named("length"), negative),
+            machine.internal_define_own_property(array, __key_length_5, negative),
             Err(EvalFailure::Throw(ThrowOrigin::RangeError { .. }))
         ));
     }
@@ -745,9 +752,11 @@ mod tests {
             value: Some(Value::int32(7)),
             ..Default::default()
         };
-        apply_property_descriptor(&mut machine, proxy, named("x"), descriptor).unwrap();
+        let __key_x_6 = PropertyKey::Named(machine.intern_str("x"));
+        apply_property_descriptor(&mut machine, proxy, __key_x_6, descriptor).unwrap();
+        let __key_x_7 = PropertyKey::Named(machine.intern_str("x"));
         assert!(matches!(
-            machine.own_descriptor(target, &named("x")).unwrap(),
+            machine.own_descriptor(target, &__key_x_7).unwrap(),
             Some(Property::Data { value, .. }) if value == Value::int32(7)
         ));
     }
@@ -758,14 +767,16 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let array = allocate_array(&mut machine, vec![Value::int32(1)]).unwrap();
+        let __key_0_8 = PropertyKey::Named(machine.intern_str("0"));
         machine
-            .define_descriptor(array, named("0"), pinned_element(Value::int32(1)))
+            .define_descriptor(array, __key_0_8, pinned_element(Value::int32(1)))
             .unwrap();
         machine
             .set_data_property(array, "0", Value::int32(9))
             .unwrap();
+        let __key_0_9 = PropertyKey::Named(machine.intern_str("0"));
         assert!(matches!(
-            machine.own_descriptor(array, &named("0")).unwrap(),
+            machine.own_descriptor(array, &__key_0_9).unwrap(),
             Some(Property::Data {
                 value,
                 configurable: false,
@@ -783,9 +794,12 @@ mod tests {
         machine
             .set_data_property(array, "tag", Value::TRUE)
             .unwrap();
+        let zero_key = PropertyKey::Named(machine.intern_str("0"));
+        let length_key = PropertyKey::Named(machine.intern_str("length"));
+        let tag_key = PropertyKey::Named(machine.intern_str("tag"));
         assert_eq!(
             machine.internal_own_property_keys(array).unwrap(),
-            [named("0"), named("length"), named("tag")]
+            [zero_key, length_key, tag_key]
         );
         assert!(machine.enumerable_keys(array).unwrap().len() == 2);
     }
@@ -798,8 +812,9 @@ mod tests {
         let text = allocate_string(&mut machine, EcmaString::encode("ab")).unwrap();
         let wrapper = machine.value_to_object(text).unwrap();
         for (name, expected_enumerable) in [("0", true), ("1", true), ("length", false)] {
+            let __key_11 = PropertyKey::Named(machine.intern_str(name));
             assert!(matches!(
-                machine.own_descriptor(wrapper, &named(name)).unwrap(),
+                machine.own_descriptor(wrapper, &__key_11).unwrap(),
                 Some(Property::Data {
                     writable: false,
                     enumerable,
@@ -807,22 +822,26 @@ mod tests {
                     ..
                 }) if enumerable == expected_enumerable
             ));
-            assert!(!machine.internal_delete(wrapper, &named(name)).unwrap());
+            let __key_12 = PropertyKey::Named(machine.intern_str(name));
+            assert!(!machine.internal_delete(wrapper, &__key_12).unwrap());
+            let __key_13 = PropertyKey::Named(machine.intern_str(name));
             assert!(
                 !machine
-                    .internal_set(wrapper, named(name), Value::int32(0), wrapper)
+                    .internal_set(wrapper, __key_13, Value::int32(0), wrapper)
                     .unwrap()
             );
         }
+        let __key_2_14 = PropertyKey::Named(machine.intern_str("2"));
         assert!(
             machine
-                .own_descriptor(wrapper, &named("2"))
+                .own_descriptor(wrapper, &__key_2_14)
                 .unwrap()
                 .is_none()
         );
+        let __key_2_15 = PropertyKey::Named(machine.intern_str("2"));
         assert!(
             machine
-                .internal_set(wrapper, named("2"), Value::int32(0), wrapper)
+                .internal_set(wrapper, __key_2_15, Value::int32(0), wrapper)
                 .unwrap()
         );
         assert_eq!(machine.enumerable_keys(wrapper).unwrap().len(), 3);
@@ -875,9 +894,10 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let prototype = machine.intrinsics.object_prototype;
+        let __key_to_string_16 = PropertyKey::Named(machine.intern_str("toString"));
         assert!(matches!(
             machine
-                .own_descriptor(prototype, &named("toString"))
+                .own_descriptor(prototype, &__key_to_string_16)
                 .unwrap(),
             Some(Property::Data {
                 writable: true,
@@ -885,9 +905,10 @@ mod tests {
                 ..
             })
         ));
+        let __key_to_string_17 = PropertyKey::Named(machine.intern_str("toString"));
         assert!(
             machine
-                .internal_delete(prototype, &named("toString"))
+                .internal_delete(prototype, &__key_to_string_17)
                 .unwrap()
         );
         assert_eq!(
@@ -925,7 +946,8 @@ mod tests {
             value: Some(Value::int32(7)),
             ..Default::default()
         };
-        apply_property_descriptor(&mut machine, settled, named("tag"), descriptor).unwrap();
+        let __key_tag_18 = PropertyKey::Named(machine.intern_str("tag"));
+        apply_property_descriptor(&mut machine, settled, __key_tag_18, descriptor).unwrap();
         assert_eq!(
             machine.get_named_property(settled, "tag").unwrap(),
             Value::int32(7)
@@ -939,8 +961,10 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let target = machine.intrinsics.global("parseInt").unwrap();
         let bound = call_method(&mut machine, target, "bind", &[]).unwrap();
-        assert!(machine.internal_delete(bound, &named("name")).unwrap());
-        assert!(machine.internal_delete(bound, &named("length")).unwrap());
+        let __key_name_19 = PropertyKey::Named(machine.intern_str("name"));
+        assert!(machine.internal_delete(bound, &__key_name_19).unwrap());
+        let __key_length_20 = PropertyKey::Named(machine.intern_str("length"));
+        assert!(machine.internal_delete(bound, &__key_length_20).unwrap());
     }
 
     #[test]
@@ -955,7 +979,8 @@ mod tests {
         }
         let target = ordinary_object(&mut machine);
         call_object(&mut machine, "assign", &[target, text]).unwrap();
-        assert!(machine.has_own_property_key(target, &named("1")).unwrap());
+        let __key_1_21 = PropertyKey::Named(machine.intern_str("1"));
+        assert!(machine.has_own_property_key(target, &__key_1_21).unwrap());
     }
 
     #[test]
@@ -966,8 +991,9 @@ mod tests {
         let prototype = machine.intrinsics.function_prototype;
         let thrower = machine.intrinsics.builtins.throw_type_error();
         for name in ["caller", "arguments"] {
+            let __key_22 = PropertyKey::Named(machine.intern_str(name));
             assert!(matches!(
-                machine.own_descriptor(prototype, &named(name)).unwrap(),
+                machine.own_descriptor(prototype, &__key_22).unwrap(),
                 Some(Property::Accessor {
                     getter: Some(getter),
                     setter: Some(setter),
@@ -977,8 +1003,9 @@ mod tests {
             ));
             assert!(machine.get_named_property(prototype, name).is_err());
         }
+        let __key_length_23 = PropertyKey::Named(machine.intern_str("length"));
         assert!(matches!(
-            machine.own_descriptor(thrower, &named("length")).unwrap(),
+            machine.own_descriptor(thrower, &__key_length_23).unwrap(),
             Some(Property::Data {
                 configurable: false,
                 ..
@@ -1015,9 +1042,11 @@ mod tests {
             "reads work before anything stores them"
         );
         let keys = machine.internal_own_property_keys(function).unwrap();
-        assert_eq!(keys[..2], [named("length"), named("name")]);
+        let length_key = PropertyKey::Named(machine.intern_str("length"));
+        let name_key = PropertyKey::Named(machine.intern_str("name"));
+        assert_eq!(keys[..2], [length_key, name_key.clone()]);
         assert!(matches!(
-            machine.own_descriptor(function, &named("name")).unwrap(),
+            machine.own_descriptor(function, &name_key).unwrap(),
             Some(Property::Data {
                 writable: false,
                 enumerable: false,
@@ -1025,15 +1054,18 @@ mod tests {
                 ..
             })
         ));
-        assert!(machine.internal_delete(function, &named("length")).unwrap());
+        let __key_length_26 = PropertyKey::Named(machine.intern_str("length"));
+        assert!(machine.internal_delete(function, &__key_length_26).unwrap());
+        let __key_length_27 = PropertyKey::Named(machine.intern_str("length"));
         assert!(
             !machine
-                .has_own_property_key(function, &named("length"))
+                .has_own_property_key(function, &__key_length_27)
                 .unwrap()
         );
+        let __key_length_28 = PropertyKey::Named(machine.intern_str("length"));
         assert!(
             machine
-                .own_descriptor(function, &named("length"))
+                .own_descriptor(function, &__key_length_28)
                 .unwrap()
                 .is_none()
         );
@@ -1113,10 +1145,11 @@ mod tests {
         let renamed = machine
             .allocate(HeapEntry::String(EcmaString::encode("renamed")))
             .unwrap();
+        let __key_name_29 = PropertyKey::Named(machine.intern_str("name"));
         machine
             .define_descriptor(
                 push,
-                PropertyKey::Named(EcmaString::encode("name")),
+                __key_name_29,
                 Property::Data {
                     value: renamed,
                     writable: false,
@@ -1151,7 +1184,7 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let prototype = machine.intrinsics.builtins.function_prototype();
         let key = machine
-            .to_property_key(machine.intrinsics.builtins.symbol_has_instance())
+            .property_key_from_value(machine.intrinsics.builtins.symbol_has_instance())
             .unwrap();
         let has_instance = machine.get_property_key(prototype, &key).unwrap();
         let object = ordinary_object(&mut machine);
@@ -1210,20 +1243,22 @@ mod tests {
             machine.get_named_property(target, "stable").unwrap(),
             Value::int32(9)
         );
+        let __key_first_30 = PropertyKey::Named(machine.intern_str("first"));
         assert!(
             !machine
-                .has_own_property_key(target, &PropertyKey::Named(EcmaString::encode("first")))
+                .has_own_property_key(target, &__key_first_30)
                 .unwrap()
         );
+        let __key_second_31 = PropertyKey::Named(machine.intern_str("second"));
         assert!(
             !machine
-                .has_own_property_key(target, &PropertyKey::Named(EcmaString::encode("second")))
+                .has_own_property_key(target, &__key_second_31)
                 .unwrap()
         );
     }
 
-    fn symbol_key(machine: &Machine<'_, TestHost>, symbol: Value) -> PropertyKey {
-        machine.to_property_key(symbol).unwrap()
+    fn symbol_key(machine: &mut Machine<'_, TestHost>, symbol: Value) -> PropertyKey {
+        machine.property_key_from_value(symbol).unwrap()
     }
 
     fn symbol(machine: &mut Machine<'_, TestHost>, description: &str) -> Value {
@@ -1245,7 +1280,7 @@ mod tests {
 
         call_object(&mut machine, "defineProperty", &[target, key, descriptor]).unwrap();
 
-        let property_key = symbol_key(&machine, key);
+        let property_key = symbol_key(&mut machine, key);
         assert_eq!(
             machine.get_property_key(target, &property_key).unwrap(),
             Value::int32(42)
@@ -1282,7 +1317,7 @@ mod tests {
         let target = ordinary_object(&mut machine);
         let source = ordinary_object(&mut machine);
         let symbol = symbol(&mut machine, "key");
-        let key = symbol_key(&machine, symbol);
+        let key = symbol_key(&mut machine, symbol);
         machine
             .set_data_property_key(source, key.clone(), Value::int32(42))
             .unwrap();
@@ -1303,7 +1338,8 @@ mod tests {
             _args: &[Value],
             _constructing: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
-            machine.internal_delete(this, &PropertyKey::Named(EcmaString::encode("next")))?;
+            let __key_next_32 = PropertyKey::Named(machine.intern_str("next"));
+            machine.internal_delete(this, &__key_next_32)?;
             Ok(BuiltinOutcome::Value(Value::int32(1)))
         }
 
@@ -1318,12 +1354,17 @@ mod tests {
                 length: 0,
                 handler: delete_next::<TestHost>,
             });
-        let getter =
-            crate::intrinsics::native_function(&mut machine.heap, getter_id, "delete next", 0);
+        let getter = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            getter_id,
+            "delete next",
+            0,
+        );
         let source = ordinary_object(&mut machine);
         let target = ordinary_object(&mut machine);
-        let first = PropertyKey::Named(EcmaString::encode("first"));
-        let next = PropertyKey::Named(EcmaString::encode("next"));
+        let first = PropertyKey::Named(machine.intern_str("first"));
+        let next = PropertyKey::Named(machine.intern_str("next"));
         machine
             .define_descriptor(
                 source,
@@ -1357,7 +1398,8 @@ mod tests {
             _args: &[Value],
             _constructing: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
-            machine.internal_delete(this, &PropertyKey::Named(EcmaString::encode("10")))?;
+            let __key_10_33 = PropertyKey::Named(machine.intern_str("10"));
+            machine.internal_delete(this, &__key_10_33)?;
             Ok(BuiltinOutcome::Value(Value::int32(1)))
         }
 
@@ -1374,6 +1416,7 @@ mod tests {
             });
         let getter = crate::intrinsics::native_function(
             &mut machine.heap,
+            &mut machine.atoms,
             getter_id,
             "delete later index",
             0,
@@ -1381,10 +1424,11 @@ mod tests {
         let mut elements = vec![Value::HOLE; 11];
         elements[10] = Value::int32(2);
         let source = allocate_array(&mut machine, elements).unwrap();
+        let __key_2_34 = PropertyKey::Named(machine.intern_str("2"));
         machine
             .define_descriptor(
                 source,
-                PropertyKey::Named(EcmaString::encode("2")),
+                __key_2_34,
                 Property::Accessor {
                     getter: Some(getter),
                     setter: None,
@@ -1394,7 +1438,7 @@ mod tests {
             )
             .unwrap();
         let target = ordinary_object(&mut machine);
-        let later = PropertyKey::Named(EcmaString::encode("10"));
+        let later = PropertyKey::Named(machine.intern_str("10"));
 
         call_object(&mut machine, "assign", &[target, source]).unwrap();
 
@@ -1410,14 +1454,14 @@ mod tests {
         let descriptors = ordinary_object(&mut machine);
         let key = symbol(&mut machine, "definition");
         let descriptor = data_descriptor(&mut machine, Value::int32(7));
-        let property_key = symbol_key(&machine, key);
+        let property_key = symbol_key(&mut machine, key);
         machine
             .set_data_property_key(descriptors, property_key, descriptor)
             .unwrap();
 
         call_define_properties(&mut machine, target, descriptors).unwrap();
 
-        let property_key = symbol_key(&machine, key);
+        let property_key = symbol_key(&mut machine, key);
         assert_eq!(
             machine.get_property_key(target, &property_key).unwrap(),
             Value::int32(7)
@@ -1436,7 +1480,7 @@ mod tests {
                 description: EcmaString::encode("private"),
             })
             .unwrap();
-        let key = machine.to_property_key(private).unwrap();
+        let key = machine.property_key_from_value(private).unwrap();
         let descriptor = data_descriptor(&mut machine, Value::int32(7));
         machine
             .set_data_property_key(descriptors, key.clone(), descriptor)
@@ -1498,7 +1542,8 @@ mod tests {
         let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let tag_key = symbol_key(&machine, machine.intrinsics.builtins.symbol_to_string_tag());
+        let tag_symbol = machine.intrinsics.builtins.symbol_to_string_tag();
+        let tag_key = symbol_key(&mut machine, tag_symbol);
         let object_to_string = machine.intrinsics.object_to_string();
 
         let non_string_tag = ordinary_object(&mut machine);
@@ -1550,8 +1595,8 @@ mod tests {
                 description: EcmaString::encode("private"),
             })
             .unwrap();
-        let public_key = symbol_key(&machine, symbol);
-        let private_key = machine.to_property_key(private).unwrap();
+        let public_key = symbol_key(&mut machine, symbol);
+        let private_key = machine.property_key_from_value(private).unwrap();
         machine
             .set_data_property_key(target, public_key, Value::int32(1))
             .unwrap();
@@ -1589,8 +1634,9 @@ mod tests {
             machine.array_elements(array).unwrap().unwrap(),
             vec![Value::int32(1), Value::HOLE, Value::HOLE]
         );
+        let __key_length_35 = PropertyKey::Named(machine.intern_str("length"));
         let length = machine
-            .own_descriptor(array, &PropertyKey::Named(EcmaString::encode("length")))
+            .own_descriptor(array, &__key_length_35)
             .unwrap()
             .unwrap();
         assert!(matches!(
@@ -1672,10 +1718,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(machine.array_elements(array).unwrap().unwrap().len(), 4);
+        let __key_3_36 = PropertyKey::Named(machine.intern_str("3"));
         assert!(matches!(
-            machine
-                .own_descriptor(array, &PropertyKey::Named(EcmaString::encode("3")))
-                .unwrap(),
+            machine.own_descriptor(array, &__key_3_36).unwrap(),
             Some(Property::Accessor { .. })
         ));
 
@@ -1760,10 +1805,11 @@ mod tests {
         let throwing_getter = machine
             .get_named_property(object_constructor, "defineProperty")
             .unwrap();
+        let __key_get_37 = PropertyKey::Named(machine.intern_str("get"));
         machine
             .define_descriptor(
                 second,
-                PropertyKey::Named(EcmaString::encode("get")),
+                __key_get_37,
                 Property::Accessor {
                     getter: Some(throwing_getter),
                     setter: None,
@@ -1860,10 +1906,11 @@ mod tests {
             allocate_array(&mut machine, vec![Value::int32(1), Value::int32(2)]).unwrap();
         let array_prototype = machine.intrinsics.array_prototype;
         let pop = machine.get_named_property(array_prototype, "pop").unwrap();
+        let __key_value_38 = PropertyKey::Named(machine.intern_str("value"));
         machine
             .define_descriptor(
                 descriptor,
-                PropertyKey::Named(EcmaString::encode("value")),
+                __key_value_38,
                 Property::Accessor {
                     getter: Some(pop),
                     setter: None,
@@ -1910,9 +1957,10 @@ mod tests {
         )
         .unwrap();
 
+        let __key_data_39 = PropertyKey::Named(machine.intern_str("data"));
         assert!(matches!(
             machine
-                .own_descriptor(target, &PropertyKey::Named(EcmaString::encode("data")))
+                .own_descriptor(target, &__key_data_39)
                 .unwrap(),
             Some(Property::Data {
                 value,
@@ -1924,10 +1972,11 @@ mod tests {
 
         let getter = machine.intrinsics.global("Object").unwrap();
         let setter = machine.intrinsics.global("Array").unwrap();
+        let __key_accessor_40 = PropertyKey::Named(machine.intern_str("accessor"));
         machine
             .define_descriptor(
                 target,
-                PropertyKey::Named(EcmaString::encode("accessor")),
+                __key_accessor_40,
                 Property::Accessor {
                     getter: Some(getter),
                     setter: Some(setter),
@@ -1949,9 +1998,10 @@ mod tests {
         )
         .unwrap();
 
+        let __key_accessor_41 = PropertyKey::Named(machine.intern_str("accessor"));
         assert!(matches!(
             machine
-                .own_descriptor(target, &PropertyKey::Named(EcmaString::encode("accessor")))
+                .own_descriptor(target, &__key_accessor_41)
                 .unwrap(),
             Some(Property::Accessor {
                 getter: Some(actual_getter),
@@ -1992,9 +2042,10 @@ mod tests {
         call_object(&mut machine, "defineProperty", &[array, length_key, shrink]).unwrap();
 
         assert!(machine.array_elements(array).unwrap().unwrap().is_empty());
+        let __key_3_42 = PropertyKey::Named(machine.intern_str("3"));
         assert!(
             machine
-                .own_descriptor(array, &PropertyKey::Named(EcmaString::encode("3")))
+                .own_descriptor(array, &__key_3_42)
                 .unwrap()
                 .is_none()
         );
@@ -2027,18 +2078,18 @@ mod tests {
             .is_err()
         );
         assert_eq!(machine.array_elements(blocked).unwrap().unwrap().len(), 4);
+        let __key_3_43 = PropertyKey::Named(machine.intern_str("3"));
         assert!(matches!(
-            machine
-                .own_descriptor(blocked, &PropertyKey::Named(EcmaString::encode("3")))
-                .unwrap(),
+            machine.own_descriptor(blocked, &__key_3_43).unwrap(),
             Some(Property::Accessor {
                 configurable: false,
                 ..
             })
         ));
+        let __key_length_44 = PropertyKey::Named(machine.intern_str("length"));
         assert!(matches!(
             machine
-                .own_descriptor(blocked, &PropertyKey::Named(EcmaString::encode("length")))
+                .own_descriptor(blocked, &__key_length_44)
                 .unwrap(),
             Some(Property::Data {
                 value,
@@ -2068,7 +2119,7 @@ mod tests {
                 length,
                 handler: probe_handler::<TestHost>,
             });
-        crate::intrinsics::native_function(&mut machine.heap, id, name, length)
+        crate::intrinsics::native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
     }
 
     fn call_method(
@@ -2149,9 +2200,10 @@ mod tests {
                 return Err(type_error("length was read more than once"));
             }
             machine.set_data_property(this, "reads", Value::int32(1))?;
+            let __key_length_45 = PropertyKey::Named(machine.intern_str("length"));
             machine.define_descriptor(
                 this,
-                PropertyKey::Named(EcmaString::encode("length")),
+                __key_length_45,
                 Property::Data {
                     value: Value::int32(0),
                     writable: true,
@@ -2217,11 +2269,18 @@ mod tests {
                     length: 0,
                     handler,
                 });
-            let getter = crate::intrinsics::native_function(&mut machine.heap, id, name, 0);
+            let getter = crate::intrinsics::native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                id,
+                name,
+                0,
+            );
+            let __key_46 = PropertyKey::Named(machine.intern_str(key));
             machine
                 .define_descriptor(
                     arguments,
-                    PropertyKey::Named(EcmaString::encode(key)),
+                    __key_46,
                     Property::Accessor {
                         getter: Some(getter),
                         setter: None,
@@ -2271,13 +2330,19 @@ mod tests {
                 length: 0,
                 handler: mark_length::<TestHost>,
             });
-        let getter =
-            crate::intrinsics::native_function(&mut machine.heap, getter_id, "mark length", 0);
+        let getter = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            getter_id,
+            "mark length",
+            0,
+        );
         let arguments = ordinary_object(&mut machine);
+        let __key_length_47 = PropertyKey::Named(machine.intern_str("length"));
         machine
             .define_descriptor(
                 arguments,
-                PropertyKey::Named(EcmaString::encode("length")),
+                __key_length_47,
                 Property::Accessor {
                     getter: Some(getter),
                     setter: None,
@@ -2376,8 +2441,13 @@ mod tests {
                 length: 0,
                 handler: value_of::<TestHost>,
             });
-        let value_of_fn =
-            crate::intrinsics::native_function(&mut machine.heap, value_of_id, "valueOf", 0);
+        let value_of_fn = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            value_of_id,
+            "valueOf",
+            0,
+        );
         machine
             .set_data_property(arguments, "valueOf", value_of_fn)
             .unwrap();
@@ -2390,8 +2460,13 @@ mod tests {
                 length: 0,
                 handler: to_string::<TestHost>,
             });
-        let to_string_fn =
-            crate::intrinsics::native_function(&mut machine.heap, to_string_id, "toString", 0);
+        let to_string_fn = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            to_string_id,
+            "toString",
+            0,
+        );
         machine
             .set_data_property(arguments, "toString", to_string_fn)
             .unwrap();
@@ -2406,14 +2481,16 @@ mod tests {
             });
         let index_zero_getter_fn = crate::intrinsics::native_function(
             &mut machine.heap,
+            &mut machine.atoms,
             index_zero_id,
             "index 0 getter",
             0,
         );
+        let __key_0_48 = PropertyKey::Named(machine.intern_str("0"));
         machine
             .define_descriptor(
                 arguments,
-                PropertyKey::Named(EcmaString::encode("0")),
+                __key_0_48,
                 Property::Accessor {
                     getter: Some(index_zero_getter_fn),
                     setter: None,
@@ -2433,14 +2510,16 @@ mod tests {
             });
         let index_one_getter_fn = crate::intrinsics::native_function(
             &mut machine.heap,
+            &mut machine.atoms,
             index_one_id,
             "index 1 getter",
             0,
         );
+        let __key_1_49 = PropertyKey::Named(machine.intern_str("1"));
         machine
             .define_descriptor(
                 arguments,
-                PropertyKey::Named(EcmaString::encode("1")),
+                __key_1_49,
                 Property::Accessor {
                     getter: Some(index_one_getter_fn),
                     setter: None,
@@ -2505,6 +2584,7 @@ mod tests {
             });
         let value_of_fn = crate::intrinsics::native_function(
             &mut machine.heap,
+            &mut machine.atoms,
             value_of_id,
             "throwing valueOf",
             0,
@@ -2523,14 +2603,16 @@ mod tests {
             });
         let index_zero_getter_fn = crate::intrinsics::native_function(
             &mut machine.heap,
+            &mut machine.atoms,
             index_zero_id,
             "index 0 getter",
             0,
         );
+        let __key_0_50 = PropertyKey::Named(machine.intern_str("0"));
         machine
             .define_descriptor(
                 arguments,
-                PropertyKey::Named(EcmaString::encode("0")),
+                __key_0_50,
                 Property::Accessor {
                     getter: Some(index_zero_getter_fn),
                     setter: None,
@@ -2598,17 +2680,17 @@ mod tests {
             machine.internal_get_prototype_of(bound).unwrap(),
             Some(machine.intrinsics.function_prototype)
         );
+        let __key_prototype_51 = PropertyKey::Named(machine.intern_str("prototype"));
         assert!(
             !machine
-                .has_own_property_key(bound, &PropertyKey::Named(EcmaString::encode("prototype")),)
+                .has_own_property_key(bound, &__key_prototype_51,)
                 .unwrap()
         );
+        let __key_length_52 = PropertyKey::Named(machine.intern_str("length"));
+        let __key_name_53 = PropertyKey::Named(machine.intern_str("name"));
         assert_eq!(
             machine.own_property_keys(bound).unwrap(),
-            vec![
-                PropertyKey::Named(EcmaString::encode("length")),
-                PropertyKey::Named(EcmaString::encode("name")),
-            ]
+            vec![__key_length_52, __key_name_53,]
         );
 
         let nested = call_method(&mut machine, bound, "bind", &[ignored, Value::int32(3)]).unwrap();
@@ -2634,8 +2716,9 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let prototype = ordinary_object(&mut machine);
         let mut properties = PropertyMap::default();
+        let __key_prototype_54 = PropertyKey::Named(machine.intern_str("prototype"));
         properties.insert(
-            PropertyKey::Named(EcmaString::encode("prototype")),
+            __key_prototype_54,
             Property::Data {
                 value: prototype,
                 writable: true,
@@ -2690,8 +2773,9 @@ mod tests {
             .set_data_property(custom_prototype, "marker", Value::int32(42))
             .unwrap();
         let mut properties = PropertyMap::default();
+        let __key_prototype_55 = PropertyKey::Named(machine.intern_str("prototype"));
         properties.insert(
-            PropertyKey::Named(EcmaString::encode("prototype")),
+            __key_prototype_55,
             Property::Data {
                 value: custom_prototype,
                 writable: true,
@@ -2732,9 +2816,10 @@ mod tests {
             machine.internal_get_prototype_of(from_object).unwrap(),
             Some(custom_prototype)
         );
+        let __key_own_56 = PropertyKey::Named(machine.intern_str("own"));
         assert!(
             !machine
-                .has_own_property_key(from_object, &PropertyKey::Named(EcmaString::encode("own")))
+                .has_own_property_key(from_object, &__key_own_56)
                 .unwrap()
         );
         assert_eq!(
@@ -2834,8 +2919,9 @@ mod tests {
 
         // Non-object constructor prototype still falls back for a valid object NewTarget.
         let mut bare_properties = PropertyMap::default();
+        let __key_prototype_57 = PropertyKey::Named(machine.intern_str("prototype"));
         bare_properties.insert(
-            PropertyKey::Named(EcmaString::encode("prototype")),
+            __key_prototype_57,
             Property::Data {
                 value: Value::int32(1),
                 writable: true,
@@ -2923,8 +3009,9 @@ mod tests {
             .set_data_property(custom_prototype, "marker", Value::int32(42))
             .unwrap();
         let mut properties = PropertyMap::default();
+        let __key_prototype_58 = PropertyKey::Named(machine.intern_str("prototype"));
         properties.insert(
-            PropertyKey::Named(EcmaString::encode("prototype")),
+            __key_prototype_58,
             Property::Data {
                 value: custom_prototype,
                 writable: true,
@@ -3063,7 +3150,7 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let target = probe(&mut machine, "probe", 2);
-        let call_key = PropertyKey::Named(EcmaString::encode("call"));
+        let call_key = PropertyKey::Named(machine.intern_str("call"));
 
         assert!(!machine.has_own_property_key(target, &call_key).unwrap());
         machine
@@ -3250,8 +3337,13 @@ mod tests {
                 length: 0,
                 handler: custom_iterator_next::<TestHost>,
             });
-        let next_fn =
-            crate::intrinsics::native_function(&mut machine.heap, next_id, "from entries next", 0);
+        let next_fn = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            next_id,
+            "from entries next",
+            0,
+        );
         let return_id = machine
             .intrinsics
             .builtins
@@ -3262,6 +3354,7 @@ mod tests {
             });
         let return_fn = crate::intrinsics::native_function(
             &mut machine.heap,
+            &mut machine.atoms,
             return_id,
             "from entries return",
             0,
@@ -3276,6 +3369,7 @@ mod tests {
             });
         let create_fn = crate::intrinsics::native_function(
             &mut machine.heap,
+            &mut machine.atoms,
             create_id,
             "from entries iterator",
             0,
@@ -3292,7 +3386,7 @@ mod tests {
             .set_data_property(iterable, "_return", return_fn)
             .unwrap();
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let iterator_key = machine.property_key_from_value(iterator_symbol).unwrap();
         machine
             .set_data_property_key(iterable, iterator_key, create_fn)
             .unwrap();
@@ -3457,14 +3551,16 @@ mod tests {
             });
         let getter = crate::intrinsics::native_function(
             &mut machine.heap,
+            &mut machine.atoms,
             getter_id,
             "from entries throwing value getter",
             0,
         );
+        let __key_1_59 = PropertyKey::Named(machine.intern_str("1"));
         machine
             .define_descriptor(
                 first,
-                PropertyKey::Named(EcmaString::encode("1")),
+                __key_1_59,
                 Property::Accessor {
                     getter: Some(getter),
                     setter: None,
@@ -3502,14 +3598,16 @@ mod tests {
             });
         let key_getter = crate::intrinsics::native_function(
             &mut machine.heap,
+            &mut machine.atoms,
             key_getter_id,
             "from entries collecting key getter",
             0,
         );
+        let __key_0_60 = PropertyKey::Named(machine.intern_str("0"));
         machine
             .define_descriptor(
                 entry,
-                PropertyKey::Named(EcmaString::encode("0")),
+                __key_0_60,
                 Property::Accessor {
                     getter: Some(key_getter),
                     setter: None,
@@ -3528,14 +3626,16 @@ mod tests {
             });
         let getter = crate::intrinsics::native_function(
             &mut machine.heap,
+            &mut machine.atoms,
             getter_id,
             "from entries collecting value getter",
             0,
         );
+        let __key_1_61 = PropertyKey::Named(machine.intern_str("1"));
         machine
             .define_descriptor(
                 entry,
-                PropertyKey::Named(EcmaString::encode("1")),
+                __key_1_61,
                 Property::Accessor {
                     getter: Some(getter),
                     setter: None,
@@ -3547,7 +3647,7 @@ mod tests {
         let source = custom_iterable(&mut machine, vec![entry]);
 
         let result = call_object(&mut machine, "fromEntries", &[source]).unwrap();
-        let property_key = symbol_key(&machine, key);
+        let property_key = symbol_key(&mut machine, key);
         assert_eq!(
             machine.get_property_key(result, &property_key).unwrap(),
             Value::int32(7)
@@ -3576,14 +3676,16 @@ mod tests {
             });
         let setter = crate::intrinsics::native_function(
             &mut machine.heap,
+            &mut machine.atoms,
             setter_id,
             "from entries inherited setter",
             1,
         );
+        let __key_own_62 = PropertyKey::Named(machine.intern_str("own"));
         machine
             .define_descriptor(
                 machine.intrinsics.object_prototype,
-                PropertyKey::Named(EcmaString::encode("own")),
+                __key_own_62,
                 Property::Accessor {
                     getter: None,
                     setter: Some(setter),
@@ -3596,9 +3698,10 @@ mod tests {
         let source = custom_iterable(&mut machine, vec![entry]);
 
         let result = call_object(&mut machine, "fromEntries", &[source]).unwrap();
+        let __key_own_63 = PropertyKey::Named(machine.intern_str("own"));
         assert!(matches!(
             machine
-                .own_descriptor(result, &PropertyKey::Named(EcmaString::encode("own")))
+                .own_descriptor(result, &__key_own_63)
                 .unwrap(),
             Some(Property::Data {
                 value,

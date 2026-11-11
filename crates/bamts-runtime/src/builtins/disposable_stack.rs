@@ -96,6 +96,7 @@ fn async_disposable_stack_public_method<H: Host>(
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -126,32 +127,39 @@ pub(super) fn install<H: Host>(
         };
         let constructor = install_constructor_function(
             heap,
+            atoms,
             builtins,
             descriptor.name,
             descriptor.length,
             stack_constructor_handler::<H>,
         );
-        builtins.set_constructor_prototype(heap, constructor, prototype);
+        builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
 
         let mut disposal_method = None;
         for method in methods {
-            let function =
-                install_function(heap, builtins, method.name, method.length, method_handler);
+            let function = install_function(
+                heap,
+                atoms,
+                builtins,
+                method.name,
+                method.length,
+                method_handler,
+            );
             if matches!(
                 method.kind,
                 StackMethodKind::Dispose | StackMethodKind::DisposeAsync
             ) {
                 disposal_method = Some(function);
             }
-            define_data(heap, prototype, method.name, function);
+            define_data(heap, atoms, prototype, method.name, function);
         }
         let disposal_method = disposal_method.expect("stack method table includes disposal");
         for install in installs {
             match *install {
                 StackInstall::DisposedAccessor => {
                     let getter =
-                        install_function(heap, builtins, "get disposed", 0, disposed_getter);
-                    define_getter(heap, prototype, "disposed", getter);
+                        install_function(heap, atoms, builtins, "get disposed", 0, disposed_getter);
+                    define_getter(heap, atoms, prototype, "disposed", getter);
                 }
                 StackInstall::DisposeAlias => {
                     define_symbol(heap, prototype, builtins.symbol_dispose(), disposal_method)
@@ -183,12 +191,18 @@ fn ordinary(heap: &mut Vec<HeapEntry>, prototype: Option<Value>) -> Value {
     )
 }
 
-fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
+fn define_getter(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    object: Value,
+    name: &str,
+    getter: Value,
+) {
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
         unreachable!("DisposableStack prototype is an ordinary object")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern_str(name)),
         Property::Accessor {
             getter: Some(getter),
             setter: None,

@@ -27,6 +27,7 @@ use crate::{
 
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
     script_compiler: bool,
@@ -34,13 +35,14 @@ pub(crate) fn install<H: Host>(
     let prototype = builtins.function_prototype();
     let constructor = install_constructor_function(
         heap,
+        atoms,
         builtins,
         "Function",
         1,
         function_constructor::<H> as BuiltinHandler<H>,
     );
-    define_frozen_data(heap, constructor, "prototype", prototype);
-    define_data(heap, prototype, "constructor", constructor);
+    define_frozen_data(heap, atoms, constructor, "prototype", prototype);
+    define_data(heap, atoms, prototype, "constructor", constructor);
     globals.insert(EcmaString::encode("Function"), constructor);
     let generator_prototype = builtins.generator_prototype();
     let async_generator_prototype = builtins.async_generator_prototype();
@@ -49,6 +51,7 @@ pub(crate) fn install<H: Host>(
     define_to_string_tag(heap, async_generator_prototype, tag, "AsyncGenerator");
     let generator = install_function_kind(
         heap,
+        atoms,
         builtins,
         "GeneratorFunction",
         generator_function_constructor::<H>,
@@ -57,6 +60,7 @@ pub(crate) fn install<H: Host>(
     );
     let asynchronous = install_function_kind(
         heap,
+        atoms,
         builtins,
         "AsyncFunction",
         async_function_constructor::<H>,
@@ -65,6 +69,7 @@ pub(crate) fn install<H: Host>(
     );
     let async_generator = install_function_kind(
         heap,
+        atoms,
         builtins,
         "AsyncGeneratorFunction",
         async_generator_function_constructor::<H>,
@@ -78,18 +83,24 @@ pub(crate) fn install<H: Host>(
             length: 1,
             handler: eval::<H>,
         });
-        let function = native_function(heap, id, "eval", 1);
+        let function = native_function(heap, atoms, id, "eval", 1);
         globals.insert(EcmaString::encode("eval"), function);
     }
 }
 
 /// A read-only link between function-kind intrinsics.
-fn define_link(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
+fn define_link(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    object: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
-        panic!("function kind intrinsics are ordinary objects");
+        panic!("function kind intrinsics are ordinary objects")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern_str(name)),
         Property::Data {
             value,
             writable: false,
@@ -104,6 +115,7 @@ fn define_link(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) 
 /// they are found through `Object.getPrototypeOf(function* () {})`.
 fn install_function_kind<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     name: &'static str,
     handler: BuiltinHandler<H>,
@@ -119,7 +131,7 @@ fn install_function_kind<H: Host>(
             boxed_primitive: None,
         },
     );
-    let constructor = install_constructor_function(heap, builtins, name, 1, handler);
+    let constructor = install_constructor_function(heap, atoms, builtins, name, 1, handler);
     let HeapEntry::NativeFunction {
         prototype: parent, ..
     } = &mut heap[heap_index(constructor)]
@@ -127,12 +139,12 @@ fn install_function_kind<H: Host>(
         panic!("function kind constructor is a native function");
     };
     *parent = Some(function_constructor);
-    define_frozen_data(heap, constructor, "prototype", prototype);
-    define_link(heap, prototype, "constructor", constructor);
+    define_frozen_data(heap, atoms, constructor, "prototype", prototype);
+    define_link(heap, atoms, prototype, "constructor", constructor);
     define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), name);
     if let Some(instance_prototype) = instance_prototype {
-        define_link(heap, prototype, "prototype", instance_prototype);
-        define_link(heap, instance_prototype, "constructor", prototype);
+        define_link(heap, atoms, prototype, "prototype", instance_prototype);
+        define_link(heap, atoms, instance_prototype, "constructor", prototype);
     }
     prototype
 }
@@ -336,7 +348,7 @@ mod tests {
             .intrinsics
             .global("Function")
             .expect("Function global installs");
-        let key = PropertyKey::Named(EcmaString::encode("prototype"));
+        let key = PropertyKey::Named(machine.intern_str("prototype"));
         let Some(Property::Data {
             value: _,
             writable,

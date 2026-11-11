@@ -19,6 +19,7 @@ pub(crate) mod import_attributes;
 
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     object_prototype: Value,
 ) -> InstalledModule {
@@ -38,9 +39,10 @@ pub(crate) fn install<H: Host>(
             extensible: true,
         },
     );
-    let script = register_constructor(heap, builtins, "Script", 1, script_constructor::<H>);
+    let script = register_constructor(heap, atoms, builtins, "Script", 1, script_constructor::<H>);
     let run_in_this_context = register_constructor(
         heap,
+        atoms,
         builtins,
         "runInThisContext",
         2,
@@ -48,6 +50,7 @@ pub(crate) fn install<H: Host>(
     );
     let run_in_new_context = register_constructor(
         heap,
+        atoms,
         builtins,
         "runInNewContext",
         3,
@@ -62,9 +65,10 @@ pub(crate) fn install<H: Host>(
             extensible: true,
         },
     );
-    builtins.set_function_prototype(heap, run_in_this_context, run_prototype);
+    builtins.set_function_prototype(heap, atoms, run_in_this_context, run_prototype);
     crate::intrinsics::builtins::define_data(
         heap,
+        atoms,
         run_prototype,
         "constructor",
         run_in_this_context,
@@ -78,25 +82,33 @@ pub(crate) fn install<H: Host>(
             extensible: true,
         },
     );
-    builtins.set_function_prototype(heap, run_in_new_context, run_in_new_context_prototype);
+    builtins.set_function_prototype(
+        heap,
+        atoms,
+        run_in_new_context,
+        run_in_new_context_prototype,
+    );
     crate::intrinsics::builtins::define_data(
         heap,
+        atoms,
         run_in_new_context_prototype,
         "constructor",
         run_in_new_context,
     );
     let script_run_in_this_context = register(
         heap,
+        atoms,
         builtins,
         "runInThisContext",
         1,
         script_run_in_this_context::<H>,
     );
 
-    builtins.set_constructor_prototype(heap, script, script_prototype);
-    crate::intrinsics::builtins::define_data(heap, script_prototype, "constructor", script);
+    builtins.set_constructor_prototype(heap, atoms, script, script_prototype);
+    crate::intrinsics::builtins::define_data(heap, atoms, script_prototype, "constructor", script);
     crate::intrinsics::builtins::define_data(
         heap,
+        atoms,
         script_prototype,
         "runInThisContext",
         script_run_in_this_context,
@@ -116,6 +128,7 @@ pub(crate) fn install<H: Host>(
 
 fn register<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     name: &'static str,
     length: u32,
@@ -126,13 +139,14 @@ fn register<H: Host>(
         length,
         handler,
     });
-    intrinsics::native_function(heap, id, name, length)
+    intrinsics::native_function(heap, atoms, id, name, length)
 }
 
 /// Registers a function `new` can reach. Node's `runIn*Context` are plain
 /// functions, so unlike `Script` they work with or without it.
 fn register_constructor<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     name: &'static str,
     length: u32,
@@ -143,7 +157,7 @@ fn register_constructor<H: Host>(
         length,
         handler,
     });
-    intrinsics::native_function(heap, id, name, length)
+    intrinsics::native_function(heap, atoms, id, name, length)
 }
 
 fn type_error(operation: &'static str) -> EvalFailure {
@@ -436,11 +450,13 @@ fn contextify_global<H: Host>(
         return Ok(());
     }
 
+    let global_this = PropertyKey::Named(machine.intern_str("globalThis"));
+    let global = PropertyKey::Named(machine.intern_str("global"));
     machine.define_descriptor_batch(
         context,
         [
             (
-                PropertyKey::Named(EcmaString::encode("globalThis")),
+                global_this,
                 Property::Data {
                     value: context,
                     writable: true,
@@ -449,7 +465,7 @@ fn contextify_global<H: Host>(
                 },
             ),
             (
-                PropertyKey::Named(EcmaString::encode("global")),
+                global,
                 Property::Data {
                     value: context,
                     writable: true,
@@ -487,7 +503,7 @@ fn contextify_global<H: Host>(
         .cloned()
         .collect();
     for name in intrinsic_names {
-        let key = PropertyKey::Named(name);
+        let key = PropertyKey::Named(machine.intern(name));
         if machine.own_descriptor(context, &key)?.is_none()
             && let Some(descriptor) = machine.own_descriptor(machine.global_object, &key)?
         {
@@ -819,7 +835,7 @@ mod tests {
             unreachable!();
         };
         assert!(matches!(
-            properties.get_ascii("constructor"),
+            properties.get_ascii(&machine.atoms, "constructor"),
             Some(crate::Property::Data {
                 value,
                 writable: true,
@@ -836,7 +852,7 @@ mod tests {
             unreachable!();
         };
         assert!(matches!(
-            script_properties.get_ascii("prototype"),
+            script_properties.get_ascii(&machine.atoms, "prototype"),
             Some(crate::Property::Data {
                 value,
                 writable: false,
@@ -857,7 +873,7 @@ mod tests {
             writable: true,
             enumerable: false,
             configurable: false,
-        }) = run_properties.get_ascii("prototype")
+        }) = run_properties.get_ascii(&machine.atoms, "prototype")
         else {
             panic!("runInThisContext has an ordinary function prototype");
         };
@@ -978,22 +994,20 @@ mod tests {
         machine
             .set_data_property(context, "globalThis", Value::int32(7))
             .unwrap();
-        assert!(
-            machine
-                .internal_delete(context, &PropertyKey::Named(EcmaString::encode("global")))
-                .unwrap()
-        );
+        let global_key = PropertyKey::Named(machine.intern_str("global"));
+        assert!(machine.internal_delete(context, &global_key).unwrap());
         contextify_global(&mut machine, context).unwrap();
 
         assert_eq!(
             machine.get_named_property(context, "globalThis").unwrap(),
             Value::int32(7)
         );
+        let global_this_key = PropertyKey::Named(machine.intern_str("globalThis"));
         assert!(matches!(
             machine
                 .own_descriptor(
                     context,
-                    &PropertyKey::Named(EcmaString::encode("globalThis")),
+                    &global_this_key,
                 )
                 .unwrap(),
             Some(Property::Data {
@@ -1003,9 +1017,10 @@ mod tests {
                 configurable: true,
             }) if value == Value::int32(7)
         ));
+        let global_key = PropertyKey::Named(machine.intern_str("global"));
         assert!(
             machine
-                .own_descriptor(context, &PropertyKey::Named(EcmaString::encode("global")),)
+                .own_descriptor(context, &global_key)
                 .unwrap()
                 .is_none()
         );
@@ -1024,8 +1039,8 @@ mod tests {
                 extensible: true,
             })
             .unwrap();
-        let global_this = PropertyKey::Named(EcmaString::encode("globalThis"));
-        let global = PropertyKey::Named(EcmaString::encode("global"));
+        let global_this = PropertyKey::Named(machine.intern_str("globalThis"));
+        let global = PropertyKey::Named(machine.intern_str("global"));
         machine
             .define_descriptor(
                 context,
@@ -1108,8 +1123,8 @@ mod tests {
         ));
         assert_eq!(machine.heap_bytes, bytes);
         for key in [
-            PropertyKey::Named(EcmaString::encode("globalThis")),
-            PropertyKey::Named(EcmaString::encode("global")),
+            PropertyKey::Named(machine.intern_str("globalThis")),
+            PropertyKey::Named(machine.intern_str("global")),
         ] {
             assert!(machine.own_descriptor(context, &key).unwrap().is_none());
         }

@@ -2141,7 +2141,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     }
 
     fn get_ascii(&self, object: Value, name: &str) -> InvokeOutcome {
-        let key = crate::PropertyKey::Named(bamts_bytecode::EcmaString::encode(name));
+        let key = crate::PropertyKey::Named(self.machine.borrow_mut().intern_str(name));
         let outcome = self
             .machine
             .borrow_mut()
@@ -2187,7 +2187,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         } else {
             self.machine.borrow().intrinsics.builtins.symbol_dispose()
         };
-        let key = match self.machine.borrow_mut().to_property_key(symbol) {
+        let key = match self.machine.borrow_mut().property_key_from_value(symbol) {
             Ok(key) => key,
             Err(failure) => return Err(self.failure_outcome(failure)),
         };
@@ -2223,7 +2223,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         }
 
         let symbol = self.machine.borrow().intrinsics.builtins.symbol_dispose();
-        let key = match self.machine.borrow_mut().to_property_key(symbol) {
+        let key = match self.machine.borrow_mut().property_key_from_value(symbol) {
             Ok(key) => key,
             Err(failure) => return Err(self.failure_outcome(failure)),
         };
@@ -2270,7 +2270,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             }
             bamts_bytecode::IteratorKind::Keys => unreachable!("keys handled above"),
         };
-        let key = match self.machine.borrow_mut().to_property_key(symbol) {
+        let key = match self.machine.borrow_mut().property_key_from_value(symbol) {
             Ok(key) => key,
             Err(failure) => return self.failure_outcome(failure),
         };
@@ -2289,7 +2289,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         {
             from_sync = true;
             let symbol = self.machine.borrow().intrinsics.builtins.symbol_iterator();
-            let key = match self.machine.borrow_mut().to_property_key(symbol) {
+            let key = match self.machine.borrow_mut().property_key_from_value(symbol) {
                 Ok(key) => key,
                 Err(failure) => return self.failure_outcome(failure),
             };
@@ -3407,10 +3407,8 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             return HelperResult::normal(existing);
         }
         let prototype = self.machine.borrow().intrinsics.array_prototype;
-        let properties = self
-            .machine
-            .borrow()
-            .arguments_properties(self.running_is_sloppy());
+        let sloppy = self.running_is_sloppy();
+        let properties = self.machine.borrow_mut().arguments_properties(sloppy);
         let allocated = self.machine.borrow_mut().allocate(HeapEntry::Array {
             elements: args,
             properties,
@@ -4522,7 +4520,9 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     let pattern = self.constant_text(module, pattern);
                     let flags = self.constant_text(module, flags);
                     let prototype = self.machine.borrow().intrinsics.regexp_prototype();
-                    let properties = crate::intrinsics::builtins::initial_regexp_properties();
+                    let properties = crate::intrinsics::builtins::initial_regexp_properties(
+                        &mut self.machine.borrow_mut().atoms,
+                    );
                     self.allocated(HeapEntry::RegExp {
                         pattern,
                         flags,
@@ -11337,9 +11337,6 @@ mod tests {
             )],
         );
         let program = one_module_program(&module);
-        let created = PropertyKey::Named(EcmaString::encode("created"));
-        let data = PropertyKey::Named(EcmaString::encode("data"));
-        let accessor = PropertyKey::Named(EcmaString::encode("accessor"));
 
         let mut interpreter_host = SilentHost;
         let mut interpreter = Machine::new(&program, &mut interpreter_host, Limits::default());
@@ -11359,6 +11356,9 @@ mod tests {
         );
         let assert_slots =
             |machine: &mut Machine<'_, SilentHost>, object: Value, registers: &[Value]| {
+                let created = PropertyKey::Named(machine.intern_str("created"));
+                let data = PropertyKey::Named(machine.intern_str("data"));
+                let accessor = PropertyKey::Named(machine.intern_str("accessor"));
                 assert!(matches!(
                     machine.own_descriptor(object, &created).unwrap(),
                     Some(Property::Data {
@@ -11732,7 +11732,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, id, name, 0)
     }
 
     #[test]
@@ -11749,10 +11749,11 @@ mod tests {
             machine
                 .set_data_property(list, "length", Value::int32(1))
                 .unwrap();
+            let index_key = PropertyKey::Named(machine.intern_str("0"));
             machine
                 .define_descriptor(
                     list,
-                    PropertyKey::Named(EcmaString::encode("0")),
+                    index_key,
                     Property::Accessor {
                         getter: Some(getter),
                         setter: None,

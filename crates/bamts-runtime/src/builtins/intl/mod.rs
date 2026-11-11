@@ -77,33 +77,41 @@ struct Class<'a, H: Host> {
 
 fn install_class<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     namespace: Value,
     class: &Class<'_, H>,
 ) {
     let prototype = builtins.intl_prototype(class.kind);
-    let constructor =
-        install_constructor_function(heap, builtins, class.name, class.length, class.constructor);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        builtins,
+        class.name,
+        class.length,
+        class.constructor,
+    );
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     for &(name, length, handler) in class.statics {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, constructor, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, constructor, name, function);
     }
     for &(property, name, handler) in class.getters {
-        let getter = install_function(heap, builtins, name, 0, handler);
-        super::temporal::define_getter(heap, prototype, property, getter);
+        let getter = install_function(heap, atoms, builtins, name, 0, handler);
+        super::temporal::define_getter(heap, atoms, prototype, property, getter);
     }
     for &(name, length, handler) in class.methods {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, function);
     }
     let tag_symbol = builtins.symbol_to_string_tag();
     super::define_to_string_tag(heap, prototype, tag_symbol, class.tag);
-    define_data(heap, namespace, class.name, constructor);
+    define_data(heap, atoms, namespace, class.name, constructor);
 }
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -128,19 +136,19 @@ pub(super) fn install<H: Host>(
         ("supportedValuesOf", 1, supported_values_of::<H>),
     ];
     for (name, length, handler) in functions {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, namespace, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, namespace, name, function);
     }
-    locale::install(heap, builtins, namespace);
-    collator::install(heap, builtins, namespace);
-    number_format::install(heap, builtins, namespace);
-    date_time_format::install(heap, builtins, namespace);
-    plural_rules::install(heap, builtins, namespace);
-    list_format::install(heap, builtins, namespace);
-    relative_time_format::install(heap, builtins, namespace);
-    segmenter::install(heap, builtins, namespace);
-    display_names::install(heap, builtins, namespace);
-    duration_format::install(heap, builtins, namespace);
+    locale::install(heap, atoms, builtins, namespace);
+    collator::install(heap, atoms, builtins, namespace);
+    number_format::install(heap, atoms, builtins, namespace);
+    date_time_format::install(heap, atoms, builtins, namespace);
+    plural_rules::install(heap, atoms, builtins, namespace);
+    list_format::install(heap, atoms, builtins, namespace);
+    relative_time_format::install(heap, atoms, builtins, namespace);
+    segmenter::install(heap, atoms, builtins, namespace);
+    display_names::install(heap, atoms, builtins, namespace);
+    duration_format::install(heap, atoms, builtins, namespace);
     globals.insert(EcmaString::encode("Intl"), namespace);
 }
 
@@ -292,7 +300,7 @@ pub(super) fn chain_legacy_instance<H: Host>(
         return Ok(BuiltinOutcome::Value(instance));
     }
     let symbol = machine.intrinsics.builtins.intl_fallback_symbol();
-    let key = machine.to_property_key(symbol)?;
+    let key = machine.property_key_from_value(symbol)?;
     machine.define_descriptor(
         this,
         key,
@@ -318,7 +326,7 @@ pub(super) fn unwrap_legacy_instance<H: Host>(
         return Ok(value);
     }
     let symbol = machine.intrinsics.builtins.intl_fallback_symbol();
-    let key = machine.to_property_key(symbol)?;
+    let key = machine.property_key_from_value(symbol)?;
     machine.get_property_key(value, &key)
 }
 
@@ -369,9 +377,10 @@ pub(super) fn bound_function<H: Host>(
         ("length", crate::number_value(f64::from(length))),
         ("name", name),
     ] {
+        let key = PropertyKey::Named(machine.intern_str(key));
         machine.define_descriptor(
             function,
-            PropertyKey::Named(EcmaString::encode(key)),
+            key,
             Property::Data {
                 value,
                 writable: false,
@@ -501,7 +510,8 @@ pub(super) fn define_field<H: Host>(
     name: &str,
     value: Value,
 ) -> Result<(), EvalFailure> {
-    machine.create_data_property_key(object, PropertyKey::Named(EcmaString::encode(name)), value)
+    let key = PropertyKey::Named(machine.intern_str(name));
+    machine.create_data_property_key(object, key, value)
 }
 
 /// One element of a `formatToParts` result. `source` and `unit` are the
@@ -588,7 +598,7 @@ pub(super) fn string_iterable_to_list<H: Host>(
     if iterable == Value::UNDEFINED {
         return Ok(list);
     }
-    let key = machine.to_property_key(machine.intrinsics.builtins.symbol_iterator())?;
+    let key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_iterator())?;
     let object = machine.value_to_object(iterable)?;
     let method = machine.get_property_key(object, &key)?;
     if !machine.is_callable(method)? {

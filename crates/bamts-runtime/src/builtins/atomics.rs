@@ -26,31 +26,39 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, Proper
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    install_shared_array_buffer(heap, globals, builtins);
-    install_atomics(heap, globals, builtins);
+    install_shared_array_buffer(heap, atoms, globals, builtins);
+    install_atomics(heap, atoms, globals, builtins);
 }
 
 fn install_shared_array_buffer<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let constructor =
-        install_constructor_function(heap, builtins, "SharedArrayBuffer", 1, constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        builtins,
+        "SharedArrayBuffer",
+        1,
+        constructor::<H>,
+    );
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     builtins.set_sharedarraybuffer_constructor(constructor);
     builtins.set_sharedarraybuffer_prototype(prototype);
-    define_data(heap, prototype, "constructor", constructor);
+    define_data(heap, atoms, prototype, "constructor", constructor);
     for (name, length, handler) in [
         ("grow", 1, grow::<H> as BuiltinHandler<H>),
         ("slice", 2, slice::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, function);
     }
     for (property_name, function_name, handler) in [
         (
@@ -61,12 +69,12 @@ fn install_shared_array_buffer<H: Host>(
         ("maxByteLength", "get maxByteLength", max_byte_length::<H>),
         ("growable", "get growable", growable::<H>),
     ] {
-        let getter = install_function(heap, builtins, function_name, 0, handler);
+        let getter = install_function(heap, atoms, builtins, function_name, 0, handler);
         let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
             unreachable!("SharedArrayBuffer.prototype is ordinary")
         };
         properties.insert(
-            PropertyKey::Named(EcmaString::encode(property_name)),
+            PropertyKey::Named(atoms.intern_str(property_name)),
             Property::Accessor {
                 getter: Some(getter),
                 setter: None,
@@ -75,7 +83,14 @@ fn install_shared_array_buffer<H: Host>(
             },
         );
     }
-    let species = install_function(heap, builtins, "get [Symbol.species]", 0, species::<H>);
+    let species = install_function(
+        heap,
+        atoms,
+        builtins,
+        "get [Symbol.species]",
+        0,
+        species::<H>,
+    );
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)] else {
         unreachable!("SharedArrayBuffer constructor is native")
     };
@@ -99,6 +114,7 @@ fn install_shared_array_buffer<H: Host>(
 
 fn install_atomics<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -119,10 +135,10 @@ fn install_atomics<H: Host>(
         ("waitAsync", 4, wait_async::<H>),
         ("xor", 3, xor::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, atomics, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, atomics, name, function);
     }
-    let timeout = install_function(heap, builtins, "", 1, wait_async_timeout::<H>);
+    let timeout = install_function(heap, atoms, builtins, "", 1, wait_async_timeout::<H>);
     builtins.set_wait_async_timeout(timeout);
     define_to_string_tag(heap, atomics, builtins.symbol_to_string_tag(), "Atomics");
     globals.insert(EcmaString::encode("Atomics"), atomics);
@@ -738,7 +754,7 @@ fn wait_async_result<H: Host>(
     let prototype = machine.intrinsics.object_prototype;
     let object = super::ordinary_runtime(machine, Some(prototype))?;
     for (name, value) in [("async", Value::boolean(asynchronous)), ("value", value)] {
-        let key = PropertyKey::Named(EcmaString::encode(name));
+        let key = PropertyKey::Named(machine.intern_str(name));
         machine.create_data_property_key(object, key, value)?;
     }
     Ok(object)
@@ -1458,7 +1474,7 @@ mod tests {
                 machine
                     .set_data_property(object, "marker", Value::int32(1))
                     .unwrap();
-                let key = PropertyKey::Named(EcmaString::encode("marker"));
+                let key = PropertyKey::Named(machine.intern_str("marker"));
                 assert!(machine.own_descriptor(object, &key).unwrap().is_some());
                 assert_eq!(machine.enumerable_keys(object).unwrap().len(), 1);
             }
@@ -1507,7 +1523,7 @@ mod tests {
                 length: 0,
                 handler: shrink_buffer,
             });
-            let value_of = native_function(&mut machine.heap, id, "valueOf", 0);
+            let value_of = native_function(&mut machine.heap, &mut machine.atoms, id, "valueOf", 0);
             let atomics = atomics(machine);
             let constructor = machine.intrinsics.global("ArrayBuffer").unwrap();
             let operations: [(&str, Arguments); 4] = [

@@ -13,19 +13,21 @@ use crate::{EvalFailure, HeapEntry, Host, IterationKind, Machine, PropertyKey};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.string_prototype();
-    let constructor = install_constructor_function(heap, builtins, "String", 1, constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, builtins, "String", 1, constructor::<H>);
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     globals.insert(EcmaString::encode("String"), constructor);
     for (name, length, handler) in [
         ("fromCharCode", 1, from_char_code::<H> as BuiltinHandler<H>),
         ("raw", 1, raw::<H>),
     ] {
-        let f = install_function(heap, builtins, name, length, handler);
-        define_static(heap, constructor, name, f)
+        let f = install_function(heap, atoms, builtins, name, length, handler);
+        define_static(heap, atoms, constructor, name, f)
     }
     for (name, length, handler) in [
         ("toString", 0, this_string_value::<H> as BuiltinHandler<H>),
@@ -60,10 +62,17 @@ pub(super) fn install<H: Host>(
         ("search", 1, search::<H>),
         ("localeCompare", 1, locale_compare::<H>),
     ] {
-        let f = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, f)
+        let f = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, f)
     }
-    let iterator = install_function(heap, builtins, "[Symbol.iterator]", 0, string_iterator::<H>);
+    let iterator = install_function(
+        heap,
+        atoms,
+        builtins,
+        "[Symbol.iterator]",
+        0,
+        string_iterator::<H>,
+    );
     let HeapEntry::Object { properties, .. } = &mut heap[super::heap_index(prototype)] else {
         unreachable!()
     };
@@ -72,13 +81,19 @@ pub(super) fn install<H: Host>(
         super::builtin_property(iterator),
     );
 }
-fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
+fn define_static(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    constructor: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[super::heap_index(constructor)]
     else {
         panic!("String constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern_str(name)),
         super::builtin_property(value),
     );
 }
@@ -490,7 +505,7 @@ fn pattern_method<H: Host>(
     if !machine.is_object(argument) {
         return Ok(None);
     }
-    let key = machine.to_property_key(symbol)?;
+    let key = machine.property_key_from_value(symbol)?;
     let method = machine.get_property_key(argument, &key)?;
     if matches!(method.decode(), Some(Decoded::Undefined | Decoded::Null)) {
         return Ok(None);
@@ -510,7 +525,7 @@ fn invoke_on_new_regexp<H: Host>(
     input: Value,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     with_roots(machine, &[regexp, input], |machine, _| {
-        let key = machine.to_property_key(symbol)?;
+        let key = machine.property_key_from_value(symbol)?;
         let method = machine.get_property_key(regexp, &key)?;
         machine.call_value(method, regexp, &[input])
     })
@@ -1237,7 +1252,7 @@ mod unescape_tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, id, name, 0)
     }
 
     #[test]
@@ -1496,7 +1511,7 @@ mod unescape_tests {
             .allocate(HeapEntry::String(EcmaString::encode("x")))
             .expect("source string allocation succeeds");
         let iterator_key = machine
-            .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+            .property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
             .expect("Symbol.iterator is a property key");
         let iterator = machine
             .get_property_key(
@@ -1558,7 +1573,13 @@ mod split_replace_tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, "replacementArgumentCount", 0)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            id,
+            "replacementArgumentCount",
+            0,
+        )
     }
 
     /// Constructs a RegExp the same way the `RegExp` constructor does, so

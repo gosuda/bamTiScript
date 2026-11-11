@@ -733,6 +733,7 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn set_constructor_prototype(
         &mut self,
         heap: &mut [HeapEntry],
+        atoms: &mut crate::AtomTable,
         constructor: Value,
         prototype: Value,
     ) {
@@ -741,7 +742,7 @@ impl<H: Host> BuiltinTable<H> {
             panic!("builtin constructor is a native function");
         };
         properties.insert(
-            crate::PropertyKey::Named(EcmaString::encode("prototype")),
+            crate::PropertyKey::Named(atoms.intern_str("prototype")),
             crate::Property::Data {
                 value: prototype,
                 writable: false,
@@ -763,7 +764,7 @@ impl<H: Host> BuiltinTable<H> {
             | HeapEntry::Temporal { properties, .. }
             | HeapEntry::Intl { properties, .. } => {
                 properties.insert(
-                    crate::PropertyKey::Named(EcmaString::encode("constructor")),
+                    crate::PropertyKey::Named(atoms.intern_str("constructor")),
                     constructor_property,
                 );
             }
@@ -773,6 +774,7 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn set_function_prototype(
         &mut self,
         heap: &mut [HeapEntry],
+        atoms: &mut crate::AtomTable,
         function: Value,
         prototype: Value,
     ) {
@@ -781,7 +783,7 @@ impl<H: Host> BuiltinTable<H> {
             panic!("builtin function is a native function");
         };
         properties.insert(
-            crate::PropertyKey::Named(EcmaString::encode("prototype")),
+            crate::PropertyKey::Named(atoms.intern_str("prototype")),
             crate::Property::Data {
                 value: prototype,
                 writable: true,
@@ -1035,6 +1037,7 @@ pub(crate) struct Intrinsics<H: Host> {
 impl<H: Host> Intrinsics<H> {
     pub(crate) fn initialize(
         heap: &mut Vec<HeapEntry>,
+        atoms: &mut crate::AtomTable,
         timers_available: bool,
         script_compiler: bool,
     ) -> Self {
@@ -1073,12 +1076,13 @@ impl<H: Host> Intrinsics<H> {
         );
         builtins::install(
             heap,
+            atoms,
             &mut globals,
             &mut builtins,
             timers_available,
             script_compiler,
         );
-        crate::host_objects::install(heap, &mut globals, &mut builtins);
+        crate::host_objects::install(heap, atoms, &mut globals, &mut builtins);
         Self {
             globals,
             symbol_registry: BTreeMap::new(),
@@ -1166,24 +1170,27 @@ fn ordinary_prototype(heap: &mut Vec<HeapEntry>, object_prototype: Value) -> Val
         },
     )
 }
-/// The `length` and `name` every built-in function owns, in that order.
 pub(crate) fn native_function_properties(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     name: &'static str,
     length: u32,
 ) -> PropertyMap {
     let name_value = push(heap, HeapEntry::String(EcmaString::encode(name)));
-    function_properties(length, name_value)
+    function_properties(atoms, length, name_value)
 }
-/// `length` then `name`, the order a built-in function creates them in.
-pub(crate) fn function_properties(length: u32, name: Value) -> PropertyMap {
+pub(crate) fn function_properties(
+    atoms: &mut crate::AtomTable,
+    length: u32,
+    name: Value,
+) -> PropertyMap {
     let mut properties = PropertyMap::default();
     for (key, value) in [
         ("length", crate::number_value(f64::from(length))),
         ("name", name),
     ] {
         properties.insert(
-            crate::PropertyKey::Named(EcmaString::encode(key)),
+            crate::PropertyKey::Named(atoms.intern_str(key)),
             crate::Property::Data {
                 value,
                 writable: false,
@@ -1196,11 +1203,12 @@ pub(crate) fn function_properties(length: u32, name: Value) -> PropertyMap {
 }
 pub(crate) fn native_function(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     id: BuiltinId,
     name: &'static str,
     length: u32,
 ) -> Value {
-    let properties = native_function_properties(heap, name, length);
+    let properties = native_function_properties(heap, atoms, name, length);
     push(
         heap,
         HeapEntry::native_function(NativeCallable::Builtin(id), properties, None),
@@ -1294,9 +1302,10 @@ impl<'a, H: Host> Machine<'a, H> {
     }
     /// The own `message` data property of a thrown object. Like constructor
     /// resolution, this runs no user code, so an accessor yields nothing.
-    pub(crate) fn resolve_thrown_message(&self, value: Value) -> Option<EcmaString> {
+    pub(crate) fn resolve_thrown_message(&mut self, value: Value) -> Option<EcmaString> {
         let index = self.runtime_slot(value).ok().flatten()?;
-        match self.own_get_ascii(index, "message")? {
+        let message_atom = self.intern_str("message");
+        match self.own_get_atom(index, message_atom)? {
             Found::Value(message) => self.string_value(message),
             Found::Text(message) => Some(message),
             _ => None,
@@ -1313,7 +1322,7 @@ impl<'a, H: Host> Machine<'a, H> {
     /// user code (no getters, no `toString`); it reads only own data
     /// properties and the static `error_prototypes` table.
     pub(crate) fn resolve_thrown_constructor_name(
-        &self,
+        &mut self,
         value: Value,
     ) -> Result<Option<EcmaString>, EvalFailure> {
         let Some(mut index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
@@ -1344,8 +1353,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.intrinsics.builtins.get(*id).name,
                 )));
             }
-            // Try to read `constructor` own data property on this prototype.
-            if let Some(Found::Value(constructor)) = self.own_get_ascii(index, "constructor")
+            let constructor_atom = self.intern_str("constructor");
+            if let Some(Found::Value(constructor)) = self.own_get_atom(index, constructor_atom)
                 && let Some(ctor_index) = self
                     .runtime_slot(constructor)
                     .map_err(EvalFailure::Runtime)?
@@ -1371,7 +1380,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties,
                 ..
             } => {
-                if let Some(Property::Data { value, .. }) = properties.get_ascii("name")
+                if let Some(Property::Data { value, .. }) =
+                    properties.get_ascii(&self.atoms, "name")
                     && let Some(text) = self.string_from_value(*value)
                 {
                     return Some(text);
@@ -1382,7 +1392,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     .map(|id| self.constant_text(*module, id).clone())
             }
             HeapEntry::NativeFunction { properties, .. } => {
-                if let Some(Property::Data { value, .. }) = properties.get_ascii("name") {
+                if let Some(Property::Data { value, .. }) =
+                    properties.get_ascii(&self.atoms, "name")
+                {
                     self.string_from_value(*value)
                 } else {
                     None
@@ -1655,12 +1667,13 @@ mod tests {
             })
             .unwrap();
         for (key, value) in [("b", 1), ("2", 2), ("a", 3), ("1", 4)] {
+            let atom = PropertyKey::Named(machine.intern_str(key));
             let index = machine.runtime_slot(ordered).unwrap().unwrap();
             let HeapEntry::Object { properties, .. } = &mut machine.heap[index] else {
                 unreachable!()
             };
             properties.insert(
-                PropertyKey::Named(EcmaString::encode(key)),
+                atom,
                 Property::Data {
                     value: Value::int32(value),
                     writable: true,
@@ -1799,7 +1812,7 @@ mod tests {
     fn realm_handles_never_enter_public_globals() {
         let module = module();
         let mut host = TestHost;
-        let machine = Machine::new(&module, &mut host, Limits::default());
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
         assert!(
             machine
                 .intrinsics
@@ -1815,7 +1828,7 @@ mod tests {
             .own_property_keys(global_this)
             .expect("globalThis is an object");
         assert!(keys.into_iter().all(|key| {
-            key.as_string()
+            key.as_string(&machine.atoms)
                 .is_none_or(|name| name.as_units().first() != Some(&0))
         }));
     }

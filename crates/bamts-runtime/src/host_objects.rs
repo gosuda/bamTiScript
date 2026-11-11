@@ -8,6 +8,7 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, Proper
 
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -20,12 +21,13 @@ pub(crate) fn install<H: Host>(
         ("debug", console_debug::<H> as _),
         ("info", console_info::<H> as _),
     ] {
-        let function = register(heap, builtins, name, 0, handler);
-        put(heap, console, name, function);
+        let function = register(heap, atoms, builtins, name, 0, handler);
+        put(heap, atoms, console, name, function);
     }
 
     let stdout = stream(
         heap,
+        atoms,
         builtins,
         object_prototype,
         "stdout",
@@ -33,6 +35,7 @@ pub(crate) fn install<H: Host>(
     );
     let stderr = stream(
         heap,
+        atoms,
         builtins,
         object_prototype,
         "stderr",
@@ -56,25 +59,25 @@ pub(crate) fn install<H: Host>(
         },
     );
     let versions = object(heap, object_prototype);
-    put_text(heap, versions, "node", "24.18.0");
+    put_text(heap, atoms, versions, "node", "24.18.0");
 
     let process = object(heap, object_prototype);
-    put(heap, process, "stdout", stdout);
-    put(heap, process, "stderr", stderr);
-    put(heap, process, "env", env);
-    put(heap, process, "argv", argv);
-    put_text(heap, process, "platform", std::env::consts::OS);
-    put_text(heap, process, "version", "v24.18.0");
-    put(heap, process, "versions", versions);
+    put(heap, atoms, process, "stdout", stdout);
+    put(heap, atoms, process, "stderr", stderr);
+    put(heap, atoms, process, "env", env);
+    put(heap, atoms, process, "argv", argv);
+    put_text(heap, atoms, process, "platform", std::env::consts::OS);
+    put_text(heap, atoms, process, "version", "v24.18.0");
+    put(heap, atoms, process, "versions", versions);
     for (name, length, handler) in [
         ("exit", 1, process_exit::<H> as _),
         ("nextTick", 1, process_next_tick::<H> as _),
     ] {
-        let function = register(heap, builtins, name, length, handler);
-        put(heap, process, name, function);
+        let function = register(heap, atoms, builtins, name, length, handler);
+        put(heap, atoms, process, name, function);
     }
 
-    let print_fn = register(heap, builtins, "print", 1, print_fn::<H> as _);
+    let print_fn = register(heap, atoms, builtins, "print", 1, print_fn::<H> as _);
     globals.insert(EcmaString::encode("print"), print_fn);
     globals.insert(EcmaString::encode("console"), console);
     globals.insert(EcmaString::encode("process"), process);
@@ -82,42 +85,68 @@ pub(crate) fn install<H: Host>(
     let global_this = object(heap, object_prototype);
     for (name, value) in globals.iter() {
         if name.eq_ascii("Infinity") {
-            crate::intrinsics::builtins::define_frozen_data(heap, global_this, "Infinity", *value);
+            crate::intrinsics::builtins::define_frozen_data(
+                heap,
+                atoms,
+                global_this,
+                "Infinity",
+                *value,
+            );
         } else if name.eq_ascii("NaN") {
-            crate::intrinsics::builtins::define_frozen_data(heap, global_this, "NaN", *value);
+            crate::intrinsics::builtins::define_frozen_data(
+                heap,
+                atoms,
+                global_this,
+                "NaN",
+                *value,
+            );
         } else if name.eq_ascii("undefined") {
-            crate::intrinsics::builtins::define_frozen_data(heap, global_this, "undefined", *value);
+            crate::intrinsics::builtins::define_frozen_data(
+                heap,
+                atoms,
+                global_this,
+                "undefined",
+                *value,
+            );
         } else {
-            define_global_data(heap, global_this, name.clone(), *value);
+            define_global_data(heap, atoms, global_this, name.clone(), *value);
         }
     }
     define_global_data(
         heap,
+        atoms,
         global_this,
         EcmaString::encode("globalThis"),
         global_this,
     );
-    define_global_data(heap, global_this, EcmaString::encode("global"), global_this);
+    define_global_data(
+        heap,
+        atoms,
+        global_this,
+        EcmaString::encode("global"),
+        global_this,
+    );
     globals.insert(EcmaString::encode("global"), global_this);
     globals.insert(EcmaString::encode("globalThis"), global_this);
 }
-
 fn stream<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     object_prototype: Value,
     name: &'static str,
     handler: crate::intrinsics::BuiltinHandler<H>,
 ) -> Value {
     let stream = object(heap, object_prototype);
-    let write = register(heap, builtins, "write", 1, handler);
-    put(heap, stream, "write", write);
-    put_text(heap, stream, "_name", name);
+    let write = register(heap, atoms, builtins, "write", 1, handler);
+    put(heap, atoms, stream, "write", write);
+    put_text(heap, atoms, stream, "_name", name);
     stream
 }
 
 fn register<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     name: &'static str,
     length: u32,
@@ -128,7 +157,7 @@ fn register<H: Host>(
         length,
         handler,
     });
-    intrinsics::native_function(heap, id, name, length)
+    intrinsics::native_function(heap, atoms, id, name, length)
 }
 
 fn object(heap: &mut Vec<HeapEntry>, prototype: Value) -> Value {
@@ -142,13 +171,19 @@ fn object(heap: &mut Vec<HeapEntry>, prototype: Value) -> Value {
         },
     )
 }
-
-fn put(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
-    put_ecma(heap, object, EcmaString::encode(name), value);
+fn put(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    object: Value,
+    name: &str,
+    value: Value,
+) {
+    put_ecma(heap, atoms, object, EcmaString::encode(name), value);
 }
 
 fn define_data(
     heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
     object: Value,
     name: EcmaString,
     value: Value,
@@ -162,7 +197,7 @@ fn define_data(
         _ => unreachable!("host object installation target owns properties"),
     };
     properties.insert(
-        PropertyKey::Named(name),
+        PropertyKey::Named(atoms.intern(name)),
         Property::Data {
             value,
             writable: true,
@@ -172,17 +207,35 @@ fn define_data(
     );
 }
 
-fn put_ecma(heap: &mut [HeapEntry], object: Value, name: EcmaString, value: Value) {
-    define_data(heap, object, name, value, true);
+fn put_ecma(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    object: Value,
+    name: EcmaString,
+    value: Value,
+) {
+    define_data(heap, atoms, object, name, value, true);
 }
 
-fn define_global_data(heap: &mut [HeapEntry], object: Value, name: EcmaString, value: Value) {
-    define_data(heap, object, name, value, false);
+fn define_global_data(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    object: Value,
+    name: EcmaString,
+    value: Value,
+) {
+    define_data(heap, atoms, object, name, value, false);
 }
 
-fn put_text(heap: &mut Vec<HeapEntry>, object: Value, name: &str, text: &str) {
+fn put_text(
+    heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    object: Value,
+    name: &str,
+    text: &str,
+) {
     let value = intrinsics::push(heap, HeapEntry::String(EcmaString::encode(text)));
-    put(heap, object, name, value);
+    put(heap, atoms, object, name, value);
 }
 
 fn heap_index(value: Value) -> usize {
@@ -441,7 +494,7 @@ impl<H: Host> Machine<'_, H> {
                             };
                             parts.push(format!(
                                 "{}: {}",
-                                inspect_key(name),
+                                inspect_key(self.atoms.resolve(*name)),
                                 self.console_format(*value, false, depth + 1)?
                             ));
                         }

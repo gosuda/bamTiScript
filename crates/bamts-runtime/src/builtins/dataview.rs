@@ -102,14 +102,16 @@ fn bounds_for<H: Host>(
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let constructor = install_constructor_function(heap, builtins, "DataView", 1, constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, builtins, "DataView", 1, constructor::<H>);
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     builtins.set_dataview_prototype(prototype);
-    define_data(heap, prototype, "constructor", constructor);
+    define_data(heap, atoms, prototype, "constructor", constructor);
 
     for (name, length, handler) in [
         ("getInt8", 1, get_int8::<H> as BuiltinHandler<H>),
@@ -135,8 +137,8 @@ pub(super) fn install<H: Host>(
         ("setBigInt64", 2, set_big_int64::<H>),
         ("setBigUint64", 2, set_big_uint64::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, function);
     }
 
     for (property_name, function_name, handler) in [
@@ -144,12 +146,12 @@ pub(super) fn install<H: Host>(
         ("byteLength", "get byteLength", get_byte_length::<H>),
         ("byteOffset", "get byteOffset", get_byte_offset::<H>),
     ] {
-        let getter = install_function(heap, builtins, function_name, 0, handler);
+        let getter = install_function(heap, atoms, builtins, function_name, 0, handler);
         let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
             unreachable!("DataView.prototype is ordinary")
         };
         properties.insert(
-            PropertyKey::Named(EcmaString::encode(property_name)),
+            PropertyKey::Named(atoms.intern_str(property_name)),
             Property::Accessor {
                 getter: Some(getter),
                 setter: None,
@@ -1046,14 +1048,20 @@ mod tests {
                 length: 0,
                 handler: detach_during_prototype_lookup,
             });
-            let new_target =
-                native_function(&mut machine.heap, id, "DetachDuringPrototypeLookup", 0);
+            let new_target = native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                id,
+                "DetachDuringPrototypeLookup",
+                0,
+            );
+            let proto_key = PropertyKey::Named(machine.atoms.intern_str("prototype"));
             let index = machine.runtime_slot(new_target).unwrap().unwrap();
             let HeapEntry::NativeFunction { properties, .. } = &mut machine.heap[index] else {
                 panic!("native new.target must be callable");
             };
             properties.insert(
-                PropertyKey::Named(EcmaString::encode("prototype")),
+                proto_key,
                 Property::Accessor {
                     getter: Some(new_target),
                     setter: None,
@@ -1168,11 +1176,8 @@ mod tests {
                 Value::int32(0),
                 "numeric-looking own property must not shadow buffer reads"
             );
-            assert!(
-                machine
-                    .internal_delete(view, &PropertyKey::Named(EcmaString::encode("marker")))
-                    .unwrap()
-            );
+            let marker = PropertyKey::Named(machine.intern_str("marker"));
+            assert!(machine.internal_delete(view, &marker).unwrap());
             assert_eq!(
                 machine.get_named_property(view, "marker").unwrap(),
                 Value::UNDEFINED
@@ -1180,7 +1185,7 @@ mod tests {
             let keys = machine.own_property_keys(view).unwrap();
             assert!(
                 keys.iter().any(
-                    |key| matches!(key, PropertyKey::Named(name) if name.to_utf8_lossy() == "0")
+                    |key| matches!(key, PropertyKey::Named(name) if machine.atoms.resolve(*name).to_utf8_lossy() == "0")
                 )
             );
         });
@@ -1195,13 +1200,20 @@ mod tests {
                 length: 0,
                 handler: fresh_subclass_prototype,
             });
-            let new_target = native_function(&mut machine.heap, id, "FreshSubclassPrototype", 0);
+            let new_target = native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                id,
+                "FreshSubclassPrototype",
+                0,
+            );
+            let proto_key = PropertyKey::Named(machine.atoms.intern_str("prototype"));
             let index = machine.runtime_slot(new_target).unwrap().unwrap();
             let HeapEntry::NativeFunction { properties, .. } = &mut machine.heap[index] else {
                 panic!("native new.target must be callable");
             };
             properties.insert(
-                PropertyKey::Named(EcmaString::encode("prototype")),
+                proto_key,
                 Property::Accessor {
                     getter: Some(new_target),
                     setter: None,

@@ -158,33 +158,41 @@ struct Class<'a, H: Host> {
 
 fn install_class<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     namespace: Value,
     class: &Class<'_, H>,
 ) {
     let prototype = builtins.temporal_prototype(class.kind);
-    let constructor =
-        install_constructor_function(heap, builtins, class.name, class.length, class.constructor);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        builtins,
+        class.name,
+        class.length,
+        class.constructor,
+    );
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     for &(name, length, handler) in class.statics {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, constructor, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, constructor, name, function);
     }
     for &(property, name, handler) in class.getters {
-        let getter = install_function(heap, builtins, name, 0, handler);
-        define_getter(heap, prototype, property, getter);
+        let getter = install_function(heap, atoms, builtins, name, 0, handler);
+        define_getter(heap, atoms, prototype, property, getter);
     }
     for &(name, length, handler) in class.methods {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, function);
     }
     let tag_symbol = builtins.symbol_to_string_tag();
     super::define_to_string_tag(heap, prototype, tag_symbol, class.tag);
-    define_data(heap, namespace, class.name, constructor);
+    define_data(heap, atoms, namespace, class.name, constructor);
 }
 
 pub(in crate::intrinsics::builtins) fn define_getter(
     heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
     object: Value,
     name: &str,
     getter: Value,
@@ -196,7 +204,7 @@ pub(in crate::intrinsics::builtins) fn define_getter(
         panic!("accessor target is an ordinary object");
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern_str(name)),
         Property::Accessor {
             getter: Some(getter),
             setter: None,
@@ -208,6 +216,7 @@ pub(in crate::intrinsics::builtins) fn define_getter(
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -220,15 +229,15 @@ pub(super) fn install<H: Host>(
         let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
         builtins.set_temporal_prototype(kind, prototype);
     }
-    duration::install(heap, builtins, namespace);
-    instant::install(heap, builtins, namespace);
-    plain_time::install(heap, builtins, namespace);
-    plain_date::install(heap, builtins, namespace);
-    plain_date_time::install(heap, builtins, namespace);
-    plain_year_month::install(heap, builtins, namespace);
-    plain_month_day::install(heap, builtins, namespace);
-    zoned_date_time::install(heap, builtins, namespace);
-    now::install(heap, builtins, namespace);
+    duration::install(heap, atoms, builtins, namespace);
+    instant::install(heap, atoms, builtins, namespace);
+    plain_time::install(heap, atoms, builtins, namespace);
+    plain_date::install(heap, atoms, builtins, namespace);
+    plain_date_time::install(heap, atoms, builtins, namespace);
+    plain_year_month::install(heap, atoms, builtins, namespace);
+    plain_month_day::install(heap, atoms, builtins, namespace);
+    zoned_date_time::install(heap, atoms, builtins, namespace);
+    now::install(heap, atoms, builtins, namespace);
     globals.insert(EcmaString::encode("Temporal"), namespace);
 }
 

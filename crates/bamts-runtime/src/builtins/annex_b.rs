@@ -45,21 +45,27 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, Proper
 /// Object, String, and RegExp installers; see the module documentation.
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    install_proto_accessor(heap, builtins);
-    install_object_accessor_methods(heap, builtins);
-    install_string_annex_b(heap, builtins);
-    install_regexp_compile(heap, builtins);
-    install_regexp_legacy_statics(heap, globals, builtins);
+    install_proto_accessor(heap, atoms, builtins);
+    install_object_accessor_methods(heap, atoms, builtins);
+    install_string_annex_b(heap, atoms, builtins);
+    install_regexp_compile(heap, atoms, builtins);
+    install_regexp_legacy_statics(heap, atoms, globals, builtins);
 }
 
-fn install_proto_accessor<H: Host>(heap: &mut Vec<HeapEntry>, builtins: &mut BuiltinTable<H>) {
-    let getter = install_function(heap, builtins, "get __proto__", 0, proto_getter::<H>);
-    let setter = install_function(heap, builtins, "set __proto__", 1, proto_setter::<H>);
+fn install_proto_accessor<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    builtins: &mut BuiltinTable<H>,
+) {
+    let getter = install_function(heap, atoms, builtins, "get __proto__", 0, proto_getter::<H>);
+    let setter = install_function(heap, atoms, builtins, "set __proto__", 1, proto_setter::<H>);
     define_property(
         heap,
+        atoms,
         builtins.object_prototype(),
         "__proto__",
         Property::Accessor {
@@ -83,6 +89,7 @@ enum LegacyAccessorSlot {
 /// surrounding `Object.prototype` surface.
 fn install_object_accessor_methods<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.object_prototype();
@@ -96,8 +103,8 @@ fn install_object_accessor_methods<H: Host>(
         ("__lookupGetter__", 1, lookup_getter::<H>),
         ("__lookupSetter__", 1, lookup_setter::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, function);
     }
 }
 
@@ -241,7 +248,11 @@ fn lookup_legacy_accessor<H: Host>(
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 
-fn install_string_annex_b<H: Host>(heap: &mut Vec<HeapEntry>, builtins: &mut BuiltinTable<H>) {
+fn install_string_annex_b<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    builtins: &mut BuiltinTable<H>,
+) {
     let prototype = builtins.string_prototype();
     for (name, length, handler) in [
         ("anchor", 1, anchor::<H> as BuiltinHandler<H>),
@@ -259,21 +270,25 @@ fn install_string_annex_b<H: Host>(heap: &mut Vec<HeapEntry>, builtins: &mut Bui
         ("sup", 0, sup::<H>),
         ("substr", 2, substr::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, function);
     }
     // §B.2.3: `trimLeft` is the same function object as `trimStart`, and
     // `trimRight` the same as `trimEnd`; clone the installed descriptors so
     // the identity relationship holds through the alias.
     for (alias, canonical) in [("trimLeft", "trimStart"), ("trimRight", "trimEnd")] {
-        let property = clone_property(heap, prototype, canonical);
-        define_property(heap, prototype, alias, property);
+        let property = clone_property(heap, atoms, prototype, canonical);
+        define_property(heap, atoms, prototype, alias, property);
     }
 }
 
-fn install_regexp_compile<H: Host>(heap: &mut Vec<HeapEntry>, builtins: &mut BuiltinTable<H>) {
-    let method = install_function(heap, builtins, "compile", 1, regexp_compile::<H>);
-    define_data(heap, builtins.regexp_prototype(), "compile", method);
+fn install_regexp_compile<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    builtins: &mut BuiltinTable<H>,
+) {
+    let method = install_function(heap, atoms, builtins, "compile", 1, regexp_compile::<H>);
+    define_data(heap, atoms, builtins.regexp_prototype(), "compile", method);
 }
 const LEGACY_STATE_PRIVATE_NAME: &str = "RegExp legacy static state";
 const CAPTURE_START_NAMES: [&str; 9] = [
@@ -316,6 +331,7 @@ fn reject_construction(constructing: bool, operation: &'static str) -> Result<()
 }
 fn install_regexp_legacy_statics<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -326,22 +342,22 @@ fn install_regexp_legacy_statics<H: Host>(
     let empty = push(heap, HeapEntry::String(EcmaString::default()));
     let mut state_properties = PropertyMap::default();
     state_properties.insert(
-        PropertyKey::Named(EcmaString::encode("input")),
+        PropertyKey::Named(atoms.intern_str("input")),
         hidden_data(empty),
     );
     state_properties.insert(
-        PropertyKey::Named(EcmaString::encode("matchInput")),
+        PropertyKey::Named(atoms.intern_str("matchInput")),
         hidden_data(empty),
     );
     for name in ["matchStart", "matchEnd", "lastParenStart", "lastParenEnd"] {
         state_properties.insert(
-            PropertyKey::Named(EcmaString::encode(name)),
+            PropertyKey::Named(atoms.intern_str(name)),
             hidden_data(crate::number_value(-1.0)),
         );
     }
     for name in CAPTURE_START_NAMES.into_iter().chain(CAPTURE_END_NAMES) {
         state_properties.insert(
-            PropertyKey::Named(EcmaString::encode(name)),
+            PropertyKey::Named(atoms.intern_str(name)),
             hidden_data(crate::number_value(-1.0)),
         );
     }
@@ -379,10 +395,11 @@ fn install_regexp_legacy_statics<H: Host>(
         ),
         ("$_", "get $_", legacy_input_get::<H>, "set $_"),
     ] {
-        let getter = install_function(heap, builtins, getter_name, 0, getter);
-        let setter = install_function(heap, builtins, setter_name, 1, legacy_input_set::<H>);
+        let getter = install_function(heap, atoms, builtins, getter_name, 0, getter);
+        let setter = install_function(heap, atoms, builtins, setter_name, 1, legacy_input_set::<H>);
         define_property(
             heap,
+            atoms,
             constructor,
             property,
             Property::Accessor {
@@ -424,9 +441,10 @@ fn install_regexp_legacy_statics<H: Host>(
         ("$8", "get $8", legacy_capture_8_get::<H>),
         ("$9", "get $9", legacy_capture_9_get::<H>),
     ] {
-        let getter = install_function(heap, builtins, getter_name, 0, getter);
+        let getter = install_function(heap, atoms, builtins, getter_name, 0, getter);
         define_property(
             heap,
+            atoms,
             constructor,
             property,
             Property::Accessor {
@@ -482,12 +500,17 @@ fn legacy_state(heap: &[HeapEntry], constructor: Value) -> Value {
         .expect("Annex B installs RegExp legacy state")
 }
 
-fn legacy_state_value(heap: &[HeapEntry], state: Value, name: &str) -> Value {
+fn legacy_state_value(
+    heap: &[HeapEntry],
+    atoms: &crate::AtomTable,
+    state: Value,
+    name: &str,
+) -> Value {
     let HeapEntry::Object { properties, .. } = &heap[heap_index(state)] else {
         panic!("RegExp legacy state must be an object");
     };
     match properties
-        .get_ascii(name)
+        .get_ascii(atoms, name)
         .unwrap_or_else(|| panic!("RegExp legacy state contains {name}"))
     {
         Property::Data { value, .. } => *value,
@@ -495,12 +518,18 @@ fn legacy_state_value(heap: &[HeapEntry], state: Value, name: &str) -> Value {
     }
 }
 
-fn set_legacy_state_value(heap: &mut [HeapEntry], state: Value, name: &str, value: Value) {
+fn set_legacy_state_value(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    state: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(state)] else {
         panic!("RegExp legacy state must be an object");
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern_str(name)),
         hidden_data(value),
     );
 }
@@ -518,8 +547,13 @@ fn checked_legacy_state<H: Host>(
     Ok(legacy_state(&machine.heap, constructor))
 }
 
-fn stored_index(heap: &[HeapEntry], state: Value, name: &str) -> Option<usize> {
-    let number = super::value_number(legacy_state_value(heap, state, name));
+fn stored_index(
+    heap: &[HeapEntry],
+    atoms: &crate::AtomTable,
+    state: Value,
+    name: &str,
+) -> Option<usize> {
+    let number = super::value_number(legacy_state_value(heap, atoms, state, name));
     (number >= 0.0).then_some(number as usize)
 }
 
@@ -531,6 +565,7 @@ fn legacy_static_get<H: Host>(
     let state = checked_legacy_state(machine, this)?;
     let input_value = legacy_state_value(
         &machine.heap,
+        &machine.atoms,
         state,
         if matches!(kind, LegacyStatic::Input) {
             "input"
@@ -544,25 +579,42 @@ fn legacy_static_get<H: Host>(
     let input = machine
         .string_value(input_value)
         .expect("RegExp legacy input is a string");
-    let range = match kind {
-        LegacyStatic::Input => unreachable!("handled above"),
-        LegacyStatic::LastMatch => stored_index(&machine.heap, state, "matchStart")
-            .zip(stored_index(&machine.heap, state, "matchEnd")),
-        LegacyStatic::LastParen => stored_index(&machine.heap, state, "lastParenStart")
-            .zip(stored_index(&machine.heap, state, "lastParenEnd")),
-        LegacyStatic::LeftContext => {
-            stored_index(&machine.heap, state, "matchStart").map(|end| (0, end))
-        }
-        LegacyStatic::RightContext => {
-            stored_index(&machine.heap, state, "matchEnd").map(|start| (start, input.len_units()))
-        }
-        LegacyStatic::Capture(index) => stored_index(
-            &machine.heap,
-            state,
-            CAPTURE_START_NAMES[index],
-        )
-        .zip(stored_index(&machine.heap, state, CAPTURE_END_NAMES[index])),
-    };
+    let range =
+        match kind {
+            LegacyStatic::Input => unreachable!("handled above"),
+            LegacyStatic::LastMatch => {
+                stored_index(&machine.heap, &machine.atoms, state, "matchStart").zip(stored_index(
+                    &machine.heap,
+                    &machine.atoms,
+                    state,
+                    "matchEnd",
+                ))
+            }
+            LegacyStatic::LastParen => {
+                stored_index(&machine.heap, &machine.atoms, state, "lastParenStart").zip(
+                    stored_index(&machine.heap, &machine.atoms, state, "lastParenEnd"),
+                )
+            }
+            LegacyStatic::LeftContext => {
+                stored_index(&machine.heap, &machine.atoms, state, "matchStart").map(|end| (0, end))
+            }
+            LegacyStatic::RightContext => {
+                stored_index(&machine.heap, &machine.atoms, state, "matchEnd")
+                    .map(|start| (start, input.len_units()))
+            }
+            LegacyStatic::Capture(index) => stored_index(
+                &machine.heap,
+                &machine.atoms,
+                state,
+                CAPTURE_START_NAMES[index],
+            )
+            .zip(stored_index(
+                &machine.heap,
+                &machine.atoms,
+                state,
+                CAPTURE_END_NAMES[index],
+            )),
+        };
     let result = range
         .and_then(|(start, end)| input.slice_units(start..end))
         .unwrap_or_default();
@@ -590,7 +642,7 @@ fn legacy_input_set<H: Host>(
     let input =
         machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let input = allocate_string(machine, input)?;
-    set_legacy_state_value(&mut machine.heap, state, "input", input);
+    set_legacy_state_value(&mut machine.heap, &mut machine.atoms, state, "input", input);
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 
@@ -624,14 +676,15 @@ legacy_static_getter!(legacy_capture_9_get, LegacyStatic::Capture(8));
 
 fn store_range(
     heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
     state: Value,
     start_name: &str,
     end_name: &str,
     range: Option<&std::ops::Range<usize>>,
 ) {
     let (start, end) = range.map_or((-1.0, -1.0), |range| (range.start as f64, range.end as f64));
-    set_legacy_state_value(heap, state, start_name, crate::number_value(start));
-    set_legacy_state_value(heap, state, end_name, crate::number_value(end));
+    set_legacy_state_value(heap, atoms, state, start_name, crate::number_value(start));
+    set_legacy_state_value(heap, atoms, state, end_name, crate::number_value(end));
 }
 
 /// Records the successful match state used by the Annex B RegExp constructor
@@ -645,10 +698,23 @@ pub(super) fn record_legacy_match<H: Host>(
     let constructor = regexp_constructor(machine)?;
     let state = legacy_state(&machine.heap, constructor);
     let input_value = allocate_string(machine, input.clone())?;
-    set_legacy_state_value(&mut machine.heap, state, "input", input_value);
-    set_legacy_state_value(&mut machine.heap, state, "matchInput", input_value);
+    set_legacy_state_value(
+        &mut machine.heap,
+        &mut machine.atoms,
+        state,
+        "input",
+        input_value,
+    );
+    set_legacy_state_value(
+        &mut machine.heap,
+        &mut machine.atoms,
+        state,
+        "matchInput",
+        input_value,
+    );
     store_range(
         &mut machine.heap,
+        &mut machine.atoms,
         state,
         "matchStart",
         "matchEnd",
@@ -662,6 +728,7 @@ pub(super) fn record_legacy_match<H: Host>(
         .find_map(Option::as_ref);
     store_range(
         &mut machine.heap,
+        &mut machine.atoms,
         state,
         "lastParenStart",
         "lastParenEnd",
@@ -670,6 +737,7 @@ pub(super) fn record_legacy_match<H: Host>(
     for index in 0..9 {
         store_range(
             &mut machine.heap,
+            &mut machine.atoms,
             state,
             CAPTURE_START_NAMES[index],
             CAPTURE_END_NAMES[index],
@@ -697,11 +765,22 @@ fn properties_of(heap: &mut [HeapEntry], object: Value) -> &mut PropertyMap {
     }
 }
 
-fn define_property(heap: &mut [HeapEntry], object: Value, name: &str, property: Property) {
-    properties_of(heap, object).insert(PropertyKey::Named(EcmaString::encode(name)), property);
+fn define_property(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    object: Value,
+    name: &str,
+    property: Property,
+) {
+    properties_of(heap, object).insert(PropertyKey::Named(atoms.intern_str(name)), property);
 }
 
-fn clone_property(heap: &[HeapEntry], object: Value, name: &str) -> Property {
+fn clone_property(
+    heap: &[HeapEntry],
+    atoms: &crate::AtomTable,
+    object: Value,
+    name: &str,
+) -> Property {
     let index = heap_index(object);
     let properties = match &heap[index] {
         HeapEntry::Object { properties, .. }
@@ -716,7 +795,7 @@ fn clone_property(heap: &[HeapEntry], object: Value, name: &str) -> Property {
         _ => panic!("Annex B property source must be an ordinary object"),
     };
     properties
-        .get_ascii(name)
+        .get_ascii(atoms, name)
         .unwrap_or_else(|| panic!("{name} must be installed before the Annex B surface"))
         .clone()
 }
@@ -991,7 +1070,7 @@ fn reset_last_index<H: Host>(
     machine: &mut Machine<'_, H>,
     regexp: Value,
 ) -> Result<(), EvalFailure> {
-    let key = PropertyKey::Named(EcmaString::encode("lastIndex"));
+    let key = PropertyKey::Named(machine.intern_str("lastIndex"));
     let descriptor = {
         let properties = properties_of(&mut machine.heap, regexp);
         properties.get(&key).cloned()
@@ -1089,7 +1168,7 @@ mod tests {
             length,
             handler,
         });
-        native_function(&mut machine.heap, id, name, length)
+        native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
     }
 
     fn assert_type_error(result: Result<Value, EvalFailure>) {
@@ -1116,8 +1195,9 @@ mod tests {
         object: Value,
         name: &str,
     ) -> Property {
+        let key = PropertyKey::Named(machine.intern_str(name));
         machine
-            .own_descriptor(object, &PropertyKey::Named(EcmaString::encode(name)))
+            .own_descriptor(object, &key)
             .expect("descriptor lookup succeeds")
             .unwrap_or_else(|| panic!("{name} is installed"))
     }
@@ -1189,16 +1269,14 @@ mod tests {
         let mut host = ControlledHost { zone: "UTC" };
         let mut machine = machine(&module, &mut host);
         let object_prototype = machine.intrinsics.builtins.object_prototype();
+        let proto_key = PropertyKey::Named(machine.intern_str("__proto__"));
         let Property::Accessor {
             getter: Some(getter),
             setter: Some(setter),
             enumerable: false,
             configurable: true,
         } = machine
-            .own_descriptor(
-                object_prototype,
-                &PropertyKey::Named(EcmaString::encode("__proto__")),
-            )
+            .own_descriptor(object_prototype, &proto_key)
             .expect("descriptor lookup succeeds")
             .expect("__proto__ accessor is installed")
         else {
@@ -1610,14 +1688,12 @@ mod tests {
 
     fn proto_getter_function(machine: &mut Machine<'_, ControlledHost>) -> Value {
         let object_prototype = machine.intrinsics.builtins.object_prototype();
+        let proto_key = PropertyKey::Named(machine.intern_str("__proto__"));
         let Property::Accessor {
             getter: Some(getter),
             ..
         } = machine
-            .own_descriptor(
-                object_prototype,
-                &PropertyKey::Named(EcmaString::encode("__proto__")),
-            )
+            .own_descriptor(object_prototype, &proto_key)
             .expect("descriptor lookup succeeds")
             .expect("__proto__ accessor is installed")
         else {
@@ -1628,14 +1704,12 @@ mod tests {
 
     fn proto_setter_function(machine: &mut Machine<'_, ControlledHost>) -> Value {
         let object_prototype = machine.intrinsics.builtins.object_prototype();
+        let proto_key = PropertyKey::Named(machine.intern_str("__proto__"));
         let Property::Accessor {
             setter: Some(setter),
             ..
         } = machine
-            .own_descriptor(
-                object_prototype,
-                &PropertyKey::Named(EcmaString::encode("__proto__")),
-            )
+            .own_descriptor(object_prototype, &proto_key)
             .expect("descriptor lookup succeeds")
             .expect("__proto__ accessor is installed")
         else {
@@ -2034,11 +2108,9 @@ mod tests {
             0.0
         );
         for (name, expected) in [("source", "x"), ("flags", "gi")] {
+            let name_key = PropertyKey::Named(machine.intern_str(name));
             assert!(
-                machine
-                    .own_descriptor(regexp, &PropertyKey::Named(EcmaString::encode(name)))
-                    .unwrap()
-                    .is_none(),
+                machine.own_descriptor(regexp, &name_key).unwrap().is_none(),
                 "compile must not create an own {name} property"
             );
             let value = machine.get_named_property(regexp, name).unwrap();
@@ -2234,11 +2306,9 @@ mod tests {
             "$8",
             "$9",
         ] {
+            let prop_key = PropertyKey::Named(machine.intern_str(property));
             let descriptor = machine
-                .own_descriptor(
-                    constructor,
-                    &PropertyKey::Named(EcmaString::encode(property)),
-                )
+                .own_descriptor(constructor, &prop_key)
                 .unwrap()
                 .unwrap_or_else(|| panic!("RegExp.{property} is installed"));
             let Property::Accessor {
@@ -2269,15 +2339,13 @@ mod tests {
             .intrinsics
             .global("RegExp")
             .expect("RegExp is installed");
+        let input_key = PropertyKey::Named(machine.intern_str("input"));
         let Property::Accessor {
             getter: Some(getter),
             setter: Some(setter),
             ..
         } = machine
-            .own_descriptor(
-                constructor,
-                &PropertyKey::Named(EcmaString::encode("input")),
-            )
+            .own_descriptor(constructor, &input_key)
             .unwrap()
             .expect("RegExp.input is installed")
         else {
@@ -2391,15 +2459,13 @@ mod tests {
                 .unwrap(),
         );
         let object_prototype = machine.intrinsics.builtins.object_prototype();
+        let proto_key = PropertyKey::Named(machine.intern_str("__proto__"));
         let Property::Accessor {
             getter: Some(proto_getter),
             setter: Some(proto_setter),
             ..
         } = machine
-            .own_descriptor(
-                object_prototype,
-                &PropertyKey::Named(EcmaString::encode("__proto__")),
-            )
+            .own_descriptor(object_prototype, &proto_key)
             .unwrap()
             .expect("__proto__ is installed")
         else {
@@ -2419,11 +2485,9 @@ mod tests {
             .global("RegExp")
             .expect("RegExp is installed");
         for property in ["input", "$1"] {
+            let prop_key = PropertyKey::Named(machine.intern_str(property));
             let Property::Accessor { getter, setter, .. } = machine
-                .own_descriptor(
-                    regexp_constructor,
-                    &PropertyKey::Named(EcmaString::encode(property)),
-                )
+                .own_descriptor(regexp_constructor, &prop_key)
                 .unwrap()
                 .unwrap_or_else(|| panic!("RegExp.{property} is installed"))
             else {
@@ -2636,10 +2700,11 @@ mod tests {
             Value::UNDEFINED,
             "a getter-only slot reports no setter"
         );
+        let both_key = PropertyKey::Named(machine.intern_str("both"));
         machine
             .define_descriptor(
                 parent,
-                PropertyKey::Named(EcmaString::encode("both")),
+                both_key,
                 Property::Accessor {
                     getter: Some(getter),
                     setter: Some(setter),
@@ -2723,10 +2788,11 @@ mod tests {
         let object = ordinary_object(&mut machine);
         let getter = native(&mut machine, "get locked", 0, getter_of_this);
         let setter = native(&mut machine, "set sealed", 1, setter_records_on_this);
+        let locked_key = PropertyKey::Named(machine.intern_str("locked"));
         machine
             .define_descriptor(
                 object,
-                PropertyKey::Named(EcmaString::encode("locked")),
+                locked_key,
                 Property::Data {
                     value: Value::UNDEFINED,
                     writable: false,
@@ -2735,10 +2801,11 @@ mod tests {
                 },
             )
             .unwrap();
+        let sealed_key = PropertyKey::Named(machine.intern_str("sealed"));
         machine
             .define_descriptor(
                 object,
-                PropertyKey::Named(EcmaString::encode("sealed")),
+                sealed_key,
                 Property::Accessor {
                     getter: None,
                     setter: None,
@@ -2777,10 +2844,11 @@ mod tests {
             &[boxed_key, getter],
         )
         .unwrap();
+        let inherited_key2 = PropertyKey::Named(machine.intern_str("inherited"));
         machine
             .define_descriptor(
                 machine.intrinsics.number_prototype,
-                PropertyKey::Named(EcmaString::encode("inherited")),
+                inherited_key2,
                 Property::Accessor {
                     getter: Some(getter),
                     setter: None,

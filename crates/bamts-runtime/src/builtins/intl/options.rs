@@ -162,7 +162,7 @@ pub(super) fn canonicalize_locale_list<H: Host>(
     let object = machine.value_to_object(locales)?;
     let length = length_of_array_like(machine, object)?;
     for index in 0..length {
-        let key = index_key(index);
+        let key = index_key(&mut machine.atoms, index);
         if !machine.internal_has_property(object, &key)? {
             continue;
         }

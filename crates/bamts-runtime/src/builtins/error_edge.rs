@@ -30,6 +30,7 @@ const ERROR_TYPES: [(&str, u32); 9] = [
 /// prototypes. Main must call this after the baseline error installation.
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -40,18 +41,32 @@ pub(super) fn install<H: Host>(
         },
     );
     builtins.set_error_brand(brand);
-    let error_prototype = prototype_of(heap, globals, "Error");
-    let stack_getter = install_function(heap, builtins, "get stack", 0, stack_get::<H>);
-    let stack_setter = install_function(heap, builtins, "set stack", 1, stack_set::<H>);
-    define_hidden(heap, error_prototype, STACK_GETTER, stack_getter);
-    define_hidden(heap, error_prototype, STACK_SETTER, stack_setter);
-    let getter = install_function(heap, builtins, "get stack", 0, prototype_stack_get::<H>);
-    let setter = install_function(heap, builtins, "set stack", 1, prototype_stack_set::<H>);
+    let error_prototype = prototype_of(heap, atoms, globals, "Error");
+    let stack_getter = install_function(heap, atoms, builtins, "get stack", 0, stack_get::<H>);
+    let stack_setter = install_function(heap, atoms, builtins, "set stack", 1, stack_set::<H>);
+    define_hidden(heap, atoms, error_prototype, STACK_GETTER, stack_getter);
+    define_hidden(heap, atoms, error_prototype, STACK_SETTER, stack_setter);
+    let getter = install_function(
+        heap,
+        atoms,
+        builtins,
+        "get stack",
+        0,
+        prototype_stack_get::<H>,
+    );
+    let setter = install_function(
+        heap,
+        atoms,
+        builtins,
+        "set stack",
+        1,
+        prototype_stack_set::<H>,
+    );
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(error_prototype)] else {
         panic!("Error.prototype is an ordinary object")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode("stack")),
+        PropertyKey::Named(atoms.intern(EcmaString::encode("stack"))),
         Property::Accessor {
             getter: Some(getter),
             setter: Some(setter),
@@ -61,22 +76,29 @@ pub(super) fn install<H: Host>(
     );
 
     for (name, length) in ERROR_TYPES {
-        let prototype = prototype_of(heap, globals, name);
-        let constructor =
-            install_constructor_function(heap, builtins, name, length, error_constructor::<H>);
-        builtins.set_constructor_prototype(heap, constructor, prototype);
+        let prototype = prototype_of(heap, atoms, globals, name);
+        let constructor = install_constructor_function(
+            heap,
+            atoms,
+            builtins,
+            name,
+            length,
+            error_constructor::<H>,
+        );
+        builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
         builtins.set_error_prototype(heap, constructor, prototype);
         if name == "Error" {
             let capture = install_function(
                 heap,
+                atoms,
                 builtins,
                 "captureStackTrace",
                 1,
                 capture_stack_trace::<H>,
             );
-            define_static(heap, constructor, "captureStackTrace", capture);
-            let is_error = install_function(heap, builtins, "isError", 1, is_error::<H>);
-            define_static(heap, constructor, "isError", is_error);
+            define_static(heap, atoms, constructor, "captureStackTrace", capture);
+            let is_error = install_function(heap, atoms, builtins, "isError", 1, is_error::<H>);
+            define_static(heap, atoms, constructor, "isError", is_error);
         } else {
             let HeapEntry::NativeFunction { prototype, .. } = &mut heap[heap_index(constructor)]
             else {
@@ -88,43 +110,60 @@ pub(super) fn install<H: Host>(
     }
 }
 
-fn prototype_of(heap: &[HeapEntry], globals: &BTreeMap<EcmaString, Value>, name: &str) -> Value {
+fn prototype_of(
+    heap: &[HeapEntry],
+    atoms: &mut crate::AtomTable,
+    globals: &BTreeMap<EcmaString, Value>,
+    name: &str,
+) -> Value {
     let constructor = globals
         .get(&EcmaString::encode(name))
         .copied()
         .expect("baseline error constructor is installed first");
-    own_data(heap, constructor, "prototype")
+    own_data(heap, atoms, constructor, "prototype")
 }
 
-fn own_data(heap: &[HeapEntry], object: Value, name: &str) -> Value {
+fn own_data(heap: &[HeapEntry], atoms: &mut crate::AtomTable, object: Value, name: &str) -> Value {
     let properties = match &heap[heap_index(object)] {
         HeapEntry::Object { properties, .. } | HeapEntry::NativeFunction { properties, .. } => {
             properties
         }
         _ => panic!("error intrinsic property owner is an object"),
     };
-    match properties.get(&PropertyKey::Named(EcmaString::encode(name))) {
+    match properties.get(&PropertyKey::Named(atoms.intern(EcmaString::encode(name)))) {
         Some(Property::Data { value, .. }) => *value,
         _ => panic!("error intrinsic data property exists"),
     }
 }
 
-fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
+fn define_static(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    constructor: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)] else {
         panic!("error constructor is a native function")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern(EcmaString::encode(name))),
         super::builtin_property(value),
     );
 }
 
-fn define_hidden(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
+fn define_hidden(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    object: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
         panic!("Error.prototype is an ordinary object")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern(EcmaString::encode(name))),
         Property::Data {
             value,
             writable: false,
@@ -149,11 +188,8 @@ fn define_own<H: Host>(
     name: &str,
     value: Value,
 ) -> Result<(), EvalFailure> {
-    machine.define_descriptor(
-        object,
-        PropertyKey::Named(EcmaString::encode(name)),
-        data(value),
-    )
+    let key = PropertyKey::Named(machine.intern_str(name));
+    machine.define_descriptor(object, key, data(value))
 }
 
 fn has_error_brand<H: Host>(machine: &Machine<'_, H>, value: Value) -> Result<bool, EvalFailure> {
@@ -241,7 +277,7 @@ pub(super) fn error_constructor<H: Host>(
         if let Some(options) = args.get(options_index).copied()
             && machine.is_object(options)
         {
-            let key = PropertyKey::Named(EcmaString::encode("cause"));
+            let key = PropertyKey::Named(machine.intern_str("cause"));
             if machine.internal_has_property(options, &key)? {
                 let cause = machine.get_named_property(options, "cause")?;
                 define_own(machine, object, "cause", cause)?;
@@ -310,9 +346,10 @@ fn install_stack<H: Host>(
         ],
     )?;
     let setter = machine.get_named_property(error_prototype, STACK_SETTER)?;
+    let stack_key = PropertyKey::Named(machine.intern_str("stack"));
     machine.define_descriptor(
         object,
-        PropertyKey::Named(EcmaString::encode("stack")),
+        stack_key,
         Property::Accessor {
             getter: Some(getter),
             setter: Some(setter),
@@ -416,7 +453,7 @@ fn append_cause_chain<H: Host>(
     text: &mut EcmaStringBuilder,
     root: Value,
 ) -> Result<(), EvalFailure> {
-    let cause_key = PropertyKey::Named(EcmaString::encode("cause"));
+    let cause_key = PropertyKey::Named(machine.intern_str("cause"));
     let mut current = root;
     let mut seen = vec![root];
 
@@ -498,7 +535,7 @@ fn prototype_stack_set<H: Host>(
     if this == prototype_of_error(machine)? {
         return Err(type_error("Cannot set stack on Error.prototype"));
     }
-    let key = PropertyKey::Named(EcmaString::encode("stack"));
+    let key = PropertyKey::Named(machine.intern_str("stack"));
     if machine.internal_get_own_property(this, &key)?.is_some() {
         machine.set_data_property_key(this, key, value)?;
     } else {
@@ -634,8 +671,9 @@ mod tests {
     }
 
     fn descriptor(machine: &mut Machine<'_, TestHost>, object: Value, name: &str) -> Property {
+        let key = PropertyKey::Named(machine.intern_str(name));
         machine
-            .own_descriptor(object, &PropertyKey::Named(EcmaString::encode(name)))
+            .own_descriptor(object, &key)
             .unwrap()
             .expect("own descriptor")
     }
@@ -721,7 +759,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, id, name, 0)
     }
 
     #[test]
@@ -729,7 +767,7 @@ mod tests {
         machine!(machine);
         let error = machine.intrinsics.global("Error").unwrap();
         let prototype = machine.get_named_property(error, "prototype").unwrap();
-        let key = PropertyKey::Named(EcmaString::encode("stack"));
+        let key = PropertyKey::Named(machine.intern_str("stack"));
         let Some(Property::Accessor {
             setter: Some(setter),
             ..
@@ -769,10 +807,11 @@ mod tests {
     #[test]
     fn cause_distinguishes_absence_from_present_undefined() {
         machine!(machine);
+        let cause_key = PropertyKey::Named(machine.intern_str("cause"));
         let absent = call_error(&mut machine, "Error", &[]);
         assert!(
             machine
-                .own_descriptor(absent, &PropertyKey::Named(EcmaString::encode("cause")))
+                .own_descriptor(absent, &cause_key)
                 .unwrap()
                 .is_none()
         );
@@ -780,10 +819,7 @@ mod tests {
         let null_options = call_error(&mut machine, "Error", &[Value::UNDEFINED, Value::NULL]);
         assert!(
             machine
-                .own_descriptor(
-                    null_options,
-                    &PropertyKey::Named(EcmaString::encode("cause")),
-                )
+                .own_descriptor(null_options, &cause_key,)
                 .unwrap()
                 .is_none()
         );
@@ -869,7 +905,7 @@ mod tests {
         let iterable = ordinary_object(&mut machine);
         let iterator_throw = native(&mut machine, "iterator throw", iterator_throw);
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let iterator_key = machine.property_key_from_value(iterator_symbol).unwrap();
         machine
             .set_data_property_key(iterable, iterator_key, iterator_throw)
             .unwrap();
@@ -887,10 +923,11 @@ mod tests {
         machine!(machine);
         let source_and_options = ordinary_object(&mut machine);
         let cause_getter = native(&mut machine, "cause getter", cause_then_iterator);
+        let cause_key = PropertyKey::Named(machine.intern_str("cause"));
         machine
             .define_descriptor(
                 source_and_options,
-                PropertyKey::Named(EcmaString::encode("cause")),
+                cause_key,
                 Property::Accessor {
                     getter: Some(cause_getter),
                     setter: None,
@@ -901,7 +938,7 @@ mod tests {
             .unwrap();
         let iterator = native(&mut machine, "iterator", iterator_after_cause);
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let iterator_key = machine.property_key_from_value(iterator_symbol).unwrap();
         machine
             .set_data_property_key(source_and_options, iterator_key, iterator)
             .unwrap();
@@ -930,10 +967,11 @@ mod tests {
         machine!(machine);
         let source_and_options = ordinary_object(&mut machine);
         let cause_getter = native(&mut machine, "cause getter", cause_abrupt);
+        let cause_key = PropertyKey::Named(machine.intern_str("cause"));
         machine
             .define_descriptor(
                 source_and_options,
-                PropertyKey::Named(EcmaString::encode("cause")),
+                cause_key,
                 Property::Accessor {
                     getter: Some(cause_getter),
                     setter: None,
@@ -944,7 +982,7 @@ mod tests {
             .unwrap();
         let iterator = native(&mut machine, "iterator", iterator_after_cause);
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let iterator_key = machine.property_key_from_value(iterator_symbol).unwrap();
         machine
             .set_data_property_key(source_and_options, iterator_key, iterator)
             .unwrap();
@@ -1005,10 +1043,11 @@ mod tests {
         let name_getter = native(&mut machine, "name getter", chain_name);
         let message_getter = native(&mut machine, "message getter", chain_message);
         for (name, getter) in [("name", name_getter), ("message", message_getter)] {
+            let key = PropertyKey::Named(machine.intern_str(name));
             machine
                 .define_descriptor(
                     cause,
-                    PropertyKey::Named(EcmaString::encode(name)),
+                    key,
                     Property::Accessor {
                         getter: Some(getter),
                         setter: None,

@@ -16,6 +16,7 @@ use crate::{
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -47,8 +48,8 @@ pub(super) fn install<H: Host>(
         ("set", 3, set::<H>),
         ("setPrototypeOf", 2, set_prototype_of::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, reflect, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, reflect, name, function);
     }
     define_to_string_tag(heap, reflect, builtins.symbol_to_string_tag(), "Reflect");
     globals.insert(EcmaString::encode("Reflect"), reflect);
@@ -248,7 +249,10 @@ pub(crate) fn property_key_value<H: Host>(
     key: PropertyKey,
 ) -> Result<Value, EvalFailure> {
     match key {
-        PropertyKey::Named(name) => allocate_string(machine, name),
+        PropertyKey::Named(name) => {
+            let text = machine.atoms.resolve(name).clone();
+            allocate_string(machine, text)
+        }
         PropertyKey::Symbol(index) => Ok(Value::heap_ref(
             SlotId::from_parts(RUNTIME_HEAP_SEGMENT, index + 1)
                 .expect("symbol property key is a valid runtime slot"),
@@ -374,7 +378,7 @@ mod tests {
             length,
             handler,
         });
-        native_function(&mut machine.heap, id, name, length)
+        native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
     }
 
     fn return_this(
@@ -440,7 +444,7 @@ mod tests {
             ("set", 3),
             ("setPrototypeOf", 2),
         ] {
-            let key = PropertyKey::Named(EcmaString::encode(name));
+            let key = PropertyKey::Named(machine.intern_str(name));
             let Some(Property::Data {
                 value,
                 writable: true,
@@ -501,10 +505,11 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let throwing = callback(&mut machine, "late getter", 0, throw_late);
         let key = ordinary_object(&mut machine);
+        let to_string_key = PropertyKey::Named(machine.intern_str("toString"));
         machine
             .define_descriptor(
                 key,
-                PropertyKey::Named(EcmaString::encode("toString")),
+                to_string_key,
                 Property::Accessor {
                     getter: Some(throwing),
                     setter: None,
@@ -578,10 +583,11 @@ mod tests {
         let target = ordinary_object(&mut machine);
         let getter = callback(&mut machine, "receiver getter", 0, return_this);
         let setter = callback(&mut machine, "receiver setter", 1, write_receiver);
+        let value_key = PropertyKey::Named(machine.intern_str("value"));
         machine
             .define_descriptor(
                 target,
-                PropertyKey::Named(EcmaString::encode("value")),
+                value_key,
                 Property::Accessor {
                     getter: Some(getter),
                     setter: Some(setter),
@@ -624,7 +630,7 @@ mod tests {
         let prototype = ordinary_object(&mut machine);
         let mut properties = PropertyMap::default();
         properties.insert(
-            PropertyKey::Named(EcmaString::encode("prototype")),
+            PropertyKey::Named(machine.intern_str("prototype")),
             Property::Data {
                 value: prototype,
                 writable: true,
@@ -652,10 +658,11 @@ mod tests {
 
         let throwing_args = ordinary_object(&mut machine);
         let late = callback(&mut machine, "late length", 0, throw_late);
+        let length_key = PropertyKey::Named(machine.intern_str("length"));
         machine
             .define_descriptor(
                 throwing_args,
-                PropertyKey::Named(EcmaString::encode("length")),
+                length_key,
                 Property::Accessor {
                     getter: Some(late),
                     setter: None,
@@ -807,10 +814,11 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let target = ordinary_object(&mut machine);
         let throwing = callback(&mut machine, "abrupt getter", 0, throw_late);
+        let boom_key = PropertyKey::Named(machine.intern_str("boom"));
         machine
             .define_descriptor(
                 target,
-                PropertyKey::Named(EcmaString::encode("boom")),
+                boom_key,
                 Property::Accessor {
                     getter: Some(throwing),
                     setter: None,
@@ -828,10 +836,11 @@ mod tests {
         ));
 
         let key = ordinary_object(&mut machine);
+        let to_string_key = PropertyKey::Named(machine.intern_str("toString"));
         machine
             .define_descriptor(
                 key,
-                PropertyKey::Named(EcmaString::encode("toString")),
+                to_string_key,
                 Property::Accessor {
                     getter: Some(throwing),
                     setter: None,
@@ -848,10 +857,11 @@ mod tests {
         ));
 
         let descriptor = ordinary_object(&mut machine);
+        let enumerable_key = PropertyKey::Named(machine.intern_str("enumerable"));
         machine
             .define_descriptor(
                 descriptor,
-                PropertyKey::Named(EcmaString::encode("enumerable")),
+                enumerable_key,
                 Property::Accessor {
                     getter: Some(throwing),
                     setter: None,
@@ -905,10 +915,11 @@ mod tests {
         machine
             .set_data_property(list, "length", Value::int32(length as u32))
             .unwrap();
+        let position_key = PropertyKey::Named(machine.intern_str(position));
         machine
             .define_descriptor(
                 list,
-                PropertyKey::Named(EcmaString::encode(position)),
+                position_key,
                 Property::Accessor {
                     getter: Some(getter),
                     setter: None,

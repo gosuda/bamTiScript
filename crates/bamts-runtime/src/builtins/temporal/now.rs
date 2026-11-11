@@ -23,6 +23,7 @@ use crate::{EvalFailure, HeapEntry, Host, Machine};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     namespace: Value,
 ) {
@@ -36,12 +37,12 @@ pub(super) fn install<H: Host>(
         ("plainTimeISO", 0, plain_time_iso::<H>),
     ];
     for (name, length, handler) in methods {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, now, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, now, name, function);
     }
     let tag_symbol = builtins.symbol_to_string_tag();
     super::super::define_to_string_tag(heap, now, tag_symbol, "Temporal.Now");
-    define_data(heap, namespace, "Now", now);
+    define_data(heap, atoms, namespace, "Now", now);
 }
 
 /// One reading of the host clock. The host has millisecond resolution.

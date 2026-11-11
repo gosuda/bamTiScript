@@ -75,6 +75,7 @@ fn syntax_error<H: Host>(machine: &mut Machine<'_, H>, message: String) -> EvalF
 /// global only after the object is complete.
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -97,8 +98,8 @@ pub(super) fn install<H: Host>(
         ("rawJSON", 1, raw_json::<H>),
         ("isRawJSON", 1, is_raw_json::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, json, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, json, name, function);
     }
     let brand_index = heap.len() as u32;
     let brand = super::push(
@@ -171,7 +172,7 @@ fn has_raw_json_brand<H: Host>(machine: &Machine<'_, H>, value: Value) -> bool {
         writable: false,
         configurable: false,
         ..
-    }) = properties.get_ascii("rawJSON")
+    }) = properties.get_ascii(&machine.atoms, "rawJSON")
     else {
         return false;
     };
@@ -189,7 +190,7 @@ fn raw_json_text<H: Host>(machine: &Machine<'_, H>, value: Value) -> Option<Ecma
     };
     let Some(Property::Data {
         value: text_value, ..
-    }) = properties.get_ascii("rawJSON")
+    }) = properties.get_ascii(&machine.atoms, "rawJSON")
     else {
         return None;
     };
@@ -259,7 +260,7 @@ fn raw_json<H: Host>(
     let text_value = allocate_string(machine, text)?;
     let mut properties = PropertyMap::default();
     properties.insert(
-        PropertyKey::Named(EcmaString::encode("rawJSON")),
+        PropertyKey::Named(machine.intern_str("rawJSON")),
         Property::Data {
             value: text_value,
             writable: false,
@@ -328,12 +329,8 @@ fn parse<H: Host>(
         })
         .map_err(EvalFailure::Runtime)?;
     let root_key = EcmaString::default();
-    create_data_property(
-        machine,
-        wrapper,
-        PropertyKey::Named(root_key.clone()),
-        root_value,
-    )?;
+    let root_atom = PropertyKey::Named(machine.intern(root_key.clone()));
+    create_data_property(machine, wrapper, root_atom, root_value)?;
     let result = walk_reviver(
         machine,
         wrapper,
@@ -457,13 +454,9 @@ impl OpenContainer {
                 key,
             } => {
                 let key = std::mem::take(key);
-                create_data_property(
-                    machine,
-                    *value,
-                    PropertyKey::Named(key.clone()),
-                    child.value(),
-                )
-                .map_err(ParseFailure::Runtime)?;
+                let atom = PropertyKey::Named(machine.intern(key.clone()));
+                create_data_property(machine, *value, atom, child.value())
+                    .map_err(ParseFailure::Runtime)?;
                 // Mirror the property map: a duplicate key overwrites in place,
                 // keeping its first-insertion position in enumeration order.
                 match children.iter().position(|(name, _)| *name == key) {
@@ -506,7 +499,7 @@ fn walk_reviver<H: Host>(
     source: &[u16],
     depth: usize,
 ) -> Result<Value, EvalFailure> {
-    let property_key = PropertyKey::Named(key.clone());
+    let property_key = PropertyKey::Named(machine.intern(key.clone()));
     let live = machine.get_property_key(holder, &property_key)?;
     let matched = node.is_some_and(|node| node.value() == live);
     let matched_node = if matched { node } else { None };
@@ -534,7 +527,7 @@ fn walk_reviver<H: Host>(
                 source,
                 depth + 1,
             )?;
-            let key = PropertyKey::Named(name);
+            let key = PropertyKey::Named(machine.intern(name));
             if child == Value::UNDEFINED {
                 machine.internal_delete(live, &key)?;
             } else {
@@ -566,7 +559,7 @@ fn walk_reviver<H: Host>(
                 source,
                 depth + 1,
             )?;
-            let key = PropertyKey::Named(name);
+            let key = PropertyKey::Named(machine.intern(name));
             if child == Value::UNDEFINED {
                 machine.internal_delete(live, &key)?;
             } else {
@@ -585,12 +578,8 @@ fn walk_reviver<H: Host>(
     if let Some(span) = matched_node.and_then(JsonNode::primitive_source) {
         let text = EcmaString::from_units(&source[span.0..span.1]);
         let text = allocate_string(machine, text)?;
-        create_data_property(
-            machine,
-            context,
-            PropertyKey::Named(EcmaString::encode("source")),
-            text,
-        )?;
+        let source_key = PropertyKey::Named(machine.intern_str("source"));
+        create_data_property(machine, context, source_key, text)?;
     }
     let name = allocate_string(machine, key)?;
     machine.call_value(reviver, holder, &[name, live, context])
@@ -656,10 +645,8 @@ fn stringify<H: Host>(
             let mut seen: BTreeSet<EcmaString> = BTreeSet::new();
             let mut list = Vec::new();
             for index in 0..length {
-                let item = machine.get_property_key(
-                    replacer,
-                    &PropertyKey::Named(EcmaString::encode(&index.to_string())),
-                )?;
+                let key = PropertyKey::Named(machine.intern_str(&index.to_string()));
+                let item = machine.get_property_key(replacer, &key)?;
                 let primitive = machine.unbox_primitive_or_self(item)?;
                 let is_wrapper = machine.is_object(item) && primitive != item;
                 let text = match primitive.decode() {
@@ -727,12 +714,8 @@ fn stringify<H: Host>(
         })
         .map_err(EvalFailure::Runtime)?;
     let root_key = EcmaString::default();
-    create_data_property(
-        machine,
-        wrapper,
-        PropertyKey::Named(root_key.clone()),
-        value,
-    )?;
+    let root_atom = PropertyKey::Named(machine.intern(root_key.clone()));
+    create_data_property(machine, wrapper, root_atom, value)?;
     let mut serializer = Serializer {
         replacer: replacer_function,
         property_list: property_list.as_deref(),
@@ -780,7 +763,8 @@ impl Serializer<'_> {
         if json_nesting_overflows(machine, depth) {
             return Err(json_depth_error());
         }
-        let mut value = machine.get_property_key(holder, &PropertyKey::Named(key.clone()))?;
+        let property_key = PropertyKey::Named(machine.intern(key.clone()));
+        let mut value = machine.get_property_key(holder, &property_key)?;
         if machine.is_object(value) || super::bigint::is_bigint(machine, value)? {
             let to_json = machine.get_named_property(value, "toJSON")?;
             if machine.is_callable(to_json)? {
@@ -1343,6 +1327,7 @@ mod tests {
             let mut $machine = Machine::new(&$program, &mut $host, Limits::default());
             install(
                 &mut $machine.heap,
+                &mut $machine.atoms,
                 &mut $machine.intrinsics.globals,
                 &mut $machine.intrinsics.builtins,
             );
@@ -1374,7 +1359,7 @@ mod tests {
             length,
             handler,
         });
-        native_function(&mut machine.heap, id, name, length)
+        native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
     }
 
     fn json_parse(
@@ -1396,13 +1381,9 @@ mod tests {
     }
 
     fn define_own(machine: &mut Machine<'_, TestHost>, object: Value, name: &str, value: Value) {
-        create_data_property(
-            machine,
-            object,
-            PropertyKey::Named(EcmaString::encode(name)),
-            value,
-        )
-        .expect("own data property definition succeeds");
+        let key = PropertyKey::Named(machine.intern_str(name));
+        create_data_property(machine, object, key, value)
+            .expect("own data property definition succeeds");
     }
 
     fn install_prototype_setter(
@@ -1412,6 +1393,7 @@ mod tests {
         setter: Value,
     ) {
         let index = super::super::heap_index(prototype);
+        let key = PropertyKey::Named(machine.intern_str(name));
         let properties = match &mut machine.heap[index] {
             HeapEntry::Object { properties, .. } | HeapEntry::Array { properties, .. } => {
                 properties
@@ -1419,7 +1401,7 @@ mod tests {
             _ => panic!("prototype must be an ordinary object"),
         };
         properties.insert(
-            PropertyKey::Named(EcmaString::encode(name)),
+            key,
             Property::Accessor {
                 getter: None,
                 setter: Some(setter),
@@ -1506,12 +1488,13 @@ mod tests {
             .expect("reviver key is a string")
             .to_utf8_lossy();
         if key == "a" {
+            let b_key = PropertyKey::Named(machine.intern_str("b"));
             let index = super::super::heap_index(holder);
             let HeapEntry::Object { properties, .. } = &mut machine.heap[index] else {
                 panic!("object member holder must be an object");
             };
             properties.insert(
-                PropertyKey::Named(EcmaString::encode("b")),
+                b_key,
                 Property::Data {
                     value: Value::int32(7),
                     writable: false,
@@ -1568,7 +1551,7 @@ mod tests {
                 enumerable: false,
                 configurable: true,
                 ..
-            }) = properties.get_ascii(name)
+            }) = properties.get_ascii(&machine.atoms, name)
             else {
                 panic!("{name} must keep builtin data-property attributes");
             };
@@ -1630,7 +1613,7 @@ mod tests {
         );
         let value = json_parse(&mut machine, &[source, reviver])
             .expect("reviver redefines the configurable property");
-        let key = PropertyKey::Named(EcmaString::encode("b"));
+        let key = PropertyKey::Named(machine.intern_str("b"));
         let Some(Property::Data {
             value: replacement,
             writable,
@@ -1932,12 +1915,13 @@ mod tests {
         );
         // A structurally similar forgery without the private brand is rejected.
         let text_property = text(&mut machine, "1");
+        let raw_json_key = PropertyKey::Named(machine.intern_str("rawJSON"));
         let forgery = machine
             .allocate(HeapEntry::Object {
                 properties: {
                     let mut properties = PropertyMap::default();
                     properties.insert(
-                        PropertyKey::Named(EcmaString::encode("rawJSON")),
+                        raw_json_key,
                         Property::Data {
                             value: text_property,
                             writable: false,
@@ -2000,7 +1984,7 @@ mod tests {
             enumerable: true,
             configurable: false,
             ..
-        }) = properties.get_ascii("rawJSON")
+        }) = properties.get_ascii(&machine.atoms, "rawJSON")
         else {
             panic!("rawJSON property must be frozen but enumerable");
         };
@@ -2450,6 +2434,7 @@ mod tests {
                 let mut machine = Machine::new(&program, &mut host, limits);
                 install(
                     &mut machine.heap,
+                    &mut machine.atoms,
                     &mut machine.intrinsics.globals,
                     &mut machine.intrinsics.builtins,
                 );

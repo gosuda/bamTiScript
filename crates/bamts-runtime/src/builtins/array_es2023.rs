@@ -7,7 +7,6 @@
 use std::cmp::Ordering;
 use std::mem::size_of;
 
-use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
 use super::array_generic::tick;
@@ -23,6 +22,7 @@ const MAX_ARRAY_LENGTH: usize = u32::MAX as usize;
 /// `Array.fromAsync` plus its hidden continuation targets on `%Array%`.
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     array_prototype: Value,
     array_constructor: Value,
@@ -36,11 +36,11 @@ pub(super) fn install<H: Host>(
         ("toSpliced", 2, to_spliced::<H>),
         ("with", 2, with::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, array_prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, array_prototype, name, function);
     }
-    let from_async = install_function(heap, builtins, "fromAsync", 3, from_async::<H>);
-    define_static(heap, array_constructor, "fromAsync", from_async);
+    let from_async = install_function(heap, atoms, builtins, "fromAsync", 3, from_async::<H>);
+    define_static(heap, atoms, array_constructor, "fromAsync", from_async);
     let mut targets = Vec::new();
     for (name, handler) in [
         (
@@ -54,7 +54,7 @@ pub(super) fn install<H: Host>(
         ("Array.fromAsync close settled", close_settled::<H>),
         ("Array.fromAsync array-like mapped", arraylike_mapped::<H>),
     ] {
-        targets.push(install_function(heap, builtins, name, 1, handler));
+        targets.push(install_function(heap, atoms, builtins, name, 1, handler));
     }
     let target_table = crate::intrinsics::push(
         heap,
@@ -66,7 +66,7 @@ pub(super) fn install<H: Host>(
             length_writable: true,
         },
     );
-    define_data(heap, array_prototype, TARGETS_PROPERTY, target_table);
+    define_data(heap, atoms, array_prototype, TARGETS_PROPERTY, target_table);
 }
 
 fn argument(args: &[Value], index: usize) -> Value {
@@ -111,8 +111,8 @@ pub(super) fn length_of_array_like<H: Host>(
     Ok(length.trunc().min(MAX_SAFE_INTEGER) as usize)
 }
 
-pub(super) fn index_key(index: usize) -> PropertyKey {
-    PropertyKey::Named(EcmaString::encode(&index.to_string()))
+pub(super) fn index_key(atoms: &mut crate::AtomTable, index: usize) -> PropertyKey {
+    PropertyKey::Named(atoms.intern_str(&index.to_string()))
 }
 
 /// `ArrayCreate(length)` with a preflight before Rust allocates the backing
@@ -155,7 +155,7 @@ pub(super) fn create_data_property<H: Host>(
     index: usize,
     value: Value,
 ) -> Result<(), EvalFailure> {
-    let key = index_key(index);
+    let key = index_key(&mut machine.atoms, index);
     let Some(slot) = machine.runtime_slot(array).map_err(EvalFailure::Runtime)? else {
         return machine.create_data_property_key(array, key, value);
     };
@@ -221,8 +221,9 @@ fn at<H: Host>(
     if index < 0.0 || index >= length as f64 {
         return Ok(BuiltinOutcome::Value(Value::UNDEFINED));
     }
+    let key = index_key(&mut machine.atoms, index as usize);
     Ok(BuiltinOutcome::Value(
-        machine.get_property_key(object, &index_key(index as usize))?,
+        machine.get_property_key(object, &key)?,
     ))
 }
 
@@ -238,7 +239,8 @@ fn find_via_predicate<H: Host>(
     }
     for index in (0..length).rev() {
         tick(machine)?;
-        let value = machine.get_property_key(object, &index_key(index))?;
+        let key = index_key(&mut machine.atoms, index);
+        let value = machine.get_property_key(object, &key)?;
         if machine.call_truthy(
             predicate,
             this_arg,
@@ -301,7 +303,8 @@ fn to_reversed<H: Host>(
     let result = array_create(machine, length)?;
     for index in 0..length {
         tick(machine)?;
-        let value = machine.get_property_key(object, &index_key(length - index - 1))?;
+        let key = index_key(&mut machine.atoms, length - index - 1);
+        let value = machine.get_property_key(object, &key)?;
         create_data_property(machine, result, index, value)?;
     }
     Ok(BuiltinOutcome::Value(result))
@@ -390,7 +393,8 @@ fn to_sorted<H: Host>(
     })?;
     for index in 0..length {
         tick(machine)?;
-        values.push(machine.get_property_key(object, &index_key(index))?);
+        let key = index_key(&mut machine.atoms, index);
+        values.push(machine.get_property_key(object, &key)?);
     }
     stable_sort(machine, &mut values, comparator)?;
     for (index, value) in values.into_iter().enumerate() {
@@ -433,7 +437,8 @@ fn to_spliced<H: Host>(
     let mut destination = 0;
     while destination < actual_start {
         tick(machine)?;
-        let value = machine.get_property_key(object, &index_key(destination))?;
+        let key = index_key(&mut machine.atoms, destination);
+        let value = machine.get_property_key(object, &key)?;
         create_data_property(machine, result, destination, value)?;
         destination += 1;
     }
@@ -444,7 +449,8 @@ fn to_spliced<H: Host>(
     let mut source = actual_start + skip_count;
     while destination < new_length {
         tick(machine)?;
-        let value = machine.get_property_key(object, &index_key(source))?;
+        let key = index_key(&mut machine.atoms, source);
+        let value = machine.get_property_key(object, &key)?;
         create_data_property(machine, result, destination, value)?;
         destination += 1;
         source += 1;
@@ -473,7 +479,8 @@ fn with<H: Host>(
         let value = if index == actual {
             replacement
         } else {
-            machine.get_property_key(object, &index_key(index))?
+            let key = index_key(&mut machine.atoms, index);
+            machine.get_property_key(object, &key)?
         };
         create_data_property(machine, result, index, value)?;
     }
@@ -513,13 +520,19 @@ const FIELD_CAP: &str = "\0cap";
 /// Mirrors `array.rs`'s static-property writer: a static on the Array
 /// constructor lives in a `NativeFunction` entry, which `define_data` does
 /// not accept.
-fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
+fn define_static(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    constructor: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[super::heap_index(constructor)]
     else {
         panic!("Array fromAsync attaches to a native-function constructor")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern_str(name)),
         super::builtin_property(value),
     );
 }
@@ -885,7 +898,7 @@ fn arraylike_driver<H: Host>(
         return resolve_cap(machine, record, array);
     }
     let source = record_get(machine, record, FIELD_SOURCE)?;
-    let key = index_key(k as usize);
+    let key = index_key(&mut machine.atoms, k as usize);
     match machine.get_property_key(source, &key) {
         Err(EvalFailure::Runtime(kind)) => Err(EvalFailure::Runtime(kind)),
         Err(failure) => reject_cap_failure(machine, record, failure),
@@ -958,12 +971,14 @@ fn from_async_run<H: Host>(
         return Err(type_error("Array.fromAsync mapper is not callable"));
     }
     let this_arg = argument(args, 2);
-    let async_key = machine.to_property_key(machine.intrinsics.builtins.symbol_async_iterator())?;
+    let async_key =
+        machine.property_key_from_value(machine.intrinsics.builtins.symbol_async_iterator())?;
     let mut iterator_handle = None;
     if let Some(method) = get_method(machine, items, &async_key)? {
         iterator_handle = Some(get_iterator_from_method(machine, items, method, false)?);
     } else {
-        let sync_key = machine.to_property_key(machine.intrinsics.builtins.symbol_iterator())?;
+        let sync_key =
+            machine.property_key_from_value(machine.intrinsics.builtins.symbol_iterator())?;
         if let Some(method) = get_method(machine, items, &sync_key)? {
             iterator_handle = Some(get_iterator_from_method(machine, items, method, true)?);
         }
@@ -1030,7 +1045,7 @@ mod tests {
     use crate::intrinsics::builtins::test_support::{TestHost, blank_program, ordinary_object};
     use crate::intrinsics::{BuiltinDef, native_function};
     use crate::{Limits, Property, PropertyMap, ThrowOrigin};
-
+    use bamts_bytecode::EcmaString;
     fn with_machine(test: impl FnOnce(&mut Machine<'_, TestHost>)) {
         let program = blank_program("array es2023");
         let mut host = TestHost;
@@ -1063,7 +1078,7 @@ mod tests {
             length,
             handler,
         });
-        native_function(&mut machine.heap, id, name, length)
+        native_function(&mut machine.heap, &mut machine.atoms, id, name, length)
     }
 
     fn is_seven<H: Host>(
@@ -1170,12 +1185,8 @@ mod tests {
                 vec![Value::UNDEFINED, Value::int32(7), Value::UNDEFINED]
             );
             for index in 0..3 {
-                assert!(
-                    machine
-                        .own_descriptor(reversed, &index_key(index))
-                        .unwrap()
-                        .is_some()
-                );
+                let key = index_key(&mut machine.atoms, index);
+                assert!(machine.own_descriptor(reversed, &key).unwrap().is_some());
             }
         });
     }
@@ -1282,10 +1293,11 @@ mod tests {
                     .unwrap();
             }
             let length_getter = native(machine, "length getter", 0, record_length::<TestHost>);
+            let length_key = PropertyKey::Named(machine.intern_str("length"));
             machine
                 .define_descriptor(
                     receiver,
-                    PropertyKey::Named(EcmaString::encode("length")),
+                    length_key,
                     Property::Accessor {
                         getter: Some(length_getter),
                         setter: None,
@@ -1334,10 +1346,11 @@ mod tests {
                 .set_data_property(source, "1", Value::int32(2))
                 .unwrap();
             let getter = native(machine, "throwing getter", 0, throwing::<TestHost>);
+            let zero = index_key(&mut machine.atoms, 0);
             machine
                 .define_descriptor(
                     source,
-                    index_key(0),
+                    zero,
                     Property::Accessor {
                         getter: Some(getter),
                         setter: None,
@@ -1404,10 +1417,11 @@ mod tests {
                 0,
                 throwing::<TestHost>,
             );
+            let constructor_key = PropertyKey::Named(machine.intern_str("constructor"));
             machine
                 .define_descriptor(
                     source,
-                    PropertyKey::Named(EcmaString::encode("constructor")),
+                    constructor_key,
                     Property::Accessor {
                         getter: Some(trap),
                         setter: None,
@@ -1447,8 +1461,9 @@ mod tests {
                     Some(machine.intrinsics.array_prototype)
                 );
                 for index in 0..3 {
+                    let key = index_key(&mut machine.atoms, index);
                     assert!(matches!(
-                        machine.own_descriptor(copy, &index_key(index)).unwrap(),
+                        machine.own_descriptor(copy, &key).unwrap(),
                         Some(Property::Data {
                             writable: true,
                             enumerable: true,
@@ -1466,10 +1481,11 @@ mod tests {
     fn copying_methods_bypass_inherited_result_setters() {
         with_machine(|machine| {
             let trap = native(machine, "unexpected setter", 1, throwing::<TestHost>);
+            let zero = index_key(&mut machine.atoms, 0);
             machine
                 .define_descriptor(
                     machine.intrinsics.array_prototype,
-                    index_key(0),
+                    zero,
                     Property::Accessor {
                         getter: None,
                         setter: Some(trap),
@@ -1493,8 +1509,9 @@ mod tests {
                 value(with(machine, source, &[Value::int32(0), Value::int32(4)], false).unwrap()),
             ] {
                 assert_eq!(array(machine, copy), vec![Value::int32(4)]);
+                let zero = index_key(&mut machine.atoms, 0);
                 assert!(matches!(
-                    machine.own_descriptor(copy, &index_key(0)).unwrap(),
+                    machine.own_descriptor(copy, &zero).unwrap(),
                     Some(Property::Data { value, .. }) if value == Value::int32(4)
                 ));
             }
@@ -1594,10 +1611,11 @@ mod tests {
             machine
                 .set_data_property(source, "length", Value::int32(2))
                 .unwrap();
+            let zero = index_key(&mut machine.atoms, 0);
             machine
                 .define_descriptor(
                     source,
-                    index_key(0),
+                    zero,
                     Property::Accessor {
                         getter: Some(trap),
                         setter: None,
@@ -1651,10 +1669,11 @@ mod tests {
                 .set_data_property(source, "_len", Value::int32(0))
                 .unwrap();
             let length_getter = native(machine, "length getter", 0, record_length::<TestHost>);
+            let length_key = PropertyKey::Named(machine.intern_str("length"));
             machine
                 .define_descriptor(
                     source,
-                    PropertyKey::Named(EcmaString::encode("length")),
+                    length_key,
                     Property::Accessor {
                         getter: Some(length_getter),
                         setter: None,
@@ -1679,6 +1698,7 @@ mod tests {
             let constructor = machine.intrinsics.global("Array").unwrap();
             install(
                 &mut machine.heap,
+                &mut machine.atoms,
                 &mut machine.intrinsics.builtins,
                 prototype,
                 constructor,
@@ -1686,8 +1706,9 @@ mod tests {
             let from_async = machine
                 .get_named_property(constructor, "fromAsync")
                 .unwrap();
+            let from_async_key = PropertyKey::Named(machine.intern_str("fromAsync"));
             assert!(matches!(
-                machine.own_descriptor(constructor, &PropertyKey::Named(EcmaString::encode("fromAsync"))).unwrap(),
+                machine.own_descriptor(constructor, &from_async_key).unwrap(),
                 Some(Property::Data { value, writable: true, enumerable: false, configurable: true }) if value == from_async
             ));
             assert_eq!(
@@ -1704,8 +1725,9 @@ mod tests {
                 ("with", 2),
             ] {
                 let method = machine.get_named_property(prototype, name).unwrap();
+                let key = PropertyKey::Named(machine.intern_str(name));
                 assert!(matches!(
-                    machine.own_descriptor(prototype, &PropertyKey::Named(EcmaString::encode(name))).unwrap(),
+                    machine.own_descriptor(prototype, &key).unwrap(),
                     Some(Property::Data { value, writable: true, enumerable: false, configurable: true }) if value == method
                 ));
                 assert_eq!(
@@ -1740,6 +1762,7 @@ mod tests {
         let constructor = machine.intrinsics.global("Array").unwrap();
         install(
             &mut machine.heap,
+            &mut machine.atoms,
             &mut machine.intrinsics.builtins,
             prototype,
             constructor,
@@ -1790,7 +1813,7 @@ mod tests {
         machine.set_data_property(iterable, "next", next).unwrap();
         let iterator = machine.intrinsics.builtins.symbol_async_iterator();
         let self_target = native(machine, "iterator self", 0, iterator_self::<TestHost>);
-        let key = machine.to_property_key(iterator).unwrap();
+        let key = machine.property_key_from_value(iterator).unwrap();
         machine
             .set_data_property_key(iterable, key, self_target)
             .unwrap();
@@ -1845,7 +1868,7 @@ mod tests {
         machine.set_data_property(iterable, "next", next).unwrap();
         let self_target = native(machine, "sync iterator self", 0, iterator_self::<TestHost>);
         let key = machine
-            .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+            .property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
             .unwrap();
         machine
             .set_data_property_key(iterable, key, self_target)

@@ -16,13 +16,15 @@ use crate::{
 /// requirements cannot be expressed by the baseline eager constructors.
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let map = replace_constructor(heap, globals, builtins, "Map", map_constructor::<H>);
-    let set = replace_constructor(heap, globals, builtins, "Set", set_constructor::<H>);
+    let map = replace_constructor(heap, atoms, globals, builtins, "Map", map_constructor::<H>);
+    let set = replace_constructor(heap, atoms, globals, builtins, "Set", set_constructor::<H>);
     let weak_map = replace_constructor(
         heap,
+        atoms,
         globals,
         builtins,
         "WeakMap",
@@ -30,6 +32,7 @@ pub(super) fn install<H: Host>(
     );
     let weak_set = replace_constructor(
         heap,
+        atoms,
         globals,
         builtins,
         "WeakSet",
@@ -39,6 +42,7 @@ pub(super) fn install<H: Host>(
     for constructor in [map.constructor, set.constructor] {
         let species = install_function(
             heap,
+            atoms,
             builtins,
             "get [Symbol.species]",
             0,
@@ -57,10 +61,10 @@ pub(super) fn install<H: Host>(
         );
     }
 
-    let group_by = install_function(heap, builtins, "groupBy", 2, map_group_by::<H>);
-    define_constructor_data(heap, map.constructor, "groupBy", group_by);
-    let map_set = install_function(heap, builtins, "set", 2, strong_map_set::<H>);
-    define_data(heap, map.prototype, "set", map_set);
+    let group_by = install_function(heap, atoms, builtins, "groupBy", 2, map_group_by::<H>);
+    define_constructor_data(heap, atoms, map.constructor, "groupBy", group_by);
+    let map_set = install_function(heap, atoms, builtins, "set", 2, strong_map_set::<H>);
+    define_data(heap, atoms, map.prototype, "set", map_set);
     for (target, name, handler) in [
         (
             map.prototype,
@@ -83,16 +87,16 @@ pub(super) fn install<H: Host>(
             weak_map_get_or_insert_computed::<H>,
         ),
     ] {
-        let function = install_function(heap, builtins, name, 2, handler);
-        define_data(heap, target, name, function);
+        let function = install_function(heap, atoms, builtins, name, 2, handler);
+        define_data(heap, atoms, target, name, function);
     }
-    let set_add = install_function(heap, builtins, "add", 1, strong_set_add::<H>);
-    define_data(heap, set.prototype, "add", set_add);
+    let set_add = install_function(heap, atoms, builtins, "add", 1, strong_set_add::<H>);
+    define_data(heap, atoms, set.prototype, "add", set_add);
 
     // Set.prototype.keys and Set.prototype.values are the same function object.
-    let set_prototype = prototype_of(heap, "Set", globals);
-    let values = own_data_property(heap, set_prototype, "values");
-    define_data(heap, set_prototype, "keys", values);
+    let set_prototype = prototype_of(heap, atoms, "Set", globals);
+    let values = own_data_property(heap, atoms, set_prototype, "values");
+    define_data(heap, atoms, set_prototype, "keys", values);
 
     define_collection_tag(
         heap,
@@ -116,48 +120,64 @@ struct InstalledConstructor {
 
 fn replace_constructor<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
     name: &'static str,
     handler: BuiltinHandler<H>,
 ) -> InstalledConstructor {
-    let prototype = prototype_of(heap, name, globals);
-    let constructor = install_constructor_function(heap, builtins, name, 0, handler);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let prototype = prototype_of(heap, atoms, name, globals);
+    let constructor = install_constructor_function(heap, atoms, builtins, name, 0, handler);
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     globals.insert(EcmaString::encode(name), constructor);
     InstalledConstructor {
         constructor,
         prototype,
     }
 }
-
-fn prototype_of(heap: &[HeapEntry], name: &str, globals: &BTreeMap<EcmaString, Value>) -> Value {
+fn prototype_of(
+    heap: &[HeapEntry],
+    atoms: &mut crate::AtomTable,
+    name: &str,
+    globals: &BTreeMap<EcmaString, Value>,
+) -> Value {
     let constructor = globals
         .get(&EcmaString::encode(name))
         .copied()
         .expect("baseline collection constructor is installed first");
-    own_data_property(heap, constructor, "prototype")
+    own_data_property(heap, atoms, constructor, "prototype")
 }
 
-fn own_data_property(heap: &[HeapEntry], object: Value, name: &str) -> Value {
+fn own_data_property(
+    heap: &[HeapEntry],
+    atoms: &mut crate::AtomTable,
+    object: Value,
+    name: &str,
+) -> Value {
     let properties = match &heap[heap_index(object)] {
         HeapEntry::Object { properties, .. }
         | HeapEntry::Array { properties, .. }
         | HeapEntry::NativeFunction { properties, .. } => properties,
         _ => panic!("collection intrinsic property owner must be an object"),
     };
-    match properties.get(&PropertyKey::Named(EcmaString::encode(name))) {
+    match properties.get(&PropertyKey::Named(atoms.intern(EcmaString::encode(name)))) {
         Some(Property::Data { value, .. }) => *value,
         _ => panic!("collection intrinsic data property must exist"),
     }
 }
 
-fn define_constructor_data(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
+fn define_constructor_data(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    constructor: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)] else {
         panic!("collection constructor must be a native function")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern(EcmaString::encode(name))),
         Property::Data {
             value,
             writable: true,
@@ -544,7 +564,7 @@ fn get_sync_iterator<H: Host>(
     machine: &mut Machine<'_, H>,
     iterable: Value,
 ) -> Result<Value, EvalFailure> {
-    let key = machine.to_property_key(machine.intrinsics.builtins.symbol_iterator())?;
+    let key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_iterator())?;
     let method = machine.get_property_key(iterable, &key)?;
     if !machine.is_callable(method)? {
         return Err(type_error("value is not iterable"));
@@ -719,7 +739,7 @@ mod tests {
             length: 1,
             handler,
         });
-        crate::intrinsics::native_function(&mut machine.heap, id, name, 1)
+        crate::intrinsics::native_function(&mut machine.heap, &mut machine.atoms, id, name, 1)
     }
 
     fn new_collection(machine: &mut Machine<'_, TestHost>, name: &str) -> Value {
@@ -868,12 +888,13 @@ mod tests {
                 .get_named_property(map, "groupBy")
                 .expect("Map.groupBy is readable");
             assert!(machine.is_callable(group_by).unwrap());
+            let length_key = PropertyKey::Named(machine.intern_str("length"));
             let slot = machine.runtime_slot(group_by).unwrap().unwrap();
             let HeapEntry::NativeFunction { properties, .. } = &machine.heap[slot] else {
                 panic!("Map.groupBy is a native function")
             };
             assert!(matches!(
-                properties.get(&PropertyKey::Named(EcmaString::encode("length"))),
+                properties.get(&length_key),
                 Some(Property::Data {
                     value,
                     writable: false,
@@ -984,11 +1005,27 @@ mod tests {
             length: 0,
             handler: iterator::<TestHost>,
         });
-        let next = crate::intrinsics::native_function(&mut machine.heap, next_id, "edge next", 0);
-        let close =
-            crate::intrinsics::native_function(&mut machine.heap, close_id, "edge return", 0);
-        let iterator_fn =
-            crate::intrinsics::native_function(&mut machine.heap, iterator_id, "edge iterator", 0);
+        let next = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            next_id,
+            "edge next",
+            0,
+        );
+        let close = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            close_id,
+            "edge return",
+            0,
+        );
+        let iterator_fn = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            iterator_id,
+            "edge iterator",
+            0,
+        );
         let source = ordinary_object(machine);
         machine
             .set_data_property(source, "used", Value::FALSE)
@@ -1002,7 +1039,7 @@ mod tests {
         machine.set_data_property(source, "next", next).unwrap();
         machine.set_data_property(source, "return", close).unwrap();
         let key = machine
-            .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+            .property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
             .unwrap();
         machine
             .set_data_property_key(source, key, iterator_fn)
@@ -1042,7 +1079,13 @@ mod tests {
                 length: 2,
                 handler: reject::<TestHost>,
             });
-            let reject = crate::intrinsics::native_function(&mut machine.heap, id, "reject set", 2);
+            let reject = crate::intrinsics::native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                id,
+                "reject set",
+                2,
+            );
             let constructor = machine.intrinsics.global("Map").unwrap();
             let prototype = machine
                 .get_named_property(constructor, "prototype")
@@ -1102,8 +1145,13 @@ mod tests {
                 length: 3,
                 handler: mutate::<TestHost>,
             });
-            let callback =
-                crate::intrinsics::native_function(&mut machine.heap, id, "mutate map", 3);
+            let callback = crate::intrinsics::native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                id,
+                "mutate map",
+                3,
+            );
             call_method(machine, "Map", "forEach", map, &[callback]).unwrap();
             assert_eq!(
                 machine.get_named_property(map, "visits").unwrap(),
@@ -1226,7 +1274,13 @@ mod tests {
                 length: 2,
                 handler: parity::<TestHost>,
             });
-            let callback = crate::intrinsics::native_function(&mut machine.heap, id, "parity", 2);
+            let callback = crate::intrinsics::native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                id,
+                "parity",
+                2,
+            );
             let items = custom_iterable(
                 machine,
                 vec![Value::int32(1), Value::int32(2), Value::int32(3)],
@@ -1262,7 +1316,7 @@ mod tests {
                     .get_named_property(constructor, "prototype")
                     .unwrap();
                 let key = machine
-                    .to_property_key(machine.intrinsics.builtins.symbol_to_string_tag())
+                    .property_key_from_value(machine.intrinsics.builtins.symbol_to_string_tag())
                     .unwrap();
                 let tag = machine.get_property_key(prototype, &key).unwrap();
                 let slot = machine.runtime_slot(tag).unwrap().unwrap();

@@ -17,17 +17,18 @@ use crate::{EvalFailure, HeapEntry, Host, Machine};
 /// https://tc39.es/ecma262/2025/multipage/numbers-and-dates.html#sec-math-object
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     math: Value,
 ) {
     // 21.3.1: every value property is non-writable, non-enumerable, and
     // non-configurable.
     for (name, value) in CONSTANTS {
-        define_frozen_data(heap, math, name, crate::number_value(value));
+        define_frozen_data(heap, atoms, math, name, crate::number_value(value));
     }
     for (name, length, handler) in functions::<H>() {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, math, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, math, name, function);
     }
 }
 
@@ -781,7 +782,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, "math valueOf", 0)
+        native_function(&mut machine.heap, &mut machine.atoms, id, "math valueOf", 0)
     }
 
     fn coercible(
@@ -1167,10 +1168,15 @@ mod tests {
             .intrinsics
             .global("Math")
             .expect("Math is installed");
-        install(&mut machine.heap, &mut machine.intrinsics.builtins, math);
+        install(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.intrinsics.builtins,
+            math,
+        );
 
         for (name, expected) in CONSTANTS {
-            let key = PropertyKey::Named(EcmaString::encode(name));
+            let key = PropertyKey::Named(machine.intern_str(name));
             assert!(
                 matches!(
                     machine.own_descriptor(math, &key).unwrap(),
@@ -1192,9 +1198,8 @@ mod tests {
                 "Math.{name} is callable"
             );
             for (property, expected_length) in [("name", None), ("length", Some(length))] {
-                let descriptor = machine
-                    .own_descriptor(function, &PropertyKey::Named(EcmaString::encode(property)))
-                    .unwrap();
+                let descriptor_key = PropertyKey::Named(machine.intern_str(property));
+                let descriptor = machine.own_descriptor(function, &descriptor_key).unwrap();
                 assert!(
                     matches!(
                         descriptor,
@@ -1211,10 +1216,11 @@ mod tests {
                     "Math.{name} has the standard {property} descriptor",
                 );
             }
+            let math_key = PropertyKey::Named(machine.intern_str(name));
             assert!(
                 matches!(
                     machine
-                        .own_descriptor(math, &PropertyKey::Named(EcmaString::encode(name)))
+                        .own_descriptor(math, &math_key)
                         .unwrap(),
                     Some(Property::Data {
                         value,

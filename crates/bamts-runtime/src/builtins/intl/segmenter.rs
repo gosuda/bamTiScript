@@ -22,11 +22,13 @@ use crate::{EvalFailure, HeapEntry, Host, Machine};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
     namespace: Value,
 ) {
     install_class(
         heap,
+        atoms,
         builtins,
         namespace,
         &Class {
@@ -44,18 +46,25 @@ pub(super) fn install<H: Host>(
         },
     );
     let segments = builtins.intl_prototype(IntlKind::Segments);
-    let containing = super::install_function(heap, builtins, "containing", 1, containing::<H>);
-    super::define_data(heap, segments, "containing", containing);
+    let containing =
+        super::install_function(heap, atoms, builtins, "containing", 1, containing::<H>);
+    super::define_data(heap, atoms, segments, "containing", containing);
     let iterator = builtins.symbol_iterator();
-    let function =
-        super::install_function(heap, builtins, "[Symbol.iterator]", 0, create_iterator::<H>);
+    let function = super::install_function(
+        heap,
+        atoms,
+        builtins,
+        "[Symbol.iterator]",
+        0,
+        create_iterator::<H>,
+    );
     super::define_symbol_method(heap, segments, iterator, function);
 
     let prototype = builtins.intl_prototype(IntlKind::SegmentIterator);
     let iterator_prototype = builtins.iterator_prototype();
     super::set_prototype(heap, prototype, iterator_prototype);
-    let next = super::install_function(heap, builtins, "next", 0, next::<H>);
-    super::define_data(heap, prototype, "next", next);
+    let next = super::install_function(heap, atoms, builtins, "next", 0, next::<H>);
+    super::define_data(heap, atoms, prototype, "next", next);
     let tag_symbol = builtins.symbol_to_string_tag();
     super::define_tag(heap, prototype, tag_symbol, "Segmenter String Iterator");
 }
@@ -329,7 +338,7 @@ mod tests {
             .call_value(segment, segmenter, &[text.unwrap()])
             .unwrap();
         let symbol = machine.intrinsics.builtins.symbol_iterator();
-        let key = machine.to_property_key(symbol).unwrap();
+        let key = machine.property_key_from_value(symbol).unwrap();
         let create = machine.get_property_key(segments, &key).unwrap();
         let iterator = machine.call_value(create, segments, &[]).unwrap();
         machine.hold_temporaries(&[segments, iterator]);

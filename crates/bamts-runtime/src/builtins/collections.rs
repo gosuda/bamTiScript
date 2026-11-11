@@ -18,24 +18,27 @@ use bamts_bytecode::IteratorKind;
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    install_map(heap, globals, builtins);
-    install_set(heap, globals, builtins);
-    install_weak_map(heap, globals, builtins);
-    install_weak_set(heap, globals, builtins);
+    install_map(heap, atoms, globals, builtins);
+    install_set(heap, atoms, globals, builtins);
+    install_weak_map(heap, atoms, globals, builtins);
+    install_weak_set(heap, atoms, globals, builtins);
 }
 
 fn install_map<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     builtins.set_map_prototype(prototype);
-    let constructor = install_constructor_function(heap, builtins, "Map", 0, map_constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, builtins, "Map", 0, map_constructor::<H>);
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     for (name, length, handler) in [
         ("set", 2, map_set::<H> as BuiltinHandler<H>),
         ("get", 1, map_get::<H>),
@@ -47,12 +50,12 @@ fn install_map<H: Host>(
         ("entries", 0, map_entries::<H>),
         ("forEach", 1, map_for_each::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, function);
     }
-    let size = install_function(heap, builtins, "get size", 0, map_size::<H>);
-    define_getter(heap, prototype, "size", size);
-    let entries = named_property(heap, prototype, "entries");
+    let size = install_function(heap, atoms, builtins, "get size", 0, map_size::<H>);
+    define_getter(heap, atoms, prototype, "size", size);
+    let entries = named_property(heap, atoms, prototype, "entries");
     define_symbol(heap, prototype, builtins.symbol_iterator(), entries);
     let map_tag = super::super::push(heap, HeapEntry::String(EcmaString::encode("Map")));
     define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), map_tag);
@@ -61,14 +64,16 @@ fn install_map<H: Host>(
 
 fn install_set<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     builtins.set_set_prototype(prototype);
-    super::set_methods::install(heap, builtins, prototype);
-    let constructor = install_constructor_function(heap, builtins, "Set", 0, set_constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    super::set_methods::install(heap, atoms, builtins, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, builtins, "Set", 0, set_constructor::<H>);
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     for (name, length, handler) in [
         ("add", 1, set_add::<H> as BuiltinHandler<H>),
         ("has", 1, set_has::<H>),
@@ -79,12 +84,12 @@ fn install_set<H: Host>(
         ("entries", 0, set_entries::<H>),
         ("forEach", 1, set_for_each::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, function);
     }
-    let size = install_function(heap, builtins, "get size", 0, set_size::<H>);
-    define_getter(heap, prototype, "size", size);
-    let values = named_property(heap, prototype, "values");
+    let size = install_function(heap, atoms, builtins, "get size", 0, set_size::<H>);
+    define_getter(heap, atoms, prototype, "size", size);
+    let values = named_property(heap, atoms, prototype, "values");
     define_symbol(heap, prototype, builtins.symbol_iterator(), values);
     let set_tag = super::super::push(heap, HeapEntry::String(EcmaString::encode("Set")));
     define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), set_tag);
@@ -93,54 +98,70 @@ fn install_set<H: Host>(
 
 fn install_weak_map<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     builtins.set_weak_map_prototype(prototype);
-    let constructor =
-        install_constructor_function(heap, builtins, "WeakMap", 0, weak_map_constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        builtins,
+        "WeakMap",
+        0,
+        weak_map_constructor::<H>,
+    );
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     for (name, length, handler) in [
         ("set", 2, weak_map_set::<H> as BuiltinHandler<H>),
         ("get", 1, weak_map_get::<H>),
         ("has", 1, weak_map_has::<H>),
         ("delete", 1, weak_map_delete::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, function);
     }
     globals.insert(EcmaString::encode("WeakMap"), constructor);
 }
 
 fn install_weak_set<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     builtins.set_weak_set_prototype(prototype);
-    let constructor =
-        install_constructor_function(heap, builtins, "WeakSet", 0, weak_set_constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        builtins,
+        "WeakSet",
+        0,
+        weak_set_constructor::<H>,
+    );
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     for (name, length, handler) in [
         ("add", 1, weak_set_add::<H> as BuiltinHandler<H>),
         ("has", 1, weak_set_has::<H>),
         ("delete", 1, weak_set_delete::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, function);
     }
     globals.insert(EcmaString::encode("WeakSet"), constructor);
 }
 
 pub(super) fn install_iterator_prototype<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     let identity = install_function(
         heap,
+        atoms,
         builtins,
         "[Symbol.iterator]",
         0,
@@ -159,8 +180,8 @@ pub(super) fn install_iterator_prototype<H: Host>(
     ]
     .map(|(tag, handler)| {
         let family = ordinary(heap, Some(prototype));
-        let next = install_function(heap, builtins, "next", 0, handler);
-        define_data(heap, family, "next", next);
+        let next = install_function(heap, atoms, builtins, "next", 0, handler);
+        define_data(heap, atoms, family, "next", next);
         super::define_to_string_tag(heap, family, builtins.symbol_to_string_tag(), tag);
         family
     });
@@ -169,11 +190,13 @@ pub(super) fn install_iterator_prototype<H: Host>(
 
 pub(super) fn install_async_iterator_prototype<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     let identity = install_function(
         heap,
+        atoms,
         builtins,
         "[Symbol.asyncIterator]",
         0,
@@ -185,6 +208,7 @@ pub(super) fn install_async_iterator_prototype<H: Host>(
 
 pub(super) fn install_generator_prototype<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.iterator_prototype()));
@@ -194,14 +218,15 @@ pub(super) fn install_generator_prototype<H: Host>(
         generator_throw::<H> as BuiltinHandler<H>,
     ];
     for (method, handler) in GENERATOR_METHODS.into_iter().zip(handlers) {
-        let function = install_function(heap, builtins, method.name, method.length, handler);
-        define_data(heap, prototype, method.name, function);
+        let function = install_function(heap, atoms, builtins, method.name, method.length, handler);
+        define_data(heap, atoms, prototype, method.name, function);
     }
     builtins.set_generator_prototype(prototype);
 }
 
 pub(super) fn install_async_generator_prototype<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.async_iterator_prototype()));
@@ -211,8 +236,8 @@ pub(super) fn install_async_generator_prototype<H: Host>(
         async_generator_throw::<H> as BuiltinHandler<H>,
     ];
     for (method, handler) in ASYNC_GENERATOR_METHODS.into_iter().zip(handlers) {
-        let function = install_function(heap, builtins, method.name, method.length, handler);
-        define_data(heap, prototype, method.name, function);
+        let function = install_function(heap, atoms, builtins, method.name, method.length, handler);
+        define_data(heap, atoms, prototype, method.name, function);
     }
     let adapter_prototype = ordinary(heap, Some(builtins.async_iterator_prototype()));
     let adapter_handlers = [
@@ -221,8 +246,8 @@ pub(super) fn install_async_generator_prototype<H: Host>(
         async_from_sync_throw::<H> as BuiltinHandler<H>,
     ];
     for (method, handler) in ASYNC_FROM_SYNC_METHODS.into_iter().zip(adapter_handlers) {
-        let function = install_function(heap, builtins, method.name, method.length, handler);
-        define_data(heap, adapter_prototype, method.name, function);
+        let function = install_function(heap, atoms, builtins, method.name, method.length, handler);
+        define_data(heap, atoms, adapter_prototype, method.name, function);
     }
     builtins.set_async_from_sync_iterator_prototype(adapter_prototype);
     builtins.set_async_generator_prototype(prototype);
@@ -1455,12 +1480,18 @@ pub(crate) fn ordinary_runtime<H: Host>(
         })
         .map_err(EvalFailure::Runtime)
 }
-fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
+fn define_getter(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    object: Value,
+    name: &str,
+    getter: Value,
+) {
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern_str(name)),
         Property::Accessor {
             getter: Some(getter),
             setter: None,
@@ -1492,11 +1523,16 @@ fn define_to_string_tag(heap: &mut [HeapEntry], object: Value, symbol: Value, va
         },
     );
 }
-fn named_property(heap: &[HeapEntry], object: Value, name: &str) -> Value {
+fn named_property(
+    heap: &[HeapEntry],
+    atoms: &mut crate::AtomTable,
+    object: Value,
+    name: &str,
+) -> Value {
     let HeapEntry::Object { properties, .. } = &heap[heap_index(object)] else {
         unreachable!()
     };
-    match properties.get(&PropertyKey::Named(EcmaString::encode(name))) {
+    match properties.get(&PropertyKey::Named(atoms.intern_str(name))) {
         Some(Property::Data { value, .. }) => *value,
         _ => unreachable!(),
     }
@@ -1994,7 +2030,7 @@ mod tests {
             ),
         ] {
             for name in ["next", "return", "throw"] {
-                let key = PropertyKey::Named(EcmaString::encode(name));
+                let key = PropertyKey::Named(machine.intern_str(name));
                 let method_descriptor = machine
                     .own_descriptor(prototype, &key)
                     .unwrap()
@@ -2031,8 +2067,9 @@ mod tests {
                 assert_eq!(definition.length, 1, "{label}.prototype.{name} length");
 
                 for metadata in ["name", "length"] {
+                    let metadata_key = PropertyKey::Named(machine.intern_str(metadata));
                     let descriptor = machine
-                        .own_descriptor(method, &PropertyKey::Named(EcmaString::encode(metadata)))
+                        .own_descriptor(method, &metadata_key)
                         .unwrap()
                         .unwrap_or_else(|| {
                             panic!("{label}.prototype.{name}.{metadata} must exist")
@@ -3030,7 +3067,6 @@ mod tests {
     }
 
     use crate::intrinsics::{BuiltinDef, BuiltinHandler, native_function};
-
     fn native_callback(
         machine: &mut Machine<'_, TestHost>,
         name: &'static str,
@@ -3041,7 +3077,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, id, name, 0)
     }
 
     fn push_log(machine: &mut Machine<'_, TestHost>, event: u32) {
@@ -3075,7 +3111,7 @@ mod tests {
         let iterable = ordinary_object(machine);
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
         let iterator_key = machine
-            .to_property_key(iterator_symbol)
+            .property_key_from_value(iterator_symbol)
             .expect("Symbol.iterator is a property key");
         machine
             .set_data_property_key(iterable, iterator_key, get_iter)

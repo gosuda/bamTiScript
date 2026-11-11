@@ -477,6 +477,7 @@ fn time_clip(time: f64) -> f64 {
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -490,8 +491,9 @@ pub(super) fn install<H: Host>(
         prototype: Some(builtins.object_prototype()),
         extensible: true,
     };
-    let constructor = install_constructor_function(heap, builtins, "Date", 7, constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, builtins, "Date", 7, constructor::<H>);
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     builtins.set_date_prototype(prototype);
 
     for (name, length, handler) in [
@@ -499,8 +501,8 @@ pub(super) fn install<H: Host>(
         ("parse", 1, parse::<H>),
         ("UTC", 7, utc::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        native_properties(heap, constructor).insert(named(name), builtin_property(function));
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        native_properties(heap, constructor).insert(named(atoms, name), builtin_property(function));
     }
 
     let methods: &[(&str, u32, BuiltinHandler<H>)] = &[
@@ -552,20 +554,22 @@ pub(super) fn install<H: Host>(
     ];
     let mut utc_string_function = None;
     for &(name, length, handler) in methods {
-        let function = install_function(heap, builtins, name, length, handler);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
         if name == "toUTCString" {
             utc_string_function = Some(function);
         }
-        define_data(heap, prototype, name, function);
+        define_data(heap, atoms, prototype, name, function);
     }
     define_data(
         heap,
+        atoms,
         prototype,
         "toGMTString",
         utc_string_function.expect("toUTCString is installed"),
     );
     let to_primitive = install_function(
         heap,
+        atoms,
         builtins,
         "[Symbol.toPrimitive]",
         1,
@@ -616,8 +620,8 @@ fn date_to_primitive<H: Host>(
     ))
 }
 
-fn named(name: &str) -> PropertyKey {
-    PropertyKey::Named(EcmaString::encode(name))
+fn named(atoms: &mut crate::AtomTable, name: &str) -> PropertyKey {
+    PropertyKey::Named(atoms.intern_str(name))
 }
 fn builtin_property(value: Value) -> Property {
     Property::Data {
@@ -1444,7 +1448,7 @@ mod to_primitive_tests {
             .get_named_property(date_constructor, "prototype")
             .unwrap();
         let key = machine
-            .to_property_key(machine.intrinsics.builtins.symbol_to_primitive())
+            .property_key_from_value(machine.intrinsics.builtins.symbol_to_primitive())
             .unwrap();
         let method = machine.get_property_key(prototype, &key).unwrap();
 
@@ -1772,13 +1776,14 @@ mod tests {
         let mut machine = machine(&module, &mut host);
         let constructor = machine.intrinsics.global("Date").unwrap();
         let date_prototype = machine.intrinsics.builtins.date_prototype();
+        let prototype_key = PropertyKey::Named(machine.intern_str("prototype"));
         let Property::Data {
             writable,
             enumerable,
             configurable,
             ..
         } = machine
-            .own_descriptor(constructor, &named("prototype"))
+            .own_descriptor(constructor, &prototype_key)
             .unwrap()
             .unwrap()
         else {
@@ -1958,7 +1963,7 @@ mod tests {
                 length: 0,
                 handler,
             });
-            let function = native_function(&mut machine.heap, id, name, 0);
+            let function = native_function(&mut machine.heap, &mut machine.atoms, id, name, 0);
             machine
                 .set_data_property(object, "valueOf", function)
                 .unwrap();
@@ -2038,7 +2043,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, id, name, 0)
     }
 
     fn generic_value_of(

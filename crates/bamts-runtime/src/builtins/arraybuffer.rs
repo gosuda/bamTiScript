@@ -561,16 +561,17 @@ pub(crate) fn detach_for_host<H: Host>(
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
     let constructor =
-        install_constructor_function(heap, builtins, "ArrayBuffer", 1, constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+        install_constructor_function(heap, atoms, builtins, "ArrayBuffer", 1, constructor::<H>);
+    builtins.set_constructor_prototype(heap, atoms, constructor, prototype);
     builtins.set_arraybuffer_constructor(constructor);
     builtins.set_arraybuffer_prototype(prototype);
-    define_data(heap, prototype, "constructor", constructor);
+    define_data(heap, atoms, prototype, "constructor", constructor);
 
     for (name, length, handler) in [
         ("resize", 1, resize::<H> as BuiltinHandler<H>),
@@ -582,8 +583,8 @@ pub(super) fn install<H: Host>(
             transfer_to_fixed_length::<H> as BuiltinHandler<H>,
         ),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, builtins, name, length, handler);
+        define_data(heap, atoms, prototype, name, function);
     }
 
     for (property_name, function_name, getter) in [
@@ -608,12 +609,12 @@ pub(super) fn install<H: Host>(
             detached::<H> as BuiltinHandler<H>,
         ),
     ] {
-        let getter = install_function(heap, builtins, function_name, 0, getter);
+        let getter = install_function(heap, atoms, builtins, function_name, 0, getter);
         let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
             unreachable!("ArrayBuffer prototype is ordinary")
         };
         properties.insert(
-            PropertyKey::Named(EcmaString::encode(property_name)),
+            PropertyKey::Named(atoms.intern_str(property_name)),
             Property::Accessor {
                 getter: Some(getter),
                 setter: None,
@@ -623,15 +624,22 @@ pub(super) fn install<H: Host>(
         );
     }
 
-    let is_view = install_function(heap, builtins, "isView", 1, is_view::<H>);
+    let is_view = install_function(heap, atoms, builtins, "isView", 1, is_view::<H>);
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)] else {
         unreachable!("ArrayBuffer constructor is native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode("isView")),
+        PropertyKey::Named(atoms.intern_str("isView")),
         builtin_property(is_view),
     );
-    let species = install_function(heap, builtins, "get [Symbol.species]", 0, species::<H>);
+    let species = install_function(
+        heap,
+        atoms,
+        builtins,
+        "get [Symbol.species]",
+        0,
+        species::<H>,
+    );
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)] else {
         unreachable!("ArrayBuffer constructor is native")
     };
@@ -885,7 +893,7 @@ pub(super) fn species_constructor<H: Host>(
             "ArrayBuffer constructor property is not an object",
         ));
     }
-    let key = machine.to_property_key(machine.intrinsics.builtins.symbol_species())?;
+    let key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_species())?;
     let species = machine.get_property_key(constructor, &key)?;
     match species.decode() {
         Some(Decoded::Undefined | Decoded::Null) => Ok(default),
@@ -1098,9 +1106,15 @@ mod tests {
             length: 1,
             handler: species_buffer,
         });
-        let constructor = native_function(&mut machine.heap, id, "SpeciesBuffer", 1);
+        let constructor = native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            id,
+            "SpeciesBuffer",
+            1,
+        );
         let species_key = machine
-            .to_property_key(machine.intrinsics.builtins.symbol_species())
+            .property_key_from_value(machine.intrinsics.builtins.symbol_species())
             .expect("species key");
         machine
             .set_data_property_key(constructor, species_key, constructor)
@@ -1169,7 +1183,9 @@ mod tests {
                 enumerable,
                 configurable,
                 ..
-            } = properties.get_ascii("resize").expect("resize method")
+            } = properties
+                .get_ascii(&machine.atoms, "resize")
+                .expect("resize method")
             else {
                 panic!("resize is a data property")
             };
@@ -1182,7 +1198,7 @@ mod tests {
                 enumerable,
                 configurable,
             } = properties
-                .get_ascii("byteLength")
+                .get_ascii(&machine.atoms, "byteLength")
                 .expect("byteLength accessor")
             else {
                 panic!("byteLength is a getter-only accessor")
@@ -1620,11 +1636,18 @@ mod tests {
                     }))
                 },
             });
-            let getter = native_function(&mut machine.heap, id, "get maxByteLength", 0);
+            let getter = native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                id,
+                "get maxByteLength",
+                0,
+            );
+            let max_key = PropertyKey::Named(machine.intern_str("maxByteLength"));
             machine
                 .define_accessor(
                     options,
-                    PropertyKey::Named(EcmaString::encode("maxByteLength")),
+                    max_key,
                     getter,
                     bamts_bytecode::AccessorKind::Getter,
                 )
