@@ -7774,6 +7774,8 @@ mod tests {
             "import defer * as ns from \"x\";",
             "import source x from \"x\";",
             "import source from from \"x\";",
+            "import.defer(x);",
+            "import.source(x);",
         ] {
             assert_clean(source);
         }
