@@ -1330,6 +1330,28 @@ impl<'a> Scanner<'a> {
             return TokenKind::BigIntLiteral;
         }
 
+        if self.first().is_some_and(is_id_continue) || self.first() == Some('\\') {
+            self.error(
+                INVALID_NUMERIC_LITERAL,
+                start_u,
+                self.utf16_pos,
+                "a numeric literal must not be followed by an identifier",
+            );
+        }
+        if self.text[self.last_start_byte..self.byte_pos].contains('_') {
+            let token = &self.text[self.last_start_byte..self.byte_pos];
+            let mut chars = token.chars();
+            if matches!(chars.next(), Some('0'))
+                && chars.next().is_some_and(|second| second.is_ascii_digit())
+            {
+                self.error(
+                    INVALID_NUMERIC_SEPARATOR,
+                    start_u,
+                    self.utf16_pos,
+                    "a legacy octal literal cannot contain a separator",
+                );
+            }
+        }
         TokenKind::NumericLiteral
     }
 
@@ -1359,6 +1381,14 @@ impl<'a> Scanner<'a> {
                 );
             }
             return TokenKind::BigIntLiteral;
+        }
+        if self.first().is_some_and(is_id_continue) || self.first() == Some('\\') {
+            self.error(
+                INVALID_NUMERIC_LITERAL,
+                start_u,
+                self.utf16_pos,
+                "a numeric literal must not be followed by an identifier",
+            );
         }
         TokenKind::NumericLiteral
     }
@@ -2418,6 +2448,15 @@ mod tests {
             scan_text("1.5n").diagnostics()[0].code(),
             INVALID_BIGINT_LITERAL
         );
+    }
+    #[test]
+    fn numeric_literal_followed_by_identifier_is_rejected() {
+        for text in ["3in []", "00_0", "01_0", "07_0", "08_0", "09_0"] {
+            assert!(!scan_text(text).diagnostics().is_empty(), "{text}");
+        }
+        for text in ["3 in []", "0", "00", "10_0", "0xFF"] {
+            assert!(scan_text(text).diagnostics().is_empty(), "{text}");
+        }
     }
 
     #[test]
