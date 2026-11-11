@@ -8344,7 +8344,40 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::ExternalModuleNamespace { .. }
             | HeapEntry::HashState { .. }
             | HeapEntry::ProcessEnv { .. } => true,
-            _ => false,
+            HeapEntry::Vacant
+            | HeapEntry::BigInt(_)
+            | HeapEntry::Object {
+                boxed_primitive: None,
+                ..
+            }
+            | HeapEntry::Script { .. }
+            | HeapEntry::Symbol { .. }
+            | HeapEntry::PrivateName { .. }
+            | HeapEntry::RegExp { .. }
+            | HeapEntry::Date { .. }
+            | HeapEntry::Temporal { .. }
+            | HeapEntry::Intl { .. }
+            | HeapEntry::Collection { .. }
+            | HeapEntry::DataView { .. }
+            | HeapEntry::ArrayBuffer { .. }
+            | HeapEntry::SharedArrayBuffer { .. }
+            | HeapEntry::WeakRef { .. }
+            | HeapEntry::FinalizationRegistry { .. }
+            | HeapEntry::BuiltinIterator { .. }
+            | HeapEntry::Iterator { .. }
+            | HeapEntry::Generator { .. }
+            | HeapEntry::AsyncGenerator { .. }
+            | HeapEntry::AsyncFromSync { .. }
+            | HeapEntry::DisposableStack { .. }
+            | HeapEntry::Promise { .. }
+            | HeapEntry::Timeout { .. }
+            | HeapEntry::PromiseResolver { .. }
+            | HeapEntry::PromiseAll { .. }
+            | HeapEntry::PromiseAllElement { .. }
+            | HeapEntry::AsyncActivation { .. }
+            | HeapEntry::NativeFunction { .. }
+            | HeapEntry::Proxy { .. }
+            | HeapEntry::ProxyRevoker { .. } => false,
         }
     }
 
