@@ -313,6 +313,7 @@ pub fn emit_transformed(
         PrintOptions {
             newline: options.newline,
             indent_width: options.indent_width,
+            target: options.target,
             source_map: options.source_map,
             inline_source_map: options.inline_source_map,
             inline_sources: options.inline_sources,
@@ -13329,7 +13330,92 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         let code = javascript(&output);
         assert!(code.contains("}, 2)"), "{code}");
     }
+    #[test]
+    fn separated_hex_prints_as_decimal_at_es2015_like_overshifts() {
+        let output = emit_at("0xFF_FF_FF_FF;\n", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(code.contains("4294967295"), "{code}");
+        assert!(!code.contains("_"), "{code}");
+    }
+    #[test]
+    fn hex_and_octal_without_separators_keep_at_es2015_like_parse_big_int() {
+        let output = emit_at("0xC0B;\n0o567;\n", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(code.contains("0xC0B"), "{code}");
+        assert!(code.contains("0o567"), "{code}");
+    }
+    #[test]
+    fn legacy_octal_prints_decimal_like_literals() {
+        let output = emit_at("015;\n001;\n09;\n", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(code.contains("13;"), "{code}");
+        assert!(code.contains("1;"), "{code}");
+        assert!(code.contains("9;"), "{code}");
+        assert!(!code.contains("015"), "{code}");
+        assert!(!code.contains("001"), "{code}");
+    }
+    #[test]
+    fn decimal_separators_print_plain_below_es2021_like_numeric_underscored_separator() {
+        let output = emit_at("123_456;\n1e2;\n", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(code.contains("123456"), "{code}");
+        assert!(code.contains("1e2"), "{code}");
+        assert!(!code.contains("_"), "{code}");
+    }
 
+    #[test]
+    fn bigint_literals_normalize_to_decimal_except_lowercase_hex_like_parse_big_int() {
+        let output = emit_at(
+            "0b101n;\n0o567n;\n0xC0Bn;\n123n;\n0b010_10_1n;\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("5n"), "{code}");
+        assert!(code.contains("375n"), "{code}");
+        assert!(code.contains("0xc0bn"), "{code}");
+        assert!(code.contains("123n"), "{code}");
+        assert!(code.contains("21n"), "{code}");
+    }
+
+
+    #[test]
+    fn decimal_separators_keep_at_es2021_and_normalize_below_like_parser_numeric_separators_decimal() {
+        let source = "1_000_000_000;\n1.1_00_01;\n1e1_0;\n1.1e10_0;\n0_.0;\n";
+        let es2021_output = emit_at(source, ScriptTarget::Es2021);
+        let es2021 = javascript(&es2021_output);
+        assert!(es2021.contains("1_000_000_000"), "{es2021}");
+        let es5_output = emit_at(source, ScriptTarget::Es5);
+        let es5 = javascript(&es5_output);
+        assert!(es5.contains("1000000000"), "{es5}");
+        assert!(es5.contains("1.10001"), "{es5}");
+        assert!(es5.contains("10000000000"), "{es5}");
+        assert!(es5.contains("1.1e+100"), "{es5}");
+        assert!(!es5.contains("_"), "{es5}");
+    }
+    #[test]
+    fn hex_separators_keep_at_esnext_and_decimalize_below_like_numeric_underscored_separator() {
+        let source = "0xA0_B0_C0;\n";
+        let esnext_output = emit_at(source, ScriptTarget::EsNext);
+        let esnext = javascript(&esnext_output);
+        assert!(esnext.contains("0xA0_B0_C0"), "{esnext}");
+        let es2015_output = emit_at(source, ScriptTarget::Es2015);
+        let es2015 = javascript(&es2015_output);
+        assert!(!es2015.contains("_"), "{es2015}");
+        assert!(!es2015.contains("0x"), "{es2015}");
+    }
+
+    #[test]
+    fn numeric_property_names_normalize_like_numeric_underscored_separator() {
+        let output = emit_at(
+            "var x = { 0xFF_FF: 1, 0b10_1: 2 };\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("65535"), "{code}");
+        assert!(code.contains("5:"), "{code}");
+        assert!(!code.contains("0xFF_FF"), "{code}");
+        assert!(!code.contains("0b10_1"), "{code}");
+    }
     #[test]
     fn class_expression_temp_is_function_scoped_like_class_block_scoping() {
         let output = emit_at(

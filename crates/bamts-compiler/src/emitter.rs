@@ -424,6 +424,7 @@ impl EmitOptions {
         DeclarationOptions {
             newline: self.newline,
             indent_width: self.indent_width,
+            target: self.target,
             isolated_declarations: self.isolated_declarations,
             declaration_map: self.declaration_map,
         }
@@ -508,6 +509,7 @@ impl EmitOutput {
 pub(crate) struct PrintOptions {
     pub(crate) newline: Newline,
     pub(crate) indent_width: u8,
+    pub(crate) target: ScriptTarget,
     pub(crate) source_map: bool,
     pub(crate) inline_source_map: bool,
     pub(crate) inline_sources: bool,
@@ -3130,6 +3132,188 @@ impl<'a> Emitter<'a> {
         self.raw_mapped(text, range);
     }
 
+    fn numeric_radix(digits: &str) -> (u32, &str) {
+        if let Some(body) = digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+        {
+            (16, body)
+        } else if let Some(body) = digits
+            .strip_prefix("0b")
+            .or_else(|| digits.strip_prefix("0B"))
+        {
+            (2, body)
+        } else if let Some(body) = digits
+            .strip_prefix("0o")
+            .or_else(|| digits.strip_prefix("0O"))
+        {
+            (8, body)
+        } else {
+            (10, digits)
+        }
+    }
+
+    fn legacy_octal_value(digits: &str) -> Option<String> {
+        let body = digits.strip_prefix('0')?;
+        if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if body.bytes().any(|b| b == b'8' || b == b'9') {
+            return digits.parse::<f64>().ok().map(Self::format_js_number);
+        }
+        Self::decimal_from_base(body, 8)
+    }
+
+    fn decimal_from_base(body: &str, radix: u32) -> Option<String> {
+        if body.is_empty() {
+            return Some("0".to_owned());
+        }
+        let mut limbs: Vec<u32> = Vec::new();
+        for digit in body.chars() {
+            let mut carry = u64::from(digit.to_digit(radix)?);
+            for limb in limbs.iter_mut() {
+                let unit = u64::from(*limb) * u64::from(radix) + carry;
+                *limb = u32::try_from(unit % 1_000_000_000).expect("a remainder below one billion fits u32");
+                carry = unit / 1_000_000_000;
+            }
+            while carry > 0 {
+                limbs.push(u32::try_from(carry % 1_000_000_000).expect("a remainder below one billion fits u32"));
+                carry /= 1_000_000_000;
+            }
+        }
+        while limbs.len() > 1 && limbs.last() == Some(&0) {
+            limbs.pop();
+        }
+        match limbs.pop() {
+            Some(top) => {
+                let mut text = top.to_string();
+                for limb in limbs.iter().rev() {
+                    text.push_str(&format!("{limb:09}"));
+                }
+                Some(text)
+            }
+            None => Some("0".to_owned()),
+        }
+    }
+
+    fn digits_to_f64(body: &str, radix: u32) -> Option<f64> {
+        let mut value = 0.0;
+        for digit in body.chars() {
+            value = value * f64::from(radix) + f64::from(digit.to_digit(radix)?);
+        }
+        Some(value)
+    }
+
+    fn format_js_integer(value: f64) -> String {
+        if value.is_infinite() {
+            return "Infinity".to_owned();
+        }
+        if value.abs() < 1e21 {
+            return format!("{value:.0}");
+        }
+        let rendered = format!("{value:e}");
+        match rendered.find('e') {
+            Some(index) => {
+                let (mantissa, exponent) = rendered.split_at(index);
+                if exponent.starts_with("e-") {
+                    rendered
+                } else {
+                    format!("{mantissa}e+{}", &exponent[1..])
+                }
+            }
+            None => rendered,
+        }
+    }
+
+    fn format_js_number(value: f64) -> String {
+        if value.is_nan() {
+            return "NaN".to_owned();
+        }
+        if value == f64::INFINITY {
+            return "Infinity".to_owned();
+        }
+        if value == f64::NEG_INFINITY {
+            return "-Infinity".to_owned();
+        }
+        if value == 0.0 {
+            return "0".to_owned();
+        }
+        if value.abs() >= 1e-6 && value.abs() < 1e21 {
+            return value.to_string();
+        }
+        let rendered = format!("{:e}", value);
+        match rendered.find('e') {
+            Some(index) => {
+                let (mantissa, exponent) = rendered.split_at(index);
+                if exponent.starts_with("e-") {
+                    rendered
+                } else {
+                    format!("{mantissa}e+{}", &exponent[1..])
+                }
+            }
+            None => rendered,
+        }
+    }
+
+    fn normalize_bigint_literal(text: &str) -> Option<String> {
+        let digits = text.strip_suffix('n').unwrap_or(text);
+        let plain = digits.replace('_', "");
+        let (radix, body) = Self::numeric_radix(&plain);
+        let body = if body.is_empty() { "0" } else { body };
+        let mut normalized = if radix == 16 {
+            format!("0x{}", body.to_ascii_lowercase())
+        } else {
+            Self::decimal_from_base(body, radix)?
+        };
+        normalized.push('n');
+        (normalized != text).then_some(normalized)
+    }
+
+    fn normalize_number_literal(text: &str, target: ScriptTarget) -> Option<String> {
+        let plain = text.replace('_', "");
+        if let Some(legacy) = Self::legacy_octal_value(&plain) {
+            return Some(legacy);
+        }
+        let separated = plain.len() != text.len();
+        let (radix, body) = Self::numeric_radix(&plain);
+        let needs = (radix == 2 || radix == 8) && target < ScriptTarget::Es2015
+            || separated && target < ScriptTarget::Es2021;
+        if !needs {
+            return None;
+        }
+        if radix == 10 {
+            if plain.is_empty() {
+                return None;
+            }
+            match plain.parse::<f64>() {
+                Ok(value) => {
+                    let normalized = Self::format_js_number(value);
+                    (normalized != text).then_some(normalized)
+                }
+                Err(_) => (plain != text).then_some(plain),
+            }
+        } else {
+            if body.is_empty() || body.chars().any(|digit| digit.to_digit(radix).is_none()) {
+                return (plain != text).then_some(plain);
+            }
+            Self::digits_to_f64(body, radix)
+                .map(Self::format_js_integer)
+                .filter(|normalized| normalized != text)
+        }
+    }
+
+    fn emit_normalized_token(
+        &mut self,
+        token: &Token,
+        range: TextRange,
+        normalized: Option<String>,
+    ) {
+        match normalized {
+            Some(text) => self.raw_mapped(&text, range),
+            None => self.emit_token(token),
+        }
+    }
+
     fn emit_literal(&mut self, literal: &Literal) {
         if let Literal::String(node) = literal
             && self.generated_text(node.id()).is_some()
@@ -3153,8 +3337,20 @@ impl<'a> Emitter<'a> {
         }
         match literal {
             Literal::String(node) => self.emit_token(node.data().token()),
-            Literal::Number(node) => self.emit_token(node.data().token()),
-            Literal::BigInt(node) => self.emit_token(node.data().token()),
+            Literal::Number(node) => {
+                let token = node.data().token();
+                let normalized = self
+                    .text(token)
+                    .and_then(|text| Self::normalize_number_literal(text, self.options.target));
+                self.emit_normalized_token(token, node.range(), normalized);
+            }
+            Literal::BigInt(node) => {
+                let token = node.data().token();
+                let normalized = self
+                    .text(token)
+                    .and_then(Self::normalize_bigint_literal);
+                self.emit_normalized_token(token, node.range(), normalized);
+            }
             Literal::Boolean(node) => self.emit_token(node.data().token()),
             Literal::Null(node) => match self.text(node.data().token()) {
                 Some(text) if !text.is_empty() => self.raw_mapped(text, node.range()),
@@ -3163,7 +3359,6 @@ impl<'a> Emitter<'a> {
             Literal::Regex(node) => self.emit_token(node.data().token()),
         }
     }
-
     fn emit_template(&mut self, template: &TemplateLiteral) {
         if template.elements.is_empty() {
             return;
@@ -3295,7 +3490,17 @@ impl<'a> Emitter<'a> {
             PropertyName::Identifier(ident) => self.emit_ident(ident),
             PropertyName::Private(private) => self.emit_token(private.data().token()),
             PropertyName::String(string) => self.emit_string(string),
-            PropertyName::Number(number) => self.emit_token(number.data().token()),
+            PropertyName::Number(number) => {
+                let token = number.data().token();
+                let normalized = self.text(token).and_then(|text| {
+                    if text.ends_with('n') {
+                        Self::normalize_bigint_literal(text)
+                    } else {
+                        Self::normalize_number_literal(text, self.options.target)
+                    }
+                });
+                self.emit_normalized_token(token, number.range(), normalized);
+            }
             PropertyName::Computed(expression) => {
                 self.raw("[");
                 self.emit_expression_prec(expression, P_ASSIGN);

@@ -27,7 +27,7 @@ use crate::syntax::{
     PropertyName, SourceFile, Statement, Stmt, VariableDeclaration,
 };
 
-use super::{EmitFileNames, EmitOutput, Newline, PrintOptions, Surface, print};
+use super::{EmitFileNames, EmitOutput, Newline, PrintOptions, ScriptTarget, Surface, print};
 
 /// Stable diagnostic identifiers produced by declaration emit.
 pub mod codes {
@@ -48,6 +48,8 @@ pub struct DeclarationOptions {
     pub newline: Newline,
     /// Spaces per indent level forwarded to the printer.
     pub indent_width: u8,
+    /// Target the declaration text must run on.
+    pub target: ScriptTarget,
     /// When true, exported values without portable types are errors.
     pub isolated_declarations: bool,
     /// When true, emit a source map for the declaration file.
@@ -59,6 +61,7 @@ impl Default for DeclarationOptions {
         Self {
             newline: Newline::Lf,
             indent_width: 4,
+            target: ScriptTarget::EsNext,
             isolated_declarations: false,
             declaration_map: false,
         }
@@ -72,6 +75,7 @@ impl DeclarationOptions {
         Self {
             newline: Newline::Lf,
             indent_width: 4,
+            target: ScriptTarget::EsNext,
             isolated_declarations: true,
             declaration_map: false,
         }
@@ -97,6 +101,7 @@ pub fn emit_declarations(
         PrintOptions {
             newline: options.newline,
             indent_width: options.indent_width,
+            target: options.target,
             source_map: options.declaration_map,
             inline_source_map: false,
             inline_sources: false,
