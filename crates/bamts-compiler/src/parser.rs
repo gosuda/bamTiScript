@@ -1700,9 +1700,6 @@ impl Parser {
         self.bump();
         let is_await = self.eat(TokenKind::KwAwait).is_some();
         self.expect(TokenKind::LParen, "expected `(`");
-        let head_start = self.cur_start();
-
-        // Empty initializer.
         if self.eat(TokenKind::Semicolon).is_some() {
             return self.finish_classic_for(start, None);
         }
@@ -1847,14 +1844,13 @@ impl Parser {
                 )
             }
             TokenKind::KwOf => {
-                self.bump();
-                if let Expression::Identifier(identifier) = expression.data() {
-                    if expression.range().start() == head_start
-                        && self.lexeme(*identifier.data().token()) == "async"
-                    {
-                        self.error_here(EXPECTED_TOKEN, "a for-of target cannot be `async`");
-                    }
+                if let Expression::Identifier(identifier) = expression.data()
+                    && !is_await
+                    && self.lexeme(*identifier.data().token()) == "async"
+                {
+                    self.error_here(EXPECTED_TOKEN, "a for-of target cannot be `async`");
                 }
+                self.bump();
                 let target = self.expression_to_target(expression);
                 let iterable = self.parse_assignment_expression(false);
                 let body = self.finish_for_body();
@@ -8986,10 +8982,15 @@ mod tests {
     #[test]
     fn async_identifier_cannot_head_a_for_of() {
         assert!(!errors(&parse_ts("for (async of [1]) {}")).is_empty());
+        assert!(!errors(&parse_ts("for (/*c*/async of [1]) {}")).is_empty());
+        assert!(!errors(&parse_ts("for (async /*c*/ of [1]) {}")).is_empty());
         assert_clean("for (x of [1]) {}");
         assert_clean("for (async in obj) {}");
         assert_clean("for ((async) of [7]) {}");
         assert_clean("for (\\u0061sync of [7]) {}");
+        assert_clean("for (async.x of [7]) {}");
+        assert_clean("for (async of => {}; ;);");
+        assert_clean("async function f() { for await (async of [1]) {} }");
     }
 
     #[test]
