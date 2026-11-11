@@ -8236,8 +8236,68 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn get_property_ascii(&mut self, object: Value, name: &str) -> Result<Value, EvalFailure> {
         debug_assert!(name.is_ascii());
-        let atom = self.intern_str(name);
-        self.internal_get(object, &PropertyKey::Named(atom), object)
+        if let Some(atom) = self.atoms.find(name) {
+            return self.internal_get(object, &PropertyKey::Named(atom), object);
+        }
+        self.get_property_never_interned(object, name)
+    }
+    /// Reads a name that was never interned. No ordinary map can hold it,
+    /// so only exotic reads observe it and anything else is absent.
+    /// Exotic nodes fall back to the interning path, which stays correct.
+    fn get_property_never_interned(
+        &mut self,
+        object: Value,
+        name: &str,
+    ) -> Result<Value, EvalFailure> {
+        let slot = self.runtime_slot(object).map_err(EvalFailure::Runtime)?;
+        let start = match slot {
+            Some(index) => Some(index),
+            None => match object.decode() {
+                Some(Decoded::Boolean(_)) => self
+                    .runtime_slot(self.intrinsics.boolean_prototype)
+                    .map_err(EvalFailure::Runtime)?,
+                Some(Decoded::Number(_) | Decoded::Int32(_)) => self
+                    .runtime_slot(self.intrinsics.number_prototype)
+                    .map_err(EvalFailure::Runtime)?,
+                _ => return Ok(Value::UNDEFINED),
+            },
+        };
+        let Some(mut node) = start else {
+            return Ok(Value::UNDEFINED);
+        };
+        for _ in 0..=self.heap.len() {
+            if matches!(self.heap[node], HeapEntry::Proxy { .. })
+                || Self::observes_fresh_name(&self.heap[node])
+            {
+                let atom = self.intern_str(name);
+                return self.internal_get(object, &PropertyKey::Named(atom), object);
+            }
+            match self.prototype_index(node)? {
+                Some(next) => node = next,
+                None => return Ok(Value::UNDEFINED),
+            }
+        }
+        Ok(Value::UNDEFINED)
+    }
+    /// Reports whether `entry` can observe a property name that was never
+    /// interned: exotic string, element, function, namespace, boxed, and
+    /// environment reads key on the name text rather than the atom.
+    fn observes_fresh_name(entry: &HeapEntry) -> bool {
+        match entry {
+            HeapEntry::Object {
+                boxed_primitive: Some(_),
+                ..
+            }
+            | HeapEntry::String(_)
+            | HeapEntry::Array { .. }
+            | HeapEntry::TypedArray { .. }
+            | HeapEntry::Function { .. }
+            | HeapEntry::ModuleNamespace { .. }
+            | HeapEntry::ExternalModuleNamespace { .. }
+            | HeapEntry::HashState { .. }
+            | HeapEntry::ProcessEnv { .. } => true,
+            _ => false,
+        }
     }
 
     pub(crate) fn get_property_key(
@@ -31045,6 +31105,28 @@ mod tests {
                 Value::int32(2)
             );
             assert_eq!(other_key, PropertyKey::Named(machine.intern_str("other")));
+        });
+    }
+    #[test]
+    fn absent_ascii_reads_do_not_intern_names() {
+        with_machine(Limits::default(), |machine| {
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let before = machine.atoms.strings.len();
+            for index in 0..10_000 {
+                let name = format!("absent_property_{index}");
+                assert_eq!(
+                    machine.get_named_property(object, &name).unwrap(),
+                    Value::UNDEFINED
+                );
+            }
+            assert_eq!(machine.atoms.strings.len(), before);
         });
     }
 }
