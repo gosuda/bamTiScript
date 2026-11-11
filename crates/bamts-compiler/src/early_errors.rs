@@ -2682,6 +2682,23 @@ mod tests {
     }
 
     #[test]
+    fn invalid_regex_unicode_atoms_are_rejected() {
+        for source in [
+            "/{/u;",
+            "/[\\d-a]/u;",
+            "/[\\s-\\d]/u;",
+            "/[%-\\d]/u;",
+            "/[--\\d]/u;",
+            "/[\\p{Hex}-\\uFFFF]/u;",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in ["/[\\p{Hex}\\P{Hex}]/u;"] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    #[test]
     fn invalid_regex_unicode_escapes_are_rejected() {
         for source in [
             "/\\c0/u;",
