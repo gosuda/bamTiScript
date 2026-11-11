@@ -137,6 +137,8 @@ pub(super) fn install<H: Host>(
     let race = install_function(heap, atoms, builtins, "race", 1, race::<H>);
     let all_settled = install_function(heap, atoms, builtins, "allSettled", 1, all_settled::<H>);
     let any = install_function(heap, atoms, builtins, "any", 1, any::<H>);
+    let all_keyed = install_function(heap, atoms, builtins, "allKeyed", 1, all_keyed::<H>);
+    let all_settled_keyed = install_function(heap, atoms, builtins, "allSettledKeyed", 1, all_settled_keyed::<H>);
     let try_method = install_function(heap, atoms, builtins, "try", 1, promise_try::<H>);
     let with_resolvers = install_function(
         heap,
@@ -152,6 +154,8 @@ pub(super) fn install<H: Host>(
     define_static(heap, atoms, constructor, "race", race);
     define_static(heap, atoms, constructor, "allSettled", all_settled);
     define_static(heap, atoms, constructor, "any", any);
+    define_static(heap, atoms, constructor, "allKeyed", all_keyed);
+    define_static(heap, atoms, constructor, "allSettledKeyed", all_settled_keyed);
     define_static(heap, atoms, constructor, "try", try_method);
     define_static(heap, atoms, constructor, "withResolvers", with_resolvers);
     builtins.set_promise_capability_executor(capability_executor);
@@ -671,6 +675,242 @@ fn any<H: Host>(
 }
 
 #[derive(Clone, Copy)]
+enum KeyedVariant {
+    All,
+    AllSettled,
+}
+
+fn all_keyed<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    keyed_static(machine, this, args, constructing, KeyedVariant::All)
+}
+
+fn all_settled_keyed<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    keyed_static(machine, this, args, constructing, KeyedVariant::AllSettled)
+}
+
+fn keyed_static<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+    variant: KeyedVariant,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let operation: &'static str = match variant {
+        KeyedVariant::All => "Promise.allKeyed",
+        KeyedVariant::AllSettled => "Promise.allSettledKeyed",
+    };
+    if constructing {
+        return Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }));
+    }
+    let capability = new_promise_capability(machine, this)?;
+    let resolve_operation: &'static str = match variant {
+        KeyedVariant::All => "Promise.allKeyed resolve",
+        KeyedVariant::AllSettled => "Promise.allSettledKeyed resolve",
+    };
+    let resolve = match machine.get_named_property(this, "resolve") {
+        Ok(candidate) => match machine.is_callable(candidate) {
+            Ok(true) => candidate,
+            Ok(false) => {
+                return reject_capability_failure(
+                    machine,
+                    &capability,
+                    EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: resolve_operation,
+                    }),
+                );
+            }
+            Err(failure) => return reject_capability_failure(machine, &capability, failure),
+        },
+        Err(failure) => return reject_capability_failure(machine, &capability, failure),
+    };
+    let promises = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if !machine.is_object(promises) {
+        return reject_capability_failure(
+            machine,
+            &capability,
+            EvalFailure::Throw(ThrowOrigin::TypeError { operation }),
+        );
+    }
+    perform_keyed(machine, promises, resolve, this, &capability, variant)?;
+    Ok(BuiltinOutcome::Value(capability.promise))
+}
+
+fn perform_keyed<H: Host>(
+    machine: &mut Machine<'_, H>,
+    promises: Value,
+    resolve_method: Value,
+    receiver: Value,
+    capability: &PromiseCapability,
+    variant: KeyedVariant,
+) -> Result<(), EvalFailure> {
+    let all_keys = match machine.internal_own_property_keys(promises) {
+        Ok(keys) => keys,
+        Err(failure) => {
+            reject_failure(machine, capability.reject, failure)?;
+            return Ok(());
+        }
+    };
+    let target = machine.intrinsics.builtins.promise_all_target();
+    let record = completion_record(machine, ReactionKind::KeyedComplete, capability.resolve, capability.reject)?;
+    let keys_placeholder = super::allocate_array(machine, Vec::new())?;
+    let keys_key = PropertyKey::Named(machine.intern_str("keys"));
+    machine.create_data_property_key(record, keys_key, keys_placeholder)?;
+    let keyed_complete = machine.create_promise_resolver_function(target, record)?;
+    let aggregate = machine
+        .allocate(HeapEntry::PromiseAll {
+            resolve: keyed_complete,
+            reject: capability.reject,
+            values: Vec::new(),
+            remaining: 1,
+            settled: false,
+        })
+        .map_err(EvalFailure::Runtime)?;
+    let mut keys: Vec<PropertyKey> = Vec::new();
+    for key in all_keys {
+        let desc = match machine.internal_get_own_property(promises, &key) {
+            Ok(desc) => desc,
+            Err(failure) => {
+                machine.mark_promise_all_settled(aggregate)?;
+                reject_failure(machine, capability.reject, failure)?;
+                return Ok(());
+            }
+        };
+        let Some(desc) = desc else { continue };
+        if desc.enumerable != Some(true) {
+            continue;
+        }
+        let property_value = match machine.get_property_key(promises, &key) {
+            Ok(value) => value,
+            Err(failure) => {
+                machine.mark_promise_all_settled(aggregate)?;
+                reject_failure(machine, capability.reject, failure)?;
+                return Ok(());
+            }
+        };
+        keys.push(key);
+        let index = match machine.add_promise_all_element(aggregate) {
+            Ok(index) => index,
+            Err(failure) => {
+                machine.mark_promise_all_settled(aggregate)?;
+                reject_failure(machine, capability.reject, failure)?;
+                return Ok(());
+            }
+        };
+        let element = match machine
+            .allocate(HeapEntry::PromiseAllElement {
+                aggregate,
+                index,
+                called: false,
+            })
+            .map_err(EvalFailure::Runtime)
+        {
+            Ok(element) => element,
+            Err(failure) => {
+                machine.mark_promise_all_settled(aggregate)?;
+                reject_failure(machine, capability.reject, failure)?;
+                return Ok(());
+            }
+        };
+        let (on_fulfilled, on_rejected) = match variant {
+            KeyedVariant::All => {
+                let on_fulfilled = match machine.create_promise_resolver_function(target, element) {
+                    Ok(callback) => callback,
+                    Err(failure) => {
+                        machine.mark_promise_all_settled(aggregate)?;
+                        reject_failure(machine, capability.reject, failure)?;
+                        return Ok(());
+                    }
+                };
+                (on_fulfilled, capability.reject)
+            }
+            KeyedVariant::AllSettled => match aggregate_callbacks(machine, AggregateKind::AllSettled, element, capability) {
+                Ok(callbacks) => callbacks,
+                Err(failure) => {
+                    machine.mark_promise_all_settled(aggregate)?;
+                    reject_failure(machine, capability.reject, failure)?;
+                    return Ok(());
+                }
+            },
+        };
+        let resolved = match machine.call_value(resolve_method, receiver, &[property_value]) {
+            Ok(resolved) => resolved,
+            Err(failure) => {
+                machine.mark_promise_all_settled(aggregate)?;
+                reject_failure(machine, capability.reject, failure)?;
+                return Ok(());
+            }
+        };
+        let then = match machine.get_named_property(resolved, "then") {
+            Ok(then) => then,
+            Err(failure) => {
+                machine.mark_promise_all_settled(aggregate)?;
+                reject_failure(machine, capability.reject, failure)?;
+                return Ok(());
+            }
+        };
+        if let Err(failure) = machine.call_value(then, resolved, &[on_fulfilled, on_rejected]) {
+            machine.mark_promise_all_settled(aggregate)?;
+            reject_failure(machine, capability.reject, failure)?;
+            return Ok(());
+        }
+    }
+    let mut key_values = Vec::with_capacity(keys.len());
+    for key in &keys {
+        match super::reflect::property_key_value(machine, key.clone()) {
+            Ok(value) => key_values.push(value),
+            Err(failure) => {
+                machine.mark_promise_all_settled(aggregate)?;
+                reject_failure(machine, capability.reject, failure)?;
+                return Ok(());
+            }
+        }
+    }
+    let keys_array = super::allocate_array(machine, key_values)?;
+    let keys_key = PropertyKey::Named(machine.intern_str("keys"));
+    machine.create_data_property_key(record, keys_key, keys_array)?;
+    if machine.finish_promise_all(aggregate)? {
+        let values = machine.move_promise_all_values_to_array(aggregate)?;
+        if let Err(failure) = machine.call_value(keyed_complete, Value::UNDEFINED, &[values]) {
+            reject_failure(machine, capability.reject, failure)?;
+        }
+    }
+    Ok(())
+}
+
+fn keyed_complete<H: Host>(
+    machine: &mut Machine<'_, H>,
+    record: Value,
+    values_array: Value,
+) -> Result<(), EvalFailure> {
+    let resolve = machine.get_named_property(record, "resolve")?;
+    let keys_array = machine.get_named_property(record, "keys")?;
+    let keys = machine
+        .array_elements(keys_array)?
+        .unwrap_or_default();
+    let values = machine
+        .array_elements(values_array)?
+        .unwrap_or_default();
+    let result = super::ordinary_runtime(machine, None)?;
+    let len = keys.len().min(values.len());
+    for i in 0..len {
+        let key = machine.property_key_from_value(keys[i])?;
+        machine.create_data_property_key(result, key, values[i])?;
+    }
+    machine.call_value(resolve, Value::UNDEFINED, &[result])?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
 enum AggregateKind {
     AllSettled,
     Any,
@@ -910,6 +1150,7 @@ enum ReactionKind {
     AnyComplete = 3,
     AllSettledComplete = 4,
     AnyFulfilled = 5,
+    KeyedComplete = 6,
 }
 
 fn reaction_record<H: Host>(
@@ -1265,6 +1506,9 @@ fn all_fulfill<H: Host>(
         {
             let resolve = machine.get_named_property(record, "resolve")?;
             machine.call_value(resolve, Value::UNDEFINED, &[value])?;
+        }
+        raw if raw == ReactionKind::KeyedComplete as i32 => {
+            keyed_complete(machine, record, value)?;
         }
         _ => {
             return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -2799,5 +3043,28 @@ mod tests {
             Some(Value::int32(1)),
             "Promise.any must invoke a throwing aggregate reject exactly once"
         );
+    }
+
+    #[test]
+    fn all_keyed_resolves_empty_object_to_null_prototype() {
+        let module = blank_program("<promise-all-keyed-empty>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let method = machine.get_named_property(constructor, "allKeyed").unwrap();
+        assert!(machine.is_callable(method).unwrap(), "Promise.allKeyed is callable");
+        let proto = machine.intrinsics.object_prototype;
+        let input = super::super::ordinary_runtime(&mut machine, Some(proto)).unwrap();
+        let promise = machine.call_value(method, constructor, &[input]).unwrap();
+        machine.drain_microtasks().unwrap();
+        match state(&machine, promise) {
+            PromiseState::Fulfilled { value } => {
+                let proto = machine.internal_get_prototype_of(value).unwrap();
+                assert_eq!(proto, None, "resolves-empty-object.js result has null prototype");
+                let keys = machine.internal_own_property_keys(value).unwrap();
+                assert!(keys.is_empty(), "empty input resolves to empty object");
+            }
+            other => panic!("empty allKeyed should fulfill, got {other:?}"),
+        }
     }
 }
