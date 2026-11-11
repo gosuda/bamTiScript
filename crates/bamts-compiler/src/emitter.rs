@@ -749,6 +749,92 @@ pub(crate) fn print_with_jsx_plan(
     }
 }
 
+#[must_use]
+pub(crate) fn print_json_value(
+    source: PrintSource<'_>,
+    model: &SemanticModel,
+    options: PrintOptions,
+    names: &EmitFileNames,
+    expression: &Expr,
+) -> EmitOutput {
+    let PrintSource {
+        file,
+        original_content,
+        synthesized,
+        synthesized_floor,
+        inline_lines,
+    } = source;
+    let mut source_map = (options.source_map || options.inline_source_map).then(|| {
+        let mut builder = SourceMapBuilder::new().with_sources_content(options.inline_sources);
+        if let Some(file_name) = names.js_file_name.as_deref() {
+            builder = builder.with_file(file_name);
+        }
+        if let Some(source_root) = names.source_root.as_deref() {
+            builder = builder.with_source_root(source_root);
+        }
+        builder
+    });
+    if let Some(builder) = &mut source_map {
+        builder.intern_source_with_content(
+            names
+                .js_file_name
+                .as_deref()
+                .unwrap_or(names.source_name.as_ref()),
+            original_content,
+        );
+    }
+    let mapped_source_name: &str = names
+        .js_file_name
+        .as_deref()
+        .unwrap_or(names.source_name.as_ref());
+    let mut emitter = Emitter {
+        line_comments: file
+            .tokens()
+            .iter()
+            .filter(|token| token.kind() == TokenKind::LineComment)
+            .map(|token| token.range())
+            .collect(),
+        tokens: file.tokens(),
+        pending_comments: Vec::new(),
+        comment_cursor: Utf16Pos::ZERO,
+        source: file.source_text(),
+        source_name: mapped_source_name,
+        source_id: file.source_id(),
+        model,
+        enum_facts: model.enum_facts(),
+        options,
+        map: source_map.take(),
+        generated_line: 0,
+        generated_column: 0,
+        out: String::new(),
+        indent: 0,
+        pending_indent: false,
+        anchor: file.range(),
+        last_mapped_end: None,
+        jsx_plan: None,
+        diagnostics: Vec::new(),
+        decl_ambient: false,
+        current_scope: model.module_scope(),
+        decl_drop_member_export: false,
+        decl_source_is_js: false,
+        authored_len: Utf16Pos::new(utf16_len(original_content)),
+        synthesized,
+        synthesized_floor,
+        emitted_module_syntax: false,
+        inline_lines,
+    };
+    emitter.emit_expression_prec(expression, 0);
+    emitter.newline();
+    let code = emitter.out;
+    emitter.diagnostics.sort();
+    let source_map = emitter.map.take().map(SourceMapBuilder::finish);
+    EmitOutput {
+        javascript: Some(EmittedFile { code, source_map }),
+        declaration: None,
+        diagnostics: emitter.diagnostics,
+    }
+}
+
 pub(crate) fn parse_target(value: &str) -> Option<ScriptTarget> {
     match value.trim().to_ascii_lowercase().as_str() {
         "es3" => Some(ScriptTarget::Es3),

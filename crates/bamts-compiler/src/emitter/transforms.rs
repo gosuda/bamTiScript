@@ -25,14 +25,15 @@ use crate::jsx_desugar::{
     desugar_source_jsx,
 };
 use crate::source::{
-    JsxEmit, NodeIdSource, SourceId, SourcePositionError, SourceText, TextRange, Utf16Pos,
+    JsxEmit, NodeIdSource, ScriptKind, SourceId, SourcePositionError, SourceText, TextRange,
+    Utf16Pos,
 };
 use crate::syntax::*;
 
 use super::helpers::{self, HelperKind, HelperOptions};
 use super::{
-    EmitFileNames, EmitOutput, ModuleKind, Newline, PrintOptions, PrintSource, Surface,
-    print_with_jsx_plan,
+    EmittedFile, EmitFileNames, EmitOutput, ModuleKind, Newline, PrintOptions, PrintSource,
+    Surface, print_json_value, print_with_jsx_plan,
 };
 
 mod namespaces;
@@ -226,6 +227,157 @@ pub fn analyze(file: &SourceFile, options: &TransformOptions) -> TransformPlan {
     }
 }
 
+fn emit_json_file(
+    file: &SourceFile,
+    model: &SemanticModel,
+    options: &TransformOptions,
+    names: &EmitFileNames,
+) -> EmitOutput {
+    let print_options = PrintOptions {
+        newline: options.newline,
+        indent_width: options.indent_width,
+        target: options.target,
+        source_map: options.source_map,
+        inline_source_map: options.inline_source_map,
+        inline_sources: options.inline_sources,
+        remove_comments: options.remove_comments,
+        module_marker: false,
+        verbatim_module_syntax: options.verbatim_module_syntax,
+    };
+    let statements = file.statements();
+    if statements.is_empty() {
+        return EmitOutput {
+            javascript: Some(EmittedFile {
+                code: String::new(),
+                source_map: None,
+            }),
+            ..EmitOutput::default()
+        };
+    }
+    let print_original = |expression: &Expr| {
+        print_json_value(
+            PrintSource {
+                file,
+                original_content: file.source_text().as_str(),
+                synthesized: None,
+                synthesized_floor: u32::MAX,
+                inline_lines: None,
+            },
+            model,
+            print_options,
+            names,
+            expression,
+        )
+    };
+    if let [statement] = statements {
+        match statement.data() {
+            Statement::Expression(expression) => {
+                return print_original(&expression.expression);
+            }
+            Statement::Block(block) if block.data().statements.is_empty() => {
+                let mut ids = NodeIdSource::after(file.id());
+                let empty = Node::new(
+                    ids.fresh(),
+                    file.range(),
+                    Expression::Object(ObjectLiteral { members: Vec::new() }),
+                );
+                return print_original(&empty);
+            }
+            Statement::Block(_) => {
+                return emit_json_object(file, model, &print_options, names);
+            }
+            _ => {}
+        }
+    }
+    let identifiers: Option<Vec<&IdentifierNode>> = statements
+        .iter()
+        .map(|statement| match statement.data() {
+            Statement::Expression(expression) => match expression.expression.data() {
+                Expression::Identifier(identifier) => Some(identifier),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let Some(identifiers) = identifiers else {
+        return EmitOutput::default();
+    };
+    let mut ids = NodeIdSource::after(file.id());
+    let mut members = Vec::with_capacity(identifiers.len());
+    for identifier in identifiers {
+        let value = Node::new(
+            ids.fresh(),
+            identifier.range(),
+            Expression::Identifier(identifier.clone()),
+        );
+        members.push(Node::new(
+            ids.fresh(),
+            identifier.range(),
+            ObjectMember::Property(ObjectProperty {
+                name: PropertyName::Identifier(identifier.clone()),
+                value: Box::new(value),
+                modifier: PropertyModifier::None,
+                shorthand: true,
+            }),
+        ));
+    }
+    let object = Node::new(
+        ids.fresh(),
+        file.range(),
+        Expression::Object(ObjectLiteral { members }),
+    );
+    print_original(&object)
+}
+
+fn emit_json_object(
+    file: &SourceFile,
+    model: &SemanticModel,
+    options: &PrintOptions,
+    names: &EmitFileNames,
+) -> EmitOutput {
+    let wrapped = format!("({})", file.source_text().as_str());
+    let text = match SourceText::new(wrapped.as_str()) {
+        Ok(text) => Arc::new(text),
+        Err(_) => {
+            return EmitOutput {
+                diagnostics: vec![Diagnostic::error(
+                    codes::SOURCE_TOO_LARGE,
+                    file.source_id(),
+                    file.range(),
+                    "transformed source text exceeds the per-file budget",
+                )],
+                ..EmitOutput::default()
+            };
+        }
+    };
+    let reparsed = crate::parser::parse(crate::scanner::scan(
+        file.source_id(),
+        ScriptKind::TypeScript,
+        text,
+    ))
+    .into_product();
+    if let [statement] = reparsed.statements() {
+        if let Statement::Expression(expression) = statement.data() {
+            if let Expression::Parenthesized(inner) = expression.expression.data() {
+                return print_json_value(
+                    PrintSource {
+                        file: &reparsed,
+                        original_content: reparsed.source_text().as_str(),
+                        synthesized: None,
+                        synthesized_floor: u32::MAX,
+                        inline_lines: None,
+                    },
+                    model,
+                    *options,
+                    names,
+                    inner,
+                );
+            }
+        }
+    }
+    EmitOutput::default()
+}
+
 /// Rewrites `file` for `options.target` and prints it through the core printer.
 #[must_use]
 pub fn emit_transformed(
@@ -234,6 +386,9 @@ pub fn emit_transformed(
     options: &TransformOptions,
     names: &EmitFileNames,
 ) -> EmitOutput {
+    if file.script_kind() == ScriptKind::Json {
+        return emit_json_file(file, model, options, names);
+    }
     let plan = analyze(file, options);
     let mut ids = NodeIdSource::after(file.id());
     let jsx_plan = executable_jsx_plan(file, options, names, &mut ids);
@@ -12248,6 +12403,72 @@ mod tests {
 
     fn javascript(output: &EmitOutput) -> &str {
         &output.javascript.as_ref().expect("JavaScript output").code
+    }
+    fn parse_json(source: &str) -> crate::syntax::SourceFile {
+        parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::Json,
+            Arc::new(SourceText::new(source).expect("test source fits the per-file source budget")),
+        ))
+        .into_product()
+    }
+    fn emit_json_at(source: &str, target: ScriptTarget) -> EmitOutput {
+        let file = parse_json(source);
+        let checked = checker::check(&Recovered::clean(parse_json(source)));
+        let options = options_for(target);
+        emit_transformed(
+            &file,
+            checked.product(),
+            &options.transform_view(),
+            &names(),
+        )
+    }
+    #[test]
+    fn json_empty_object_prints_braces_without_prologue_like_require_of_json_file_with_empty_object() {
+        assert_eq!(javascript(&emit_json_at("{\n}\n", ScriptTarget::Es2015)), "{}\n");
+    }
+    #[test]
+    fn json_trailing_comma_drops_and_keeps_indent_like_require_of_json_file_with_trailling_comma() {
+        assert_eq!(
+            javascript(&emit_json_at(
+                "{\n    \"a\": true,\n    \"b\": \"hello\",\n}\n",
+                ScriptTarget::Es2015
+            )),
+            "{\n    \"a\": true,\n    \"b\": \"hello\"\n}\n"
+        );
+    }
+    #[test]
+    fn json_invalid_content_prints_shorthand_object_like_require_of_json_file_without_resolve_json_module() {
+        assert_eq!(
+            javascript(&emit_json_at("contents Not read", ScriptTarget::Es2015)),
+            "{ contents, Not, read }\n"
+        );
+    }
+    #[test]
+    fn json_empty_input_prints_empty_without_prologue_like_require_of_json_file_with_no_content() {
+        let output = emit_json_at("", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(code.is_empty(), "{code:?}");
+    }
+    #[test]
+    fn json_values_print_like_require_of_json_file_types() {
+        for (source, expected) in [
+            ("[\"a\", null, \"string\"]\n", "[\"a\", null, \"string\"]\n"),
+            ("\"dConfig\"\n", "\"dConfig\"\n"),
+            ("-10\n", "-10\n"),
+            ("[-10, 30]\n", "[-10, 30]\n"),
+            ("[true, false]\n", "[true, false]\n"),
+            (
+                "{\n    \"a\": true,\n    \"b\": \"hello\",\n    \"c\": null,\n    \"d\": false\n}\n",
+                "{\n    \"a\": true,\n    \"b\": \"hello\",\n    \"c\": null,\n    \"d\": false\n}\n",
+            ),
+        ] {
+            assert_eq!(
+                javascript(&emit_json_at(source, ScriptTarget::Es2015)),
+                expected,
+                "{source:?}"
+            );
+        }
     }
 
     #[test]

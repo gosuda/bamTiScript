@@ -422,6 +422,7 @@ fn javascript_file_name(source: &Path, jsx_preserve: bool) -> Result<PathBuf, Ou
         Some("cts" | "cjs") => "cjs",
         Some("js") => "js",
         Some("jsx") => "jsx",
+        Some("json") => "json",
         _ => {
             return Err(OutputMapError::UnsupportedSourceExtension {
                 source: source.to_path_buf(),
