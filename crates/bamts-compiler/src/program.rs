@@ -2820,7 +2820,7 @@ pub fn lower_program_with_cancel(
         )?;
         let mut linked_modules = Vec::with_capacity(raw_modules.len());
         let mut provenance = Vec::with_capacity(raw_modules.len());
-        let mut module_failed: Option<ProgramLowerError> = None;
+        let mut module_failed: Option<(SourceId, ProgramLowerError)> = None;
         for (index, (kept_module, raw)) in kept.iter().zip(raw_modules.iter()).enumerate() {
             check_lower_cancel(cancel, kept_module.path(), ProgramLowerPhase::Module)?;
             let code = if let Some(stub) = stub_codes.remove(&kept_module.source_id()) {
@@ -2851,10 +2851,13 @@ pub fn lower_program_with_cancel(
                 }) {
                     Ok(code) => code,
                     Err(error) => {
-                        module_failed = Some(program_lower_error(
-                            kept_module.path(),
-                            ProgramLowerPhase::Module,
-                            ProgramLowerErrorKind::Lower(error),
+                        module_failed = Some((
+                            kept_module.source_id(),
+                            program_lower_error(
+                                kept_module.path(),
+                                ProgramLowerPhase::Module,
+                                ProgramLowerErrorKind::Lower(error),
+                            ),
                         ));
                         break;
                     }
@@ -2868,8 +2871,20 @@ pub fn lower_program_with_cancel(
                 edges: Arc::from(kept_module.dependencies()),
             });
         }
-        if let Some(failure) = module_failed {
-            return Err(failure);
+        if let Some((failing, failure)) = module_failed {
+            if static_reachable.contains(&failing) {
+                return Err(failure);
+            }
+            let mut quarantine = DynamicQuarantine {
+                resolved,
+                static_reachable: &static_reachable,
+                stubbed: &mut stubbed,
+                excluded: &mut excluded,
+            };
+            if !quarantine.quarantine(failing) {
+                return Err(failure);
+            }
+            continue;
         }
         let entry = new_ids[&resolved.entrypoint_id()];
         check_lower_cancel(
@@ -2912,35 +2927,13 @@ pub fn lower_program_with_cancel(
                         ProgramLowerErrorKind::Link(link_error),
                     ));
                 }
-                let mut progressed = false;
-                if stubbed.insert(failing) {
-                    progressed = true;
-                }
-                {
-                    let mut stack = vec![failing];
-                    let mut seen: HashSet<SourceId> = HashSet::new();
-                    while let Some(current) = stack.pop() {
-                        if !seen.insert(current) {
-                            continue;
-                        }
-                        let Some(node) = resolved.module(current) else {
-                            continue;
-                        };
-                        for dep in node.dependencies() {
-                            if let ModuleTarget::Local(target) = dep.target() {
-                                if *target != failing
-                                    && !static_reachable.contains(target)
-                                    && !stubbed.contains(target)
-                                    && excluded.insert(*target)
-                                {
-                                    progressed = true;
-                                }
-                                stack.push(*target);
-                            }
-                        }
-                    }
-                }
-                if !progressed {
+                let mut quarantine = DynamicQuarantine {
+                    resolved,
+                    static_reachable: &static_reachable,
+                    stubbed: &mut stubbed,
+                    excluded: &mut excluded,
+                };
+                if !quarantine.quarantine(failing) {
                     let path = resolved
                         .module(failing)
                         .map_or_else(|| resolved.entrypoint().path(), ResolvedModule::path);
@@ -2955,6 +2948,91 @@ pub fn lower_program_with_cancel(
         }
     }
 }
+
+fn live_without(
+    resolved: &ResolvedProgram,
+    failing: SourceId,
+    excluded: &HashSet<SourceId>,
+    stubbed: &HashSet<SourceId>,
+) -> HashSet<SourceId> {
+    let mut protected = HashSet::new();
+    let mut stack = vec![resolved.entrypoint_id()];
+    while let Some(current) = stack.pop() {
+        if current == failing || !protected.insert(current) {
+            continue;
+        }
+
+        if excluded.contains(&current) || stubbed.contains(&current) {
+            continue;
+        }
+        let Some(node) = resolved.module(current) else {
+            continue;
+        };
+        for dependency in node.dependencies() {
+            if let ModuleTarget::Local(target) = dependency.target() {
+                if *target != failing {
+                    stack.push(*target);
+                }
+            }
+        }
+    }
+    protected
+}
+
+struct DynamicQuarantine<'a> {
+    resolved: &'a ResolvedProgram,
+    static_reachable: &'a HashSet<SourceId>,
+    stubbed: &'a mut HashSet<SourceId>,
+    excluded: &'a mut HashSet<SourceId>,
+}
+
+impl DynamicQuarantine<'_> {
+    fn quarantine(&mut self, failing: SourceId) -> bool {
+        let mut progressed = self.stubbed.insert(failing);
+        let protected = live_without(self.resolved, failing, self.excluded, self.stubbed);
+        progressed |= self.exclude_transitive(failing, &protected);
+        progressed
+    }
+
+    fn exclude_transitive(&mut self, failing: SourceId, protected: &HashSet<SourceId>) -> bool {
+        let mut progressed = false;
+        let mut stack = vec![failing];
+        let mut seen = HashSet::new();
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            let Some(node) = self.resolved.module(current) else {
+                continue;
+            };
+            for dependency in node.dependencies() {
+                if let ModuleTarget::Local(target) = dependency.target() {
+                    progressed |= self.consider(target, failing, protected, &mut stack);
+                }
+            }
+        }
+        progressed
+    }
+
+    fn consider(
+        &mut self,
+        target: &SourceId,
+        failing: SourceId,
+        protected: &HashSet<SourceId>,
+        stack: &mut Vec<SourceId>,
+    ) -> bool {
+        stack.push(*target);
+        if *target == failing
+            || self.static_reachable.contains(target)
+            || protected.contains(target)
+            || self.stubbed.contains(target)
+        {
+            return false;
+        }
+        self.excluded.insert(*target)
+    }
+}
+
 fn check_lower_cancel(
     cancel: &CancellationToken,
     path: &Path,
@@ -5095,6 +5173,38 @@ mod tests {
             .expect("dynamic link failure becomes runtime rejection");
         let main_wire = module(&executable, "main.ts");
         assert!(main_wire.edges().iter().any(|edge| edge.kind == EdgeKind::Dynamic));
+    }
+    #[test]
+    fn dynamic_link_failure_keeps_shared_dependency_of_surviving_branch() {
+        let fixture = Fixture::new();
+        fixture.write("shared.ts", "export const value = 1;");
+        fixture.write(
+            "good.ts",
+            "import { value } from './shared.js';\nexport const got = value;\n",
+        );
+        fixture.write(
+            "bad.ts",
+            "import { value } from './shared.js';\n\
+             export { x } from './bad-2.js';\n\
+             export const other = value;\n",
+        );
+        fixture.write("bad-2.ts", "export { x } from './bad.js';\n");
+        fixture.write(
+            "main.ts",
+            "const good = import('./good.js');\nconst bad = import('./bad.js');\ngood;\nbad;\n",
+        );
+        let executable = lower_fixture(&fixture, "main.ts");
+        let good = module(&executable, "good.ts");
+        let shared_edge = good
+            .edges()
+            .iter()
+            .find(|edge| constant_string(good, edge.specifier) == "./shared.js")
+            .expect("the surviving branch keeps its shared edge");
+        assert!(
+            matches!(shared_edge.target, EdgeTarget::Local(_)),
+            "the shared dependency stays local instead of being excluded with the failure"
+        );
+        module(&executable, "shared.ts");
     }
 
 
