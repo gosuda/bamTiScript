@@ -38,7 +38,11 @@ impl ShapeTable {
     }
 
     pub(crate) fn slot_count(&self, id: ShapeId) -> u32 {
-        self.0[id.index()].slot + 1
+        if id == ShapeId::ROOT {
+            0
+        } else {
+            self.0[id.index()].slot + 1
+        }
     }
 
     pub(crate) fn transition(&mut self, from: ShapeId, key: &PropertyKey) -> ShapeId {
@@ -106,5 +110,19 @@ impl ShapeTable {
             current = shape.parent;
         }
         table
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_count_tracks_shape_depth() {
+        let mut shapes = ShapeTable::new();
+        assert_eq!(shapes.slot_count(ShapeId::ROOT), 0);
+        let child = shapes.transition(ShapeId::ROOT, &PropertyKey::Private(0));
+        assert_eq!(shapes.slot_count(child), 1);
+        let grandchild = shapes.transition(child, &PropertyKey::Private(1));
+        assert_eq!(shapes.slot_count(grandchild), 2);
     }
 }
