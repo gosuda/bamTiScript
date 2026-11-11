@@ -2589,4 +2589,22 @@ mod tests {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
     }
+
+    #[test]
+    fn invalid_regex_modifiers_are_rejected() {
+        for source in [
+            "/(?I:a)/;",
+            "/(?i-i:a)/;",
+            "/(?m-m:a)/;",
+            "/(?d:a)/;",
+            "/(?-:a)/;",
+            "/(?ms-i)/;",
+            "/(?-s)/;",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in ["/(?i:a)/;", "/(?m:a)/;", "/(?i-m:a)/;", "/(?-i:a)/;"] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
 }
