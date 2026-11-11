@@ -350,7 +350,7 @@ fn rooted_in_import(expression: &Expr) -> bool {
     }
 }
 
-fn strip_parentheses(expression: &Expr) -> &Expr {
+pub(crate) fn strip_parentheses(expression: &Expr) -> &Expr {
     match expression.data() {
         Expression::Parenthesized(inner) => strip_parentheses(inner),
         _ => expression,
@@ -1586,11 +1586,12 @@ impl Walker<'_> {
                 }
             }
             AssignmentTarget::Invalid(expression) => {
-                // Annex B keeps `f() = 1` a runtime error in sloppy code, but not a
-                // call in an optional chain.
+                // Annex B keeps `f() = 1` and `(f()) += 1` a runtime error in sloppy
+                // code, but not a call in an optional chain.
+                let call = strip_parentheses(expression);
                 if context.strict
-                    || !matches!(expression.data(), Expression::Call(_))
-                    || in_optional_chain(expression)
+                    || !matches!(call.data(), Expression::Call(_))
+                    || in_optional_chain(call)
                 {
                     self.error(target.range(), "this cannot be assigned to");
                 }
@@ -2366,6 +2367,41 @@ mod tests {
         }
         for source in ["[a?.b()] = [];", "({ x: a?.b() } = {});"] {
             assert_eq!(errors(source).len(), 1, "one error for {source}");
+        }
+    }
+
+    /// Parentheses pass a name or a member through to every assignment operator,
+    /// and a call through to the runtime error of Annex B, as Node reads them.
+    #[test]
+    fn a_parenthesized_target_takes_every_assignment_operator() {
+        for source in [
+            "(x) += 1;",
+            "((x)) -= 1;",
+            "(a.b) *= 2;",
+            "(a['b']) **= 2;",
+            "(x) &&= 1;",
+            "(a.b) ||= 1;",
+            "(x) ??= 1;",
+            "(eval) += 1;",
+            "(f()) += 1;",
+            "((f())) <<= 1;",
+            "(a?.b)() += 1;",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+        for source in [
+            "(f()) &&= 1;",
+            "(a?.b) += 1;",
+            "(a?.b()) += 1;",
+            "(this) += 1;",
+            "(a, b) += 1;",
+            "([x]) += 1;",
+            "({ x }) += 1;",
+            "'use strict'; (f()) += 1;",
+            "'use strict'; (eval) += 1;",
+            "'use strict'; (arguments) &&= 1;",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
         }
     }
 

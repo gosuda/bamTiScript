@@ -120,6 +120,15 @@ fn with_roots<H: Host, T>(
 fn keep_root<H: Host>(machine: &mut Machine<'_, H>, depth: usize, value: Value) {
     machine.native_roots[depth].push(value);
 }
+/// How many roots the frame at `depth` holds, for `release_roots`.
+fn root_count<H: Host>(machine: &Machine<'_, H>, depth: usize) -> usize {
+    machine.native_roots[depth].len()
+}
+/// Drops the roots that `keep_root` added after the frame held `count`. A loop that
+/// is done with the values of a step calls this, so that it holds one step at a time.
+fn release_roots<H: Host>(machine: &mut Machine<'_, H>, depth: usize, count: usize) {
+    machine.native_roots[depth].truncate(count);
+}
 fn install_function<H: Host>(
     heap: &mut Vec<HeapEntry>,
     atoms: &mut crate::AtomTable,

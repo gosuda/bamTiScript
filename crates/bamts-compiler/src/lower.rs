@@ -11841,6 +11841,12 @@ mod tests {
         lower_js_result(src).expect("snippet lowers to a verified module")
     }
     #[test]
+    fn a_parenthesized_name_or_member_lowers_for_every_assignment_operator() {
+        lower_js(
+            "var x = 1, o = { a: 1 }; (x) += 1; ((x)) **= 2; (o.a) *= 2; (o['a']) ??= 1; (x) &&= 3;",
+        );
+    }
+    #[test]
     fn a_call_target_lowers_to_the_call_and_a_reference_error() {
         for (statement, message) in [
             ("f() = 1;", "Invalid left-hand side in assignment"),

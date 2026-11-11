@@ -703,6 +703,29 @@ mod tests {
         assert_eq!(range(&standard, -1.0, -1.0), "~-$1.00");
     }
 
+    /// CLDR has no accounting form of a compact pattern, so a value with a compact
+    /// suffix takes a minus sign, as in Node, and a value without one keeps the
+    /// parentheses.
+    #[test]
+    fn a_compact_accounting_value_with_a_suffix_takes_a_minus_sign() {
+        let compact = english(NumberFormatOptions {
+            style: Some("currency".to_owned()),
+            currency: Some("USD".to_owned()),
+            currency_sign: Some("accounting".to_owned()),
+            notation: Some("compact".to_owned()),
+            ..NumberFormatOptions::default()
+        });
+        let text = |value| compact.format_number(value).expect("a text");
+        assert_eq!(text(-1234.0), "-$1.2K");
+        assert_eq!(text(-999.9), "-$1K");
+        assert_eq!(text(-999.0), "($999)");
+        assert_eq!(text(-0.0), "($0)");
+        assert_eq!(range(&compact, -1000.0, -2000.0), "-$1–2K");
+        assert_eq!(range(&compact, -1500.0, -1500.0), "~-$1.5K");
+        assert_eq!(range(&compact, -1500.0, -500.0), "-$1.5K – ($500)");
+        assert_eq!(range(&compact, -500.0, -100.0), "($500–100)");
+    }
+
     #[test]
     fn a_hidden_sign_keeps_a_range_a_range() {
         let unsigned = english(NumberFormatOptions {

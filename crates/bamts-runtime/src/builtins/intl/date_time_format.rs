@@ -2,6 +2,7 @@
 
 use bamts_native::{Decoded, Value};
 
+use super::super::date_full::TimeZoneRule;
 use super::super::temporal::temporal_record;
 use super::options::{
     Options, boolean_option, canonicalize_locale_list, coerce_options_to_object,
@@ -233,7 +234,30 @@ pub(super) fn read_options<H: Host>(
     })
 }
 
-/// CreateDateTimeFormat over already canonicalized locales.
+/// The identifier of the time zone of the host, where a format can hold it: a
+/// fixed offset in whole minutes, below 24 hours. The local methods of `Date` read
+/// the same rule.
+fn host_time_zone<H: Host>(machine: &Machine<'_, H>) -> Option<String> {
+    let TimeZoneRule::Fixed { offset_seconds, .. } = TimeZoneRule::from_host(machine.host).ok()?
+    else {
+        return None;
+    };
+    if offset_seconds % 60 != 0 || offset_seconds.unsigned_abs() >= 24 * 60 * 60 {
+        return None;
+    }
+    let minutes = offset_seconds / 60;
+    Some(if minutes == 0 {
+        String::from("UTC")
+    } else {
+        let sign = if minutes < 0 { '-' } else { '+' };
+        let minutes = minutes.unsigned_abs();
+        format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60)
+    })
+}
+
+/// CreateDateTimeFormat over already canonicalized locales. With no `timeZone`
+/// option, the format is in the time zone of the host, as the local methods of
+/// `Date` are, so that `toLocaleTimeString` and `getHours` agree.
 pub(super) fn create_date_time_format<H: Host>(
     machine: &mut Machine<'_, H>,
     requested: &[String],
@@ -241,6 +265,17 @@ pub(super) fn create_date_time_format<H: Host>(
     required: RequiredComponents,
     defaults: DefaultComponents,
 ) -> Result<DateTimeFormat, EvalFailure> {
+    let in_host_zone;
+    let options = match host_time_zone(machine) {
+        Some(zone) if options.time_zone.is_none() => {
+            in_host_zone = DateTimeFormatOptions {
+                time_zone: Some(zone),
+                ..options.clone()
+            };
+            &in_host_zone
+        }
+        _ => options,
+    };
     DateTimeFormat::try_new_with_mode(
         requested,
         options,

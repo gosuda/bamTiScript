@@ -1309,6 +1309,8 @@ pub struct NumberFormat<'a> {
     symbols: NumberSymbols,
     grouping: GroupingSizes,
     patterns: NumberPatternSet,
+    /// The patterns of a value that takes a compact suffix, where they differ.
+    compact_patterns: Option<NumberPatternSet>,
     scientific_pattern: Option<String>,
     range_patterns: RangePatterns,
 }
@@ -1454,6 +1456,23 @@ impl<'a> NumberFormat<'a> {
             .number_patterns(&resolved.data_locale, request)
             .ok_or_else(|| NumberFormatError::missing("missing number pattern"))?;
         validate_number_patterns(&patterns)?;
+        // CLDR has no accounting form of a compact currency pattern, so a value
+        // that takes a compact suffix is signed as in the standard form.
+        let compact_patterns = if notation == Notation::Compact
+            && request.currency_sign == Some(CurrencySign::Accounting)
+        {
+            let request = NumberPatternRequest {
+                currency_sign: Some(CurrencySign::Standard),
+                ..request
+            };
+            let patterns = provider
+                .number_patterns(&resolved.data_locale, request)
+                .ok_or_else(|| NumberFormatError::missing("missing number pattern"))?;
+            validate_number_patterns(&patterns)?;
+            Some(patterns)
+        } else {
+            None
+        };
         let scientific_pattern = if matches!(notation, Notation::Scientific | Notation::Engineering)
         {
             let pattern = provider
@@ -1497,6 +1516,7 @@ impl<'a> NumberFormat<'a> {
             symbols,
             grouping,
             patterns,
+            compact_patterns,
             scientific_pattern,
             range_patterns,
         })
@@ -1896,7 +1916,7 @@ impl<'a> NumberFormat<'a> {
         prepared: &PreparedFormat,
         category: PluralCategory,
     ) -> Result<Vec<NumberPart>, NumberFormatError> {
-        let pattern = self.pattern_for_value(&prepared.rounded);
+        let pattern = self.pattern_for(prepared);
         let tokens = partition_pattern(pattern)?;
         let digits = matches!(
             prepared.rounded,
@@ -2117,28 +2137,37 @@ impl<'a> NumberFormat<'a> {
             .collect()
     }
 
-    fn pattern_for_value(&self, value: &IntlMathematicalValue) -> &str {
-        let category = value_category(value);
+    /// The sign patterns of `prepared`: those of a compact suffix where it has one.
+    fn patterns_for(&self, prepared: &PreparedFormat) -> &NumberPatternSet {
+        match &self.compact_patterns {
+            Some(patterns) if prepared.exponent != 0 => patterns,
+            _ => &self.patterns,
+        }
+    }
+
+    fn pattern_for(&self, prepared: &PreparedFormat) -> &str {
+        let patterns = self.patterns_for(prepared);
+        let category = value_category(&prepared.rounded);
         match self.sign_display {
-            SignDisplay::Never => &self.patterns.zero,
+            SignDisplay::Never => &patterns.zero,
             SignDisplay::Auto => match category {
-                ValueCategory::Positive | ValueCategory::ZeroPositive => &self.patterns.zero,
-                ValueCategory::Negative | ValueCategory::ZeroNegative => &self.patterns.negative,
+                ValueCategory::Positive | ValueCategory::ZeroPositive => &patterns.zero,
+                ValueCategory::Negative | ValueCategory::ZeroNegative => &patterns.negative,
             },
             SignDisplay::Always => match category {
-                ValueCategory::Positive | ValueCategory::ZeroPositive => &self.patterns.positive,
-                ValueCategory::Negative | ValueCategory::ZeroNegative => &self.patterns.negative,
+                ValueCategory::Positive | ValueCategory::ZeroPositive => &patterns.positive,
+                ValueCategory::Negative | ValueCategory::ZeroNegative => &patterns.negative,
             },
             SignDisplay::ExceptZero => match category {
-                ValueCategory::ZeroPositive | ValueCategory::ZeroNegative => &self.patterns.zero,
-                ValueCategory::Positive => &self.patterns.positive,
-                ValueCategory::Negative => &self.patterns.negative,
+                ValueCategory::ZeroPositive | ValueCategory::ZeroNegative => &patterns.zero,
+                ValueCategory::Positive => &patterns.positive,
+                ValueCategory::Negative => &patterns.negative,
             },
             SignDisplay::Negative => match category {
-                ValueCategory::Negative => &self.patterns.negative,
+                ValueCategory::Negative => &patterns.negative,
                 ValueCategory::Positive
                 | ValueCategory::ZeroPositive
-                | ValueCategory::ZeroNegative => &self.patterns.zero,
+                | ValueCategory::ZeroNegative => &patterns.zero,
             },
         }
     }
@@ -2150,8 +2179,9 @@ impl<'a> NumberFormat<'a> {
         prepared: &PreparedFormat,
     ) -> Result<Vec<NumberRangePart>, NumberFormatError> {
         let number_parts = self.partition_outer_pattern(prepared)?;
-        let pattern = self.pattern_for_value(&prepared.rounded);
-        let unsigned = pattern == self.patterns.negative && !pattern.contains("{minusSign}");
+        let pattern = self.pattern_for(prepared);
+        let unsigned =
+            pattern == self.patterns_for(prepared).negative && !pattern.contains("{minusSign}");
         let tokens = partition_pattern(if unsigned {
             "{number}"
         } else {

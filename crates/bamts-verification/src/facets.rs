@@ -51,7 +51,7 @@ pub const DIAGNOSTIC_CODE_MAP_PATH: &str = "verification/diagnostic-code-map.jso
 pub const DIAGNOSTIC_CODE_MAP_SCHEMA_VERSION: u32 = 1;
 
 /// Every current BAMTS diagnostic code the map must cover exactly once.
-pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 131] = [
+pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 132] = [
     "BAMTS-L001",
     "BAMTS-L002",
     "BAMTS-L003",
@@ -67,6 +67,7 @@ pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 131] = [
     "BAMTS-L013",
     "BAMTS-L014",
     "BAMTS-L015",
+    "BAMTS-L016",
     "BAMTS-P001",
     "BAMTS-P002",
     "BAMTS-P003",

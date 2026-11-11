@@ -10,6 +10,7 @@ use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
 use super::array_es2023::{index_key, integer_or_infinity, length_of_array_like};
+use super::array_generic::tick;
 use super::regexp::{builtin_exec, regexp_parts};
 use super::{allocate_array, allocate_string, keep_root, type_error, with_roots};
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
@@ -335,7 +336,14 @@ fn split_steps<H: Host>(
         }
         piece_start = end;
         let captures = length_of_array_like(machine, matched)?.saturating_sub(1);
+        // The pieces of every match so far count too: each match can claim again.
+        budget_claimed_captures(
+            machine,
+            pieces.len() + captures.min(limit - pieces.len()),
+            2 * std::mem::size_of::<Value>(),
+        )?;
         for index in 1..=captures {
+            tick(machine)?;
             let key = index_key(&mut machine.atoms, index);
             let capture = machine.get_property_key(matched, &key)?;
             keep_root(machine, depth, capture);
@@ -352,6 +360,20 @@ fn split_steps<H: Host>(
     )?;
     pieces.push(tail);
     allocate_array(machine, pieces)
+}
+
+/// Holds `count` captures of `size` bytes each against the heap budget before a loop
+/// reads them. A result of `exec` can claim any length, so the claim reserves no
+/// memory, and a claim past the budget is a runtime failure in place of a loop that
+/// ends when the host has no more memory.
+fn budget_claimed_captures<H: Host>(
+    machine: &Machine<'_, H>,
+    count: usize,
+    size: usize,
+) -> Result<(), EvalFailure> {
+    machine
+        .ensure_allocation_capacity(0, count.saturating_mul(size))
+        .map_err(EvalFailure::Runtime)
 }
 
 /// One match result read in full, as `@@replace` requires before it calls user
@@ -373,8 +395,14 @@ fn read_replace_step<H: Host>(
     let matched = machine.coerce_string_observable(matched)?;
     let position = machine.get_named_property(result, "index")?;
     let position = integer_or_infinity(machine, position)?.clamp(0.0, length as f64) as usize;
-    let mut captures = Vec::with_capacity(capture_count);
+    budget_claimed_captures(
+        machine,
+        capture_count,
+        std::mem::size_of::<Option<EcmaString>>(),
+    )?;
+    let mut captures = Vec::new();
     for index in 1..=capture_count {
+        tick(machine)?;
         let key = index_key(&mut machine.atoms, index);
         let capture = machine.get_property_key(result, &key)?;
         captures.push(if capture == Value::UNDEFINED {
@@ -1010,7 +1038,7 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
     use crate::intrinsics::{BuiltinDef, native_function};
-    use crate::{Limits, ThrowOrigin};
+    use crate::{Limits, RuntimeErrorKind, ThrowOrigin};
 
     fn regexp(machine: &mut Machine<'_, TestHost>, pattern: &str, flags: &str) -> Value {
         let constructor = machine.intrinsics.global("RegExp").unwrap();
@@ -1117,6 +1145,148 @@ mod tests {
         let result =
             outcome_value(symbol_replace(&mut machine, rx, &[string, replacement], false).unwrap());
         assert!(machine.string_value(result).unwrap().eq_ascii("a[b]c"));
+    }
+
+    /// A match of `b` at index 1 in an object that claims `length` elements.
+    fn claiming_result(
+        machine: &mut Machine<'_, TestHost>,
+        length: f64,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let matched = allocate_string(machine, EcmaString::encode("b"))?;
+        let result = ordinary_object(machine);
+        machine.set_data_property(result, "0", matched)?;
+        machine.set_data_property(result, "index", Value::int32(1))?;
+        machine.set_data_property(result, "length", crate::number_value(length))?;
+        Ok(BuiltinOutcome::Value(result))
+    }
+
+    fn endless_exec(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        claiming_result(machine, MAX_SAFE_INTEGER)
+    }
+
+    fn long_exec(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        claiming_result(machine, 1000.0)
+    }
+
+    /// Makes `handler` the `exec` of every RegExp, also of the splitter that
+    /// `@@split` constructs.
+    fn replace_exec(
+        machine: &mut Machine<'_, TestHost>,
+        handler: crate::intrinsics::BuiltinHandler<TestHost>,
+    ) {
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "claiming exec",
+            length: 1,
+            handler,
+        });
+        let exec = native_function(&mut machine.heap, &mut machine.atoms, id, "claiming exec", 1);
+        let prototype = machine.intrinsics.regexp_prototype();
+        machine.set_data_property(prototype, "exec", exec).unwrap();
+    }
+
+    /// A result of `exec` can claim 2^53 - 1 elements. Before, `@@replace` reserved
+    /// memory for all of them, which ended the process.
+    #[test]
+    fn a_result_that_claims_endless_captures_is_a_runtime_failure() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let rx = regexp(&mut machine, "b", "");
+        replace_exec(&mut machine, endless_exec);
+        let (string, replacement) = (text(&mut machine, "abc"), text(&mut machine, "x"));
+        assert!(matches!(
+            symbol_replace(&mut machine, rx, &[string, replacement], false),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::HeapByteLimitExceeded { .. }
+            ))
+        ));
+        assert!(matches!(
+            symbol_split(&mut machine, rx, &[string], false),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::HeapByteLimitExceeded { .. }
+            ))
+        ));
+        // A limit bounds what `@@split` keeps, so the claim does not matter there.
+        let limited = outcome_value(
+            symbol_split(&mut machine, rx, &[string, Value::int32(3)], false).unwrap(),
+        );
+        assert_eq!(machine.array_elements(limited).unwrap().unwrap().len(), 3);
+    }
+
+    thread_local! {
+        static EXEC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A claim that the budget of the test below holds one time and not two times.
+    fn counted_exec(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        EXEC_CALLS.with(|calls| calls.set(calls.get() + 1));
+        claiming_result(machine, 40_001.0)
+    }
+
+    /// Each match of `@@split` can claim again, so the pieces of all matches count
+    /// together. The second match fails here, before `exec` runs for a third.
+    #[test]
+    fn the_captures_of_every_split_match_count_against_the_budget_together() {
+        let module = blank_program("<test>");
+        let used = {
+            let mut host = TestHost;
+            Machine::new(&module, &mut host, Limits::default()).heap_bytes
+        };
+        let mut host = TestHost;
+        let limits = Limits {
+            max_heap_bytes: used + (1 << 20),
+            ..Limits::default()
+        };
+        let mut machine = Machine::new(&module, &mut host, limits);
+        let rx = regexp(&mut machine, "b", "");
+        replace_exec(&mut machine, counted_exec);
+        let string = text(&mut machine, "abcdefgh");
+        EXEC_CALLS.with(|calls| calls.set(0));
+        assert!(matches!(
+            symbol_split(&mut machine, rx, &[string], false),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::HeapByteLimitExceeded { .. }
+            ))
+        ));
+        // Two calls find no progress, and two calls find a match.
+        assert_eq!(EXEC_CALLS.with(std::cell::Cell::get), 4);
+    }
+
+    #[test]
+    fn a_loop_over_claimed_captures_runs_out_of_fuel() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let limits = Limits {
+            fuel: 16,
+            ..Limits::default()
+        };
+        let mut machine = Machine::new(&module, &mut host, limits);
+        let rx = regexp(&mut machine, "b", "");
+        replace_exec(&mut machine, long_exec);
+        let (string, replacement) = (text(&mut machine, "abc"), text(&mut machine, "x"));
+        assert!(matches!(
+            symbol_replace(&mut machine, rx, &[string, replacement], false),
+            Err(EvalFailure::Runtime(RuntimeErrorKind::FuelExhausted { .. }))
+        ));
+        assert!(matches!(
+            symbol_split(&mut machine, rx, &[string], false),
+            Err(EvalFailure::Runtime(RuntimeErrorKind::FuelExhausted { .. }))
+        ));
     }
 
     #[test]

@@ -211,87 +211,98 @@ fn paragraph_separator(class: SentenceBreak) -> bool {
     )
 }
 
-/// The rules SB6 to SB11, for a boundary before position `next`. `significant`
-/// lists the code points before it that are not Extend or Format, nearest last.
-fn sentence_joined(significant: &[SentenceBreak], classes: &[SentenceBreak], next: usize) -> bool {
-    use SentenceBreak as Sb;
-    let mut position = significant.len();
-    let mut take_while = |test: &dyn Fn(Sb) -> bool| {
-        let start = position;
-        while position > 0 && test(significant[position - 1]) {
-            position -= 1;
+/// What the rules SB6 to SB11 need from the text before a boundary: the last
+/// terminator, where only Close and then Sp follow it. A code point that is Extend or
+/// Format is not in it, except the first of a sentence.
+#[derive(Clone, Copy, Default)]
+struct SentenceTail {
+    last: Option<SentenceBreak>,
+    /// The terminator, and the code point before it.
+    terminator: Option<(SentenceBreak, Option<SentenceBreak>)>,
+    closed: bool,
+    spaced: bool,
+}
+
+impl SentenceTail {
+    fn push(&mut self, class: SentenceBreak) {
+        use SentenceBreak as Sb;
+        match class {
+            Sb::ATerm | Sb::STerm => {
+                self.terminator = Some((class, self.last));
+                self.closed = false;
+                self.spaced = false;
+            }
+            Sb::Close if self.terminator.is_some() && !self.spaced => self.closed = true,
+            Sb::Sp if self.terminator.is_some() => self.spaced = true,
+            _ => self.terminator = None,
         }
-        start - position
-    };
-    let spaces = take_while(&|class| class == Sb::Sp);
-    let closes = take_while(&|class| class == Sb::Close);
-    let Some(&terminator) = position
-        .checked_sub(1)
-        .and_then(|last| significant.get(last))
-    else {
-        return true;
-    };
-    if !matches!(terminator, Sb::ATerm | Sb::STerm) {
-        return true;
+        self.last = Some(class);
     }
-    let before_terminator = position.checked_sub(2).map(|index| significant[index]);
-    let upcoming: Vec<Sb> = classes[next..]
-        .iter()
-        .copied()
-        .filter(|class| !ignorable_sentence(*class))
-        .collect();
-    let first = upcoming.first().copied();
+}
+
+/// The rules SB6 to SB11, for a boundary before a code point of class `first`.
+/// `lower_follows` is whether SB8 finds a lowercase letter from there on.
+fn sentence_joined(tail: &SentenceTail, first: SentenceBreak, lower_follows: bool) -> bool {
+    use SentenceBreak as Sb;
+    let Some((terminator, before_terminator)) = tail.terminator else {
+        return true;
+    };
+    let adjacent = !tail.closed && !tail.spaced;
     if terminator == Sb::ATerm {
-        if spaces == 0 && closes == 0 && first == Some(Sb::Numeric) {
+        if adjacent && first == Sb::Numeric {
             return true;
         }
-        if spaces == 0
-            && closes == 0
-            && first == Some(Sb::Upper)
+        if adjacent
+            && first == Sb::Upper
             && matches!(before_terminator, Some(Sb::Upper | Sb::Lower))
         {
             return true;
         }
-        let lower_ahead = upcoming.iter().copied().find(|class| {
-            matches!(
-                *class,
-                Sb::OLetter
-                    | Sb::Upper
-                    | Sb::Lower
-                    | Sb::Sep
-                    | Sb::CR
-                    | Sb::LF
-                    | Sb::ATerm
-                    | Sb::STerm
-            )
-        }) == Some(Sb::Lower);
-        if lower_ahead {
+        if lower_follows {
             return true;
         }
     }
-    if matches!(first, Some(Sb::SContinue | Sb::ATerm | Sb::STerm)) {
+    if matches!(first, Sb::SContinue | Sb::ATerm | Sb::STerm) {
         return true;
     }
-    if spaces == 0 && matches!(first, Some(Sb::Close | Sb::Sp)) {
+    if !tail.spaced && matches!(first, Sb::Close | Sb::Sp) {
         return true;
     }
-    if spaces > 0 && matches!(first, Some(Sb::Sp)) {
+    if tail.spaced && first == Sb::Sp {
         return true;
     }
-    spaces > 0 && first.is_some_and(paragraph_separator)
-        || closes > 0 && first.is_some_and(paragraph_separator)
+    // SB9 and SB10: a paragraph separator stays with the terminator before it,
+    // with or without Close and Sp between them.
+    paragraph_separator(first)
+}
+
+/// For each position, whether the first code point from there on that ends the
+/// scan of SB8 is a lowercase letter. One pass from the end gives every answer, so
+/// a boundary check does not read the rest of the text.
+fn lowercase_follows(classes: &[SentenceBreak]) -> Vec<bool> {
+    use SentenceBreak as Sb;
+    let mut follows = vec![false; classes.len() + 1];
+    for index in (0..classes.len()).rev() {
+        follows[index] = match classes[index] {
+            Sb::Lower => true,
+            Sb::OLetter | Sb::Upper | Sb::Sep | Sb::CR | Sb::LF | Sb::ATerm | Sb::STerm => false,
+            _ => follows[index + 1],
+        };
+    }
+    follows
 }
 
 fn sentence_breaks(text: &[Scalar]) -> Vec<usize> {
     use SentenceBreak as Sb;
     let map = CodePointMapData::<Sb>::new();
     let classes: Vec<Sb> = text.iter().map(|s| map.get(s.character)).collect();
+    let lower_follows = lowercase_follows(&classes);
     let mut breaks = Vec::new();
-    let mut significant: Vec<Sb> = Vec::new();
+    let mut tail = SentenceTail::default();
     for index in 0..text.len() {
         let class = classes[index];
-        if !ignorable_sentence(class) || significant.is_empty() {
-            significant.push(class);
+        if !ignorable_sentence(class) || tail.last.is_none() {
+            tail.push(class);
         }
         if index + 1 == text.len() {
             breaks.push(index);
@@ -303,15 +314,15 @@ fn sentence_breaks(text: &[Scalar]) -> Vec<usize> {
         }
         if paragraph_separator(class) {
             breaks.push(index);
-            significant.clear();
+            tail = SentenceTail::default();
             continue;
         }
         if ignorable_sentence(next) {
             continue;
         }
-        if !sentence_joined(&significant, &classes, index + 1) {
+        if !sentence_joined(&tail, next, lower_follows[index + 1]) {
             breaks.push(index);
-            significant.clear();
+            tail = SentenceTail::default();
         }
     }
     breaks
@@ -409,5 +420,34 @@ mod tests {
         assert_eq!(ends(SegmenterGranularity::Word, "123 "), [3, 4]);
         assert_eq!(ends(SegmenterGranularity::Word, "can't stop"), [5, 6, 10]);
         assert_eq!(ends(SegmenterGranularity::Word, "3.14"), [4]);
+    }
+
+    /// SB9 and SB10: a paragraph separator ends the sentence of the terminator
+    /// before it, also with nothing between them. The ends are those of Node.
+    #[test]
+    fn a_paragraph_separator_stays_with_the_terminator_before_it() {
+        let sentence = |text| ends(SegmenterGranularity::Sentence, text);
+        assert_eq!(sentence("Hello!\nWorld"), [7, 12]);
+        assert_eq!(sentence("Hello.\nWorld"), [7, 12]);
+        assert_eq!(sentence("Hello.\r\nWorld"), [8, 13]);
+        assert_eq!(sentence("Hello?\n\nWorld"), [7, 8, 13]);
+        assert_eq!(sentence("Hello.\u{2029}World"), [7, 12]);
+        assert_eq!(sentence("Hello.\u{85}World"), [7, 12]);
+        assert_eq!(sentence("a.\nb.\nc"), [3, 6, 7]);
+        assert_eq!(sentence("Hi.\n"), [4]);
+        assert_eq!(sentence("3.\n4"), [3, 4]);
+        assert_eq!(sentence("e.g.\nfoo"), [5, 8]);
+        assert_eq!(sentence("Mr.\nSmith"), [4, 9]);
+    }
+
+    /// A boundary check reads neither the text before it nor the text after it
+    /// again. Before, this input took time in proportion to the square of its
+    /// length, which is minutes for this one.
+    #[test]
+    fn a_long_run_after_a_terminator_takes_linear_time() {
+        for terminator in ['!', '.'] {
+            let text = format!("{terminator}{}", " ".repeat(300_000));
+            assert_eq!(ends(SegmenterGranularity::Sentence, &text), [300_001]);
+        }
     }
 }

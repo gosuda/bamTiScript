@@ -526,6 +526,7 @@ fn walk_reviver<H: Host>(
         // come from the holder. Nodes only supply source spans.
         let length = length_of_array_like(machine, live)?;
         for index in 0..length {
+            super::array_generic::tick(machine)?;
             let name = EcmaString::encode(&index.to_string());
             let child_node = child_nodes.and_then(|children| children.get(index));
             let child = walk_reviver(
@@ -655,6 +656,7 @@ fn stringify<H: Host>(
             let mut seen: BTreeSet<EcmaString> = BTreeSet::new();
             let mut list = Vec::new();
             for index in 0..length {
+                super::array_generic::tick(machine)?;
                 let key = PropertyKey::Named(machine.intern_str(&index.to_string()));
                 let item = machine.get_property_key(replacer, &key)?;
                 let primitive = machine.unbox_primitive_or_self(item)?;
@@ -860,6 +862,7 @@ impl Serializer<'_> {
         let length = length_of_array_like(machine, array)?;
         self.output.push_unit(u16::from(b'['));
         for index in 0..length {
+            super::array_generic::tick(machine)?;
             self.open_member(index == 0, depth);
             let element = self.property(
                 machine,

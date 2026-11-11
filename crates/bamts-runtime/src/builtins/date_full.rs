@@ -1915,6 +1915,73 @@ mod tests {
         );
     }
 
+    /// With no `timeZone` option, a format is in the fixed offset of the host, as
+    /// `getHours` is. Before, `toLocaleTimeString` was in UTC whatever the host said.
+    #[test]
+    fn locale_strings_are_in_the_fixed_offset_of_the_host() {
+        let module = blank_program("<date locale zone>");
+        for (zone, hours, time, date, resolved) in [
+            ("UTC", 23.0, "11:30:00 PM", "1/15/2026", "UTC"),
+            ("+02:00", 1.0, "1:30:00 AM", "1/16/2026", "+02:00"),
+            ("UTC-05:30", 18.0, "6:00:00 PM", "1/15/2026", "-05:30"),
+            // POSIX allows an offset of 24 hours, which no format can hold.
+            ("XYZ24", 23.0, "11:30:00 PM", "1/15/2026", "UTC"),
+        ] {
+            let mut host = ControlledHost { zone };
+            let mut machine = machine(&module, &mut host);
+            let instant = parse_iso("2026-01-15T23:30:00.000Z", &TimeZoneRule::utc()).unwrap();
+            let value = construct_date(&mut machine, &[Value::number(instant)]);
+            assert_eq!(
+                value_number(call(&mut machine, value, "getHours", &[]).unwrap()),
+                hours,
+                "{zone}"
+            );
+            let locale = allocate_string(&mut machine, EcmaString::encode("en-US")).unwrap();
+            // The space before AM or PM is U+202F.
+            let shown =
+                |machine: &mut Machine<'_, ControlledHost>, method: &str, args: &[Value]| {
+                    let text = call(machine, value, method, args).unwrap();
+                    let text = machine.string_value(text).unwrap().to_utf8_lossy();
+                    text.replace('\u{202f}', " ")
+                };
+            assert_eq!(
+                shown(&mut machine, "toLocaleTimeString", &[locale]),
+                time,
+                "{zone}"
+            );
+            assert_eq!(
+                shown(&mut machine, "toLocaleDateString", &[locale]),
+                date,
+                "{zone}"
+            );
+            assert_eq!(
+                shown(&mut machine, "toLocaleString", &[locale]),
+                format!("{date}, {time}"),
+                "{zone}"
+            );
+            // An explicit option wins over the host.
+            let options = ordinary_object(&mut machine);
+            let utc = allocate_string(&mut machine, EcmaString::encode("UTC")).unwrap();
+            machine.set_data_property(options, "timeZone", utc).unwrap();
+            assert_eq!(
+                shown(&mut machine, "toLocaleTimeString", &[locale, options]),
+                "11:30:00 PM",
+                "{zone}"
+            );
+            // A new format reports the zone that it took from the host.
+            let intl = machine.intrinsics.global("Intl").unwrap();
+            let constructor = machine.get_named_property(intl, "DateTimeFormat").unwrap();
+            let format = machine.construct_value(constructor, &[]).unwrap();
+            let options = call(&mut machine, format, "resolvedOptions", &[]).unwrap();
+            let time_zone = machine.get_named_property(options, "timeZone").unwrap();
+            assert_eq!(
+                machine.string_value(time_zone).unwrap().to_utf8_lossy(),
+                resolved,
+                "{zone}"
+            );
+        }
+    }
+
     static COERCION_STEP: AtomicUsize = AtomicUsize::new(0);
 
     fn first_value_of(

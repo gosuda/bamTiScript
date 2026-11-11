@@ -69,6 +69,8 @@ const UNTERMINATED_UNICODE_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L
 const LEGACY_OCTAL_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L014");
 /// A `\8` or `\9` escape in a TypeScript file or in a template.
 const NON_OCTAL_DECIMAL_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L015");
+/// A `\u{...}` escape whose digits reach the end of the text.
+const UNICODE_ESCAPE_AT_END: DiagnosticCode = DiagnosticCode::new("BAMTS-L016");
 
 /// Whether `code` reports a malformed escape in the text of a literal. A tagged
 /// template accepts such an escape, so its text keeps none of these.
@@ -80,6 +82,7 @@ pub(crate) fn is_escape_diagnostic(code: DiagnosticCode) -> bool {
         UNTERMINATED_UNICODE_ESCAPE,
         LEGACY_OCTAL_ESCAPE,
         NON_OCTAL_DECIMAL_ESCAPE,
+        UNICODE_ESCAPE_AT_END,
     ]
     .contains(&code)
 }
@@ -1658,13 +1661,18 @@ impl<'a> Scanner<'a> {
                 "a unicode escape is greater than the maximum code point",
             ));
         }
-        if self.first() == Some('}') {
-            self.bump();
-        } else {
-            faults.push(self.fault_here(
+        match self.first() {
+            Some('}') => {
+                self.bump();
+            }
+            None => faults.push(self.fault_here(
+                UNICODE_ESCAPE_AT_END,
+                "a unicode escape reaches the end of the text",
+            )),
+            Some(_) => faults.push(self.fault_here(
                 UNTERMINATED_UNICODE_ESCAPE,
                 "a unicode escape is missing its closing brace",
-            ));
+            )),
         }
         if faults.is_empty() {
             Ok(value)

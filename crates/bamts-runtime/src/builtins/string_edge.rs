@@ -172,6 +172,7 @@ fn raw<H: Host>(
 
     let mut output = EcmaStringBuilder::new();
     for index in 0..literal_count {
+        super::array_generic::tick(machine)?;
         let key = PropertyKey::Named(machine.intern_str(&index.to_string()));
         let literal = machine.get_property_key(literals, &key)?;
         append(&mut output, &machine.coerce_string_observable(literal)?);

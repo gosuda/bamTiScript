@@ -14330,6 +14330,35 @@ class B extends A {
             "x = 1 must not report C086, got {codes:?}"
         );
     }
+
+    #[test]
+    fn a_parenthesized_name_or_member_takes_a_compound_assignment() {
+        // Authority: compoundAssignmentLHSIsReference.ts reports nothing for
+        // `(x1) *= value` or `(x3.a) *= value`; a call stays an invalid target.
+        for text in [
+            "var x = 1; (x) += 1;",
+            "var x = 1; ((x)) **= 2;",
+            "var o = { a: 1 }; (o.a) *= 2;",
+            "var o = { a: 1 }; (o['a']) -= 1;",
+            "var x: number | undefined; (x) ??= 1;",
+        ] {
+            let codes = checker_codes_strict_null(text);
+            assert!(
+                !codes
+                    .iter()
+                    .any(|c| c == INVALID_ASSIGNMENT_TARGET.as_str()),
+                "{text} must not report C036, got {codes:?}"
+            );
+        }
+        let codes = checker_codes_strict_null("declare function f(): any; (f()) += 1;");
+        assert!(
+            codes
+                .iter()
+                .any(|c| c == INVALID_ASSIGNMENT_TARGET.as_str()),
+            "(f()) += 1 must report C036, got {codes:?}"
+        );
+    }
+
     #[test]
     fn grounded_cell_increment_null_matches_authority_multiset() {
         // Authority: incrementOperatorWithAnyOtherTypeInvalidOperations.ts

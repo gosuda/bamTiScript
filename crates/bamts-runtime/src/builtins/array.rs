@@ -482,6 +482,62 @@ mod fuel_tests {
             );
         }
     }
+
+    /// The same holds outside `Array.prototype`: each of these builtins walks a
+    /// length that the program states.
+    #[test]
+    fn a_loop_over_a_claimed_length_runs_out_of_fuel_outside_array() {
+        for case in [
+            "Intl.getCanonicalLocales",
+            "String.raw",
+            "JSON.stringify array",
+            "JSON.stringify replacer",
+            "JSON.parse reviver",
+        ] {
+            let module = blank_program("<test>");
+            let mut host = TestHost;
+            let limits = Limits {
+                fuel: 16,
+                ..Limits::default()
+            };
+            let mut machine = Machine::new(&module, &mut host, limits);
+            let claimed = ordinary_object(&mut machine);
+            machine
+                .set_data_property(claimed, "length", Value::int32(1000))
+                .unwrap();
+            let long =
+                super::super::allocate_array(&mut machine, vec![Value::int32(0); 1000]).unwrap();
+            let (owner, method, arguments) = match case {
+                "Intl.getCanonicalLocales" => ("Intl", "getCanonicalLocales", vec![claimed]),
+                "String.raw" => {
+                    let template = ordinary_object(&mut machine);
+                    machine.set_data_property(template, "raw", claimed).unwrap();
+                    ("String", "raw", vec![template])
+                }
+                "JSON.stringify array" => ("JSON", "stringify", vec![long]),
+                "JSON.stringify replacer" => ("JSON", "stringify", vec![claimed, long]),
+                _ => {
+                    let text = format!("[{}]", vec!["0"; 1000].join(","));
+                    let text = super::super::allocate_string(
+                        &mut machine,
+                        bamts_bytecode::EcmaString::encode(&text),
+                    )
+                    .unwrap();
+                    let reviver = machine.intrinsics.global("Boolean").unwrap();
+                    ("JSON", "parse", vec![text, reviver])
+                }
+            };
+            let owner = machine.intrinsics.global(owner).unwrap();
+            let function = machine.get_named_property(owner, method).unwrap();
+            assert!(
+                matches!(
+                    machine.call_value(function, owner, &arguments),
+                    Err(EvalFailure::Runtime(RuntimeErrorKind::FuelExhausted { .. }))
+                ),
+                "{case}"
+            );
+        }
+    }
 }
 #[cfg(test)]
 mod copy_within_tests {

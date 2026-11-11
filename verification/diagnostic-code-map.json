@@ -596,6 +596,12 @@
       "tsCode": 1488
     },
     {
+      "bamtsCode": "BAMTS-L016",
+      "evidence": "Extended unicode escape whose digits reach the end of the text -> TS1126 at the end via tsc 7.0.2 --noEmit on let a = \"\\u{12 with no newline (x.ts(1,15)); a closed one, let a = \"\\u{12x\", stays TS1199.",
+      "status": "mapped",
+      "tsCode": 1126
+    },
+    {
       "bamtsCode": "BAMTS-P001",
       "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
       "status": "unmapped",

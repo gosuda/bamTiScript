@@ -14,8 +14,8 @@ use bamts_native::{Decoded, Value};
 use super::property_descriptor::descriptor_from_property;
 use super::{
     allocate_array, allocate_string, define_data, define_frozen_data, define_symbol_property,
-    heap_index, install_constructor_function, install_function, keep_root, range_error, type_error,
-    value_number, with_roots,
+    heap_index, install_constructor_function, install_function, keep_root, range_error,
+    release_roots, root_count, type_error, value_number, with_roots,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
@@ -139,14 +139,33 @@ fn new_helper<H: Host>(
 
 /// One `IteratorStepValue`. A failure here does not close the iterator: it is the
 /// iterator that failed.
+///
+/// The result object and its value are done with soon, so only the recent ones stay
+/// rooted, as the results of a callback do. A stream of any length then holds a
+/// bounded number of them. A caller that keeps the value across a later step roots
+/// it itself.
 fn step_value<H: Host>(
     machine: &mut Machine<'_, H>,
     iterator: Value,
     next: Value,
 ) -> Result<Option<Value>, EvalFailure> {
-    let result = machine.call_value(next, iterator, &[])?;
-    let (done, value) = machine.iterator_result_parts(result)?;
-    Ok((!done).then_some(value))
+    let result = machine.call_callback(next, iterator, &[])?;
+    if !machine.is_object(result) {
+        return Err(type_error("iterator result is not an object"));
+    }
+    // An accessor or a trap can make `done` and the value. The machine keeps what
+    // such a call returns for this builtin, and the list of recent results holds
+    // the value from here on. A failure keeps what it has: the stream ends there.
+    let read = machine.hold_temporaries(&[]);
+    let done = machine.get_named_property(result, "done")?;
+    if machine.to_boolean(done) {
+        machine.release_temporaries(read);
+        return Ok(None);
+    }
+    let value = machine.get_named_property(result, "value")?;
+    machine.keep_callback_result(value);
+    machine.release_temporaries(read);
+    Ok(Some(value))
 }
 
 /// One `IteratorStep`: `value` is never read, so skipping stays unobservable.
@@ -155,12 +174,15 @@ fn step<H: Host>(
     iterator: Value,
     next: Value,
 ) -> Result<bool, EvalFailure> {
-    let result = machine.call_value(next, iterator, &[])?;
+    let result = machine.call_callback(next, iterator, &[])?;
     if !machine.is_object(result) {
         return Err(type_error("iterator result is not an object"));
     }
+    let read = machine.hold_temporaries(&[]);
     let done = machine.get_named_property(result, "done")?;
-    Ok(machine.to_boolean(done))
+    let done = machine.to_boolean(done);
+    machine.release_temporaries(read);
+    Ok(done)
 }
 
 fn call_return<H: Host>(
@@ -310,18 +332,23 @@ fn advance<H: Host>(
             bump_counter(machine, state);
             Ok(Some(mapped))
         }
-        Operation::Filter => loop {
-            let Some(value) = step_value(machine, iterator, next)? else {
-                return Ok(None);
-            };
-            keep_root(machine, depth, value);
-            let counter = slot(machine, state, COUNTER);
-            let selected = call_closing(machine, iterator, callback, &[value, counter])?;
-            bump_counter(machine, state);
-            if machine.to_boolean(selected) {
-                return Ok(Some(value));
+        Operation::Filter => {
+            let held = root_count(machine, depth);
+            loop {
+                // A value that the callback refused is done with.
+                release_roots(machine, depth, held);
+                let Some(value) = step_value(machine, iterator, next)? else {
+                    return Ok(None);
+                };
+                keep_root(machine, depth, value);
+                let counter = slot(machine, state, COUNTER);
+                let selected = call_closing(machine, iterator, callback, &[value, counter])?;
+                bump_counter(machine, state);
+                if machine.to_boolean(selected) {
+                    return Ok(Some(value));
+                }
             }
-        },
+        }
         Operation::Take => {
             let remaining = value_number(slot(machine, state, REMAINING));
             if remaining == 0.0 {
@@ -361,7 +388,10 @@ fn flat_map_step<H: Host>(
     callback: Value,
     depth: usize,
 ) -> Result<Option<Value>, EvalFailure> {
+    let held = root_count(machine, depth);
     loop {
+        // The state holds the inner iterator, so the mapped value is done with.
+        release_roots(machine, depth, held);
         let inner = slot(machine, state, INNER);
         if inner != Value::UNDEFINED {
             let inner_next = slot(machine, state, INNER_NEXT);
@@ -381,6 +411,9 @@ fn flat_map_step<H: Host>(
         let counter = slot(machine, state, COUNTER);
         let mapped = call_closing(machine, iterator, callback, &[value, counter])?;
         keep_root(machine, depth, mapped);
+        // Opening the inner iterator keeps it for this builtin. The state holds it
+        // from here on, so an outer value that maps to nothing leaves nothing held.
+        let opened = machine.hold_temporaries(&[]);
         match flattenable(machine, mapped, false) {
             Ok((inner, inner_next)) => {
                 set_slot(machine, state, INNER, inner);
@@ -388,6 +421,7 @@ fn flat_map_step<H: Host>(
             }
             Err(failure) => return Err(close_after(machine, iterator, failure)),
         }
+        machine.release_temporaries(opened);
     }
 }
 
@@ -826,7 +860,7 @@ fn consume<H: Host>(
     let callback = argument(args, 0);
     checked_callback(machine, this, callback)?;
     let (iterator, next) = direct_record(machine, this)?;
-    with_roots(machine, &[iterator, next, callback], |machine, _| {
+    with_roots(machine, &[iterator, next, callback], |machine, depth| {
         let mut counter = 0.0;
         loop {
             let Some(value) = step_value(machine, iterator, next)? else {
@@ -846,6 +880,8 @@ fn consume<H: Host>(
                 Consumer::Find => truthy.then_some(value),
             };
             if let Some(answer) = finished {
+                // `return` is user code, and `find` answers with the value.
+                keep_root(machine, depth, answer);
                 close_iterator(machine, iterator, Ok(()))?;
                 return Ok(answer);
             }
@@ -1610,6 +1646,309 @@ mod tests {
         assert_eq!(
             machine.internal_get_prototype_of(instance).unwrap(),
             Some(subclass_prototype)
+        );
+    }
+
+    const STREAM: f64 = 100.0;
+
+    thread_local! {
+        /// For each call of a sampling callback: the `n` of the value it got, and how
+        /// many values the machine held for the builtins that were running.
+        static SAMPLES: std::cell::RefCell<Vec<(f64, usize)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// `next` of a source that yields a fresh object `{ n }` for each `n` below
+    /// `STREAM`. Nothing but the iterator result refers to that object.
+    fn fresh_next(
+        machine: &mut Machine<'_, TestHost>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let position = machine.get_named_property(this, "position")?;
+        let n = value_number(position);
+        machine.set_data_property(this, "position", crate::number_value(n + 1.0))?;
+        let result = ordinary_object(machine);
+        if n < STREAM {
+            let value = ordinary_object(machine);
+            machine.set_data_property(value, "n", crate::number_value(n))?;
+            machine.set_data_property(result, "value", value)?;
+        }
+        let done = if n < STREAM {
+            Value::FALSE
+        } else {
+            Value::TRUE
+        };
+        machine.set_data_property(result, "done", done)?;
+        Ok(BuiltinOutcome::Value(result))
+    }
+
+    /// `return` of that source, which is user code that can collect.
+    fn collecting_return(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.collect_garbage();
+        Ok(BuiltinOutcome::Value(ordinary_object(machine)))
+    }
+
+    fn fresh_source(machine: &mut Machine<'_, TestHost>) -> Value {
+        SAMPLES.with(|samples| samples.borrow_mut().clear());
+        let source = ordinary_object(machine);
+        let prototype = machine.intrinsics.builtins.iterator_prototype();
+        machine
+            .internal_set_prototype_of(source, Some(prototype))
+            .unwrap();
+        machine
+            .set_data_property(source, "position", Value::int32(0))
+            .unwrap();
+        let next = native(machine, "fresh next", fresh_next);
+        machine.set_data_property(source, "next", next).unwrap();
+        let close = native(machine, "collecting return", collecting_return);
+        machine.set_data_property(source, "return", close).unwrap();
+        source
+    }
+
+    /// The getter of `value` in a result of `getter_next`: a fresh object `{ n }`.
+    fn made_value(
+        machine: &mut Machine<'_, TestHost>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let n = machine.get_named_property(this, "n")?;
+        let value = ordinary_object(machine);
+        machine.set_data_property(value, "n", n)?;
+        Ok(BuiltinOutcome::Value(value))
+    }
+
+    /// `next` of a source whose results make their value in a getter, so that no
+    /// result object refers to it.
+    fn getter_next(
+        machine: &mut Machine<'_, TestHost>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let position = machine.get_named_property(this, "position")?;
+        let n = value_number(position);
+        machine.set_data_property(this, "position", crate::number_value(n + 1.0))?;
+        let result = ordinary_object(machine);
+        machine.set_data_property(result, "n", crate::number_value(n))?;
+        let done = if n < STREAM {
+            Value::FALSE
+        } else {
+            Value::TRUE
+        };
+        machine.set_data_property(result, "done", done)?;
+        let getter = machine.get_named_property(this, "getter")?;
+        let value_key = PropertyKey::Named(machine.intern_str("value"));
+        machine.internal_define_own_property(
+            result,
+            value_key,
+            super::super::property_descriptor::PropertyDescriptor {
+                value: None,
+                writable: None,
+                getter: Some(getter),
+                setter: None,
+                enumerable: Some(true),
+                configurable: Some(true),
+            },
+        )?;
+        Ok(BuiltinOutcome::Value(result))
+    }
+
+    fn getter_source(machine: &mut Machine<'_, TestHost>) -> Value {
+        let source = fresh_source(machine);
+        let next = native(machine, "getter next", getter_next);
+        machine.set_data_property(source, "next", next).unwrap();
+        let getter = native(machine, "made value", made_value);
+        machine.set_data_property(source, "getter", getter).unwrap();
+        source
+    }
+
+    /// Collects, then reads the value in `args[index]`. A value that its caller did
+    /// not root is gone by then.
+    fn sample(
+        machine: &mut Machine<'_, TestHost>,
+        args: &[Value],
+        index: usize,
+    ) -> Result<f64, EvalFailure> {
+        machine.collect_garbage();
+        let n = machine.get_named_property(args[index], "n")?;
+        let n = value_number(n);
+        let held = machine.builtin_temporaries.len()
+            + machine.native_roots.iter().map(Vec::len).sum::<usize>();
+        SAMPLES.with(|samples| samples.borrow_mut().push((n, held)));
+        Ok(n)
+    }
+
+    fn sample_and_refuse(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        sample(machine, args, 0)?;
+        Ok(BuiltinOutcome::Value(Value::FALSE))
+    }
+
+    fn sample_and_accept(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        sample(machine, args, 0)?;
+        Ok(BuiltinOutcome::Value(Value::TRUE))
+    }
+
+    fn sample_and_accept_the_last(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let n = sample(machine, args, 0)?;
+        Ok(BuiltinOutcome::Value(if n == STREAM - 1.0 {
+            Value::TRUE
+        } else {
+            Value::FALSE
+        }))
+    }
+
+    /// A reducer that answers with the value, so that the accumulator of each step
+    /// is the fresh object of the step before it.
+    fn sample_and_keep_the_value(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let n = sample(machine, args, 1)?;
+        let before = machine.get_named_property(args[0], "n")?;
+        assert_eq!(value_number(before), n - 1.0, "the accumulator is intact");
+        Ok(BuiltinOutcome::Value(args[1]))
+    }
+
+    fn sample_and_map_to_nothing(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        sample(machine, args, 0)?;
+        Ok(BuiltinOutcome::Value(allocate_array(machine, Vec::new())?))
+    }
+
+    /// Every value arrived intact, in order, and the machine held no more for the
+    /// last step than for the first.
+    fn assert_streamed(case: &str, first: f64) {
+        let samples = SAMPLES.with(|samples| samples.borrow().clone());
+        let expected: Vec<f64> = (first as usize..STREAM as usize)
+            .map(|n| n as f64)
+            .collect();
+        let seen: Vec<f64> = samples.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            seen, expected,
+            "{case}: each value is intact after a collection"
+        );
+        let held: Vec<usize> = samples.iter().map(|(_, held)| *held).collect();
+        let (least, most) = (held.iter().min().unwrap(), held.iter().max().unwrap());
+        assert!(
+            most - least <= 2,
+            "{case}: the machine holds {least} to {most} values, which grows with the stream"
+        );
+    }
+
+    /// A consumer holds one step at a time. Before, each iterator result stayed
+    /// rooted until the consumer returned, so memory grew with the stream.
+    #[test]
+    fn a_consumer_holds_one_step_of_a_stream_at_a_time() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        for (method, handler) in [
+            ("forEach", sample_and_refuse as BuiltinHandler<TestHost>),
+            ("some", sample_and_refuse),
+            ("every", sample_and_accept),
+            ("find", sample_and_accept_the_last),
+        ] {
+            let source = fresh_source(&mut machine);
+            let callback = native(&mut machine, "sample", handler);
+            let answer = invoke(&mut machine, source, method, &[callback]).unwrap();
+            assert_streamed(method, 0.0);
+            if method == "find" {
+                let n = machine.get_named_property(answer, "n").unwrap();
+                assert_eq!(value_number(n), STREAM - 1.0, "find answers with the value");
+            }
+        }
+        let source = fresh_source(&mut machine);
+        let reducer = native(&mut machine, "sample", sample_and_keep_the_value);
+        let last = invoke(&mut machine, source, "reduce", &[reducer]).unwrap();
+        assert_streamed("reduce", 1.0);
+        let n = machine.get_named_property(last, "n").unwrap();
+        assert_eq!(value_number(n), STREAM - 1.0);
+    }
+
+    /// A value that an accessor makes is in no result object. It stays alive for
+    /// its step, and the machine does not keep it for the rest of the stream.
+    #[test]
+    fn a_step_value_from_an_accessor_is_held_for_its_step_only() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let source = getter_source(&mut machine);
+        let callback = native(&mut machine, "sample", sample_and_refuse);
+        invoke(&mut machine, source, "forEach", &[callback]).unwrap();
+        assert_streamed("forEach over accessor values", 0.0);
+
+        let source = getter_source(&mut machine);
+        let reducer = native(&mut machine, "sample", sample_and_keep_the_value);
+        let last = invoke(&mut machine, source, "reduce", &[reducer]).unwrap();
+        assert_streamed("reduce over accessor values", 1.0);
+        let n = machine.get_named_property(last, "n").unwrap();
+        assert_eq!(value_number(n), STREAM - 1.0);
+
+        let source = getter_source(&mut machine);
+        let callback = native(&mut machine, "sample", sample_and_accept_the_last);
+        let filtered = invoke(&mut machine, source, "filter", &[callback]).unwrap();
+        let result = invoke(&mut machine, filtered, "next", &[]).unwrap();
+        assert_streamed("filter over accessor values", 0.0);
+        let value = machine.get_named_property(result, "value").unwrap();
+        let n = machine.get_named_property(value, "n").unwrap();
+        assert_eq!(value_number(n), STREAM - 1.0);
+    }
+
+    /// One `next` of a lazy helper can read many values: `filter` until its callback
+    /// accepts one, `flatMap` until an inner iterator yields one.
+    #[test]
+    fn a_lazy_helper_holds_one_step_of_a_stream_at_a_time() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let source = fresh_source(&mut machine);
+        let callback = native(&mut machine, "sample", sample_and_accept_the_last);
+        let filtered = invoke(&mut machine, source, "filter", &[callback]).unwrap();
+        let result = invoke(&mut machine, filtered, "next", &[]).unwrap();
+        assert_streamed("filter", 0.0);
+        let value = machine.get_named_property(result, "value").unwrap();
+        let n = machine.get_named_property(value, "n").unwrap();
+        assert_eq!(value_number(n), STREAM - 1.0, "filter yields the value");
+
+        let source = fresh_source(&mut machine);
+        let callback = native(&mut machine, "sample", sample_and_map_to_nothing);
+        let flattened = invoke(&mut machine, source, "flatMap", &[callback]).unwrap();
+        let result = invoke(&mut machine, flattened, "next", &[]).unwrap();
+        assert_streamed("flatMap", 0.0);
+        assert_eq!(
+            machine.get_named_property(result, "done").unwrap(),
+            Value::TRUE
         );
     }
 

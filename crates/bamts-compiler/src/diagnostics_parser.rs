@@ -48,6 +48,8 @@ const TS1110: DiagnosticCode = DiagnosticCode::new("TS1110");
 const TS1124: DiagnosticCode = DiagnosticCode::new("TS1124");
 /// Hexadecimal digit expected.
 const TS1125: DiagnosticCode = DiagnosticCode::new("TS1125");
+/// Unexpected end of text.
+const TS1126: DiagnosticCode = DiagnosticCode::new("TS1126");
 /// Invalid character.
 const TS1127: DiagnosticCode = DiagnosticCode::new("TS1127");
 /// An extended Unicode escape value is above U+10FFFF.
@@ -95,6 +97,7 @@ pub fn typescript_parse_code(code: DiagnosticCode, message: &str) -> Option<Diag
         "BAMTS-L013" => TS1199,
         "BAMTS-L014" => TS1487,
         "BAMTS-L015" => TS1488,
+        "BAMTS-L016" => TS1126,
         "BAMTS-P001" => map_expected_token(message),
         "BAMTS-P002" => map_expected_expression(message),
         "BAMTS-P003" => TS1003,
@@ -108,6 +111,7 @@ pub fn typescript_parse_code(code: DiagnosticCode, message: &str) -> Option<Diag
         "BAMTS-P016" => TS17014,
         "BAMTS-P017" => TS1163,
         "BAMTS-P018" => TS1308,
+        "BAMTS-P020" => TS1141,
         "BAMTS-C051" if is_export_modifier_on_class_element(message) => TS1031,
         _ => return None,
     })
@@ -138,6 +142,7 @@ pub fn typescript_parse_message(code: DiagnosticCode) -> Option<&'static str> {
         "TS1110" => "Type expected.",
         "TS1124" => "Digit expected.",
         "TS1125" => "Hexadecimal digit expected.",
+        "TS1126" => "Unexpected end of text.",
         "TS1127" => "Invalid character.",
         "TS1198" => "An extended Unicode escape value must be between 0x0 and 0x10FFFF inclusive.",
         "TS1199" => "Unterminated Unicode escape sequence.",
@@ -351,6 +356,20 @@ mod tests {
             ),
             ("BAMTS-L014", 1, 5, "legacy octal escape", "TS1487"),
             ("BAMTS-L015", 1, 3, "the escape is not allowed", "TS1488"),
+            (
+                "BAMTS-L016",
+                14,
+                14,
+                "a unicode escape reaches the end of the text",
+                "TS1126",
+            ),
+            (
+                "BAMTS-P020",
+                14,
+                15,
+                "a module name must be a string literal",
+                "TS1141",
+            ),
             ("BAMTS-L005", 0, 1, "unexpected character", "TS1127"),
             (
                 "BAMTS-P005",

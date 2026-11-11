@@ -124,6 +124,9 @@ const UNTERMINATED_REGEX: DiagnosticCode = DiagnosticCode::new("BAMTS-L004");
 const YIELD_OUTSIDE_GENERATOR: DiagnosticCode = DiagnosticCode::new("BAMTS-P017");
 /// An await expression parsed inside a non-async function-like.
 const AWAIT_OUTSIDE_ASYNC: DiagnosticCode = DiagnosticCode::new("BAMTS-P018");
+/// A module name that is not a string literal. TypeScript reports it as a grammar
+/// error, which a file with a parse error does not get.
+const MODULE_NAME_NOT_STRING: DiagnosticCode = DiagnosticCode::new("BAMTS-P020");
 
 /// A parser operation was interrupted before completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,13 +255,59 @@ pub fn parse_with_cancel(
     // TypeScript reports no parse error at the start of an earlier one. Its
     // scanner runs as it parses, so at one position a lexical error comes first,
     // a literal that is not closed comes after the errors in its text, and the
-    // parse errors come last, in the order that the parser found them.
-    let mut ordered: Vec<(usize, u8, Diagnostic)> = diagnostics
+    // parse errors come last, in the order that the parser found them. A template
+    // with no substitution is the exception: TypeScript finds the errors in its
+    // text when it reads that text again, after the template that is not closed.
+    let opens_template = |diagnostic: &Diagnostic| {
+        let start = diagnostic.range().start();
+        let at = parser
+            .tokens
+            .partition_point(|token| token.range().start() < start);
+        parser.tokens.get(at).is_some_and(|token| {
+            token.range().start() == start && token.kind() == TokenKind::NoSubstitutionTemplate
+        })
+    };
+    // TypeScript drops an error only at the start of the error that it reported
+    // last. In such a template that is the template itself for the first error in
+    // its text, and an error in the text for each later one. So an error at the end
+    // of the text is kept when an earlier error is in the text.
+    let unclosed_templates: Vec<(usize, usize)> = diagnostics
+        .iter()
+        .filter(|diagnostic| is_unterminated_diagnostic(diagnostic.code()))
+        .filter(|diagnostic| opens_template(diagnostic))
+        .map(|diagnostic| {
+            let range = diagnostic.range();
+            (range.start().get(), range.end().get())
+        })
+        .collect();
+    let lexical_starts: Vec<usize> = diagnostics
+        .iter()
+        .filter(|diagnostic| !is_unterminated_diagnostic(diagnostic.code()))
+        .map(|diagnostic| diagnostic.range().start().get())
+        .collect();
+    let follows_an_error_in_its_template = |at: usize| {
+        unclosed_templates.iter().any(|(start, end)| {
+            at == *end
+                && lexical_starts
+                    .iter()
+                    .any(|error| (*start..*end).contains(error))
+        })
+    };
+    let mut ordered: Vec<(usize, u8, bool, Diagnostic)> = diagnostics
         .into_iter()
         .map(|diagnostic| {
-            let rank = u8::from(is_unterminated_diagnostic(diagnostic.code()));
+            let unterminated = is_unterminated_diagnostic(diagnostic.code());
+            let rank = if !unterminated {
+                1
+            } else if opens_template(&diagnostic) {
+                0
+            } else {
+                2
+            };
             let diagnostic = at_reported_position(diagnostic);
-            (diagnostic.range().start().get(), rank, diagnostic)
+            let start = diagnostic.range().start().get();
+            let kept = !unterminated && follows_an_error_in_its_template(start);
+            (start, rank, kept, diagnostic)
         })
         .chain(
             parser
@@ -269,23 +318,27 @@ pub fn parse_with_cancel(
                     // A literal that the parser scans again, such as a JSX attribute
                     // string, is not closed at the same place as a scanned one.
                     let rank = if is_unterminated_diagnostic(diagnostic.code()) {
-                        1
-                    } else {
                         2
+                    } else {
+                        3
                     };
                     let diagnostic = at_reported_position(diagnostic.clone());
-                    (diagnostic.range().start().get(), rank, diagnostic)
+                    (diagnostic.range().start().get(), rank, false, diagnostic)
                 }),
         )
         .collect();
-    ordered.sort_by_key(|(start, rank, _)| (*start, *rank));
+    ordered.sort_by_key(|(start, rank, _, _)| (*start, *rank));
     let mut starts = std::collections::BTreeSet::new();
     let mut diagnostics: Vec<Diagnostic> = ordered
         .into_iter()
-        .filter_map(|(start, _, diagnostic)| {
-            (!is_parse_error(&diagnostic) || starts.insert(start)).then_some(diagnostic)
+        .filter_map(|(start, _, kept, diagnostic)| {
+            (kept || !is_parse_error(&diagnostic) || starts.insert(start)).then_some(diagnostic)
         })
         .collect();
+    // TypeScript reports a grammar error only in a file with no parse error.
+    if diagnostics.iter().any(is_parse_error) {
+        diagnostics.retain(|diagnostic| diagnostic.code() != MODULE_NAME_NOT_STRING);
+    }
     diagnostics.sort();
     diagnostics.dedup();
 
@@ -379,7 +432,8 @@ struct Parser {
     /// recorded inside them reflect a non-JSX reading and are dropped, mirroring
     /// the regex-rescan span handling.
     jsx_spans: Vec<TextRange>,
-    /// The text of every tagged template, which takes any escape.
+    /// The text of every tagged template, which takes any escape, and of every
+    /// template literal type with no substitution, where TypeScript reports none.
     tagged_spans: Vec<TextRange>,
     /// Cooperative cancellation signal checked at statement and list boundaries.
     cancel: CancellationToken,
@@ -2782,7 +2836,7 @@ impl Parser {
 
         let clause = self.parse_import_clause();
         self.expect(TokenKind::KwFrom, "expected `from`");
-        let source = self.parse_string_literal();
+        let source = self.parse_module_name(false);
         let attributes = self.parse_optional_import_attributes();
         self.expect_semicolon();
         self.node(
@@ -2813,7 +2867,7 @@ impl Parser {
         {
             self.bump();
             self.bump();
-            let source = self.parse_string_literal();
+            let source = self.parse_module_name(false);
             self.expect(TokenKind::RParen, "expected `)`");
             return ExternalModuleReference::Require(source);
         }
@@ -2989,18 +3043,10 @@ impl Parser {
         Some(ImportAttributes { entries })
     }
 
+    /// A string literal. TypeScript reads an expression where the value of an import
+    /// attribute belongs, so a token that cannot start one is a missing expression,
+    /// and any other token a missing string literal.
     fn parse_string_literal(&mut self) -> StringLiteralNode {
-        self.parse_string_literal_or(EXPECTED_EXPRESSION, "expected an expression")
-    }
-
-    /// TypeScript reads an expression, or in an `import()` type a type, where a
-    /// string literal belongs. A token that cannot start one is reported as
-    /// `missing`, and any other token as a missing string literal.
-    fn parse_string_literal_or(
-        &mut self,
-        missing: DiagnosticCode,
-        message: &'static str,
-    ) -> StringLiteralNode {
         if self.at(TokenKind::StringLiteral) {
             let token = self.bump();
             let range = token.range();
@@ -3009,8 +3055,31 @@ impl Parser {
         if self.can_start_expression() {
             self.error_here(EXPECTED_TOKEN, "expected a string literal");
         } else {
-            self.error_here(missing, message);
+            self.error_here(EXPECTED_EXPRESSION, "expected an expression");
         }
+        let token = self.missing_token(TokenKind::StringLiteral);
+        let range = token.range();
+        self.node_at(range, StringLiteral::new(token))
+    }
+
+    /// The name of a module after `from` or in `require(`, where TypeScript reads an
+    /// expression, or in an `import()` type, where it reads a type. A malformed one
+    /// reports its own errors, and one that is not a string literal gets a grammar
+    /// error.
+    fn parse_module_name(&mut self, in_type: bool) -> StringLiteralNode {
+        if self.at(TokenKind::StringLiteral) {
+            return self.parse_string_literal();
+        }
+        let range = if in_type {
+            self.parse_type().range()
+        } else {
+            self.parse_expression(false).range()
+        };
+        self.error_at(
+            MODULE_NAME_NOT_STRING,
+            range,
+            "a module name must be a string literal",
+        );
         let token = self.missing_token(TokenKind::StringLiteral);
         let range = token.range();
         self.node_at(range, StringLiteral::new(token))
@@ -3028,7 +3097,7 @@ impl Parser {
                 None
             };
             self.expect(TokenKind::KwFrom, "expected `from`");
-            let source = self.parse_string_literal();
+            let source = self.parse_module_name(false);
             let attributes = self.parse_optional_import_attributes();
             self.expect_semicolon();
             return self.node(
@@ -3066,7 +3135,7 @@ impl Parser {
                         None
                     };
                     self.expect(TokenKind::KwFrom, "expected `from`");
-                    let source = self.parse_string_literal();
+                    let source = self.parse_module_name(false);
                     let attributes = self.parse_optional_import_attributes();
                     self.expect_semicolon();
                     return self.node(
@@ -3262,7 +3331,7 @@ impl Parser {
         }
         self.expect(TokenKind::RBrace, "expected `}`");
         let (source, attributes) = if self.eat(TokenKind::KwFrom).is_some() {
-            let source = self.parse_string_literal();
+            let source = self.parse_module_name(false);
             let attributes = self.parse_optional_import_attributes();
             (Some(source), attributes)
         } else {
@@ -5658,8 +5727,9 @@ impl Parser {
         if simple {
             self.expression_to_target(expr)
         } else {
-            // Compound assignment requires a simple (identifier/member) target.
-            match expr.data() {
+            // Compound assignment requires a simple (identifier/member) target,
+            // which parentheses may wrap, as they may for `=`.
+            match crate::early_errors::strip_parentheses(&expr).data() {
                 Expression::Identifier(_) | Expression::Member(_) => {
                     self.expression_to_target(expr)
                 }
@@ -6409,7 +6479,7 @@ impl Parser {
     fn parse_import_type(&mut self, start: Utf16Pos) -> Ty {
         self.bump();
         self.expect(TokenKind::LParen, "expected `(`");
-        let argument = self.parse_string_literal_or(EXPECTED_TYPE, "expected a type");
+        let argument = self.parse_module_name(true);
         let attributes = if self.eat(TokenKind::Comma).is_some() {
             // `import("x", { with: {...} })`: the AST stores attributes only.
             if self.at(TokenKind::LBrace) {
@@ -6487,6 +6557,8 @@ impl Parser {
         if self.at(TokenKind::NoSubstitutionTemplate) {
             let token = self.bump();
             let range = token.range();
+            // TypeScript reports no escape error in a type with no substitution.
+            self.tagged_spans.push(range);
             elements.push(self.node_at(range, TemplateElement::new(token)));
         } else {
             let head = self.bump();
@@ -7253,6 +7325,34 @@ mod tests {
         assert_eq!(starts, [17], "a template with no tag keeps its error");
     }
 
+    /// `tsc` 7.0.2 reports no escape error in a template literal type with no
+    /// substitution, and the errors of one with a substitution.
+    #[test]
+    fn a_template_literal_type_with_no_substitution_keeps_no_escape_error() {
+        for source in [
+            r"type T = `\1`;",
+            r"type T = `a\01`;",
+            r"type T = `\8`;",
+            r"type T = `\x`;",
+            r"type T = `\u{110000}`;",
+        ] {
+            let parsed = parse_ts(source);
+            assert_eq!(errors(&parsed), Vec::<&Diagnostic>::new(), "{source}");
+        }
+        for (source, start) in [
+            (r"type T = `\1${string}`;", 10),
+            (r"type T = `${string}\1`;", 19),
+            (r"let a = `\1`;", 9),
+        ] {
+            let parsed = parse_ts(source);
+            let starts: Vec<usize> = errors(&parsed)
+                .iter()
+                .map(|d| d.range().start().get())
+                .collect();
+            assert_eq!(starts, [start], "{source}");
+        }
+    }
+
     /// `tsc` 7.0.2 reports a string, a template or a comment that is not closed
     /// at the end of its text. The parser still drops one that starts in text
     /// that it scans again.
@@ -7287,6 +7387,116 @@ mod tests {
                 .map(|d| (d.range().start().get(), d.range().end().get()))
                 .collect();
             assert_eq!(found, [(start, start)], "{source}");
+        }
+    }
+
+    /// `tsc` 7.0.2 reports a template with no substitution that is not closed
+    /// before an escape error at its end. A string and a template tail report the
+    /// escape error there, and a braced escape that reaches the end is TS1126.
+    #[test]
+    fn an_escape_at_the_end_of_an_unclosed_literal_is_reported_as_tsc_does() {
+        // The errors at one position are in the order of their TypeScript codes,
+        // which is the order that a report gives them.
+        let found = |text: &str| -> Vec<(usize, String)> {
+            let mut found: Vec<(usize, String)> = errors(&parse_ts(text))
+                .iter()
+                .map(|d| {
+                    let mapped = crate::diagnostics_parser::map_parse_diagnostic(d);
+                    (d.range().start().get(), mapped.code().as_str().to_owned())
+                })
+                .collect();
+            found.sort();
+            found
+        };
+        let at = |list: &[(usize, &str)]| -> Vec<(usize, String)> {
+            list.iter()
+                .map(|(start, code)| (*start, (*code).to_owned()))
+                .collect()
+        };
+        for (source, expected) in [
+            (r"let a = `\x", at(&[(11, "TS1160")])),
+            (r"let a = `a\x1", at(&[(13, "TS1160")])),
+            (r"let a = `\u", at(&[(11, "TS1160")])),
+            (r"let a = `\u{12", at(&[(14, "TS1160")])),
+            (r"type T = `\x", at(&[(12, "TS1160")])),
+            (r"let a = `\1", at(&[(9, "TS1487"), (11, "TS1160")])),
+            (r"let a = `${1}\x", at(&[(15, "TS1125")])),
+            (r#"let a = "\x"#, at(&[(11, "TS1125")])),
+            (r#"let a = "\u{12"#, at(&[(14, "TS1126")])),
+            (r"let a = `${1}\u{12", at(&[(18, "TS1126")])),
+            (r#"let a = "\u{12x""#, at(&[(14, "TS1199")])),
+            (
+                r#"let a = "\u{110000"#,
+                at(&[(12, "TS1198"), (18, "TS1126")]),
+            ),
+            // An error at the end of the template is lost only when it is the
+            // first error in the text.
+            (
+                r"let a = `\1\u{12",
+                at(&[(9, "TS1487"), (16, "TS1126"), (16, "TS1160")]),
+            ),
+            (
+                r"let a = `\u{110000",
+                at(&[(12, "TS1198"), (18, "TS1126"), (18, "TS1160")]),
+            ),
+            (
+                r"let a = `\xZ\u{",
+                at(&[(11, "TS1125"), (15, "TS1125"), (15, "TS1160")]),
+            ),
+            (
+                r"let a = `\u{110000}\x",
+                at(&[(12, "TS1198"), (21, "TS1125"), (21, "TS1160")]),
+            ),
+        ] {
+            assert_eq!(found(source), expected, "{source}");
+        }
+    }
+
+    /// `tsc` 7.0.2 reads an expression where a module name belongs. A malformed one
+    /// reports its own errors, and one that is not a string literal is TS1141,
+    /// which a file with a parse error does not get.
+    #[test]
+    fn a_module_name_is_read_as_an_expression() {
+        let found = |text: &str| -> Vec<(usize, String)> {
+            errors(&parse_ts(text))
+                .iter()
+                .map(|d| {
+                    let mapped = crate::diagnostics_parser::map_parse_diagnostic(d);
+                    (d.range().start().get(), mapped.code().as_str().to_owned())
+                })
+                .collect()
+        };
+        let at = |list: &[(usize, &str)]| -> Vec<(usize, String)> {
+            list.iter()
+                .map(|(start, code)| (*start, (*code).to_owned()))
+                .collect()
+        };
+        for (source, expected) in [
+            ("import x from y;", at(&[(14, "TS1141")])),
+            ("import x from 1;", at(&[(14, "TS1141")])),
+            ("import x from (a);", at(&[(14, "TS1141")])),
+            ("import x from a, b;", at(&[(14, "TS1141")])),
+            ("import x from +;", at(&[(15, "TS1109")])),
+            ("import x from *;", at(&[(14, "TS1109"), (15, "TS1109")])),
+            ("import x from =;", at(&[(14, "TS1109"), (15, "TS1109")])),
+            ("import x from <;", at(&[(15, "TS1110")])),
+            ("import x from /;", at(&[(14, "TS1161")])),
+            ("export * from +;", at(&[(15, "TS1109")])),
+            ("export { a } from +;", at(&[(19, "TS1109")])),
+            ("import x = require(y);", at(&[(19, "TS1141")])),
+            (
+                "import x = require(*);",
+                at(&[(19, "TS1109"), (20, "TS1109")]),
+            ),
+            ("import x from y; let a = ;", at(&[(25, "TS1109")])),
+            ("let a = ;\nimport x from y;", at(&[(8, "TS1109")])),
+            // An `import()` type reads a type there.
+            ("type T = import(y);", at(&[(16, "TS1141")])),
+            ("type T = import(1);", at(&[(16, "TS1141")])),
+            ("type T = import(`x`);", at(&[(16, "TS1141")])),
+            ("type T = import();", at(&[(16, "TS1110")])),
+        ] {
+            assert_eq!(found(source), expected, "{source}");
         }
     }
 
