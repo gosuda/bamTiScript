@@ -1811,7 +1811,7 @@ fn run_in_context_with_cancel(
     cancel: &CancellationToken,
 ) -> Result<CommandOutcome, DriverError> {
     let entrypoint = required_entrypoint(args)?;
-    let warnings = require_clean_frontend(args, frontend)?;
+    let warnings = require_runnable_frontend(args, frontend)?;
     let executable = lower_program_with_cancel(
         &frontend.program,
         &frontend.output,
@@ -2882,6 +2882,25 @@ fn require_clean_frontend(
     Ok(render_program_diagnostics(args, frontend))
 }
 
+/// Renders the diagnostics of a program about to run. Modules reachable only
+/// through `import()` reject that `import()` at run time instead of failing
+/// the run, so this applies the facade's run rule through the same function
+/// rather than the whole-program check the compile path uses.
+fn require_runnable_frontend(
+    args: &CliArgs,
+    frontend: &LoadedProgramFrontend,
+) -> Result<RenderedDiagnostics, DriverError> {
+    let failures = bamts::run_blocking_diagnostics(&frontend.program, &frontend.output, false);
+    if !failures.is_empty() {
+        let rendered = render_diagnostics(args, frontend, &failures);
+        return Err(DriverError::Diagnostics {
+            rendered: rendered.text,
+            truncation: rendered.truncation,
+        });
+    }
+    Ok(render_program_diagnostics(args, frontend))
+}
+
 /// Compiles a source entrypoint through the same frontend, lint, and lowering
 /// pipeline as [`execute`], returning the lowered executable program without
 /// running or linking it.  This is the in-process interpreter seam used by the
@@ -2972,6 +2991,36 @@ mod tests {
         let outcome = execute_in_context(&args, &context)?;
         assert_eq!(outcome.stdout, b"-1474936480\n");
         assert_eq!(outcome.exit_code, 0);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_run_defers_dynamic_only_early_error_to_import_rejection(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("bamts-cli-dynamic-only-{}", process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)?;
+        fs::write(
+            directory.join("main.ts"),
+            "console.log(\"before\");\n\
+             const pending = import(\"./early-error_FIXTURE.js\");\n\
+             pending.then(\n\
+             () => console.log(\"fulfilled\"),\n\
+             (error) => console.log(\"rejected:\" + error.name),\n\
+             );\n\
+             console.log(\"after\");\n",
+        )?;
+        fs::write(
+            directory.join("early-error_FIXTURE.js"),
+            "let wired = 1;\nlet wired = 2;\n",
+        )?;
+        let context = ExecutionContext::new(&directory, BTreeMap::new())?;
+        let args = parse_args(["run", "--jit", "--js-compat", "main.ts"])?;
+        let outcome = execute_in_context(&args, &context)?;
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.stdout, b"before\nafter\nrejected:SyntaxError\n");
         fs::remove_dir_all(directory)?;
         Ok(())
     }

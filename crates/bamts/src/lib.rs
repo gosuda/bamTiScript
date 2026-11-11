@@ -304,33 +304,7 @@ fn compile_entry_for_run(
     cancel: &CancellationToken,
 ) -> Result<bamts_compiler::program::ExecutableProgram> {
     let (resolved, frontend) = load_checked_frontend(path, lints, cancel)?;
-    let reachable = static_reachable_sources(&resolved.program);
-    let dynamic_ranges: HashSet<(SourceId, TextRange)> = resolved
-        .program
-        .modules()
-        .iter()
-        .flat_map(|module| {
-            module.dependencies().iter().filter_map(|edge| {
-                (edge.kind() == ModuleEdgeKind::DynamicRuntime && edge.is_unresolved())
-                    .then_some((module.source_id(), edge.range()))
-            })
-        })
-        .collect();
-    let diagnostics = frontend
-        .modules()
-        .iter()
-        .filter(|module| reachable.contains(&module.source_file().source_id()))
-        .flat_map(|module| module.diagnostics().iter())
-        .filter(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Error)
-        .filter(|diagnostic| {
-            !dynamic_ranges.contains(&(diagnostic.source_id(), diagnostic.range()))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if !diagnostics.is_empty() {
-        return Err(Error::Diagnostics { diagnostics });
-    }
-    let diagnostics = execution_early_errors(&resolved.program, script_entry);
+    let diagnostics = run_blocking_diagnostics(&resolved.program, &frontend, script_entry);
     if !diagnostics.is_empty() {
         return Err(Error::Diagnostics { diagnostics });
     }
@@ -344,6 +318,44 @@ fn compile_entry_for_run(
         cancel,
     )
     .map_err(Error::from)
+}
+
+/// The diagnostics that stop a run: frontend errors in the static reachable
+/// set, minus diagnostics anchored at a dynamic-only unresolved edge range,
+/// plus the static-reachable early errors. A module reachable only through
+/// `import()` rejects that `import()` at run time instead, per ECMA-262
+/// 13.3.10, so its diagnostics never fail the run. The CLI run path calls
+/// this same function so `bamts --run` and the library agree.
+#[cfg(feature = "node-host")]
+pub fn run_blocking_diagnostics(
+    program: &ResolvedProgram,
+    frontend: &bamts_compiler::pipeline::ProgramFrontendOutput,
+    script_entry: bool,
+) -> Vec<Diagnostic> {
+    let reachable = static_reachable_sources(program);
+    let dynamic_ranges: HashSet<(SourceId, TextRange)> = program
+        .modules()
+        .iter()
+        .flat_map(|module| {
+            module.dependencies().iter().filter_map(|edge| {
+                (edge.kind() == ModuleEdgeKind::DynamicRuntime && edge.is_unresolved())
+                    .then_some((module.source_id(), edge.range()))
+            })
+        })
+        .collect();
+    let mut diagnostics = frontend
+        .modules()
+        .iter()
+        .filter(|module| reachable.contains(&module.source_file().source_id()))
+        .flat_map(|module| module.diagnostics().iter())
+        .filter(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Error)
+        .filter(|diagnostic| {
+            !dynamic_ranges.contains(&(diagnostic.source_id(), diagnostic.range()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    diagnostics.extend(execution_early_errors(program, script_entry));
+    diagnostics
 }
 
 /// The early errors of every JavaScript module about to run. TypeScript sources
