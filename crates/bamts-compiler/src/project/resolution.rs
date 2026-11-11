@@ -152,6 +152,12 @@ pub enum ResolutionTraceStep {
     },
     NodeModulesWalk {
         directory: PathBuf,
+        exists: bool,
+        fallback: bool,
+    },
+    PackageJsonProbe {
+        path: PathBuf,
+        exists: bool,
     },
     TypesFallback {
         package: Arc<str>,
@@ -872,8 +878,16 @@ fn try_node_modules(
         if !directory.starts_with(root.path()) {
             break;
         }
+        let package_json = directory.join("package.json");
+        trace.push(ResolutionTraceStep::PackageJsonProbe {
+            path: package_json.clone(),
+            exists: host.file_exists(&package_json),
+        });
+        let node_modules = directory.join("node_modules");
         trace.push(ResolutionTraceStep::NodeModulesWalk {
             directory: directory.clone(),
+            exists: host.directory_exists(&node_modules),
+            fallback: false,
         });
         let package_root = directory.join("node_modules").join(&package_name);
         if (host.directory_exists(&package_root)
@@ -890,6 +904,25 @@ fn try_node_modules(
         {
             return Ok(Some(resolved));
         }
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        if parent == directory {
+            break;
+        }
+        directory = parent.to_path_buf();
+    }
+    let mut directory = containing.to_path_buf();
+    loop {
+        if !directory.starts_with(root.path()) {
+            break;
+        }
+        let node_modules = directory.join("node_modules");
+        trace.push(ResolutionTraceStep::NodeModulesWalk {
+            directory: directory.clone(),
+            exists: host.directory_exists(&node_modules),
+            fallback: true,
+        });
         let Some(parent) = directory.parent() else {
             break;
         };
@@ -1841,6 +1874,59 @@ mod tests {
                 log.lines()
             );
         }
+    }
+    #[test]
+    fn trace_bundler_bare_miss_matches_upstream_walk() {
+        let options = options_with_resolution("bundler");
+        let host = MemoryHost::default();
+        let mut cache = ResolutionCache::new();
+        let mut log = ResolutionTraceLog::default();
+        let outcome = resolve_module_name_with_trace(
+            &root(),
+            &options,
+            abs("/workspace/a/b/c/lib.ts"),
+            "foo",
+            (
+                ModuleResolutionKind::Bundler,
+                ResolutionMode::Import,
+                ResolutionFlavor::Runtime,
+            ),
+            TraceResolutionServices {
+                host: &host,
+                cache: &mut cache,
+                log: &mut log,
+            },
+        );
+        assert!(outcome.is_err());
+        let expected: &[&str] = &[
+            "======== Resolving module 'foo' from '/workspace/a/b/c/lib.ts'. ========",
+            "Explicitly specified module resolution kind: 'Bundler'.",
+            "Resolving in CJS mode with conditions 'import', 'types'.",
+            "File '/workspace/a/b/c/package.json' does not exist.",
+            "File '/workspace/a/b/package.json' does not exist.",
+            "File '/workspace/a/package.json' does not exist.",
+            "File '/workspace/package.json' does not exist.",
+            "Loading module 'foo' from 'node_modules' folder, target file types: TypeScript, JavaScript, Declaration, JSON.",
+            "Searching all ancestor node_modules directories for preferred extensions: TypeScript, Declaration.",
+            "Directory '/workspace/a/b/c/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/a/b/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/a/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/node_modules' does not exist, skipping all lookups in it.",
+            "Searching all ancestor node_modules directories for fallback extensions: JavaScript, JSON.",
+            "Directory '/workspace/a/b/c/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/a/b/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/a/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/node_modules' does not exist, skipping all lookups in it.",
+            "======== Module name 'foo' was not resolved. ========",
+        ];
+        let drive = trace_drive();
+        let expected: Vec<String> = expected
+            .iter()
+            .map(|line| line.replace("'/workspace", &format!("'{drive}/workspace")))
+            .collect();
+        let produced: Vec<&str> = log.lines().iter().map(String::as_str).collect();
+        assert_eq!(produced, expected);
+        assert!(log.unsupported().is_empty());
     }
     #[test]
     fn trace_log_matches_upstream_bundler_relative_blob() {

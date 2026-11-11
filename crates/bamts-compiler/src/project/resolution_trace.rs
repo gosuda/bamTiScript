@@ -55,11 +55,24 @@ impl ResolutionTraceLog {
         result: &Result<ResolvedModule, ResolutionError>,
     ) {
         if !(specifier.starts_with("./") || specifier.starts_with("../")) {
-            self.unsupported.insert(if specifier.starts_with('#') {
-                UnsupportedTraceKind::PackageImport
-            } else {
-                UnsupportedTraceKind::PackageName
-            });
+            if specifier.starts_with('#') {
+                self.unsupported
+                    .insert(UnsupportedTraceKind::PackageImport);
+                return;
+            }
+            if strategy.0 == ModuleResolutionKind::Bundler
+                && !cached
+                && self.render_bundler_bare(
+                    importer,
+                    specifier,
+                    (strategy.0, strategy.1),
+                    explicit_kind,
+                    result,
+                )
+            {
+                return;
+            }
+            self.unsupported.insert(UnsupportedTraceKind::PackageName);
             return;
         }
 
@@ -128,6 +141,109 @@ impl ResolutionTraceLog {
             self.unsupported
                 .insert(UnsupportedTraceKind::DirectoryPackage);
         }
+    }
+
+    fn render_bundler_bare(
+        &mut self,
+        importer: &Path,
+        specifier: &str,
+        strategy: (ModuleResolutionKind, ResolutionMode),
+        explicit_kind: bool,
+        result: &Result<ResolvedModule, ResolutionError>,
+    ) -> bool {
+        let trace = match result {
+            Ok(resolved) => Some(resolved.trace()),
+            Err(error) => error.trace(),
+        };
+        let Some(trace) = trace else { return false };
+        if result.is_ok() {
+            return false;
+        }
+        let mut probes = Vec::new();
+        let mut preferred = Vec::new();
+        let mut fallback = Vec::new();
+        for step in trace.steps() {
+            match step {
+                ResolutionTraceStep::PackageJsonProbe { path, exists } => {
+                    if *exists {
+                        return false;
+                    }
+                    probes.push(path);
+                }
+                ResolutionTraceStep::NodeModulesWalk {
+                    directory,
+                    exists,
+                    fallback: is_fallback,
+                } => {
+                    if *exists {
+                        return false;
+                    }
+                    if *is_fallback {
+                        fallback.push(directory);
+                    } else {
+                        preferred.push(directory);
+                    }
+                }
+                ResolutionTraceStep::PackageJson { .. }
+                | ResolutionTraceStep::PathsMatch { .. } => return false,
+                _ => {}
+            }
+        }
+        self.lines.push(format!(
+            "======== Resolving module '{specifier}' from '{}'. ========",
+            display_path(importer)
+        ));
+        if explicit_kind {
+            self.lines.push(format!(
+                "Explicitly specified module resolution kind: '{}'.",
+                strategy.0.trace_name()
+            ));
+        } else {
+            self.lines.push(format!(
+                "Module resolution kind is not specified, using '{}'.",
+                strategy.0.trace_name()
+            ));
+        }
+        let condition = match strategy.1 {
+            ResolutionMode::Import => "import",
+            ResolutionMode::Require => "require",
+        };
+        self.lines.push(format!(
+            "Resolving in CJS mode with conditions '{condition}', 'types'."
+        ));
+        for path in &probes {
+            self.lines.push(format!(
+                "File '{}' does not exist.",
+                display_path(path)
+            ));
+        }
+        self.lines.push(format!(
+            "Loading module '{specifier}' from 'node_modules' folder, target file types: TypeScript, JavaScript, Declaration, JSON."
+        ));
+        self.lines.push(
+            "Searching all ancestor node_modules directories for preferred extensions: TypeScript, Declaration."
+                .to_string(),
+        );
+        for directory in &preferred {
+            self.lines.push(format!(
+                "Directory '{}/node_modules' does not exist, skipping all lookups in it.",
+                display_path(directory)
+            ));
+        }
+        self.lines.push(
+            "Searching all ancestor node_modules directories for fallback extensions: JavaScript, JSON."
+                .to_string(),
+        );
+        for directory in &fallback {
+            self.lines.push(format!(
+                "Directory '{}/node_modules' does not exist, skipping all lookups in it.",
+                display_path(directory)
+            ));
+        }
+        self.lines.push(format!(
+            "======== Module name '{specifier}' was not resolved. ========"
+        ));
+        true
     }
 
     fn render_candidates(
