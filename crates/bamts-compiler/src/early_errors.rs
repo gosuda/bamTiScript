@@ -2658,6 +2658,30 @@ mod tests {
     }
 
     #[test]
+    fn invalid_regex_group_names_are_rejected() {
+        for source in [
+            "/(?<:a>a)/;",
+            "/(?<:a>a)/u;",
+            "/(?<a:>a)/;",
+            "/(?<a:>a)/u;",
+            "/(?<42a>a)/;",
+            "/(?<\u{2764}>a)/;",
+            "/(?<a\\uD801>b)/u;",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "/(?<a>a)/;",
+            "/(?<$a_1>x)/;",
+            "/(?<\\u0041>a)/;",
+            "/(?<a\\uD801\\uDCA4>b)/u;",
+            "/\\k<a>(?<a>x)/;",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    #[test]
     fn invalid_regex_unicode_escapes_are_rejected() {
         for source in [
             "/\\c0/u;",

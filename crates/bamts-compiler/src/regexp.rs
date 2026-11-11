@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use crate::scanner::{is_id_continue, is_id_start};
 
 const BINARY_PROPS: &[&str] = &[
     "AHex",
@@ -846,6 +847,9 @@ impl<'a> Parser<'a> {
         if name.is_empty() {
             return Some(format!("invalid regular expression"));
         }
+        if let Some(message) = validate_group_name(&name) {
+            return Some(message);
+        }
         if self.peek() != Some(0x3E) {
             return Some(format!("invalid regular expression"));
         }
@@ -890,6 +894,9 @@ impl<'a> Parser<'a> {
         let name: Vec<u16> = self.units[name_start..self.pos].to_vec();
         if name.is_empty() {
             return Some(format!("invalid regular expression"));
+        }
+        if let Some(message) = validate_group_name(&name) {
+            return Some(message);
         }
         self.pos += 1;
         self.groups.push(GroupDef {
@@ -1456,6 +1463,128 @@ fn validate_named_property(name: &[u16], value: &[u16]) -> Option<String> {
         return None;
     }
     Some(format!("invalid regular expression"))
+}
+
+fn validate_group_name(name: &[u16]) -> Option<String> {
+    let mut chars: Vec<char> = Vec::new();
+    let mut idx = 0;
+    while idx < name.len() {
+        if let Some(message) = push_group_name_unit(name, &mut idx, &mut chars) {
+            return Some(message);
+        }
+    }
+    let mut chars = chars.iter();
+    match chars.next() {
+        Some(first) if is_id_start(*first) => {}
+        _ => return Some(format!("invalid regular expression")),
+    }
+    if chars.any(|candidate| !is_id_continue(*candidate)) {
+        return Some(format!("invalid regular expression"));
+    }
+    None
+}
+
+fn push_group_name_unit(name: &[u16], idx: &mut usize, chars: &mut Vec<char>) -> Option<String> {
+    if name[*idx] == 0x5C {
+        return push_group_name_escape(name, idx, chars);
+    }
+    if (0xD800..0xDC00).contains(&name[*idx])
+        && *idx + 1 < name.len()
+        && (0xDC00..0xE000).contains(&name[*idx + 1])
+    {
+        let high = u32::from(name[*idx] - 0xD800);
+        let low = u32::from(name[*idx + 1] - 0xDC00);
+        *idx += 2;
+        return match char::from_u32(0x10000 + (high << 10) + low) {
+            Some(candidate) => {
+                chars.push(candidate);
+                None
+            }
+            None => Some(format!("invalid regular expression")),
+        };
+    }
+    if (0xD800..0xE000).contains(&name[*idx]) {
+        return Some(format!("invalid regular expression"));
+    }
+    *idx += 1;
+    match char::from_u32(u32::from(name[*idx - 1])) {
+        Some(candidate) => {
+            chars.push(candidate);
+            None
+        }
+        None => Some(format!("invalid regular expression")),
+    }
+}
+
+fn push_group_name_escape(name: &[u16], idx: &mut usize, chars: &mut Vec<char>) -> Option<String> {
+    let Some(first) = decode_group_name_escape(name, idx) else {
+        return Some(format!("invalid regular expression"));
+    };
+    if !(0xD800..0xDC00).contains(&first) {
+        return match char::from_u32(first) {
+            Some(candidate) => {
+                chars.push(candidate);
+                None
+            }
+            None => Some(format!("invalid regular expression")),
+        };
+    }
+    let Some(second) = decode_group_name_escape(name, idx) else {
+        return Some(format!("invalid regular expression"));
+    };
+    if !(0xDC00..0xE000).contains(&second) {
+        return Some(format!("invalid regular expression"));
+    }
+    match char::from_u32(0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00)) {
+        Some(astral) => {
+            chars.push(astral);
+            None
+        }
+        None => Some(format!("invalid regular expression")),
+    }
+}
+
+fn decode_group_name_escape(name: &[u16], idx: &mut usize) -> Option<u32> {
+    if *name.get(*idx + 1)? != 0x75 {
+        return None;
+    }
+    if *name.get(*idx + 2)? == 0x7B {
+        let mut end = *idx + 3;
+        while end < name.len() && name[end] != 0x7D {
+            if !is_hex_digit(name[end]) {
+                return None;
+            }
+            end += 1;
+        }
+        if end >= name.len() || end == *idx + 3 {
+            return None;
+        }
+        let mut value: u32 = 0;
+        for unit in &name[*idx + 3..end] {
+            value = value * 16 + hex_value(*unit);
+        }
+        *idx = end + 1;
+        Some(value)
+    } else {
+        let end = *idx + 6;
+        if end > name.len() || name[*idx + 2..end].iter().any(|unit| !is_hex_digit(*unit)) {
+            return None;
+        }
+        let mut value: u32 = 0;
+        for unit in &name[*idx + 2..end] {
+            value = value * 16 + hex_value(*unit);
+        }
+        *idx = end;
+        Some(value)
+    }
+}
+
+fn hex_value(unit: u16) -> u32 {
+    match unit {
+        0x30..=0x39 => u32::from(unit - 0x30),
+        0x41..=0x46 => u32::from(unit - 0x41) + 10,
+        _ => u32::from(unit - 0x61) + 10,
+    }
 }
 
 fn can_both_participate(first: &[(usize, usize)], second: &[(usize, usize)]) -> bool {
