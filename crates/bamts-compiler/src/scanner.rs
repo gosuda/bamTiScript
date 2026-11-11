@@ -2443,6 +2443,14 @@ mod tests {
             scan_text("0x").diagnostics()[0].code(),
             INVALID_NUMERIC_LITERAL
         );
+        assert_eq!(
+            scan_text("0b").diagnostics()[0].code(),
+            INVALID_NUMERIC_LITERAL
+        );
+        assert_eq!(
+            scan_text("0b2").diagnostics()[0].code(),
+            INVALID_NUMERIC_LITERAL
+        );
         // A float or leading-zero integer cannot carry a BigInt suffix.
         assert_eq!(
             scan_text("1.5n").diagnostics()[0].code(),
