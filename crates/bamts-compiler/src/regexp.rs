@@ -584,14 +584,31 @@ fn validate_pattern(pattern: &[u16], mode: RegexMode) -> Option<String> {
         units: pattern,
         pos: 0,
         mode,
+        disjunctions: Vec::new(),
+        next_disjunction: 0,
+        groups: Vec::new(),
+        references: Vec::new(),
+        bare_k: 0,
+        incomplete_k: 0,
     };
     parser.parse_top()
+}
+
+struct GroupDef {
+    name: Vec<u16>,
+    context: Vec<(usize, usize)>,
 }
 
 struct Parser<'a> {
     units: &'a [u16],
     pos: usize,
     mode: RegexMode,
+    disjunctions: Vec<(usize, usize)>,
+    next_disjunction: usize,
+    groups: Vec<GroupDef>,
+    references: Vec<Vec<u16>>,
+    bare_k: usize,
+    incomplete_k: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -610,20 +627,28 @@ impl<'a> Parser<'a> {
         if self.pos != self.units.len() {
             return Some(format!("invalid regular expression"));
         }
-        None
+        self.check_named_groups()
     }
 
     fn parse_disjunction(&mut self) -> Option<String> {
+        let id = self.next_disjunction;
+        self.next_disjunction += 1;
+        self.disjunctions.push((id, 0));
         loop {
             if let Some(message) = self.parse_alternative() {
                 return Some(message);
             }
             if self.peek() == Some(0x7C) {
                 self.pos += 1;
+                if let Some(top) = self.disjunctions.last_mut() {
+                    top.1 += 1;
+                }
                 continue;
             }
-            return None;
+            break;
         }
+        self.disjunctions.pop();
+        None
     }
 
     fn parse_alternative(&mut self) -> Option<String> {
@@ -752,16 +777,75 @@ impl<'a> Parser<'a> {
 
     fn parse_named_group(&mut self) -> Option<String> {
         self.pos += 1;
+        let name_start = self.pos;
         while let Some(unit) = self.peek() {
             if unit == 0x3E {
-                self.pos += 1;
                 break;
             }
             if unit == 0x29 || unit == 0x2F {
                 return Some(format!("invalid regular expression"));
             }
+            if unit == 0x5C {
+                break;
+            }
             self.pos += 1;
         }
+        if self.peek() == Some(0x5C) {
+            return self.parse_named_group_escaped(name_start);
+        }
+        let name: Vec<u16> = self.units[name_start..self.pos].to_vec();
+        if name.is_empty() {
+            return Some(format!("invalid regular expression"));
+        }
+        if self.peek() != Some(0x3E) {
+            return Some(format!("invalid regular expression"));
+        }
+        self.pos += 1;
+        self.groups.push(GroupDef {
+            name,
+            context: self.disjunctions.clone(),
+        });
+        if let Some(message) = self.parse_disjunction() {
+            return Some(message);
+        }
+        if self.peek() != Some(0x29) {
+            return Some(format!("invalid regular expression"));
+        }
+        self.pos += 1;
+        self.skip_quantifier();
+        None
+    }
+
+    fn parse_named_group_escaped(&mut self, name_start: usize) -> Option<String> {
+        while let Some(unit) = self.peek() {
+            if unit == 0x3E {
+                break;
+            }
+            if unit == 0x29 || unit == 0x2F {
+                return Some(format!("invalid regular expression"));
+            }
+            if unit == 0x5C {
+                self.pos += 1;
+                if self.peek().is_none() {
+                    return Some(format!("invalid regular expression"));
+                }
+                self.pos += 1;
+                continue;
+            }
+            self.pos += 1;
+        }
+        if self.peek() != Some(0x3E) {
+            return Some(format!("invalid regular expression"));
+        }
+        let name: Vec<u16> = self.units[name_start..self.pos].to_vec();
+        if name.is_empty() {
+            return Some(format!("invalid regular expression"));
+        }
+        self.pos += 1;
+        self.groups.push(GroupDef {
+            name,
+            context: self.disjunctions.clone(),
+        });
         if let Some(message) = self.parse_disjunction() {
             return Some(message);
         }
@@ -897,12 +981,96 @@ impl<'a> Parser<'a> {
             self.skip_quantifier();
             return None;
         }
+        if self.is_k_prefix() {
+            self.parse_k_reference();
+            self.skip_quantifier();
+            return None;
+        }
         self.pos += 1;
         if self.peek().is_none() {
             return Some(format!("invalid regular expression"));
         }
         self.pos += 1;
         self.skip_quantifier();
+        None
+    }
+
+    fn is_k_prefix(&self) -> bool {
+        self.units.get(self.pos) == Some(&0x5C) && self.units.get(self.pos + 1) == Some(&0x6B)
+    }
+
+    fn parse_k_reference(&mut self) {
+        self.pos += 2;
+        if self.peek() != Some(0x3C) {
+            self.bare_k += 1;
+            return;
+        }
+        self.pos += 1;
+        let name_start = self.pos;
+        while let Some(unit) = self.peek() {
+            if unit == 0x3E {
+                break;
+            }
+            if unit == 0x29 || unit == 0x2F {
+                break;
+            }
+            self.pos += 1;
+        }
+        if self.peek() != Some(0x3E) {
+            self.incomplete_k += 1;
+            return;
+        }
+        let name: Vec<u16> = self.units[name_start..self.pos].to_vec();
+        self.references.push(name);
+        self.pos += 1;
+    }
+
+    fn check_named_groups(&self) -> Option<String> {
+        if let Some(message) = self.check_duplicate_groups() {
+            return Some(message);
+        }
+        self.check_k_references()
+    }
+
+    fn check_duplicate_groups(&self) -> Option<String> {
+        let mut idx = 0;
+        while idx < self.groups.len() {
+            let mut inner = idx + 1;
+            while inner < self.groups.len() {
+                if self.groups[idx].name == self.groups[inner].name
+                    && can_both_participate(&self.groups[idx].context, &self.groups[inner].context)
+                {
+                    return Some(format!("invalid regular expression"));
+                }
+                inner += 1;
+            }
+            idx += 1;
+        }
+        None
+    }
+
+    fn check_k_references(&self) -> Option<String> {
+        if matches!(self.mode, RegexMode::Unicode | RegexMode::UnicodeSets) {
+            return self.check_k_strict();
+        }
+        if self.groups.is_empty() {
+            return None;
+        }
+        self.check_k_strict()
+    }
+
+    fn check_k_strict(&self) -> Option<String> {
+        if self.bare_k > 0 || self.incomplete_k > 0 {
+            return Some(format!("invalid regular expression"));
+        }
+        for reference in &self.references {
+            if reference.is_empty() {
+                return Some(format!("invalid regular expression"));
+            }
+            if !self.groups.iter().any(|group| group.name == *reference) {
+                return Some(format!("invalid regular expression"));
+            }
+        }
         None
     }
 
@@ -1013,6 +1181,19 @@ fn validate_named_property(name: &[u16], value: &[u16]) -> Option<String> {
         return None;
     }
     Some(format!("invalid regular expression"))
+}
+
+fn can_both_participate(first: &[(usize, usize)], second: &[(usize, usize)]) -> bool {
+    for (id, alt) in first {
+        let mut idx = 0;
+        while idx < second.len() {
+            if &second[idx].0 == id && &second[idx].1 != alt {
+                return false;
+            }
+            idx += 1;
+        }
+    }
+    true
 }
 
 fn validate_single_modifier(first: &[u16]) -> Option<String> {
