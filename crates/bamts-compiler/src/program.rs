@@ -2644,6 +2644,13 @@ pub fn lower_program_with_cancel(
     }
     let mut excluded: HashSet<SourceId> = HashSet::new();
     let mut stubbed: HashSet<SourceId> = HashSet::new();
+    let mut synthetic_id = resolved
+        .modules()
+        .iter()
+        .map(|module| module.source_id().get())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
     loop {
         let kept: Vec<&ResolvedModule> = resolved
             .modules()
@@ -2698,8 +2705,10 @@ pub fn lower_program_with_cancel(
                 )
                 .expect("stub fits budget");
                 let stub_arc = Arc::new(stub_source);
+                let stub_id = SourceId::new(synthetic_id);
+                synthetic_id = synthetic_id.saturating_add(1);
                 let scanned = scanner::scan_with_cancel(
-                    module.source_id(),
+                    stub_id,
                     module.script_kind(),
                     Arc::clone(&stub_arc),
                     cancel.clone(),
