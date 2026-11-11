@@ -246,6 +246,10 @@ fn raw_json<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let text =
         machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let units = text.as_units();
+    if units.is_empty() || matches!(units[0], 0x09 | 0x0A | 0x0D | 0x20) || matches!(units[units.len() - 1], 0x09 | 0x0A | 0x0D | 0x20) {
+        return Err(raw_json_error(machine, "empty or whitespace-padded text is not valid raw JSON"));
+    }
     match parse_root(machine, &text)? {
         JsonNode::Primitive { .. } => {}
         JsonNode::Array { .. } | JsonNode::Object { .. } => {
@@ -1778,12 +1782,6 @@ mod tests {
         );
     }
 
-    // Recovery-disk extras originally accepted incomplete (`tru`) and
-    // structured (`[1]`, `{}`) texts, and expected boxed BigInt stringify
-    // as `{}`. Restored 7dbbbb9 plus ECMA-262 2026 §25.5.3 / SerializeJSONProperty
-    // require SyntaxError for incomplete/structured rawJSON and TypeError for
-    // boxed BigInt after toJSON/replacer. Keep surrounding whitespace accepted
-    // to stay aligned with the restored witness.
     #[test]
     fn raw_json_validates_empty_and_leading_continuations() {
         test_machine!(program, host, machine);
@@ -1799,7 +1797,7 @@ mod tests {
                 "{input:?} must surface as an abrupt throw"
             );
         }
-        for input in ["0", " 0", "\ttrue ", "null", "\"s\""] {
+        for input in ["0", "null", "\"s\"", "true"] {
             let argument = text(&mut machine, input);
             let object = machine
                 .call_value(raw, json, &[argument])
@@ -1867,7 +1865,7 @@ mod tests {
         let json = global(&mut machine, "JSON");
         let raw = method(&mut machine, json, "rawJSON");
         for input in [
-            "", "   ", "\t\n ", ",", "] 1", "}0", "tru", "0 1", "null x", "[1]", "{}",
+            "", "   ", "\t\n ", ",", "] 1", "}0", "tru", "0 1", "null x", "[1]", "{}", " 0", "\ttrue ", " 123", "123 ",
         ] {
             let argument = text(&mut machine, input);
             let error = machine
@@ -1878,7 +1876,7 @@ mod tests {
                 "{input:?} must surface as a SyntaxError object"
             );
         }
-        for input in ["0", " 0", "\ttrue ", "null", "\"s\""] {
+        for input in ["0", "null", "\"s\"", "true"] {
             let argument = text(&mut machine, input);
             let object = machine
                 .call_value(raw, json, &[argument])
