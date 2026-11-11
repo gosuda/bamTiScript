@@ -133,7 +133,7 @@ pub struct EmitOptions {
     pub declaration: bool,
     pub emit_declaration_only: bool,
     pub isolated_declarations: bool,
-    pub strip_private: bool,
+    pub strip_internal: bool,
     pub source_map: bool,
     pub inline_source_map: bool,
     pub inline_sources: bool,
@@ -167,7 +167,7 @@ impl Default for EmitOptions {
             declaration: false,
             emit_declaration_only: false,
             isolated_declarations: false,
-            strip_private: false,
+            strip_internal: false,
             source_map: false,
             inline_source_map: false,
             inline_sources: false,
@@ -312,10 +312,10 @@ impl EmitOptions {
                 self.isolated_declarations = isolated_declarations;
             }
             "stripinternal" => {
-                let Some(strip_private) = parse_bool(value) else {
+                let Some(strip_internal) = parse_bool(value) else {
                     return Some(invalid());
                 };
-                self.strip_private = strip_private;
+                self.strip_internal = strip_internal;
             }
             "sourcemap" => {
                 let Some(source_map) = parse_bool(value) else {
@@ -425,7 +425,6 @@ impl EmitOptions {
             newline: self.newline,
             indent_width: self.indent_width,
             isolated_declarations: self.isolated_declarations,
-            strip_private: self.strip_private,
             declaration_map: self.declaration_map,
         }
     }
@@ -4518,14 +4517,34 @@ impl<'a> Emitter<'a> {
     }
     fn emit_class_body_decl(&mut self, members: &[ClassMemberNode], range: TextRange) {
         self.raw("{");
-        let has = members
+        let has_private_name = members
             .iter()
-            .any(|member| self.class_member_emits_decl(member.data()));
+            .any(|member| Self::member_has_private_name(member.data()));
+        let has = has_private_name
+            || members
+                .iter()
+                .any(|member| self.class_member_emits_decl(member.data()));
         if has {
             self.newline();
             self.indent += 1;
         }
+        let mut printed_private_name = false;
+        let mut bare_private_methods: Vec<String> = Vec::new();
         for member in members {
+            if Self::member_has_private_name(member.data()) {
+                if !printed_private_name {
+                    self.raw("#private;");
+                    self.newline();
+                    printed_private_name = true;
+                }
+                continue;
+            }
+            if let Some(key) = self.bare_private_method_name(member.data()) {
+                if bare_private_methods.contains(&key) {
+                    continue;
+                }
+                bare_private_methods.push(key);
+            }
             if self.class_member_emits_decl(member.data()) {
                 self.emit_jsdoc_for_range(member.range());
             }
@@ -4548,6 +4567,31 @@ impl<'a> Emitter<'a> {
         )
     }
 
+    fn member_has_private_name(member: &ClassMember) -> bool {
+        match member {
+            ClassMember::Method(method) => matches!(method.name, PropertyName::Private(_)),
+            ClassMember::Property(property) => {
+                matches!(property.name, PropertyName::Private(_))
+            }
+            ClassMember::AutoAccessor(accessor) => {
+                matches!(accessor.name, PropertyName::Private(_))
+            }
+            _ => false,
+        }
+    }
+
+    fn bare_private_method_name(&self, member: &ClassMember) -> Option<String> {
+        if let ClassMember::Method(method) = member
+            && method.modifiers.accessibility == Some(Accessibility::Private)
+            && method.modifier == PropertyModifier::None
+            && let PropertyName::Identifier(name) = &method.name
+            && let Some(key) = self.text(name.data().token())
+        {
+            return Some(key.to_owned());
+        }
+        None
+    }
+
     fn emit_class_member_decl(&mut self, member: &ClassMember) -> bool {
         match member {
             ClassMember::Constructor(constructor) => {
@@ -4563,6 +4607,26 @@ impl<'a> Emitter<'a> {
                 true
             }
             ClassMember::Method(method) => {
+                if method.modifiers.accessibility == Some(Accessibility::Private) {
+                    self.emit_member_modifiers_decl(&method.modifiers);
+                    match method.modifier {
+                        PropertyModifier::Get => self.raw("get "),
+                        PropertyModifier::Set => self.raw("set "),
+                        PropertyModifier::None => {}
+                    }
+                    self.emit_property_name(&method.name);
+                    match method.modifier {
+                        PropertyModifier::Get => self.raw("();"),
+                        PropertyModifier::Set => self.raw("(value);"),
+                        PropertyModifier::None => {
+                            if method.optional {
+                                self.raw("?");
+                            }
+                            self.raw(";");
+                        }
+                    }
+                    return true;
+                }
                 self.emit_member_modifiers_decl(&method.modifiers);
                 match method.modifier {
                     PropertyModifier::Get => self.raw("get "),
@@ -4583,6 +4647,15 @@ impl<'a> Emitter<'a> {
                 true
             }
             ClassMember::Property(property) => {
+                if property.modifiers.accessibility == Some(Accessibility::Private) {
+                    self.emit_member_modifiers_decl(&property.modifiers);
+                    self.emit_property_name(&property.name);
+                    if property.optional {
+                        self.raw("?");
+                    }
+                    self.raw(";");
+                    return true;
+                }
                 self.emit_member_modifiers_decl(&property.modifiers);
                 self.emit_property_name(&property.name);
                 if property.optional {
@@ -4605,6 +4678,13 @@ impl<'a> Emitter<'a> {
                 true
             }
             ClassMember::AutoAccessor(accessor) => {
+                if accessor.modifiers.accessibility == Some(Accessibility::Private) {
+                    self.emit_member_modifiers_decl(&accessor.modifiers);
+                    self.raw("accessor ");
+                    self.emit_property_name(&accessor.name);
+                    self.raw(";");
+                    return true;
+                }
                 self.emit_member_modifiers_decl(&accessor.modifiers);
                 self.raw("accessor ");
                 self.emit_property_name(&accessor.name);

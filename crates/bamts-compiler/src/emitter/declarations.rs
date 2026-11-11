@@ -3,7 +3,7 @@
 //! The JavaScript printer already has a [`super::Surface::Declaration`] path.
 //! This module is the declaration-emit policy layer in front of that path: it
 //! rewrites the tree so parameter properties become class fields, private
-//! members can be stripped, and isolated-declaration errors are reported for
+//! members print without types, and isolated-declaration errors are reported for
 //! exported values that would otherwise require the checker to invent a type.
 //!
 //! # Guarantees
@@ -50,8 +50,6 @@ pub struct DeclarationOptions {
     pub indent_width: u8,
     /// When true, exported values without portable types are errors.
     pub isolated_declarations: bool,
-    /// When true, `private` members and private parameter properties are omitted.
-    pub strip_private: bool,
     /// When true, emit a source map for the declaration file.
     pub declaration_map: bool,
 }
@@ -62,30 +60,21 @@ impl Default for DeclarationOptions {
             newline: Newline::Lf,
             indent_width: 4,
             isolated_declarations: false,
-            strip_private: false,
             declaration_map: false,
         }
     }
 }
 
 impl DeclarationOptions {
-    /// Isolated-declaration checking with private members retained.
+    /// Isolated-declaration checking.
     #[must_use]
     pub const fn isolated() -> Self {
         Self {
             newline: Newline::Lf,
             indent_width: 4,
             isolated_declarations: true,
-            strip_private: false,
             declaration_map: false,
         }
-    }
-
-    /// Returns a copy that strips `private` members.
-    #[must_use]
-    pub const fn with_strip_private(mut self, strip_private: bool) -> Self {
-        self.strip_private = strip_private;
-        self
     }
 }
 
@@ -101,7 +90,7 @@ pub fn emit_declarations(
     if options.isolated_declarations {
         collect_isolated_errors(file, &mut diagnostics);
     }
-    let rewritten = rewrite_file(file, options, &mut diagnostics);
+    let rewritten = rewrite_file(file, &mut diagnostics);
     let mut output = print(
         &rewritten,
         model,
@@ -125,12 +114,8 @@ pub fn emit_declarations(
     output
 }
 
-fn rewrite_file(
-    file: &SourceFile,
-    options: DeclarationOptions,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> SourceFile {
-    let statements = rewrite_statements(file.statements(), options, diagnostics);
+fn rewrite_file(file: &SourceFile, diagnostics: &mut Vec<Diagnostic>) -> SourceFile {
+    let statements = rewrite_statements(file.statements(), diagnostics);
     SourceFile::new(
         file.id(),
         file.source_id(),
@@ -144,30 +129,22 @@ fn rewrite_file(
     )
 }
 
-fn rewrite_statements(
-    statements: &[Stmt],
-    options: DeclarationOptions,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Vec<Stmt> {
+fn rewrite_statements(statements: &[Stmt], diagnostics: &mut Vec<Diagnostic>) -> Vec<Stmt> {
     statements
         .iter()
-        .map(|statement| rewrite_statement(statement, options, diagnostics))
+        .map(|statement| rewrite_statement(statement, diagnostics))
         .collect()
 }
 
-fn rewrite_statement(
-    statement: &Stmt,
-    options: DeclarationOptions,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Stmt {
+fn rewrite_statement(statement: &Stmt, diagnostics: &mut Vec<Diagnostic>) -> Stmt {
     match statement.data() {
         Statement::Class(class) => Node::new(
             statement.id(),
             statement.range(),
-            Statement::Class(rewrite_class(class, options, diagnostics)),
+            Statement::Class(rewrite_class(class, diagnostics)),
         ),
         Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner))) => {
-            let inner = rewrite_statement(inner, options, diagnostics);
+            let inner = rewrite_statement(inner, diagnostics);
             Node::new(
                 statement.id(),
                 statement.range(),
@@ -179,7 +156,7 @@ fn rewrite_statement(
         Statement::Export(ExportDeclaration::Default(default)) => {
             let value = match &default.value {
                 ExportDefaultValue::Class(class) => {
-                    ExportDefaultValue::Class(rewrite_class(class, options, diagnostics))
+                    ExportDefaultValue::Class(rewrite_class(class, diagnostics))
                 }
                 other => other.clone(),
             };
@@ -194,43 +171,26 @@ fn rewrite_statement(
         Statement::Declare(inner) => Node::new(
             statement.id(),
             statement.range(),
-            Statement::Declare(Box::new(rewrite_statement(inner, options, diagnostics))),
+            Statement::Declare(Box::new(rewrite_statement(inner, diagnostics))),
         ),
         _ => statement.clone(),
     }
 }
 
-fn rewrite_class(
-    class: &ClassDeclaration,
-    options: DeclarationOptions,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> ClassDeclaration {
+fn rewrite_class(class: &ClassDeclaration, diagnostics: &mut Vec<Diagnostic>) -> ClassDeclaration {
     let mut members = Vec::new();
     for member in &class.members {
         match member.data() {
             ClassMember::Constructor(constructor) => {
                 let (properties, constructor) =
-                    lift_parameter_properties(member.id(), constructor, options, diagnostics);
+                    lift_parameter_properties(member.id(), constructor, diagnostics);
                 members.extend(properties);
-                if !options.strip_private
-                    || constructor.modifiers.accessibility != Some(Accessibility::Private)
-                {
-                    members.push(Node::new(
-                        member.id(),
-                        member.range(),
-                        ClassMember::Constructor(constructor),
-                    ));
-                }
+                members.push(Node::new(
+                    member.id(),
+                    member.range(),
+                    ClassMember::Constructor(constructor),
+                ));
             }
-            ClassMember::Method(method)
-                if options.strip_private
-                    && method.modifiers.accessibility == Some(Accessibility::Private) => {}
-            ClassMember::Property(property)
-                if options.strip_private
-                    && property.modifiers.accessibility == Some(Accessibility::Private) => {}
-            ClassMember::AutoAccessor(accessor)
-                if options.strip_private
-                    && accessor.modifiers.accessibility == Some(Accessibility::Private) => {}
             _ => members.push(member.clone()),
         }
     }
@@ -243,7 +203,6 @@ fn rewrite_class(
 fn lift_parameter_properties(
     constructor_id: NodeId,
     constructor: &ConstructorDeclaration,
-    options: DeclarationOptions,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> (Vec<ClassMemberNode>, ConstructorDeclaration) {
     let mut properties = Vec::new();
@@ -252,17 +211,6 @@ fn lift_parameter_properties(
         let data = parameter.data();
         if !super::is_parameter_property(data) {
             parameters.push(parameter.clone());
-            continue;
-        }
-        if options.strip_private && data.modifiers.accessibility == Some(Accessibility::Private) {
-            parameters.push(Node::new(
-                parameter.id(),
-                parameter.range(),
-                Parameter {
-                    modifiers: ParameterModifiers::default(),
-                    ..data.clone()
-                },
-            ));
             continue;
         }
         match data.binding.data() {
@@ -484,6 +432,45 @@ mod tests {
     }
 
     #[test]
+    fn private_members_print_without_types_like_comments_class_members() {
+        let output = emit_dts(
+            "export class C {\n\
+             \x20   #hidden: string;\n\
+             \x20   private p: number;\n\
+             \x20   private static x: number;\n\
+             \x20   private readonly a1: string;\n\
+             \x20   private m(): void {}\n\
+             \x20   private get g(): number { return 1; }\n\
+             \x20   private set g(v: number) {}\n\
+             \x20   private accessor acc: number;\n\
+             \x20   visible: string;\n\
+             }\n",
+            DeclarationOptions::default(),
+        );
+        assert_eq!(
+            output.declaration.as_ref().unwrap().code,
+            "export declare class C {\n    #private;\n    private p;\n    private static x;\n    private readonly a1;\n    private m;\n    private get g();\n    private set g(value);\n    private accessor acc;\n    visible: string;\n}\n"
+        );
+    }
+
+    #[test]
+    fn overloaded_private_methods_print_one_bare_member_like_decl_file_for_class_with_private_overloaded_function()
+     {
+        let output = emit_dts(
+            "export class O {\n\
+             \x20   private foo(): void;\n\
+             \x20   private foo(x: string): void;\n\
+             \x20   private foo(x?: string): void {}\n\
+             }\n",
+            DeclarationOptions::default(),
+        );
+        assert_eq!(
+            output.declaration.as_ref().unwrap().code,
+            "export declare class O {\n    private foo;\n}\n"
+        );
+    }
+
+    #[test]
     fn parameter_properties_are_lifted_before_the_constructor() {
         let output = emit_dts(
             "export class C { constructor(public x: number) {} }\n",
@@ -493,35 +480,6 @@ mod tests {
         assert_eq!(
             output.declaration.as_ref().unwrap().code,
             "export declare class C {\n    x: number;\n    constructor(x: number);\n}\n"
-        );
-    }
-
-    #[test]
-    fn private_members_are_stripped_when_requested() {
-        let source = "export class C { private hidden: number; visible: string; }\n";
-        let kept = emit_dts(source, DeclarationOptions::default());
-        assert!(kept.declaration.as_ref().unwrap().code.contains("hidden"));
-        let stripped = emit_dts(
-            source,
-            DeclarationOptions::default().with_strip_private(true),
-        );
-        assert!(
-            !stripped
-                .declaration
-                .as_ref()
-                .unwrap()
-                .code
-                .contains("hidden"),
-            "{}",
-            stripped.declaration.as_ref().unwrap().code
-        );
-        assert!(
-            stripped
-                .declaration
-                .as_ref()
-                .unwrap()
-                .code
-                .contains("visible")
         );
     }
 
