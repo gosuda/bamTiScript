@@ -26,7 +26,7 @@
   <rect class="background" width="1280" height="640"/>
 
   <text class="brand" x="76" y="138">bamTiScript</text>
-  <text class="subtitle" x="80" y="190">TypeScript 7.2 in Rust</text>
+  <text class="subtitle" x="80" y="190">TypeScript 7.0.2 in Rust</text>
   <rect class="accent" x="80" y="210" width="148" height="32" rx="16"/>
   <text class="status" x="154" y="231" text-anchor="middle">PRE-RELEASE</text>
 
