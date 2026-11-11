@@ -1341,11 +1341,6 @@ pub fn expected_facet_diagnostics(
 }
 
 /// Run the diagnostics comparison for one compiled case.
-///
-/// The compile uses the default lint profile, but TS error baselines carry no
-/// lint output: actual diagnostics are filtered to the code map's BAMTS
-/// L/P/C families (every mapped compiler diagnostic) before comparing, so
-/// `BAMTS-W…` lint warnings never fail a row.
 pub fn check_diagnostics(
     ctx: &CheckContext,
     case: &CheckedCase,
