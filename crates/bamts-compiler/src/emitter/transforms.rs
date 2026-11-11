@@ -3715,6 +3715,19 @@ impl<'a> Rewriter<'a> {
         let mut static_steps = Vec::new();
         let mut members = Vec::new();
         let mut constructor = None;
+        let class_has_suspending_key = class.members.iter().any(|member| {
+            let name = match member.data() {
+                ClassMember::Property(property) => Some(&property.name),
+                ClassMember::Method(method) => Some(&method.name),
+                ClassMember::AutoAccessor(accessor) => Some(&accessor.name),
+                _ => None,
+            };
+            matches!(
+                name,
+                Some(PropertyName::Computed(key))
+                    if contains_yield(key) || contains_await(key)
+            )
+        });
         let has_computed = class.members.iter().any(|member| {
             let name = match member.data() {
                 ClassMember::Property(property) => Some(&property.name),
@@ -3804,8 +3817,8 @@ impl<'a> Rewriter<'a> {
                 }
                 ClassMember::Method(method) => {
                     let mut method = method.clone();
-                    let has_heritage = class.extends.is_some();
-                    method.name = if matches!(mode, FieldMode::Native) || !has_heritage {
+                    let hoist_all = class.extends.is_some() || class_has_suspending_key;
+                    method.name = if matches!(mode, FieldMode::Native) || !hoist_all {
                         self.rewrite_property_name(&method.name)
                     } else {
                         self.lower_class_member_name(&method.name, &mut prelude, member.range())
@@ -8362,8 +8375,8 @@ impl<'a> Rewriter<'a> {
             Statement::Expression(value) => *value.expression,
             Statement::Variable(declaration) => {
                 let mut declarations = declaration.declarations;
-                if declarations.len() == 1 {
-                    if let Some(declarator) = declarations.pop() {
+                if declarations.len() == 1
+                    && let Some(declarator) = declarations.pop() {
                         let range = declarator.range();
                         if let VariableDeclarator {
                             binding,
@@ -8385,7 +8398,6 @@ impl<'a> Rewriter<'a> {
                             }
                         }
                     }
-                }
                 unreachable!("class lowering sequences single declarator temps");
             }
             _ => unreachable!("class lowering sequences expression statements"),
