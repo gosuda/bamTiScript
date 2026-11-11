@@ -44,7 +44,7 @@ use bamts_compiler::project::resolution::{
 use bamts_compiler::project::resolution_trace::ResolutionTraceLog;
 use bamts_compiler::project::{CompilerOptions, ProjectConfig, ProjectRoot};
 use bamts_compiler::source::SourceText;
-use bamts_compiler::source::{JsxEmit, TextRange, Utf16Pos};
+use bamts_compiler::source::{JsxEmit, SourceId, TextRange, Utf16Pos};
 use bamts_compiler::syntax::{Token, TokenKind};
 
 use crate::catalog::CaseConfiguration;
@@ -2060,14 +2060,32 @@ pub fn emit_javascript_baseline(
     // the document carries no `.js` sections at all; its `result.DTS` is empty
     // unless declaration emit is on. The section set follows those two maps.
     let mut outputs = 0usize;
-    // The echo above keeps split order; the output sections follow emit order.
+    let imported = runtime_imported_source_ids(case);
     let emitted = case.reached_units_in_module_order();
     if !options.emit_declaration_only() {
         for (unit, output) in &emitted {
             let name = unit_basename(&unit.virtual_path);
-            // A `.d.ts` input is never a JavaScript output: upstream's output
-            // mapping skips declaration files outright.
             if is_declaration_input_name(&name) {
+                continue;
+            }
+            if is_json_input_name(&name) {
+                if bundle.is_some() {
+                    continue;
+                }
+                if options.out_dir().is_none() {
+                    continue;
+                }
+                if is_config_unit_name(&name) || name.eq_ignore_ascii_case("package.json") {
+                    continue;
+                }
+                if unit.virtual_path.split('/').any(|part| part == "node_modules") {
+                    continue;
+                }
+                if !imported.contains(&output.source_file().source_id()) {
+                    continue;
+                }
+                push_output_section(&mut out, &name, &unit.text);
+                outputs += 1;
                 continue;
             }
             let Some(emit) = output.emit() else {
@@ -2135,6 +2153,28 @@ fn bundle_output_name(options: &CompilerOptions) -> std::result::Result<Option<S
         return Err("outFile path is not valid UTF-8".to_owned());
     };
     Ok(Some(basename.to_owned()))
+}
+fn runtime_imported_source_ids(case: &CheckedCase) -> HashSet<SourceId> {
+    let program = case.program();
+    let entry = program.entrypoint_id();
+    let mut imported = HashSet::new();
+    for module in program.modules() {
+        if module.source_id() == entry {
+            continue;
+        }
+        for edge in module.dependencies() {
+            if edge.is_unresolved() {
+                continue;
+            }
+            if edge.kind() == ModuleEdgeKind::TypeOnly {
+                continue;
+            }
+            if let Some(target) = edge.target().local_source_id() {
+                imported.insert(target);
+            }
+        }
+    }
+    imported
 }
 
 /// The `//// [<name>]` section header for one unit's output of a given kind.
@@ -6094,6 +6134,162 @@ export const t = 1;
             }
             other => panic!("expected a Fail verdict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn javascript_baseline_skips_json_input_outputs() {
+        let logical = "tests/cases/compiler/jsonInputPin.ts";
+        let case_text = "\
+// @resolveJsonModule: true
+// @filename: data.json
+{\"k\": 1}
+// @filename: test.ts
+export const t = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let heads: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with("//// [") && !line.ends_with(" ////"))
+            .collect();
+        assert_eq!(
+            heads,
+            vec!["//// [data.json]", "//// [test.ts]", "//// [test.js]"],
+            "{emitted}"
+        );
+    }
+
+    #[test]
+    fn javascript_baseline_emits_json_with_out_dir() {
+        let logical = "tests/cases/compiler/isolatedModules_resolveJsonModule_strict_outDir_commonJsPin.ts";
+        let case_text = "\
+// @resolveJsonModule: true
+// @outDir: dist
+// @module: commonjs
+// @filename: a.ts
+import * as j from \"./j.json\";
+// @filename: j.json
+{}";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let heads: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with("//// [") && !line.ends_with(" ////"))
+            .collect();
+        assert_eq!(
+            heads,
+            vec![
+                "//// [a.ts]",
+                "//// [j.json]",
+                "//// [j.json]",
+                "//// [a.js]"
+            ],
+            "{emitted}"
+        );
+    }
+
+    #[test]
+    fn javascript_baseline_skips_package_json_with_out_dir() {
+        let logical = "tests/cases/compiler/packageJsonPin.ts";
+        let case_text = "\
+// @outDir: dist
+// @filename: package.json
+{\"name\": \"typescript\"}
+// @filename: test.ts
+export const t = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let heads: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with("//// [") && !line.ends_with(" ////"))
+            .collect();
+        assert_eq!(
+            heads,
+            vec![
+                "//// [package.json]",
+                "//// [test.ts]",
+                "//// [test.js]"
+            ],
+            "{emitted}"
+        );
+    }
+    #[test]
+    fn javascript_baseline_skips_node_modules_json_with_out_dir() {
+        let logical = "tests/cases/compiler/nodeModulesJsonPin.ts";
+        let case_text = "\
+// @resolveJsonModule: true
+// @outDir: dist
+// @module: commonjs
+// @filename: a.ts
+import * as b from \"./node_modules/b.json\";
+// @filename: node_modules/b.json
+{\"a\": true}
+:";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let heads: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with("//// [") && !line.ends_with(" ////"))
+            .collect();
+        assert_eq!(
+            heads,
+            vec!["//// [a.ts]", "//// [b.json]", "//// [a.js]"],
+            "requireOfJsonFileNonRelative.js omits node_modules json outputs: {emitted}"
+        );
+    }
+
+    #[test]
+    fn javascript_baseline_skips_unimported_json_with_out_dir() {
+        let logical = "tests/cases/compiler/unimportedJsonPin.ts";
+        let case_text = "\
+// @resolveJsonModule: true
+// @outDir: dist
+// @module: commonjs
+// @filename: a.ts
+import * as c from \"./c.json\";
+// @filename: b.json
+{\"a\": true}
+// @filename: c.json
+{\"a\": true}
+:";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let heads: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with("//// [") && !line.ends_with(" ////"))
+            .collect();
+        assert_eq!(
+            heads,
+            vec![
+                "//// [a.ts]",
+                "//// [b.json]",
+                "//// [c.json]",
+                "//// [c.json]",
+                "//// [a.js]"
+            ],
+            "requireOfJsonFileWithoutExtensionResolvesToTs.js emits only the imported c.json: {emitted}"
+        );
     }
 
     #[test]
