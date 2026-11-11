@@ -782,7 +782,11 @@ pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), Oracl
             (Some(expected), None) => Err(OracleError::ExpectationMismatch {
                 expected: format!("{:?}/{}", expected.phase, expected.error_type.as_str()),
                 actual: "completed".to_owned(),
-                message: String::new(),
+                message: if expected.phase == NegativePhase::Parse {
+                    "expected parse-phase error was not reported; body was not run".to_owned()
+                } else {
+                    String::new()
+                },
             }),
             (None, Some(actual)) => Err(OracleError::ExpectationMismatch {
                 expected: "success".to_owned(),
@@ -1034,6 +1038,13 @@ impl Test262Runner for InterpreterRunner {
                 };
             }
         };
+        if request
+            .negative
+            .as_ref()
+            .is_some_and(|negative| negative.phase == NegativePhase::Parse)
+        {
+            return RunOutcome::Completed { thrown: None };
+        }
 
         let limits = bamts_runtime::Limits {
             agent_can_suspend: request.can_block,
@@ -3151,6 +3162,60 @@ function $ERROR(message) {\n\
             );
             run_variant(&runner, &parsed, &plan, &sources, variant).unwrap();
         }
+    }
+    #[test]
+    fn parse_negative_completion_says_not_reported() {
+        let request = RunRequest {
+            mode: ExecutionMode::Interpreter,
+            variant: ExecutionVariant {
+                kind: SourceKind::ScriptNonStrict,
+            },
+            script: ComposedScript {
+                bytes: b"$DONOTEVALUATE();".to_vec(),
+                test_offset: 0,
+                kind: SourceKind::ScriptNonStrict,
+                untouched: true,
+            },
+            negative: Some(Negative {
+                phase: NegativePhase::Parse,
+                error_type: NegativeType::SyntaxError,
+            }),
+            async_done: false,
+            can_block: true,
+            deadline: Duration::from_millis(100),
+        };
+        let outcome = RunOutcome::Completed { thrown: None };
+        let detail = match judge_run(&request, &outcome) {
+            Err(error) => failure_detail(&error),
+            Ok(()) => panic!("a completed parse negative must fail"),
+        };
+        assert!(detail.contains("was not reported"), "{detail}");
+    }
+
+    #[test]
+    fn parse_negative_body_is_not_run() {
+        let scratch = runner_scratch("parse-not-run-scratch");
+        let runner = InterpreterRunner::new(&scratch);
+        let request = RunRequest {
+            mode: ExecutionMode::Interpreter,
+            variant: ExecutionVariant {
+                kind: SourceKind::ScriptNonStrict,
+            },
+            script: ComposedScript {
+                bytes: b"$DONOTEVALUATE();".to_vec(),
+                test_offset: 0,
+                kind: SourceKind::ScriptNonStrict,
+                untouched: true,
+            },
+            negative: Some(Negative {
+                phase: NegativePhase::Parse,
+                error_type: NegativeType::SyntaxError,
+            }),
+            async_done: false,
+            can_block: true,
+            deadline: Duration::from_secs(10),
+        };
+        assert_eq!(runner.run(&request), RunOutcome::Completed { thrown: None });
     }
 
     #[test]
