@@ -10,6 +10,7 @@
 
 use bamts_bytecode::EcmaString;
 use bamts_compiler::diagnostic::Diagnostic;
+use bamts_compiler::program::{ProgramLoadError, ProgramLowerError, ProgramLowerErrorKind};
 use bamts_compiler::lint::{LintLevel, LintOverride, LintProfile, LintTable};
 use bamts_runtime::{
     CancellationToken, RuntimeErrorKind, ThrowOrigin, WarmupPolicy, run_linked_program,
@@ -1032,6 +1033,22 @@ impl Test262Runner for InterpreterRunner {
             Err(bamts::Error::Diagnostics { diagnostics }) => {
                 return parse_phase_outcome(&diagnostics);
             }
+            Err(bamts::Error::ProgramLoad(error)) => {
+                if let Some(outcome) = resolution_load_outcome(&error) {
+                    return outcome;
+                }
+                return RunOutcome::Blocked {
+                    detail: format!("compile pipeline failed: {error}"),
+                };
+            }
+            Err(bamts::Error::Lower(error)) => {
+                if let Some(outcome) = resolution_lower_outcome(&error) {
+                    return outcome;
+                }
+                return RunOutcome::Blocked {
+                    detail: format!("compile pipeline failed: {error}"),
+                };
+            }
             Err(error) => {
                 return RunOutcome::Blocked {
                     detail: format!("compile pipeline failed: {error}"),
@@ -1202,6 +1219,38 @@ fn parse_phase_outcome(diagnostics: &[Diagnostic]) -> RunOutcome {
             diagnostics.len()
         ),
     }
+}
+fn resolution_load_outcome(error: &ProgramLoadError) -> Option<RunOutcome> {
+    let resolution = matches!(
+        error,
+        ProgramLoadError::IllFormedModuleSpecifier { .. }
+            | ProgramLoadError::InvalidSpecifier { .. }
+            | ProgramLoadError::InvalidPackage { .. }
+            | ProgramLoadError::UnresolvedModule(_)
+    );
+    resolution.then(|| RunOutcome::Completed {
+        thrown: Some(ThrownError {
+            phase: NegativePhase::Resolution,
+            error_type: NegativeType::SyntaxError,
+            message: format!("{error}"),
+        }),
+    })
+}
+
+fn resolution_lower_outcome(error: &ProgramLowerError) -> Option<RunOutcome> {
+    let link = matches!(
+        error.kind,
+        ProgramLowerErrorKind::InvalidModuleName
+            | ProgramLowerErrorKind::MissingRuntimeEdge { .. }
+            | ProgramLowerErrorKind::ConflictingRuntimeEdge { .. }
+    );
+    link.then(|| RunOutcome::Completed {
+        thrown: Some(ThrownError {
+            phase: NegativePhase::Resolution,
+            error_type: NegativeType::SyntaxError,
+            message: format!("{error}"),
+        }),
+    })
 }
 
 /// Maps an engine throw origin (and, for guest-thrown values, the resolved
@@ -3216,6 +3265,71 @@ function $ERROR(message) {\n\
             deadline: Duration::from_secs(10),
         };
         assert_eq!(runner.run(&request), RunOutcome::Completed { thrown: None });
+    }
+    #[test]
+    fn resolution_load_failure_reports_resolution_syntax_error() {
+        let root = std::env::temp_dir().join(format!(
+            "bamts-test262-resolution-{}-{}",
+            std::process::id(),
+            SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let tests = root.join("tests");
+        let scratch = root.join("scratch");
+        fs::create_dir_all(&tests).expect("tests directory");
+        let runner = InterpreterRunner::new(&scratch).for_test_file(tests.join("case.js"));
+        let request = RunRequest {
+            mode: ExecutionMode::Interpreter,
+            variant: ExecutionVariant {
+                kind: SourceKind::Module,
+            },
+            script: ComposedScript {
+                bytes: b"import { value } from './THIS_FILE_DOES_NOT_EXIST.js';\n".to_vec(),
+                test_offset: 0,
+                kind: SourceKind::Module,
+                untouched: false,
+            },
+            negative: Some(Negative {
+                phase: NegativePhase::Resolution,
+                error_type: NegativeType::SyntaxError,
+            }),
+            async_done: false,
+            can_block: true,
+            deadline: Duration::from_secs(10),
+        };
+        let outcome = runner.run(&request);
+        match &outcome {
+            RunOutcome::Completed { thrown: Some(thrown) } => {
+                assert_eq!(thrown.phase, NegativePhase::Resolution);
+                assert_eq!(thrown.error_type, NegativeType::SyntaxError);
+            }
+            other => panic!("resolution load failure must report Resolution/SyntaxError, got {other:?}"),
+        }
+        assert_eq!(judge_run(&request, &outcome), Ok(()));
+        fs::remove_dir_all(root).expect("remove scratch");
+    }
+    #[test]
+    fn resolution_lower_link_failures_report_resolution_syntax_error() {
+        let link = bamts_compiler::program::ProgramLowerError {
+            module: PathBuf::from("case.js"),
+            phase: bamts_compiler::program::ProgramLowerPhase::Metadata,
+            kind: ProgramLowerErrorKind::MissingRuntimeEdge {
+                specifier: "./dep.js".to_owned(),
+            },
+        };
+        match resolution_lower_outcome(&link) {
+            Some(RunOutcome::Completed { thrown: Some(thrown) }) => {
+                assert_eq!(thrown.phase, NegativePhase::Resolution);
+                assert_eq!(thrown.error_type, NegativeType::SyntaxError);
+            }
+            other => panic!("link failure must report Resolution/SyntaxError, got {other:?}"),
+        }
+        let other = bamts_compiler::program::ProgramLowerError {
+            module: PathBuf::from("case.js"),
+            phase: bamts_compiler::program::ProgramLowerPhase::Metadata,
+            kind: ProgramLowerErrorKind::IllFormedMetadataString,
+        };
+        assert!(resolution_lower_outcome(&other).is_none());
     }
 
     #[test]
