@@ -1982,11 +1982,11 @@ fn is_line_terminator(c: char) -> bool {
     matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
 }
 
-fn is_id_start(c: char) -> bool {
+pub(crate) fn is_id_start(c: char) -> bool {
     c == '$' || c == '_' || unicode_id_start::is_id_start(c)
 }
 
-fn is_id_continue(c: char) -> bool {
+pub(crate) fn is_id_continue(c: char) -> bool {
     c == '$' || c == '\u{200C}' || c == '\u{200D}' || unicode_id_start::is_id_continue(c)
 }
 
