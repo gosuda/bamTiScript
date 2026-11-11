@@ -34,10 +34,6 @@ pub struct ResolutionTraceLog {
     unsupported: BTreeSet<UnsupportedTraceKind>,
 }
 
-enum BareItem<'a> {
-    Skip(&'a PathBuf),
-    File(&'a PathBuf, bool),
-}
 impl ResolutionTraceLog {
     #[must_use]
     pub fn lines(&self) -> &[String] {
@@ -169,6 +165,7 @@ impl ResolutionTraceLog {
         let mut fallback = Vec::new();
         let mut realpath = None;
         let mut in_fallback = false;
+        let mut scope: Vec<(&PathBuf, bool)> = Vec::new();
         for step in trace.steps() {
             match step {
                 ResolutionTraceStep::PackageJsonProbe { path, exists } => {
@@ -187,21 +184,80 @@ impl ResolutionTraceLog {
                     }
                     if !*exists {
                         let items = if *is_fallback { &mut fallback } else { &mut preferred };
-                        items.push(BareItem::Skip(directory));
+                        items.push(format!(
+                            "Directory '{}/node_modules' does not exist, skipping all lookups in it.",
+                            display_path(directory)
+                        ));
                     }
+                }
+                ResolutionTraceStep::ScopeProbe {
+                    path,
+                    exists,
+                    has_exports,
+                } => {
+                    if *has_exports {
+                        return false;
+                    }
+                    scope.push((path, *exists));
+                    let items = if in_fallback { &mut fallback } else { &mut preferred };
+                    items.push(if *exists {
+                        format!("Found 'package.json' at '{}'.", display_path(path))
+                    } else {
+                        format!("File '{}' does not exist.", display_path(path))
+                    });
+                }
+                ResolutionTraceStep::LegacyField { field, target } => {
+                    let items = if in_fallback { &mut fallback } else { &mut preferred };
+                    match target {
+                        None => items.push(format!(
+                            "'package.json' does not have a '{field}' field."
+                        )),
+                        Some((value, resolved)) => {
+                            if field.as_ref() == "typesVersions" {
+                                return false;
+                            }
+                            items.push(format!(
+                                "'package.json' has '{field}' field '{value}' that references '{}'.",
+                                display_path(resolved)
+                            ));
+                        }
+                    }
+                }
+                ResolutionTraceStep::StripExtension { path } => {
+                    let items = if in_fallback { &mut fallback } else { &mut preferred };
+                    let extension = path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .unwrap_or_default();
+                    items.push(format!(
+                        "File name '{}' has a '.{extension}' extension - stripping it.",
+                        display_path(path)
+                    ));
                 }
                 ResolutionTraceStep::Candidate { path, exists } => {
                     let items = if in_fallback { &mut fallback } else { &mut preferred };
-                    items.push(BareItem::File(path, *exists));
+                    items.push(if *exists {
+                        format!(
+                            "File '{}' exists - use it as a name resolution result.",
+                            display_path(path)
+                        )
+                    } else {
+                        format!("File '{}' does not exist.", display_path(path))
+                    });
                 }
                 ResolutionTraceStep::Resolved { path } => {
                     realpath = Some(path);
                 }
-                ResolutionTraceStep::PackageJson { .. }
+                ResolutionTraceStep::Condition { .. }
                 | ResolutionTraceStep::PathsMatch { .. }
                 | ResolutionTraceStep::TypesFallback { .. } => return false,
                 _ => {}
             }
+        }
+        if scope.first().is_some_and(|(_, exists)| !exists)
+            && scope.iter().any(|(_, exists)| *exists)
+        {
+            return false;
         }
         self.lines.push(format!(
             "======== Resolving module '{specifier}' from '{}'. ========",
@@ -235,40 +291,16 @@ impl ResolutionTraceLog {
             "Searching all ancestor node_modules directories for preferred extensions: TypeScript, Declaration."
                 .to_string(),
         );
-        for item in &preferred {
-            match item {
-                BareItem::Skip(directory) => self.lines.push(format!(
-                    "Directory '{}/node_modules' does not exist, skipping all lookups in it.",
-                    display_path(directory)
-                )),
-                BareItem::File(path, true) => self.lines.push(format!(
-                    "File '{}' exists - use it as a name resolution result.",
-                    display_path(path)
-                )),
-                BareItem::File(path, false) => {
-                    self.lines.push(format!("File '{}' does not exist.", display_path(path)))
-                }
-            }
+        for line in &preferred {
+            self.lines.push(line.clone());
         }
         if realpath.is_none() || !fallback.is_empty() {
             self.lines.push(
                 "Searching all ancestor node_modules directories for fallback extensions: JavaScript, JSON."
                     .to_string(),
             );
-            for item in &fallback {
-                match item {
-                    BareItem::Skip(directory) => self.lines.push(format!(
-                        "Directory '{}/node_modules' does not exist, skipping all lookups in it.",
-                        display_path(directory)
-                    )),
-                    BareItem::File(path, true) => self.lines.push(format!(
-                        "File '{}' exists - use it as a name resolution result.",
-                        display_path(path)
-                    )),
-                    BareItem::File(path, false) => self
-                        .lines
-                        .push(format!("File '{}' does not exist.", display_path(path))),
-                }
+            for line in &fallback {
+                self.lines.push(line.clone());
             }
         }
         if let Some(path) = realpath {
@@ -281,6 +313,15 @@ impl ResolutionTraceLog {
                 "======== Module name '{specifier}' was successfully resolved to '{}'. ========",
                 display_path(path)
             ));
+            if result.is_ok()
+                && scope.first().is_some_and(|(_, exists)| *exists)
+                && let Some((path, _)) = scope.first()
+            {
+                self.lines.push(format!(
+                    "File '{}' exists according to earlier cached lookups.",
+                    display_path(path)
+                ));
+            }
         } else {
             self.lines.push(format!(
                 "======== Module name '{specifier}' was not resolved. ========"

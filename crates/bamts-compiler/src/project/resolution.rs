@@ -9,7 +9,7 @@
 use super::resolution_trace::ResolutionTraceLog;
 use crate::project::{
     CompilerOptions, ModuleResolutionError, PackageError, PackageJson, PackageMode, PackageTarget,
-    PathError, PathMapping, ProjectRoot, ResolutionConditions, ResolutionFlavor,
+    PathError, PathMapping, ProjectRoot, ResolutionConditions, ResolutionFlavor, parse_jsonc,
     plan_relative_module,
 };
 use std::{
@@ -138,9 +138,17 @@ pub enum ResolutionTraceStep {
         pattern: Arc<str>,
         target: PathBuf,
     },
-    PackageJson {
+    ScopeProbe {
         path: PathBuf,
-        subpath: Arc<str>,
+        exists: bool,
+        has_exports: bool,
+    },
+    LegacyField {
+        field: Arc<str>,
+        target: Option<(Arc<str>, PathBuf)>,
+    },
+    StripExtension {
+        path: PathBuf,
     },
     Condition {
         name: Arc<str>,
@@ -856,10 +864,142 @@ fn pathdiff_relative(from_dir: &Path, to: &Path) -> String {
     if parts.is_empty() {
         ".".to_string()
     } else {
+
         parts.join("/")
     }
 }
+fn package_has_exports(content: &Option<Arc<str>>) -> bool {
+    content.as_ref().is_some_and(|source| {
+        parse_jsonc(source)
+            .map(|value| {
+                value
+                    .as_object()
+                    .is_some_and(|object| object.get("exports").is_some())
+            })
+            .unwrap_or(false)
+    })
+}
 
+fn legacy_field_value(content: &Arc<str>, field: &str) -> Option<Arc<str>> {
+    parse_jsonc(content)
+        .ok()?
+        .as_object()?
+        .get(field)?
+        .as_str()
+        .map(Arc::from)
+}
+
+fn probe_legacy_fields(
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+    chain: &[(PathBuf, Option<Arc<str>>)],
+) -> Option<PathBuf> {
+    let (driver_path, driver_source) = chain.first()?;
+    let driver_source = driver_source.as_ref()?;
+    let driver_dir = driver_path.parent()?;
+    for field in ["typesVersions", "typings", "types"] {
+        let value = legacy_field_value(driver_source, field);
+        match value {
+            None => {
+                trace.push(ResolutionTraceStep::LegacyField {
+                    field: Arc::from(field),
+                    target: None,
+                });
+            }
+            Some(value) => {
+                let resolved = driver_dir.join(value.strip_prefix("./").unwrap_or(value.as_ref()));
+                trace.push(ResolutionTraceStep::LegacyField {
+                    field: Arc::from(field),
+                    target: Some((Arc::clone(&value), resolved.clone())),
+                });
+                if field == "typesVersions" {
+                    return None;
+                }
+                let direct = resolved.extension().is_some_and(|extension| {
+                    extension == "ts" || extension == "tsx"
+                }) || resolved
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".d.ts"));
+                if direct {
+                    if let Some(found) = probe_candidate(host, trace, resolved) {
+                        return Some(found);
+                    }
+                } else {
+                    trace.push(ResolutionTraceStep::StripExtension {
+                        path: resolved.clone(),
+                    });
+                    let stem = resolved.with_extension("");
+                    for extension in ["ts", "tsx", "d.ts"] {
+                        let mut name = stem.clone().into_os_string();
+                        name.push(".");
+                        name.push(extension);
+                        if let Some(found) = probe_candidate(host, trace, PathBuf::from(name)) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn probe_candidate(
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+    candidate: PathBuf,
+) -> Option<PathBuf> {
+    let exists = host.file_exists(&candidate);
+    trace.push(ResolutionTraceStep::Candidate {
+        path: candidate.clone(),
+        exists,
+    });
+    exists.then_some(candidate)
+}
+
+fn confined_hit(
+    root: &ProjectRoot,
+    trace: &mut ResolutionTrace,
+    kind: ModuleResolutionKind,
+    mode: ResolutionMode,
+    found: &Path,
+) -> Result<Option<ResolvedModule>, ResolutionError> {
+    let path = root.confine(found).map_err(|error| match error {
+        PathError::PathEscapesRoot { path, root } => ResolutionError::EscapesRoot {
+            path,
+            root,
+            trace: trace.clone(),
+        },
+        other => ResolutionError::Path(other),
+    })?;
+    Ok(Some(ResolvedModule {
+        path,
+        kind,
+        mode,
+        package_json: None,
+        trace: ResolutionTrace::default(),
+    }))
+}
+
+fn probe_loose_stems(
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+    stems: &[PathBuf],
+    extensions: &[&str],
+) -> Option<PathBuf> {
+    for root in stems {
+        for extension in extensions {
+            let mut name = root.clone().into_os_string();
+            name.push(".");
+            name.push(extension);
+            if let Some(found) = probe_candidate(host, trace, PathBuf::from(name)) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
 fn probe_loose_files(
     host: &dyn ResolutionHost,
     trace: &mut ResolutionTrace,
@@ -881,23 +1021,7 @@ fn probe_loose_files(
     if stem.extension().is_some() {
         return None;
     }
-    for root in [stem.clone(), stem.join("index")] {
-        for extension in extensions {
-            let mut name = root.clone().into_os_string();
-            name.push(".");
-            name.push(extension);
-            let candidate = PathBuf::from(name);
-            let exists = host.file_exists(&candidate);
-            trace.push(ResolutionTraceStep::Candidate {
-                path: candidate.clone(),
-                exists,
-            });
-            if exists {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    probe_loose_stems(host, trace, &[stem.clone(), stem.join("index")], extensions)
 }
 
 fn try_node_modules(
@@ -967,21 +1091,7 @@ fn try_node_modules(
                 &["ts", "tsx", "d.ts"],
             )
         {
-            let path = root.confine(&found).map_err(|error| match error {
-                PathError::PathEscapesRoot { path, root } => ResolutionError::EscapesRoot {
-                    path,
-                    root,
-                    trace: trace.clone(),
-                },
-                other => ResolutionError::Path(other),
-            })?;
-            return Ok(Some(ResolvedModule {
-                path,
-                kind,
-                mode,
-                package_json: None,
-                trace: ResolutionTrace::default(),
-            }));
+            return confined_hit(root, trace, kind, mode, &found);
         }
         let Some(parent) = directory.parent() else {
             break;
@@ -1012,21 +1122,7 @@ fn try_node_modules(
                 &["js", "jsx", "json"],
             )
         {
-            let path = root.confine(&found).map_err(|error| match error {
-                PathError::PathEscapesRoot { path, root } => ResolutionError::EscapesRoot {
-                    path,
-                    root,
-                    trace: trace.clone(),
-                },
-                other => ResolutionError::Path(other),
-            })?;
-            return Ok(Some(ResolvedModule {
-                path,
-                kind,
-                mode,
-                package_json: None,
-                trace: ResolutionTrace::default(),
-            }));
+            return confined_hit(root, trace, kind, mode, &found);
         }
         let Some(parent) = directory.parent() else {
             break;
@@ -1051,46 +1147,75 @@ fn resolve_installed_package(
     let (root, options) = context;
     let (kind, mode, flavor) = strategy;
     let (host, _cache, _package_stack) = services;
-    let package_json_path = package_root.join("package.json");
-    let package_json_path = match root.confine(&package_json_path) {
-        Ok(path) => path,
-        Err(PathError::PathEscapesRoot { path, root }) => {
-            return Err(ResolutionError::EscapesRoot {
-                path,
-                root,
-                trace: trace.clone(),
-            });
-        }
-        Err(other) => return Err(other.into()),
-    };
-
     let export_subpath = if subpath.is_empty() {
         ".".to_string()
     } else {
         format!("./{subpath}")
     };
-    trace.push(ResolutionTraceStep::PackageJson {
-        path: package_json_path.clone(),
-        subpath: Arc::from(export_subpath.as_str()),
-    });
-
-    let conditions = conditions_for(kind, mode, flavor);
-    for name in conditions.values() {
-        trace.push(ResolutionTraceStep::Condition {
-            name: Arc::clone(name),
-            matched: true,
+    let walk_start = if subpath.is_empty() {
+        package_root.to_path_buf()
+    } else {
+        package_root.join(subpath)
+    };
+    let mut chain: Vec<(PathBuf, Option<Arc<str>>)> = Vec::new();
+    let mut cursor = walk_start.clone();
+    loop {
+        let confined = match root.confine(&cursor.join("package.json")) {
+            Ok(path) => path,
+            Err(PathError::PathEscapesRoot { path, root }) => {
+                if cursor == package_root {
+                    return Err(ResolutionError::EscapesRoot {
+                        path,
+                        root,
+                        trace: trace.clone(),
+                    });
+                }
+                break;
+            }
+            Err(other) => return Err(other.into()),
+        };
+        let content = host.read_file(&confined);
+        chain.push((confined, content));
+        if cursor == package_root {
+            break;
+        }
+        match cursor.parent() {
+            Some(parent) => cursor = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    for (path, content) in &chain {
+        trace.push(ResolutionTraceStep::ScopeProbe {
+            path: path.clone(),
+            exists: content.is_some(),
+            has_exports: package_has_exports(content),
         });
     }
-
-    if let Some(source) = host.read_file(&package_json_path) {
+    let package_json_path = chain
+        .last()
+        .map(|(path, _)| path.clone())
+        .unwrap_or_else(|| package_root.join("package.json"));
+    if let Some(source) = chain
+        .last()
+        .and_then(|(_, content)| content.clone())
+    {
         let package = PackageJson::parse(root, &package_json_path, &source)?;
         let has_exports = package.raw().get("exports").is_some();
+        if has_exports {
+            let conditions = conditions_for(kind, mode, flavor);
+            for name in conditions.values() {
+                trace.push(ResolutionTraceStep::Condition {
+                    name: Arc::clone(name),
+                    matched: true,
+                });
+            }
+        }
         let package_mode = if flavor == ResolutionFlavor::Types {
             PackageMode::Types
         } else {
             mode.package_mode()
         };
-        match package.resolve_export(root, &export_subpath, package_mode, &conditions) {
+        match package.resolve_export(root, &export_subpath, package_mode, &conditions_for(kind, mode, flavor)) {
             Ok(target) => {
                 return finalize_package_target(
                     (root, options),
@@ -1113,6 +1238,40 @@ fn resolve_installed_package(
             | Err(PackageError::TargetBlocked) => {}
             Err(other) => return Err(other.into()),
         }
+    }
+    let chain_has_exports = chain
+        .iter()
+        .any(|(_, content)| package_has_exports(content));
+    if kind == ModuleResolutionKind::Bundler
+        && !chain_has_exports
+        && walk_start.extension().is_none()
+        && !walk_start.components().any(|component| {
+            component
+                .as_os_str()
+                .as_encoded_bytes()
+                .first()
+                .is_some_and(|byte| *byte == b'@')
+        })
+    {
+        let mut stems = vec![walk_start.clone()];
+        if chain
+            .first()
+            .is_some_and(|(_, content)| content.is_none())
+        {
+            stems.push(walk_start.join("index"));
+        }
+        if let Some(found) = probe_loose_stems(host, trace, &stems, &["ts", "tsx", "d.ts"]) {
+            return confined_hit(root, trace, kind, mode, &found);
+        }
+    }
+    if kind == ModuleResolutionKind::Bundler
+        && !chain_has_exports
+        && chain
+            .first()
+            .is_some_and(|(_, content)| content.is_some())
+        && let Some(found) = probe_legacy_fields(host, trace, &chain)
+    {
+        return confined_hit(root, trace, kind, mode, &found);
     }
 
     // No usable exports/legacy entry: try subpath as a relative file inside the package.
@@ -1138,7 +1297,6 @@ fn resolve_installed_package(
         Err(other) => Err(other),
     }
 }
-
 fn finalize_package_target(
     context: (&ProjectRoot, &CompilerOptions),
     importer: &Path,
@@ -2023,6 +2181,77 @@ mod tests {
             "Directory '/workspace/a/node_modules' does not exist, skipping all lookups in it.",
             "Directory '/workspace/node_modules' does not exist, skipping all lookups in it.",
             "======== Module name 'foo' was not resolved. ========",
+        ];
+        let drive = trace_drive();
+        let expected: Vec<String> = expected
+            .iter()
+            .map(|line| line.replace("'/workspace", &format!("'{drive}/workspace")))
+            .collect();
+        let produced: Vec<&str> = log.lines().iter().map(String::as_str).collect();
+        assert_eq!(produced, expected);
+        assert!(log.unsupported().is_empty());
+    }
+    #[test]
+    fn trace_bundler_subpath_package_scope_matches_upstream_found_lines() {
+        let config = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/tsconfig.json"),
+            r#"{"compilerOptions":{"module":"commonjs"}}"#,
+        )
+        .expect("config");
+        let options = config.options().clone();
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/foo/bar/package.json"),
+            "{ \"types\": \"types.d.ts\" }\n",
+        );
+        host.file(abs("/workspace/node_modules/foo/package.json"), "{}\n");
+        host.file(
+            abs("/workspace/node_modules/foo/bar/types.d.ts"),
+            "export const x: number;\n",
+        );
+        let mut cache = ResolutionCache::new();
+        let mut log = ResolutionTraceLog::default();
+        let resolved = resolve_module_name_with_trace(
+            &root(),
+            &options,
+            abs("/workspace/a.ts"),
+            "foo/bar",
+            (
+                ModuleResolutionKind::Bundler,
+                ResolutionMode::Require,
+                ResolutionFlavor::Runtime,
+            ),
+            TraceResolutionServices {
+                host: &host,
+                cache: &mut cache,
+                log: &mut log,
+            },
+        )
+        .expect("subpath types hit");
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/node_modules/foo/bar/types.d.ts").as_path()
+        );
+        let expected: &[&str] = &[
+            "======== Resolving module 'foo/bar' from '/workspace/a.ts'. ========",
+            "Module resolution kind is not specified, using 'Bundler'.",
+            "Resolving in CJS mode with conditions 'require', 'types'.",
+            "File '/workspace/package.json' does not exist.",
+            "Loading module 'foo/bar' from 'node_modules' folder, target file types: TypeScript, JavaScript, Declaration, JSON.",
+            "Searching all ancestor node_modules directories for preferred extensions: TypeScript, Declaration.",
+            "Found 'package.json' at '/workspace/node_modules/foo/bar/package.json'.",
+            "Found 'package.json' at '/workspace/node_modules/foo/package.json'.",
+            "File '/workspace/node_modules/foo/bar.ts' does not exist.",
+            "File '/workspace/node_modules/foo/bar.tsx' does not exist.",
+            "File '/workspace/node_modules/foo/bar.d.ts' does not exist.",
+            "'package.json' does not have a 'typesVersions' field.",
+            "'package.json' does not have a 'typings' field.",
+            "'package.json' has 'types' field 'types.d.ts' that references '/workspace/node_modules/foo/bar/types.d.ts'.",
+            "File '/workspace/node_modules/foo/bar/types.d.ts' exists - use it as a name resolution result.",
+            "Resolving real path for '/workspace/node_modules/foo/bar/types.d.ts', result '/workspace/node_modules/foo/bar/types.d.ts'.",
+            "======== Module name 'foo/bar' was successfully resolved to '/workspace/node_modules/foo/bar/types.d.ts'. ========",
+            "File '/workspace/node_modules/foo/bar/package.json' exists according to earlier cached lookups.",
         ];
         let drive = trace_drive();
         let expected: Vec<String> = expected
