@@ -2996,8 +2996,8 @@ mod tests {
     }
 
     #[test]
-    fn cli_run_defers_dynamic_only_early_error_to_import_rejection(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn cli_run_defers_dynamic_only_early_error_to_import_rejection()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory =
             std::env::temp_dir().join(format!("bamts-cli-dynamic-only-{}", process::id()));
         let _ = fs::remove_dir_all(&directory);

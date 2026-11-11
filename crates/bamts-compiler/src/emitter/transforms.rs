@@ -8386,8 +8386,7 @@ impl<'a> Rewriter<'a> {
                     } = declarator.into_data()
                         && let BindingPattern::Identifier(name) = binding.into_data()
                     {
-                        let left =
-                            self.syn_node(name.range(), AssignmentTarget::Identifier(name));
+                        let left = self.syn_node(name.range(), AssignmentTarget::Identifier(name));
                         return self.syn_node(
                             range,
                             Expression::Assignment(AssignmentExpression {

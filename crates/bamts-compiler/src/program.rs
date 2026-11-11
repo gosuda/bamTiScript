@@ -997,7 +997,8 @@ impl ProgramLoader {
                 flavor,
             }),
             ReferenceDirectiveKind::Types => {
-                if let Some(path) = self.resolve_type_directive(importer, &edge.specifier, edge.mode)?
+                if let Some(path) =
+                    self.resolve_type_directive(importer, &edge.specifier, edge.mode)?
                 {
                     return Ok(ResolvedEdge {
                         target: ResolvedEdgeTarget::Local(path),
@@ -1557,7 +1558,11 @@ impl LoadState<'_> {
                             let Some(edge) = frame.remaining.next() else {
                                 break None;
                             };
-                            let resolved = match self.loader.resolve_edge(&frame.path, &edge, self.cancel) {
+                            let resolved = match self.loader.resolve_edge(
+                                &frame.path,
+                                &edge,
+                                self.cancel,
+                            ) {
                                 Ok(resolved) => resolved,
                                 Err(error)
                                     if edge.kind == ModuleEdgeKind::DynamicRuntime
@@ -1930,7 +1935,10 @@ fn skip_ascii_whitespace(bytes: &[u8], cursor: &mut usize) {
     }
 }
 
-fn next_directive_attribute<'a>(text: &'a str, cursor: &mut usize) -> Option<DirectiveAttribute<'a>> {
+fn next_directive_attribute<'a>(
+    text: &'a str,
+    cursor: &mut usize,
+) -> Option<DirectiveAttribute<'a>> {
     let bytes = text.as_bytes();
     let name_start = *cursor;
     while bytes
@@ -1979,14 +1987,11 @@ fn directive_value_range(
     end: usize,
 ) -> TextRange {
     let fallback = token.range();
-    let base = source
-        .source_text()
-        .utf16_to_byte(token.range().start());
+    let base = source.source_text().utf16_to_byte(token.range().start());
     let Ok(base) = base else {
         return fallback;
     };
-    let (Some(value_start), Some(value_end)) =
-        (base.checked_add(start), base.checked_add(end))
+    let (Some(value_start), Some(value_end)) = (base.checked_add(start), base.checked_add(end))
     else {
         return fallback;
     };
@@ -2937,10 +2942,10 @@ pub fn lower_program_with_cancel(
                 if dep.kind() != ModuleEdgeKind::StaticRuntime {
                     continue;
                 }
-                if let ModuleTarget::Local(target) = dep.target() {
-                    if static_reachable.insert(*target) {
-                        worklist.push(*target);
-                    }
+                if let ModuleTarget::Local(target) = dep.target()
+                    && static_reachable.insert(*target)
+                {
+                    worklist.push(*target);
                 }
             }
         }
@@ -3017,9 +3022,7 @@ pub fn lower_program_with_cancel(
                     cancel.clone(),
                 )
                 .map_err(|error| {
-                    let cancelled = match error {
-                        scanner::ScanError::Cancelled(cancelled) => cancelled,
-                    };
+                    let scanner::ScanError::Cancelled(cancelled) = error;
                     program_lower_error(
                         module.path(),
                         ProgramLowerPhase::Module,
@@ -3028,9 +3031,7 @@ pub fn lower_program_with_cancel(
                 })?;
                 let parsed =
                     parser::parse_with_cancel(scanned, cancel.clone()).map_err(|error| {
-                        let cancelled = match error {
-                            parser::ParseError::Cancelled(cancelled) => cancelled,
-                        };
+                        let parser::ParseError::Cancelled(cancelled) = error;
                         program_lower_error(
                             module.path(),
                             ProgramLowerPhase::Module,
@@ -3046,7 +3047,6 @@ pub fn lower_program_with_cancel(
                     LowerOptions {
                         script_entry: false,
                         javascript_compatibility: true,
-                        ..options
                     },
                     &strings,
                     None,
@@ -3309,7 +3309,6 @@ struct DynamicQuarantine<'a> {
 }
 
 impl DynamicQuarantine<'_> {
-
     fn quarantine_all(&mut self, failing: &[SourceId]) -> bool {
         let mut progressed = false;
         for source in failing {
@@ -5446,7 +5445,10 @@ mod tests {
             "main.ts",
             "const pending = import('./THIS_FILE_DOES_NOT_EXIST.js'); pending;",
         );
-        let resolved = fixture.loader().load("main.ts").expect("missing dynamic target loads");
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("missing dynamic target loads");
         let main = resolved.entrypoint();
         assert_eq!(main.dependencies().len(), 1);
         let edge = &main.dependencies()[0];
@@ -5458,12 +5460,16 @@ mod tests {
     fn dynamic_empty_specifier_does_not_fail_program_load() {
         let fixture = Fixture::new();
         fixture.write("main.ts", "{ import(''); }");
-        let resolved = fixture.loader().load("main.ts").expect("empty dynamic specifier loads");
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("empty dynamic specifier loads");
         let main = resolved.entrypoint();
-        assert!(main
-            .dependencies()
-            .iter()
-            .all(|edge| edge.kind() != ModuleEdgeKind::StaticRuntime));
+        assert!(
+            main.dependencies()
+                .iter()
+                .all(|edge| edge.kind() != ModuleEdgeKind::StaticRuntime)
+        );
     }
 
     #[test]
@@ -5471,7 +5477,10 @@ mod tests {
         let fixture = Fixture::new();
         fixture.write("dep.ts", "export const value = 1;");
         fixture.write("main.ts", "const pending = import('./dep.js'); pending;");
-        let resolved = fixture.loader().load("main.ts").expect("valid dynamic target loads");
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("valid dynamic target loads");
         let main = resolved.entrypoint();
         assert_eq!(main.dependencies().len(), 1);
         let edge = &main.dependencies()[0];
@@ -5484,24 +5493,26 @@ mod tests {
     #[test]
     fn dynamic_link_failure_does_not_fail_program_link() {
         let fixture = Fixture::new();
-        fixture.write(
-            "circular-1.ts",
-            "export { x } from './circular-2.js';",
-        );
-        fixture.write(
-            "circular-2.ts",
-            "export { x } from './circular-1.js';",
-        );
+        fixture.write("circular-1.ts", "export { x } from './circular-2.js';");
+        fixture.write("circular-2.ts", "export { x } from './circular-1.js';");
         fixture.write(
             "main.ts",
             "const pending = import('./circular-1.js'); pending;",
         );
-        let resolved = fixture.loader().load("main.ts").expect("dynamic link fixture loads");
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("dynamic link fixture loads");
         let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
         let executable = lower_program(&resolved, &frontend, LowerOptions::default())
             .expect("dynamic link failure becomes runtime rejection");
         let main_wire = module(&executable, "main.ts");
-        assert!(main_wire.edges().iter().any(|edge| edge.kind == EdgeKind::Dynamic));
+        assert!(
+            main_wire
+                .edges()
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::Dynamic)
+        );
     }
     #[test]
     fn dynamic_link_failure_keeps_shared_dependency_of_surviving_branch() {
@@ -5562,7 +5573,11 @@ mod tests {
         .expect("two dynamic-only assemble failures quarantine without failing the run");
         let main = module(&executable, "main.ts");
         assert_eq!(main.edges().len(), 3);
-        assert!(main.edges().iter().all(|edge| edge.kind == EdgeKind::Dynamic));
+        assert!(
+            main.edges()
+                .iter()
+                .all(|edge| edge.kind == EdgeKind::Dynamic)
+        );
         for name in ["bad1.js", "bad2.js"] {
             assert!(
                 module(&executable, name).edges().is_empty(),
@@ -5725,8 +5740,6 @@ mod tests {
             "a reference directive creates no runtime edge"
         );
     }
-
-
 
     #[test]
     fn program_lowering_coalesces_static_and_dynamic_imports_of_one_target() {

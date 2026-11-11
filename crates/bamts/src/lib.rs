@@ -17,11 +17,11 @@ use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
 use bamts_compiler::lint::{LintProfile, LintTable};
 use bamts_compiler::lower::LowerOptions;
 use bamts_compiler::parser::parse;
+use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend_with_cancel};
 use bamts_compiler::program::{
     ModuleEdgeKind, ModuleTarget, ProgramLoadError, ProgramLoader, ProgramLowerError,
     ResolvedProgram, lower_program_with_cancel,
 };
-use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend_with_cancel};
 use bamts_compiler::project::canonical::canonicalize;
 use bamts_compiler::project::{ConfigError, ProjectConfig, ProjectRoot};
 use bamts_compiler::scanner::scan;
@@ -369,10 +369,7 @@ pub fn early_errors(program: &ResolvedProgram, script_entry: bool) -> Vec<Diagno
 /// The early errors that stop execution: only static-reachable modules count.
 /// A module reachable only through `import()` rejects that `import()` at run
 /// time instead, per ECMA-262 13.3.10, so its early errors never fail the run.
-pub fn execution_early_errors(
-    program: &ResolvedProgram,
-    script_entry: bool,
-) -> Vec<Diagnostic> {
+pub fn execution_early_errors(program: &ResolvedProgram, script_entry: bool) -> Vec<Diagnostic> {
     let reachable = static_reachable_sources(program);
     collect_early_errors(program, script_entry, Some(&reachable))
 }
@@ -386,9 +383,7 @@ fn collect_early_errors(
     program
         .modules()
         .iter()
-        .filter(|module| {
-            reachable.is_none_or(|sources| sources.contains(&module.source_id()))
-        })
+        .filter(|module| reachable.is_none_or(|sources| sources.contains(&module.source_id())))
         .filter(|module| {
             matches!(
                 module.script_kind(),
@@ -1651,7 +1646,10 @@ mod tests {
             )],
         )?;
         assert_eq!(output.exit_code, 0);
-        assert_eq!(output.stdout, b"before\npending:function\nafter\nrejected:object\n");
+        assert_eq!(
+            output.stdout,
+            b"before\npending:function\nafter\nrejected:object\n"
+        );
         Ok(())
     }
 
@@ -1720,8 +1718,8 @@ mod tests {
 
     #[cfg(feature = "node-host")]
     #[test]
-    fn repeated_dynamic_import_of_failing_module_rejects_with_same_error(
-    ) -> Result<(), Box<dyn Error>> {
+    fn repeated_dynamic_import_of_failing_module_rejects_with_same_error()
+    -> Result<(), Box<dyn Error>> {
         let output = run_dynamic_program(
             "same-error",
             &[
@@ -1792,10 +1790,7 @@ mod tests {
                      );\n\
                      console.log(\"after\");\n",
                 ),
-                (
-                    "parse-error_FIXTURE.js",
-                    "export const value = ;\n",
-                ),
+                ("parse-error_FIXTURE.js", "export const value = ;\n"),
             ],
         )?;
         assert_eq!(output.exit_code, 0);
@@ -1818,10 +1813,7 @@ mod tests {
                      );\n\
                      console.log(\"after\");\n",
                 ),
-                (
-                    "script-code_FIXTURE.js",
-                    "let wired = 1;\nlet wired = 2;\n",
-                ),
+                ("script-code_FIXTURE.js", "let wired = 1;\nlet wired = 2;\n"),
             ],
         )?;
         assert_eq!(output.exit_code, 0);
@@ -1838,14 +1830,10 @@ mod tests {
                     "main.ts",
                     "import { value } from './parse-error_FIXTURE.js';\nconsole.log(value);\n",
                 ),
-                (
-                    "parse-error_FIXTURE.js",
-                    "export const value = ;\n",
-                ),
+                ("parse-error_FIXTURE.js", "export const value = ;\n"),
             ],
         )?;
-        let error =
-            run_program(&entrypoint).expect_err("a static parse error still fails the run");
+        let error = run_program(&entrypoint).expect_err("a static parse error still fails the run");
         let super::Error::Diagnostics { diagnostics } = error else {
             remove_fixture(&directory)?;
             panic!("expected diagnostics, got {error:?}");
@@ -1865,14 +1853,10 @@ mod tests {
                     "main.ts",
                     "import './early-error_FIXTURE.js';\nconsole.log(\"after\");\n",
                 ),
-                (
-                    "early-error_FIXTURE.js",
-                    "let wired = 1;\nlet wired = 2;\n",
-                ),
+                ("early-error_FIXTURE.js", "let wired = 1;\nlet wired = 2;\n"),
             ],
         )?;
-        let error =
-            run_program(&entrypoint).expect_err("a static early error still fails the run");
+        let error = run_program(&entrypoint).expect_err("a static early error still fails the run");
         let super::Error::Diagnostics { diagnostics } = error else {
             remove_fixture(&directory)?;
             panic!("expected diagnostics, got {error:?}");
@@ -1891,10 +1875,7 @@ mod tests {
                     "main.ts",
                     "const pending = import(\"./early-error_FIXTURE.js\");\npending;\n",
                 ),
-                (
-                    "early-error_FIXTURE.js",
-                    "let wired = 1;\nlet wired = 2;\n",
-                ),
+                ("early-error_FIXTURE.js", "let wired = 1;\nlet wired = 2;\n"),
             ],
         )?;
         let error = compile_source_file(&entrypoint)
@@ -1916,10 +1897,7 @@ mod tests {
                     "main.ts",
                     "const pending = import(\"./parse-error_FIXTURE.js\");\npending;\n",
                 ),
-                (
-                    "parse-error_FIXTURE.js",
-                    "export const value = ;\n",
-                ),
+                ("parse-error_FIXTURE.js", "export const value = ;\n"),
             ],
         )?;
         let error = compile_source_file(&entrypoint)
@@ -1931,7 +1909,6 @@ mod tests {
         remove_fixture(&directory)?;
         Ok(())
     }
-
 
     #[test]
     fn compile_path_still_reports_dynamic_only_missing_import() -> Result<(), Box<dyn Error>> {
@@ -1948,13 +1925,11 @@ mod tests {
             panic!("expected diagnostics, got {error:?}");
         };
         assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.code()
-                == bamts_compiler::diagnostic::DiagnosticCode::new("TS2307")
+            diagnostic.code() == bamts_compiler::diagnostic::DiagnosticCode::new("TS2307")
         }));
         remove_fixture(&directory)?;
         Ok(())
     }
-
 
     #[cfg(feature = "aot")]
     #[test]
