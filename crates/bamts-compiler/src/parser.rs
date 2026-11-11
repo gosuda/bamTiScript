@@ -1719,11 +1719,12 @@ impl Parser {
             let kind_start = self.cur().range().start();
             let kind = self.variable_kind();
             let first = self.parse_for_head_declarator();
-            let first = if kind == VariableKind::Var
+            let (first, had_initializer) = if kind == VariableKind::Var
                 && matches!(first.data().binding.data(), BindingPattern::Identifier(_))
                 && first.data().type_annotation.is_none()
                 && self.at(TokenKind::Eq)
             {
+                let checkpoint = self.checkpoint();
                 let finished = self.finish_for_declarator(first);
                 if self.at(TokenKind::KwIn) {
                     self.bump();
@@ -1745,9 +1746,10 @@ impl Parser {
                         }),
                     );
                 }
-                finished
+                self.rollback(checkpoint);
+                (self.parse_for_head_declarator(), true)
             } else {
-                first
+                (first, false)
             };
             match self.kind() {
                 TokenKind::KwIn => {
@@ -1770,7 +1772,7 @@ impl Parser {
                         }),
                     );
                 }
-                TokenKind::KwOf => {
+                TokenKind::KwOf if !had_initializer => {
                     self.bump();
                     let iterable = self.parse_assignment_expression(false);
                     let body = self.finish_for_body();
@@ -8967,6 +8969,7 @@ mod tests {
 
         assert!(!errors(&parse_ts("for (let x = 1 in obj) {}")).is_empty());
         assert!(!errors(&parse_ts("for (var {a} = b in obj) {}")).is_empty());
+        assert!(!errors(&parse_ts("for (var x = 1 of y) {}")).is_empty());
     }
 
     #[test]
