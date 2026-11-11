@@ -1654,6 +1654,7 @@ impl Parser {
         self.expect(TokenKind::RParen, "expected `)`");
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut cases = Vec::new();
+        let mut seen_default = false;
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
             if self.is_cancelled() {
                 break;
@@ -1662,6 +1663,10 @@ impl Parser {
             let test = if self.eat(TokenKind::KwCase).is_some() {
                 Some(Box::new(self.parse_expression(false)))
             } else if self.eat(TokenKind::KwDefault).is_some() {
+                if seen_default {
+                    self.error_here(EXPECTED_TOKEN, "a switch can only have one `default` clause");
+                }
+                seen_default = true;
                 None
             } else {
                 let skipped = self.bump();
@@ -8985,6 +8990,12 @@ mod tests {
         assert_clean("for (async in obj) {}");
         assert_clean("for ((async) of [7]) {}");
         assert_clean("for (\\u0061sync of [7]) {}");
+    }
+
+    #[test]
+    fn duplicate_switch_default_is_rejected() {
+        assert!(!errors(&parse_ts("switch (v) { default: break; default: break; }")).is_empty());
+        assert_clean("switch (v) { case 0: break; default: break; }");
     }
 
     #[test]
