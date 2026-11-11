@@ -1717,6 +1717,66 @@ mod tests {
         assert_eq!(output.stdout, b"before\nafter\nrejected:SyntaxError\n");
         Ok(())
     }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn repeated_dynamic_import_of_failing_module_rejects_with_same_error(
+    ) -> Result<(), Box<dyn Error>> {
+        let output = run_dynamic_program(
+            "same-error",
+            &[
+                (
+                    "main.ts",
+                    "const first = import(\"./circular-1_FIXTURE.js\");\n\
+                     first.catch((a) => import(\"./circular-1_FIXTURE.js\").catch((b) => console.log(a === b)));\n",
+                ),
+                (
+                    "circular-1_FIXTURE.js",
+                    "export { x } from './circular-2_FIXTURE.js';\n",
+                ),
+                (
+                    "circular-2_FIXTURE.js",
+                    "export { x } from './circular-1_FIXTURE.js';\n",
+                ),
+            ],
+        )?;
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, b"true\n");
+        Ok(())
+    }
+
+    #[cfg(feature = "node-host")]
+    #[test]
+    fn static_and_dynamic_edges_to_failing_module_fail_the_run() -> Result<(), Box<dyn Error>> {
+        let (directory, entrypoint) = dynamic_fixture(
+            "static-dynamic-failure",
+            &[
+                (
+                    "main.ts",
+                    "import { x } from './circular-1_FIXTURE.js';\n\
+                     const pending = import('./circular-1_FIXTURE.js');\n\
+                     console.log(x);\n\
+                     pending;\n",
+                ),
+                (
+                    "circular-1_FIXTURE.js",
+                    "export { x } from './circular-2_FIXTURE.js';\n",
+                ),
+                (
+                    "circular-2_FIXTURE.js",
+                    "export { x } from './circular-1_FIXTURE.js';\n",
+                ),
+            ],
+        )?;
+        let error =
+            run_program(&entrypoint).expect_err("a static edge to a link failure fails the run");
+        let super::Error::Lower(_) = error else {
+            remove_fixture(&directory)?;
+            panic!("expected a lowering failure, got {error:?}");
+        };
+        remove_fixture(&directory)?;
+        Ok(())
+    }
     #[cfg(feature = "node-host")]
     #[test]
     fn dynamic_parse_error_rejects_with_syntax_error() -> Result<(), Box<dyn Error>> {
