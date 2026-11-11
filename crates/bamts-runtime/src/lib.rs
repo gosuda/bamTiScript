@@ -31222,21 +31222,54 @@ mod shape_property_tests {
         for _ in 0..10_000 {
             let mut atoms = AtomTable::default();
             let mut shapes = ShapeTable::new();
-            let keys: Vec<PropertyKey> = (0..12)
-                .map(|index| PropertyKey::Named(atoms.intern_str(&format!("k{index}"))))
-                .collect();
+            let mut keys: Vec<PropertyKey> = Vec::new();
+            for text in ["0", "1", "2", "3", "10", "42", "100", "999"] {
+                let atom = atoms.intern_str(text);
+                assert_eq!(atoms.array_index(atom), Some(text.parse().expect("index parses")));
+                keys.push(PropertyKey::Named(atom));
+            }
+            for index in 0..12 {
+                keys.push(PropertyKey::Named(atoms.intern_str(&format!("k{index}"))));
+            }
+            for symbol in 0..4 {
+                keys.push(PropertyKey::Symbol(1000 + symbol));
+            }
+            for private in 0..4 {
+                keys.push(PropertyKey::Private(2000 + private));
+            }
             let mut map = PropertyMap::default();
             let mut oracle = Oracle(Vec::new());
             let operations = 1 + rng.below(64);
             for _ in 0..operations {
                 let key = keys[rng.below(keys.len())].clone();
-                if rng.below(4) == 0 {
-                    map.remove(&shapes, &key);
-                    oracle.remove(&key);
-                } else {
-                    let property = canned(&mut rng);
-                    map.insert(&mut shapes, key.clone(), property.clone());
-                    oracle.insert(key, property);
+                match rng.below(10) {
+                    0 => {
+                        map.remove(&shapes, &key);
+                        oracle.remove(&key);
+                    }
+                    1 => {
+                        map.remove(&shapes, &key);
+                        oracle.remove(&key);
+                        let property = canned(&mut rng);
+                        map.insert(&mut shapes, key.clone(), property.clone());
+                        oracle.insert(key, property);
+                    }
+                    2 => {
+                        let first = canned(&mut rng);
+                        map.insert(&mut shapes, key.clone(), first.clone());
+                        oracle.insert(key.clone(), first.clone());
+                        let mut second = canned(&mut rng);
+                        while second == first {
+                            second = canned(&mut rng);
+                        }
+                        map.insert(&mut shapes, key.clone(), second.clone());
+                        oracle.insert(key, second);
+                    }
+                    _ => {
+                        let property = canned(&mut rng);
+                        map.insert(&mut shapes, key.clone(), property.clone());
+                        oracle.insert(key, property);
+                    }
                 }
                 check(&map, &shapes, &oracle);
             }
