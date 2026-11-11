@@ -2670,4 +2670,24 @@ mod tests {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
     }
+
+    #[test]
+    fn invalid_regex_unicode_sets_are_rejected() {
+        for source in [
+            "/[(]/v;",
+            "/[-]/v;",
+            "/[&&]/v;",
+            "/[!!]/v;",
+            "/[^^^]/v;",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "/^[[0-9]--_]+$/v;",
+            "/^[\\d--_]+$/v;",
+            "/[\\(]/v;",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
 }

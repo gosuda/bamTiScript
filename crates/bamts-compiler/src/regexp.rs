@@ -1008,12 +1008,29 @@ impl<'a> Parser<'a> {
                         return Some(message);
                     }
                 }
+                Some(0x5C) if self.is_q_prefix() => {
+                    if let Some(message) = self.parse_q_string() {
+                        return Some(message);
+                    }
+                }
                 Some(0x5C) => {
                     self.pos += 1;
                     if self.peek().is_none() {
                         return Some(format!("invalid regular expression"));
                     }
                     self.pos += 1;
+                }
+                Some(unit) if is_v_single_error(unit) => {
+                    return Some(format!("invalid regular expression"));
+                }
+                Some(0x2D) if self.is_lone_dash_class(depth) => {
+                    return Some(format!("invalid regular expression"));
+                }
+                Some(0x26) if self.is_lone_double_amp() => {
+                    return Some(format!("invalid regular expression"));
+                }
+                Some(unit) if self.is_reserved_double_at(unit) => {
+                    return Some(format!("invalid regular expression"));
                 }
                 _ => {
                     self.pos += 1;
@@ -1022,6 +1039,68 @@ impl<'a> Parser<'a> {
         }
         if let Some(message) = self.skip_quantifier() { return Some(message); }
         None
+    }
+
+    fn is_q_prefix(&self) -> bool {
+        self.units.get(self.pos) == Some(&0x5C) && self.units.get(self.pos + 1) == Some(&0x71)
+    }
+
+    fn parse_q_string(&mut self) -> Option<String> {
+        self.pos += 2;
+        if self.peek() != Some(0x7B) {
+            return Some(format!("invalid regular expression"));
+        }
+        self.pos += 1;
+        while let Some(unit) = self.peek() {
+            if unit == 0x7D {
+                self.pos += 1;
+                return None;
+            }
+            self.pos += 1;
+        }
+        Some(format!("invalid regular expression"))
+    }
+
+    fn is_lone_dash_class(&self, depth: usize) -> bool {
+        if depth != 1 {
+            return false;
+        }
+        if self.units.get(self.pos) != Some(&0x2D) {
+            return false;
+        }
+        let prev_is_open = self.pos >= 1 && self.units.get(self.pos - 1) == Some(&0x5B);
+        let prev_is_caret_open = self.pos >= 2
+            && self.units.get(self.pos - 2) == Some(&0x5B)
+            && self.units.get(self.pos - 1) == Some(&0x5E);
+        let next_is_close = self.units.get(self.pos + 1) == Some(&0x5D);
+        next_is_close && (prev_is_open || prev_is_caret_open)
+    }
+
+    fn is_lone_double_amp(&self) -> bool {
+        if self.units.get(self.pos) != Some(&0x26) {
+            return false;
+        }
+        if self.units.get(self.pos + 1) != Some(&0x26) {
+            return false;
+        }
+        let prev_is_open = self.pos >= 1 && self.units.get(self.pos - 1) == Some(&0x5B);
+        let next_is_close = self.units.get(self.pos + 2) == Some(&0x5D);
+        prev_is_open && next_is_close
+    }
+
+    fn is_reserved_double_at(&self, unit: u16) -> bool {
+        let next = match self.units.get(self.pos + 1).copied() {
+            Some(n) => n,
+            None => return false,
+        };
+        if unit != next {
+            return false;
+        }
+        matches!(
+            unit,
+            0x21 | 0x23 | 0x24 | 0x25 | 0x2A | 0x2B | 0x2C | 0x2E | 0x3A | 0x3B | 0x3C
+                | 0x3D | 0x3E | 0x3F | 0x40 | 0x60 | 0x7E | 0x5E
+        )
     }
 
     fn parse_escape(&mut self) -> Option<String> {
@@ -1438,6 +1517,10 @@ fn is_valid_u_single(escaped: u16, in_class: bool) -> bool {
         return true;
     }
     false
+}
+
+fn is_v_single_error(unit: u16) -> bool {
+    matches!(unit, 0x28 | 0x29 | 0x7B | 0x7D | 0x2F | 0x7C)
 }
 
 fn validate_single_modifier(first: &[u16]) -> Option<String> {
