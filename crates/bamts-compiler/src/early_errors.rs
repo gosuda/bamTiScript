@@ -2607,4 +2607,24 @@ mod tests {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
     }
+    #[test]
+    fn invalid_regex_properties_are_rejected() {
+        for source in [
+            "/\\p{Script=FooBarBazInvalid}/u;",
+            "/\\p{ASCII=F}/u;",
+            "/\\p{General_Category = Uppercase_Letter}/u;",
+            "/\\p/u;",
+            "/[\\P{}]/u;",
+        ] {
+            assert!(!errors(source).is_empty(), "{source}");
+        }
+        for source in [
+            "/\\p{Hex}/u;",
+            "/\\p{ASCII_Hex_Digit}/u;",
+            "/\\p{Script=Greek}/u;",
+            "/[\\p{Hex}\\P{Hex}]/u;",
+        ] {
+            assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+        }
+    }
 }
