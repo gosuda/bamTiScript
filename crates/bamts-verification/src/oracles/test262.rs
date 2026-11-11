@@ -10,7 +10,7 @@
 
 use bamts_bytecode::EcmaString;
 use bamts_compiler::diagnostic::Diagnostic;
-use bamts_compiler::program::{ProgramLoadError, ProgramLowerError, ProgramLowerErrorKind};
+use bamts_compiler::program::{ModuleEdgeKind, ProgramLoadError, ProgramLowerError, ProgramLowerErrorKind};
 use bamts_compiler::lint::{LintLevel, LintOverride, LintProfile, LintTable};
 use bamts_runtime::{
     CancellationToken, RuntimeErrorKind, ThrowOrigin, WarmupPolicy, run_linked_program,
@@ -1221,14 +1221,16 @@ fn parse_phase_outcome(diagnostics: &[Diagnostic]) -> RunOutcome {
     }
 }
 fn resolution_load_outcome(error: &ProgramLoadError) -> Option<RunOutcome> {
-    let resolution = matches!(
-        error,
-        ProgramLoadError::IllFormedModuleSpecifier { .. }
-            | ProgramLoadError::InvalidSpecifier { .. }
-            | ProgramLoadError::InvalidPackage { .. }
-            | ProgramLoadError::UnresolvedModule(_)
-    );
-    resolution.then(|| RunOutcome::Completed {
+    let static_edge = match error {
+        ProgramLoadError::InvalidSpecifier { diagnostic, .. }
+        | ProgramLoadError::InvalidPackage { diagnostic, .. }
+        | ProgramLoadError::UnresolvedModule(diagnostic) => {
+            diagnostic.kind() == ModuleEdgeKind::StaticRuntime
+        }
+        ProgramLoadError::IllFormedModuleSpecifier { .. } => false,
+        _ => false,
+    };
+    static_edge.then(|| RunOutcome::Completed {
         thrown: Some(ThrownError {
             phase: NegativePhase::Resolution,
             error_type: NegativeType::SyntaxError,
@@ -1236,7 +1238,6 @@ fn resolution_load_outcome(error: &ProgramLoadError) -> Option<RunOutcome> {
         }),
     })
 }
-
 fn resolution_lower_outcome(error: &ProgramLowerError) -> Option<RunOutcome> {
     let link = matches!(
         error.kind,
@@ -3316,6 +3317,41 @@ function $ERROR(message) {\n\
             other => panic!("resolution load failure must report Resolution/SyntaxError, got {other:?}"),
         }
         assert_eq!(judge_run(&request, &outcome), Ok(()));
+        fs::remove_dir_all(root).expect("remove scratch");
+    }
+    #[test]
+    fn dynamic_missing_import_is_not_resolution_syntax_error() {
+        let root = std::env::temp_dir().join(format!(
+            "bamts-test262-dynamic-{}-{}",
+            std::process::id(),
+            SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let tests = root.join("tests");
+        let scratch = root.join("scratch");
+        fs::create_dir_all(&tests).expect("tests directory");
+        let runner = InterpreterRunner::new(&scratch).for_test_file(tests.join("case.js"));
+        let request = RunRequest {
+            mode: ExecutionMode::Interpreter,
+            variant: ExecutionVariant {
+                kind: SourceKind::Module,
+            },
+            script: ComposedScript {
+                bytes: b"import('./THIS_FILE_DOES_NOT_EXIST.js');\n".to_vec(),
+                test_offset: 0,
+                kind: SourceKind::Module,
+                untouched: false,
+            },
+            negative: None,
+            async_done: false,
+            can_block: true,
+            deadline: Duration::from_secs(10),
+        };
+        let outcome = runner.run(&request);
+        match &outcome {
+            RunOutcome::Blocked { .. } => {}
+            other => panic!("dynamic load failure must stay blocked, got {other:?}"),
+        }
         fs::remove_dir_all(root).expect("remove scratch");
     }
     #[test]
