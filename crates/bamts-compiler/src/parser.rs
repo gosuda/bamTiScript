@@ -1695,6 +1695,7 @@ impl Parser {
         self.bump();
         let is_await = self.eat(TokenKind::KwAwait).is_some();
         self.expect(TokenKind::LParen, "expected `(`");
+        let head_start = self.cur_start();
 
         // Empty initializer.
         if self.eat(TokenKind::Semicolon).is_some() {
@@ -1724,7 +1725,6 @@ impl Parser {
                 && first.data().type_annotation.is_none()
                 && self.at(TokenKind::Eq)
             {
-                let checkpoint = self.checkpoint();
                 let finished = self.finish_for_declarator(first);
                 if self.at(TokenKind::KwIn) {
                     self.bump();
@@ -1746,8 +1746,7 @@ impl Parser {
                         }),
                     );
                 }
-                self.rollback(checkpoint);
-                (self.parse_for_head_declarator(), true)
+                (finished, true)
             } else {
                 (first, false)
             };
@@ -1844,6 +1843,13 @@ impl Parser {
             }
             TokenKind::KwOf => {
                 self.bump();
+                if let Expression::Identifier(identifier) = expression.data() {
+                    if expression.range().start() == head_start
+                        && self.lexeme(*identifier.data().token()) == "async"
+                    {
+                        self.error_here(EXPECTED_TOKEN, "a for-of target cannot be `async`");
+                    }
+                }
                 let target = self.expression_to_target(expression);
                 let iterable = self.parse_assignment_expression(false);
                 let body = self.finish_for_body();
@@ -8970,6 +8976,15 @@ mod tests {
         assert!(!errors(&parse_ts("for (let x = 1 in obj) {}")).is_empty());
         assert!(!errors(&parse_ts("for (var {a} = b in obj) {}")).is_empty());
         assert!(!errors(&parse_ts("for (var x = 1 of y) {}")).is_empty());
+    }
+
+    #[test]
+    fn async_identifier_cannot_head_a_for_of() {
+        assert!(!errors(&parse_ts("for (async of [1]) {}")).is_empty());
+        assert_clean("for (x of [1]) {}");
+        assert_clean("for (async in obj) {}");
+        assert_clean("for ((async) of [7]) {}");
+        assert_clean("for (\\u0061sync of [7]) {}");
     }
 
     #[test]
