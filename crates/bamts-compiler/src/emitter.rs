@@ -1865,8 +1865,7 @@ impl<'a> Emitter<'a> {
         // Manual wrapping is only needed when emission would otherwise start
         // with a bare `{`, `function`, or `class`: a printed `(` anywhere on
         // the left edge already protects the statement position.
-        let wrap =
-            !self.starts_parenthesized(expression) && self.leads_with_bad_token(expression, false);
+        let wrap = !self.starts_parenthesized(expression) && self.leads_with_bad_token(expression);
         if wrap {
             self.raw("(");
             self.emit_expression_prec(expression, 0);
@@ -2596,7 +2595,7 @@ impl<'a> Emitter<'a> {
             }
             FunctionBody::Expression(expression) => {
                 if !self.starts_parenthesized(expression)
-                    && self.leads_with_bad_token(expression, true)
+                    && self.leads_with_bad_token_objects_only(expression)
                 {
                     self.raw("(");
                     self.emit_expression_prec(expression, 0);
@@ -3812,30 +3811,64 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_binary(&mut self, binary: &BinaryExpression) {
-        let prec = binary_prec(binary.operator);
         if matches!(binary.operator, BinaryOperator::Exponentiate) {
-            let left = self.unwrap_expression(&binary.left);
-            if matches!(left.data(), Expression::Unary(_) | Expression::Await(_))
-                || matches!(left.data(), Expression::Update(update) if update.prefix)
-            {
-                self.raw("(");
-                self.emit_expression_prec(left, 0);
-                self.raw(")");
-            } else {
-                self.emit_expression_prec(&binary.left, P_EXPONENT + 1);
-            }
-            self.raw_mapped_pos(" ** ", binary.left.range().end());
-            self.emit_expression_prec(&binary.right, P_EXPONENT);
+            self.emit_exponentiate(binary);
+            return;
+        }
+        self.emit_binary_chain(binary);
+    }
+
+    fn emit_exponentiate(&mut self, binary: &BinaryExpression) {
+        let left = self.unwrap_expression(&binary.left);
+        if matches!(left.data(), Expression::Unary(_) | Expression::Await(_))
+            || matches!(left.data(), Expression::Update(update) if update.prefix)
+        {
+            self.raw("(");
+            self.emit_expression_prec(left, 0);
+            self.raw(")");
         } else {
-            let operator_text = binary_str(binary.operator);
-            self.emit_expression_prec(&binary.left, prec);
+            self.emit_expression_prec(&binary.left, P_EXPONENT + 1);
+        }
+        self.raw_mapped_pos(" ** ", binary.left.range().end());
+        self.emit_expression_prec(&binary.right, P_EXPONENT);
+    }
+
+    fn emit_binary_chain(&mut self, binary: &BinaryExpression) {
+        let mut frames: Vec<&BinaryExpression> = Vec::new();
+        let mut cursor = binary;
+        loop {
+            frames.push(cursor);
+            match cursor.left.data() {
+                Expression::Binary(next)
+                    if !matches!(next.operator, BinaryOperator::Exponentiate) =>
+                {
+                    cursor = next;
+                }
+                _ => break,
+            }
+        }
+        let mut opened: Vec<bool> = Vec::with_capacity(frames.len());
+        let mut parent: Option<&BinaryExpression> = None;
+        for frame in frames.iter() {
+            let need = parent.is_some_and(|outer| binary_prec(frame.operator) < binary_prec(outer.operator));
+            if need {
+                self.raw("(");
+            }
+            opened.push(need);
+            parent = Some(*frame);
+        }
+        let Some(inner) = frames.last() else { return };
+        self.emit_expression_prec(&inner.left, binary_prec(inner.operator));
+        for (frame, open) in frames.iter().rev().zip(opened.iter().rev()) {
+            let prec = binary_prec(frame.operator);
+            let operator_text = binary_str(frame.operator);
             let op_pos = self
                 .source_pos_of(
-                    TextRange::new(binary.left.range().end(), binary.right.range().start())
+                    TextRange::new(frame.left.range().end(), frame.right.range().start())
                         .unwrap_or(self.anchor),
                     operator_text.chars().next().unwrap_or('+'),
                 )
-                .unwrap_or(binary.left.range().end())
+                .unwrap_or(frame.left.range().end())
                 .get()
                 .saturating_sub(1);
             let op_pos = Utf16Pos::new(op_pos);
@@ -3844,35 +3877,85 @@ impl<'a> Emitter<'a> {
                 op_pos,
                 operator_text.chars().count(),
             );
-            self.emit_expression_prec(&binary.right, prec + 1);
+            self.emit_expression_prec(&frame.right, prec + 1);
+            if *open {
+                self.raw(")");
+            }
         }
     }
 
+
+
     fn emit_logical(&mut self, logical: &LogicalExpression) {
-        let prec = match logical.operator {
+        self.emit_logical_chain(logical);
+    }
+
+    fn logical_prec(operator: LogicalOperator) -> u8 {
+        match operator {
             LogicalOperator::And => P_LOGICAL_AND,
             LogicalOperator::Or => P_LOGICAL_OR,
             LogicalOperator::Nullish => P_NULLISH,
-        };
-        let operator_text = logical_str(logical.operator);
-        self.emit_logical_operand(&logical.left, logical.operator, prec, true);
-        let op_pos = self
-            .source_pos_of(
-                TextRange::new(logical.left.range().end(), logical.right.range().start())
-                    .unwrap_or(self.anchor),
-                operator_text.chars().next().unwrap_or('&'),
-            )
-            .unwrap_or(logical.left.range().end())
-            .get()
-            .saturating_sub(1);
-        let op_pos = Utf16Pos::new(op_pos);
-        self.raw_mapped_token(
-            &format!(" {operator_text} "),
-            op_pos,
-            operator_text.chars().count(),
-        );
-        self.emit_logical_operand(&logical.right, logical.operator, prec, false);
+        }
     }
+
+    fn emit_logical_chain(&mut self, logical: &LogicalExpression) {
+        let mut frames: Vec<&LogicalExpression> = Vec::new();
+        let mut cursor = logical;
+        loop {
+            frames.push(cursor);
+            match cursor.left.data() {
+                Expression::Logical(next) => {
+                    cursor = next;
+                }
+                _ => break,
+            }
+        }
+        let Some(inner) = frames.last() else { return };
+        let left_starts_paren = self.starts_parenthesized(&inner.left);
+        let mut opened: Vec<bool> = Vec::with_capacity(frames.len());
+        let mut parent: Option<LogicalOperator> = None;
+        for frame in frames.iter() {
+            let prec = Self::logical_prec(frame.operator);
+            let need = match parent {
+                None => false,
+                Some(outer) => {
+                    let outer_prec = Self::logical_prec(outer);
+                    let mixed = matches!(outer, LogicalOperator::Nullish) != matches!(frame.operator, LogicalOperator::Nullish);
+                    prec < outer_prec || (mixed && !left_starts_paren)
+                }
+            };
+            if need {
+                self.raw("(");
+            }
+            opened.push(need);
+            parent = Some(frame.operator);
+        }
+        self.emit_logical_operand(&inner.left, inner.operator, Self::logical_prec(inner.operator), true);
+        for (frame, open) in frames.iter().rev().zip(opened.iter().rev()) {
+            let prec = Self::logical_prec(frame.operator);
+            let operator_text = logical_str(frame.operator);
+            let op_pos = self
+                .source_pos_of(
+                    TextRange::new(frame.left.range().end(), frame.right.range().start())
+                        .unwrap_or(self.anchor),
+                    operator_text.chars().next().unwrap_or('&'),
+                )
+                .unwrap_or(frame.left.range().end())
+                .get()
+                .saturating_sub(1);
+            let op_pos = Utf16Pos::new(op_pos);
+            self.raw_mapped_token(
+                &format!(" {operator_text} "),
+                op_pos,
+                operator_text.chars().count(),
+            );
+            self.emit_logical_operand(&frame.right, frame.operator, prec, false);
+            if *open {
+                self.raw(")");
+            }
+        }
+    }
+
 
     fn emit_logical_operand(
         &mut self,
@@ -4266,109 +4349,130 @@ impl<'a> Emitter<'a> {
     // ---- expression classification ----------------------------------------
 
     fn unwrap_expression<'e>(&self, expression: &'e Expr) -> &'e Expr {
-        match expression.data() {
-            Expression::Parenthesized(inner) => self.unwrap_expression(inner),
-            Expression::As(as_expr) => self.unwrap_expression(&as_expr.expression),
-            Expression::Satisfies(satisfies) => self.unwrap_expression(&satisfies.expression),
-            Expression::TypeAssertion(assertion) => self.unwrap_expression(&assertion.expression),
-            Expression::NonNull(non_null) => self.unwrap_expression(&non_null.expression),
-            _ => expression,
+        let mut current = expression;
+        loop {
+            match current.data() {
+                Expression::Parenthesized(inner) => current = inner,
+                Expression::As(as_expr) => current = &as_expr.expression,
+                Expression::Satisfies(satisfies) => current = &satisfies.expression,
+                Expression::TypeAssertion(assertion) => current = &assertion.expression,
+                Expression::NonNull(non_null) => current = &non_null.expression,
+                _ => return current,
+            }
         }
     }
 
     fn chain_has_optional(&self, expression: &Expr) -> bool {
-        match expression.data() {
-            Expression::Member(member) => {
-                member.optional || self.chain_has_optional(&member.object)
+        let mut current = expression;
+        loop {
+            match current.data() {
+                Expression::Member(member) => {
+                    if member.optional {
+                        return true;
+                    }
+                    current = &member.object;
+                }
+                Expression::Call(call) => {
+                    if call.optional {
+                        return true;
+                    }
+                    current = &call.callee;
+                }
+                Expression::NonNull(non_null) => current = &non_null.expression,
+                Expression::Parenthesized(inner) => current = inner,
+                Expression::As(as_expr) => current = &as_expr.expression,
+                Expression::Satisfies(satisfies) => current = &satisfies.expression,
+                Expression::TypeAssertion(assertion) => current = &assertion.expression,
+                _ => return false,
             }
-            Expression::Call(call) => call.optional || self.chain_has_optional(&call.callee),
-            Expression::NonNull(non_null) => self.chain_has_optional(&non_null.expression),
-            Expression::Parenthesized(inner) => self.chain_has_optional(inner),
-            Expression::As(as_expr) => self.chain_has_optional(&as_expr.expression),
-            Expression::Satisfies(satisfies) => self.chain_has_optional(&satisfies.expression),
-            Expression::TypeAssertion(assertion) => self.chain_has_optional(&assertion.expression),
-            _ => false,
         }
     }
 
-    /// Whether an expression, at a statement or arrow-body position, would begin
-    /// with a token requiring wrapping parentheses (`{`, `function`, `class`).
-    fn leads_with_bad_token(&self, expression: &Expr, objects_only: bool) -> bool {
+    fn transparent_child<'e>(expression: &'e Expr) -> Option<&'e Expr> {
         match expression.data() {
-            Expression::Object(_) => true,
-            Expression::Function(_) | Expression::Class(_) => !objects_only,
-            Expression::Binary(binary) => self.leads_with_bad_token(&binary.left, objects_only),
-            Expression::Logical(logical) => self.leads_with_bad_token(&logical.left, objects_only),
-            Expression::Conditional(conditional) => {
-                self.leads_with_bad_token(&conditional.test, objects_only)
+            Expression::Parenthesized(inner) => Some(inner),
+            Expression::As(as_expr) => Some(&as_expr.expression),
+            Expression::Satisfies(satisfies) => Some(&satisfies.expression),
+            Expression::TypeAssertion(assertion) => Some(&assertion.expression),
+            Expression::NonNull(non_null) => Some(&non_null.expression),
+            _ => None,
+        }
+    }
+
+    fn left_position_child<'e>(expression: &'e Expr) -> Option<&'e Expr> {
+        match expression.data() {
+            Expression::Binary(binary) => Some(&binary.left),
+            Expression::Logical(logical) => Some(&logical.left),
+            Expression::Conditional(conditional) => Some(&conditional.test),
+            Expression::Call(call) => Some(&call.callee),
+            Expression::Member(member) => Some(&member.object),
+            Expression::TaggedTemplate(tagged) => Some(&tagged.tag),
+            Expression::Sequence(sequence) => sequence.expressions.first(),
+            _ => None,
+        }
+    }
+
+    fn leads_with_bad_token(&self, expression: &Expr) -> bool {
+        self.leads_with_bad_token_impl(expression, false)
+    }
+
+    fn leads_with_bad_token_objects_only(&self, expression: &Expr) -> bool {
+        self.leads_with_bad_token_impl(expression, true)
+    }
+
+    fn leads_with_bad_token_impl(&self, expression: &Expr, objects_only: bool) -> bool {
+        let mut current = expression;
+        loop {
+            match current.data() {
+                Expression::Object(_) => return true,
+                Expression::Function(_) | Expression::Class(_) => return !objects_only,
+                Expression::Assignment(assignment) => {
+                    return self.target_leads_with_object(&assignment.left)
+                }
+                Expression::Update(update) => {
+                    return !update.prefix && self.target_leads_with_object(&update.argument)
+                }
+                _ => (),
             }
-            Expression::Assignment(assignment) => self.target_leads_with_object(&assignment.left),
-            Expression::Sequence(sequence) => sequence
-                .expressions
-                .first()
-                .is_some_and(|first| self.leads_with_bad_token(first, objects_only)),
-            Expression::Call(call) => self.leads_with_bad_token(&call.callee, objects_only),
-            Expression::Member(member) => self.leads_with_bad_token(&member.object, objects_only),
-            Expression::TaggedTemplate(tagged) => {
-                self.leads_with_bad_token(&tagged.tag, objects_only)
+            if let Some(next) = Self::transparent_child(current) {
+                current = next;
+                continue;
             }
-            Expression::Update(update) => {
-                !update.prefix && self.target_leads_with_object(&update.argument)
+            match Self::left_position_child(current) {
+                Some(next) => current = next,
+                None => return false,
             }
-            Expression::NonNull(non_null) => {
-                self.leads_with_bad_token(&non_null.expression, objects_only)
-            }
-            Expression::As(as_expr) => self.leads_with_bad_token(&as_expr.expression, objects_only),
-            Expression::Satisfies(satisfies) => {
-                self.leads_with_bad_token(&satisfies.expression, objects_only)
-            }
-            Expression::TypeAssertion(assertion) => {
-                self.leads_with_bad_token(&assertion.expression, objects_only)
-            }
-            Expression::Parenthesized(inner) => self.leads_with_bad_token(inner, objects_only),
-            _ => false,
         }
     }
 
     fn target_leads_with_object(&self, target: &AssignmentTargetNode) -> bool {
         match target.data() {
             AssignmentTarget::Object(_) => true,
-            AssignmentTarget::Member(member) => self.leads_with_bad_token(&member.object, false),
+            AssignmentTarget::Member(member) => self.leads_with_bad_token(&member.object),
             _ => false,
         }
     }
-    /// Whether emission of this expression starts with a printed `(`.
-    /// Walks only the left edge through nodes whose emission forwards to
-    /// it, stopping at parenthesized nodes (which print their own parens)
-    /// instead of seeing through them like [`Self::leads_with_bad_token`]
-    /// does. Naming the upstream query: this is the `GetLeftmostExpression`
-    /// stop-at-parens half of the statement-position decision.
     fn starts_parenthesized(&self, expression: &Expr) -> bool {
-        match expression.data() {
-            Expression::Parenthesized(_) => true,
-            Expression::As(as_expr) => self.starts_parenthesized(&as_expr.expression),
-            Expression::Satisfies(satisfies) => self.starts_parenthesized(&satisfies.expression),
-            Expression::TypeAssertion(assertion) => {
-                self.starts_parenthesized(&assertion.expression)
+        let mut current = expression;
+        loop {
+            match current.data() {
+                Expression::Parenthesized(_) => return true,
+                Expression::Update(update) if !update.prefix => {
+                    return self.target_starts_parenthesized(&update.argument)
+                }
+                Expression::Assignment(assignment) => {
+                    return self.target_starts_parenthesized(&assignment.left)
+                }
+                _ => (),
             }
-            Expression::NonNull(non_null) => self.starts_parenthesized(&non_null.expression),
-            Expression::Binary(binary) => self.starts_parenthesized(&binary.left),
-            Expression::Logical(logical) => self.starts_parenthesized(&logical.left),
-            Expression::Conditional(conditional) => self.starts_parenthesized(&conditional.test),
-            Expression::Sequence(sequence) => sequence
-                .expressions
-                .first()
-                .is_some_and(|first| self.starts_parenthesized(first)),
-            Expression::Call(call) => self.starts_parenthesized(&call.callee),
-            Expression::Member(member) => self.starts_parenthesized(&member.object),
-            Expression::TaggedTemplate(tagged) => self.starts_parenthesized(&tagged.tag),
-            Expression::Update(update) if !update.prefix => {
-                self.target_starts_parenthesized(&update.argument)
+            if let Some(next) = Self::transparent_child(current) {
+                current = next;
+                continue;
             }
-            Expression::Assignment(assignment) => {
-                self.target_starts_parenthesized(&assignment.left)
+            match Self::left_position_child(current) {
+                Some(next) => current = next,
+                None => return false,
             }
-            _ => false,
         }
     }
 
@@ -8824,6 +8928,43 @@ var c = () => 1;
             above.diagnostics()
         );
     }
+    #[test]
+    fn left_deep_binary_chain_emits_without_overflow() {
+        let mut builder = Builder::new();
+        let mut chain = builder.number("0");
+        for index in 1..20000 {
+            let right = builder.number(&index.to_string());
+            let left = chain;
+            chain = binary(BinaryOperator::Add, left, right);
+        }
+        let file = builder.finish(vec![expr_stmt(chain)]);
+        let empty_recovered = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new("").expect("fits")),
+        ));
+        let empty_checked = crate::checker::check(&empty_recovered);
+        let model = empty_checked.product();
+        let output = emit_checked(
+            &file,
+            model,
+            &EmitOptions {
+                target: ScriptTarget::EsNext,
+                remove_comments: true,
+                ..EmitOptions::default()
+            },
+            &EmitFileNames::default(),
+        );
+        let code = &javascript(&output).code;
+        assert!(code.starts_with("0 + 1 + 2"), "{code}");
+        assert!(code.trim_end().ends_with("19999;"), "{code}");
+        assert_eq!(code.matches(" + ").count(), 19999, "{code}");
+    }
+
+
+
+
+
 
     #[test]
     fn es5_generator_import_source_materializes_before_options_yield() {

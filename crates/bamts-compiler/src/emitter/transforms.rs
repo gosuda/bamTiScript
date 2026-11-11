@@ -8548,6 +8548,84 @@ impl<'a> Rewriter<'a> {
         }
         rewritten
     }
+    fn rewrite_binary_spine(&mut self, expression: &Expr) -> Expr {
+        let mut operators = Vec::new();
+        let mut ranges = Vec::new();
+        let mut rights = Vec::new();
+        let mut current = expression;
+        loop {
+            match current.data() {
+                Expression::Binary(value) => {
+                    operators.push(value.operator);
+                    ranges.push(current.range());
+                    rights.push(&*value.right);
+                    current = &value.left;
+                }
+                _ => break,
+            }
+        }
+        let mut rebuilt = self.rewrite_expr(current);
+        for index in (0..operators.len()).rev() {
+            let right = self.rewrite_expr(rights[index]);
+            let operator = operators[index];
+            let range = ranges[index];
+            if operator == BinaryOperator::Exponentiate
+                && Self::needs(LanguageFeature::Exponentiation, self.options)
+            {
+                rebuilt = self.math_pow(rebuilt, right, range);
+                continue;
+            }
+            rebuilt = self.node(
+                range,
+                Expression::Binary(BinaryExpression {
+                    operator,
+                    left: Box::new(rebuilt),
+                    right: Box::new(right),
+                }),
+            );
+        }
+        rebuilt
+    }
+
+    fn rewrite_logical_spine(&mut self, expression: &Expr) -> Expr {
+        let mut operators = Vec::new();
+        let mut ranges = Vec::new();
+        let mut rights = Vec::new();
+        let mut current = expression;
+        loop {
+            match current.data() {
+                Expression::Logical(value) => {
+                    operators.push(value.operator);
+                    ranges.push(current.range());
+                    rights.push(&*value.right);
+                    current = &value.left;
+                }
+                _ => break,
+            }
+        }
+        let mut rebuilt = self.rewrite_expr(current);
+        for index in (0..operators.len()).rev() {
+            let right = self.rewrite_expr(rights[index]);
+            let operator = operators[index];
+            let range = ranges[index];
+            if operator == LogicalOperator::Nullish
+                && Self::needs(LanguageFeature::NullishCoalescing, self.options)
+            {
+                rebuilt = self.lower_nullish_coalescing(rebuilt, right, range);
+                continue;
+            }
+            rebuilt = self.node(
+                range,
+                Expression::Logical(LogicalExpression {
+                    operator,
+                    left: Box::new(rebuilt),
+                    right: Box::new(right),
+                }),
+            );
+        }
+        rebuilt
+    }
+
 
     fn rewrite_expression(&mut self, expression: &Expr) -> Expr {
         if self.replace_await
@@ -8693,40 +8771,8 @@ impl<'a> Rewriter<'a> {
                     }),
                 )
             }
-            Expression::Binary(value) => {
-                let left = self.rewrite_expr(&value.left);
-                let right = self.rewrite_expr(&value.right);
-                if value.operator == BinaryOperator::Exponentiate
-                    && Self::needs(LanguageFeature::Exponentiation, self.options)
-                {
-                    return self.math_pow(left, right, expression.range());
-                }
-                self.node(
-                    expression.range(),
-                    Expression::Binary(BinaryExpression {
-                        operator: value.operator,
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    }),
-                )
-            }
-            Expression::Logical(value) => {
-                let left = self.rewrite_expr(&value.left);
-                let right = self.rewrite_expr(&value.right);
-                if value.operator == LogicalOperator::Nullish
-                    && Self::needs(LanguageFeature::NullishCoalescing, self.options)
-                {
-                    return self.lower_nullish_coalescing(left, right, expression.range());
-                }
-                self.node(
-                    expression.range(),
-                    Expression::Logical(LogicalExpression {
-                        operator: value.operator,
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    }),
-                )
-            }
+            Expression::Binary(_) => self.rewrite_binary_spine(expression),
+            Expression::Logical(_) => self.rewrite_logical_spine(expression),
             Expression::Unary(value) => {
                 let argument = self.rewrite_expr(&value.argument);
                 self.node(
@@ -11950,6 +11996,43 @@ fn scan_pattern(pattern: &BindingPattern, features: &mut BTreeSet<LanguageFeatur
 /// exposed, and only exponentiation is lowered in every expression position
 /// the rewriter visits.
 fn scan_expression(expression: &Expr, features: &mut BTreeSet<LanguageFeature>) {
+    match expression.data() {
+        Expression::Binary(_) | Expression::Logical(_) => {
+            scan_left_spine(expression, features);
+            return;
+        }
+        _ => (),
+    }
+    scan_expression_inner(expression, features);
+}
+
+pub(crate) fn scan_left_spine(expression: &Expr, features: &mut BTreeSet<LanguageFeature>) {
+    let mut current = expression;
+    loop {
+        match current.data() {
+            Expression::Binary(value) => {
+                if value.operator == BinaryOperator::Exponentiate {
+                    features.insert(LanguageFeature::Exponentiation);
+                }
+                scan_expression_inner(&value.right, features);
+                current = &value.left;
+            }
+            Expression::Logical(value) => {
+                if value.operator == LogicalOperator::Nullish {
+                    features.insert(LanguageFeature::NullishCoalescing);
+                }
+                scan_expression_inner(&value.right, features);
+                current = &value.left;
+            }
+            _ => {
+                scan_expression_inner(current, features);
+                return;
+            }
+        }
+    }
+}
+
+fn scan_expression_inner(expression: &Expr, features: &mut BTreeSet<LanguageFeature>) {
     match expression.data() {
         Expression::Binary(value) => {
             scan_expression(&value.left, features);
