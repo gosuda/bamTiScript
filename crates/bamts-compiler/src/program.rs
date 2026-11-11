@@ -65,6 +65,16 @@ pub enum ModuleEdgeKind {
     DynamicRuntime,
 }
 
+/// Which triple-slash reference directive introduced an edge, if any.
+///
+/// A `Some` value marks an edge collected from a leading
+/// `/// <reference ... />` comment rather than from an import or export
+/// statement.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ReferenceDirectiveKind {
+    Path,
+}
+
 /// The canonical identity of a resolved module dependency.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ModuleTarget {
@@ -103,11 +113,18 @@ pub struct ModuleEdge {
     type_target: Option<ModuleTarget>,
     range: TextRange,
     unresolved: bool,
+    directive: Option<ReferenceDirectiveKind>,
 }
 impl ModuleEdge {
     #[must_use]
     pub const fn kind(&self) -> ModuleEdgeKind {
         self.kind
+    }
+
+    /// Which triple-slash reference directive introduced this edge, if any.
+    #[must_use]
+    pub const fn reference_directive(&self) -> Option<ReferenceDirectiveKind> {
+        self.directive
     }
 
     /// Whether a tolerant load found nothing for this specifier.
@@ -904,6 +921,9 @@ impl ProgramLoader {
                 flavor,
             });
         }
+        if let Some(directive) = edge.directive {
+            return self.resolve_directive(importer, edge, directive, cancel);
+        }
         if self.tolerate_unresolved {
             return self.resolve_edge_for_check(importer, edge, flavor, cancel);
         }
@@ -959,6 +979,30 @@ impl ProgramLoader {
             type_overlay: None,
             flavor,
         })
+    }
+    fn resolve_directive(
+        &self,
+        importer: &Path,
+        edge: &UnresolvedEdge,
+        directive: ReferenceDirectiveKind,
+        cancel: &CancellationToken,
+    ) -> Result<ResolvedEdge, ProgramLoadError> {
+        let ReferenceDirectiveKind::Path = directive;
+        let flavor = ResolutionFlavor::Types;
+        if let Some(target) = self.resolve_local(importer, edge, flavor, cancel)? {
+            let type_overlay = self.type_overlay(importer, edge, &target, cancel)?;
+            return Ok(ResolvedEdge {
+                target,
+                type_overlay,
+                flavor,
+            });
+        }
+        Err(ProgramLoadError::UnresolvedModule(diagnostic(
+            importer,
+            &edge.specifier,
+            edge.kind,
+            edge.range,
+        )))
     }
 
     /// Reads a package or specifier the runtime rules refused as not found.
@@ -1173,6 +1217,7 @@ impl ProgramLoader {
                             mode: edge.mode,
                             specifier,
                             range: edge.range,
+                            directive: edge.directive,
                         };
                         match self.resolve_mapped(&external.specifier, flavor)? {
                             Some(mapped) => Ok(Some(ResolvedEdgeTarget::Local(mapped))),
@@ -1340,6 +1385,7 @@ impl LoadState<'_> {
                             type_target: None,
                             range: pending.edge.range,
                             unresolved: false,
+                            directive: pending.edge.directive,
                         });
                         if let Some(path) = pending.type_overlay {
                             self.type_overlays.push((
@@ -1428,6 +1474,7 @@ impl LoadState<'_> {
                             mode: self.ambient,
                             specifier: Arc::clone(specifier),
                             range: parsed.product().range(),
+                            directive: None,
                         });
                     }
                     let dependencies = Vec::with_capacity(unresolved.len());
@@ -1479,6 +1526,36 @@ impl LoadState<'_> {
                                         type_target: None,
                                         range: edge.range,
                                         unresolved: true,
+                                        directive: edge.directive,
+                                    });
+                                    continue;
+                                }
+                                Err(error)
+                                    if edge.kind == ModuleEdgeKind::TypeOnly
+                                        && edge.directive.is_some()
+                                        && matches!(
+                                            error,
+                                            ProgramLoadError::UnresolvedModule(_)
+                                                | ProgramLoadError::InvalidSpecifier { .. }
+                                                | ProgramLoadError::InvalidPackage { .. }
+                                                | ProgramLoadError::UnsupportedSource(_)
+                                                | ProgramLoadError::Read { .. }
+                                                | ProgramLoadError::Source { .. }
+                                                | ProgramLoadError::IllFormedModuleSpecifier { .. }
+                                                | ProgramLoadError::TraversalRejected { .. }
+                                                | ProgramLoadError::JsxPlan { .. }
+                                        ) =>
+                                {
+                                    frame.dependencies.push(ModuleEdge {
+                                        kind: edge.kind,
+                                        flavor: crate::project::ResolutionFlavor::Types,
+                                        mode: edge.mode,
+                                        specifier: Arc::clone(&edge.specifier),
+                                        target: ModuleTarget::External(Arc::clone(&edge.specifier)),
+                                        type_target: None,
+                                        range: edge.range,
+                                        unresolved: true,
+                                        directive: edge.directive,
                                     });
                                     continue;
                                 }
@@ -1503,6 +1580,7 @@ impl LoadState<'_> {
                                         type_target: None,
                                         range: edge.range,
                                         unresolved: false,
+                                        directive: edge.directive,
                                     });
                                 }
                                 ResolvedEdgeTarget::Unresolved(specifier) => {
@@ -1515,6 +1593,7 @@ impl LoadState<'_> {
                                         type_target: None,
                                         range: edge.range,
                                         unresolved: true,
+                                        directive: edge.directive,
                                     });
                                 }
                             }
@@ -1555,6 +1634,7 @@ impl LoadState<'_> {
                         type_target: None,
                         range: pending.edge.range,
                         unresolved: false,
+                        directive: pending.edge.directive,
                     });
                     if let Some(path) = pending.type_overlay {
                         self.type_overlays
@@ -1584,6 +1664,7 @@ struct UnresolvedEdge {
     mode: ResolutionMode,
     specifier: Arc<str>,
     range: TextRange,
+    directive: Option<ReferenceDirectiveKind>,
 }
 
 fn collect_edges(
@@ -1591,6 +1672,7 @@ fn collect_edges(
     ambient: ResolutionMode,
 ) -> Result<Vec<UnresolvedEdge>, TextRange> {
     let mut edges = Vec::new();
+    collect_reference_directives(source, ambient, &mut edges);
     for statement in source.statements() {
         match statement.data() {
             Statement::Import(import) => {
@@ -1696,9 +1778,170 @@ fn collect_edges(
             mode: ambient,
             specifier: Arc::from(specifier),
             range: window[2].range(),
+            directive: None,
         });
     }
     Ok(edges)
+}
+
+fn collect_reference_directives(
+    source: &SourceFile,
+    ambient: ResolutionMode,
+    edges: &mut Vec<UnresolvedEdge>,
+) {
+    let boundary = source
+        .statements()
+        .first()
+        .map(|statement| statement.range().start());
+    for token in source.tokens() {
+        if boundary.is_some_and(|end| token.range().start() >= end) {
+            break;
+        }
+        if token.kind() != TokenKind::LineComment {
+            continue;
+        }
+        let Some(text) = source.token_text(token) else {
+            continue;
+        };
+        parse_reference_directive(source, text, token, ambient, edges);
+    }
+}
+
+fn parse_reference_directive(
+    source: &SourceFile,
+    text: &str,
+    token: &crate::syntax::Token,
+    ambient: ResolutionMode,
+    edges: &mut Vec<UnresolvedEdge>,
+) {
+    let bytes = text.as_bytes();
+    if bytes.len() < 3 || &bytes[..3] != b"///" || bytes.get(3) == Some(&b'/') {
+        return;
+    }
+    let tag = b"<reference";
+    let mut cursor = 3;
+    while cursor + tag.len() <= bytes.len() && &bytes[cursor..cursor + tag.len()] != tag {
+        cursor += 1;
+    }
+    if cursor + tag.len() > bytes.len() {
+        return;
+    }
+    cursor += tag.len();
+    loop {
+        skip_ascii_whitespace(bytes, &mut cursor);
+        if bytes.get(cursor) == Some(&b'/') {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b'>') {
+            break;
+        }
+        let Some(attribute) = next_directive_attribute(text, &mut cursor) else {
+            return;
+        };
+        let kind = match attribute.name {
+            "path" => ReferenceDirectiveKind::Path,
+            _ => continue,
+        };
+        edges.push(UnresolvedEdge {
+            kind: ModuleEdgeKind::TypeOnly,
+            mode: ambient,
+            specifier: Arc::from(attribute.value),
+            range: directive_value_range(
+                source,
+                token,
+                text,
+                attribute.value_start,
+                attribute.value_end,
+            ),
+            directive: Some(kind),
+        });
+    }
+}
+
+struct DirectiveAttribute<'a> {
+    name: &'a str,
+    value: &'a str,
+    value_start: usize,
+    value_end: usize,
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], cursor: &mut usize) {
+    while bytes.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
+        *cursor += 1;
+    }
+}
+
+fn next_directive_attribute<'a>(text: &'a str, cursor: &mut usize) -> Option<DirectiveAttribute<'a>> {
+    let bytes = text.as_bytes();
+    let name_start = *cursor;
+    while bytes
+        .get(*cursor)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'_')
+    {
+        *cursor += 1;
+    }
+    if *cursor == name_start {
+        return None;
+    }
+    let name = &text[name_start..*cursor];
+    skip_ascii_whitespace(bytes, cursor);
+    if bytes.get(*cursor) != Some(&b'=') {
+        return None;
+    }
+    *cursor += 1;
+    skip_ascii_whitespace(bytes, cursor);
+    let quote = match bytes.get(*cursor) {
+        Some(b'"') | Some(b'\'') => bytes[*cursor],
+        _ => return None,
+    };
+    *cursor += 1;
+    let value_start = *cursor;
+    while bytes.get(*cursor).is_some_and(|byte| *byte != quote) {
+        *cursor += 1;
+    }
+    if bytes.get(*cursor) != Some(&quote) {
+        return None;
+    }
+    let value_end = *cursor;
+    *cursor += 1;
+    Some(DirectiveAttribute {
+        name,
+        value: &text[value_start..value_end],
+        value_start,
+        value_end,
+    })
+}
+
+fn directive_value_range(
+    source: &SourceFile,
+    token: &crate::syntax::Token,
+    text: &str,
+    start: usize,
+    end: usize,
+) -> TextRange {
+    let fallback = token.range();
+    let base = source
+        .source_text()
+        .utf16_to_byte(token.range().start());
+    let Ok(base) = base else {
+        return fallback;
+    };
+    let (Some(value_start), Some(value_end)) =
+        (base.checked_add(start), base.checked_add(end))
+    else {
+        return fallback;
+    };
+    if value_end > base + text.len() {
+        return fallback;
+    }
+    let source_text = source.source_text();
+    let (Ok(range_start), Ok(range_end)) = (
+        source_text.byte_to_utf16(value_start),
+        source_text.byte_to_utf16(value_end),
+    ) else {
+        return fallback;
+    };
+    TextRange::new(range_start, range_end).unwrap_or(fallback)
 }
 
 struct DynamicEdgeCollector<'a> {
@@ -2223,6 +2466,7 @@ fn push_literal_edge(
         mode,
         specifier: Arc::from(specifier),
         range: literal.range(),
+        directive: None,
     });
     Ok(())
 }
@@ -3976,7 +4220,7 @@ mod tests {
     use super::{
         ExecutableProgram, JsxRoutingDecision, ModuleEdgeKind, ModuleTarget, ProgramLoadError,
         ProgramLoader, ProgramLowerErrorKind, ProgramLowerPhase, ProgramOutputKind,
-        ResolutionFlavor, ResolutionMode, ResolvedProgram, lower_program,
+        ReferenceDirectiveKind, ResolutionFlavor, ResolutionMode, ResolvedProgram, lower_program,
         lower_program_with_cancel,
     };
     use crate::checker::ProgramCheckOptions;
@@ -5215,6 +5459,95 @@ mod tests {
         );
         module(&executable, "shared.ts");
     }
+
+    #[test]
+    fn reference_path_directive_adds_type_only_dependency() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 1;\n");
+        fixture.write(
+            "main.ts",
+            "/// <reference path=\"./dep.ts\" />\nexport const x = 1;\n",
+        );
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("path directive loads");
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(edge.kind(), ModuleEdgeKind::TypeOnly);
+        assert_eq!(
+            edge.reference_directive(),
+            Some(ReferenceDirectiveKind::Path)
+        );
+        assert!(!edge.is_unresolved());
+        assert!(matches!(edge.target(), ModuleTarget::Local(_)));
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main_wire = module(&executable, "main.ts");
+        assert!(
+            main_wire.edges().is_empty(),
+            "a reference directive creates no runtime edge"
+        );
+    }
+
+    #[test]
+    fn reference_path_directive_to_missing_file_does_not_fail_program_load() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "/// <reference path=\"./missing.ts\" />\nexport const x = 1;\n",
+        );
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("missing path directive loads");
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(edge.kind(), ModuleEdgeKind::TypeOnly);
+        assert_eq!(
+            edge.reference_directive(),
+            Some(ReferenceDirectiveKind::Path)
+        );
+        assert!(edge.is_unresolved());
+    }
+
+    #[test]
+    fn reference_path_directive_to_self_loads_once() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "self.ts",
+            "///<reference path='self.ts'/>\nclass Named { }\n",
+        );
+        let resolved = fixture
+            .loader()
+            .load("self.ts")
+            .expect("self reference loads");
+        assert_eq!(resolved.modules().len(), 1);
+        let entry = resolved.entrypoint();
+        assert_eq!(entry.dependencies().len(), 1);
+        assert_eq!(
+            entry.dependencies()[0].reference_directive(),
+            Some(ReferenceDirectiveKind::Path)
+        );
+    }
+
+    #[test]
+    fn reference_directive_after_first_statement_is_ignored() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 1;\n");
+        fixture.write(
+            "main.ts",
+            "export const x = 1;\n/// <reference path=\"./dep.ts\" />\n",
+        );
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("trailing comment loads");
+        assert_eq!(resolved.modules().len(), 1);
+        assert!(resolved.entrypoint().dependencies().is_empty());
+    }
+
 
 
     #[test]
