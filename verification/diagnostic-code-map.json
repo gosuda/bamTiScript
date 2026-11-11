@@ -435,9 +435,9 @@
     },
     {
       "bamtsCode": "BAMTS-L006",
-      "evidence": "Invalid escape sequence -> TS1488 via tsc --noEmit on \"\\8\".",
+      "evidence": "Hexadecimal escape without two digits -> TS1125 at the first character that is not a digit via tsc 7.0.2 --noEmit on const x = \"\\xg\"; (x.ts(1,14)).",
       "status": "mapped",
-      "tsCode": 1488
+      "tsCode": 1125
     },
     {
       "bamtsCode": "BAMTS-L007",
@@ -468,6 +468,36 @@
       "evidence": "Invalid private identifier / hash not followed by identifier -> TS1127 via tsc --noEmit on \"# \".",
       "status": "mapped",
       "tsCode": 1127
+    },
+    {
+      "bamtsCode": "BAMTS-L012",
+      "evidence": "Extended unicode escape above U+10FFFF -> TS1198 over its digits via tsc 7.0.2 --noEmit on const z = \"\\u{110000}\"; (x.ts(1,15)).",
+      "status": "mapped",
+      "tsCode": 1198
+    },
+    {
+      "bamtsCode": "BAMTS-L013",
+      "evidence": "Extended unicode escape without its closing brace -> TS1199 at the character after the digits via tsc 7.0.2 --noEmit on const u = \"\\u{12\"; (x.ts(1,17)).",
+      "status": "mapped",
+      "tsCode": 1199
+    },
+    {
+      "bamtsCode": "BAMTS-L014",
+      "evidence": "Legacy octal escape in a TypeScript file -> TS1487 from its backslash via tsc 7.0.2 --noEmit on const a = \"\\101\"; (x.ts(1,12), Use the syntax '\\x41'), also with --alwaysStrict false.",
+      "status": "mapped",
+      "tsCode": 1487
+    },
+    {
+      "bamtsCode": "BAMTS-L015",
+      "evidence": "\\8 or \\9 escape in a TypeScript file -> TS1488 from its backslash via tsc 7.0.2 --noEmit on const b = \"\\8\"; (x.ts(1,12)).",
+      "status": "mapped",
+      "tsCode": 1488
+    },
+    {
+      "bamtsCode": "BAMTS-L016",
+      "evidence": "Extended unicode escape whose digits reach the end of the text -> TS1126 at the end via tsc 7.0.2 --noEmit on let a = \"\\u{12 with no newline (x.ts(1,15)); a closed one, let a = \"\\u{12x\", stays TS1199.",
+      "status": "mapped",
+      "tsCode": 1126
     },
     {
       "bamtsCode": "BAMTS-P001",

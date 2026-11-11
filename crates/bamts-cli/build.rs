@@ -16,6 +16,7 @@ fn main() {
     let host = required("HOST");
     let archive = out_dir.join(staticlib_archive_name(&target));
 
+    let mut native_libraries = String::new();
     match node_staticlib_action(&target, &host) {
         NodeStaticlibAction::Assemble => {
             let wrapper = out_dir.join("embedded_node.rs");
@@ -33,7 +34,7 @@ fn main() {
                 &cargo.fingerprint,
             ) {
                 Some(node_rlib) => {
-                    assemble_staticlib(
+                    native_libraries = assemble_staticlib(
                         &rustc,
                         &target,
                         &dependencies,
@@ -55,8 +56,17 @@ fn main() {
         "rustc-env=BAMTS_NODE_STATICLIB={}",
         archive.display()
     ));
+    cargo_line(&format!(
+        "rustc-env=BAMTS_NODE_NATIVE_LIBS={native_libraries}"
+    ));
     cargo_line(&format!("rustc-env=BAMTS_HOST_TARGET={host}"));
     cargo_line(&format!("rustc-env=BAMTS_BUILD_TARGET={target}"));
+    // The compiler recurses on the main thread. Linux and macOS give that thread
+    // 8 MiB and link.exe gives it 1 MiB, on which a nesting depth that the parser
+    // accepts overflows the stack.
+    if env::var_os("CARGO_CFG_TARGET_ENV").is_some_and(|environment| environment == "msvc") {
+        cargo_line("rustc-link-arg-bin=bamts=/STACK:8388608");
+    }
 }
 
 fn wrapper_source() -> &'static str {
@@ -425,7 +435,7 @@ fn assemble_staticlib(
     node_rlib: &Path,
     archive: &Path,
     wrapper: &Path,
-) {
+) -> String {
     let mut command = Command::new(rustc);
     command
         .arg("--crate-name")
@@ -448,6 +458,12 @@ fn assemble_staticlib(
         .arg("-o")
         .arg(archive)
         .arg(wrapper);
+    // The MSVC linker takes no libraries from the archive, so the link step has to
+    // name the system libraries that the archive needs. Only rustc knows them.
+    let needs_libraries = targets_msvc(target);
+    if needs_libraries {
+        command.arg("--print=native-static-libs");
+    }
     let output = command.output().unwrap_or_else(|error| {
         panic!("could not start `{}`: {error}", Path::new(rustc).display())
     });
@@ -459,6 +475,26 @@ fn assemble_staticlib(
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    if !needs_libraries {
+        return String::new();
+    }
+    native_static_libraries(&String::from_utf8_lossy(&output.stderr)).unwrap_or_else(|| {
+        panic!(
+            "rustc did not report the native libraries of the bamts-node staticlib\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+/// The libraries rustc says to link with a staticlib, from its
+/// `note: native-static-libs: kernel32.lib ntdll.lib /defaultlib:msvcrt` line.
+fn native_static_libraries(stderr: &str) -> Option<String> {
+    const MARKER: &str = "native-static-libs:";
+    stderr.lines().find_map(|line| {
+        let libraries = line.split_once(MARKER)?.1;
+        let libraries = libraries.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!libraries.is_empty()).then_some(libraries)
+    })
 }
 
 fn write_check_placeholder(dependencies: &Path, archive: &Path) {
@@ -529,8 +565,12 @@ fn node_staticlib_action(target: &str, host: &str) -> NodeStaticlibAction {
     }
 }
 
+fn targets_msvc(target: &str) -> bool {
+    target.contains("windows-msvc")
+}
+
 fn staticlib_archive_name(target: &str) -> &'static str {
-    if target.contains("windows-msvc") {
+    if targets_msvc(target) {
         "bamts_node.lib"
     } else {
         "libbamts_node.a"
@@ -552,6 +592,28 @@ mod tests {
         ));
         fs::create_dir_all(&directory).expect("could not create test directory");
         directory
+    }
+
+    #[test]
+    fn native_libraries_come_from_the_rustc_note() {
+        let stderr = "warning: something\nnote: link against the following native artifacts when linking against this static library\nnote: native-static-libs: kernel32.lib  ntdll.lib userenv.lib /defaultlib:msvcrt\n\nwarning: 1 warning emitted\n";
+        assert_eq!(
+            native_static_libraries(stderr).as_deref(),
+            Some("kernel32.lib ntdll.lib userenv.lib /defaultlib:msvcrt")
+        );
+    }
+
+    #[test]
+    fn a_missing_or_empty_native_libraries_note_gives_nothing() {
+        assert_eq!(native_static_libraries(""), None);
+        assert_eq!(
+            native_static_libraries("note: native-static-libs:   \n"),
+            None
+        );
+        assert_eq!(
+            native_static_libraries("note: link against the following native artifacts\n"),
+            None
+        );
     }
 
     fn fingerprint_json(dependency_hash: u64) -> String {

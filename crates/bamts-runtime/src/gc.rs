@@ -3,8 +3,17 @@ use super::*;
 #[derive(Default)]
 pub(super) struct GcState {
     marks: Vec<bool>,
+    /// Runtime slots that outlived the last collection. Allocation never
+    /// reuses a slot, so a collection that walked the heap would pay for every
+    /// allocation the program ever made.
+    survivors: Vec<usize>,
+    /// The heap length at the last sweep; every later slot is unswept.
+    swept_len: usize,
     work: Vec<usize>,
     weak_collections: Vec<usize>,
+    /// Marked `WeakRef`s and `FinalizationRegistry`s, found while marking so
+    /// that clearing them need not search the heap.
+    weak_holders: Vec<usize>,
     pending: bool,
     byte_watermark: usize,
     slot_watermark: usize,
@@ -67,11 +76,16 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 }
 
+/// The heap that starts the first collection, however large the limit is. Half of a
+/// large limit would let garbage fill gigabytes before anything collects it.
+const FIRST_COLLECTION_BYTES: usize = 32 << 20;
+const FIRST_COLLECTION_SLOTS: usize = 1 << 19;
+
 impl GcState {
     pub(super) fn new(limits: &Limits) -> Self {
         Self {
-            byte_watermark: limits.max_heap_bytes / 2,
-            slot_watermark: limits.max_heap_slots / 2,
+            byte_watermark: (limits.max_heap_bytes / 2).min(FIRST_COLLECTION_BYTES),
+            slot_watermark: (limits.max_heap_slots / 2).min(FIRST_COLLECTION_SLOTS),
             ..Self::default()
         }
     }
@@ -98,15 +112,16 @@ impl GcState {
     }
 
     fn collect<H: Host>(&mut self, machine: &mut Machine<'_, H>) {
-        self.marks.resize(machine.heap.len(), false);
-        self.marks.fill(false);
+        self.reset_marks(machine);
         self.work.clear();
         self.weak_collections.clear();
+        self.weak_holders.clear();
 
         self.trace_roots(machine);
         self.drain(&machine.heap);
         self.ephemeron_fixed_point(&machine.heap);
-        machine.process_weak_targets_after_marking(&self.marks);
+        self.weak_holders.sort_unstable();
+        machine.process_weak_targets_after_marking(&self.marks, &self.weak_holders);
         self.purge_weak_entries(machine);
         self.sweep(machine);
         self.pending = false;
@@ -117,6 +132,20 @@ impl GcState {
             machine.heap_bytes,
             machine.machine_bytes + machine.slot_bytes.iter().sum::<usize>()
         );
+    }
+
+    /// Clears the last collection's marks, which are all on intrinsics or
+    /// survivors, and accounts for a rolled-back clone shortening the heap.
+    fn reset_marks<H: Host>(&mut self, machine: &Machine<'_, H>) {
+        for &index in &self.survivors {
+            self.marks[index] = false;
+        }
+        let intrinsics = self.marks.len().min(machine.intrinsic_slots);
+        self.marks[..intrinsics].fill(false);
+        let heap_len = machine.heap.len();
+        self.marks.resize(heap_len, false);
+        self.survivors.retain(|&index| index < heap_len);
+        self.swept_len = self.swept_len.min(heap_len);
     }
 
     fn trace_roots<H: Host>(&mut self, machine: &Machine<'_, H>) {
@@ -151,6 +180,8 @@ impl GcState {
         }
         self.mark_value(&machine.heap, machine.current_new_target);
         self.mark_values(&machine.heap, &machine.kept_alive);
+        self.mark_values(&machine.heap, &machine.builtin_temporaries);
+        self.mark_values(&machine.heap, &machine.callback_results);
         if let Some(resume) = &machine.pending_generator_resume {
             trace_generator_resume(resume, &machine.heap, &mut self.marks, &mut self.work);
         }
@@ -161,8 +192,14 @@ impl GcState {
         for job in &machine.microtasks {
             trace_microtask(&job.job, &machine.heap, &mut self.marks, &mut self.work);
         }
+        for job in &machine.running_jobs {
+            trace_microtask(job, &machine.heap, &mut self.marks, &mut self.work);
+        }
         for &registry in &machine.finalization_cleanup_queue {
             self.mark_value(&machine.heap, registry);
+        }
+        for waiter in machine.async_waiters.values() {
+            self.mark_value(&machine.heap, waiter.promise);
         }
         for timer in machine.timers.values() {
             self.mark_value(&machine.heap, timer.callback);
@@ -225,6 +262,12 @@ impl GcState {
 
     fn drain(&mut self, heap: &[HeapEntry]) {
         while let Some(index) = self.work.pop() {
+            if matches!(
+                heap[index],
+                HeapEntry::WeakRef { .. } | HeapEntry::FinalizationRegistry { .. }
+            ) {
+                self.weak_holders.push(index);
+            }
             trace_entry(
                 &heap[index],
                 index,
@@ -309,16 +352,23 @@ impl GcState {
         }
     }
 
-    fn sweep<H: Host>(&self, machine: &mut Machine<'_, H>) {
-        for index in machine.intrinsic_slots..machine.heap.len() {
-            if self.marks[index] || matches!(machine.heap[index], HeapEntry::Vacant) {
-                continue;
+    fn sweep<H: Host>(&mut self, machine: &mut Machine<'_, H>) {
+        let unswept = self.swept_len.max(machine.intrinsic_slots)..machine.heap.len();
+        self.survivors.extend(unswept);
+        let marks = &self.marks;
+        self.survivors.retain(|&index| {
+            if marks[index] {
+                return true;
             }
-            machine.heap[index] = HeapEntry::Vacant;
-            let charge = std::mem::take(&mut machine.slot_bytes[index]);
-            machine.heap_bytes -= charge;
-            machine.vacant_count += 1;
-        }
+            if !matches!(machine.heap[index], HeapEntry::Vacant) {
+                machine.heap[index] = HeapEntry::Vacant;
+                let charge = std::mem::take(&mut machine.slot_bytes[index]);
+                machine.heap_bytes -= charge;
+                machine.vacant_count += 1;
+            }
+            false
+        });
+        self.swept_len = machine.heap.len();
     }
 }
 
@@ -738,6 +788,11 @@ fn trace_entry(
             prototype,
             ..
         }
+        | HeapEntry::Temporal {
+            properties,
+            prototype,
+            ..
+        }
         | HeapEntry::Timeout {
             properties,
             prototype,
@@ -748,6 +803,17 @@ fn trace_entry(
             prototype,
             ..
         } => trace_properties_and_prototype(properties, *prototype, heap, marks, work),
+        HeapEntry::Intl {
+            bound,
+            properties,
+            prototype,
+            ..
+        } => {
+            if let Some(bound) = bound {
+                mark_value(heap, marks, work, *bound);
+            }
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+        }
         HeapEntry::TypedArray {
             buffer,
             properties,

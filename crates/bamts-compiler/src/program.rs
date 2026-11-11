@@ -29,7 +29,10 @@ use crate::{
     project::{
         CompilerOptions, ModuleResolutionError, PackageError, PackageJson, PackageMode,
         PackageTarget, ProjectRoot, ResolutionConditions, ResolutionFlavor, plan_relative_module,
-        resolution::ResolutionMode,
+        resolution::{
+            ModuleResolutionKind, ResolutionCache, ResolutionHost, ResolutionMode,
+            resolve_module_name, resolve_type_reference,
+        },
     },
     scanner,
     service::filesystem::{FileSystem, FileSystemError, OsFileSystem},
@@ -99,11 +102,18 @@ pub struct ModuleEdge {
     target: ModuleTarget,
     type_target: Option<ModuleTarget>,
     range: TextRange,
+    unresolved: bool,
 }
 impl ModuleEdge {
     #[must_use]
     pub const fn kind(&self) -> ModuleEdgeKind {
         self.kind
+    }
+
+    /// Whether a tolerant load found nothing for this specifier.
+    #[must_use]
+    pub const fn is_unresolved(&self) -> bool {
+        self.unresolved
     }
     /// Returns the resolution flavor used for `target`.
     ///
@@ -221,8 +231,10 @@ pub struct ResolvedProgram {
     strict_property_initialization: bool,
     always_strict: bool,
     no_emit_helpers: bool,
+    remove_comments: bool,
     use_define_for_class_fields: Option<bool>,
     import_helpers: Option<bool>,
+    verbatim_module_syntax: bool,
     target: crate::emitter::ScriptTarget,
     libs: crate::checker::intrinsic_environment::LibSet,
     check_js: bool,
@@ -246,6 +258,11 @@ impl ResolvedProgram {
     #[must_use]
     pub const fn import_helpers(&self) -> Option<bool> {
         self.import_helpers
+    }
+
+    #[must_use]
+    pub const fn verbatim_module_syntax(&self) -> bool {
+        self.verbatim_module_syntax
     }
 
     #[must_use]
@@ -343,6 +360,7 @@ impl ResolvedProgram {
         .with_strict_property_initialization(self.strict_property_initialization)
         .with_always_strict(self.always_strict)
         .with_no_emit_helpers(self.no_emit_helpers)
+        .with_remove_comments(self.remove_comments)
         .with_script_target(self.target)
         .with_libs(self.libs)
         .with_check_js(self.check_js)
@@ -583,6 +601,7 @@ pub struct ProgramLoader {
     root: ProjectRoot,
     options: CompilerOptions,
     fs: Arc<dyn FileSystem>,
+    tolerate_unresolved: bool,
 }
 
 impl fmt::Debug for ProgramLoader {
@@ -621,7 +640,18 @@ impl ProgramLoader {
             root,
             options: options.clone(),
             fs,
+            tolerate_unresolved: false,
         })
+    }
+
+    /// Keeps loading past an import nothing can satisfy, for a run that only
+    /// checks, as `tsc` does. The frontend reports each one, so a project sees
+    /// all of them at once. A run that will execute must not use this: the
+    /// program has to fail before it starts.
+    #[must_use]
+    pub const fn tolerating_unresolved_imports(mut self) -> Self {
+        self.tolerate_unresolved = true;
+        self
     }
 
     /// Resolves and loads an entrypoint. The entrypoint may be root-relative or absolute.
@@ -721,8 +751,10 @@ impl ProgramLoader {
             strict_property_initialization: self.options.strict_property_initialization(),
             always_strict: self.options.always_strict(),
             no_emit_helpers: self.options.no_emit_helpers(),
+            remove_comments: self.options.remove_comments(),
             use_define_for_class_fields: self.options.use_define_for_class_fields(),
             import_helpers: self.options.import_helpers(),
+            verbatim_module_syntax: self.options.verbatim_module_syntax(),
             target,
             libs,
             check_js: self.options.check_js(),
@@ -872,6 +904,9 @@ impl ProgramLoader {
                 flavor,
             });
         }
+        if self.tolerate_unresolved {
+            return self.resolve_edge_for_check(importer, edge, flavor, cancel);
+        }
         if let Some(target) = self.resolve_local(importer, edge, flavor, cancel)? {
             let type_overlay = self.type_overlay(importer, edge, &target, cancel)?;
             return Ok(ResolvedEdge {
@@ -893,6 +928,70 @@ impl ProgramLoader {
             edge.kind,
             edge.range,
         )))
+    }
+
+    /// Resolves an edge for a run that only checks. A package the runtime
+    /// could not use can still type-check, so `tsc`'s own algorithm gets the
+    /// last word, and what that cannot find becomes a reported edge.
+    fn resolve_edge_for_check(
+        &self,
+        importer: &Path,
+        edge: &UnresolvedEdge,
+        flavor: ResolutionFlavor,
+        cancel: &CancellationToken,
+    ) -> Result<ResolvedEdge, ProgramLoadError> {
+        let local = Self::missing_when_invalid(self.resolve_local(importer, edge, flavor, cancel))?;
+        if let Some(target) = local {
+            let type_overlay =
+                Self::missing_when_invalid(self.type_overlay(importer, edge, &target, cancel))?;
+            return Ok(ResolvedEdge {
+                target,
+                type_overlay,
+                flavor,
+            });
+        }
+        let target = match self.resolve_as_tsc(importer, edge) {
+            Some(path) => ResolvedEdgeTarget::Local(path),
+            None => ResolvedEdgeTarget::Unresolved(Arc::clone(&edge.specifier)),
+        };
+        Ok(ResolvedEdge {
+            target,
+            type_overlay: None,
+            flavor,
+        })
+    }
+
+    /// Reads a package or specifier the runtime rules refused as not found.
+    fn missing_when_invalid<T>(
+        resolved: Result<Option<T>, ProgramLoadError>,
+    ) -> Result<Option<T>, ProgramLoadError> {
+        match resolved {
+            Err(
+                ProgramLoadError::InvalidPackage { .. } | ProgramLoadError::InvalidSpecifier { .. },
+            ) => Ok(None),
+            resolved => resolved,
+        }
+    }
+
+    fn resolve_as_tsc(&self, importer: &Path, edge: &UnresolvedEdge) -> Option<PathBuf> {
+        let kind = ModuleResolutionKind::from_options(&self.options)
+            .unwrap_or(ModuleResolutionKind::Bundler);
+        let strategy = (kind, edge.mode);
+        let host = LoaderResolutionHost(self.fs.as_ref());
+        let mut cache = ResolutionCache::new();
+        let specifier = &*edge.specifier;
+        let root = &self.root;
+        let options = &self.options;
+        resolve_type_reference(
+            root, options, importer, specifier, strategy, &host, &mut cache,
+        )
+        .or_else(|_| {
+            resolve_module_name(
+                root, options, importer, specifier, strategy, &host, &mut cache,
+            )
+        })
+        .ok()
+        .and_then(|resolved| self.fs.normalize(resolved.path()).ok())
     }
 
     fn resolve_local(
@@ -1100,6 +1199,25 @@ impl ProgramLoader {
 enum ResolvedEdgeTarget {
     Local(PathBuf),
     External(Arc<str>),
+    /// Nothing satisfies the specifier, and the load was told to continue.
+    Unresolved(Arc<str>),
+}
+
+/// The loader's filesystem, as `tsc`'s resolution algorithm reads it.
+struct LoaderResolutionHost<'a>(&'a dyn FileSystem);
+
+impl ResolutionHost for LoaderResolutionHost<'_> {
+    fn file_exists(&self, path: &Path) -> bool {
+        self.0.metadata(path).is_ok() && !self.directory_exists(path)
+    }
+
+    fn directory_exists(&self, path: &Path) -> bool {
+        self.0.read_dir(path).is_ok()
+    }
+
+    fn read_file(&self, path: &Path) -> Option<Arc<str>> {
+        self.0.read(path).ok().map(Arc::from)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1221,6 +1339,7 @@ impl LoadState<'_> {
                             target: ModuleTarget::Local(source_id),
                             type_target: None,
                             range: pending.edge.range,
+                            unresolved: false,
                         });
                         if let Some(path) = pending.type_overlay {
                             self.type_overlays.push((
@@ -1354,6 +1473,19 @@ impl LoadState<'_> {
                                         target: ModuleTarget::External(specifier),
                                         type_target: None,
                                         range: edge.range,
+                                        unresolved: false,
+                                    });
+                                }
+                                ResolvedEdgeTarget::Unresolved(specifier) => {
+                                    frame.dependencies.push(ModuleEdge {
+                                        kind: edge.kind,
+                                        flavor: resolved.flavor,
+                                        mode: edge.mode,
+                                        specifier: edge.specifier,
+                                        target: ModuleTarget::External(specifier),
+                                        type_target: None,
+                                        range: edge.range,
+                                        unresolved: true,
                                     });
                                 }
                             }
@@ -1393,6 +1525,7 @@ impl LoadState<'_> {
                         target: ModuleTarget::Local(source_id),
                         type_target: None,
                         range: pending.edge.range,
+                        unresolved: false,
                     });
                     if let Some(path) = pending.type_overlay {
                         self.type_overlays
@@ -1803,7 +1936,9 @@ impl DynamicEdgeCollector<'_> {
                     }
                 }
                 ClassMember::StaticBlock(block) => self.scan_statements(&block.data().statements),
-                ClassMember::IndexSignature(_) | ClassMember::Missing(_) => {}
+                ClassMember::IndexSignature(_)
+                | ClassMember::Missing(_)
+                | ClassMember::Semicolon => {}
             }
         }
     }
@@ -2009,7 +2144,9 @@ impl DynamicEdgeCollector<'_> {
             }
             AssignmentTarget::Array(value) => {
                 for element in &value.elements {
-                    if let AssignmentArrayElement::Target(value) = element {
+                    if let AssignmentArrayElement::Target(value)
+                    | AssignmentArrayElement::Rest(value) = element
+                    {
                         self.scan_target(value);
                     }
                 }
@@ -2481,14 +2618,21 @@ pub fn lower_program_with_cancel(
                 ProgramLowerErrorKind::InvalidModuleName,
             )
         })?;
-        raw_modules.push(collect_raw_module(
+        let mut raw = collect_raw_module(
             module,
             output.source_file(),
             output.semantic_model().enum_facts(),
             output.semantic_model().namespace_facts(),
             name,
             &module_ids,
-        )?);
+        )?;
+        if runs_as_script(resolved, module, output.source_file(), options) {
+            // Its `var` and function names belong to the global object, so a
+            // module cell must not capture them.
+            raw.bindings
+                .retain(|binding| !matches!(binding.kind, RawBindingKind::Hoisted));
+        }
+        raw_modules.push(raw);
         check_lower_cancel(cancel, module.path(), ProgramLowerPhase::Metadata)?;
     }
     check_lower_cancel(
@@ -2525,7 +2669,10 @@ pub fn lower_program_with_cancel(
         let strings = linkage_strings(raw);
         let code = lower::assemble_program_module(
             file,
-            options,
+            LowerOptions {
+                script_entry: runs_as_script(resolved, resolved_module, file, options),
+                ..options
+            },
             &strings,
             raw.jsx_plan.as_ref(),
             output.semantic_model().enum_facts(),
@@ -3379,6 +3526,19 @@ fn materialize_program_module(
     }
 }
 
+/// Whether `module` is the Script the host asked for. A file with module syntax
+/// is a module either way, and the host decides whether that is an error.
+fn runs_as_script(
+    resolved: &ResolvedProgram,
+    module: &ResolvedModule,
+    file: &SourceFile,
+    options: LowerOptions,
+) -> bool {
+    options.script_entry
+        && module.source_id() == resolved.entrypoint().source_id()
+        && !crate::early_errors::is_module(file)
+}
+
 fn normalized_module_name(root: &ProjectRoot, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root.path()).ok()?;
     let mut name = String::new();
@@ -3644,6 +3804,7 @@ mod tests {
             &frontend,
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
         )
         .unwrap()
@@ -3742,6 +3903,7 @@ mod tests {
             &frontend,
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
         )
         .expect_err("ill-formed metadata must not reach host String conversion");
@@ -5527,6 +5689,7 @@ mod tests {
                 &frontend,
                 LowerOptions {
                     javascript_compatibility: true,
+                    ..LowerOptions::default()
                 },
             )
             .unwrap_or_else(|error| panic!("{entrypoint}: {error}"));
@@ -5693,6 +5856,7 @@ mod tests {
             &frontend,
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
         )
         .unwrap();

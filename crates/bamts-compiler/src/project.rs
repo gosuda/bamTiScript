@@ -1,10 +1,14 @@
 pub mod build_mode;
+pub mod canonical;
 pub mod effective;
 pub mod output;
 pub mod references;
 pub mod resolution;
 pub mod resolution_trace;
 pub mod tsconfig;
+
+#[cfg(test)]
+pub(crate) mod test_paths;
 
 use crate::{
     lint::{LintConfig, LintLevel, LintSetting},
@@ -162,7 +166,7 @@ fn normalize_absolute(path: &Path) -> PathBuf {
             Component::Normal(part) => normalized.push(part),
         }
     }
-    normalized
+    canonical::simplify(&normalized)
 }
 
 /// The reason a JSON-with-comments document was rejected.
@@ -958,6 +962,10 @@ pub struct CompilerOptions {
     always_strict: bool,
     use_define_for_class_fields: Option<bool>,
     import_helpers: Option<bool>,
+    verbatim_module_syntax: bool,
+    /// `emitDecoratorMetadata` and `reactNamespace` read imports the source scan
+    /// cannot see, so emit cannot prove one unused.
+    keeps_imports: bool,
     allow_js: bool,
     check_js: bool,
     resolve_json_module: bool,
@@ -968,6 +976,7 @@ pub struct CompilerOptions {
     inline_source_map: bool,
     inline_sources: bool,
     no_emit_helpers: bool,
+    remove_comments: bool,
     map_root: Option<Arc<str>>,
     source_root: Option<Arc<str>>,
     no_emit: bool,
@@ -1051,6 +1060,11 @@ impl CompilerOptions {
     }
 
     #[must_use]
+    pub const fn remove_comments(&self) -> bool {
+        self.remove_comments
+    }
+
+    #[must_use]
     pub const fn no_emit_helpers(&self) -> bool {
         self.no_emit_helpers
     }
@@ -1062,6 +1076,16 @@ impl CompilerOptions {
     #[must_use]
     pub const fn import_helpers(&self) -> Option<bool> {
         self.import_helpers
+    }
+
+    #[must_use]
+    pub const fn verbatim_module_syntax(&self) -> bool {
+        self.verbatim_module_syntax
+    }
+
+    #[must_use]
+    pub const fn keeps_imports(&self) -> bool {
+        self.keeps_imports
     }
 
     #[must_use]
@@ -1255,6 +1279,10 @@ impl ProjectConfig {
             .unwrap_or(strict),
             always_strict: optional_bool(compiler, "alwaysStrict")?.unwrap_or(strict),
             use_define_for_class_fields: optional_bool(compiler, "useDefineForClassFields")?,
+            verbatim_module_syntax: optional_bool(compiler, "verbatimModuleSyntax")?
+                .unwrap_or(false),
+            keeps_imports: optional_bool(compiler, "emitDecoratorMetadata")?.unwrap_or(false)
+                || compiler.is_some_and(|options| options.get("reactNamespace").is_some()),
             import_helpers: optional_bool(compiler, "importHelpers")?,
             allow_js: optional_bool(compiler, "allowJs")?.unwrap_or(false),
             check_js: optional_bool(compiler, "checkJs")?.unwrap_or(false),
@@ -1266,6 +1294,7 @@ impl ProjectConfig {
             inline_source_map: optional_bool(compiler, "inlineSourceMap")?.unwrap_or(false),
             inline_sources: optional_bool(compiler, "inlineSources")?.unwrap_or(false),
             no_emit_helpers: optional_bool(compiler, "noEmitHelpers")?.unwrap_or(false),
+            remove_comments: optional_bool(compiler, "removeComments")?.unwrap_or(false),
             map_root: optional_nested_string(compiler, "mapRoot")?,
             source_root: optional_nested_string(compiler, "sourceRoot")?,
             no_emit: optional_bool(compiler, "noEmit")?.unwrap_or(false),
@@ -1566,7 +1595,7 @@ pub enum ResolutionFlavor {
 /// file; callers decide existence by applying their own probe to the candidates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModuleResolutionError {
-    Path(PathError),
+    Path(Box<PathError>),
     EmptySpecifier,
     BareSpecifier { specifier: Arc<str> },
     UrlLikeSpecifier { specifier: Arc<str> },
@@ -1599,7 +1628,7 @@ impl fmt::Display for ModuleResolutionError {
 impl std::error::Error for ModuleResolutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         if let Self::Path(error) = self {
-            Some(error)
+            Some(&**error)
         } else {
             None
         }
@@ -1608,7 +1637,7 @@ impl std::error::Error for ModuleResolutionError {
 
 impl From<PathError> for ModuleResolutionError {
     fn from(error: PathError) -> Self {
-        Self::Path(error)
+        Self::Path(Box::new(error))
     }
 }
 
@@ -1787,7 +1816,7 @@ pub enum PackageTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PackageError {
     Json(JsoncError),
-    Path(PathError),
+    Path(Box<PathError>),
     RootMustBeObject,
     InvalidField {
         field: Arc<str>,
@@ -1874,7 +1903,7 @@ impl std::error::Error for PackageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Json(error) => Some(error),
-            Self::Path(error) => Some(error),
+            Self::Path(error) => Some(&**error),
             _ => None,
         }
     }
@@ -1888,7 +1917,7 @@ impl From<JsoncError> for PackageError {
 
 impl From<PathError> for PackageError {
     fn from(error: PathError) -> Self {
-        Self::Path(error)
+        Self::Path(Box::new(error))
     }
 }
 
@@ -2341,16 +2370,16 @@ fn resolve_package_target(
 
 #[cfg(test)]
 mod tests {
+    use super::test_paths::abs;
     use super::{
         ConfigError, JsonValue, JsoncErrorKind, LintTsConfig, ModuleResolutionError, PackageError,
         PackageJson, PackageMode, PackageTarget, ProjectConfig, ProjectRoot, ResolutionConditions,
         ResolutionFlavor, parse_bamts_toml, parse_jsonc, plan_relative_module,
     };
     use crate::source::JsxEmit;
-    use std::path::{Path, PathBuf};
 
     fn root() -> ProjectRoot {
-        ProjectRoot::new("/workspace/corpus").expect("absolute test root")
+        ProjectRoot::new(abs("/workspace/corpus")).expect("absolute test root")
     }
 
     #[test]
@@ -2378,7 +2407,7 @@ mod tests {
     fn lint_tsconfig_ignores_typescript_strictness_options() {
         let config = LintTsConfig::parse(
             &root(),
-            "/workspace/corpus/tsconfig.json",
+            abs("/workspace/corpus/tsconfig.json"),
             r#"{
                 "compilerOptions": {
                     "target": "ES2022",
@@ -2441,10 +2470,10 @@ mod tests {
 
     #[test]
     fn tsconfig_duplicate_compileroptions_keys_yield_last_value() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let config = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"strict": true, "strict": false}}"#,
         )
         .expect("duplicate keys are accepted");
@@ -2460,10 +2489,10 @@ mod tests {
         // contextuallyTypedBooleanLiterals.ts, which carry duplicate @strict
         // and @declaration pragmas. The harness emits one key per pragma
         // occurrence, so the JSONC parser must accept duplicate keys.
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let config = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"target": "es2015", "strict": true, "declaration": true, "strict": true, "declaration": true}}"#,
         )
         .expect("duplicate keys from duplicate pragmas must be accepted");
@@ -2491,7 +2520,7 @@ mod tests {
             project
                 .resolve("projects/ohash/src/../src/index.ts")
                 .expect("confined path"),
-            PathBuf::from("/workspace/corpus/projects/ohash/src/index.ts")
+            abs("/workspace/corpus/projects/ohash/src/index.ts")
         );
         assert!(project.resolve("../secrets.ts").is_err());
         assert!(ProjectRoot::new("relative/root").is_err());
@@ -2501,7 +2530,7 @@ mod tests {
     fn project_config_parses_corpus_shaped_jsonc_into_immutable_options() {
         let config = ProjectConfig::parse(
             &root(),
-            "/workspace/corpus/projects/hookable/tsconfig.json",
+            abs("/workspace/corpus/projects/hookable/tsconfig.json"),
             r##"{
                 "compilerOptions": {
                     "target": "ESNext",
@@ -2536,11 +2565,11 @@ mod tests {
         assert_eq!(config.options().jsx_import_source(), Some("@scope/runtime"));
         assert_eq!(
             config.options().base_url(),
-            Path::new("/workspace/corpus/projects/hookable")
+            abs("/workspace/corpus/projects/hookable").as_path()
         );
         assert_eq!(
             config.options().paths()[0].targets()[0],
-            PathBuf::from("/workspace/corpus/projects/hookable/src/*")
+            abs("/workspace/corpus/projects/hookable/src/*")
         );
         assert_eq!(config.include()[1].as_ref(), "test");
     }
@@ -2554,7 +2583,7 @@ mod tests {
         // b3dadd75912e490756bd1c0165909cbdbb175e7ee223a57351c9061e2f242e9a).
         let config = ProjectConfig::parse(
             &root(),
-            "/workspace/corpus/tsconfig.json",
+            abs("/workspace/corpus/tsconfig.json"),
             r#"{"compilerOptions":{"strict":true,"noImplicitAny":false,"strictNullChecks":false,"strictPropertyInitialization":false,"alwaysStrict":false}}"#,
         )
         .expect("individual strict options");
@@ -2570,7 +2599,7 @@ mod tests {
     fn project_config_parses_use_define_for_class_fields_as_tri_state() {
         let pinned_true = ProjectConfig::parse(
             &root(),
-            "/workspace/corpus/tsconfig.json",
+            abs("/workspace/corpus/tsconfig.json"),
             r#"{"compilerOptions":{"useDefineForClassFields":true}}"#,
         )
         .expect("pinned true");
@@ -2580,7 +2609,7 @@ mod tests {
         );
         let pinned_false = ProjectConfig::parse(
             &root(),
-            "/workspace/corpus/tsconfig.json",
+            abs("/workspace/corpus/tsconfig.json"),
             r#"{"compilerOptions":{"useDefineForClassFields":false}}"#,
         )
         .expect("pinned false");
@@ -2590,7 +2619,7 @@ mod tests {
         );
         let silent = ProjectConfig::parse(
             &root(),
-            "/workspace/corpus/tsconfig.json",
+            abs("/workspace/corpus/tsconfig.json"),
             r#"{"compilerOptions":{"strict":true}}"#,
         )
         .expect("silent key");
@@ -2601,21 +2630,21 @@ mod tests {
     fn project_config_parses_import_helpers_as_tri_state() {
         let pinned_true = ProjectConfig::parse(
             &root(),
-            "/workspace/corpus/tsconfig.json",
+            abs("/workspace/corpus/tsconfig.json"),
             r#"{"compilerOptions":{"importHelpers":true}}"#,
         )
         .expect("pinned true");
         assert_eq!(pinned_true.options().import_helpers(), Some(true));
         let pinned_false = ProjectConfig::parse(
             &root(),
-            "/workspace/corpus/tsconfig.json",
+            abs("/workspace/corpus/tsconfig.json"),
             r#"{"compilerOptions":{"importHelpers":false}}"#,
         )
         .expect("pinned false");
         assert_eq!(pinned_false.options().import_helpers(), Some(false));
         let silent = ProjectConfig::parse(
             &root(),
-            "/workspace/corpus/tsconfig.json",
+            abs("/workspace/corpus/tsconfig.json"),
             r#"{"compilerOptions":{"strict":true}}"#,
         )
         .expect("silent key");
@@ -2626,7 +2655,7 @@ mod tests {
     fn project_config_rejects_wrong_types_and_every_root_escape() {
         let wrong = ProjectConfig::parse(
             &root(),
-            "/workspace/corpus/tsconfig.json",
+            abs("/workspace/corpus/tsconfig.json"),
             r#"{"compilerOptions":{"strict":"yes"}}"#,
         )
         .expect_err("wrong type");
@@ -2634,7 +2663,7 @@ mod tests {
 
         let jsx = ProjectConfig::parse(
             &root(),
-            "/workspace/corpus/tsconfig.json",
+            abs("/workspace/corpus/tsconfig.json"),
             r#"{"compilerOptions":{"jsx":"invalid-mode"}}"#,
         )
         .expect_err("jsx values use the canonical closed set");
@@ -2645,7 +2674,7 @@ mod tests {
 
         let escape = ProjectConfig::parse(
             &root(),
-            "/workspace/corpus/tsconfig.json",
+            abs("/workspace/corpus/tsconfig.json"),
             r#"{"compilerOptions":{"outDir":"../outside"}}"#,
         )
         .expect_err("outDir escape");
@@ -2653,7 +2682,7 @@ mod tests {
 
         let include_escape = ProjectConfig::parse(
             &root(),
-            "/workspace/corpus/tsconfig.json",
+            abs("/workspace/corpus/tsconfig.json"),
             r#"{"include":["../outside/**/*.ts"]}"#,
         )
         .expect_err("include escape");
@@ -2665,7 +2694,7 @@ mod tests {
         let project = root();
         let explicit = plan_relative_module(
             &project,
-            "/workspace/corpus/cases/dot-prop.ts",
+            abs("/workspace/corpus/cases/dot-prop.ts"),
             "../projects/dot-prop/index.js",
             ResolutionFlavor::Runtime,
             false,
@@ -2674,40 +2703,37 @@ mod tests {
         assert_eq!(
             &explicit.candidates()[..4],
             &[
-                PathBuf::from("/workspace/corpus/projects/dot-prop/index.ts"),
-                PathBuf::from("/workspace/corpus/projects/dot-prop/index.tsx"),
-                PathBuf::from("/workspace/corpus/projects/dot-prop/index.d.ts"),
-                PathBuf::from("/workspace/corpus/projects/dot-prop/index.js"),
+                abs("/workspace/corpus/projects/dot-prop/index.ts"),
+                abs("/workspace/corpus/projects/dot-prop/index.tsx"),
+                abs("/workspace/corpus/projects/dot-prop/index.d.ts"),
+                abs("/workspace/corpus/projects/dot-prop/index.js"),
             ]
         );
 
         let directory = plan_relative_module(
             &project,
-            "/workspace/corpus/cases/ohash.ts",
+            abs("/workspace/corpus/cases/ohash.ts"),
             "../projects/ohash/src/crypto/node",
             ResolutionFlavor::Runtime,
             false,
         )
         .expect("extension and index plan");
-        assert!(directory.candidates().contains(&PathBuf::from(
-            "/workspace/corpus/projects/ohash/src/crypto/node/index.ts"
-        )));
+        let expected_index = abs("/workspace/corpus/projects/ohash/src/crypto/node/index.ts");
+        assert!(directory.candidates().contains(&expected_index));
         assert_eq!(
             directory.select(|path| path.ends_with("index.ts")),
-            Some(Path::new(
-                "/workspace/corpus/projects/ohash/src/crypto/node/index.ts"
-            ))
+            Some(expected_index.as_path())
         );
     }
 
     #[test]
     fn relative_module_plan_rejects_bare_url_unsupported_and_escaping_specifiers() {
         let project = root();
-        let importer = "/workspace/corpus/cases/main.ts";
+        let importer = abs("/workspace/corpus/cases/main.ts");
         assert!(matches!(
             plan_relative_module(
                 &project,
-                importer,
+                &importer,
                 "node:fs",
                 ResolutionFlavor::Runtime,
                 false
@@ -2717,7 +2743,7 @@ mod tests {
         assert!(matches!(
             plan_relative_module(
                 &project,
-                importer,
+                &importer,
                 "./x.ts?raw",
                 ResolutionFlavor::Runtime,
                 false
@@ -2727,7 +2753,7 @@ mod tests {
         assert!(
             plan_relative_module(
                 &project,
-                importer,
+                &importer,
                 "../../outside",
                 ResolutionFlavor::Runtime,
                 false
@@ -2741,7 +2767,7 @@ mod tests {
         let project = root();
         let flat = PackageJson::parse(
             &project,
-            "/workspace/corpus/projects/escape-string-regexp/package.json",
+            abs("/workspace/corpus/projects/escape-string-regexp/package.json"),
             r#"{"name":"escape-string-regexp","type":"module","exports":"./index.js"}"#,
         )
         .expect("flat corpus package");
@@ -2753,12 +2779,12 @@ mod tests {
                 &ResolutionConditions::for_mode(PackageMode::Import)
             )
             .expect("root export"),
-            PathBuf::from("/workspace/corpus/projects/escape-string-regexp/index.js")
+            abs("/workspace/corpus/projects/escape-string-regexp/index.js")
         );
 
         let nested = PackageJson::parse(
             &project,
-            "/workspace/corpus/projects/ohash/package.json",
+            abs("/workspace/corpus/projects/ohash/package.json"),
             r#"{
                 "name":"ohash",
                 "exports": {
@@ -2778,7 +2804,7 @@ mod tests {
                     &ResolutionConditions::for_mode(PackageMode::Import)
                 )
                 .expect("node condition"),
-            PathBuf::from("/workspace/corpus/projects/ohash/dist/crypto/node/index.mjs")
+            abs("/workspace/corpus/projects/ohash/dist/crypto/node/index.mjs")
         );
         assert_eq!(
             nested
@@ -2789,7 +2815,7 @@ mod tests {
                     &ResolutionConditions::for_mode(PackageMode::Import)
                 )
                 .expect("wildcard"),
-            PathBuf::from("/workspace/corpus/projects/ohash/src/serialize.ts")
+            abs("/workspace/corpus/projects/ohash/src/serialize.ts")
         );
     }
 
@@ -2798,7 +2824,7 @@ mod tests {
         let project = root();
         let package = PackageJson::parse(
             &project,
-            "/workspace/corpus/projects/defu/package.json",
+            abs("/workspace/corpus/projects/defu/package.json"),
             r#"{
                 "exports": {
                     ".": {
@@ -2819,7 +2845,7 @@ mod tests {
                     &ResolutionConditions::for_mode(PackageMode::Types)
                 )
                 .expect("types condition"),
-            PathBuf::from("/workspace/corpus/projects/defu/dist/defu.d.mts")
+            abs("/workspace/corpus/projects/defu/dist/defu.d.mts")
         );
     }
 
@@ -2828,7 +2854,7 @@ mod tests {
         let project = root();
         let package = PackageJson::parse(
             &project,
-            "/workspace/corpus/projects/demo/package.json",
+            abs("/workspace/corpus/projects/demo/package.json"),
             r##"{
                 "imports": {
                     "#internal/*": "./src/*.ts",
@@ -2845,9 +2871,7 @@ mod tests {
                     &ResolutionConditions::for_mode(PackageMode::Import)
                 )
                 .expect("local import"),
-            PackageTarget::Path(PathBuf::from(
-                "/workspace/corpus/projects/demo/src/value.ts"
-            ))
+            PackageTarget::Path(abs("/workspace/corpus/projects/demo/src/value.ts"))
         );
         assert_eq!(
             package
@@ -2866,7 +2890,7 @@ mod tests {
         let project = root();
         let escape = PackageJson::parse(
             &project,
-            "/workspace/corpus/projects/demo/package.json",
+            abs("/workspace/corpus/projects/demo/package.json"),
             r#"{"exports":"./../outside.js"}"#,
         )
         .expect("metadata parses");
@@ -2882,7 +2906,7 @@ mod tests {
 
         let node_modules = PackageJson::parse(
             &project,
-            "/workspace/corpus/projects/demo/package.json",
+            abs("/workspace/corpus/projects/demo/package.json"),
             r#"{"exports":"./node_modules/dep/index.js"}"#,
         )
         .expect("metadata parses");
@@ -2902,7 +2926,7 @@ mod tests {
         let project = root();
         let package = PackageJson::parse(
             &project,
-            "/workspace/corpus/projects/tslib/package.json",
+            abs("/workspace/corpus/projects/tslib/package.json"),
             r#"{
                 "main":"./tslib.js",
                 "module":"./tslib.es6.js",
@@ -2915,19 +2939,19 @@ mod tests {
             package
                 .resolve_export(&project, ".", PackageMode::Import, &conditions)
                 .expect("module entry"),
-            PathBuf::from("/workspace/corpus/projects/tslib/tslib.es6.js")
+            abs("/workspace/corpus/projects/tslib/tslib.es6.js")
         );
         assert_eq!(
             package
                 .resolve_export(&project, ".", PackageMode::Types, &conditions)
                 .expect("types entry"),
-            PathBuf::from("/workspace/corpus/projects/tslib/tslib.d.ts")
+            abs("/workspace/corpus/projects/tslib/tslib.d.ts")
         );
 
         // mitt ships bare (no leading `./`) legacy fields across all three modes.
         let bare = PackageJson::parse(
             &project,
-            "/workspace/corpus/projects/mitt/package.json",
+            abs("/workspace/corpus/projects/mitt/package.json"),
             r#"{
                 "main":"dist/mitt.js",
                 "module":"dist/mitt.mjs",
@@ -2938,17 +2962,17 @@ mod tests {
         assert_eq!(
             bare.resolve_export(&project, ".", PackageMode::Require, &conditions)
                 .expect("bare main entry"),
-            PathBuf::from("/workspace/corpus/projects/mitt/dist/mitt.js")
+            abs("/workspace/corpus/projects/mitt/dist/mitt.js")
         );
         assert_eq!(
             bare.resolve_export(&project, ".", PackageMode::Import, &conditions)
                 .expect("bare module entry"),
-            PathBuf::from("/workspace/corpus/projects/mitt/dist/mitt.mjs")
+            abs("/workspace/corpus/projects/mitt/dist/mitt.mjs")
         );
         assert_eq!(
             bare.resolve_export(&project, ".", PackageMode::Types, &conditions)
                 .expect("bare typings entry"),
-            PathBuf::from("/workspace/corpus/projects/mitt/index.d.ts")
+            abs("/workspace/corpus/projects/mitt/index.d.ts")
         );
     }
 
@@ -2956,10 +2980,10 @@ mod tests {
 
     #[test]
     fn f13_string_true_parses_as_boolean_true() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let config = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"incremental": "true"}}"#,
         )
         .expect("string \"true\" must coerce to boolean");
@@ -2968,10 +2992,10 @@ mod tests {
 
     #[test]
     fn f13_string_false_parses_as_boolean_false() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let config = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"incremental": "false"}}"#,
         )
         .expect("string \"false\" must coerce to boolean");
@@ -2980,10 +3004,10 @@ mod tests {
 
     #[test]
     fn f13_string_true_case_insensitive_parses_as_boolean_true() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let config = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"composite": "True"}}"#,
         )
         .expect("string \"True\" must coerce to boolean");
@@ -2992,10 +3016,10 @@ mod tests {
 
     #[test]
     fn f13_string_true_with_whitespace_parses_as_boolean_true() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let config = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"incremental": " true "}}"#,
         )
         .expect("string \" true \" must coerce to boolean");
@@ -3004,10 +3028,10 @@ mod tests {
 
     #[test]
     fn f13_string_composite_true_parses_as_boolean_true() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let config = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"composite": "true"}}"#,
         )
         .expect("string \"true\" must coerce to boolean for composite");
@@ -3016,10 +3040,10 @@ mod tests {
 
     #[test]
     fn f13_invalid_string_still_rejected_for_boolean_field() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let error = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"incremental": "yes"}}"#,
         )
         .expect_err("non-boolean string must be rejected");
@@ -3031,10 +3055,10 @@ mod tests {
 
     #[test]
     fn f13_number_still_rejected_for_boolean_field() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let error = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"incremental": 1}}"#,
         )
         .expect_err("number must be rejected for boolean field");
@@ -3046,10 +3070,10 @@ mod tests {
 
     #[test]
     fn f13_jsx_preserve_capital_parses_case_insensitively() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let config = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"jsx": "Preserve"}}"#,
         )
         .expect("capitalized jsx value must be accepted");
@@ -3058,10 +3082,10 @@ mod tests {
 
     #[test]
     fn f13_jsx_react_uppercase_parses_case_insensitively() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let config = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"jsx": "REACT"}}"#,
         )
         .expect("uppercase jsx value must be accepted");
@@ -3070,10 +3094,10 @@ mod tests {
 
     #[test]
     fn f13_jsx_react_native_mixed_case_parses_case_insensitively() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let config = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"jsx": "React-Native"}}"#,
         )
         .expect("mixed-case jsx value must be accepted");
@@ -3082,10 +3106,10 @@ mod tests {
 
     #[test]
     fn f13_jsx_react_jsx_mixed_case_parses_case_insensitively() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let config = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"jsx": "React-JSX"}}"#,
         )
         .expect("mixed-case jsx value must be accepted");
@@ -3094,10 +3118,10 @@ mod tests {
 
     #[test]
     fn f13_jsx_react_jsxdev_mixed_case_parses_case_insensitively() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let config = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"jsx": "React-JSXDev"}}"#,
         )
         .expect("mixed-case jsx value must be accepted");
@@ -3106,10 +3130,10 @@ mod tests {
 
     #[test]
     fn f13_jsx_with_whitespace_parses_case_insensitively() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let config = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"jsx": "  Preserve  "}}"#,
         )
         .expect("whitespace-padded jsx value must be accepted");
@@ -3118,10 +3142,10 @@ mod tests {
 
     #[test]
     fn f13_jsx_invalid_string_still_rejected() {
-        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let root = ProjectRoot::new(abs("/workspace")).expect("valid root");
         let error = ProjectConfig::parse(
             &root,
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions": {"jsx": "react-jsx-foo"}}"#,
         )
         .expect_err("invalid jsx value must be rejected");

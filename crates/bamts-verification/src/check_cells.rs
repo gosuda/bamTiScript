@@ -36,6 +36,7 @@ use bamts_compiler::program::{
 use bamts_compiler::project::build_mode::{
     BUILD_INFO_SCHEMA, BuildInfo, canonical_json, source_signature,
 };
+use bamts_compiler::project::canonical::canonicalize;
 use bamts_compiler::project::resolution::{
     ModuleResolutionKind, ResolutionCache, ResolutionHost, TraceResolutionServices,
     resolve_module_name_with_trace,
@@ -220,6 +221,20 @@ impl CheckedCase {
         self.units
             .iter()
             .filter_map(|(unit, index)| index.map(|index| (unit, &self.output.modules()[index])))
+    }
+
+    /// `(unit, output)` pairs in the order upstream's `.types` and `.symbols`
+    /// documents list them. A last unit that names its dependencies is the one
+    /// the harness compiles, so it comes first and the others follow.
+    pub fn units_in_document_order(&self) -> Vec<(&CaseUnit, &FrontendOutput)> {
+        let mut units: Vec<_> = self.reached_units().collect();
+        let last_is_root = units.last().is_some_and(|(unit, _)| {
+            unit.text.contains("require(") || unit.text.contains("reference path")
+        });
+        if last_is_root && let Some(last) = units.pop() {
+            units.insert(0, last);
+        }
+        units
     }
 
     /// `(unit, output)` pairs for every reached unit, sorted by ascending
@@ -987,6 +1002,7 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             | "resolvejsonmodule"
             | "noemit"
             | "noemithelpers"
+            | "removecomments"
             | "declaration"
             | "alwaysstrict"
             | "exactoptionalpropertytypes"
@@ -1019,10 +1035,12 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             "resolvejsonmodule" => "resolveJsonModule",
             "moduleresolution" => "moduleResolution",
             "noemithelpers" => "noEmitHelpers",
+            "removecomments" => "removeComments",
             "noemit" => "noEmit",
             "alwaysstrict" => "alwaysStrict",
             "usedefineforclassfields" => "useDefineForClassFields",
             "importhelpers" => "importHelpers",
+            "verbatimmodulesyntax" => "verbatimModuleSyntax",
             "exactoptionalpropertytypes" => "exactOptionalPropertyTypes",
             "nouncheckedindexedaccess" => "noUncheckedIndexedAccess",
             "strictpropertyinitialization" => "strictPropertyInitialization",
@@ -1124,7 +1142,8 @@ pub fn compile_case_frontend(
             .map_err(|error| CaseCompileError::Load(format!("config: {error}")))?;
         let options = config.options().clone();
         let loader = ProgramLoader::new(&root, config.options())
-            .map_err(|error| CaseCompileError::Load(format!("loader: {error}")))?;
+            .map_err(|error| CaseCompileError::Load(format!("loader: {error}")))?
+            .tolerating_unresolved_imports();
         let program = loader
             .load(Path::new(ENTRY))
             .map_err(|error| CaseCompileError::Load(error.to_string()))?;
@@ -1163,7 +1182,7 @@ fn pair_units_with_modules(
     units
         .iter()
         .map(|unit| {
-            let canonical = fs::canonicalize(root.join(&unit.virtual_path)).ok();
+            let canonical = canonicalize(root.join(&unit.virtual_path)).ok();
             let index = canonical.and_then(|canonical| {
                 program
                     .modules()
@@ -1524,7 +1543,7 @@ struct TypeAnnotation {
 #[must_use]
 pub fn emit_types_baseline(case: &CheckedCase, logical_path: &str) -> String {
     let mut out = format!("//// [{logical_path}] ////\n\n");
-    for (unit, output) in case.reached_units() {
+    for (unit, output) in case.units_in_document_order() {
         if is_config_unit_name(&unit.display_name) {
             continue;
         }
@@ -1812,9 +1831,10 @@ fn resolve_stem_baseline(
 pub fn check_types(
     snapshot: &(impl SnapshotAssets + ?Sized),
     case: &CheckedCase,
+    logical_path: &str,
     baseline_path: &str,
 ) -> Result<TypesOutcome> {
-    let emitted = emit_types_baseline(case, &case.entry);
+    let emitted = emit_types_baseline(case, logical_path);
     let bytes = read_verified_snapshot_asset(snapshot, baseline_path)?;
     let expected = String::from_utf8_lossy(&bytes).into_owned();
     let verdict = compare_types(&expected, &emitted);
@@ -1874,16 +1894,17 @@ pub(crate) fn observe_types(
                     artifact: None,
                 };
             };
-            let outcome = match check_types(snapshot, &case, &baseline_path) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    return CompilerCheckObservation {
-                        class: FailureClass::HarnessError,
-                        detail: error.to_string(),
-                        artifact: None,
-                    };
-                }
-            };
+            let outcome =
+                match check_types(snapshot, &case, &index_entry.logical_path, &baseline_path) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return CompilerCheckObservation {
+                            class: FailureClass::HarnessError,
+                            detail: error.to_string(),
+                            artifact: None,
+                        };
+                    }
+                };
             match outcome.verdict {
                 FacetVerdict::Pass => CompilerCheckObservation {
                     class: FailureClass::Pass,
@@ -2008,8 +2029,10 @@ pub fn emit_javascript_baseline(
     // the document carries no `.js` sections at all; its `result.DTS` is empty
     // unless declaration emit is on. The section set follows those two maps.
     let mut outputs = 0usize;
+    // The echo above keeps split order; the output sections follow emit order.
+    let emitted = case.reached_units_in_module_order();
     if !options.emit_declaration_only() {
-        for (unit, output) in &units {
+        for (unit, output) in &emitted {
             let name = unit_basename(&unit.virtual_path);
             // A `.d.ts` input is never a JavaScript output: upstream's output
             // mapping skips declaration files outright.
@@ -2037,7 +2060,7 @@ pub fn emit_javascript_baseline(
     }
     if options.declaration() || options.emit_declaration_only() {
         let mut declarations = Vec::new();
-        for (unit, output) in &units {
+        for (unit, output) in &emitted {
             let name = unit_basename(&unit.virtual_path);
             if is_declaration_input_name(&name) {
                 continue;
@@ -2497,6 +2520,8 @@ pub fn emit_source_map_baseline(
             prog.import_helpers(),
         );
         options.no_emit_helpers = check.no_emit_helpers();
+        options.remove_comments = check.remove_comments();
+        options.verbatim_module_syntax = prog.verbatim_module_syntax();
         match prog.jsx_routing_decision(ProgramOutputKind::JavaScript) {
             JsxRoutingDecision::Emit | JsxRoutingDecision::TransformAndEmit => {
                 options.jsx = prog.jsx();
@@ -3064,7 +3089,7 @@ pub(crate) fn observe_trace(
 #[must_use]
 pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
     let mut out = format!("//// [{logical_path}] ////\n\n");
-    let units: Vec<_> = case.reached_units().collect();
+    let units = case.units_in_document_order();
     let mut declaration_anchors: HashMap<(String, SymbolKind), Vec<SymbolDeclAnchor>> =
         HashMap::new();
     for (unit, output) in &units {
@@ -3149,6 +3174,7 @@ pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
         emit_unit_symbols(
             output.semantic_model(),
             output.source_file(),
+            &unit.display_name,
             &section,
             &declaration_anchors,
             &mut out,
@@ -3176,6 +3202,7 @@ struct SymbolRecord {
 fn emit_unit_symbols(
     model: &SemanticModel,
     source_file: &bamts_compiler::syntax::SourceFile,
+    heading: &str,
     section: &str,
     declaration_anchors: &HashMap<(String, SymbolKind), Vec<SymbolDeclAnchor>>,
     out: &mut String,
@@ -3337,7 +3364,7 @@ fn emit_unit_symbols(
         by_line.entry(record.line).or_default().push(record);
     }
 
-    out.push_str(&format!("=== {section} ===\n"));
+    out.push_str(&format!("=== {heading} ===\n"));
     for (line_index, raw_line) in source.as_str().split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         out.push_str(line);
@@ -3636,9 +3663,10 @@ pub fn resolve_symbols_baseline(groups: &BaselineGroups, logical_path: &str) -> 
 pub fn check_symbols(
     snapshot: &(impl SnapshotAssets + ?Sized),
     case: &CheckedCase,
+    logical_path: &str,
     baseline_path: &str,
 ) -> Result<SymbolsOutcome> {
-    let emitted = emit_symbols_baseline(case, &case.entry);
+    let emitted = emit_symbols_baseline(case, logical_path);
     let bytes = read_verified_snapshot_asset(snapshot, baseline_path)?;
     let expected = String::from_utf8_lossy(&bytes).into_owned();
     let verdict = compare_symbols(&expected, &emitted);
@@ -3704,16 +3732,17 @@ pub(crate) fn observe_symbols(
                     artifact: None,
                 };
             };
-            let outcome = match check_symbols(snapshot, &case, &baseline_path) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    return CompilerCheckObservation {
-                        class: FailureClass::HarnessError,
-                        detail: error.to_string(),
-                        artifact: None,
-                    };
-                }
-            };
+            let outcome =
+                match check_symbols(snapshot, &case, &index_entry.logical_path, &baseline_path) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return CompilerCheckObservation {
+                            class: FailureClass::HarnessError,
+                            detail: error.to_string(),
+                            artifact: None,
+                        };
+                    }
+                };
             match outcome.verdict {
                 FacetVerdict::Pass => CompilerCheckObservation {
                     class: FailureClass::Pass,

@@ -48,18 +48,32 @@ const TS1110: DiagnosticCode = DiagnosticCode::new("TS1110");
 const TS1124: DiagnosticCode = DiagnosticCode::new("TS1124");
 /// Hexadecimal digit expected.
 const TS1125: DiagnosticCode = DiagnosticCode::new("TS1125");
+/// Unexpected end of text.
+const TS1126: DiagnosticCode = DiagnosticCode::new("TS1126");
 /// Invalid character.
 const TS1127: DiagnosticCode = DiagnosticCode::new("TS1127");
+/// An extended Unicode escape value is above U+10FFFF.
+const TS1198: DiagnosticCode = DiagnosticCode::new("TS1198");
+/// Unterminated Unicode escape sequence.
+const TS1199: DiagnosticCode = DiagnosticCode::new("TS1199");
+/// Octal escape sequences are not allowed.
+const TS1487: DiagnosticCode = DiagnosticCode::new("TS1487");
+/// An escape sequence is not allowed.
+const TS1488: DiagnosticCode = DiagnosticCode::new("TS1488");
 /// Declaration or statement expected.
 const TS1128: DiagnosticCode = DiagnosticCode::new("TS1128");
 /// Property assignment expected.
 const TS1136: DiagnosticCode = DiagnosticCode::new("TS1136");
+/// String literal expected.
+const TS1141: DiagnosticCode = DiagnosticCode::new("TS1141");
 /// Unterminated template literal.
 const TS1160: DiagnosticCode = DiagnosticCode::new("TS1160");
 /// Unterminated regular expression literal.
 const TS1161: DiagnosticCode = DiagnosticCode::new("TS1161");
 const TS1163: DiagnosticCode = DiagnosticCode::new("TS1163");
 const TS1308: DiagnosticCode = DiagnosticCode::new("TS1308");
+/// A `try` statement needs `catch` or `finally`.
+const TS1472: DiagnosticCode = DiagnosticCode::new("TS1472");
 /// Expected corresponding JSX closing tag.
 const TS17002: DiagnosticCode = DiagnosticCode::new("TS17002");
 /// JSX fragment has no corresponding closing tag.
@@ -79,6 +93,11 @@ pub fn typescript_parse_code(code: DiagnosticCode, message: &str) -> Option<Diag
         "BAMTS-L006" | "BAMTS-L007" => TS1125,
         "BAMTS-L008" | "BAMTS-L009" | "BAMTS-L010" => TS1124,
         "BAMTS-L011" => TS1127,
+        "BAMTS-L012" => TS1198,
+        "BAMTS-L013" => TS1199,
+        "BAMTS-L014" => TS1487,
+        "BAMTS-L015" => TS1488,
+        "BAMTS-L016" => TS1126,
         "BAMTS-P001" => map_expected_token(message),
         "BAMTS-P002" => map_expected_expression(message),
         "BAMTS-P003" => TS1003,
@@ -92,6 +111,7 @@ pub fn typescript_parse_code(code: DiagnosticCode, message: &str) -> Option<Diag
         "BAMTS-P016" => TS17014,
         "BAMTS-P017" => TS1163,
         "BAMTS-P018" => TS1308,
+        "BAMTS-P020" => TS1141,
         "BAMTS-C051" if is_export_modifier_on_class_element(message) => TS1031,
         _ => return None,
     })
@@ -122,12 +142,19 @@ pub fn typescript_parse_message(code: DiagnosticCode) -> Option<&'static str> {
         "TS1110" => "Type expected.",
         "TS1124" => "Digit expected.",
         "TS1125" => "Hexadecimal digit expected.",
+        "TS1126" => "Unexpected end of text.",
         "TS1127" => "Invalid character.",
+        "TS1198" => "An extended Unicode escape value must be between 0x0 and 0x10FFFF inclusive.",
+        "TS1199" => "Unterminated Unicode escape sequence.",
+        "TS1487" => "Octal escape sequences are not allowed. Use the syntax '{0}'.",
+        "TS1488" => "Escape sequence '{0}' is not allowed.",
         "TS1128" => "Declaration or statement expected.",
         "TS1136" => "Property assignment expected.",
+        "TS1141" => "String literal expected.",
         "TS1160" => "Unterminated template literal.",
         "TS1161" => "Unterminated regular expression literal.",
         "TS1163" => "A 'yield' expression is only allowed in a generator body.",
+        "TS1472" => "'catch' or 'finally' expected.",
         "TS1308" => {
             "'await' expressions are only allowed within async functions and at the top levels of modules."
         }
@@ -149,7 +176,7 @@ pub fn map_parse_diagnostic(diagnostic: &Diagnostic) -> Diagnostic {
         return diagnostic.clone();
     };
     let message: Cow<'static, str> = typescript_parse_message(ts_code)
-        .map(Cow::Borrowed)
+        .and_then(|template| fill_arguments(template, diagnostic.message()))
         .unwrap_or_else(|| diagnostic.message_cow());
     let mapped = Diagnostic::new(
         diagnostic.severity(),
@@ -184,9 +211,30 @@ pub fn map_parse_diagnostics(diagnostics: &[Diagnostic]) -> Vec<Diagnostic> {
     crate::diagnostic::Recovered::new((), mapped).into_parts().1
 }
 
+/// The TypeScript message `template` with each `{n}` replaced by the `n`th part
+/// of `native` in backticks. A native message quotes the arguments of its
+/// TypeScript message in that order. `None` when `native` quotes too few parts.
+fn fill_arguments(template: &'static str, native: &str) -> Option<Cow<'static, str>> {
+    if !template.contains('{') {
+        return Some(Cow::Borrowed(template));
+    }
+    let arguments: Vec<&str> = native.split('`').skip(1).step_by(2).collect();
+    let mut message = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let close = open + rest[open..].find('}')?;
+        let index: usize = rest[open + 1..close].parse().ok()?;
+        message.push_str(&rest[..open]);
+        message.push_str(arguments.get(index)?);
+        rest = &rest[close + 1..];
+    }
+    message.push_str(rest);
+    Some(Cow::Owned(message))
+}
+
 fn is_export_modifier_on_class_element(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("export modifier") && lower.contains("class element")
+    lower.contains("`export` modifier") && lower.contains("class element")
 }
 
 fn map_expected_token(message: &str) -> DiagnosticCode {
@@ -205,6 +253,10 @@ fn map_expected_token(message: &str) -> DiagnosticCode {
         TS1206
     } else if lower.contains("jsx closing tag does not match") {
         TS17002
+    } else if lower.contains("`catch` or `finally`") {
+        TS1472
+    } else if lower == "expected a string literal" {
+        TS1141
     } else if lower.contains("declaration or statement") {
         TS1128
     } else {
@@ -294,6 +346,30 @@ mod tests {
                 "TS1124",
             ),
             ("BAMTS-L007", 1, 4, "invalid unicode escape", "TS1125"),
+            ("BAMTS-L012", 4, 10, "unicode escape too large", "TS1198"),
+            (
+                "BAMTS-L013",
+                10,
+                11,
+                "unicode escape is not closed",
+                "TS1199",
+            ),
+            ("BAMTS-L014", 1, 5, "legacy octal escape", "TS1487"),
+            ("BAMTS-L015", 1, 3, "the escape is not allowed", "TS1488"),
+            (
+                "BAMTS-L016",
+                14,
+                14,
+                "a unicode escape reaches the end of the text",
+                "TS1126",
+            ),
+            (
+                "BAMTS-P020",
+                14,
+                15,
+                "a module name must be a string literal",
+                "TS1141",
+            ),
             ("BAMTS-L005", 0, 1, "unexpected character", "TS1127"),
             (
                 "BAMTS-P005",
@@ -347,7 +423,7 @@ mod tests {
                 "BAMTS-C051",
                 10,
                 16,
-                "export modifier cannot appear on a class element",
+                "`export` modifier cannot appear on class elements",
                 "TS1031",
             ),
             (
@@ -398,6 +474,48 @@ mod tests {
     }
 
     #[test]
+    fn a_mapped_message_takes_its_arguments_from_the_native_message() {
+        let cases = [
+            ("BAMTS-P001", "expected `;`", "';' expected."),
+            (
+                "BAMTS-P005",
+                "an unparenthesized unary expression with `typeof` cannot be the left operand of `**`",
+                "An unary expression with the 'typeof' operator is not allowed in the left-hand side of an exponentiation expression. Consider enclosing the expression in parentheses.",
+            ),
+            (
+                "BAMTS-P001",
+                "JSX closing tag does not match the opening tag `a.b`",
+                "Expected corresponding JSX closing tag for 'a.b'.",
+            ),
+            (
+                "BAMTS-P001",
+                "expected `}` to continue the template",
+                "'}' expected.",
+            ),
+            (
+                "BAMTS-P001",
+                "expected `{` to begin the method body",
+                "'{' expected.",
+            ),
+            (
+                "BAMTS-P001",
+                "expected a string literal",
+                "String literal expected.",
+            ),
+            ("BAMTS-P001", "expected `with`", "'with' expected."),
+            (
+                "BAMTS-L001",
+                "unterminated `string`",
+                "Unterminated string literal.",
+            ),
+        ];
+        for (code, message, expected) in cases {
+            let mapped = map_parse_diagnostic(&native(code, 0, 1, message));
+            assert_eq!(mapped.message(), expected, "{code}: {message}");
+        }
+    }
+
+    #[test]
     fn unmapped_codes_keep_identity() {
         let original = native("BAMTS-P010", 0, 1, "nesting too deep");
         let mapped = map_parse_diagnostic(&original);
@@ -413,7 +531,7 @@ mod tests {
             "BAMTS-C051",
             9,
             15,
-            "export modifier cannot appear on a class element",
+            "`export` modifier cannot appear on class elements",
         );
         let mapped = map_parse_diagnostics(&[checker.clone(), parser]);
         let preserved = mapped

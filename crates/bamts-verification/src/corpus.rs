@@ -24,7 +24,7 @@
 use std::{
     collections::BTreeSet,
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     io::{ErrorKind, Read},
     path::{Component, Path, PathBuf},
@@ -127,6 +127,8 @@ const MAX_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1 << 20;
 const READ_CHUNK: usize = 8192;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// How long output drains may run after the process group of a timed-out run ends.
+const DRAIN_GRACE: Duration = Duration::from_secs(1);
 const NODE_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const NODE_VERSION_OUTPUT_CAP: usize = 128;
 /// Wall-clock bound for the AOT compile lane. A case timeout bounds the
@@ -911,6 +913,7 @@ impl CorpusFailure {
             | driver::DriverError::LinkFailed { .. }
             | driver::DriverError::PublishExecutable { .. }
             | driver::DriverError::CrossTargetLink { .. } => CorpusStage::Link,
+            driver::DriverError::ProgramThread(_) => CorpusStage::Spawn,
         };
         Self {
             stage,
@@ -1748,6 +1751,7 @@ pub(crate) fn run_process(
     for (key, value) in environment {
         command.env(key, value);
     }
+    forward_host_runtime_env(&mut command);
     command
         .current_dir(cwd)
         .args(args)
@@ -1791,6 +1795,41 @@ pub(crate) fn run_process(
         thread::sleep(POLL_INTERVAL);
     };
 
+    // The drains end when nothing holds the pipes, and a child that this process left
+    // can hold them for as long as it runs. The timeout covers that wait too. A holder
+    // that survives keeps its thread blocked, and nothing waits for the thread.
+    let drained = |deadline: Instant| {
+        while !(stdout_handle.is_finished() && stderr_handle.is_finished()) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        true
+    };
+    if !drained(start + limits.timeout) {
+        if !timed_out {
+            timed_out = true;
+            let _ = terminate_process_group(&mut child, label);
+        }
+        if !drained(Instant::now() + DRAIN_GRACE) {
+            if let Some(error) = termination_error {
+                return Err(error);
+            }
+            return Ok(OracleOutcome {
+                timed_out,
+                exit_code: None,
+                signal: termination_signal(&status),
+                stdout: Vec::new(),
+                stdout_truncated: false,
+                stderr: Vec::new(),
+                stderr_truncated: false,
+                compile_stderr: Vec::new(),
+                compile_stderr_truncated: false,
+            });
+        }
+    }
+
     let (stdout, stdout_truncated) = stdout_handle
         .join()
         .map_err(|_| thread_error(label, "stdout"))?;
@@ -1803,7 +1842,9 @@ pub(crate) fn run_process(
 
     Ok(OracleOutcome {
         timed_out,
-        exit_code: status.code(),
+        // A child the harness killed has no exit code of its own: Unix reports
+        // the signal, and Windows would report the 1 that `TerminateProcess` sets.
+        exit_code: if timed_out { None } else { status.code() },
         signal: termination_signal(&status),
         stdout,
         stdout_truncated,
@@ -1879,15 +1920,33 @@ pub(crate) fn drain_stream<R: Read + Send + 'static>(
 }
 
 #[cfg(unix)]
-fn termination_signal(status: &ExitStatus) -> Option<i32> {
+pub(crate) fn termination_signal(status: &ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
     status.signal()
 }
 
 #[cfg(not(unix))]
-fn termination_signal(_status: &ExitStatus) -> Option<i32> {
+pub(crate) fn termination_signal(_status: &ExitStatus) -> Option<i32> {
     None
 }
+
+/// Windows resolves hosts, loads system libraries and seeds randomness through
+/// `SystemRoot`; a child started without it fails (`curl` cannot resolve any
+/// name). It also finds its temporary directory only through `TEMP` and `TMP`;
+/// without them `std::env::temp_dir()` is the system directory, which an
+/// unprivileged process cannot write. These variables are host plumbing and
+/// stay out of `NORMALIZED_ENV`, which evidence records byte for byte.
+#[cfg(windows)]
+pub(crate) fn forward_host_runtime_env(command: &mut Command) {
+    for key in ["SystemRoot", "windir", "TEMP", "TMP"] {
+        if let Some(value) = env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn forward_host_runtime_env(_command: &mut Command) {}
 
 fn locate_node() -> Result<PathBuf> {
     let path = env::var_os("PATH").ok_or_else(|| {
@@ -1896,19 +1955,17 @@ fn locate_node() -> Result<PathBuf> {
             "PATH is unset; cannot locate the Node oracle",
         )
     })?;
-    for dir in env::split_paths(&path) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let candidate = dir.join("node");
-        if is_executable_file(&candidate) {
-            return Ok(candidate);
-        }
-    }
-    Err(VerificationError::new(
-        ErrorCode::ToolMissing,
-        "cannot locate `node` on PATH",
-    ))
+    find_node_in(&path).ok_or_else(|| {
+        VerificationError::new(ErrorCode::ToolMissing, "cannot locate `node` on PATH")
+    })
+}
+
+fn find_node_in(search_path: &OsStr) -> Option<PathBuf> {
+    let file_name = if cfg!(windows) { "node.exe" } else { "node" };
+    env::split_paths(search_path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(file_name))
+        .find(|candidate| is_executable_file(candidate))
 }
 
 #[cfg(unix)]
@@ -2141,7 +2198,11 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn spawn_error(label: &str, program: &Path, error: &std::io::Error) -> VerificationError {
+pub(crate) fn spawn_error(
+    label: &str,
+    program: &Path,
+    error: &std::io::Error,
+) -> VerificationError {
     let code = if error.kind() == ErrorKind::NotFound {
         ErrorCode::ToolMissing
     } else {
@@ -2153,18 +2214,18 @@ fn spawn_error(label: &str, program: &Path, error: &std::io::Error) -> Verificat
     )
 }
 
-fn pipe_error(label: &str, stream: &str) -> VerificationError {
+pub(crate) fn pipe_error(label: &str, stream: &str) -> VerificationError {
     VerificationError::new(
         ErrorCode::Io,
         format!("{label} {stream} pipe was not captured"),
     )
 }
 
-fn wait_error(label: &str, error: std::io::Error) -> VerificationError {
+pub(crate) fn wait_error(label: &str, error: std::io::Error) -> VerificationError {
     VerificationError::new(ErrorCode::Io, format!("cannot wait on {label}: {error}"))
 }
 
-fn thread_error(label: &str, stream: &str) -> VerificationError {
+pub(crate) fn thread_error(label: &str, stream: &str) -> VerificationError {
     VerificationError::new(
         ErrorCode::ToolFailed,
         format!("{label} {stream} reader thread panicked"),
@@ -2244,6 +2305,34 @@ mod tests {
             &limits,
         )
         .expect("oracle run")
+    }
+
+    #[test]
+    fn node_is_found_by_the_file_name_the_platform_gives_it() {
+        let decoys = scratch("node-decoys");
+        let installed = scratch("node-installed");
+        let (native, foreign) = if cfg!(windows) {
+            ("node.exe", "node")
+        } else {
+            ("node", "node.exe")
+        };
+        fs::write(decoys.join(foreign), b"").expect("write foreign-named file");
+        let binary = installed.join(native);
+        fs::write(&binary, b"").expect("write stand-in binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+                .expect("mark stand-in executable");
+        }
+
+        let search = env::join_paths([&decoys, &installed]).expect("join search path");
+        assert_eq!(find_node_in(&search), Some(binary));
+        let search = env::join_paths([&decoys]).expect("join search path");
+        assert_eq!(find_node_in(&search), None);
+
+        fs::remove_dir_all(decoys).expect("remove decoys");
+        fs::remove_dir_all(installed).expect("remove installed");
     }
 
     // ---- execution modes --------------------------------------------------
@@ -2872,6 +2961,27 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn windows_children_keep_the_host_system_root() {
+        let dir = scratch("system-root");
+        let outcome = run_process(
+            "SystemRoot probe",
+            Path::new("cmd.exe"),
+            &dir,
+            &[],
+            &["/D", "/C", "echo %SystemRoot%"].map(OsString::from),
+            &OracleLimits {
+                timeout: Duration::from_secs(10),
+                max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            },
+        )
+        .expect("run cmd.exe");
+        let expected = env::var("SystemRoot").expect("host SystemRoot");
+        assert_eq!(String::from_utf8_lossy(&outcome.stdout).trim(), expected);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn oracle_bounds_output_without_deadlock() {
         let dir = scratch("bound");
         let outcome = run_script(
@@ -2886,6 +2996,26 @@ mod tests {
         assert_eq!(outcome.exit_code, Some(0));
         assert_eq!(outcome.stdout.len(), 1000);
         assert!(outcome.stdout_truncated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A detached child leaves the process group, so nothing here can end it, and it
+    /// inherits both pipes after the process that started it exits.
+    #[test]
+    fn oracle_does_not_wait_for_a_child_that_holds_the_pipes() {
+        let dir = scratch("holder");
+        let started = Instant::now();
+        let outcome = run_script(
+            &dir,
+            "process.getBuiltinModule('node:child_process').spawn(process.execPath, \
+             ['-e', 'setTimeout(() => {}, 30000)'], { detached: true, stdio: 'inherit' }).unref();",
+            OracleLimits {
+                timeout: Duration::from_secs(3),
+                max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            },
+        );
+        assert!(outcome.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(20));
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -15,11 +15,15 @@ use bamts_cancel::{CancellationToken, Cancelled};
 use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
 use bamts_compiler::lint::{LintProfile, LintTable};
 use bamts_compiler::lower::LowerOptions;
+use bamts_compiler::parser::parse;
 use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend_with_cancel};
 use bamts_compiler::program::{
     ProgramLoadError, ProgramLoader, ProgramLowerError, ResolvedProgram, lower_program_with_cancel,
 };
+use bamts_compiler::project::canonical::canonicalize;
 use bamts_compiler::project::{ConfigError, ProjectConfig, ProjectRoot};
+use bamts_compiler::scanner::scan;
+use bamts_compiler::source::ScriptKind;
 
 pub use bamts_bytecode as bytecode;
 pub use bamts_compiler as compiler;
@@ -186,7 +190,37 @@ pub fn compile_source_file_with_cancel(
     path: impl AsRef<Path>,
     cancel: &CancellationToken,
 ) -> Result<bamts_compiler::program::ExecutableProgram> {
-    let path = canonical_entrypoint_with_cancel(path.as_ref(), cancel)?;
+    compile_source_file_with_lints(path, &LintTable::new(LintProfile::Default), cancel)
+}
+
+/// Compiles an entrypoint and its complete local module graph under `lints`.
+pub fn compile_source_file_with_lints(
+    path: impl AsRef<Path>,
+    lints: &LintTable,
+    cancel: &CancellationToken,
+) -> Result<bamts_compiler::program::ExecutableProgram> {
+    compile_entry(path.as_ref(), lints, false, cancel)
+}
+
+/// Compiles an entrypoint the host runs as an ECMAScript Script. Its top-level
+/// `var` and function names live on the global object, and module syntax in it
+/// is an error. A file cannot say this of itself, which is why it is a separate
+/// entry: Node runs the same bytes as a CommonJS module.
+pub fn compile_script_file(
+    path: impl AsRef<Path>,
+    lints: &LintTable,
+    cancel: &CancellationToken,
+) -> Result<bamts_compiler::program::ExecutableProgram> {
+    compile_entry(path.as_ref(), lints, true, cancel)
+}
+
+fn compile_entry(
+    path: &Path,
+    lints: &LintTable,
+    script_entry: bool,
+    cancel: &CancellationToken,
+) -> Result<bamts_compiler::program::ExecutableProgram> {
+    let path = canonical_entrypoint_with_cancel(path, cancel)?;
     let fallback_root = path.parent().map(Path::to_path_buf).ok_or_else(|| {
         Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -197,7 +231,7 @@ pub fn compile_source_file_with_cancel(
     let frontend = compile_program_frontend_with_cancel(
         &resolved.program,
         FrontendMode::Check,
-        &LintTable::new(LintProfile::Default),
+        lints,
         cancel,
     )?;
     let diagnostics = frontend
@@ -210,15 +244,51 @@ pub fn compile_source_file_with_cancel(
     if !diagnostics.is_empty() {
         return Err(Error::Diagnostics { diagnostics });
     }
+    let diagnostics = early_errors(&resolved.program, script_entry);
+    if !diagnostics.is_empty() {
+        return Err(Error::Diagnostics { diagnostics });
+    }
     lower_program_with_cancel(
         &resolved.program,
         &frontend,
         LowerOptions {
             javascript_compatibility: true,
+            script_entry,
         },
         cancel,
     )
     .map_err(Error::from)
+}
+
+/// The early errors of every JavaScript module about to run. TypeScript sources
+/// answer to the checker instead. Node refuses to load a module that has one, so
+/// a caller that runs or compiles `program` stops on any of them. `script_entry`
+/// says that the host runs the entrypoint as a Script.
+pub fn early_errors(program: &ResolvedProgram, script_entry: bool) -> Vec<Diagnostic> {
+    let entrypoint = program.entrypoint().source_id();
+    program
+        .modules()
+        .iter()
+        .filter(|module| {
+            matches!(
+                module.script_kind(),
+                ScriptKind::JavaScript | ScriptKind::JavaScriptReact
+            )
+        })
+        .flat_map(|module| {
+            let scanned = scan(
+                module.source_id(),
+                module.script_kind(),
+                module.source().clone(),
+            );
+            let parsed = parse(scanned);
+            if script_entry && module.source_id() == entrypoint {
+                bamts_compiler::early_errors::check_script(parsed.product())
+            } else {
+                bamts_compiler::early_errors::check(parsed.product())
+            }
+        })
+        .collect()
 }
 
 /// Runs an entrypoint and its complete local module graph with the deterministic
@@ -303,7 +373,7 @@ pub fn canonical_entrypoint_with_cancel(
             .map_err(|error| Error::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?
     };
     cancel.check()?;
-    let canonical = fs::canonicalize(&absolute).map_err(|source| {
+    let canonical = canonicalize(&absolute).map_err(|source| {
         Error::ProgramLoad(ProgramLoadError::Read {
             path: absolute,
             source,
@@ -409,7 +479,7 @@ pub fn resolve_project_with_cancel(
 ) -> Result<ResolvedProject> {
     let project = discover_project_with_cancel(entrypoint, fallback_root, cancel)?;
     cancel.check()?;
-    let canonical_root = fs::canonicalize(project.root())
+    let canonical_root = canonicalize(project.root())
         .map_err(|error| Error::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
     cancel.check()?;
     let root = ProjectRoot::new(canonical_root).map_err(|error| {
@@ -445,9 +515,9 @@ pub fn resolve_project_with_cancel(
 
 #[cfg(test)]
 mod tests {
-    use super::compile_source_file;
     #[cfg(feature = "node-host")]
     use super::run_program;
+    use super::{canonicalize, compile_source_file};
     use std::error::Error;
     use std::path::{Path, PathBuf};
 
@@ -529,7 +599,7 @@ mod tests {
         std::fs::remove_file(directory.join("sub/tsconfig.json"))?;
         let error =
             compile_source_file(&entrypoint).expect_err("the root tsconfig.json must be parsed");
-        let expected = std::fs::canonicalize(directory.join("tsconfig.json"))?;
+        let expected = canonicalize(directory.join("tsconfig.json"))?;
         assert!(matches!(
             error,
             super::Error::ProjectConfig { ref path, .. } if *path == expected
@@ -607,6 +677,110 @@ mod tests {
             before_timer,
             after_timer,
         })
+    }
+
+    /// The calls that end the guest stack: a recursion, a recursion through a
+    /// builtin callback, a construction, a construction through a builtin, a
+    /// generator delegation, a proxy chain, chains of generators and of async
+    /// generators that resume the next one, and builtins that call builtins with
+    /// no guest call between them. Each throws `RangeError`, and the program goes on.
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    const STACK_OVERFLOWS: &str = "// @ts-nocheck\n\
+         function down(n) { return down(n + 1) + 1; }\n\
+         try { down(0); } catch (error) { console.log(error instanceof RangeError, error.message); }\n\
+         const callback = () => [0].map(callback);\n\
+         try { callback(); } catch (error) { console.log(error.name); }\n\
+         class Deep { constructor(n) { new Deep(n + 1); } }\n\
+         try { new Deep(0); } catch (error) { console.log(error.name); }\n\
+         class Reflected { constructor(n) { Reflect.construct(Reflected, [n + 1]); } }\n\
+         try { new Reflected(0); } catch (error) { console.log(error.name); }\n\
+         function* nest() { yield* nest(); }\n\
+         try { [...nest()]; } catch (error) { console.log(error.name); }\n\
+         let proxy = {};\n\
+         for (let i = 0; i < 2000; i++) proxy = new Proxy(proxy, {});\n\
+         try { proxy.x; } catch (error) { console.log(error.name); }\n\
+         const chain = [];\n\
+         function* link(i) { chain[i + 1].next(); }\n\
+         for (let i = 0; i < 2000; i++) chain.push(link(i));\n\
+         try { chain[0].next(); } catch (error) { console.log(error.name); }\n\
+         const tasks = [];\n\
+         async function* task(i) { await tasks[i + 1].next(); }\n\
+         for (let i = 0; i < 2000; i++) tasks.push(task(i));\n\
+         tasks[0].next().then(() => console.log('done'), (error) => console.log(error.name));\n\
+         let nested = [];\n\
+         for (let i = 0; i < 200000; i++) nested = [nested];\n\
+         try { String(nested); } catch (error) { console.log(error.name); }\n\
+         function count(n) { return n === 0 ? 0 : 1 + count(n - 1); }\n\
+         console.log(count(500));\n";
+
+    /// What [`STACK_OVERFLOWS`] prints with [`small_guest_stack`]. Each chain of
+    /// 2,000 passes the guest stack of 1,000.
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    const STACK_OVERFLOW_OUTPUT: &str = "true Maximum call stack size exceeded\nRangeError\nRangeError\n\
+         RangeError\nRangeError\nRangeError\nRangeError\nRangeError\n500\nRangeError\n";
+
+    /// A guest stack of 1,000 activations, which 32 MiB of native stack holds in a
+    /// debug build.
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    fn small_guest_stack() -> bamts_runtime::Limits {
+        bamts_runtime::Limits {
+            fuel: u64::MAX,
+            max_call_depth: 1 << 20,
+            max_stack_depth: 1_000,
+            max_stack_bytes: 32 << 20,
+            ..bamts_runtime::Limits::default()
+        }
+    }
+
+    /// Runs `body` on a thread whose stack holds [`small_guest_stack`] and its slack.
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    fn on_a_large_stack<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(body)
+            .expect("the test thread starts")
+            .join()
+            .expect("the test thread ends")
+    }
+
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    #[test]
+    fn the_interpreter_throws_range_error_at_the_end_of_the_guest_stack() {
+        let stdout = on_a_large_stack(|| {
+            let (directory, entrypoint) =
+                script_fixture("interpreter-stack", STACK_OVERFLOWS).expect("the fixture");
+            let executable = compile_source_file(&entrypoint).expect("the fixture compiles");
+            let mut host = bamts_node::NodeHost::new();
+            bamts_runtime::run(executable.wire(), &mut host, &small_guest_stack())
+                .expect("the program runs");
+            remove_fixture(&directory).expect("the fixture is removed");
+            host.stdout().to_vec()
+        });
+        assert_eq!(String::from_utf8_lossy(&stdout), STACK_OVERFLOW_OUTPUT);
+    }
+
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    #[test]
+    fn native_code_throws_range_error_at_the_end_of_the_guest_stack() {
+        let stdout = on_a_large_stack(|| {
+            let (directory, entrypoint) =
+                script_fixture("native-stack", STACK_OVERFLOWS).expect("the fixture");
+            let executable = compile_source_file(&entrypoint).expect("the fixture compiles");
+            let compiled = bamts_codegen::compile_jit(executable.wire()).expect("the JIT compiles");
+            let mut host = bamts_node::NodeHost::new();
+            let outcome = bamts_runtime::run_linked_program(
+                executable.wire(),
+                &compiled,
+                &mut host,
+                &small_guest_stack(),
+            )
+            .expect("the program runs");
+            remove_fixture(&directory).expect("the fixture is removed");
+            let mut stdout = host.stdout().to_vec();
+            stdout.extend_from_slice(&outcome.stdout);
+            stdout
+        });
+        assert_eq!(String::from_utf8_lossy(&stdout), STACK_OVERFLOW_OUTPUT);
     }
 
     #[test]

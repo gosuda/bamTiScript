@@ -85,6 +85,8 @@ pub(crate) fn install<H: Host>(
             crate::intrinsics::builtins::define_frozen_data(heap, global_this, "Infinity", *value);
         } else if name.eq_ascii("NaN") {
             crate::intrinsics::builtins::define_frozen_data(heap, global_this, "NaN", *value);
+        } else if name.eq_ascii("undefined") {
+            crate::intrinsics::builtins::define_frozen_data(heap, global_this, "undefined", *value);
         } else {
             define_global_data(heap, global_this, name.clone(), *value);
         }
@@ -411,6 +413,8 @@ impl<H: Host> Machine<'_, H> {
                     HeapEntry::Object { properties, .. }
                     | HeapEntry::Script { properties, .. }
                     | HeapEntry::Date { properties, .. }
+                    | HeapEntry::Temporal { properties, .. }
+                    | HeapEntry::Intl { properties, .. }
                     | HeapEntry::BuiltinIterator { properties, .. }
                     | HeapEntry::Collection { properties, .. }
                     | HeapEntry::Generator { properties, .. }

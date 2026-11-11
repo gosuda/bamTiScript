@@ -2,6 +2,7 @@ pub mod binder;
 pub mod checker;
 pub mod diagnostic;
 pub mod diagnostics_parser;
+pub mod early_errors;
 pub mod emitter;
 pub mod enum_plan;
 pub(crate) mod jsx_desugar;

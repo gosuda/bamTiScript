@@ -368,11 +368,8 @@ impl<'a, H: Host> Machine<'a, H> {
     /// Clears dead weak handles and extracts holdings after the collector's
     /// ephemeron fixed point. This queues candidates, not jobs: the host chooses
     /// when (or whether) to call `schedule_finalization_cleanup_jobs`.
-    pub(crate) fn process_weak_targets_after_marking(&mut self, marks: &[bool]) {
-        for index in 0..self.heap.len() {
-            if !marks.get(index).copied().unwrap_or(false) {
-                continue;
-            }
+    pub(crate) fn process_weak_targets_after_marking(&mut self, marks: &[bool], holders: &[usize]) {
+        for &index in holders {
             let mut released = 0usize;
             let mut queue_registry = false;
             match &mut self.heap[index] {

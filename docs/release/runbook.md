@@ -155,7 +155,7 @@ EVIDENCE: receipt=<repo-relative-path> sha256=<64-hex-digest>
 
 ### Global completeness ledger
 
-`proof/completeness-ledger.json` (schema `bamti.completeness-ledger/v1`) is generated from the canonical receipt set. Do not hand-edit it.
+`proof/completeness-ledger.json` (schema `bamti.completeness-ledger/v2`) is generated from the canonical receipt set. Do not hand-edit it.
 
 ```bash
 cargo run -p bamts-verification -- ledger rebuild --write

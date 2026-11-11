@@ -2,21 +2,51 @@ use std::collections::BTreeMap;
 
 use super::property_descriptor::{
     PropertyDescriptor as CanonicalPropertyDescriptor, collect_property_descriptors,
-    is_extensible as descriptor_is_extensible, to_property_descriptor,
-    validate_and_apply_property_descriptor,
+    to_property_descriptor,
 };
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
 use super::{
-    allocate_string, define_data, install_constructor_function, install_function, range_error,
-    to_integer_or_infinity, type_error, value_number,
+    allocate_string, define_data, define_symbol_property, heap_index, install_constructor_function,
+    install_function, to_integer_or_infinity, type_error, value_number,
 };
-use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
+use crate::intrinsics::{
+    BuiltinDef, BuiltinHandler, BuiltinOutcome, BuiltinTable, native_function_properties,
+};
 use crate::{
     BoundCallable, EvalFailure, HeapEntry, Host, Machine, NativeCallable, Property, PropertyKey,
     PropertyMap, RuntimeErrorKind,
 };
+
+/// `%Function.prototype%` is itself a function, so this replaces the ordinary
+/// object that had to exist before the builtin table could. Its prototype is
+/// stated explicitly: a native function without one falls back to this object.
+pub(super) fn install_function_prototype<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    builtins: &mut BuiltinTable<H>,
+) {
+    let id = builtins.register(BuiltinDef {
+        name: "",
+        length: 0,
+        handler: function_prototype_call::<H>,
+    });
+    let properties = native_function_properties(heap, "", 0);
+    heap[heap_index(builtins.function_prototype())] = HeapEntry::native_function(
+        NativeCallable::Builtin(id),
+        properties,
+        Some(builtins.object_prototype()),
+    );
+}
+
+fn function_prototype_call<H: Host>(
+    _machine: &mut Machine<'_, H>,
+    _this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -32,6 +62,7 @@ pub(super) fn install<H: Host>(
 
     for (name, length, handler) in [
         ("toString", 0, prototype_to_string::<H> as BuiltinHandler<H>),
+        ("toLocaleString", 0, prototype_to_locale_string::<H>),
         ("hasOwnProperty", 1, has_own_property::<H>),
         ("isPrototypeOf", 1, is_prototype_of::<H>),
         ("valueOf", 0, value_of::<H>),
@@ -47,10 +78,197 @@ pub(super) fn install<H: Host>(
         ("call", 1, function_call::<H> as BuiltinHandler<H>),
         ("apply", 2, function_apply::<H>),
         ("bind", 1, function_bind::<H>),
+        ("toString", 0, function_to_string::<H>),
     ] {
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, builtins.function_prototype(), name, function);
     }
+    install_restricted_function_properties(heap, builtins);
+    let reified = crate::intrinsics::push(
+        heap,
+        HeapEntry::PrivateName {
+            description: EcmaString::encode("[[FunctionPropertiesStored]]"),
+        },
+    );
+    builtins.set_function_reified_brand(reified);
+    let has_instance = install_function(
+        heap,
+        builtins,
+        "[Symbol.hasInstance]",
+        1,
+        function_has_instance::<H>,
+    );
+    define_symbol_property(
+        heap,
+        builtins.function_prototype(),
+        builtins.symbol_has_instance(),
+        Property::Data {
+            value: has_instance,
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        },
+    );
+}
+
+/// `AddRestrictedFunctionProperties` for %Function.prototype%, around a frozen
+/// %ThrowTypeError%.
+fn install_restricted_function_properties<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    builtins: &mut BuiltinTable<H>,
+) {
+    let thrower = install_function(heap, builtins, "", 0, throw_type_error::<H>);
+    builtins.set_throw_type_error(thrower);
+    let HeapEntry::NativeFunction {
+        properties,
+        extensible,
+        ..
+    } = &mut heap[heap_index(thrower)]
+    else {
+        panic!("%ThrowTypeError% must be native");
+    };
+    *extensible = false;
+    for (_, property) in &mut properties.0 {
+        if let Property::Data { configurable, .. } = property {
+            *configurable = false;
+        }
+    }
+    let HeapEntry::NativeFunction { properties, .. } =
+        &mut heap[heap_index(builtins.function_prototype())]
+    else {
+        panic!("%Function.prototype% must be native");
+    };
+    for name in ["caller", "arguments"] {
+        properties.insert(
+            PropertyKey::Named(EcmaString::encode(name)),
+            Property::Accessor {
+                getter: Some(thrower),
+                setter: Some(thrower),
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+}
+
+/// %ThrowTypeError%. A non-strict `function` has no call-stack introspection here,
+/// so it reads `caller` and `arguments` as undefined instead of throwing.
+fn throw_type_error<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if machine.is_sloppy_ordinary_function(this)? {
+        return Ok(BuiltinOutcome::Value(Value::UNDEFINED));
+    }
+    Err(type_error(
+        "caller and arguments are restricted function properties",
+    ))
+}
+
+/// Whether `text` can follow `function` in the `NativeFunction` syntax:
+/// an identifier or a computed symbol name, optionally after `get` or `set`.
+/// Engine-internal labels such as `Promise resolve target` are neither.
+fn is_native_function_name(text: &str) -> bool {
+    fn is_identifier(text: &str) -> bool {
+        let mut characters = text.chars();
+        characters
+            .next()
+            .is_some_and(|first| first.is_alphabetic() || matches!(first, '$' | '_'))
+            && characters.all(|next| next.is_alphanumeric() || matches!(next, '$' | '_'))
+    }
+    let property = text
+        .strip_prefix("get ")
+        .or_else(|| text.strip_prefix("set "))
+        .unwrap_or(text);
+    match property
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        Some(computed) => computed.split('.').all(is_identifier),
+        None => is_identifier(property),
+    }
+}
+
+/// The name a function was created with. This reads metadata rather than the
+/// `name` property, which user code can redefine as an accessor.
+fn function_metadata_name<H: Host>(
+    machine: &Machine<'_, H>,
+    function: Value,
+) -> Result<Option<String>, EvalFailure> {
+    let Some(index) = machine
+        .runtime_slot(function)
+        .map_err(EvalFailure::Runtime)?
+    else {
+        return Ok(None);
+    };
+    Ok(match &machine.heap[index] {
+        HeapEntry::NativeFunction {
+            callable: NativeCallable::Builtin(id),
+            ..
+        } => Some(machine.intrinsics.builtins.get(*id).name.to_owned()),
+        HeapEntry::Function {
+            module, function, ..
+        } => machine.module_code(*module).functions()[function.get() as usize]
+            .name()
+            .map(|id| machine.constant_text(*module, id).to_utf8_lossy()),
+        _ => None,
+    })
+}
+
+/// `Function.prototype.toString`. Every callable answers in the
+/// `NativeFunction` form: bytecode does not retain source text, so a user
+/// function's exact source is not available here.
+fn function_to_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_callable(this)? {
+        return Err(type_error(
+            "Function.prototype.toString requires a callable receiver",
+        ));
+    }
+    let name = function_metadata_name(machine, this)?
+        .filter(|name| is_native_function_name(name))
+        .unwrap_or_default();
+    let source = EcmaString::encode(&format!("function {name}() {{ [native code] }}"));
+    Ok(BuiltinOutcome::Value(allocate_string(machine, source)?))
+}
+
+/// `Object.prototype.toLocaleString`: `Invoke(this, "toString")`, with the
+/// receiver passed through unboxed so a primitive `this` stays primitive.
+fn prototype_to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if matches!(this.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+        return Err(type_error(
+            "Object.prototype.toLocaleString called on null or undefined",
+        ));
+    }
+    let method = machine.get_named_property(this, "toString")?;
+    Ok(BuiltinOutcome::Value(machine.call_value(
+        method,
+        this,
+        &[],
+    )?))
+}
+
+fn function_has_instance<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let value = args.first().copied().unwrap_or(Value::UNDEFINED);
+    Ok(BuiltinOutcome::Value(Value::boolean(
+        machine.ordinary_has_instance(value, this)?,
+    )))
 }
 
 fn constructor<H: Host>(
@@ -134,76 +352,17 @@ pub(super) fn create<H: Host>(
     Ok(BuiltinOutcome::Value(object))
 }
 
-fn define_array_length_descriptor<H: Host>(
-    machine: &mut Machine<'_, H>,
-    object: Value,
-    key: &PropertyKey,
-    descriptor: CanonicalPropertyDescriptor,
-) -> Result<bool, EvalFailure> {
-    let Some(index) = machine.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
-        return Ok(false);
-    };
-    if !matches!(key, PropertyKey::Named(name) if name.eq_ascii("length"))
-        || !matches!(machine.heap[index], HeapEntry::Array { .. })
-    {
-        return Ok(false);
-    }
-    if descriptor.is_accessor() {
-        return Err(type_error("Invalid property descriptor"));
-    }
-    if descriptor.enumerable == Some(true) || descriptor.configurable == Some(true) {
-        return Err(type_error("Cannot redefine array length"));
-    }
-    let length = descriptor
-        .value
-        .map(|value| {
-            crate::exact_array_length(value).ok_or_else(|| range_error("define array length"))
-        })
-        .transpose()?;
-    let HeapEntry::Array {
-        elements,
-        properties,
-        length_writable,
-        ..
-    } = &mut machine.heap[index]
-    else {
-        unreachable!("array checked above");
-    };
-    if descriptor.writable == Some(true) && !*length_writable {
-        return Err(type_error("Cannot make array length writable"));
-    }
-    let result = match length {
-        Some(length) => super::define_array_length(elements, properties, *length_writable, length),
-        None => Ok(()),
-    };
-    if descriptor.writable == Some(false) {
-        *length_writable = false;
-    }
-    result?;
-    Ok(true)
-}
-
 pub(super) fn apply_property_descriptor<H: Host>(
     machine: &mut Machine<'_, H>,
     target: Value,
     key: PropertyKey,
     descriptor: CanonicalPropertyDescriptor,
 ) -> Result<(), EvalFailure> {
-    if define_array_length_descriptor(machine, target, &key, descriptor)? {
-        return Ok(());
+    if machine.internal_define_own_property(target, key, descriptor)? {
+        Ok(())
+    } else {
+        Err(type_error("Cannot redefine property"))
     }
-    let current = machine.own_descriptor(target, &key)?;
-    let extensible = descriptor_is_extensible(machine, target)?;
-    if !validate_and_apply_property_descriptor(
-        machine,
-        Some((target, key)),
-        extensible,
-        descriptor,
-        current,
-    )? {
-        return Err(type_error("Cannot redefine property"));
-    }
-    Ok(())
 }
 
 pub(super) fn define_property<H: Host>(
@@ -265,7 +424,8 @@ fn prototype_to_string<H: Host>(
         Some(Decoded::Undefined) => EcmaString::encode("Undefined"),
         Some(Decoded::Null) => EcmaString::encode("Null"),
         _ => {
-            let fallback = machine.object_to_string_tag(this)?;
+            let object = machine.value_to_object(this)?;
+            let fallback = machine.object_to_string_tag(object)?;
             let symbol = machine.intrinsics.builtins.symbol_to_string_tag();
             let key = PropertyKey::Symbol(
                 machine
@@ -273,7 +433,7 @@ fn prototype_to_string<H: Host>(
                     .map_err(EvalFailure::Runtime)?
                     .expect("well-known symbol belongs to the runtime heap") as u32,
             );
-            let tag_value = machine.get_property_key(this, &key)?;
+            let tag_value = machine.get_property_key(object, &key)?;
             machine
                 .string_value(tag_value)
                 .unwrap_or_else(|| EcmaString::encode(fallback))
@@ -298,10 +458,10 @@ fn has_own_property<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let key = machine.to_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    Ok(BuiltinOutcome::Value(Value::boolean(
-        machine.has_own_property_key(this, &key)?,
-    )))
+    let key = machine.observable_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let object = machine.value_to_object(this)?;
+    let own = machine.internal_get_own_property(object, &key)?.is_some();
+    Ok(BuiltinOutcome::Value(Value::boolean(own)))
 }
 
 fn is_prototype_of<H: Host>(
@@ -311,8 +471,12 @@ fn is_prototype_of<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let mut value = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if !machine.is_object(value) {
+        return Ok(BuiltinOutcome::Value(Value::FALSE));
+    }
+    let object = machine.value_to_object(this)?;
     while let Some(prototype) = machine.internal_get_prototype_of(value)? {
-        if prototype == this {
+        if prototype == object {
             return Ok(BuiltinOutcome::Value(Value::TRUE));
         }
         value = prototype;
@@ -321,12 +485,12 @@ fn is_prototype_of<H: Host>(
 }
 
 fn value_of<H: Host>(
-    _machine: &mut Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     this: Value,
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    Ok(BuiltinOutcome::Value(this))
+    machine.value_to_object(this).map(BuiltinOutcome::Value)
 }
 
 fn property_is_enumerable<H: Host>(
@@ -335,10 +499,11 @@ fn property_is_enumerable<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let key = machine.to_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let key = machine.observable_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let object = machine.value_to_object(this)?;
     let enumerable = machine
-        .own_descriptor(this, &key)?
-        .is_some_and(|property| property.enumerable());
+        .internal_get_own_property(object, &key)?
+        .is_some_and(|descriptor| descriptor.enumerable == Some(true));
     Ok(BuiltinOutcome::Value(Value::boolean(enumerable)))
 }
 
@@ -506,6 +671,508 @@ mod tests {
     use super::*;
     use crate::{Limits, RuntimeErrorKind, ThrowOrigin};
     use bamts_bytecode::{FunctionId, ModuleId};
+
+    fn named(name: &str) -> PropertyKey {
+        PropertyKey::Named(EcmaString::encode(name))
+    }
+
+    fn pinned_element(value: Value) -> Property {
+        Property::Data {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: false,
+        }
+    }
+
+    #[test]
+    fn a_blocked_array_truncation_stops_at_the_element_and_reports_failure() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let values = vec![Value::int32(1), Value::int32(2), Value::int32(3)];
+        let array = allocate_array(&mut machine, values).unwrap();
+        machine
+            .define_descriptor(array, named("1"), pinned_element(Value::int32(2)))
+            .unwrap();
+        let zero = CanonicalPropertyDescriptor {
+            value: Some(Value::int32(0)),
+            ..Default::default()
+        };
+        assert!(
+            !machine
+                .internal_define_own_property(array, named("length"), zero)
+                .unwrap()
+        );
+        assert_eq!(machine.array_length(array).unwrap(), 2);
+        assert!(
+            !machine
+                .internal_set(array, named("length"), Value::int32(0), array)
+                .unwrap()
+        );
+        assert_eq!(machine.array_length(array).unwrap(), 2);
+    }
+
+    #[test]
+    fn an_invalid_array_length_is_a_range_error_before_the_descriptor_is_judged() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = allocate_array(&mut machine, Vec::new()).unwrap();
+        let negative = CanonicalPropertyDescriptor {
+            value: Some(crate::number_value(-1.0)),
+            configurable: Some(true),
+            ..Default::default()
+        };
+        assert!(matches!(
+            machine.internal_define_own_property(array, named("length"), negative),
+            Err(EvalFailure::Throw(ThrowOrigin::RangeError { .. }))
+        ));
+    }
+
+    #[test]
+    fn defining_through_a_proxy_without_a_trap_reaches_the_target() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = ordinary_object(&mut machine);
+        let handler = ordinary_object(&mut machine);
+        let proxy_constructor = machine.intrinsics.global("Proxy").unwrap();
+        let proxy = machine
+            .construct_value(proxy_constructor, &[target, handler])
+            .unwrap();
+        let descriptor = CanonicalPropertyDescriptor {
+            value: Some(Value::int32(7)),
+            ..Default::default()
+        };
+        apply_property_descriptor(&mut machine, proxy, named("x"), descriptor).unwrap();
+        assert!(matches!(
+            machine.own_descriptor(target, &named("x")).unwrap(),
+            Some(Property::Data { value, .. }) if value == Value::int32(7)
+        ));
+    }
+
+    #[test]
+    fn writing_an_element_with_a_descriptor_keeps_its_attributes() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = allocate_array(&mut machine, vec![Value::int32(1)]).unwrap();
+        machine
+            .define_descriptor(array, named("0"), pinned_element(Value::int32(1)))
+            .unwrap();
+        machine
+            .set_data_property(array, "0", Value::int32(9))
+            .unwrap();
+        assert!(matches!(
+            machine.own_descriptor(array, &named("0")).unwrap(),
+            Some(Property::Data {
+                value,
+                configurable: false,
+                ..
+            }) if value == Value::int32(9)
+        ));
+    }
+
+    #[test]
+    fn array_own_keys_put_length_after_indices_and_before_other_names() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = allocate_array(&mut machine, vec![Value::int32(1)]).unwrap();
+        machine
+            .set_data_property(array, "tag", Value::TRUE)
+            .unwrap();
+        assert_eq!(
+            machine.internal_own_property_keys(array).unwrap(),
+            [named("0"), named("length"), named("tag")]
+        );
+        assert!(machine.enumerable_keys(array).unwrap().len() == 2);
+    }
+
+    #[test]
+    fn string_wrappers_own_read_only_length_and_code_units() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let text = allocate_string(&mut machine, EcmaString::encode("ab")).unwrap();
+        let wrapper = machine.value_to_object(text).unwrap();
+        for (name, expected_enumerable) in [("0", true), ("1", true), ("length", false)] {
+            assert!(matches!(
+                machine.own_descriptor(wrapper, &named(name)).unwrap(),
+                Some(Property::Data {
+                    writable: false,
+                    enumerable,
+                    configurable: false,
+                    ..
+                }) if enumerable == expected_enumerable
+            ));
+            assert!(!machine.internal_delete(wrapper, &named(name)).unwrap());
+            assert!(
+                !machine
+                    .internal_set(wrapper, named(name), Value::int32(0), wrapper)
+                    .unwrap()
+            );
+        }
+        assert!(
+            machine
+                .own_descriptor(wrapper, &named("2"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            machine
+                .internal_set(wrapper, named("2"), Value::int32(0), wrapper)
+                .unwrap()
+        );
+        assert_eq!(machine.enumerable_keys(wrapper).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn freezing_a_string_wrapper_keeps_its_exotic_properties() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let text = allocate_string(&mut machine, EcmaString::encode("ab")).unwrap();
+        let wrapper = machine.value_to_object(text).unwrap();
+        call_object(&mut machine, "freeze", &[wrapper]).unwrap();
+        let frozen = call_object(&mut machine, "isFrozen", &[wrapper]).unwrap();
+        assert_eq!(frozen, Value::TRUE);
+    }
+
+    #[test]
+    fn object_prototype_methods_convert_their_receiver_after_the_key() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.object_prototype;
+        for name in ["hasOwnProperty", "propertyIsEnumerable"] {
+            let method = machine.get_named_property(prototype, name).unwrap();
+            assert!(matches!(
+                machine.call_value(method, Value::UNDEFINED, &[Value::int32(0)]),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        }
+        let value_of = machine.get_named_property(prototype, "valueOf").unwrap();
+        assert!(machine.call_value(value_of, Value::NULL, &[]).is_err());
+        let boxed = machine.call_value(value_of, Value::TRUE, &[]).unwrap();
+        assert!(machine.is_object(boxed));
+        let is_prototype_of = machine
+            .get_named_property(prototype, "isPrototypeOf")
+            .unwrap();
+        assert_eq!(
+            machine
+                .call_value(is_prototype_of, Value::UNDEFINED, &[Value::int32(1)])
+                .unwrap(),
+            Value::FALSE,
+            "a primitive argument answers before the receiver is converted"
+        );
+    }
+
+    #[test]
+    fn object_prototype_to_string_is_an_ordinary_property() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.object_prototype;
+        assert!(matches!(
+            machine
+                .own_descriptor(prototype, &named("toString"))
+                .unwrap(),
+            Some(Property::Data {
+                writable: true,
+                configurable: true,
+                ..
+            })
+        ));
+        assert!(
+            machine
+                .internal_delete(prototype, &named("toString"))
+                .unwrap()
+        );
+        assert_eq!(
+            machine.get_named_property(prototype, "toString").unwrap(),
+            Value::UNDEFINED
+        );
+    }
+
+    #[test]
+    fn object_prototype_has_an_immutable_prototype() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.object_prototype;
+        let parent = ordinary_object(&mut machine);
+        assert!(
+            !machine
+                .internal_set_prototype_of(prototype, Some(parent))
+                .unwrap()
+        );
+        assert!(machine.internal_set_prototype_of(prototype, None).unwrap());
+    }
+
+    #[test]
+    fn promises_and_generators_accept_defined_properties() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let promise = machine.intrinsics.global("Promise").unwrap();
+        let resolve = machine.get_named_property(promise, "resolve").unwrap();
+        let settled = machine
+            .call_value(resolve, promise, &[Value::int32(1)])
+            .unwrap();
+        let descriptor = CanonicalPropertyDescriptor {
+            value: Some(Value::int32(7)),
+            ..Default::default()
+        };
+        apply_property_descriptor(&mut machine, settled, named("tag"), descriptor).unwrap();
+        assert_eq!(
+            machine.get_named_property(settled, "tag").unwrap(),
+            Value::int32(7)
+        );
+    }
+
+    #[test]
+    fn deleting_a_builtin_function_name_refunds_what_it_was_charged() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = machine.intrinsics.global("parseInt").unwrap();
+        let bound = call_method(&mut machine, target, "bind", &[]).unwrap();
+        assert!(machine.internal_delete(bound, &named("name")).unwrap());
+        assert!(machine.internal_delete(bound, &named("length")).unwrap());
+    }
+
+    #[test]
+    fn enumerable_own_listing_boxes_a_primitive_source() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let text = allocate_string(&mut machine, EcmaString::encode("ab")).unwrap();
+        for name in ["keys", "values", "entries"] {
+            let listed = call_object(&mut machine, name, &[text]).unwrap();
+            assert_eq!(machine.array_length(listed).unwrap(), 2, "{name}");
+        }
+        let target = ordinary_object(&mut machine);
+        call_object(&mut machine, "assign", &[target, text]).unwrap();
+        assert!(machine.has_own_property_key(target, &named("1")).unwrap());
+    }
+
+    #[test]
+    fn function_prototype_poisons_caller_and_arguments_for_strict_receivers() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.function_prototype;
+        let thrower = machine.intrinsics.builtins.throw_type_error();
+        for name in ["caller", "arguments"] {
+            assert!(matches!(
+                machine.own_descriptor(prototype, &named(name)).unwrap(),
+                Some(Property::Accessor {
+                    getter: Some(getter),
+                    setter: Some(setter),
+                    enumerable: false,
+                    configurable: true,
+                }) if getter == thrower && setter == thrower
+            ));
+            assert!(machine.get_named_property(prototype, name).is_err());
+        }
+        assert!(matches!(
+            machine.own_descriptor(thrower, &named("length")).unwrap(),
+            Some(Property::Data {
+                configurable: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            machine.heap[heap_index(thrower)],
+            HeapEntry::NativeFunction {
+                extensible: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn function_length_and_name_become_own_properties_that_can_be_deleted() {
+        let module = constructable_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let function = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                context: None,
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        assert_eq!(
+            machine.get_named_property(function, "length").unwrap(),
+            Value::int32(0),
+            "reads work before anything stores them"
+        );
+        let keys = machine.internal_own_property_keys(function).unwrap();
+        assert_eq!(keys[..2], [named("length"), named("name")]);
+        assert!(matches!(
+            machine.own_descriptor(function, &named("name")).unwrap(),
+            Some(Property::Data {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                ..
+            })
+        ));
+        assert!(machine.internal_delete(function, &named("length")).unwrap());
+        assert!(
+            !machine
+                .has_own_property_key(function, &named("length"))
+                .unwrap()
+        );
+        assert!(
+            machine
+                .own_descriptor(function, &named("length"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_property_reference_rejects_a_nullish_base_before_converting_its_key() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let key = ordinary_object(&mut machine);
+        for base in [Value::NULL, Value::UNDEFINED] {
+            assert!(matches!(
+                machine.computed_property_key(base, key),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        }
+    }
+
+    #[test]
+    fn function_prototype_is_a_function_without_construct() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.function_prototype;
+        assert!(machine.is_callable(prototype).unwrap());
+        assert!(!machine.is_constructor(prototype).unwrap());
+        assert_eq!(
+            machine
+                .call_value(prototype, Value::UNDEFINED, &[Value::int32(1)])
+                .unwrap(),
+            Value::UNDEFINED
+        );
+        assert_eq!(
+            machine.internal_get_prototype_of(prototype).unwrap(),
+            Some(machine.intrinsics.object_prototype),
+            "the chain must not loop back to Function.prototype"
+        );
+        assert_eq!(
+            machine.get_named_property(prototype, "length").unwrap(),
+            Value::int32(0)
+        );
+        let name = machine.get_named_property(prototype, "name").unwrap();
+        assert!(
+            machine
+                .string_value(name)
+                .is_some_and(|text| text.is_empty())
+        );
+    }
+
+    #[test]
+    fn native_function_names_exclude_engine_labels() {
+        for name in ["push", "get source", "set x", "[Symbol.replace]", "$_a1"] {
+            assert!(is_native_function_name(name), "{name}");
+        }
+        for name in ["", "Promise resolve target", "#private", "1a", "[a b]"] {
+            assert!(!is_native_function_name(name), "{name}");
+        }
+    }
+
+    fn function_source(machine: &mut Machine<'_, TestHost>, function: Value) -> EcmaString {
+        let prototype = machine.intrinsics.builtins.function_prototype();
+        let to_string = machine.get_named_property(prototype, "toString").unwrap();
+        let source = machine.call_value(to_string, function, &[]).unwrap();
+        machine.string_value(source).unwrap()
+    }
+
+    #[test]
+    fn function_to_string_uses_metadata_rather_than_the_name_property() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array_prototype = machine.intrinsics.array_prototype;
+        let push = machine.get_named_property(array_prototype, "push").unwrap();
+        assert!(function_source(&mut machine, push).eq_ascii("function push() { [native code] }"));
+
+        let renamed = machine
+            .allocate(HeapEntry::String(EcmaString::encode("renamed")))
+            .unwrap();
+        machine
+            .define_descriptor(
+                push,
+                PropertyKey::Named(EcmaString::encode("name")),
+                Property::Data {
+                    value: renamed,
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        assert!(function_source(&mut machine, push).eq_ascii("function push() { [native code] }"));
+    }
+
+    #[test]
+    fn function_to_string_rejects_non_callable_receivers() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.builtins.function_prototype();
+        let to_string = machine.get_named_property(prototype, "toString").unwrap();
+        let object = ordinary_object(&mut machine);
+        for receiver in [Value::UNDEFINED, Value::int32(1), object] {
+            assert!(matches!(
+                machine.call_value(to_string, receiver, &[]),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        }
+    }
+
+    #[test]
+    fn has_instance_is_false_for_non_callable_receivers_and_primitives() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.builtins.function_prototype();
+        let key = machine
+            .to_property_key(machine.intrinsics.builtins.symbol_has_instance())
+            .unwrap();
+        let has_instance = machine.get_property_key(prototype, &key).unwrap();
+        let object = ordinary_object(&mut machine);
+        let array = machine.intrinsics.global("Array").unwrap();
+        assert_eq!(
+            machine.call_value(has_instance, object, &[object]).unwrap(),
+            Value::FALSE,
+            "a non-callable receiver is not a constructor of anything"
+        );
+        assert_eq!(
+            machine
+                .call_value(has_instance, array, &[Value::int32(1)])
+                .unwrap(),
+            Value::FALSE,
+            "a primitive has no prototype chain to walk"
+        );
+        assert!(matches!(
+            machine.instance_of(object, Value::int32(1)),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+    }
 
     fn data_descriptor(machine: &mut Machine<'_, TestHost>, value: Value) -> Value {
         let descriptor = ordinary_object(machine);

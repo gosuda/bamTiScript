@@ -44,18 +44,26 @@ impl CollatorError {
     /// Creates a JavaScript `TypeError` result.
     #[must_use]
     pub fn type_error(message: impl Into<String>) -> Self {
-        Self { kind: CollatorErrorKind::TypeError, message: message.into() }
+        Self {
+            kind: CollatorErrorKind::TypeError,
+            message: message.into(),
+        }
     }
 
     /// Creates a JavaScript `RangeError` result.
     #[must_use]
     pub fn range_error(message: impl Into<String>) -> Self {
-        Self { kind: CollatorErrorKind::RangeError, message: message.into() }
+        Self {
+            kind: CollatorErrorKind::RangeError,
+            message: message.into(),
+        }
     }
 }
 
 impl From<LocaleError> for CollatorError {
-    fn from(error: LocaleError) -> Self { Self::range_error(error.to_string()) }
+    fn from(error: LocaleError) -> Self {
+        Self::range_error(error.to_string())
+    }
 }
 
 impl fmt::Display for CollatorError {
@@ -231,11 +239,7 @@ pub struct CollatorCompareRequest<'a> {
 /// when an injected provider deliberately has no tailoring for a request.
 pub trait CollatorDataProvider: LocaleDataProvider {
     /// Returns defaults from the resolved sort/search locale-data record.
-    fn locale_defaults(
-        &self,
-        data_locale: &str,
-        usage: CollatorUsage,
-    ) -> CollatorLocaleDefaults;
+    fn locale_defaults(&self, data_locale: &str, usage: CollatorUsage) -> CollatorLocaleDefaults;
 
     /// Compares two exact JavaScript strings, or selects the UTF-16 fallback.
     fn compare(&self, request: CollatorCompareRequest<'_>) -> Option<Ordering>;
@@ -314,18 +318,12 @@ impl Collator {
             )));
         }
         let numeric = read_boolean_option(&mut options, "numeric")?;
-        let case_first = read_string_option(
-            &mut options,
-            "caseFirst",
-            &["upper", "lower", "false"],
-        )?;
+        let case_first =
+            read_string_option(&mut options, "caseFirst", &["upper", "lower", "false"])?;
 
         let mut resolution_options = BTreeMap::new();
         if let Some(value) = collation {
-            resolution_options.insert(
-                "co".to_owned(),
-                canonicalize_uvalue(provider, "co", &value),
-            );
+            resolution_options.insert("co".to_owned(), canonicalize_uvalue(provider, "co", &value));
         }
         if let Some(value) = numeric {
             resolution_options.insert(
@@ -401,12 +399,7 @@ impl Collator {
     /// Compares exact JavaScript UTF-16 strings and normalizes the provider's
     /// implementation-defined number to `-1`, `0`, or `1`.
     #[must_use]
-    pub fn compare(
-        &self,
-        provider: &dyn CollatorDataProvider,
-        left: &[u16],
-        right: &[u16],
-    ) -> i8 {
+    pub fn compare(&self, provider: &dyn CollatorDataProvider, left: &[u16], right: &[u16]) -> i8 {
         let request = CollatorCompareRequest {
             options: CollatorCompareOptions {
                 data_locale: &self.data_locale,
@@ -525,13 +518,12 @@ fn parse_sensitivity(value: &str) -> CollatorSensitivity {
     }
 }
 
-fn canonicalize_uvalue(
-    provider: &dyn LocaleDataProvider,
-    key: &str,
-    value: &str,
-) -> String {
+fn canonicalize_uvalue(provider: &dyn LocaleDataProvider, key: &str, value: &str) -> String {
     let lower = value.to_ascii_lowercase();
-    provider.unicode_type_alias(key, &lower).unwrap_or(&lower).to_ascii_lowercase()
+    provider
+        .unicode_type_alias(key, &lower)
+        .unwrap_or(&lower)
+        .to_ascii_lowercase()
 }
 
 fn is_unicode_type(value: &str) -> bool {
@@ -552,8 +544,8 @@ const fn ordering_number(ordering: Ordering) -> i8 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::locale_negotiation::LanguageId;
+    use super::*;
     use std::cell::{Cell, RefCell};
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -572,12 +564,14 @@ mod tests {
 
     impl Options {
         fn string(mut self, key: &'static str, value: &str) -> Self {
-            self.values.insert(key, CoercedCollatorOption::String(value.to_owned()));
+            self.values
+                .insert(key, CoercedCollatorOption::String(value.to_owned()));
             self
         }
 
         fn boolean(mut self, key: &'static str, value: bool) -> Self {
-            self.values.insert(key, CoercedCollatorOption::Boolean(value));
+            self.values
+                .insert(key, CoercedCollatorOption::Boolean(value));
             self
         }
     }
@@ -682,7 +676,9 @@ mod tests {
     }
 
     impl LocaleDataProvider for TestProvider {
-        fn available_locales(&self) -> &[String] { &self.available }
+        fn available_locales(&self) -> &[String] {
+            &self.available
+        }
 
         fn unicode_type_alias(&self, key: &str, value: &str) -> Option<&str> {
             self.type_aliases
@@ -708,7 +704,9 @@ mod tests {
             })
         }
 
-        fn fallback_locale(&self) -> Option<&str> { self.fallback.as_deref() }
+        fn fallback_locale(&self) -> Option<&str> {
+            self.fallback.as_deref()
+        }
     }
 
     impl CollatorDataProvider for TestProvider {
@@ -717,7 +715,9 @@ mod tests {
             data_locale: &str,
             usage: CollatorUsage,
         ) -> CollatorLocaleDefaults {
-            self.defaults_calls.borrow_mut().push((data_locale.to_owned(), usage));
+            self.defaults_calls
+                .borrow_mut()
+                .push((data_locale.to_owned(), usage));
             CollatorLocaleDefaults {
                 sensitivity: CollatorSensitivity::Base,
                 ignore_punctuation: usage == CollatorUsage::Search,
@@ -754,11 +754,7 @@ mod tests {
             request.options.sensitivity,
             CollatorSensitivity::Case | CollatorSensitivity::Variant
         ) && request.options.case_first != CollatorCaseFirst::False
-            && let Some(ordering) = compare_case_variants(
-                &left,
-                &right,
-                request.options.case_first,
-            )
+            && let Some(ordering) = compare_case_variants(&left, &right, request.options.case_first)
         {
             return ordering;
         }
@@ -784,9 +780,10 @@ mod tests {
                 .map(ascii_lower)
                 .collect(),
             CollatorSensitivity::Accent => decomposed.into_iter().map(ascii_lower).collect(),
-            CollatorSensitivity::Case => {
-                decomposed.into_iter().filter(|unit| *unit != 0x0301).collect()
-            }
+            CollatorSensitivity::Case => decomposed
+                .into_iter()
+                .filter(|unit| *unit != 0x0301)
+                .collect(),
             CollatorSensitivity::Variant => decomposed,
         }
     }
@@ -800,7 +797,7 @@ mod tests {
     }
 
     const fn is_ascii_punctuation(unit: u16) -> bool {
-        (unit >= 0x21 && unit <= 0x2f)
+        (unit >= 0x20 && unit <= 0x2f)
             || (unit >= 0x3a && unit <= 0x40)
             || (unit >= 0x5b && unit <= 0x60)
             || (unit >= 0x7b && unit <= 0x7e)
@@ -864,11 +861,11 @@ mod tests {
         (left.len() - left_index).cmp(&(right.len() - right_index))
     }
 
-    fn digit_run_end(units: &[u16], start: usize) -> usize {
     const fn is_ascii_digit_unit(unit: u16) -> bool {
         unit >= b'0' as u16 && unit <= b'9' as u16
     }
 
+    fn digit_run_end(units: &[u16], start: usize) -> usize {
         let mut end = start;
         while end < units.len() && is_ascii_digit_unit(units[end]) {
             end += 1;
@@ -881,7 +878,9 @@ mod tests {
         first_nonzero.map_or(&units[units.len()..], |index| &units[index..])
     }
 
-    fn utf16(value: &str) -> Vec<u16> { value.encode_utf16().collect() }
+    fn utf16(value: &str) -> Vec<u16> {
+        value.encode_utf16().collect()
+    }
 
     #[test]
     fn constructor_reads_hostile_options_in_specification_order_once() {
@@ -950,12 +949,8 @@ mod tests {
     #[test]
     fn supported_unicode_keywords_survive_and_provider_defaults_fill_absent_keys() {
         let provider = TestProvider::populated();
-        let collator = Collator::new(
-            &["de-u-kn-kf-upper-co-phonebk".to_owned()],
-            None,
-            &provider,
-        )
-        .expect("locale extension is supported");
+        let collator = Collator::new(&["de-u-kn-kf-upper-co-phonebk".to_owned()], None, &provider)
+            .expect("locale extension is supported");
         let resolved = collator.resolved_options();
 
         assert_eq!(resolved.locale, "de-u-co-phonebk-kf-upper-kn");
@@ -963,9 +958,9 @@ mod tests {
         assert!(resolved.numeric);
         assert_eq!(resolved.case_first, CollatorCaseFirst::Upper);
 
-        let default = Collator::new(&["de".to_owned()], None, &provider)
-            .expect("provider has a default locale record")
-            .resolved_options();
+        let collator = Collator::new(&["de".to_owned()], None, &provider)
+            .expect("provider has a default locale record");
+        let default = collator.resolved_options();
         assert_eq!(default.collation, "default");
         assert!(!default.numeric);
         assert_eq!(default.case_first, CollatorCaseFirst::False);
@@ -974,19 +969,21 @@ mod tests {
     #[test]
     fn sort_and_search_use_their_required_default_sources() {
         let provider = TestProvider::populated();
-        let sort = Collator::new(&["en".to_owned()], None, &provider)
-            .expect("sort defaults resolve");
+        let sort =
+            Collator::new(&["en".to_owned()], None, &provider).expect("sort defaults resolve");
         let mut search_options = Options::default().string("usage", "search");
-        let search = Collator::new(
-            &["en".to_owned()],
-            Some(&mut search_options),
-            &provider,
-        )
-        .expect("search defaults resolve");
+        let search = Collator::new(&["en".to_owned()], Some(&mut search_options), &provider)
+            .expect("search defaults resolve");
 
-        assert_eq!(sort.resolved_options().sensitivity, CollatorSensitivity::Variant);
+        assert_eq!(
+            sort.resolved_options().sensitivity,
+            CollatorSensitivity::Variant
+        );
         assert!(!sort.resolved_options().ignore_punctuation);
-        assert_eq!(search.resolved_options().sensitivity, CollatorSensitivity::Base);
+        assert_eq!(
+            search.resolved_options().sensitivity,
+            CollatorSensitivity::Base
+        );
         assert!(search.resolved_options().ignore_punctuation);
         assert_eq!(
             *provider.defaults_calls.borrow(),
@@ -1001,32 +998,24 @@ mod tests {
     fn locale_and_option_failures_keep_error_classes_and_short_circuit_getters() {
         let provider = TestProvider::populated();
         let mut untouched = Options::default();
-        let invalid_locale = Collator::new(
-            &["en--US".to_owned()],
-            Some(&mut untouched),
-            &provider,
-        )
-        .expect_err("ill-formed locales are rejected");
+        let invalid_locale = Collator::new(&["en--US".to_owned()], Some(&mut untouched), &provider)
+            .expect_err("ill-formed locales are rejected");
         assert_eq!(invalid_locale.kind, CollatorErrorKind::RangeError);
         assert!(untouched.events.is_empty());
 
-        let mut null_options = Options { fail_coercion: true, ..Options::default() };
-        let null_error = Collator::new(
-            &["en".to_owned()],
-            Some(&mut null_options),
-            &provider,
-        )
-        .expect_err("null ToObject is a TypeError");
+        let mut null_options = Options {
+            fail_coercion: true,
+            ..Options::default()
+        };
+        let null_error = Collator::new(&["en".to_owned()], Some(&mut null_options), &provider)
+            .expect_err("null ToObject is a TypeError");
         assert_eq!(null_error.kind, CollatorErrorKind::TypeError);
         assert_eq!(null_options.events, vec![OptionEvent::Coerce]);
 
         let mut invalid_collation = Options::default().string("collation", "ab");
-        let range_error = Collator::new(
-            &["en".to_owned()],
-            Some(&mut invalid_collation),
-            &provider,
-        )
-        .expect_err("a Unicode type subtag needs at least three characters");
+        let range_error =
+            Collator::new(&["en".to_owned()], Some(&mut invalid_collation), &provider)
+                .expect_err("a Unicode type subtag needs at least three characters");
         assert_eq!(range_error.kind, CollatorErrorKind::RangeError);
         assert!(range_error.message.contains("collation"));
         assert_eq!(
@@ -1039,15 +1028,17 @@ mod tests {
             ]
         );
 
-        let mut hostile = Options { fail_property: Some("caseFirst"), ..Options::default() };
-        let hostile_error = Collator::new(
-            &["en".to_owned()],
-            Some(&mut hostile),
-            &provider,
-        )
-        .expect_err("getter failure propagates");
+        let mut hostile = Options {
+            fail_property: Some("caseFirst"),
+            ..Options::default()
+        };
+        let hostile_error = Collator::new(&["en".to_owned()], Some(&mut hostile), &provider)
+            .expect_err("getter failure propagates");
         assert_eq!(hostile_error.kind, CollatorErrorKind::TypeError);
-        assert_eq!(hostile.events.last(), Some(&OptionEvent::Get("caseFirst", CollatorOptionType::String)));
+        assert_eq!(
+            hostile.events.last(),
+            Some(&OptionEvent::Get("caseFirst", CollatorOptionType::String))
+        );
         assert!(!hostile.events.iter().any(|event| matches!(
             event,
             OptionEvent::Get("sensitivity" | "ignorePunctuation", _)
@@ -1076,21 +1067,21 @@ mod tests {
             ]
         );
 
-        let best_fit = supported_locales_of(&locales, None, &provider)
-            .expect("best-fit filtering succeeds");
+        let best_fit =
+            supported_locales_of(&locales, None, &provider).expect("best-fit filtering succeeds");
         assert_eq!(best_fit, vec!["sv-SE", "zh-HK", "en-US"]);
     }
 
     #[test]
     fn supported_locales_validate_locales_before_touching_options() {
         let provider = TestProvider::populated();
-        let mut options = Options { fail_coercion: true, ..Options::default() };
-        let error = supported_locales_of(
-            &["not_a_locale".to_owned()],
-            Some(&mut options),
-            &provider,
-        )
-        .expect_err("locale failure precedes options coercion");
+        let mut options = Options {
+            fail_coercion: true,
+            ..Options::default()
+        };
+        let error =
+            supported_locales_of(&["not_a_locale".to_owned()], Some(&mut options), &provider)
+                .expect_err("locale failure precedes options coercion");
         assert_eq!(error.kind, CollatorErrorKind::RangeError);
         assert!(options.events.is_empty());
     }
@@ -1102,14 +1093,13 @@ mod tests {
             .boolean("numeric", true)
             .string("caseFirst", "lower")
             .boolean("ignorePunctuation", true);
-        let collator = Collator::new(
-            &["en".to_owned()],
-            Some(&mut options),
-            &provider,
-        )
-        .expect("comparison options resolve");
+        let collator = Collator::new(&["en".to_owned()], Some(&mut options), &provider)
+            .expect("comparison options resolve");
 
-        assert_eq!(collator.compare(&provider, &utf16("item-2"), &utf16("item 10")), -1);
+        assert_eq!(
+            collator.compare(&provider, &utf16("item-2"), &utf16("item 10")),
+            -1
+        );
         assert_eq!(collator.compare(&provider, &utf16("a"), &utf16("A")), -1);
         assert_eq!(collator.compare(&provider, &utf16("a-b"), &utf16("ab")), 0);
 
@@ -1117,14 +1107,18 @@ mod tests {
         assert_eq!(calls.len(), 3);
         assert!(calls.iter().all(|call| call.numeric));
         assert!(calls.iter().all(|call| call.ignore_punctuation));
-        assert!(calls.iter().all(|call| call.case_first == CollatorCaseFirst::Lower));
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.case_first == CollatorCaseFirst::Lower)
+        );
     }
 
     #[test]
     fn canonical_equivalence_remains_equal_without_a_code_unit_tiebreak() {
         let provider = TestProvider::populated();
-        let collator = Collator::new(&["en".to_owned()], None, &provider)
-            .expect("default collator resolves");
+        let collator =
+            Collator::new(&["en".to_owned()], None, &provider).expect("default collator resolves");
         let composed = vec![0x00e9];
         let decomposed = vec!['e' as u16, 0x0301];
 
@@ -1139,8 +1133,8 @@ mod tests {
     fn utf16_fallback_is_total_and_preserves_lone_surrogates() {
         let provider = TestProvider::populated();
         provider.defer_compare.set(true);
-        let collator = Collator::new(&["en".to_owned()], None, &provider)
-            .expect("default collator resolves");
+        let collator =
+            Collator::new(&["en".to_owned()], None, &provider).expect("default collator resolves");
 
         assert_eq!(collator.compare(&provider, &[0xd800], &[0xdc00]), -1);
         assert_eq!(collator.compare(&provider, &[0xd800], &[0xd800]), 0);
@@ -1161,12 +1155,8 @@ mod tests {
             .string("caseFirst", "upper")
             .string("sensitivity", "accent")
             .boolean("ignorePunctuation", false);
-        let collator = Collator::new(
-            &["de".to_owned()],
-            Some(&mut options),
-            &provider,
-        )
-        .expect("collator resolves");
+        let collator = Collator::new(&["de".to_owned()], Some(&mut options), &provider)
+            .expect("collator resolves");
         let left = utf16("A2");
         let right = utf16("a10");
 
@@ -1187,8 +1177,8 @@ mod tests {
     #[test]
     fn absent_provider_data_fails_instead_of_reading_an_ambient_locale() {
         let provider = TestProvider::empty();
-        let error = Collator::new(&[], None, &provider)
-            .expect_err("no provider locale means no Collator");
+        let error =
+            Collator::new(&[], None, &provider).expect_err("no provider locale means no Collator");
 
         assert_eq!(error.kind, CollatorErrorKind::RangeError);
         assert_eq!(error.message, "no available locale");

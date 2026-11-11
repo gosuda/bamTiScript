@@ -25,6 +25,7 @@ wasmtime-internal-jit-icache-coherence = { version = "=47.0.2", optional = true 
 libc = { version = "=0.2.189", optional = true }
 
 [dev-dependencies]
+bamts-platform.workspace = true
 bamts-runtime.workspace = true
 
 [features]

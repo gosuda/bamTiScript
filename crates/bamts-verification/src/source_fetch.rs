@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256, Sha512};
 use crate::{
     ErrorCode, Result, VerificationError,
     corpus::{OracleLimits, normalized_env, run_process},
+    fsync,
     schema::{SourcePin, base64_value, load_sources, required_source},
 };
 
@@ -594,6 +595,9 @@ fn select_payload(extracted: &Path) -> Result<PathBuf> {
         .map_err(|error| io_error(extracted, error))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|error| io_error(extracted, error))?;
+    // macOS can write this into any new directory, which must not hide the
+    // archive's single root and change the layout of the whole tree.
+    entries.retain(|entry| entry.file_name() != ".DS_Store");
     if entries.is_empty() {
         return Err(VerificationError::new(
             ErrorCode::Schema,
@@ -619,18 +623,14 @@ fn sync_tree(root: &Path) -> Result<()> {
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
             sync_tree(&entry.path())?;
         } else if metadata.is_file() {
-            File::open(entry.path())
-                .and_then(|file| file.sync_all())
-                .map_err(|error| io_error(&entry.path(), error))?;
+            fsync::sync_file(&entry.path()).map_err(|error| io_error(&entry.path(), error))?;
         }
     }
     sync_directory(root)
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| io_error(path, error))
+    fsync::sync_directory(path).map_err(|error| io_error(path, error))
 }
 
 fn ensure_parent(parent: &Path) -> Result<PathBuf> {
@@ -848,6 +848,16 @@ mod tests {
             .expect_err("changed tree");
         assert_eq!(error.code(), ErrorCode::Digest);
         assert_eq!(backend.fetches.get(), 1);
+    }
+
+    #[test]
+    fn a_finder_file_does_not_hide_the_archive_root() {
+        let root = std::env::temp_dir().join(format!("select-payload-{}", std::process::id()));
+        let payload = root.join("source-1234");
+        fs::create_dir_all(&payload).expect("payload");
+        fs::write(root.join(".DS_Store"), b"finder").expect("finder file");
+        assert_eq!(select_payload(&root).expect("payload"), payload);
+        fs::remove_dir_all(&root).expect("remove root");
     }
 
     #[test]

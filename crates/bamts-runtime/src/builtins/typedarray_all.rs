@@ -379,7 +379,6 @@ fn view_fields<H: Host>(machine: &Machine<'_, H>, view: Value) -> Result<ViewFie
     })
 }
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct TypedArraySnapshot {
     pub(crate) kind: ElementKind,
     pub(crate) buffer: ViewBuffer,
@@ -387,7 +386,6 @@ pub(crate) struct TypedArraySnapshot {
     pub(crate) bounds: ViewBounds,
 }
 
-#[allow(dead_code)]
 pub(crate) fn typed_array_snapshot<H: Host>(
     machine: &Machine<'_, H>,
     view: Value,
@@ -551,15 +549,17 @@ fn numeric_value<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<
     }
 }
 
-fn integer_or_infinity<H: Host>(
+/// ToIntegerOrInfinity. Adding `+0` turns the `-0` that truncating a small
+/// negative fraction yields into the `+0` the operation is defined to return.
+pub(crate) fn integer_or_infinity<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<f64, EvalFailure> {
     let number = numeric_value(machine, value)?;
-    Ok(if number.is_nan() || number == 0.0 {
+    Ok(if number.is_nan() {
         0.0
     } else {
-        number.trunc()
+        number.trunc() + 0.0
     })
 }
 
@@ -2023,7 +2023,7 @@ fn for_each<H: Host>(
     let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
     for index in 0..length {
         let value = read_element(machine, this, index)?;
-        machine.call_value(
+        machine.call_callback(
             callback,
             this_arg,
             &[value, crate::number_value(index as f64), this],
@@ -2198,7 +2198,7 @@ fn reduce_impl<H: Host, I: Iterator<Item = usize>>(
     };
     for index in indices {
         let value = read_element(machine, this, index)?;
-        accumulator = machine.call_value(
+        accumulator = machine.call_callback(
             callback,
             Value::UNDEFINED,
             &[accumulator, value, crate::number_value(index as f64), this],

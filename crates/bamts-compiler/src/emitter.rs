@@ -24,14 +24,14 @@ pub mod transforms;
 pub mod transpile;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
     sync::Arc,
 };
 
 use crate::checker::{SemanticModel, Type, TypeId, render_type_declaration};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
-use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar};
+use crate::enum_plan::{EnumFacts, EnumScalar};
 use crate::jsx_desugar::JsxSourceDesugarPlan;
 use crate::source::{JsxEmit, SourceId, SourceText, TextRange, Utf16Pos};
 use crate::syntax::*;
@@ -87,6 +87,9 @@ pub enum ModuleKind {
     System,
     Es2015,
     EsNext,
+    /// A Node mode, where each file is CommonJS or an ES module. The project
+    /// resolves it per file before emit.
+    Node,
 }
 
 /// The structural line terminator the emitter inserts between lines.
@@ -118,6 +121,14 @@ pub struct EmitOptions {
     /// Assume downleveling helpers exist globally; emit no helper prelude
     /// (`noEmitHelpers`, tsc's noEmitHelpers).
     pub no_emit_helpers: bool,
+    /// Leave authored comments out of the output (`removeComments`).
+    pub remove_comments: bool,
+    /// Keeps every import and export as written instead of eliding by use.
+    pub verbatim_module_syntax: bool,
+    /// `(specifier, name)` pairs the program knows have no runtime form.
+    pub erased_imports: Arc<BTreeSet<(String, String)>>,
+    /// Something outside the source reads imports, so none can be proven unused.
+    pub keeps_imports: bool,
     pub use_define_for_class_fields: Option<bool>,
     pub declaration: bool,
     pub emit_declaration_only: bool,
@@ -148,6 +159,10 @@ impl Default for EmitOptions {
             always_strict: false,
             import_helpers: false,
             no_emit_helpers: false,
+            remove_comments: false,
+            verbatim_module_syntax: false,
+            erased_imports: Arc::default(),
+            keeps_imports: false,
             use_define_for_class_fields: None,
             declaration: false,
             emit_declaration_only: false,
@@ -253,6 +268,12 @@ impl EmitOptions {
                     return Some(invalid());
                 };
                 self.no_emit_helpers = no_emit_helpers;
+            }
+            "removecomments" => {
+                let Some(remove_comments) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.remove_comments = remove_comments;
             }
             "module" => {
                 let Some(module) = parse_module(value) else {
@@ -392,6 +413,10 @@ impl EmitOptions {
             source_map: self.source_map,
             inline_source_map: self.inline_source_map,
             inline_sources: self.inline_sources,
+            remove_comments: self.remove_comments,
+            verbatim_module_syntax: self.verbatim_module_syntax,
+            erased_imports: Arc::clone(&self.erased_imports),
+            keeps_imports: self.keeps_imports,
         }
     }
 
@@ -487,6 +512,11 @@ pub(crate) struct PrintOptions {
     pub(crate) source_map: bool,
     pub(crate) inline_source_map: bool,
     pub(crate) inline_sources: bool,
+    pub(crate) remove_comments: bool,
+    /// An ES module whose output has no module syntax left ends in `export {};`.
+    pub(crate) module_marker: bool,
+    /// An import or re-export of only types still loads its module.
+    pub(crate) verbatim_module_syntax: bool,
 }
 
 pub(crate) struct PrintSource<'a> {
@@ -497,6 +527,8 @@ pub(crate) struct PrintSource<'a> {
     /// parser tree and any JSX-desugar consumption). Ids below it are
     /// parser-assigned and must carry ranges within the authored text.
     pub(crate) synthesized_floor: u32,
+    /// Raw lines that print in place of a marker statement.
+    pub(crate) inline_lines: Option<&'a HashMap<NodeId, String>>,
 }
 
 /// Print context for a braced block. Carries two tsc behaviors that split on
@@ -581,6 +613,7 @@ pub(crate) fn print(
             // No rewriter ran: every id is parser-assigned, so the mint
             // gate's range check applies universally.
             synthesized_floor: u32::MAX,
+            inline_lines: None,
         },
         model,
         options,
@@ -606,6 +639,7 @@ pub(crate) fn print_with_jsx_plan(
         original_content,
         synthesized,
         synthesized_floor,
+        inline_lines,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
         let mut builder = SourceMapBuilder::new()
@@ -640,6 +674,8 @@ pub(crate) fn print_with_jsx_plan(
             .map(|token| token.range())
             .collect(),
         tokens: file.tokens(),
+        pending_comments: Vec::new(),
+        comment_cursor: Utf16Pos::ZERO,
         source: file.source_text(),
         source_name: mapped_source_name,
         source_id: file.source_id(),
@@ -666,6 +702,8 @@ pub(crate) fn print_with_jsx_plan(
         authored_len: Utf16Pos::new(utf16_len(original_content)),
         synthesized,
         synthesized_floor,
+        emitted_module_syntax: false,
+        inline_lines,
     };
     if let Some(prelude) = prelude.filter(|prelude| !prelude.is_empty()) {
         let has_trailing_newline = prelude.ends_with('\n');
@@ -737,7 +775,8 @@ pub(crate) fn parse_module(value: &str) -> Option<ModuleKind> {
         "umd" => Some(ModuleKind::Umd),
         "system" => Some(ModuleKind::System),
         "es6" | "es2015" => Some(ModuleKind::Es2015),
-        "esnext" => Some(ModuleKind::EsNext),
+        "es2020" | "es2022" | "esnext" | "preserve" => Some(ModuleKind::EsNext),
+        "node16" | "node18" | "node20" | "nodenext" => Some(ModuleKind::Node),
         _ => None,
     }
 }
@@ -822,6 +861,12 @@ struct Emitter<'a> {
     /// The full authored token stream, sorted by start. Backs authored-form
     /// lookups (arrow parameter parens) that the AST does not retain.
     tokens: &'a [Token],
+    /// Comments waiting for the next write. A statement that erases never
+    /// writes, so its comments go with it, as they do in `tsc`.
+    pending_comments: Vec<TextRange>,
+    /// Comments before this position are already spoken for, so rewritten
+    /// statements cannot print one twice.
+    comment_cursor: Utf16Pos,
     source_id: SourceId,
     model: &'a SemanticModel,
     enum_facts: &'a EnumFacts,
@@ -863,6 +908,41 @@ struct Emitter<'a> {
     /// First rewriter-minted id for this file; ids below it are
     /// parser-assigned and must carry ranges within the authored text.
     synthesized_floor: u32,
+    /// An import or export reached the output.
+    emitted_module_syntax: bool,
+    inline_lines: Option<&'a HashMap<NodeId, String>>,
+}
+
+/// The source text of an enum's numeric value.
+pub(crate) fn enum_number_lexeme(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value == f64::INFINITY {
+        "Infinity".to_owned()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+/// The contents of a double-quoted literal holding `value`.
+pub(crate) fn enum_string_lexeme(value: &bamts_bytecode::EcmaString) -> String {
+    let mut text = String::with_capacity(value.as_units().len());
+    for &unit in value.as_units() {
+        match unit {
+            0x08 => text.push_str("\\b"),
+            0x09 => text.push_str("\\t"),
+            0x0A => text.push_str("\\n"),
+            0x0C => text.push_str("\\f"),
+            0x0D => text.push_str("\\r"),
+            0x22 => text.push_str("\\\""),
+            0x5C => text.push_str("\\\\"),
+            0x20..=0x7E => text.push(char::from_u32(u32::from(unit)).expect("ASCII unit")),
+            _ => write!(text, "\\u{unit:04X}").expect("writing to a String cannot fail"),
+        }
+    }
+    text
 }
 
 impl Emitter<'_> {
@@ -895,18 +975,168 @@ impl Emitter<'_> {
         self.source.as_str().get(start..end)
     }
 
-    /// Prints a statement list with tsc's default comment preservation: each
-    /// statement that emits is followed by its same-line trailing comment
-    /// before the newline. Single-line-preserved bodies do not route here —
-    /// tsc expands a body whose statement carries a trailing comment, a
-    /// rule queued separately.
+    fn is_comment(token: &Token) -> bool {
+        matches!(
+            token.kind(),
+            TokenKind::LineComment | TokenKind::BlockComment
+        )
+    }
+
+    fn is_trivia(token: &Token) -> bool {
+        Self::is_comment(token) || token.kind() == TokenKind::Whitespace
+    }
+
+    /// The comments before `position` back to the previous code token, which
+    /// comes with them. That token still exists for code that erased, which is
+    /// what keeps a comment from reaching past the declaration it belongs to.
+    fn comments_after_previous_token(
+        &self,
+        position: Utf16Pos,
+    ) -> (Vec<TextRange>, Option<&Token>) {
+        let end = self
+            .tokens
+            .partition_point(|token| token.range().start() < position);
+        let previous = self.tokens[..end]
+            .iter()
+            .rposition(|token| !Self::is_trivia(token));
+        let first = previous.map_or(0, |index| index + 1);
+        let comments = self.tokens[first..end]
+            .iter()
+            .filter(|token| Self::is_comment(token) && token.range().start() >= self.comment_cursor)
+            .map(|token| token.range())
+            .collect();
+        (comments, previous.map(|index| &self.tokens[index]))
+    }
+
+    fn source_line(&self, position: Utf16Pos) -> Option<usize> {
+        self.source.line_column(position).ok().map(|(line, _)| line)
+    }
+
+    /// The comments that lead the code at `position`. One on the line of the
+    /// previous token trails that token instead, unless that token opens a block.
+    fn leading_comments(&self, position: Utf16Pos) -> Vec<TextRange> {
+        let (comments, previous) = self.comments_after_previous_token(position);
+        let trailing_line = previous
+            .filter(|token| token.kind() != TokenKind::LBrace)
+            .and_then(|token| self.source_line(token.range().end()));
+        comments
+            .into_iter()
+            .filter(|comment| {
+                trailing_line.is_none() || self.source_line(comment.start()) != trailing_line
+            })
+            .collect()
+    }
+
+    /// Queues the comments before a statement. They print on its first write.
+    fn queue_leading_comments(&mut self, start: Utf16Pos) {
+        if self.options.remove_comments || start > self.authored_len {
+            return;
+        }
+        self.pending_comments = self.leading_comments(start);
+        self.comment_cursor = self.comment_cursor.max(start);
+    }
+
+    /// Prints the comments that close a file.
+    fn write_closing_comments(&mut self) {
+        self.queue_leading_comments(self.authored_len);
+        self.flush_comments();
+    }
+
+    /// The start of the first code in the file, or its end if there is none.
+    fn first_code_position(&self) -> Utf16Pos {
+        self.tokens
+            .iter()
+            .find(|token| !Self::is_trivia(token))
+            .map_or(self.authored_len, |token| token.range().start())
+    }
+
+    /// Prints the comment header of a file: a run with no blank line inside it
+    /// and a blank line after it survives whatever the first statement does.
+    fn write_detached_comments(&mut self) {
+        if self.options.remove_comments {
+            return;
+        }
+        let first_code = self.first_code_position();
+        let (comments, _) = self.comments_after_previous_token(first_code);
+        let starts_after = |emitter: &Self, index: usize| {
+            let next = comments
+                .get(index + 1)
+                .map_or(first_code, |next| next.start());
+            emitter
+                .source_line(next)
+                .zip(emitter.source_line(comments[index].end()))
+                .is_some_and(|(next, end)| next >= end + 2)
+        };
+        let Some(last) = (0..comments.len()).find(|&index| starts_after(self, index)) else {
+            return;
+        };
+        self.comment_cursor = comments[last].end();
+        self.pending_comments = comments[..=last].to_vec();
+        self.flush_comments();
+    }
+
+    fn flush_comments(&mut self) {
+        for comment in std::mem::take(&mut self.pending_comments) {
+            self.write_comment(comment);
+            if self.comment_ends_its_line(comment) {
+                self.newline();
+            } else {
+                self.raw(" ");
+            }
+        }
+    }
+
+    /// Whether code follows a comment on its own last line.
+    fn comment_ends_its_line(&self, comment: TextRange) -> bool {
+        let start = self
+            .tokens
+            .partition_point(|token| token.range().start() < comment.end());
+        let next = self.tokens[start..]
+            .iter()
+            .find(|token| !Self::is_trivia(token));
+        next.is_none_or(|token| {
+            self.source_line(token.range().start()) != self.source_line(comment.end())
+        })
+    }
+
+    /// Writes a comment at the current indentation. The lines of a block comment
+    /// keep their shape relative to where the comment began.
+    fn write_comment(&mut self, comment: TextRange) {
+        let Some(text) = self.source_slice(comment).map(str::to_owned) else {
+            return;
+        };
+        let column = self
+            .source
+            .line_column(comment.start())
+            .map_or(0, |(_, column)| column);
+        for (index, line) in text.split('\n').enumerate() {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if index > 0 {
+                self.newline();
+            }
+            let indent = line.len() - line.trim_start().len();
+            self.raw(&line[if index == 0 { 0 } else { indent.min(column) }..]);
+        }
+    }
+
+    /// Prints a statement list with tsc's default comment preservation: a
+    /// comment above a statement prints above it, and its same-line trailing
+    /// comment follows it before the newline. Single-line-preserved bodies do
+    /// not route here: tsc expands a body whose
+    /// statement carries a trailing comment, a rule queued separately.
     fn emit_statement_list(&mut self, statements: &[Stmt]) {
         for (index, statement) in statements.iter().enumerate() {
-            if self.emit_statement(statement) {
+            self.queue_leading_comments(statement.range().start());
+            let emitted = self.emit_statement(statement);
+            self.pending_comments.clear();
+            if emitted {
                 let limit = statements
                     .get(index + 1)
                     .map_or_else(|| Utf16Pos::new(usize::MAX), |next| next.range().start());
-                if let Some(comment) = self.trailing_line_comment(statement.range().end(), limit) {
+                if !self.options.remove_comments
+                    && let Some(comment) =
+                        self.trailing_line_comment(statement.range().end(), limit)
+                {
                     self.raw(" ");
                     if let Some(text) = self.source_slice(comment) {
                         let text = text.to_owned();
@@ -1195,6 +1425,9 @@ impl<'a> Emitter<'a> {
 
     /// Flushes pending indentation, updating `generated_column`.
     fn flush_indent(&mut self) {
+        if !self.pending_comments.is_empty() {
+            self.flush_comments();
+        }
         if self.pending_indent {
             let spaces = self.indent * self.options.indent_width as usize;
             for _ in 0..spaces {
@@ -1323,7 +1556,13 @@ impl<'a> Emitter<'a> {
     // ---- module drivers ---------------------------------------------------
 
     fn emit_module_js(&mut self, statements: &[Stmt]) {
+        self.write_detached_comments();
         self.emit_statement_list(statements);
+        if self.options.module_marker && !self.emitted_module_syntax {
+            self.raw("export {};");
+            self.newline();
+        }
+        self.write_closing_comments();
     }
 
     fn emit_module_decl(&mut self, statements: &[Stmt]) {
@@ -1340,20 +1579,41 @@ impl<'a> Emitter<'a> {
     // =======================================================================
 
     fn emit_statement(&mut self, statement: &Stmt) -> bool {
+        if let Some(lines) = self
+            .inline_lines
+            .and_then(|lines| lines.get(&statement.id()))
+        {
+            for (index, line) in lines.lines().enumerate() {
+                if index > 0 {
+                    self.newline();
+                }
+                self.raw(line);
+            }
+            return true;
+        }
         let previous = self.anchor;
         self.anchor = statement.range();
         let stmt_range = self.anchor;
         let emitted = match statement.data() {
-            Statement::Import(import) => self.emit_import(import, false),
+            Statement::Import(import) => {
+                let emitted = self.emit_import(import, false);
+                self.emitted_module_syntax |= emitted;
+                emitted
+            }
             Statement::ImportEquals(import) => {
                 if import.is_type_only {
                     false
                 } else {
                     self.emit_import_equals_js(import);
+                    self.emitted_module_syntax = true;
                     true
                 }
             }
-            Statement::Export(export) => self.emit_export_js(export),
+            Statement::Export(export) => {
+                let emitted = self.emit_export_js(export);
+                self.emitted_module_syntax |= emitted;
+                emitted
+            }
             Statement::Variable(declaration) => {
                 self.emit_variable_head(declaration);
                 let semi_start = Utf16Pos::new(stmt_range.end().get().saturating_sub(1));
@@ -1375,7 +1635,7 @@ impl<'a> Emitter<'a> {
                 true
             }
             Statement::Interface(_) | Statement::TypeAlias(_) | Statement::Declare(_) => false,
-            Statement::Enum(declaration) => self.emit_enum_js(statement.id(), declaration),
+            Statement::Enum(declaration) => self.emit_enum_js(declaration),
             Statement::Namespace(_) => {
                 self.diag_here(
                     codes::NAMESPACE_UNLOWERED,
@@ -1874,7 +2134,10 @@ impl<'a> Emitter<'a> {
         // A clause that resolves to no value bindings is fully type-only and is
         // erased in JavaScript (a bare side-effect import keeps its clause-less
         // form below).
-        if !keep_types && let Some(clause) = &import.clause {
+        if !keep_types
+            && !self.options.verbatim_module_syntax
+            && let Some(clause) = &import.clause
+        {
             let has_value = clause.default.is_some()
                 || matches!(&clause.binding, Some(ImportBinding::Namespace(_)))
                 || matches!(
@@ -2022,17 +2285,22 @@ impl<'a> Emitter<'a> {
                     .iter()
                     .filter(|s| matches!(s.data().mode, ExportSpecifierMode::Value))
                     .collect();
-                if visible.is_empty() {
+                let loads_module = self.options.verbatim_module_syntax && source.is_some();
+                if visible.is_empty() && !loads_module {
                     return false;
                 }
-                self.raw("export { ");
-                for (index, specifier) in visible.iter().enumerate() {
-                    if index > 0 {
-                        self.raw(", ");
+                if visible.is_empty() {
+                    self.raw("export {}");
+                } else {
+                    self.raw("export { ");
+                    for (index, specifier) in visible.iter().enumerate() {
+                        if index > 0 {
+                            self.raw(", ");
+                        }
+                        self.emit_export_specifier(specifier.data(), false);
                     }
-                    self.emit_export_specifier(specifier.data(), false);
+                    self.raw(" }");
                 }
-                self.raw(" }");
                 if let Some(source) = source {
                     self.raw(" from ");
                     self.emit_string(source);
@@ -2133,129 +2401,28 @@ impl<'a> Emitter<'a> {
     // enum lowering (JavaScript)
     // =======================================================================
 
-    fn emit_enum_js(&mut self, declaration_id: NodeId, declaration: &EnumDeclaration) -> bool {
-        let Some(name) = self
-            .text(declaration.name.data().token())
-            .map(str::to_owned)
-        else {
-            self.diag(
-                codes::UNRESOLVED_TOKEN,
-                "token text is not a valid slice of the source",
-                declaration.name.range(),
-            );
-            return false;
-        };
-        if name.is_empty() || declaration.is_const {
-            return false;
-        }
-        let Some(plan) = self.enum_facts.declaration(declaration_id) else {
+    /// The rewriter lowers every enum it has facts for, so one that reaches
+    /// the printer is either erased or has none.
+    fn emit_enum_js(&mut self, declaration: &EnumDeclaration) -> bool {
+        if !declaration.is_const {
             self.diag_here(
                 codes::ENUM_FACTS_UNAVAILABLE,
                 "runtime enum lowering requires checked enum facts",
             );
-            return false;
-        };
-        if plan.members().len() != declaration.members.len() {
-            self.diag_here(
-                codes::ENUM_FACTS_UNAVAILABLE,
-                "runtime enum lowering requires a complete checked enum plan",
-            );
-            return false;
         }
-
-        self.raw("var ");
-        self.raw(&name);
-        self.raw(";");
-        self.newline();
-        self.raw("(function (");
-        self.raw(&name);
-        self.raw(") {");
-        self.newline();
-        self.indent += 1;
-        for (member, plan_member) in declaration.members.iter().zip(plan.members()) {
-            if self.emit_enum_member(&name, member.data(), plan_member) {
-                self.newline();
-            }
-        }
-        self.indent -= 1;
-        self.raw("})(");
-        self.raw(&name);
-        self.raw(" || (");
-        self.raw(&name);
-        self.raw(" = {}));");
-        true
-    }
-
-    fn emit_enum_member(
-        &mut self,
-        object: &str,
-        member: &EnumMember,
-        plan_member: &EnumMemberPlan,
-    ) -> bool {
-        let (Some(key), Some(value)) = (plan_member.name(), plan_member.value()) else {
-            return false;
-        };
-        let initializer = member.initializer.as_deref();
-        if value.constant().is_none() && initializer.is_none() {
-            return false;
-        }
-
-        self.raw(object);
-        self.raw("[");
-        if plan_member.reverse() {
-            self.raw(object);
-            self.raw("[");
-        }
-        self.emit_enum_string(key);
-        self.raw("] = ");
-        if let Some(constant) = value.constant() {
-            self.emit_enum_scalar(constant);
-        } else if let Some(initializer) = initializer {
-            self.emit_expression_prec(initializer, P_ASSIGN);
-        }
-        if plan_member.reverse() {
-            self.raw("] = ");
-            self.emit_enum_string(key);
-        }
-        self.raw(";");
-        true
+        false
     }
 
     fn emit_enum_scalar(&mut self, scalar: &EnumScalar) {
         match scalar {
-            EnumScalar::Number(value) => {
-                let value = value.to_f64();
-                if value.is_nan() {
-                    self.raw("NaN");
-                } else if value == f64::INFINITY {
-                    self.raw("Infinity");
-                } else if value == f64::NEG_INFINITY {
-                    self.raw("-Infinity");
-                } else {
-                    write!(self.out, "{value}").expect("writing to a String cannot fail");
-                }
-            }
+            EnumScalar::Number(value) => self.raw(&enum_number_lexeme(value.to_f64())),
             EnumScalar::String(value) => self.emit_enum_string(value),
         }
     }
 
     fn emit_enum_string(&mut self, value: &bamts_bytecode::EcmaString) {
         self.raw("\"");
-        for &unit in value.as_units() {
-            match unit {
-                0x08 => self.raw("\\b"),
-                0x09 => self.raw("\\t"),
-                0x0A => self.raw("\\n"),
-                0x0C => self.raw("\\f"),
-                0x0D => self.raw("\\r"),
-                0x22 => self.raw("\\\""),
-                0x5C => self.raw("\\\\"),
-                0x20..=0x7E => self
-                    .out
-                    .push(char::from_u32(u32::from(unit)).expect("ASCII unit")),
-                _ => write!(self.out, "\\u{unit:04X}").expect("writing to a String cannot fail"),
-            }
-        }
+        self.raw(&enum_string_lexeme(value));
         self.raw("\"");
     }
 
@@ -2507,7 +2674,9 @@ impl<'a> Emitter<'a> {
 
     fn class_member_emits_js(&self, member: &ClassMember) -> bool {
         match member {
-            ClassMember::Constructor(_) | ClassMember::StaticBlock(_) => true,
+            ClassMember::Constructor(_) | ClassMember::StaticBlock(_) | ClassMember::Semicolon => {
+                true
+            }
             ClassMember::Method(method) => {
                 method.function.body.is_some() && !method.modifiers.is_abstract
             }
@@ -2578,6 +2747,10 @@ impl<'a> Emitter<'a> {
             ClassMember::Missing(_) => {
                 self.diag_here(codes::MISSING_MEMBER, "cannot emit a missing class member");
                 false
+            }
+            ClassMember::Semicolon => {
+                self.raw(";");
+                true
             }
         }
     }
@@ -3560,6 +3733,10 @@ impl<'a> Emitter<'a> {
                         AssignmentArrayElement::Target(target) => {
                             self.emit_assignment_target(target)
                         }
+                        AssignmentArrayElement::Rest(target) => {
+                            self.raw("...");
+                            self.emit_assignment_target(target);
+                        }
                         AssignmentArrayElement::Elision => {}
                         AssignmentArrayElement::Missing(_) => {
                             self.diag_here(codes::MISSING_TARGET, "cannot emit a missing target");
@@ -3587,6 +3764,11 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_assignment_object_property(&mut self, property: &AssignmentObjectProperty) {
+        if property.rest {
+            self.raw("...");
+            self.emit_assignment_target(&property.target);
+            return;
+        }
         let shorthand = property.initializer.is_none()
             && self.target_matches_name(&property.name, &property.target);
         if shorthand {
@@ -4362,7 +4544,7 @@ impl<'a> Emitter<'a> {
     fn class_member_emits_decl(&self, member: &ClassMember) -> bool {
         !matches!(
             member,
-            ClassMember::StaticBlock(_) | ClassMember::Missing(_)
+            ClassMember::StaticBlock(_) | ClassMember::Missing(_) | ClassMember::Semicolon
         )
     }
 
@@ -4442,7 +4624,7 @@ impl<'a> Emitter<'a> {
                 self.raw(";");
                 true
             }
-            ClassMember::StaticBlock(_) => false,
+            ClassMember::StaticBlock(_) | ClassMember::Semicolon => false,
             ClassMember::Missing(_) => {
                 self.diag_here(codes::MISSING_MEMBER, "cannot emit a missing class member");
                 false
@@ -5985,6 +6167,41 @@ export default answer;
     }
 
     #[test]
+    fn array_assignment_rest_and_defaults_emit_as_written() {
+        let input = "[a = 1, ...b] = c;\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(!output.has_errors());
+        assert_eq!(javascript(&output).code, input);
+    }
+
+    #[test]
+    fn a_bare_class_semicolon_survives_javascript_and_not_declarations() {
+        // Authority: `classWithSemicolonClassElement1` and `2` keep each `;`.
+        let input = "export class C {\n    ;\n    ;\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(!output.has_errors());
+        assert_eq!(
+            javascript(&output).code,
+            "export class C {\n    ;\n    ;\n}\n"
+        );
+        let declaration = emit_declaration(parsed.product());
+        assert!(!declaration.has_errors());
+        assert!(!format!("{declaration:?}").contains(";\\n    ;"));
+    }
+
+    #[test]
     fn empty_class_body_expands_in_javascript() {
         // Authority: `exnextmodulekindExportClassNameWithObject(target=es2015)`
         // emits `export class Object {}` as `export class Object {\n}`. The TS
@@ -6255,6 +6472,66 @@ export default answer;
             declaration(&output).code,
             "export default interface Foo {\n}\n"
         );
+    }
+
+    #[test]
+    fn comments_above_statements_survive_in_javascript() {
+        let emit = |input: &str, remove_comments: bool| {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+            ));
+            assert!(parsed.diagnostics().is_empty());
+            let options = EmitOptions {
+                remove_comments,
+                ..EmitOptions::default()
+            };
+            javascript(&emit_output(parsed.product(), &options))
+                .code
+                .clone()
+        };
+        assert_eq!(
+            emit("// above\nvar x = 1;\n// next\nvar y = 2;\n", false),
+            "// above\nvar x = 1;\n// next\nvar y = 2;\n"
+        );
+        assert_eq!(
+            emit("/* one */ var x = 1;\n", false),
+            "/* one */ var x = 1;\n"
+        );
+        assert_eq!(
+            emit("function f() {\n    // inner\n    return 1;\n}\n", false),
+            "function f() {\n    // inner\n    return 1;\n}\n"
+        );
+        assert_eq!(
+            emit("var x; // t\n// next\nvar y;\n", false),
+            "var x; // t\n// next\nvar y;\n"
+        );
+        // A comment on an erased declaration goes with it.
+        assert_eq!(
+            emit("// gone\ninterface I {}\n// kept\nvar x;\n", false),
+            "// kept\nvar x;\n"
+        );
+        // A header stays even when the first statement erases.
+        assert_eq!(
+            emit("// header\n\n// gone\ninterface I {}\nvar x;\n", false),
+            "// header\nvar x;\n"
+        );
+        assert_eq!(emit("var x;\n// end\n", false), "var x;\n// end\n");
+        // The rewriter removes a `declare` from the list, but its comment stays
+        // with it rather than moving to the next statement that prints.
+        assert_eq!(
+            emit(
+                "// one\ndeclare var a;\n\n// two\ndeclare var b;\nc();\n",
+                false
+            ),
+            "c();\n"
+        );
+        assert_eq!(
+            emit("if (a) {\n    /* a\n       b */\n    f();\n}\n", false),
+            "if (a) {\n    /* a\n       b */\n    f();\n}\n"
+        );
+        assert_eq!(emit("// above\nvar x; // t\n// end\n", true), "var x;\n");
     }
 
     #[test]

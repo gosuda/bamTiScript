@@ -36,10 +36,56 @@ pub(super) fn install<H: Host>(
         weak_set_constructor::<H>,
     );
 
+    for constructor in [map.constructor, set.constructor] {
+        let species = install_function(
+            heap,
+            builtins,
+            "get [Symbol.species]",
+            0,
+            super::regexp_protocol::species_getter::<H>,
+        );
+        super::define_symbol_property(
+            heap,
+            constructor,
+            builtins.symbol_species(),
+            crate::Property::Accessor {
+                getter: Some(species),
+                setter: None,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+
     let group_by = install_function(heap, builtins, "groupBy", 2, map_group_by::<H>);
     define_constructor_data(heap, map.constructor, "groupBy", group_by);
     let map_set = install_function(heap, builtins, "set", 2, strong_map_set::<H>);
     define_data(heap, map.prototype, "set", map_set);
+    for (target, name, handler) in [
+        (
+            map.prototype,
+            "getOrInsert",
+            map_get_or_insert::<H> as BuiltinHandler<H>,
+        ),
+        (
+            map.prototype,
+            "getOrInsertComputed",
+            map_get_or_insert_computed::<H>,
+        ),
+        (
+            weak_map.prototype,
+            "getOrInsert",
+            weak_map_get_or_insert::<H>,
+        ),
+        (
+            weak_map.prototype,
+            "getOrInsertComputed",
+            weak_map_get_or_insert_computed::<H>,
+        ),
+    ] {
+        let function = install_function(heap, builtins, name, 2, handler);
+        define_data(heap, target, name, function);
+    }
     let set_add = install_function(heap, builtins, "add", 1, strong_set_add::<H>);
     define_data(heap, set.prototype, "add", set_add);
 
@@ -199,6 +245,112 @@ fn strong_set_add<H: Host>(
     let value = canonical_collection_key(args.first().copied().unwrap_or(Value::UNDEFINED));
     put_strong_entry(machine, this, value, value, CollectionKind::Set)?;
     Ok(BuiltinOutcome::Value(this))
+}
+
+/// The key `getOrInsert*` stores: `Map` canonicalizes `-0`, and `WeakMap`
+/// refuses anything that cannot be held weakly.
+fn upsert_key<H: Host>(
+    machine: &Machine<'_, H>,
+    key: Value,
+    kind: CollectionKind,
+) -> Result<Value, EvalFailure> {
+    if kind == CollectionKind::WeakMap {
+        super::collections::require_weak_key(machine, key)?;
+        return Ok(key);
+    }
+    Ok(canonical_collection_key(key))
+}
+
+fn existing_value<H: Host>(machine: &Machine<'_, H>, slot: usize, key: Value) -> Option<Value> {
+    let HeapEntry::Collection { entries, index, .. } = &machine.heap[slot] else {
+        unreachable!("collection brand was checked")
+    };
+    index
+        .get(machine, entries, key)
+        .map(|entry_index| entries[entry_index].value)
+}
+
+fn get_or_insert<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    kind: CollectionKind,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let slot = super::collections::collection_slot(machine, this, kind)?;
+    let key = upsert_key(
+        machine,
+        args.first().copied().unwrap_or(Value::UNDEFINED),
+        kind,
+    )?;
+    if let Some(existing) = existing_value(machine, slot, key) {
+        return Ok(BuiltinOutcome::Value(existing));
+    }
+    let value = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    super::collections::append_collection_entry(machine, slot, key, value)?;
+    Ok(BuiltinOutcome::Value(value))
+}
+
+/// The callback may change the collection, so its result is stored by a fresh
+/// lookup rather than at a position found before the call.
+fn get_or_insert_computed<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    kind: CollectionKind,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let slot = super::collections::collection_slot(machine, this, kind)?;
+    let key = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let key = upsert_key(machine, key, kind)?;
+    let callback = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    if !machine.is_callable(callback)? {
+        return Err(type_error("getOrInsertComputed callback is not callable"));
+    }
+    if let Some(existing) = existing_value(machine, slot, key) {
+        return Ok(BuiltinOutcome::Value(existing));
+    }
+    let depth = machine.native_roots.len();
+    machine.push_native_roots(depth, &[this, key, callback]);
+    let value = machine.call_value(callback, Value::UNDEFINED, &[key]);
+    machine.pop_native_roots(depth);
+    let value = value?;
+    super::collections::map_put(machine, this, key, value, kind)?;
+    Ok(BuiltinOutcome::Value(value))
+}
+
+fn map_get_or_insert<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    get_or_insert(machine, this, args, CollectionKind::Map)
+}
+
+fn map_get_or_insert_computed<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    get_or_insert_computed(machine, this, args, CollectionKind::Map)
+}
+
+fn weak_map_get_or_insert<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    get_or_insert(machine, this, args, CollectionKind::WeakMap)
+}
+
+fn weak_map_get_or_insert_computed<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    get_or_insert_computed(machine, this, args, CollectionKind::WeakMap)
 }
 
 fn canonical_collection_key(value: Value) -> Value {
@@ -523,6 +675,178 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         test(&mut machine);
+    }
+
+    fn invoke(
+        machine: &mut Machine<'_, TestHost>,
+        receiver: Value,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        let method = machine.get_named_property(receiver, name).unwrap();
+        machine.call_value(method, receiver, args)
+    }
+
+    fn compute_seven(
+        _machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(Value::int32(7)))
+    }
+
+    /// Stores into the map before returning, as a user callback may.
+    fn insert_during_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let global = machine.intrinsics.global("globalThis").unwrap();
+        let map = machine.get_named_property(global, "upsertTarget").unwrap();
+        invoke(machine, map, "set", &[args[0], Value::int32(1)])?;
+        Ok(BuiltinOutcome::Value(Value::int32(2)))
+    }
+
+    fn native_callback(
+        machine: &mut Machine<'_, TestHost>,
+        name: &'static str,
+        handler: crate::intrinsics::BuiltinHandler<TestHost>,
+    ) -> Value {
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name,
+            length: 1,
+            handler,
+        });
+        crate::intrinsics::native_function(&mut machine.heap, id, name, 1)
+    }
+
+    fn new_collection(machine: &mut Machine<'_, TestHost>, name: &str) -> Value {
+        let constructor = machine.intrinsics.global(name).unwrap();
+        machine.construct_value(constructor, &[]).unwrap()
+    }
+
+    #[test]
+    fn get_or_insert_keeps_an_existing_value_and_canonicalizes_negative_zero() {
+        with_machine(|machine| {
+            let map = new_collection(machine, "Map");
+            let negative_zero = Value::number(-0.0);
+            assert_eq!(
+                invoke(
+                    machine,
+                    map,
+                    "getOrInsert",
+                    &[negative_zero, Value::int32(1)]
+                )
+                .unwrap(),
+                Value::int32(1)
+            );
+            assert_eq!(
+                invoke(
+                    machine,
+                    map,
+                    "getOrInsert",
+                    &[Value::int32(0), Value::int32(2)]
+                )
+                .unwrap(),
+                Value::int32(1),
+                "-0 and +0 are one key"
+            );
+            let keys = invoke(machine, map, "keys", &[]).unwrap();
+            let first = invoke(machine, keys, "next", &[]).unwrap();
+            let key = machine.get_named_property(first, "value").unwrap();
+            assert!(
+                matches!(key.decode(), Some(Decoded::Number(zero)) if zero.is_sign_positive())
+                    || key == Value::int32(0),
+                "the stored key is +0"
+            );
+        });
+    }
+
+    #[test]
+    fn get_or_insert_computed_calls_back_only_for_a_missing_key() {
+        with_machine(|machine| {
+            let map = new_collection(machine, "Map");
+            let compute = native_callback(machine, "compute seven", compute_seven);
+            assert_eq!(
+                invoke(
+                    machine,
+                    map,
+                    "getOrInsertComputed",
+                    &[Value::int32(1), compute]
+                )
+                .unwrap(),
+                Value::int32(7)
+            );
+            let non_callable = Value::int32(0);
+            assert!(matches!(
+                invoke(
+                    machine,
+                    map,
+                    "getOrInsertComputed",
+                    &[Value::int32(1), non_callable]
+                ),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        });
+    }
+
+    #[test]
+    fn a_key_stored_by_the_callback_is_overwritten_not_duplicated() {
+        with_machine(|machine| {
+            let map = new_collection(machine, "Map");
+            let global = machine.intrinsics.global("globalThis").unwrap();
+            machine
+                .set_data_property(global, "upsertTarget", map)
+                .unwrap();
+            let callback =
+                native_callback(machine, "insert during callback", insert_during_callback);
+            assert_eq!(
+                invoke(
+                    machine,
+                    map,
+                    "getOrInsertComputed",
+                    &[Value::int32(5), callback]
+                )
+                .unwrap(),
+                Value::int32(2)
+            );
+            assert_eq!(
+                invoke(machine, map, "get", &[Value::int32(5)]).unwrap(),
+                Value::int32(2)
+            );
+            assert_eq!(
+                machine.get_named_property(map, "size").unwrap(),
+                Value::int32(1)
+            );
+        });
+    }
+
+    #[test]
+    fn weak_map_get_or_insert_rejects_keys_that_cannot_be_held_weakly() {
+        with_machine(|machine| {
+            let weak_map = new_collection(machine, "WeakMap");
+            let key = ordinary_object(machine);
+            assert_eq!(
+                invoke(machine, weak_map, "getOrInsert", &[key, Value::int32(1)]).unwrap(),
+                Value::int32(1)
+            );
+            assert!(matches!(
+                invoke(machine, weak_map, "getOrInsert", &[Value::int32(1), key]),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+            let compute = native_callback(machine, "compute seven", compute_seven);
+            assert!(matches!(
+                invoke(
+                    machine,
+                    weak_map,
+                    "getOrInsertComputed",
+                    &[Value::int32(1), compute]
+                ),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        });
     }
 
     fn builtin_id(machine: &Machine<'_, TestHost>, value: Value) -> crate::intrinsics::BuiltinId {

@@ -17,7 +17,7 @@ use crate::schema::{
     set_difference_detail, set_mismatch, sha256_hex, source_by_name, string_set, validate_digest,
     validate_manifest, validate_sha256,
 };
-use crate::{ErrorCode, Gate, GateReport, Result, VerificationError};
+use crate::{ErrorCode, Gate, GateReport, Result, VerificationError, rebuild::LEDGER_SCHEMA};
 
 const TOOLCHAINS_PATH: &str = "formal/toolchains.toml";
 const LEDGER_PATH: &str = "proof/completeness-ledger.json";
@@ -114,7 +114,6 @@ struct LedgerMetadata {
 }
 
 struct LedgerRow {
-    case: String,
     catalog: String,
     citation: String,
     id: String,
@@ -162,7 +161,6 @@ impl LedgerState {
 
         for (field, value) in [
             ("catalog", row.catalog.as_str()),
-            ("case", row.case.as_str()),
             ("id", row.id.as_str()),
             ("state", row.state.as_str()),
         ] {
@@ -175,13 +173,13 @@ impl LedgerState {
             }
         }
 
-        let expected_id = format!("{}:{}", row.catalog, row.case);
-        if row.id != expected_id {
+        let case = row.id.strip_prefix(&format!("{}:", row.catalog));
+        if !case.is_some_and(is_nonempty) {
             self.record_error(VerificationError::new(
                 ErrorCode::Schema,
                 format!(
-                    "{LEDGER_PATH}: row id `{}` does not equal `{expected_id}`",
-                    row.id
+                    "{LEDGER_PATH}: row id `{}` names no case in catalog `{}`",
+                    row.id, row.catalog
                 ),
             ));
             return;
@@ -487,11 +485,11 @@ fn stream_ledger(
 }
 
 fn validate_ledger_metadata(ledger: &LedgerMetadata, manifest_sha256: &str) -> Result<()> {
-    if ledger.schema != "bamti.completeness-ledger/v1" {
+    if ledger.schema != LEDGER_SCHEMA {
         return Err(VerificationError::new(
             ErrorCode::Schema,
             format!(
-                "{LEDGER_PATH}: expected schema `bamti.completeness-ledger/v1`, found `{}`",
+                "{LEDGER_PATH}: expected schema `{LEDGER_SCHEMA}`, found `{}`",
                 ledger.schema
             ),
         ));
@@ -735,7 +733,6 @@ impl<'de, 'a> Visitor<'de> for RowVisitor<'a> {
     where
         A: MapAccess<'de>,
     {
-        let mut case = None;
         let mut catalog = None;
         let mut citation = None;
         let mut id = None;
@@ -751,7 +748,6 @@ impl<'de, 'a> Visitor<'de> for RowVisitor<'a> {
             }
 
             match key.as_str() {
-                "case" => read_ledger_string(&mut map, &mut case, "row", "case", self.state)?,
                 "catalog" => {
                     read_ledger_string(&mut map, &mut catalog, "row", "catalog", self.state)?
                 }
@@ -776,13 +772,8 @@ impl<'de, 'a> Visitor<'de> for RowVisitor<'a> {
         }
 
         let missing = [
-            ("case", case.is_none()),
             ("catalog", catalog.is_none()),
-            ("citation", citation.is_none()),
             ("id", id.is_none()),
-            ("matcher", matcher.is_none()),
-            ("owner", owner.is_none()),
-            ("reason", reason.is_none()),
             ("state", state.is_none()),
         ]
         .into_iter()
@@ -795,28 +786,17 @@ impl<'de, 'a> Visitor<'de> for RowVisitor<'a> {
             return Ok(());
         }
 
-        let (
-            Some(case),
-            Some(catalog),
-            Some(citation),
-            Some(id),
-            Some(matcher),
-            Some(owner),
-            Some(reason),
-            Some(state),
-        ) = (case, catalog, citation, id, matcher, owner, reason, state)
-        else {
+        let (Some(catalog), Some(id), Some(state)) = (catalog, id, state) else {
             return Ok(());
         };
 
         self.state.process_row(LedgerRow {
-            case,
             catalog,
-            citation,
+            citation: citation.unwrap_or_default(),
             id,
-            matcher,
-            owner,
-            reason,
+            matcher: matcher.unwrap_or_default(),
+            owner: owner.unwrap_or_default(),
+            reason: reason.unwrap_or_default(),
             state,
         });
         Ok(())
@@ -1025,7 +1005,6 @@ mod tests {
                     "BLOCKING_FAIL"
                 };
                 json!({
-                    "case": case,
                     "catalog": catalog,
                     "citation": format!("https://example.invalid/{id}"),
                     "id": id,
@@ -1039,7 +1018,7 @@ mod tests {
         json!({
             "manifest_sha256": manifest_sha256,
             "rows": rows,
-            "schema": "bamti.completeness-ledger/v1",
+            "schema": LEDGER_SCHEMA,
             "states": P0_STATES,
         })
     }
@@ -1163,12 +1142,72 @@ mod tests {
     }
 
     #[test]
+    fn a_pass_row_needs_no_prose_and_a_non_pass_row_does() {
+        let bare = |ledger: &mut Value| {
+            let row = &mut ledger["rows"].as_array_mut().unwrap()[0];
+            for field in ["citation", "matcher", "owner", "reason"] {
+                row.as_object_mut().unwrap().remove(field);
+            }
+        };
+        let fixture_a = fixture();
+        mutate_ledger(&fixture_a, |ledger| {
+            bare(ledger);
+            ledger["rows"][0]["state"] = json!("PASS");
+        });
+        verify_ledger_g0(&fixture_a.root).expect("a PASS row is three fields");
+
+        let fixture_b = fixture();
+        mutate_ledger(&fixture_b, bare);
+        assert_eq!(
+            verify_ledger_g0(&fixture_b.root).unwrap_err().code(),
+            ErrorCode::Transition
+        );
+    }
+
+    #[test]
+    fn a_v1_ledger_is_not_read_as_v2() {
+        let schema = fixture();
+        mutate_ledger(&schema, |ledger| {
+            ledger["schema"] = json!("bamti.completeness-ledger/v1");
+        });
+        assert_eq!(
+            verify_ledger_g0(&schema.root).unwrap_err().code(),
+            ErrorCode::Schema
+        );
+
+        let row = fixture();
+        mutate_ledger(&row, |ledger| {
+            ledger["rows"][0]["case"] = json!("fixture");
+        });
+        assert_eq!(
+            verify_ledger_g0(&row.root).unwrap_err().code(),
+            ErrorCode::Schema
+        );
+    }
+
+    #[test]
+    fn a_row_id_must_name_a_case_in_its_catalog() {
+        for id in ["typescript-6.0.2:elsewhere", "typescript-7.0.2:"] {
+            let fixture = fixture();
+            mutate_ledger(&fixture, |ledger| {
+                let row = &mut ledger["rows"].as_array_mut().unwrap()[0];
+                row["catalog"] = json!("typescript-7.0.2");
+                row["id"] = json!(id);
+            });
+            assert_eq!(
+                verify_ledger_g0(&fixture.root).unwrap_err().code(),
+                ErrorCode::Schema,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_extra_ledger_rows() {
         let fixture = fixture();
         mutate_ledger(&fixture, |ledger| {
             let rows = ledger["rows"].as_array_mut().unwrap();
             let mut extra = rows[0].clone();
-            extra["case"] = json!("case-extra");
             extra["id"] = json!("typescript-7.0.2:case-extra");
             rows.push(extra);
         });

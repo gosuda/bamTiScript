@@ -34,7 +34,7 @@ The workspace root `Cargo.toml` enforces a strict lint policy:
 unsafe_code = "forbid"
 ```
 
-The root policy defaults to `unsafe_code = "forbid"`. Most crates inherit it. `bamts-codegen`, `bamts-node`, and `bamts-verification` use `deny` with narrowly scoped exceptions. `bamts-native` contains documented unsafe FFI and native-bridge code. This policy and encapsulation are not an end-to-end memory-safety proof.
+The root policy defaults to `unsafe_code = "forbid"`. Most crates inherit it. `bamts-codegen`, `bamts-napi`, `bamts-node`, `bamts-platform`, and `bamts-verification` use `deny` with narrowly scoped exceptions. `bamts-native` contains documented unsafe FFI and native-bridge code. This policy and encapsulation are not an end-to-end memory-safety proof.
 
 ### Host C toolchain
 

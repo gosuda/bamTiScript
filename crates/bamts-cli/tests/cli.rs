@@ -204,7 +204,8 @@ fn api_transport_serves_socket_backed_stdin() {
     drop(peer);
 
     assert_success(&output, "bamts --api");
-    let canonical_root = fs::canonicalize(&directory.path).expect("session root canonicalizes");
+    let canonical_root = bamts_compiler::project::canonical::canonicalize(&directory.path)
+        .expect("session root canonicalizes");
     let responses = decode_frames(&output.stdout);
     assert_eq!(
         responses,
@@ -292,7 +293,7 @@ process.stdout.write(process.env.BAMTS_AOT_ENTRYPOINT === undefined ? "hidden\n"
 
     let expected = format!(
         "bamts\n{}\nfirst\nsecond\nhidden\n",
-        fs::canonicalize(project.path.join("main.ts"))
+        bamts_compiler::project::canonical::canonicalize(project.path.join("main.ts"))
             .expect("entrypoint canonicalizes")
             .display()
     );
@@ -650,6 +651,120 @@ fn aot_fixture_matches_jit_stdout_and_exit_code() {
     assert_eq!(output.stdout, EXPECTED_STDOUT);
 }
 
+/// `/BREPRO` leaves the link time out of the file, so the Microsoft linker gives the
+/// same bytes for the same inputs. The test pins the flag, which only it can set.
+#[cfg(target_env = "msvc")]
+#[test]
+fn aot_executables_for_the_same_source_have_the_same_bytes() {
+    let directory = ScratchDirectory::new();
+    let mut images = Vec::new();
+    for name in ["first", "second"] {
+        let executable = directory
+            .path
+            .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        let compile = directory.emit(&fixture().to_string_lossy(), &executable);
+        assert_success(&compile, "bamts tsc-compatible emit");
+        images.push(fs::read(&executable).expect("the linked executable"));
+        // The link time has a resolution of one second.
+        std::thread::sleep(Duration::from_millis(1100));
+    }
+    assert!(images[0] == images[1], "the two executables differ");
+}
+
+/// `link.exe` looks for a library named without a path in its working directory
+/// before `LIB`. A file in the project named like a system library must not be what
+/// the executable is linked against.
+#[cfg(target_env = "msvc")]
+#[test]
+fn a_file_in_the_project_named_like_a_system_library_is_not_linked() {
+    let directory = ScratchDirectory::new();
+    fs::write(directory.path.join("kernel32.lib"), b"not a library").expect("the stray file");
+    let executable = directory
+        .path
+        .join(format!("hello{}", std::env::consts::EXE_SUFFIX));
+
+    let compile = directory.emit(&fixture().to_string_lossy(), &executable);
+    assert_success(&compile, "bamts emit beside a stray kernel32.lib");
+
+    let output = Command::new(&executable)
+        .output()
+        .expect("compiled executable starts");
+    assert_success(&output, "compiled fixture");
+    assert_eq!(output.stdout, EXPECTED_STDOUT);
+}
+
+/// A recursion past the guest stack throws `RangeError`, which ends the program with
+/// exit code 1, as in Node. A native stack overflow would end the process with no
+/// message, with 0xC00000FD on Windows.
+#[test]
+fn aot_deep_recursion_throws_range_error_before_the_end_of_the_stack() {
+    let output = run_compiled_module(
+        "function down(n: number): number {\n  return n === 0 ? 0 : 1 + down(n - 1);\n}\n\
+         console.log(down(100000));\n\
+         export {};\n",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("Maximum call stack size exceeded"),
+        "stderr:\n{stderr}"
+    );
+}
+
+/// The guest stack of a compiled program is about as deep as that of Node, and each
+/// call that passes it throws `RangeError`: a recursion, a recursion through a
+/// builtin callback, a construction, a construction through a builtin, a generator
+/// delegation, a proxy chain, and chains of generators and of async generators that
+/// resume the next one. The output is that of Node 24.
+#[test]
+fn a_compiled_program_has_a_stack_as_deep_as_node() {
+    let output = run_compiled_module(
+        "// @ts-nocheck\n\
+         function down(n) { return down(n + 1) + 1; }\n\
+         try { down(0); } catch (error) { console.log(error instanceof RangeError, error.message); }\n\
+         const callback = () => [0].map(callback);\n\
+         try { callback(); } catch (error) { console.log(error.name); }\n\
+         class Deep { constructor(n) { new Deep(n + 1); } }\n\
+         try { new Deep(0); } catch (error) { console.log(error.name); }\n\
+         class Reflected { constructor(n) { Reflect.construct(Reflected, [n + 1]); } }\n\
+         try { new Reflected(0); } catch (error) { console.log(error.name); }\n\
+         function* nest() { yield* nest(); }\n\
+         try { [...nest()]; } catch (error) { console.log(error.name); }\n\
+         let proxy = {};\n\
+         for (let i = 0; i < 20000; i++) proxy = new Proxy(proxy, {});\n\
+         try { proxy.x; } catch (error) { console.log(error.name); }\n\
+         const chain = [];\n\
+         function* link(i) { chain[i + 1].next(); }\n\
+         for (let i = 0; i < 20000; i++) chain.push(link(i));\n\
+         try { chain[0].next(); } catch (error) { console.log(error.name); }\n\
+         const tasks = [];\n\
+         async function* task(i) { await tasks[i + 1].next(); }\n\
+         for (let i = 0; i < 20000; i++) tasks.push(task(i));\n\
+         tasks[0].next().then(() => console.log('done'), (error) => console.log(error.name));\n\
+         function count(n) { return n === 0 ? 0 : 1 + count(n - 1); }\n\
+         console.log(count(5000));\n\
+         export {};\n",
+    );
+    assert_success(&output, "the calls past the guest stack");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "true Maximum call stack size exceeded\nRangeError\nRangeError\nRangeError\nRangeError\n\
+         RangeError\nRangeError\n5000\nRangeError\n"
+    );
+}
+
+/// The compiler recurses on the main thread, whose stack `link.exe` sets to 1 MiB
+/// unless the build asks for more. This depth overflowed that stack.
+#[cfg(target_env = "msvc")]
+#[test]
+fn deep_nesting_does_not_overflow_the_stack_of_the_main_thread() {
+    let directory = ScratchDirectory::new();
+    let source = format!("const nested = {}0{};\n", "[".repeat(50), "]".repeat(50));
+    directory.write("nested.ts", &source);
+
+    assert_success(&directory.check("nested.ts"), "bamts check of deep nesting");
+}
+
 #[test]
 fn jit_runs_two_module_program_with_live_imported_mutation() {
     let project = ScratchDirectory::new();
@@ -662,6 +777,98 @@ fn jit_runs_two_module_program_with_live_imported_mutation() {
     let output = project.execute("jit", "main.ts", &[]);
     assert_execution_success(&output, "compiler/execute two-module JIT");
     assert_eq!(output.stdout, b"2\n");
+}
+
+/// Runs one compiled module and returns its output.
+fn run_compiled_module(source: &str) -> std::process::Output {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", source);
+    let executable = project
+        .path
+        .join(format!("module{}", std::env::consts::EXE_SUFFIX));
+    let compile = project.emit("main.ts", &executable);
+    assert_success(&compile, "bamts emit of a module");
+    Command::new(&executable)
+        .output()
+        .expect("the compiled module starts")
+}
+
+/// An import of a module's own export shares a cell with the export. The module
+/// writes the cell through the export, and only the import is read-only.
+#[test]
+fn a_module_writes_the_export_that_it_imports() {
+    let output = run_compiled_module(
+        "// @ts-nocheck\n\
+         import self from \"./main.js\";\n\
+         import { count as other } from \"./main.js\";\n\
+         export let count = 1;\n\
+         count = 2;\n\
+         export default 42;\n\
+         console.log(self, other);\n\
+         try {\n  other = 3;\n} catch (error) {\n  console.log(error.name);\n}\n",
+    );
+    assert_success(&output, "the module that imports itself");
+    assert_eq!(output.stdout, b"42 2\nTypeError\n");
+}
+
+#[test]
+fn a_read_before_a_module_binding_is_initialized_can_be_caught() {
+    let output = run_compiled_module(
+        "// @ts-nocheck\n\
+         import * as self from \"./main.js\";\n\
+         import { later as other } from \"./main.js\";\n\
+         for (const read of [() => later, () => other, () => self.later]) {\n\
+           try {\n    read();\n  } catch (error) {\n    console.log(error.name);\n  }\n\
+         }\n\
+         export let later = 1;\n\
+         console.log(later, other, self.later);\n",
+    );
+    assert_success(&output, "the reads before initialization");
+    assert_eq!(
+        output.stdout,
+        b"ReferenceError\nReferenceError\nReferenceError\n1 1 1\n"
+    );
+}
+
+/// A fatal error before the first `await` aborts the module in the turn that runs
+/// it, and then settles it again on the way out. A call with more arguments than
+/// the runtime takes is such an error.
+#[test]
+fn a_fatal_error_before_the_first_await_is_reported() {
+    let output = run_compiled_module(
+        "Math.max(...new Array(70000).fill(0));\n\
+         await 1;\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("exceeds runtime limit"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+/// The API keeps a budget of 1,000,000 instructions and 64 MiB, so that a request
+/// ends. A compiled program runs for its user and has neither.
+#[test]
+fn an_executable_runs_past_the_budget_of_the_api() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        "let total = 0;\n\
+         for (let index = 0; index < 1100000; index++) {\n  total += 1;\n}\n\
+         const parts: string[] = [];\n\
+         for (let index = 0; index < 40; index++) {\n  parts.push(\"x\".repeat(1 << 20));\n}\n\
+         console.log(total, parts.join(\"\").length);\n",
+    );
+
+    let executable = project
+        .path
+        .join(format!("long{}", std::env::consts::EXE_SUFFIX));
+    let compile = project.emit("main.ts", &executable);
+    assert_success(&compile, "bamts emit of a long program");
+    let output = Command::new(&executable)
+        .output()
+        .expect("the long program starts");
+    assert_success(&output, "the compiled long program");
+    assert_eq!(output.stdout, b"1100000 41943040\n");
 }
 
 #[test]
@@ -722,6 +929,133 @@ fn jit_supports_apply_and_bound_callables() {
     let output = project.execute("jit", "main.ts", &[]);
     assert_execution_success(&output, "compiler/execute callable JIT");
     assert!(output.stdout.is_empty());
+}
+
+/// Builtins that call builtins with no guest call between them: `String` of an
+/// array nested past the native stack. Node throws `RangeError` and goes on.
+const NESTED_STRING_PROGRAM: &str = "let nested: unknown[] = [];\n\
+     for (let i = 0; i < DEPTH; i++) nested = [nested];\n\
+     try { String(nested); } catch (error) { console.log((error as Error).name); }\n\
+     console.log(\"ok\");\n";
+
+/// An array whose `join` is `toString` calls itself through builtins alone, so it
+/// passes any stack bound, however deep that is.
+const BUILTIN_CYCLE_PROGRAM: &str = "const cycle: any = [];\n\
+     cycle.join = Array.prototype.toString;\n\
+     try { String(cycle); } catch (error) { console.log((error as Error).name); }\n\
+     console.log(\"ok\");\n";
+
+#[test]
+fn jit_throws_range_error_for_builtins_that_call_builtins_without_end() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", BUILTIN_CYCLE_PROGRAM);
+
+    let output = project.execute("jit", "main.ts", &[]);
+    assert_execution_success(&output, "compiler/execute builtin cycle JIT");
+    assert_eq!(output.stdout, b"RangeError\nok\n");
+}
+
+/// Node does not load a JavaScript module that breaks an early error, in the
+/// entrypoint or in a module that it imports. The CLI does not run one either.
+#[test]
+fn a_javascript_module_with_an_early_error_does_not_run() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.js",
+        "import { a } from \"./m.js\";\nconsole.log(a);\n",
+    );
+    project.write("m.js", "export const a;\n");
+    project.write(
+        "class.js",
+        "class C { constructor() {} \"constructor\"() {} }\nconsole.log(1);\n",
+    );
+    for (entrypoint, message) in [
+        ("main.js", "this declaration needs a value"),
+        ("class.js", "a class has one constructor"),
+    ] {
+        for target in ["--jit", "--aot"] {
+            let output = project
+                .command()
+                .args(["--run", target, "--js-compat", entrypoint])
+                .current_dir(&project.path)
+                .output()
+                .expect("bamts run starts");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{entrypoint} {target}: {stderr}"
+            );
+            assert!(output.stdout.is_empty(), "{entrypoint} {target}");
+            assert!(stderr.contains(message), "{entrypoint} {target}: {stderr}");
+        }
+    }
+}
+
+/// Node and the AOT tier both read an array nested 2,000 deep, so the JIT reads
+/// it too.
+#[test]
+fn jit_reads_a_nested_array_as_deep_as_node_does() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        "let nested: unknown[] = [];\n\
+         for (let i = 0; i < 2000; i++) nested = [nested];\n\
+         console.log(JSON.stringify(String(nested)));\n",
+    );
+
+    let output = project.execute("jit", "main.ts", &[]);
+    assert_execution_success(&output, "compiler/execute deep String JIT");
+    assert_eq!(output.stdout, b"\"\"\n");
+}
+
+/// Node parses JSON of any depth and writes it several thousand levels deep. Both
+/// tiers do too, past the 256 levels where they stopped before.
+#[test]
+fn json_reads_and_writes_text_far_deeper_than_256_levels() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        "const deep = (depth: number): string => \"[\".repeat(depth) + \"]\".repeat(depth);\n\
+         JSON.parse(deep(100000));\n\
+         console.log(\"parsed\");\n\
+         console.log(JSON.stringify(JSON.parse(deep(3000))) === deep(3000));\n",
+    );
+    for target in ["--jit", "--aot"] {
+        let output = project
+            .command()
+            .args(["--run", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .expect("bamts run starts");
+        assert!(
+            output.status.success(),
+            "{target}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"parsed\ntrue\n", "{target}");
+    }
+}
+
+#[test]
+fn aot_throws_range_error_for_builtins_that_call_builtins_without_end() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        &NESTED_STRING_PROGRAM.replace("DEPTH", "1000000"),
+    );
+    let executable = project
+        .path
+        .join(format!("nested{}", std::env::consts::EXE_SUFFIX));
+
+    let compile = project.emit("main.ts", &executable);
+    assert_success(&compile, "bamts tsc-compatible nested String AOT emit");
+
+    let output = Command::new(&executable)
+        .output()
+        .expect("nested String AOT executable starts");
+    assert_success(&output, "compiled nested String program");
+    assert_eq!(output.stdout, b"RangeError\nok\n");
 }
 
 #[test]

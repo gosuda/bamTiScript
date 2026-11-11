@@ -161,6 +161,7 @@ struct HeapCheckpoint {
     slot_bytes_len: usize,
     heap_bytes: usize,
     vacant_count: usize,
+    temporaries: usize,
 }
 impl HeapCheckpoint {
     fn capture<H: Host>(machine: &Machine<'_, H>) -> Self {
@@ -169,9 +170,11 @@ impl HeapCheckpoint {
             slot_bytes_len: machine.slot_bytes.len(),
             heap_bytes: machine.heap_bytes,
             vacant_count: machine.vacant_count,
+            temporaries: machine.builtin_temporaries.len(),
         }
     }
     fn rollback<H: Host>(self, machine: &mut Machine<'_, H>) {
+        machine.builtin_temporaries.truncate(self.temporaries);
         machine.heap.truncate(self.heap_len);
         machine.slot_bytes.truncate(self.slot_bytes_len);
         machine.heap_bytes = self.heap_bytes;
@@ -439,6 +442,8 @@ fn build_plan<H: Host>(
             | HeapEntry::AsyncFromSync { .. }
             | HeapEntry::DisposableStack { .. }
             | HeapEntry::ProcessEnv { .. }
+            | HeapEntry::Temporal { .. }
+            | HeapEntry::Intl { .. }
             | HeapEntry::Promise { .. }
             | HeapEntry::Timeout { .. }
             | HeapEntry::PromiseResolver { .. }

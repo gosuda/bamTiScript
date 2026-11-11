@@ -17,6 +17,7 @@ bamts-cli.workspace = true
 bamts-codegen.workspace = true
 bamts-compiler.workspace = true
 bamts-native.workspace = true
+bamts-platform.workspace = true
 bamts-node = { workspace = true, features = ["script-compiler"] }
 bamts-runtime.workspace = true
 libc = "=0.2.189"

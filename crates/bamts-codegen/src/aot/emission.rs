@@ -13,11 +13,14 @@ use super::{AotError, AotObject, compile_aot_with_cancel};
 use crate::{LowerError, ProgramLowerError};
 
 /// The target cells for which BamTS publishes AOT evidence.
-pub const SUPPORTED_TARGET_TRIPLES: [&str; 4] = [
+pub const SUPPORTED_TARGET_TRIPLES: [&str; 7] = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
     "s390x-unknown-linux-gnu",
     "riscv64gc-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
 ];
 
 /// Canonical code-generation properties for one registered target cell.
@@ -34,7 +37,7 @@ impl TargetDescriptor {
     pub fn lookup(target: &str) -> Result<Self, EmissionError> {
         if !SUPPORTED_TARGET_TRIPLES.contains(&target) {
             return Err(EmissionError::Target(AotError::TargetLookup(format!(
-                "`{target}` is not one of the four registered BamTS targets"
+                "`{target}` is not a registered BamTS target"
             ))));
         }
 
@@ -338,6 +341,20 @@ mod tests {
                 .endianness(),
             Endianness::Big
         );
+    }
+
+    #[test]
+    fn each_registered_target_emits_its_own_object_format() {
+        for (triple, magic) in [
+            ("x86_64-unknown-linux-gnu", &[0x7f, b'E', b'L', b'F'][..]),
+            ("aarch64-apple-darwin", &[0xcf, 0xfa, 0xed, 0xfe][..]),
+            ("x86_64-apple-darwin", &[0xcf, 0xfa, 0xed, 0xfe][..]),
+            ("x86_64-pc-windows-msvc", &[0x64, 0x86][..]),
+        ] {
+            let descriptor = TargetDescriptor::lookup(triple).expect("registered target resolves");
+            let emitted = emit_for_target(&program(42), &descriptor).expect("object emits");
+            assert!(emitted.bytes().starts_with(magic), "{triple}");
+        }
     }
 
     #[test]

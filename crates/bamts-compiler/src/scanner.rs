@@ -14,9 +14,10 @@
 //! resolved through *explicit* scanner operations rather than guesses:
 //!
 //! * A `/` is ambiguous between division and a regular-expression literal. The
-//!   default pass always emits [`TokenKind::Slash`]/[`TokenKind::SlashEq`]; a
-//!   caller with grammar context calls [`Scanner::rescan_regex`] to reinterpret
-//!   it as a [`TokenKind::RegularExpressionLiteral`].
+//!   default pass emits [`TokenKind::Slash`]/[`TokenKind::SlashEq`] unless the
+//!   token before it cannot end an expression; a caller with grammar context
+//!   calls [`Scanner::rescan_regex`] to reinterpret it as a
+//!   [`TokenKind::RegularExpressionLiteral`].
 //! * A `>` is ambiguous between a single relational operator and the start of a
 //!   shift/compound operator. The default pass greedily forms the longest
 //!   operator; a caller closing type arguments or a JSX tag calls
@@ -27,6 +28,7 @@
 //! deterministically instead of being guessed. A parser that drives the scanner
 //! itself may instead call [`Scanner::rescan_template_continuation`].
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
@@ -46,9 +48,9 @@ const UNTERMINATED_TEMPLATE: DiagnosticCode = DiagnosticCode::new("BAMTS-L003");
 const UNTERMINATED_REGEX: DiagnosticCode = DiagnosticCode::new("BAMTS-L004");
 /// A character that cannot begin any token.
 const UNEXPECTED_CHARACTER: DiagnosticCode = DiagnosticCode::new("BAMTS-L005");
-/// A malformed escape sequence.
+/// A `\x` escape without two hexadecimal digits.
 const INVALID_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L006");
-/// A malformed unicode escape sequence.
+/// A `\u` escape without a hexadecimal digit where one must be.
 const INVALID_UNICODE_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L007");
 /// A misplaced numeric separator.
 const INVALID_NUMERIC_SEPARATOR: DiagnosticCode = DiagnosticCode::new("BAMTS-L008");
@@ -58,6 +60,58 @@ const INVALID_NUMERIC_LITERAL: DiagnosticCode = DiagnosticCode::new("BAMTS-L009"
 const INVALID_BIGINT_LITERAL: DiagnosticCode = DiagnosticCode::new("BAMTS-L010");
 /// A `#` that does not begin a private identifier.
 const INVALID_PRIVATE_IDENTIFIER: DiagnosticCode = DiagnosticCode::new("BAMTS-L011");
+/// A `\u{...}` escape whose value is above U+10FFFF.
+const UNICODE_ESCAPE_OUT_OF_RANGE: DiagnosticCode = DiagnosticCode::new("BAMTS-L012");
+/// A `\u{...}` escape without its closing brace.
+const UNTERMINATED_UNICODE_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L013");
+/// A legacy octal escape, such as `\1` or `\08`, in a TypeScript file or in a
+/// template.
+const LEGACY_OCTAL_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L014");
+/// A `\8` or `\9` escape in a TypeScript file or in a template.
+const NON_OCTAL_DECIMAL_ESCAPE: DiagnosticCode = DiagnosticCode::new("BAMTS-L015");
+/// A `\u{...}` escape whose digits reach the end of the text.
+const UNICODE_ESCAPE_AT_END: DiagnosticCode = DiagnosticCode::new("BAMTS-L016");
+
+/// Whether `code` reports a malformed escape in the text of a literal. A tagged
+/// template accepts such an escape, so its text keeps none of these.
+pub(crate) fn is_escape_diagnostic(code: DiagnosticCode) -> bool {
+    [
+        INVALID_ESCAPE,
+        INVALID_UNICODE_ESCAPE,
+        UNICODE_ESCAPE_OUT_OF_RANGE,
+        UNTERMINATED_UNICODE_ESCAPE,
+        LEGACY_OCTAL_ESCAPE,
+        NON_OCTAL_DECIMAL_ESCAPE,
+        UNICODE_ESCAPE_AT_END,
+    ]
+    .contains(&code)
+}
+
+/// A malformed `\u` escape. Each fault names the UTF-16 range and the message
+/// that a literal reports for it.
+type EscapeFault = (DiagnosticCode, usize, usize, &'static str);
+
+/// Whether `code` reports a string, a template or a comment that is not closed.
+pub(crate) fn is_unterminated_diagnostic(code: DiagnosticCode) -> bool {
+    [
+        UNTERMINATED_STRING,
+        UNTERMINATED_BLOCK_COMMENT,
+        UNTERMINATED_TEMPLATE,
+    ]
+    .contains(&code)
+}
+
+/// `diagnostic` where TypeScript reports it. The scanner records a literal or
+/// a comment that is not closed over its whole text, so that the parser can
+/// drop the errors of text that it scans again. TypeScript reports it at the
+/// end of that text.
+pub(crate) fn at_reported_position(diagnostic: Diagnostic) -> Diagnostic {
+    if !is_unterminated_diagnostic(diagnostic.code()) {
+        return diagnostic;
+    }
+    let end = diagnostic.range().end();
+    diagnostic.with_range(TextRange::new(end, end).expect("an empty range is ordered"))
+}
 
 /// Scans a regular-expression literal starting at `text[0] == '/'`, returning
 /// `(consumed_utf16, terminated)`.  This is the single source of truth for
@@ -386,10 +440,10 @@ impl ScannedSource {
 
 /// Scans a whole source into an ordered token stream with recovery diagnostics.
 ///
-/// This is the default single-pass driver: `/` stays division and `>` forms the
-/// longest operator, both of which a grammar-aware caller can reinterpret with
-/// [`Scanner::rescan_regex`] and [`Scanner::rescan_greater_than`]. Template
-/// literals are fully segmented here.
+/// This is the default single-pass driver: `>` forms the longest operator and `/`
+/// is division unless nothing before it could be divided. A grammar-aware caller
+/// can reinterpret either with [`Scanner::rescan_regex`] and
+/// [`Scanner::rescan_greater_than`]. Template literals are fully segmented here.
 #[must_use]
 pub fn scan(
     source_id: SourceId,
@@ -420,13 +474,30 @@ pub fn scan_with_cancel(
     let (tokens, eof, diagnostics) = {
         let mut scanner = Scanner::new_with_cancel(source_id, script_kind, &source, cancel.clone());
         let mut tokens = Vec::new();
+        let mut previous = None;
         let eof = loop {
             if scanner.is_cancelled() {
                 break scanner.make(TokenKind::EndOfFile, scanner.position().get());
             }
-            let token = scanner.next_token();
+            let mut token = scanner.next_token();
+            if matches!(token.kind(), TokenKind::Slash | TokenKind::SlashEq)
+                && previous.is_some_and(cannot_end_expression)
+                && scanner.regex_closes_at_last_token()
+            {
+                token = scanner.rescan_regex();
+            }
             if token.kind() == TokenKind::EndOfFile || scanner.is_cancelled() {
                 break token;
+            }
+            if !matches!(
+                token.kind(),
+                TokenKind::Whitespace | TokenKind::LineComment | TokenKind::BlockComment
+            ) {
+                previous = Some(match previous {
+                    // A keyword here is a property name, so `o.in / 2` divides.
+                    Some(TokenKind::Dot | TokenKind::QuestionDot) => TokenKind::Identifier,
+                    _ => token.kind(),
+                });
             }
             tokens.push(token);
         };
@@ -445,6 +516,71 @@ pub fn scan_with_cancel(
         eof,
     };
     Ok(Recovered::new(product, diagnostics))
+}
+
+/// Whether no expression can end with `kind`, so a `/` after it has nothing to
+/// divide and can only start a regular expression. This needs no grammar: reading
+/// that `/` as division here would let a quote in the regex open a false string.
+/// Tokens an expression can end with, such as `)`, `}`, `]`, `!`, and `>`, stay
+/// with the parser, which knows what they closed. So does `<`, which opens a
+/// closing JSX tag.
+const fn cannot_end_expression(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::LParen
+            | TokenKind::LBracket
+            | TokenKind::LBrace
+            | TokenKind::Comma
+            | TokenKind::Semicolon
+            | TokenKind::Colon
+            | TokenKind::Question
+            | TokenKind::QuestionQuestion
+            | TokenKind::Arrow
+            | TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::StarStar
+            | TokenKind::Percent
+            | TokenKind::Eq
+            | TokenKind::EqEq
+            | TokenKind::EqEqEq
+            | TokenKind::BangEq
+            | TokenKind::BangEqEq
+            | TokenKind::Amp
+            | TokenKind::AmpAmp
+            | TokenKind::Pipe
+            | TokenKind::PipePipe
+            | TokenKind::Caret
+            | TokenKind::Tilde
+            | TokenKind::PlusEq
+            | TokenKind::MinusEq
+            | TokenKind::StarEq
+            | TokenKind::StarStarEq
+            | TokenKind::SlashEq
+            | TokenKind::PercentEq
+            | TokenKind::LessLessEq
+            | TokenKind::GreaterGreaterEq
+            | TokenKind::GreaterGreaterGreaterEq
+            | TokenKind::AmpEq
+            | TokenKind::AmpAmpEq
+            | TokenKind::PipeEq
+            | TokenKind::PipePipeEq
+            | TokenKind::CaretEq
+            | TokenKind::QuestionQuestionEq
+            | TokenKind::TemplateHead
+            | TokenKind::TemplateMiddle
+            | TokenKind::KwReturn
+            | TokenKind::KwTypeof
+            | TokenKind::KwCase
+            | TokenKind::KwThrow
+            | TokenKind::KwVoid
+            | TokenKind::KwDelete
+            | TokenKind::KwIn
+            | TokenKind::KwInstanceof
+            | TokenKind::KwNew
+            | TokenKind::KwElse
+            | TokenKind::KwDo
+    )
 }
 
 /// The kind of an open brace the scanner is currently inside, used to segment
@@ -627,6 +763,12 @@ impl<'a> Scanner<'a> {
         let start_u = self.utf16_pos;
         let kind = self.scan_regex(start_u);
         self.make(kind, start_u)
+    }
+
+    /// Whether a regular expression starting at the most recent token closes on
+    /// its own line. One that does not is left for the parser to judge.
+    fn regex_closes_at_last_token(&self) -> bool {
+        scan_regex_slice(&self.text[self.last_start_byte..]).1
     }
 
     /// Reinterprets the most recent `>`-family token as a single `>`, advancing
@@ -1028,7 +1170,7 @@ impl<'a> Scanner<'a> {
                     );
                     break;
                 }
-                Some('\\') => self.scan_escape(),
+                Some('\\') => self.scan_escape(false),
                 Some(_) => {
                     self.bump();
                 }
@@ -1073,7 +1215,7 @@ impl<'a> Scanner<'a> {
                         TokenKind::TemplateHead
                     };
                 }
-                Some('\\') => self.scan_escape(),
+                Some('\\') => self.scan_escape(true),
                 Some(_) => {
                     self.bump();
                 }
@@ -1305,35 +1447,30 @@ impl<'a> Scanner<'a> {
         keyword_kind(word).unwrap_or(TokenKind::Identifier)
     }
 
+    /// Scans a `\u` escape in a name. TypeScript reports a bad one as an invalid
+    /// character at its backslash.
     fn scan_identifier_escape(&mut self, is_start: bool) {
-        let esc_start = self.utf16_pos;
+        let backslash = self.utf16_pos;
         self.bump();
-        if self.first() != Some('u') {
+        let valid = self.first() == Some('u') && {
+            self.bump();
+            self.read_hex_code_point().is_ok_and(|code_point| {
+                char::from_u32(code_point).is_some_and(|character| {
+                    if is_start {
+                        is_id_start(character)
+                    } else {
+                        is_id_continue(character)
+                    }
+                })
+            })
+        };
+        if !valid {
             self.error(
-                INVALID_UNICODE_ESCAPE,
-                esc_start,
-                self.utf16_pos,
-                "an identifier escape must be a unicode escape",
+                UNEXPECTED_CHARACTER,
+                backslash,
+                backslash + 1,
+                "this escape does not name a character of an identifier",
             );
-            return;
-        }
-        self.bump();
-        if let Some(code_point) = self.read_hex_code_point(esc_start) {
-            let valid = char::try_from(code_point).ok().is_some_and(|character| {
-                if is_start {
-                    is_id_start(character)
-                } else {
-                    is_id_continue(character)
-                }
-            });
-            if !valid {
-                self.error(
-                    INVALID_UNICODE_ESCAPE,
-                    esc_start,
-                    self.utf16_pos,
-                    "the escaped code point is not a valid identifier character",
-                );
-            }
         }
     }
 
@@ -1388,11 +1525,24 @@ impl<'a> Scanner<'a> {
         TokenKind::PrivateIdentifier
     }
 
-    fn scan_escape(&mut self) {
-        let esc_start = self.utf16_pos;
+    /// Scans an escape in the text of a string or a `template`. TypeScript reports
+    /// a bad escape at the character where the escape goes wrong. Sloppy
+    /// JavaScript accepts a legacy octal escape in a string, but no JavaScript
+    /// accepts one in a template.
+    fn scan_escape(&mut self, template: bool) {
+        let backslash = self.utf16_pos;
         self.bump();
         match self.first() {
             None => {}
+            Some('0'..='9')
+                if template
+                    || matches!(
+                        self.script_kind,
+                        ScriptKind::TypeScript | ScriptKind::TypeScriptReact
+                    ) =>
+            {
+                self.scan_digit_escape(backslash);
+            }
             // A line continuation consumes the terminator; CRLF counts as one.
             Some('\r') => {
                 self.bump();
@@ -1406,17 +1556,18 @@ impl<'a> Scanner<'a> {
             Some('x') => {
                 self.bump();
                 if !self.consume_fixed_hex(2) {
-                    self.error(
-                        INVALID_ESCAPE,
-                        esc_start,
-                        self.utf16_pos,
-                        "a hexadecimal escape requires two digits",
-                    );
+                    let fault =
+                        self.fault_here(INVALID_ESCAPE, "a hexadecimal escape requires two digits");
+                    self.report(fault);
                 }
             }
             Some('u') => {
                 self.bump();
-                let _ = self.read_hex_code_point(esc_start);
+                if let Err(faults) = self.read_hex_code_point() {
+                    for fault in faults {
+                        self.report(fault);
+                    }
+                }
             }
             Some(_) => {
                 self.bump();
@@ -1424,82 +1575,120 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Reads a `\u`-style code point after the `u` has been consumed, handling
-    /// both the fixed four-digit and braced forms and reporting malformations.
-    fn read_hex_code_point(&mut self, esc_start: usize) -> Option<u32> {
-        if self.first() == Some('{') {
-            self.bump();
+    /// Scans an escape that begins with a digit. TypeScript rejects `\8`, `\9`
+    /// and a legacy octal escape in every file. It accepts `\0` before a
+    /// character that is not a digit.
+    fn scan_digit_escape(&mut self, backslash: usize) {
+        let Some(first) = self.bump() else {
+            return;
+        };
+        if matches!(first, '8' | '9') {
+            self.error(
+                NON_OCTAL_DECIMAL_ESCAPE,
+                backslash,
+                self.utf16_pos,
+                format!("the escape `\\{first}` is not allowed"),
+            );
+            return;
+        }
+        if first == '0' && !self.first().is_some_and(|c| c.is_ascii_digit()) {
+            return;
+        }
+        // An escape that starts with 0 to 3 has up to three octal digits; one
+        // that starts with 4 to 7 has up to two.
+        let mut value = first.to_digit(8).unwrap_or(0);
+        let limit = if value < 4 { 3 } else { 2 };
+        for _ in 1..limit {
+            match self.first().and_then(|c| c.to_digit(8)) {
+                Some(digit) => {
+                    self.bump();
+                    value = value * 8 + digit;
+                }
+                None => break,
+            }
+        }
+        self.error(
+            LEGACY_OCTAL_ESCAPE,
+            backslash,
+            self.utf16_pos,
+            format!("a legacy octal escape is not allowed; write `\\x{value:02x}`"),
+        );
+    }
+
+    /// Reads the code point of a `\u` escape after its `u`, in the four-digit
+    /// or the braced form.
+    fn read_hex_code_point(&mut self) -> Result<u32, Vec<EscapeFault>> {
+        if self.first() != Some('{') {
             let mut value: u32 = 0;
-            let mut any = false;
-            let mut overflow = false;
-            while let Some(digit) = self.first().and_then(|c| c.to_digit(16)) {
-                if self.is_cancelled() {
-                    break;
-                }
-                self.bump();
-                any = true;
-                value = value.saturating_mul(16).saturating_add(digit);
-                if value > 0x0010_FFFF {
-                    overflow = true;
-                }
-            }
-            if self.first() == Some('}') {
-                self.bump();
-            } else {
-                self.error(
-                    INVALID_UNICODE_ESCAPE,
-                    esc_start,
-                    self.utf16_pos,
-                    "a unicode escape is missing its closing brace",
-                );
-                return None;
-            }
-            if !any {
-                self.error(
-                    INVALID_UNICODE_ESCAPE,
-                    esc_start,
-                    self.utf16_pos,
-                    "a unicode escape has no digits",
-                );
-                return None;
-            }
-            if overflow {
-                self.error(
-                    INVALID_UNICODE_ESCAPE,
-                    esc_start,
-                    self.utf16_pos,
-                    "a unicode escape is greater than the maximum code point",
-                );
-                return None;
-            }
-            Some(value)
-        } else {
-            let mut value: u32 = 0;
-            let mut count = 0;
-            while count < 4 {
-                if self.is_cancelled() {
-                    break;
-                }
+            for _ in 0..4 {
                 match self.first().and_then(|c| c.to_digit(16)) {
-                    Some(digit) => {
+                    Some(digit) if !self.is_cancelled() => {
                         self.bump();
                         value = value * 16 + digit;
-                        count += 1;
                     }
-                    None => break,
+                    _ => {
+                        return Err(vec![self.fault_here(
+                            INVALID_UNICODE_ESCAPE,
+                            "a unicode escape requires four hexadecimal digits",
+                        )]);
+                    }
                 }
             }
-            if count < 4 {
-                self.error(
-                    INVALID_UNICODE_ESCAPE,
-                    esc_start,
-                    self.utf16_pos,
-                    "a unicode escape requires four hexadecimal digits",
-                );
-                return None;
-            }
-            Some(value)
+            return Ok(value);
         }
+        self.bump();
+        let digits = self.utf16_pos;
+        let mut value: u32 = 0;
+        while let Some(digit) = self.first().and_then(|c| c.to_digit(16)) {
+            if self.is_cancelled() {
+                break;
+            }
+            self.bump();
+            value = value.saturating_mul(16).saturating_add(digit);
+        }
+        if self.utf16_pos == digits {
+            return Err(vec![self.fault_here(
+                INVALID_UNICODE_ESCAPE,
+                "a unicode escape has no digits",
+            )]);
+        }
+        let mut faults = Vec::new();
+        if value > 0x0010_FFFF {
+            faults.push((
+                UNICODE_ESCAPE_OUT_OF_RANGE,
+                digits,
+                self.utf16_pos,
+                "a unicode escape is greater than the maximum code point",
+            ));
+        }
+        match self.first() {
+            Some('}') => {
+                self.bump();
+            }
+            None => faults.push(self.fault_here(
+                UNICODE_ESCAPE_AT_END,
+                "a unicode escape reaches the end of the text",
+            )),
+            Some(_) => faults.push(self.fault_here(
+                UNTERMINATED_UNICODE_ESCAPE,
+                "a unicode escape is missing its closing brace",
+            )),
+        }
+        if faults.is_empty() {
+            Ok(value)
+        } else {
+            Err(faults)
+        }
+    }
+
+    /// A fault at the next character, or at the end of the text.
+    fn fault_here(&self, code: DiagnosticCode, message: &'static str) -> EscapeFault {
+        let width = self.first().map_or(0, char::len_utf16);
+        (code, self.utf16_pos, self.utf16_pos + width, message)
+    }
+
+    fn report(&mut self, (code, start, end, message): EscapeFault) {
+        self.error(code, start, end, message);
     }
 
     /// Consumes exactly `count` hexadecimal digits, or as many as are present,
@@ -1736,7 +1925,13 @@ impl<'a> Scanner<'a> {
         Token::new(kind, range)
     }
 
-    fn error(&mut self, code: DiagnosticCode, start_u: usize, end_u: usize, message: &'static str) {
+    fn error(
+        &mut self,
+        code: DiagnosticCode,
+        start_u: usize,
+        end_u: usize,
+        message: impl Into<Cow<'static, str>>,
+    ) {
         let range = TextRange::new(Utf16Pos::new(start_u), Utf16Pos::new(end_u))
             .expect("diagnostic ranges advance monotonically");
         self.diagnostics
@@ -2096,6 +2291,86 @@ mod tests {
         assert_tiles("\"open\nnext");
     }
 
+    /// Each escape fault is where `tsc` 7.0.2 reports it, in UTF-16 units:
+    /// TS1125 at the bad character, TS1198 over the digits, TS1199 where the
+    /// brace is missing, and TS1127 at the backslash of a name.
+    #[test]
+    fn escape_faults_are_where_typescript_reports_them() {
+        let faults = |text: &str| -> Vec<(DiagnosticCode, usize, usize)> {
+            scan_text(text)
+                .diagnostics()
+                .iter()
+                .map(|d| (d.code(), d.range().start().get(), d.range().end().get()))
+                .collect()
+        };
+        assert_eq!(faults(r#""\xg""#), [(INVALID_ESCAPE, 3, 4)]);
+        assert_eq!(faults(r#""ab\x1""#), [(INVALID_ESCAPE, 6, 7)]);
+        assert_eq!(faults("\"\\x😀\""), [(INVALID_ESCAPE, 3, 5)]);
+        assert_eq!(faults(r#""\u12""#), [(INVALID_UNICODE_ESCAPE, 5, 6)]);
+        assert_eq!(faults(r#""\u{}""#), [(INVALID_UNICODE_ESCAPE, 4, 5)]);
+        assert_eq!(faults(r#""\u{zz}""#), [(INVALID_UNICODE_ESCAPE, 4, 5)]);
+        assert_eq!(
+            faults(r#""\u{1234567}""#),
+            [(UNICODE_ESCAPE_OUT_OF_RANGE, 4, 11)]
+        );
+        assert_eq!(
+            faults(r#""\u{110000""#),
+            [
+                (UNICODE_ESCAPE_OUT_OF_RANGE, 4, 10),
+                (UNTERMINATED_UNICODE_ESCAPE, 10, 11)
+            ]
+        );
+        assert_eq!(faults(r#""\u{10FFFF}""#), []);
+        assert_eq!(faults(r#""\0" + "\0x""#), []);
+        assert_eq!(faults(r"var \u{30}x"), [(UNEXPECTED_CHARACTER, 4, 5)]);
+        assert_eq!(faults(r"a\u{110000}"), [(UNEXPECTED_CHARACTER, 1, 2)]);
+    }
+
+    /// `tsc` 7.0.2 rejects `\8`, `\9` and a legacy octal escape in a TypeScript
+    /// file, from the backslash to the end of the escape, and suggests the `\x`
+    /// form. A JavaScript string keeps them for sloppy code, and its early errors
+    /// reject them in strict code. A JavaScript template rejects them in all code.
+    #[test]
+    fn a_typescript_file_rejects_a_legacy_octal_escape() {
+        let found = |text: &str| -> Vec<(DiagnosticCode, usize, usize, String)> {
+            scan_text(text)
+                .diagnostics()
+                .iter()
+                .map(|d| {
+                    let range = d.range();
+                    let (start, end) = (range.start().get(), range.end().get());
+                    (d.code(), start, end, d.message().to_owned())
+                })
+                .collect()
+        };
+        let octal = |start, end, hex: &str| {
+            let message = format!("a legacy octal escape is not allowed; write `\\x{hex}`");
+            (LEGACY_OCTAL_ESCAPE, start, end, message)
+        };
+        assert_eq!(found(r#""\101""#), [octal(1, 5, "41")]);
+        assert_eq!(found(r#""\0123""#), [octal(1, 5, "0a")]);
+        assert_eq!(found(r#""\400""#), [octal(1, 4, "20")]);
+        assert_eq!(found(r#""\377""#), [octal(1, 5, "ff")]);
+        assert_eq!(found(r"'a\08b'"), [octal(2, 4, "00")]);
+        assert_eq!(found(r"`\1`"), [octal(1, 3, "01")]);
+        let message = "the escape `\\9` is not allowed".to_owned();
+        assert_eq!(
+            found(r#""\9x""#),
+            [(NON_OCTAL_DECIMAL_ESCAPE, 1, 3, message)]
+        );
+        let javascript = |text: &str| -> Vec<DiagnosticCode> {
+            let source = SourceText::new(text).expect("test source fits budget");
+            scan(SourceId::new(0), ScriptKind::JavaScript, Arc::new(source))
+                .diagnostics()
+                .iter()
+                .map(Diagnostic::code)
+                .collect()
+        };
+        assert_eq!(javascript(r#""\101" + "\8""#), []);
+        assert_eq!(javascript(r"`\0` + `a${1}\1`"), [LEGACY_OCTAL_ESCAPE]);
+        assert_eq!(javascript(r"`\8`"), [NON_OCTAL_DECIMAL_ESCAPE]);
+    }
+
     #[test]
     fn unterminated_block_comment_is_diagnosed() {
         let recovered = scan_text("/* nope");
@@ -2195,6 +2470,90 @@ mod tests {
             recovered.diagnostics()[0].code(),
             INVALID_PRIVATE_IDENTIFIER
         );
+    }
+
+    #[test]
+    fn a_regex_holding_a_quote_does_not_break_the_template_around_it() {
+        // Read as a division, the `'` opens a string that swallows the `}` and
+        // leaves the template unterminated.
+        let text = "`${k.replace(/'/g, \"\\\\'\")}`;\n";
+        let recovered = scan_text(text);
+        assert_eq!(recovered.diagnostics(), &[]);
+        let tokens = significant(text);
+        assert!(tokens.contains(&(TokenKind::RegularExpressionLiteral, "/'/g".to_owned())));
+        assert_eq!(
+            tokens.last().map(|token| token.0),
+            Some(TokenKind::Semicolon)
+        );
+    }
+
+    #[test]
+    fn a_slash_that_cannot_divide_starts_a_regex() {
+        for text in [
+            "x = /'/;",
+            "f(/'/);",
+            "[/'/];",
+            "a, /'/;",
+            "a ? /'/ : b;",
+            "return /'/;",
+            "typeof /'/;",
+            "x = /=/;",
+        ] {
+            assert!(
+                kinds(text).contains(&TokenKind::RegularExpressionLiteral),
+                "{text}"
+            );
+            assert_eq!(scan_text(text).diagnostics(), &[], "{text}");
+        }
+    }
+
+    #[test]
+    fn a_slash_after_a_keyword_named_property_stays_division() {
+        for text in [
+            "o.in / 2 / 1",
+            "o?.in / 2 / 1",
+            "o.typeof / 2 / 1",
+            "o.\n  return /* name */ / 2 / 1",
+        ] {
+            assert!(
+                !kinds(text).contains(&TokenKind::RegularExpressionLiteral),
+                "{text}"
+            );
+        }
+        assert!(kinds("x in / 2 / 1").contains(&TokenKind::RegularExpressionLiteral));
+    }
+
+    #[test]
+    fn a_slash_with_an_operand_before_it_stays_division() {
+        for text in [
+            "a / b / c",
+            "1 / 2 / 3",
+            "(a) / b / c",
+            "a[0] / b / c",
+            "x! / 2 / 3",
+            "a++ / b / c",
+            "a-- / b / c",
+            "f<T> / b / c",
+            "{} / b / c",
+            "this / b / c",
+        ] {
+            assert!(
+                !kinds(text).contains(&TokenKind::RegularExpressionLiteral),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_closing_tag_slash_stays_for_the_parser() {
+        assert!(!kinds("<a></a>").contains(&TokenKind::RegularExpressionLiteral));
+    }
+
+    #[test]
+    fn a_slash_that_never_closes_is_left_for_the_parser_to_judge() {
+        let text = "x = /abc\n";
+        assert!(kinds(text).contains(&TokenKind::Slash));
+        assert_eq!(scan_text(text).diagnostics(), &[]);
     }
 
     #[test]
@@ -2386,15 +2745,8 @@ mod tests {
 
     #[test]
     fn corpus_cases_lex_totally_and_tile() {
-        // The default pass does not guess `/` as a regular expression, so a
-        // file that uses a regex literal will not lex cleanly without the
-        // explicit `rescan_regex` a parser would drive. These files still must
-        // tile and round-trip; only the clean-diagnostics claim is waived.
-        const REGEX_LITERAL_CASES: &[&str] = &["escape-string-regexp.ts"];
-
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/cases");
         let mut scanned_any = false;
-        let mut regex_case_seen = false;
         for entry in std::fs::read_dir(&root).expect("corpus/cases must be readable") {
             let path = entry.expect("directory entry").path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("ts") {
@@ -2437,29 +2789,14 @@ mod tests {
                 "{name}: lexemes did not reproduce the source"
             );
 
-            if REGEX_LITERAL_CASES.contains(&name.as_str()) {
-                regex_case_seen = true;
-                // The no-guess contract means the default pass reports at least
-                // one diagnostic on a raw regex literal it cannot recognize.
-                assert!(
-                    !recovered.diagnostics().is_empty(),
-                    "{name}: expected the default pass to reject a regex literal"
-                );
-            } else {
-                // Every regex-free corpus driver is valid TypeScript and must
-                // lex cleanly under the default pass.
-                assert!(
-                    recovered.diagnostics().is_empty(),
-                    "{name}: unexpected diagnostics {:?}",
-                    recovered.diagnostics()
-                );
-            }
+            // Every corpus driver is valid TypeScript and must lex cleanly.
+            assert!(
+                recovered.diagnostics().is_empty(),
+                "{name}: unexpected diagnostics {:?}",
+                recovered.diagnostics()
+            );
         }
         assert!(scanned_any, "expected at least one corpus case");
-        assert!(
-            regex_case_seen,
-            "expected the regex-literal case to be present"
-        );
     }
 
     #[test]

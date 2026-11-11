@@ -1,16 +1,17 @@
 use super::{
-    CompilerOptions, JsonObject, JsonValue, PathError, ProjectRoot,
+    CompilerOptions, JsonObject, JsonValue, PackageJson, PathError, ProjectRoot,
     build_mode::{
         BUILD_INFO_SCHEMA, BuildInfo, BuildOutputs, is_project_up_to_date, options_signature,
         project_signature, source_signature,
     },
+    canonical::slash_text,
     output::{ArtifactKind, ArtifactSelection, OutputMapError, PlanRequest, map_output_paths},
     references::{ReferenceError, ReferenceGraph, resolve_config_file_name},
     tsconfig::{ProjectReference, ResolvedExtends, TsConfig, TsConfigError, resolve_extends},
 };
 use crate::{
     diagnostic::Diagnostic,
-    emitter::{self, EmitFileNames, EmitOptions},
+    emitter::{self, EmitFileNames, EmitOptions, ModuleKind},
     lint::{LintProfile, LintTable},
     pipeline::{FrontendMode, compile_program_frontend_with_lints},
     program::{JsxRoutingDecision, ProgramLoader, ProgramOutputKind},
@@ -391,6 +392,7 @@ pub fn compile_project<F: FileSystem + Clone>(
             .insert(artifact.kind, artifact.path.clone());
     }
     let jsx_route = program.jsx_routing_decision(ProgramOutputKind::JavaScript);
+    let erased_exports = checked.erased_exports(&program);
     let mut outputs = BuildOutputs::default();
     for module in checked.modules() {
         let source_path = sources
@@ -405,6 +407,16 @@ pub fn compile_project<F: FileSystem + Clone>(
             emit_options(project.options(), module.source_file().source_id());
         emit_options.declaration = selection.declaration;
         emit_options.emit_declaration_only = selection.declaration && !selection.javascript;
+        emit_options.verbatim_module_syntax = project.options().verbatim_module_syntax();
+        emit_options.keeps_imports = project.options().keeps_imports();
+        emit_options.erased_imports = Arc::new(checked.erased_imports(
+            &program,
+            &erased_exports,
+            module.source_file().source_id(),
+        ));
+        if emit_options.module == Some(ModuleKind::Node) {
+            emit_options.module = Some(node_module_format(project, source_path, fs));
+        }
         diagnostics.extend(option_diagnostics);
         match jsx_route {
             JsxRoutingDecision::Emit | JsxRoutingDecision::TransformAndEmit => {
@@ -545,17 +557,17 @@ fn surface_map_names(
     // map directory back to the original source.
     let source_name = match source_root {
         Some(root) if has_explicit_source_root && !root.is_empty() => {
-            Some(Arc::<str>::from(source_relative.to_string_lossy().as_ref()))
+            Some(Arc::<str>::from(slash_text(&source_relative)))
         }
         _ => {
             let map_directory = map_path.parent().unwrap_or_else(|| Path::new(""));
             let relative_to_map = relative_path_between(map_directory, source_path);
-            Some(Arc::<str>::from(relative_to_map.to_string_lossy().as_ref()))
+            Some(Arc::<str>::from(slash_text(&relative_to_map)))
         }
     };
 
     let source_map_url = map_root.map(|root| {
-        let source_relative_identity = format!("{}.map", output_relative.to_string_lossy());
+        let source_relative_identity = format!("{}.map", slash_text(&output_relative));
         if is_url_like(root) || root.starts_with('/') {
             Arc::<str>::from(join_url_segments(root, &source_relative_identity))
         } else {
@@ -563,7 +575,7 @@ fn surface_map_names(
             let output_directory = output_path.parent().unwrap_or_else(|| Path::new(""));
             let url =
                 relative_path_between(output_directory, &base.join(&source_relative_identity));
-            Arc::<str>::from(url.to_string_lossy().as_ref())
+            Arc::<str>::from(slash_text(&url))
         }
     });
 
@@ -704,6 +716,7 @@ fn emit_options(options: &CompilerOptions, source_id: SourceId) -> (EmitOptions,
         ("inlineSources", options.inline_sources()),
         ("alwaysStrict", options.always_strict()),
         ("noEmitHelpers", options.no_emit_helpers()),
+        ("removeComments", options.remove_comments()),
     ] {
         if enabled {
             directives.insert(name.to_owned(), String::from("true"));
@@ -727,6 +740,31 @@ fn emit_options(options: &CompilerOptions, source_id: SourceId) -> (EmitOptions,
     );
 
     (emit_options, diagnostics)
+}
+
+/// What a Node module mode emits for one file: the extension decides, then the
+/// `type` of the nearest `package.json`, and a file with neither is CommonJS.
+fn node_module_format(
+    project: &EffectiveProject,
+    source: &Path,
+    fs: &dyn FileSystem,
+) -> ModuleKind {
+    match source.extension().and_then(|extension| extension.to_str()) {
+        Some("mts" | "mjs") => return ModuleKind::EsNext,
+        Some("cts" | "cjs") => return ModuleKind::CommonJs,
+        _ => {}
+    }
+    let root = project.root();
+    let package = source.ancestors().skip(1).find_map(|directory| {
+        let path = directory.join("package.json");
+        let text = fs.read(&path).ok()?;
+        PackageJson::parse(root, &path, &text).ok()
+    });
+    if package.as_ref().and_then(PackageJson::package_type) == Some("module") {
+        ModuleKind::EsNext
+    } else {
+        ModuleKind::CommonJs
+    }
 }
 
 fn single_project_graph(project: &EffectiveProject) -> Result<ReferenceGraph, ProjectCompileError> {
@@ -902,7 +940,7 @@ impl fmt::Display for MaterializeError {
             Self::FilesListEmpty { config_path } => write!(
                 formatter,
                 "TS18002: The 'files' list in config file '{}' is empty.",
-                config_path.display()
+                slash_text(config_path)
             ),
             Self::NoInputs {
                 config_path,
@@ -911,7 +949,7 @@ impl fmt::Display for MaterializeError {
             } => write!(
                 formatter,
                 "TS18003: No inputs were found in config file '{}'. Specified 'include' paths were '{:?}' and 'exclude' paths were '{:?}'.",
-                config_path.display(),
+                slash_text(config_path),
                 include,
                 exclude
             ),
@@ -1479,11 +1517,10 @@ fn materialize_sources(
                     if value_path.is_absolute() {
                         return Arc::clone(value);
                     }
-                    Arc::<str>::from(
-                        relative_path_between(directory, &source.directory.join(value_path))
-                            .to_string_lossy()
-                            .as_ref(),
-                    )
+                    Arc::<str>::from(slash_text(&relative_path_between(
+                        directory,
+                        &source.directory.join(value_path),
+                    )))
                 })
                 .collect::<Vec<_>>(),
         )
@@ -2319,6 +2356,277 @@ mod tests {
         .unwrap();
         assert!(javascript.contains("./runtime/jsx-runtime"));
         assert!(!javascript.contains("<div"));
+    }
+
+    #[test]
+    fn a_name_another_file_erases_leaves_no_trace_in_javascript() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "t.ts",
+            "export interface I {}\nexport const v = 1;\nexport const enum K { A = 1 }\n",
+        );
+        fixture.write("only.d.ts", "export interface D {}\n");
+        fixture.write(
+            "main.ts",
+            "import { I, v, K } from './t.js';\n\
+             console.log(K.A);\n\
+             export { I, v, K };\n\
+             export { I as J } from './t.js';\n\
+             export { D } from './only.js';\n",
+        );
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["main.ts"],"compilerOptions":{"module":"esnext","target":"es2022","outDir":"dist"}}"#,
+        );
+        let filesystem = fixture.filesystem();
+        let project =
+            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
+        let report =
+            compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+        let javascript = std::str::from_utf8(
+            report
+                .outputs
+                .files
+                .get(&fixture.0.join("dist/main.js"))
+                .expect("project JavaScript output"),
+        )
+        .unwrap();
+        assert_eq!(
+            javascript,
+            "import { v } from './t.js';\nconsole.log(1);\nexport { v };\n"
+        );
+    }
+
+    #[test]
+    fn exports_decide_what_is_erased_through_any_barrel() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "t.ts",
+            "export const value = 2;\n\
+             interface Foo {}\n\
+             export { value as Foo };\n\
+             export interface Real {}\n\
+             export default interface Dflt {}\n\
+             export const enum CE { A = 1 }\n",
+        );
+        fixture.write(
+            "barrel.ts",
+            "export * from './t.js';\n\
+             export { Real as Renamed } from './t.js';\n\
+             export { default as Props } from './t.js';\n",
+        );
+        fixture.write("impl.ts", "export const Config = 5;\n");
+        fixture.write(
+            "mid.ts",
+            "type Config = 1;\n\
+             export { Config } from './impl.js';\n\
+             export { Shadow } from './impl2.js';\n\
+             export * from './shadowed.js';\n",
+        );
+        fixture.write("impl2.ts", "export const Shadow = 6;\n");
+        fixture.write("shadowed.ts", "export interface Shadow {}\n");
+        fixture.write("lib.d.ts", "export declare type Declared = 1;\n");
+        fixture.write(
+            "main.ts",
+            "import { Foo, Real, CE } from './barrel.js';\n\
+             import { Renamed, Props } from './barrel.js';\n\
+             import { Config, Shadow } from './mid.js';\n\
+             console.log(Foo, Config, CE.A, Shadow);\n\
+             export { Real, Renamed, Props, Foo };\n\
+             export { Real as R2 } from './barrel.js';\n\
+             export { Declared } from './lib.js';\n",
+        );
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["main.ts"],"compilerOptions":{"module":"esnext","target":"es2022","outDir":"dist"}}"#,
+        );
+        let filesystem = fixture.filesystem();
+        let project =
+            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
+        let report =
+            compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+        let javascript = std::str::from_utf8(
+            report
+                .outputs
+                .files
+                .get(&fixture.0.join("dist/main.js"))
+                .expect("project JavaScript output"),
+        )
+        .unwrap();
+        assert_eq!(
+            javascript,
+            "import { Foo } from './barrel.js';\n\
+             import { Config, Shadow } from './mid.js';\n\
+             console.log(Foo, Config, 1, Shadow);\n\
+             export { Foo };\n"
+        );
+    }
+
+    #[test]
+    fn a_node_module_format_reads_the_package_above_the_project() {
+        let fixture = Fixture::new();
+        fixture.write("package.json", r#"{"type":"module"}"#);
+        fixture.write("app/main.ts", "export const a = 1;\n");
+        fixture.write(
+            "app/tsconfig.json",
+            r#"{"files":["main.ts"],"compilerOptions":{"module":"nodenext","outDir":"dist"}}"#,
+        );
+        let filesystem = fixture.filesystem();
+        let project =
+            EffectiveProject::load(&fixture.request("app/tsconfig.json"), &filesystem).unwrap();
+        let report =
+            compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+        let javascript = std::str::from_utf8(
+            report
+                .outputs
+                .files
+                .get(&fixture.0.join("app/dist/main.js"))
+                .expect("project JavaScript output"),
+        )
+        .unwrap();
+        assert!(javascript.contains("export const a"), "{javascript}");
+    }
+
+    #[test]
+    fn a_local_value_outranks_an_erased_import_of_its_name() {
+        let fixture = Fixture::new();
+        fixture.write("t.ts", "export interface T {}\n");
+        fixture.write(
+            "main.ts",
+            "import { T } from './t.js';\nconst T = 1;\nexport default T;\nexport { T };\n",
+        );
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["main.ts"],"compilerOptions":{"module":"esnext","target":"es2022","outDir":"dist"}}"#,
+        );
+        let filesystem = fixture.filesystem();
+        let project =
+            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
+        let report =
+            compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+        let javascript = std::str::from_utf8(
+            report
+                .outputs
+                .files
+                .get(&fixture.0.join("dist/main.js"))
+                .expect("project JavaScript output"),
+        )
+        .unwrap();
+        assert_eq!(
+            javascript,
+            "const T = 1;\nexport default T;\nexport { T };\n"
+        );
+
+        // A module importing that value keeps its import.
+        fixture.write(
+            "user.ts",
+            "import D, { T } from './main.js';\nconsole.log(D, T);\n",
+        );
+        fixture.write(
+            "ambient.d.ts",
+            "export declare namespace N { function f(): number; }\n",
+        );
+        fixture.write(
+            "values.ts",
+            "import type { V } from './t.js';\nconst V = 1;\n\
+             namespace W { export const a = 1; }\nexport { V, W };\n",
+        );
+        fixture.write(
+            "user2.ts",
+            "import { N } from './ambient.js';\nimport { V, W } from './values.js';\n\
+             console.log(N, V, W);\n",
+        );
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["user.ts","user2.ts"],"compilerOptions":{"module":"esnext","target":"es2022","outDir":"dist"}}"#,
+        );
+        let project =
+            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
+        let report =
+            compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+        let output = |name: &str| {
+            String::from_utf8(
+                report
+                    .outputs
+                    .files
+                    .get(&fixture.0.join(name))
+                    .expect("project JavaScript output")
+                    .clone(),
+            )
+            .unwrap()
+        };
+        let first = output("dist/user.js");
+        assert!(
+            first.contains("import D, { T } from './main.js';"),
+            "{first}"
+        );
+        let second = output("dist/user2.js");
+        assert!(
+            second.contains("import { N } from './ambient.js';"),
+            "{second}"
+        );
+        assert!(
+            second.contains("import { V, W } from './values.js';"),
+            "{second}"
+        );
+        assert!(output("dist/values.js").contains("export { V, W };"));
+    }
+
+    #[test]
+    fn every_es_and_node_module_kind_emits() {
+        for (module, package, source, expected) in [
+            ("es2020", None, "main.ts", "export const a"),
+            ("es2022", None, "main.ts", "export const a"),
+            ("preserve", None, "main.ts", "export const a"),
+            ("node16", None, "main.ts", "exports.a"),
+            (
+                "nodenext",
+                Some(r#"{"type":"commonjs"}"#),
+                "main.ts",
+                "exports.a",
+            ),
+            (
+                "nodenext",
+                Some(r#"{"type":"module"}"#),
+                "main.ts",
+                "export const a",
+            ),
+            (
+                "node20",
+                Some(r#"{"type":"module"}"#),
+                "main.ts",
+                "export const a",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            fixture.write(source, "export const a = 1;\n");
+            if let Some(package) = package {
+                fixture.write("package.json", package);
+            }
+            fixture.write(
+                "tsconfig.json",
+                &format!(
+                    r#"{{"files":["{source}"],"compilerOptions":{{"module":"{module}","outDir":"dist"}}}}"#
+                ),
+            );
+            let filesystem = fixture.filesystem();
+            let project =
+                EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
+            let report =
+                compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+            let javascript = std::str::from_utf8(
+                report
+                    .outputs
+                    .files
+                    .get(&fixture.0.join("dist/main.js"))
+                    .expect("project JavaScript output"),
+            )
+            .unwrap();
+            assert!(
+                javascript.contains(expected),
+                "{module} {package:?}: {javascript}"
+            );
+        }
     }
 
     #[test]

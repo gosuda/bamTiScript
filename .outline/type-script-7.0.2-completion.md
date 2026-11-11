@@ -22,6 +22,10 @@ Complete the clean-room Rust TypeScript compiler and native execution product ag
 - Runtime: every applicable stable test262 obligation required by bamTiScript native execution must pass in Interpreter, JIT, and AOT modes. Stable `Intl` and `Temporal` stay in scope.
 - Final scoped roots permit zero `BLOCKING_FAIL`, zero `EXTERNAL_BLOCKED`, and zero `INAPPLICABLE_CATALOG_ERROR`.
 - `.references/` is study-only. Workers may inspect release metadata, public declarations, test inputs, baselines, and observable behavior. They must not copy implementation code.
+- Execution hosts: Interpreter, JIT, AOT, and direct native executable output run on `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`. `s390x-unknown-linux-gnu` and `riscv64gc-unknown-linux-gnu` remain target cells.
+- Evidence host: primary receipts for every catalog are produced on `aarch64-apple-darwin` through the repository `Justfile`. Other hosts are proven by their target cell, the corpus differential, and the clean-install contract.
+- Continuous integration: hosted workflows remain. Local `Justfile` recipes are an additional runner, not a replacement.
+- Historical catalogs are owned, measured locally, and filtered by the 7.0.2 applicability rule above.
 
 ## Product roots
 
@@ -131,6 +135,7 @@ Depth is seven: product -> root -> track -> cluster -> leaf -> logical shard -> 
 | B6.1 | W4 | B6 | tsc argv surface + exit-code parity | `crates/bamts-cli/src/cli/tsc_args.rs` | `.outline/gates/B6.1.md` |
 | B6.2 | W4 | B6 | diagnostic rendering parity (pretty false canonical text; json) | `crates/bamts-cli/src/cli/diagnostic_format.rs` | `.outline/gates/B6.2.md` |
 | B7.1 | W4 | B7 | corpus expansion wave (add projects per failure clusters; corpus/manifest.toml + specs + projects) | `corpus/manifest.toml; corpus/cases/*.ts` | `.outline/gates/B7.1.md` |
+| B7.2 | W4 | B7 | historical 6.0.2 and 5.9.3 catalog ownership and 7.0.2 applicability filter | `crates/bamts-verification/src/historical.rs` | `.outline/gates/B7.2.md` |
 | C0.1 | W2 | C0 | $262 host + harness loader + async $DONE + agent/Atomics hooks (blocks every C leaf) | `crates/bamts-runtime/src/host_objects.rs; crates/bamts-verification/src/oracles/test262_harness.rs` | `.outline/gates/C0.1.md` |
 | C1.1 | W2 | C1 | BigInt full family (value model, operations, literals, asIntN/asUintN, JSON interplay) | `crates/bamts-runtime/src/builtins/bigint.rs` | `.outline/gates/C1.1.md` |
 | C1.2 | W2 | C1 | Number formatting/parsing exactness (toFixed/toPrecision/toExponential/radix) | `crates/bamts-runtime/src/builtins/number_format.rs` | `.outline/gates/C1.2.md` |
@@ -177,14 +182,22 @@ Depth is seven: product -> root -> track -> cluster -> leaf -> logical shard -> 
 | E2.1 | W3 | E2 | JIT helper coverage completeness (46 helpers vs ISA) | `crates/bamts-codegen/src/jit/helpers.rs` | `.outline/gates/E2.1.md` |
 | E2.2 | W3 | E2 | JIT tiering: OSR + deopt + warmup policy | `crates/bamts-codegen/src/jit/tiering.rs` | `.outline/gates/E2.2.md` |
 | E2.3 | W3 | E2 | JIT-vs-interpreter differential stress (random program corpus) | `crates/bamts-codegen/tests/jit_differential.rs` | `.outline/gates/E2.3.md` |
+| E2.4 | W3 | E2 | JIT execution and W^X proof on Apple Silicon | `crates/bamts-codegen/src/jit_memory.rs` | `.outline/gates/E2.4.md` |
 | E3.1 | W4 | E3 | AOT object emission per target triple | `crates/bamts-codegen/src/aot/emission.rs` | `.outline/gates/E3.1.md` |
 | E3.2 | W4 | E3 | AOT linking + cache correctness (existing fallback-cache lessons) | `crates/bamts-codegen/src/aot/linking.rs` | `.outline/gates/E3.2.md` |
 | E3.3 | W4 | E3 | reproducible-build pipeline (deterministic objects) | `crates/bamts-codegen/src/aot/reproducible.rs` | `.outline/gates/E3.3.md` |
+| E3.4 | W4 | E3 | native executable link and run on macOS hosts | `crates/bamts-cli/src/driver.rs` | `.outline/gates/E3.4.md` |
+| E3.5 | W4 | E3 | native executable link and run on Windows MSVC | `crates/bamts-cli/src/windows_link.rs` | `.outline/gates/E3.5.md` |
+| E3.6 | W4 | E3 | shared platform facts: host triple, machine facts, process regions, and peak memory on every execution host | `crates/bamts-platform/` | `.outline/gates/E3.6.md` |
+| E3.7 | W4 | E3 | in-process AOT linking on every execution host | `crates/bamts-codegen/src/aot/in_process_link.rs` | `.outline/gates/E3.7.md` |
 | E4.1 | W5 | E4 | target-cell evidence schema + verification/toolchains/<triple>.json generator | `crates/bamts-verification/src/toolchain_schema.rs` | `.outline/gates/E4.1.md` |
 | E4.2 | W5 | E4 | x86_64-unknown-linux-gnu cell closure (native host) | `verification/toolchains/x86_64-unknown-linux-gnu.json` | `.outline/gates/E4.2.md` |
 | E4.3 | W5 | E4 | aarch64 cell (cross + QEMU) | `verification/toolchains/aarch64-unknown-linux-gnu.json` | `.outline/gates/E4.3.md` |
 | E4.4 | W5 | E4 | s390x cell (cross + QEMU) | `verification/toolchains/s390x-unknown-linux-gnu.json` | `.outline/gates/E4.4.md` |
 | E4.5 | W5 | E4 | riscv64gc cell (cross + QEMU) | `verification/toolchains/riscv64gc-unknown-linux-gnu.json` | `.outline/gates/E4.5.md` |
+| E4.6 | W5 | E4 | aarch64-apple-darwin cell (native host) | `verification/toolchains/aarch64-apple-darwin.json` | `.outline/gates/E4.6.md` |
+| E4.7 | W5 | E4 | x86_64-apple-darwin cell (Rosetta) | `verification/toolchains/x86_64-apple-darwin.json` | `.outline/gates/E4.7.md` |
+| E4.8 | W5 | E4 | x86_64-pc-windows-msvc cell (native host) | `verification/toolchains/x86_64-pc-windows-msvc.json` | `.outline/gates/E4.8.md` |
 | E5.1 | W6 | E5 | bench/compiler-rules.toml schema + measure harness (conditions record: governor/affinity/swap; INVALID_CONDITIONS on mismatch; median-of-N) | `bench/compiler-rules.toml` | `.outline/gates/E5.1.md` |
 | E5.2 | W6 | E5 | jit.compile-cost/payback/queue-tail-latency accepted measurements | `bench/jit_benchmarks.rs` | `.outline/gates/E5.2.md` |
 | E5.3 | W6 | E5 | stage0.{correctness,integrity,no-rwx,event-completeness,aot-no-jit-allocator} evidence | `bench/stage0_evidence.rs` | `.outline/gates/E5.3.md` |
@@ -212,7 +225,7 @@ Depth is seven: product -> root -> track -> cluster -> leaf -> logical shard -> 
 | B4 | B4.1, B4.2, B4.3, B4.4, B4.5 | `.outline/gates/cluster-B4.md` |
 | B5 | B5.1, B5.2, B5.3, B5.4 | `.outline/gates/cluster-B5.md` |
 | B6 | B6.1, B6.2 | `.outline/gates/cluster-B6.md` |
-| B7 | B7.1 | `.outline/gates/cluster-B7.md` |
+| B7 | B7.1, B7.2 | `.outline/gates/cluster-B7.md` |
 | C0 | C0.1 | `.outline/gates/cluster-C0.md` |
 | C1 | C1.1, C1.2, C1.3 | `.outline/gates/cluster-C1.md` |
 | C2 | C2.1, C2.2, C2.3, C2.4 | `.outline/gates/cluster-C2.md` |
@@ -226,9 +239,9 @@ Depth is seven: product -> root -> track -> cluster -> leaf -> logical shard -> 
 | C10 | C10.1, C10.2, C10.3, C10.4, C10.5, C10.6 | `.outline/gates/cluster-C10.md` |
 | C11 | C11.1, C11.2, C11.3, C11.4 | `.outline/gates/cluster-C11.md` |
 | E1 | E1.1, E1.2 | `.outline/gates/cluster-E1.md` |
-| E2 | E2.1, E2.2, E2.3 | `.outline/gates/cluster-E2.md` |
-| E3 | E3.1, E3.2, E3.3 | `.outline/gates/cluster-E3.md` |
-| E4 | E4.1, E4.2, E4.3, E4.4, E4.5 | `.outline/gates/cluster-E4.md` |
+| E2 | E2.1, E2.2, E2.3, E2.4 | `.outline/gates/cluster-E2.md` |
+| E3 | E3.1, E3.2, E3.3, E3.4, E3.5, E3.6, E3.7 | `.outline/gates/cluster-E3.md` |
+| E4 | E4.1, E4.2, E4.3, E4.4, E4.5, E4.6, E4.7, E4.8 | `.outline/gates/cluster-E4.md` |
 | E5 | E5.1, E5.2, E5.3, E5.4 | `.outline/gates/cluster-E5.md` |
 | F1 | F1.1, F1.2 | `.outline/gates/cluster-F1.md` |
 | F2 | F2.1, F2.2, F2.3, F2.4 | `.outline/gates/cluster-F2.md` |
@@ -292,7 +305,7 @@ Leaf ledgers contain the exact checks. Integration requires:
 - unpiped workspace format, Clippy `-D warnings`, and tests;
 - Interpreter/JIT/AOT corpus differential;
 - formal G1, G2, G5, G3, G4, and G6 in order;
-- 28 target obligations and 9 pre-registered benchmark rules;
+- 49 target obligations and 9 pre-registered benchmark rules;
 - clean Node 24 package install and import of all thirteen export subpaths across five artifacts;
 - byte-identical catalog, evidence merge, ledger, proof, package, and release regeneration.
 
@@ -307,3 +320,4 @@ Append-only.
 - 2026-08-25 CONTRACT_WRITTEN: stable 7.0.2 TypeScript-product scope, interfaces, evidence, ownership, depth tree, waves, and unlazy gates fixed before production edits.
 - 2026-08-25 LEAF_STARTED A1.1-A1.5: authority, source materialization, logical catalog, manifest cutover, and exact-classification vertical slice dispatched under one integration owner.
 - 2026-08-25 LEAF_STARTED A2.1: closed shard, lane, receipt, bounded-memory merge, and atomic-publication core dispatched with disjoint ownership.
+- 2026-11-01 CONTRACT_AMENDED: execution hosts widened to the five artifact targets, with `aarch64-apple-darwin` as the primary evidence host through the repository `Justfile` and hosted workflows kept beside it. Nine leaves added (B7.2, E2.4, E3.4 to E3.7, E4.6 to E4.8), taking the frozen authority from 105 to 114 leaves and the target obligations from 28 to 49 (seven cells of seven obligations).

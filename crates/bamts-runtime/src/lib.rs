@@ -26,8 +26,7 @@ use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 
 use crate::vm::explicit_resource::DisposalStackState;
 use crate::vm::generator_async::GeneratorCompletion;
@@ -44,10 +43,12 @@ use intrinsics::builtins::typedarray_all::{self, ElementKind, LengthSlot};
 mod external_modules;
 mod gc;
 mod host_objects;
+pub mod intl;
 mod intrinsics;
 mod native;
 #[cfg(test)]
 mod proxy_reflect_integration;
+mod temporal;
 mod vm;
 pub(crate) use intrinsics::builtins;
 
@@ -56,6 +57,8 @@ pub use native::{
     run_linked_program_tiered, run_linked_program_with_cancel,
 };
 
+/// Callback results a builtin keeps rooted, for the locals it still holds.
+const RECENT_CALLBACK_RESULTS: usize = 32;
 const RUNTIME_HEAP_SEGMENT: u16 = 1;
 
 /// The observable result of a terminated execution.
@@ -82,7 +85,15 @@ pub struct Execution {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Limits {
     pub fuel: u64,
+    /// The ceiling of the host on activations. Past it the run ends.
     pub max_call_depth: usize,
+    /// The activations of the guest stack. A call past it throws `RangeError`, which
+    /// the program can catch, as V8 does when its stack is full.
+    pub max_stack_depth: usize,
+    /// The native stack that the guest stack can use, from the position where the
+    /// machine was built. A call past it throws the same `RangeError`. Build and run
+    /// the machine on one thread when this is less than `usize::MAX`.
+    pub max_stack_bytes: usize,
     pub max_total_registers: usize,
     /// Ceiling on the length of a single call's arguments array.
     pub max_argument_count: u32,
@@ -96,6 +107,8 @@ pub struct Limits {
     pub max_microtasks: usize,
     /// Ceiling on live timers armed at once.
     pub max_timers: usize,
+    /// This agent's `[[CanBlock]]`: whether `Atomics.wait` may suspend it.
+    pub agent_can_suspend: bool,
 }
 
 impl Default for Limits {
@@ -103,6 +116,8 @@ impl Default for Limits {
         Self {
             fuel: 1_000_000,
             max_call_depth: 64,
+            max_stack_depth: usize::MAX,
+            max_stack_bytes: usize::MAX,
             max_total_registers: 1 << 20,
             max_argument_count: 1 << 16,
             max_heap_slots: 1 << 20,
@@ -111,8 +126,57 @@ impl Default for Limits {
             max_dynamic_modules: 1 << 10,
             max_microtasks: 1 << 20,
             max_timers: 1 << 20,
+            agent_can_suspend: true,
         }
     }
+}
+
+impl Limits {
+    /// The native stack of the thread that runs a compiled program. The system
+    /// reserves it as address space and commits only the pages that the program uses.
+    pub const PROGRAM_STACK: usize = 256 << 20;
+
+    /// The ceilings of a compiled program. The defaults hold a test, an embedded script
+    /// or an API request to a small budget. A compiled program runs until it ends, and
+    /// its heap stops near the default of Node.
+    ///
+    /// Its guest stack is about as deep as that of Node 24, which holds 9,686 calls of
+    /// a function with one parameter and 12,516 calls of an empty function. A call
+    /// past it throws `RangeError`. Run the program on a thread with
+    /// [`Self::PROGRAM_STACK`] bytes of stack. A native call takes about 10 KiB, so
+    /// 10,000 calls use less than half of it, and a call through a builtin callback,
+    /// which takes more, stops at [`Self::max_stack_bytes`]. The host ceiling stays
+    /// far past the guest stack, and the registers hold 10,000 large frames.
+    #[must_use]
+    pub fn program() -> Self {
+        Self {
+            fuel: u64::MAX,
+            max_call_depth: 1 << 20,
+            max_stack_depth: 10_000,
+            max_stack_bytes: Self::PROGRAM_STACK - (16 << 20),
+            max_total_registers: 1 << 24,
+            max_heap_slots: 1 << 30,
+            max_heap_bytes: 1 << 32,
+            ..Self::default()
+        }
+    }
+}
+
+/// What a call throws when it passes the guest stack, in the words of V8.
+pub(crate) const STACK_OVERFLOW: ThrowOrigin = ThrowOrigin::RangeError {
+    operation: "Maximum call stack size exceeded",
+};
+
+/// How far past [`Limits::max_stack_bytes`] the native stack goes before the run
+/// ends. It covers the frames between the check of a call and the next check of
+/// the host ceiling.
+const STACK_SLACK: usize = 1 << 20;
+
+/// The address of a local in the frame of the caller. The stack grows down on
+/// every supported target, so a deeper call has a smaller position.
+fn stack_position() -> usize {
+    let marker = 0_u8;
+    std::ptr::from_ref(&marker).addr()
 }
 
 /// The exact source of one classic script. Source and resource name preserve
@@ -330,6 +394,9 @@ pub enum RuntimeErrorKind {
         /// names the constructor, or when the value is not an object with a
         /// resolvable constructor.
         constructor_name: Option<EcmaString>,
+        /// The thrown object's own `message` data property, read at the same
+        /// boundary, so a failure can say more than which constructor threw.
+        message: Option<EcmaString>,
     },
     FuelExhausted {
         limit: u64,
@@ -422,6 +489,7 @@ impl fmt::Display for RuntimeError {
                 value,
                 origin,
                 constructor_name,
+                ..
             } => match constructor_name {
                 Some(name) => write!(
                     formatter,
@@ -684,6 +752,14 @@ enum IterationKind {
     Key,
     Value,
     Entry,
+    /// A `%StringIteratorPrototype%` instance; `source` is its code points.
+    StringCodePoint,
+    /// A `%RegExpStringIteratorPrototype%` instance; `source` is its hidden state.
+    RegExpString,
+    /// An `Iterator` helper; `source` is its hidden state.
+    IteratorHelper(intrinsics::builtins::iterator_helpers::Operation),
+    /// A `%WrapForValidIteratorPrototype%` instance; `source` is its record.
+    WrapForValid,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1219,6 +1295,24 @@ enum HeapEntry {
         prototype: Option<Value>,
         extensible: bool,
     },
+    /// Instances of the `Temporal` classes. The boxed record holds no `Value`,
+    /// so tracing needs only the properties and prototype.
+    Temporal {
+        value: Box<temporal::TemporalObject>,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    /// Instances of the `Intl` classes. The boxed record holds no `Value`;
+    /// `bound` is the one value an instance keeps: the getter-created `format`
+    /// or `compare`, or the input string of a `Segments` object or its iterator.
+    Intl {
+        value: Box<intl::IntlObject>,
+        bound: Option<Value>,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
     /// Entries retain insertion positions. Deletion tombstones an entry so
     /// live iterators keep a stable order cursor; the index retains only
     /// integer positions and therefore introduces no GC roots.
@@ -1450,10 +1544,14 @@ impl HeapEntry {
                 )
                 .saturating_add(properties.charge_bytes())
                 .saturating_add(1),
-            Self::NativeFunction { callable, .. } => match callable {
+            Self::NativeFunction {
+                callable,
+                properties,
+                ..
+            } => properties.charge_bytes().saturating_add(match callable {
                 NativeCallable::Builtin(_) => 1,
                 NativeCallable::Bound(bound) => bound.arguments.len().saturating_add(1),
-            },
+            }),
             Self::Proxy { .. } => 1,
             Self::ProxyRevoker { properties, .. } => properties.charge_bytes().saturating_add(1),
             Self::Generator { state, .. } => match state {
@@ -1512,6 +1610,8 @@ impl HeapEntry {
             | Self::ExternalModuleNamespace { .. }
             | Self::ProcessEnv { .. }
             | Self::Date { .. }
+            | Self::Temporal { .. }
+            | Self::Intl { .. }
             | Self::BuiltinIterator { .. }
             | Self::Iterator { .. }
             | Self::Promise { .. }
@@ -1784,40 +1884,6 @@ struct TimerRecord {
     interval_delay: Option<u32>,
 }
 
-#[allow(dead_code)]
-pub(crate) enum ExternalJob {
-    ResolveWaitAsync { promise: u64, result: &'static str },
-}
-
-pub(crate) struct ExternalInbox {
-    queue: Mutex<VecDeque<ExternalJob>>,
-    signal: Condvar,
-    pending: AtomicUsize,
-}
-
-#[allow(dead_code)]
-impl ExternalInbox {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            queue: Mutex::new(VecDeque::new()),
-            signal: Condvar::new(),
-            pending: AtomicUsize::new(0),
-        })
-    }
-
-    pub(crate) fn reserve(&self) {
-        self.pending.fetch_add(1, AtomicOrdering::AcqRel);
-    }
-
-    pub(crate) fn push(&self, job: ExternalJob) {
-        self.queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_back(job);
-        self.signal.notify_one();
-    }
-}
-
 /// The production bytecode interpreter.
 pub struct Machine<'a, H: Host> {
     program: Option<&'a Program<Verified>>,
@@ -1826,9 +1892,33 @@ pub struct Machine<'a, H: Host> {
     limits: Limits,
     gc: gc::GcState,
     native_roots: Vec<Vec<Value>>,
+    /// Recently compiled patterns. `exec` runs once per match of a global search,
+    /// so recompiling on every call would make it cost a parse per match.
+    /// Objects being joined, innermost last. A cycle passes through native code
+    /// on every level, so no activation limit would stop it.
+    array_join_stack: Vec<Value>,
+    regexp_cache: Vec<(
+        EcmaString,
+        EcmaString,
+        std::rc::Rc<intrinsics::builtins::regexp_v::CompiledV>,
+    )>,
     /// Values kept strongly reachable for the current ECMAScript job by
     /// WeakRef construction/deref. Cleared exactly once at the outer job seam.
     kept_alive: Vec<Value>,
+    /// What running builtins hold in Rust locals: everything they allocated or
+    /// got back from user code. Calling user code can reach a collection, so
+    /// these stay rooted until the builtin returns.
+    builtin_temporaries: Vec<Value>,
+    /// The latest results of `call_callback`, for loops that use each result
+    /// once: `reduce` holds one at a time, and keeping them all would hold every
+    /// intermediate.
+    callback_results: Vec<Value>,
+    /// Where the running builtin's results start in `callback_results`.
+    results_floor: usize,
+    /// A builtin is running, and not user code it called.
+    in_builtin: bool,
+    /// Microtask jobs that have left the queue and are still running.
+    running_jobs: Vec<MicrotaskJob>,
     frames: Vec<Frame>,
     heap: Vec<HeapEntry>,
     slot_bytes: Vec<usize>,
@@ -1841,6 +1931,9 @@ pub struct Machine<'a, H: Host> {
     heap_bytes: usize,
     live_registers: usize,
     native_depth: usize,
+    /// The native stack position where the machine was built, from which
+    /// [`Limits::max_stack_bytes`] is measured.
+    stack_base: usize,
     fuel: u64,
     global_object: Value,
     vm_context_marker: Value,
@@ -1864,7 +1957,9 @@ pub struct Machine<'a, H: Host> {
     async_boundaries: Vec<usize>,
     pending_async_suspend: Option<(Value, SuspendedActivation)>,
     microtasks: VecDeque<QueuedMicrotask>,
-    external_inbox: Arc<ExternalInbox>,
+    /// Every pending `Atomics.waitAsync`, by the id in its `Waiter::Async`.
+    async_waiters: BTreeMap<u64, intrinsics::builtins::atomics::AsyncWaiter>,
+    next_async_waiter: u64,
     finalization_cleanup_queue: VecDeque<Value>,
     microtask_drain_active: bool,
     next_timer_id: Option<u64>,
@@ -1885,6 +1980,8 @@ pub struct Machine<'a, H: Host> {
     registry: ModuleRegistry,
     /// First machine-wide module ID reserved for host-compiled script modules.
     dynamic_base: usize,
+    /// The last global a read found no binding for, which names it in a report.
+    missing_global: Option<EcmaString>,
     /// Host-compiled programs retained for the machine lifetime so their
     /// closures remain executable after the originating Script object dies.
     dynamic: Vec<DynamicModule>,
@@ -1934,6 +2031,9 @@ struct ExternalExport {
 struct ModuleInstance {
     binding_cells: Vec<Option<CellId>>,
     constant_cells: Vec<Option<CellId>>,
+    /// Whether a constant names an import. One cell can have two names: a module
+    /// that imports its own export reads the cell that it writes.
+    constant_is_import: Vec<bool>,
     namespace: Option<Value>,
     state: ModuleState,
     import_meta: Option<Value>,
@@ -2060,26 +2160,13 @@ pub fn run_with_telemetry<H: Host>(
     (outcome, telemetry)
 }
 
-/// Best-effort process peak resident set size, in KiB, from
-/// `/proc/self/status` `VmHWM`. Returns `None` when the file or field is
-/// unavailable (non-Linux hosts, sandboxes).
+/// Best-effort peak memory of this process, in KiB: the resident-set peak on
+/// Linux and the physical-footprint peak on macOS. Returns `None` when the host
+/// cannot say, such as a sandbox without `/proc`.
 fn peak_rss_kb() -> Option<u64> {
-    let content = std::fs::read_to_string("/proc/self/status").ok()?;
-    parse_peak_rss_kb(&content)
-}
-
-/// Parses the process peak resident set size, in KiB, from a
-/// `/proc/self/status`-shaped document. Selects the `VmHWM:` field (the peak
-/// resident set) rather than `VmRSS:` (the current resident set), returning
-/// `None` when the field or its numeric value is missing.
-fn parse_peak_rss_kb(status: &str) -> Option<u64> {
-    status.lines().find_map(|line| {
-        line.strip_prefix("VmHWM:")?
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()
-    })
+    bamts_platform::peak_memory_bytes(std::process::id())
+        .ok()
+        .map(|bytes| bytes / 1024)
 }
 
 impl<'a, H: Host> Machine<'a, H> {
@@ -2143,11 +2230,12 @@ impl<'a, H: Host> Machine<'a, H> {
         let live_registers = frame.registers.len();
         let mut heap = Vec::new();
         let timers_available = host.timers().is_some();
-        let mut intrinsics = intrinsics::Intrinsics::<H>::initialize(&mut heap, timers_available);
+        let script_compiler = host.script_compiler().is_some();
+        let mut intrinsics =
+            intrinsics::Intrinsics::<H>::initialize(&mut heap, timers_available, script_compiler);
         let global_object = intrinsics
             .global("globalThis")
             .expect("host objects install globalThis");
-        let script_compiler = host.script_compiler().is_some();
         let installed_external = external_modules::install(
             &mut heap,
             &mut intrinsics.builtins,
@@ -2207,7 +2295,14 @@ impl<'a, H: Host> Machine<'a, H> {
             gc: gc::GcState::new(&limits),
             limits,
             native_roots: Vec::new(),
+            regexp_cache: Vec::new(),
+            array_join_stack: Vec::new(),
             kept_alive: Vec::new(),
+            builtin_temporaries: Vec::new(),
+            callback_results: Vec::new(),
+            results_floor: 0,
+            in_builtin: false,
+            running_jobs: Vec::new(),
             fuel,
             frames: vec![frame],
             heap,
@@ -2219,6 +2314,7 @@ impl<'a, H: Host> Machine<'a, H> {
             heap_bytes: 0,
             live_registers,
             native_depth: 0,
+            stack_base: stack_position(),
             last_completion: None,
             callback_boundaries: Vec::new(),
             generator_boundaries: Vec::new(),
@@ -2226,7 +2322,8 @@ impl<'a, H: Host> Machine<'a, H> {
             async_boundaries: Vec::new(),
             pending_async_suspend: None,
             microtasks: VecDeque::new(),
-            external_inbox: ExternalInbox::new(),
+            async_waiters: BTreeMap::new(),
+            next_async_waiter: 0,
             finalization_cleanup_queue: VecDeque::new(),
             microtask_drain_active: false,
             next_timer_id: Some(1),
@@ -2269,6 +2366,7 @@ impl<'a, H: Host> Machine<'a, H> {
             },
             dynamic_base: program.map_or(1, |program| program.modules().len()),
             dynamic: Vec::new(),
+            missing_global: None,
             template_objects,
             template_sites: BTreeMap::new(),
             current_builtin_id: None,
@@ -2394,6 +2492,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     value: exception.value,
                     origin: exception.origin,
                     constructor_name: None,
+                    message: None,
                 }));
             }
         }
@@ -2614,54 +2713,6 @@ impl<'a, H: Host> Machine<'a, H> {
         !self.timers.is_empty()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn external_inbox(&self) -> Arc<ExternalInbox> {
-        Arc::clone(&self.external_inbox)
-    }
-
-    fn drain_external_jobs(&mut self) -> Result<(), RuntimeError> {
-        loop {
-            let job = self
-                .external_inbox
-                .queue
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .pop_front();
-            let Some(job) = job else {
-                return Ok(());
-            };
-            self.external_inbox
-                .pending
-                .fetch_sub(1, AtomicOrdering::AcqRel);
-            match job {
-                ExternalJob::ResolveWaitAsync { promise, result } => {
-                    let value = self
-                        .allocate(HeapEntry::String(EcmaString::encode(result)))
-                        .map_err(|kind| self.checkpoint_error(kind))?;
-                    self.fulfill_promise(Value::from_bits(promise), value)
-                        .map_err(|kind| self.checkpoint_error(kind))?;
-                }
-            }
-        }
-    }
-
-    fn wait_for_external_job(&self) {
-        let queue = self
-            .external_inbox
-            .queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        drop(
-            self.external_inbox
-                .signal
-                .wait_while(queue, |queue| {
-                    queue.is_empty()
-                        && self.external_inbox.pending.load(AtomicOrdering::Acquire) != 0
-                })
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-    }
-
     /// Drives the automatic event loop to quiescence after synchronous
     /// evaluation.
     ///
@@ -2681,7 +2732,6 @@ impl<'a, H: Host> Machine<'a, H> {
     /// exhausted work fails with [`RuntimeErrorKind::FuelExhausted`].
     pub(crate) fn run_to_quiescence(&mut self) -> Result<(), RuntimeError> {
         loop {
-            self.drain_external_jobs()?;
             self.drain_microtasks_automatic()?;
             self.check_cancel()
                 .map_err(|kind| self.checkpoint_error(kind))?;
@@ -2705,12 +2755,9 @@ impl<'a, H: Host> Machine<'a, H> {
                         value: exception.value,
                         origin: exception.origin,
                         constructor_name: None,
+                        message: None,
                     }));
                 }
-                continue;
-            }
-            if self.external_inbox.pending.load(AtomicOrdering::Acquire) != 0 {
-                self.wait_for_external_job();
                 continue;
             }
             return Ok(());
@@ -2842,6 +2889,13 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(live_record) = self.timers.get(&id) else {
             return Ok(());
         };
+        // A bare number comes from a script, and an internal timeout is not its
+        // to cancel. Only the runtime holds that timer's handle.
+        if request_generation.is_none()
+            && live_record.callback == self.intrinsics.builtins.wait_async_timeout()
+        {
+            return Ok(());
+        }
         if let Some(request_generation) = request_generation
             && live_record.generation != request_generation
         {
@@ -2906,7 +2960,6 @@ impl<'a, H: Host> Machine<'a, H> {
     /// throws settle their derived promises. Throws from `queueMicrotask`
     /// callbacks are returned in [`MicrotaskDrain::uncaught`].
     pub fn drain_microtasks(&mut self) -> Result<MicrotaskDrain, RuntimeError> {
-        self.drain_external_jobs()?;
         self.drain_microtasks_core(MicrotaskExceptionPolicy::CollectAndContinue)
     }
 
@@ -2923,6 +2976,7 @@ impl<'a, H: Host> Machine<'a, H> {
             value: exception.value,
             origin: exception.origin,
             constructor_name: None,
+            message: None,
         }))
     }
 
@@ -2959,7 +3013,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 report.executed = report.executed.saturating_add(1);
                 let is_finalization_cleanup =
                     matches!(&queued.job, MicrotaskJob::FinalizationCleanup { .. });
+                self.running_jobs.push(queued.job.clone());
                 let job_result = self.execute_microtask_job(queued.job);
+                self.running_jobs.pop();
                 self.clear_kept_alive_for_job();
                 let Some(exception) = job_result.map_err(|kind| self.checkpoint_error(kind))?
                 else {
@@ -3308,6 +3364,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 value,
                 origin,
                 constructor_name: None,
+                message: None,
             },
         );
         self.store_async_module_completion(pending.record, Some(Err(error.clone())))
@@ -3486,13 +3543,16 @@ impl<'a, H: Host> Machine<'a, H> {
         target: Value,
         record: Value,
     ) -> Result<Value, EvalFailure> {
+        let name = self
+            .allocate(HeapEntry::String(EcmaString::encode("")))
+            .map_err(EvalFailure::Runtime)?;
         self.allocate(HeapEntry::native_function(
             NativeCallable::Bound(Box::new(BoundCallable {
                 target,
                 this_value: Value::UNDEFINED,
                 arguments: vec![record],
             })),
-            PropertyMap::default(),
+            intrinsics::function_properties(1, name),
             None,
         ))
         .map_err(EvalFailure::Runtime)
@@ -3928,6 +3988,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 },
             );
         }
+        properties.insert(self.intrinsics.builtins.error_brand_key(), error_brand());
         self.allocate(HeapEntry::Object {
             properties,
             prototype: Some(self.intrinsics.error_prototype(id)),
@@ -4397,9 +4458,9 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    /// Populates the `constructor_name` field of a
-    /// [`RuntimeErrorKind::UncaughtThrow`] when the throw originated from
-    /// guest bytecode ([`ThrowOrigin::Bytecode`]). Engine-originated throws
+    /// Populates the `message` field of a [`RuntimeErrorKind::UncaughtThrow`],
+    /// and its `constructor_name` field when the throw originated from guest
+    /// bytecode ([`ThrowOrigin::Bytecode`]). Engine-originated throws
     /// (`TypeError`, `RangeError`, etc.) already name their constructor in
     /// the [`ThrowOrigin`] variant and are left as `None`.
     ///
@@ -4412,10 +4473,21 @@ impl<'a, H: Host> Machine<'a, H> {
             value,
             origin,
             constructor_name,
+            message,
         } = &mut error.kind
         else {
             return;
         };
+        if message.is_none() {
+            *message = match origin {
+                ThrowOrigin::ReferenceError {
+                    operation: "global is not defined",
+                } => self.missing_global.as_ref().map(|name| {
+                    EcmaString::encode(&format!("{} is not defined", name.to_utf8_lossy()))
+                }),
+                _ => self.resolve_thrown_message(*value),
+            };
+        }
         if *origin != ThrowOrigin::Bytecode {
             return;
         }
@@ -4569,6 +4641,7 @@ impl<'a, H: Host> Machine<'a, H> {
         self.registry.modules.push(ModuleInstance {
             binding_cells: Vec::new(),
             constant_cells: Vec::new(),
+            constant_is_import: Vec::new(),
             namespace: None,
             import_meta: None,
             state: ModuleState::Unevaluated,
@@ -4614,6 +4687,7 @@ impl<'a, H: Host> Machine<'a, H> {
             .iter()
             .map(|module| ModuleInstance {
                 binding_cells: vec![None; module.bindings.len()],
+                constant_is_import: vec![false; module.code.constants().len()],
                 constant_cells: vec![None; module.code.constants().len()],
                 namespace: None,
                 import_meta: None,
@@ -4711,13 +4785,17 @@ impl<'a, H: Host> Machine<'a, H> {
                 let Constant::String(name) = constant else {
                     continue;
                 };
-                if let Some((binding_index, _)) =
+                if let Some((binding_index, binding)) =
                     bindings.iter().enumerate().find(|(_, binding)| {
                         self.constant_text(ModuleId::new(module_index as u32), binding.name) == name
                     })
                 {
                     self.registry.modules[module_index].constant_cells[constant_index] =
                         self.registry.modules[module_index].binding_cells[binding_index];
+                    self.registry.modules[module_index].constant_is_import[constant_index] = matches!(
+                        binding.kind,
+                        BindingKind::Imported { .. } | BindingKind::Namespace { .. }
+                    );
                 }
             }
         }
@@ -5079,6 +5157,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     value,
                     origin,
                     constructor_name: None,
+                    message: None,
                 },
             ),
             Err(EvalFailure::Runtime(kind)) => self.program_error(module, kind),
@@ -5567,6 +5646,13 @@ impl<'a, H: Host> Machine<'a, H> {
         ) {
             return;
         }
+        // A fatal error stores nothing, and it can reach a module that an inner turn
+        // already aborted, so it comes before the check of the state.
+        if matches!(&result, Err(error) if !matches!(error.kind, RuntimeErrorKind::UncaughtThrow { .. }))
+        {
+            self.abort_module_evaluation(module);
+            return;
+        }
         debug_assert!(
             matches!(
                 self.registry.modules[module.get() as usize].state,
@@ -5574,16 +5660,7 @@ impl<'a, H: Host> Machine<'a, H> {
             ),
             "only an in-flight module settles"
         );
-        match result {
-            Ok(()) => {
-                self.registry.modules[module.get() as usize].state = ModuleState::Evaluated(Ok(()));
-            }
-            Err(error) if matches!(error.kind, RuntimeErrorKind::UncaughtThrow { .. }) => {
-                self.registry.modules[module.get() as usize].state =
-                    ModuleState::Evaluated(Err(error));
-            }
-            Err(_) => self.abort_module_evaluation(module),
-        }
+        self.registry.modules[module.get() as usize].state = ModuleState::Evaluated(result);
     }
 
     pub(crate) fn abort_module_evaluation(&mut self, module: ModuleId) {
@@ -5622,7 +5699,9 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn run_loop(&mut self, stop_depth: usize) -> Result<Option<Execution>, RuntimeError> {
-        if self.frames.len().saturating_add(self.native_depth) > self.limits.max_call_depth {
+        if self.frames.len().saturating_add(self.native_depth) > self.limits.max_call_depth
+            || self.native_stack_exhausted()
+        {
             return Err(self.error_here(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
             }));
@@ -5736,14 +5815,17 @@ impl<'a, H: Host> Machine<'a, H> {
                     captures,
                 } => match self.read_captures(frame_index, captures.get(), function) {
                     Ok(captures) => {
+                        let properties = self
+                            .closure_properties(module_id, function)
+                            .map_err(|kind| self.error_at(kind, function_index, pc))?;
                         let value = self
                             .allocate(HeapEntry::Function {
                                 module: module_id,
                                 function,
                                 captures,
                                 context: self.frames[frame_index].context,
-                                properties: PropertyMap::default(),
-                                prototype: Some(self.intrinsics.function_prototype),
+                                properties,
+                                prototype: Some(self.closure_prototype(module_id, function)),
                                 extensible: true,
                             })
                             .map_err(|kind| self.error_at(kind, function_index, pc))?;
@@ -5755,7 +5837,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Instruction::GetProperty { dst, object, key } => {
                     let object = self.read_register(frame_index, object.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.computed_property_key(object, key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5774,7 +5856,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let object = self.read_register(frame_index, object.get());
                     let value = self.read_register(frame_index, value.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.computed_property_key(object, key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5783,6 +5865,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     };
                     match self.internal_set(object, key, value, object) {
                         Ok(true) => self.frames[frame_index].pc = pc + 1,
+                        Ok(false) if self.is_sloppy(module_id, function_index) => {
+                            self.frames[frame_index].pc = pc + 1;
+                        }
                         Ok(false) => {
                             self.resolve_failure(
                                 EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -5797,14 +5882,17 @@ impl<'a, H: Host> Machine<'a, H> {
                 Instruction::DeleteProperty { dst, object, key } => {
                     let object = self.read_register(frame_index, object.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.computed_property_key(object, key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
                             continue;
                         }
                     };
-                    match self.internal_delete(object, &key) {
+                    let deleted = self.internal_delete(object, &key).and_then(|deleted| {
+                        self.deletion_result(module_id, function_index, deleted)
+                    });
+                    match deleted {
                         Ok(deleted) => {
                             self.write_register(frame_index, dst.get(), Value::boolean(deleted));
                             self.frames[frame_index].pc = pc + 1;
@@ -5821,7 +5909,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let object = self.read_register(frame_index, object.get());
                     let accessor = self.read_register(frame_index, accessor.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5837,7 +5925,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let object = self.read_register(frame_index, object.get());
                     let value = self.read_register(frame_index, value.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -5958,7 +6046,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 },
                 Instruction::StoreGlobal { name, value } => {
                     let value = self.read_register(frame_index, value.get());
-                    match self.store_global(module_id, name, value) {
+                    let sloppy = self.is_sloppy(module_id, function_index);
+                    match self.store_global(module_id, name, value, sloppy) {
                         Ok(()) => self.frames[frame_index].pc = pc + 1,
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
@@ -5977,9 +6066,15 @@ impl<'a, H: Host> Machine<'a, H> {
                     }
                 }
                 Instruction::LoadThis { dst } => {
-                    let value = self.frames[frame_index].this_value;
-                    self.write_register(frame_index, dst.get(), value);
-                    self.frames[frame_index].pc = pc + 1;
+                    let this_value = self.frames[frame_index].this_value;
+                    match self.bind_this(module_id, function_index, this_value) {
+                        Ok(value) => {
+                            self.frames[frame_index].this_value = value;
+                            self.write_register(frame_index, dst.get(), value);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
                 }
                 Instruction::LoadArguments { dst } => {
                     let value = self.materialize_arguments(frame_index, function_index, pc)?;
@@ -6326,7 +6421,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let home = self.read_register(frame_index, home.get());
                     let receiver = self.read_register(frame_index, receiver.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -6350,7 +6445,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     let home = self.read_register(frame_index, home.get());
                     let receiver = self.read_register(frame_index, receiver.get());
                     let key_value = self.read_register(frame_index, key.get());
-                    let key = match self.to_property_key(key_value) {
+                    let key = match self.observable_property_key(key_value) {
                         Ok(key) => key,
                         Err(failure) => {
                             self.resolve_failure(failure, pc)?;
@@ -6484,7 +6579,11 @@ impl<'a, H: Host> Machine<'a, H> {
         let id = SlotId::from_parts(RUNTIME_HEAP_SEGMENT, slot)
             .expect("runtime segment and one-based slot are nonzero");
         self.request_garbage_collection();
-        Ok(Value::heap_ref(id))
+        let value = Value::heap_ref(id);
+        if self.in_builtin {
+            self.builtin_temporaries.push(value);
+        }
+        Ok(value)
     }
 
     fn live_runtime_slots(&self) -> usize {
@@ -6681,26 +6780,191 @@ impl<'a, H: Host> Machine<'a, H> {
         {
             let value = self.registry.cells[cell.0].value;
             if value.is_uninitialized() {
-                let binding = self.registry.modules[module.get() as usize]
-                    .binding_cells
-                    .iter()
-                    .position(|candidate| *candidate == Some(cell))
-                    .map(|index| BindingId::new(index as u32))
-                    .expect("linked cell belongs to a binding");
-                return Err(EvalFailure::Runtime(RuntimeErrorKind::TemporalDeadZone {
-                    module,
-                    binding,
-                }));
+                return Err(self.uninitialized_read());
             }
             return Ok(Some(value));
         }
         let name = self.constant_text(module, name).to_owned();
-        let key = PropertyKey::Named(name);
+        let key = PropertyKey::Named(name.clone());
         let global = self.context_global.unwrap_or(self.global_object);
         if self.internal_has_property(global, &key)? {
             return self.get_property_key(global, &key).map(Some);
         }
+        self.missing_global = Some(name);
         Ok(None)
+    }
+
+    /// `ToPropertyKey` for a property reference. A null or undefined base throws
+    /// here, before the key converts, so that conversion runs no user code.
+    pub(crate) fn computed_property_key(
+        &mut self,
+        object: Value,
+        key: Value,
+    ) -> Result<PropertyKey, EvalFailure> {
+        if matches!(object.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "access a property of null or undefined",
+            }));
+        }
+        self.observable_property_key(key)
+    }
+
+    /// The `[[Prototype]]` a new closure starts with, which depends on its kind.
+    pub(crate) fn closure_prototype(&self, module: ModuleId, function: FunctionId) -> Value {
+        let flags = self.module_code(module).functions()[function.get() as usize].flags();
+        let builtins = &self.intrinsics.builtins;
+        match (flags.is_async, flags.is_generator) {
+            (false, false) => self.intrinsics.function_prototype,
+            (false, true) => builtins.generator_function_prototype(),
+            (true, false) => builtins.async_function_prototype(),
+            (true, true) => builtins.async_generator_function_prototype(),
+        }
+    }
+
+    /// The own properties a new closure starts with. A generator function owns
+    /// the `prototype` object its kind requires, which the compiler emits only
+    /// for constructors; every other property of a closure is materialized on
+    /// demand.
+    pub(crate) fn closure_properties(
+        &mut self,
+        module: ModuleId,
+        function: FunctionId,
+    ) -> Result<PropertyMap, RuntimeErrorKind> {
+        let flags = self.module_code(module).functions()[function.get() as usize].flags();
+        let mut properties = PropertyMap::default();
+        if flags.is_generator {
+            let builtins = &self.intrinsics.builtins;
+            let parent = if flags.is_async {
+                builtins.async_generator_prototype()
+            } else {
+                builtins.generator_prototype()
+            };
+            let value = self.allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(parent),
+                extensible: true,
+                boxed_primitive: None,
+            })?;
+            properties.insert(
+                PropertyKey::Named(EcmaString::encode("prototype")),
+                Property::Data {
+                    value,
+                    writable: true,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+        Ok(properties)
+    }
+
+    /// A function's `length` and `name` come from its code until something could
+    /// tell that from stored properties: a descriptor read, a key list, a delete or
+    /// a redefinition stores them first, ahead of whatever is already stored.
+    pub(crate) fn reify_function_properties(&mut self, index: usize) -> Result<(), EvalFailure> {
+        let reified = self.intrinsics.builtins.function_reified_key();
+        let name_key = PropertyKey::Named(EcmaString::encode("name"));
+        let length_key = PropertyKey::Named(EcmaString::encode("length"));
+        let HeapEntry::Function {
+            module,
+            function,
+            properties,
+            ..
+        } = &self.heap[index]
+        else {
+            return Ok(());
+        };
+        if properties.contains_key(&reified) {
+            return Ok(());
+        }
+        let metadata = &self.module_code(*module).functions()[function.get() as usize];
+        let length = (!properties.contains_key(&length_key))
+            .then(|| number_value(metadata.parameter_count() as f64));
+        let name = (!properties.contains_key(&name_key)).then(|| {
+            metadata
+                .name()
+                .map(|id| self.constant_text(*module, id).clone())
+                .unwrap_or_default()
+        });
+        let name = name
+            .map(|text| self.allocate(HeapEntry::String(text)))
+            .transpose()
+            .map_err(EvalFailure::Runtime)?;
+        let mut stored = PropertyMap::default();
+        for (key, value) in [(length_key, length), (name_key, name)] {
+            if let Some(value) = value {
+                stored.insert(
+                    key,
+                    Property::Data {
+                        value,
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                );
+            }
+        }
+        stored.insert(
+            reified,
+            Property::Data {
+                value: Value::TRUE,
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        self.charge_slot(index, stored.charge_bytes())
+            .map_err(EvalFailure::Runtime)?;
+        let HeapEntry::Function { properties, .. } = &mut self.heap[index] else {
+            unreachable!("function checked above");
+        };
+        for (key, property) in std::mem::take(properties).0 {
+            stored.insert(key, property);
+        }
+        *properties = stored;
+        Ok(())
+    }
+
+    /// Whether a function is non-strict ECMAScript code.
+    pub(crate) fn is_sloppy(&self, module: ModuleId, function: usize) -> bool {
+        self.module_code(module).functions()[function]
+            .flags()
+            .is_sloppy
+    }
+
+    /// `OrdinaryCallBindThis` for the running function: a sloppy function sees
+    /// the global object for a missing receiver and a wrapper for a primitive.
+    /// Callers keep the result so a wrapper keeps its identity. Doing this at
+    /// the first read cannot be observed, because `ToObject` runs no user code.
+    pub(crate) fn bind_this(
+        &mut self,
+        module: ModuleId,
+        function: usize,
+        this_value: Value,
+    ) -> Result<Value, EvalFailure> {
+        if !self.is_sloppy(module, function) {
+            return Ok(this_value);
+        }
+        if this_value == Value::UNDEFINED || this_value == Value::NULL {
+            return Ok(self.context_global.unwrap_or(self.global_object));
+        }
+        self.value_to_object(this_value)
+    }
+
+    /// The value of a `delete` the running function performed. Strict code
+    /// must not silently keep a property it asked to remove.
+    pub(crate) fn deletion_result(
+        &self,
+        module: ModuleId,
+        function: usize,
+        deleted: bool,
+    ) -> Result<bool, EvalFailure> {
+        if deleted || self.is_sloppy(module, function) {
+            return Ok(deleted);
+        }
+        Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "delete of an unconfigurable property",
+        }))
     }
 
     pub(crate) fn store_global(
@@ -6708,6 +6972,7 @@ impl<'a, H: Host> Machine<'a, H> {
         module: ModuleId,
         name: ConstantId,
         value: Value,
+        sloppy: bool,
     ) -> Result<(), EvalFailure> {
         let cell = self
             .registry
@@ -6717,15 +6982,8 @@ impl<'a, H: Host> Machine<'a, H> {
             .copied()
             .flatten();
         if let Some(cell) = cell {
-            let binding = self.registry.modules[module.get() as usize]
-                .binding_cells
-                .iter()
-                .position(|candidate| *candidate == Some(cell))
-                .expect("mapped module cell belongs to a binding");
-            if matches!(
-                self.program_module(module).bindings[binding].kind,
-                BindingKind::Imported { .. } | BindingKind::Namespace { .. }
-            ) {
+            if self.registry.modules[module.get() as usize].constant_is_import[name.get() as usize]
+            {
                 return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "assign to immutable module binding",
                 }));
@@ -6734,7 +6992,17 @@ impl<'a, H: Host> Machine<'a, H> {
         } else {
             let name = self.constant_text(module, name).to_owned();
             let global = self.context_global.unwrap_or(self.global_object);
-            self.set_data_property_key(global, PropertyKey::Named(name), value)?;
+            let key = PropertyKey::Named(name);
+            let stored = self.internal_set(global, key.clone(), value, global)?;
+            // This instruction also carries global declarations, whose failure
+            // always throws. Only an assignment can fail on an existing
+            // property, and sloppy code ignores that; a missing property on a
+            // non-extensible global is taken to be a declaration.
+            if !stored && !(sloppy && self.has_own_property_key(global, &key)?) {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "assign to read only property",
+                }));
+            }
         }
         Ok(())
     }
@@ -6839,22 +7107,6 @@ impl<'a, H: Host> Machine<'a, H> {
             arguments: flattened,
             new_target,
         })
-    }
-
-    fn bound_target(&self, mut value: Value) -> Result<Value, RuntimeErrorKind> {
-        loop {
-            let Some(index) = self.runtime_slot(value)? else {
-                return Ok(value);
-            };
-            let HeapEntry::NativeFunction {
-                callable: NativeCallable::Bound(bound),
-                ..
-            } = &self.heap[index]
-            else {
-                return Ok(value);
-            };
-            value = bound.target;
-        }
     }
 
     /// Materializes a constant into an ABI value, interning strings and bigints
@@ -6966,6 +7218,25 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// A strict arguments object poisons `callee`; a sloppy one would name the
+    /// function, which a frame does not hold.
+    pub(crate) fn arguments_properties(&self, sloppy: bool) -> PropertyMap {
+        let mut properties = PropertyMap::default();
+        if !sloppy {
+            let thrower = self.intrinsics.builtins.throw_type_error();
+            properties.insert(
+                PropertyKey::Named(EcmaString::encode("callee")),
+                Property::Accessor {
+                    getter: Some(thrower),
+                    setter: Some(thrower),
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+        properties
+    }
+
     pub(crate) fn materialize_arguments(
         &mut self,
         frame: usize,
@@ -6976,10 +7247,12 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(existing);
         }
         let args = self.frames[frame].args.clone();
+        let properties =
+            self.arguments_properties(self.is_sloppy(self.frames[frame].module, function));
         let value = self
             .allocate(HeapEntry::Array {
                 elements: args,
-                properties: PropertyMap::default(),
+                properties,
                 prototype: Some(self.intrinsics.array_prototype),
                 extensible: true,
                 length_writable: true,
@@ -7001,7 +7274,7 @@ impl<'a, H: Host> Machine<'a, H> {
             (_, None) => self.error_at_in_module(kind, target.module, function_index, 0),
             (None, Some(_)) => unreachable!("a returning frame has a caller"),
         };
-        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+        if self.call_depth_exhausted() {
             return Err(limit_error(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
             }));
@@ -7043,11 +7316,41 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// Whether a call here passes the guest stack, so that it throws
+    /// [`STACK_OVERFLOW`] in place of a new activation.
+    pub(crate) fn stack_overflows(&self) -> bool {
+        self.frames.len().saturating_add(self.native_depth) >= self.limits.max_stack_depth
+            || self.native_stack_overflows()
+    }
+
+    /// Whether the native stack here passes [`Limits::max_stack_bytes`]. A builtin
+    /// that calls a builtin adds no activation, so only this bounds that path.
+    pub(crate) fn native_stack_overflows(&self) -> bool {
+        self.native_stack_used() > self.limits.max_stack_bytes
+    }
+
+    /// Whether a new activation here ends the run: the host ceiling of
+    /// [`Limits::max_call_depth`], or a native stack that is [`STACK_SLACK`] past
+    /// the guest stack. Only a path that did not check [`Self::stack_overflows`]
+    /// gets that far, and it ends with an error, not with a stack overflow.
+    fn call_depth_exhausted(&self) -> bool {
+        self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth
+            || self.native_stack_exhausted()
+    }
+
+    fn native_stack_exhausted(&self) -> bool {
+        self.native_stack_used() > self.limits.max_stack_bytes.saturating_add(STACK_SLACK)
+    }
+
+    fn native_stack_used(&self) -> usize {
+        self.stack_base.saturating_sub(stack_position())
+    }
+
     pub(crate) fn reserve_native_activation(
         &mut self,
         register_count: usize,
     ) -> Result<(), RuntimeErrorKind> {
-        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+        if self.call_depth_exhausted() {
             return Err(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
             });
@@ -7085,7 +7388,7 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn enter_native_generator(&mut self) -> Result<(), RuntimeErrorKind> {
-        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+        if self.call_depth_exhausted() {
             return Err(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
             });
@@ -7103,7 +7406,10 @@ impl<'a, H: Host> Machine<'a, H> {
     /// chain of transparent proxies would exhaust the process stack while the
     /// `frames.len() + native_depth` ceiling still had room.
     pub(crate) fn enter_proxy_dispatch(&mut self) -> Result<(), EvalFailure> {
-        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+        if self.stack_overflows() {
+            return Err(EvalFailure::Throw(STACK_OVERFLOW));
+        }
+        if self.call_depth_exhausted() {
             return Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
             }));
@@ -7124,9 +7430,103 @@ impl<'a, H: Host> Machine<'a, H> {
         f: impl FnOnce(&mut Machine<'a, H>) -> Result<T, EvalFailure>,
     ) -> Result<T, EvalFailure> {
         self.enter_proxy_dispatch()?;
-        let result = f(self);
+        let result = self.with_temporaries(f);
         self.leave_proxy_dispatch();
         result
+    }
+
+    /// Runs native code that holds values in Rust locals across user code,
+    /// keeping what it allocates and what user code returns to it rooted.
+    pub(crate) fn with_temporaries<T>(&mut self, body: impl FnOnce(&mut Machine<'a, H>) -> T) -> T {
+        if self.in_builtin {
+            return body(self);
+        }
+        self.in_builtin = true;
+        let mark = self.builtin_temporaries.len();
+        let floor = std::mem::replace(&mut self.results_floor, self.callback_results.len());
+        let result = body(self);
+        self.callback_results.truncate(self.results_floor);
+        self.results_floor = floor;
+        self.builtin_temporaries.truncate(mark);
+        self.in_builtin = false;
+        result
+    }
+
+    /// Roots values for native code outside a builtin; `release_temporaries`
+    /// with the returned mark ends that.
+    pub(crate) fn hold_temporaries(&mut self, values: &[Value]) -> usize {
+        let mark = self.builtin_temporaries.len();
+        self.builtin_temporaries.extend_from_slice(values);
+        mark
+    }
+
+    pub(crate) fn release_temporaries(&mut self, mark: usize) {
+        self.builtin_temporaries.truncate(mark);
+    }
+
+    /// Roots a call that a builtin forwarded. `apply` and `Reflect.apply` read
+    /// their list into a Rust vector, and with the end of the builtin nothing
+    /// else keeps those values. The next builtin can run user code, and it
+    /// expects its caller to root what it is given.
+    pub(crate) fn hold_forwarded_call(
+        &mut self,
+        callee: Value,
+        this_value: Value,
+        arguments: &[Value],
+    ) {
+        self.builtin_temporaries.extend([callee, this_value]);
+        self.builtin_temporaries.extend_from_slice(arguments);
+    }
+
+    /// Keeps a value a builtin just received until that builtin returns.
+    pub(crate) fn keep_temporary(&mut self, value: Value) {
+        if self.in_builtin && matches!(value.decode(), Some(Decoded::HeapRef(_))) {
+            self.builtin_temporaries.push(value);
+        }
+    }
+
+    fn keep_callback_result(&mut self, value: Value) {
+        if !self.in_builtin || !matches!(value.decode(), Some(Decoded::HeapRef(_))) {
+            return;
+        }
+        if self.callback_results.len() - self.results_floor == RECENT_CALLBACK_RESULTS {
+            self.callback_results.remove(self.results_floor);
+        }
+        self.callback_results.push(value);
+    }
+
+    /// Runs user code for a builtin, which holds the result in a Rust local.
+    fn call_user_code(
+        &mut self,
+        call: impl FnOnce(&mut Machine<'a, H>) -> Result<Value, EvalFailure>,
+        keep: fn(&mut Self, Value),
+    ) -> Result<Value, EvalFailure> {
+        let in_builtin = std::mem::replace(&mut self.in_builtin, false);
+        let result = call(self);
+        self.in_builtin = in_builtin;
+        match &result {
+            Ok(value)
+            | Err(EvalFailure::ThrowValue(value) | EvalFailure::ThrowValueOrigin { value, .. }) => {
+                keep(self, *value);
+            }
+            Err(_) => {}
+        }
+        result
+    }
+
+    /// `call_value` for a loop over a user callback that is done with each result
+    /// before the next call: `forEach`, `map`, `reduce` and their like. Only
+    /// such a loop may use this; anything collecting results needs `call_value`.
+    pub(crate) fn call_callback(
+        &mut self,
+        callee: Value,
+        this_value: Value,
+        arguments: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        self.call_user_code(
+            |machine| machine.dispatch_call(callee, this_value, arguments),
+            Self::keep_callback_result,
+        )
     }
 
     /// Answers whether `value` has `[[Construct]]`. Builtin callees consult the
@@ -7134,6 +7534,22 @@ impl<'a, H: Host> Machine<'a, H> {
     /// callees recurse into their target, runtime closures consult the
     /// compiler-emitted `FunctionFlags::is_constructable` bit, and proxies
     /// answer from the snapshot `ProxyCreate` took of their target.
+    /// Whether `value` is a non-strict `function`, the one kind of function that
+    /// the specification lets an implementation give `caller` and `arguments`.
+    pub(crate) fn is_sloppy_ordinary_function(&self, value: Value) -> Result<bool, EvalFailure> {
+        let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
+            return Ok(false);
+        };
+        let HeapEntry::Function {
+            module, function, ..
+        } = &self.heap[index]
+        else {
+            return Ok(false);
+        };
+        let flags = self.module_code(*module).functions()[function.get() as usize].flags();
+        Ok(flags.is_sloppy && flags.is_constructable && !flags.is_async && !flags.is_generator)
+    }
+
     pub(crate) fn is_constructor(&self, value: Value) -> Result<bool, EvalFailure> {
         let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
             return Ok(false);
@@ -7164,6 +7580,14 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn execute_call(&mut self, request: CallRequest<'_>) -> Result<(), RuntimeError> {
+        let mark = self.builtin_temporaries.len();
+        let result = self.execute_call_forwarding(request);
+        self.release_temporaries(mark);
+        result
+    }
+
+    /// [`Machine::execute_call`], which releases what this holds for a forward.
+    fn execute_call_forwarding(&mut self, request: CallRequest<'_>) -> Result<(), RuntimeError> {
         let CallRequest {
             callee,
             this_value,
@@ -7183,40 +7607,30 @@ impl<'a, H: Host> Machine<'a, H> {
                     captures,
                     context,
                 }) => {
+                    if self.stack_overflows() {
+                        return self.resolve_failure(EvalFailure::Throw(STACK_OVERFLOW), call_pc);
+                    }
                     let flags = self.module_code(target.module).functions()
                         [target.function.get() as usize]
                         .flags();
-                    if flags.is_async && flags.is_generator {
-                        let generator = self
-                            .create_async_generator(GeneratorStart {
-                                target,
-                                captures,
-                                context,
-                                this_value,
-                                new_target,
-                                args: arguments.as_ref().to_vec(),
-                            })
-                            .map_err(|kind| self.error_here_at(kind, call_pc))?;
-                        if let Some(register) = destination {
-                            self.write_register(self.frames.len() - 1, register, generator);
-                        }
-                        return Ok(());
-                    }
-                    if flags.is_generator && !flags.is_async {
-                        let generator = self
-                            .create_generator(GeneratorStart {
-                                target,
-                                captures,
-                                context,
-                                this_value,
-                                new_target,
-                                args: arguments.as_ref().to_vec(),
-                            })
-                            .map_err(|kind| self.error_here_at(kind, call_pc))?;
-                        if let Some(register) = destination {
-                            self.write_register(self.frames.len() - 1, register, generator);
-                        }
-                        return Ok(());
+                    if flags.is_generator {
+                        let start = GeneratorStart {
+                            target,
+                            captures,
+                            context,
+                            this_value,
+                            new_target,
+                            args: arguments.as_ref().to_vec(),
+                        };
+                        return match self.start_generator(start, flags) {
+                            Ok(generator) => {
+                                if let Some(register) = destination {
+                                    self.write_register(self.frames.len() - 1, register, generator);
+                                }
+                                Ok(())
+                            }
+                            Err(failure) => self.resolve_failure(failure, call_pc),
+                        };
                     }
                     if flags.is_async && !flags.is_generator {
                         return match crate::vm::generator_async::start_async_function(
@@ -7264,6 +7678,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             this_value: next_this,
                             arguments: next_arguments,
                         }) => {
+                            self.hold_forwarded_call(next, next_this, &next_arguments);
                             callee = next;
                             this_value = next_this;
                             arguments = Cow::Owned(next_arguments);
@@ -7366,6 +7781,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 Err(failure) => self.resolve_failure(failure, call_pc),
             };
+        }
+        match self.is_constructor(callee) {
+            Ok(true) => {}
+            Ok(false) => return self.throw_type("construct", call_pc),
+            Err(failure) => return self.resolve_failure(failure, call_pc),
         }
         let index = match self.runtime_slot(callee) {
             Ok(Some(index)) => index,
@@ -7674,6 +8094,49 @@ impl<'a, H: Host> Machine<'a, H> {
         self.box_primitive(value)
     }
 
+    /// The string inside a String exotic object.
+    fn boxed_string(&self, index: usize) -> Option<&EcmaString> {
+        let HeapEntry::Object {
+            boxed_primitive: Some(primitive),
+            ..
+        } = &self.heap[index]
+        else {
+            return None;
+        };
+        let slot = self.runtime_slot(*primitive).ok().flatten()?;
+        match &self.heap[slot] {
+            HeapEntry::String(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// `StringGetOwnProperty`, plus the `length` every String exotic object owns.
+    pub(crate) fn string_exotic_property(
+        &mut self,
+        index: usize,
+        key: &PropertyKey,
+    ) -> Result<Option<Property>, EvalFailure> {
+        let found = self
+            .boxed_string(index)
+            .and_then(|text| string_own_get(text, key));
+        let (value, enumerable) = match found {
+            Some(Found::Value(length)) => (length, false),
+            Some(Found::Text(unit)) => {
+                let unit = self
+                    .allocate(HeapEntry::String(unit))
+                    .map_err(EvalFailure::Runtime)?;
+                (unit, true)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Property::Data {
+            value,
+            writable: false,
+            enumerable,
+            configurable: false,
+        }))
+    }
+
     pub(crate) fn unbox_primitive_or_self(&self, value: Value) -> Result<Value, EvalFailure> {
         let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
             return Ok(value);
@@ -7740,6 +8203,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 configurable: true,
             },
         );
+        properties.insert(self.intrinsics.builtins.error_brand_key(), error_brand());
         match self.allocate(HeapEntry::Object {
             properties,
             prototype: Some(self.intrinsics.error_prototype(id)),
@@ -7763,6 +8227,18 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn internal_construct(
+        &mut self,
+        callee: Value,
+        arguments: &[Value],
+        new_target: Value,
+    ) -> Result<Value, EvalFailure> {
+        self.call_user_code(
+            |machine| machine.dispatch_construct(callee, arguments, new_target),
+            Self::keep_temporary,
+        )
+    }
+
+    fn dispatch_construct(
         &mut self,
         callee: Value,
         arguments: &[Value],
@@ -7796,11 +8272,16 @@ impl<'a, H: Host> Machine<'a, H> {
                         operation: "construct",
                     }));
                 }
+                if self.stack_overflows() {
+                    return Err(EvalFailure::Throw(STACK_OVERFLOW));
+                }
                 let object = self.allocate_constructed_receiver(new_target)?;
                 let stop_depth = self.frames.len();
-                let return_to = self.frames.last().map(|frame| ReturnTo {
+                // Native code calling back has no interpreter frame here, and
+                // the construction still has to answer with `object`.
+                let return_to = Some(ReturnTo {
                     destination: None,
-                    call_pc: frame.pc,
+                    call_pc: self.frames.last().map_or(0, |frame| frame.pc),
                     constructed: Some(object),
                 });
                 self.push_frame(ActivationRequest {
@@ -7822,7 +8303,10 @@ impl<'a, H: Host> Machine<'a, H> {
                     Ok(None) => self.last_completion.take().ok_or(EvalFailure::Runtime(
                         RuntimeErrorKind::InvalidValue { value: object },
                     )),
-                    Ok(Some(execution)) => Ok(execution.value),
+                    // With no activation to return to, `complete_frame` hands back
+                    // the raw completion, so the receiver rule applies here.
+                    Ok(Some(execution)) if self.is_object(execution.value) => Ok(execution.value),
+                    Ok(Some(_)) => Ok(object),
                     Err(error) => {
                         self.unwind_frames_to(stop_depth);
                         match error.kind {
@@ -7868,6 +8352,31 @@ impl<'a, H: Host> Machine<'a, H> {
         this_value: Value,
         arguments: &[Value],
     ) -> Result<Value, EvalFailure> {
+        self.call_user_code(
+            |machine| machine.dispatch_call(callee, this_value, arguments),
+            Self::keep_temporary,
+        )
+    }
+
+    fn dispatch_call(
+        &mut self,
+        callee: Value,
+        this_value: Value,
+        arguments: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        let mark = self.builtin_temporaries.len();
+        let result = self.dispatch_call_forwarding(callee, this_value, arguments);
+        self.release_temporaries(mark);
+        result
+    }
+
+    /// [`Machine::dispatch_call`], which releases what this holds for a forward.
+    fn dispatch_call_forwarding(
+        &mut self,
+        callee: Value,
+        this_value: Value,
+        arguments: &[Value],
+    ) -> Result<Value, EvalFailure> {
         let mut callee = callee;
         let mut this_value = this_value;
         let mut arguments = Cow::Borrowed(arguments);
@@ -7881,6 +8390,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             this_value: next_this,
                             arguments: next_arguments,
                         } => {
+                            self.hold_forwarded_call(next, next_this, &next_arguments);
                             callee = next;
                             this_value = next_this;
                             arguments = Cow::Owned(next_arguments);
@@ -7900,32 +8410,22 @@ impl<'a, H: Host> Machine<'a, H> {
                     captures,
                     context,
                 } => {
+                    if self.stack_overflows() {
+                        return Err(EvalFailure::Throw(STACK_OVERFLOW));
+                    }
                     let flags = self.module_code(target.module).functions()
                         [target.function.get() as usize]
                         .flags();
-                    if flags.is_async && flags.is_generator {
-                        return self
-                            .create_async_generator(GeneratorStart {
-                                target,
-                                captures,
-                                context,
-                                this_value,
-                                new_target: Value::UNDEFINED,
-                                args: arguments.as_ref().to_vec(),
-                            })
-                            .map_err(EvalFailure::Runtime);
-                    }
-                    if flags.is_generator && !flags.is_async {
-                        return self
-                            .create_generator(GeneratorStart {
-                                target,
-                                context,
-                                captures,
-                                this_value,
-                                new_target: Value::UNDEFINED,
-                                args: arguments.as_ref().to_vec(),
-                            })
-                            .map_err(EvalFailure::Runtime);
+                    if flags.is_generator {
+                        let start = GeneratorStart {
+                            target,
+                            context,
+                            captures,
+                            this_value,
+                            new_target: Value::UNDEFINED,
+                            args: arguments.as_ref().to_vec(),
+                        };
+                        return self.start_generator(start, flags);
                     }
                     if flags.is_async && !flags.is_generator {
                         return crate::vm::generator_async::start_async_function(
@@ -8089,6 +8589,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         value,
                         origin,
                         constructor_name: None,
+                        message: None,
                     },
                     site_module,
                     site_function,
@@ -8126,6 +8627,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             value,
                             origin,
                             constructor_name: None,
+                            message: None,
                         },
                         site_module,
                         site_function,
@@ -8379,30 +8881,42 @@ impl<'a, H: Host> Machine<'a, H> {
     }
     fn found_outcome(&mut self, found: Found) -> Result<GetOutcome, EvalFailure> {
         match found {
-            Found::Value(Value::UNINITIALIZED) => {
-                let id = self
-                    .intrinsics
-                    .builtins
-                    .id_named("ReferenceError")
-                    .expect("ReferenceError intrinsic is installed");
-                match self.throw_error(
-                    id,
-                    "Cannot access lexical binding before initialization".into(),
-                ) {
-                    EvalFailure::ThrowValue(value) => Err(EvalFailure::ThrowValueOrigin {
-                        value,
-                        origin: ThrowOrigin::ReferenceError {
-                            operation: "lexical binding is uninitialized",
-                        },
-                    }),
-                    failure => Err(failure),
-                }
-            }
+            Found::Value(Value::UNINITIALIZED) => Err(self.uninitialized_read()),
             Found::Value(value) => Ok(GetOutcome::Value(value)),
             Found::Text(text) => Ok(GetOutcome::Text(text)),
             Found::Getter(getter) => Ok(GetOutcome::Getter(getter)),
-            Found::Failure(kind) => Err(EvalFailure::Runtime(kind)),
+            Found::Failure(kind) => Err(self.read_failure(kind)),
             Found::NoGetter => Ok(GetOutcome::Value(Value::UNDEFINED)),
+        }
+    }
+
+    /// The `ReferenceError` of a read before a binding is initialized.
+    fn uninitialized_read(&mut self) -> EvalFailure {
+        let id = self
+            .intrinsics
+            .builtins
+            .id_named("ReferenceError")
+            .expect("ReferenceError intrinsic is installed");
+        match self.throw_error(
+            id,
+            "Cannot access lexical binding before initialization".into(),
+        ) {
+            EvalFailure::ThrowValue(value) => EvalFailure::ThrowValueOrigin {
+                value,
+                origin: ThrowOrigin::ReferenceError {
+                    operation: "lexical binding is uninitialized",
+                },
+            },
+            failure => failure,
+        }
+    }
+
+    /// The failure of a read. A program can catch a read before initialization, and
+    /// any other kind ends it.
+    pub(crate) fn read_failure(&mut self, kind: RuntimeErrorKind) -> EvalFailure {
+        match kind {
+            RuntimeErrorKind::TemporalDeadZone { .. } => self.uninitialized_read(),
+            kind => EvalFailure::Runtime(kind),
         }
     }
 
@@ -8423,10 +8937,6 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn own_get_ascii(&self, index: usize, name: &str) -> Option<Found> {
         debug_assert!(name.is_ascii());
-        let slot = |value| self.runtime_slot(value).ok().flatten();
-        if slot(self.intrinsics.object_prototype) == Some(index) && name == "toString" {
-            return Some(Found::Value(self.intrinsics.object_to_string()));
-        }
         match &self.heap[index] {
             HeapEntry::Object {
                 properties,
@@ -8450,6 +8960,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Script { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::Date { properties, .. }
+            | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::Promise { properties, .. }
@@ -8497,6 +9009,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 if let Some(found) = property_lookup_ascii(properties, name) {
                     return Some(found);
                 }
+                if properties.contains_key(&self.intrinsics.builtins.function_reified_key()) {
+                    return None;
+                }
                 let metadata = &self.module_code(*module).functions()[function.get() as usize];
                 if name == "length" {
                     return Some(Found::Value(
@@ -8536,33 +9051,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.registry.cells[cell.0].value
                 })))
             }
-            HeapEntry::RegExp {
-                pattern,
-                flags,
-                properties,
-                ..
-            } => {
-                if let Some(found) = property_lookup_ascii(properties, name) {
-                    return Some(found);
-                }
-                let flag = |unit| {
-                    Found::Value(Value::boolean(flags.as_units().contains(&u16::from(unit))))
-                };
-                match name {
-                    "source" => Some(Found::Text(crate::intrinsics::builtins::canonical_source(
-                        pattern,
-                    ))),
-                    "flags" => Some(Found::Text(flags.clone())),
-                    "global" => Some(flag(b'g')),
-                    "ignoreCase" => Some(flag(b'i')),
-                    "multiline" => Some(flag(b'm')),
-                    "sticky" => Some(flag(b'y')),
-                    "unicode" => Some(flag(b'u')),
-                    "dotAll" => Some(flag(b's')),
-                    "lastIndex" => Some(Found::Value(Value::int32(0))),
-                    _ => None,
-                }
-            }
+            HeapEntry::RegExp { properties, .. } => property_lookup_ascii(properties, name),
             HeapEntry::HashState { update, digest, .. } => match name {
                 "update" => Some(Found::Value(*update)),
                 "digest" => Some(Found::Value(*digest)),
@@ -8586,12 +9075,6 @@ impl<'a, H: Host> Machine<'a, H> {
     /// Looks up an own property of the heap entry at `index`, returning `None`
     /// when the key is absent so the caller may continue up the prototype chain.
     fn own_get(&self, index: usize, key: &PropertyKey) -> Option<Found> {
-        if let PropertyKey::Named(name) = key {
-            let slot = |value| self.runtime_slot(value).ok().flatten();
-            if slot(self.intrinsics.object_prototype) == Some(index) && name.eq_ascii("toString") {
-                return Some(Found::Value(self.intrinsics.object_to_string()));
-            }
-        }
         match &self.heap[index] {
             HeapEntry::Object {
                 properties,
@@ -8614,6 +9097,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::AsyncFromSync { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Date { properties, .. }
+            | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::Promise { properties, .. }
@@ -8663,7 +9148,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 if let Some(found) = property_lookup(properties, key) {
                     return Some(found);
                 }
-                if let PropertyKey::Named(name) = key {
+                if let PropertyKey::Named(name) = key
+                    && !properties.contains_key(&self.intrinsics.builtins.function_reified_key())
+                {
                     let metadata = &self.module_code(*module).functions()[function.get() as usize];
                     if name.eq_ascii("length") {
                         return Some(Found::Value(
@@ -8701,53 +9188,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 })))
             }
             HeapEntry::NativeFunction { properties, .. } => property_lookup(properties, key),
-            HeapEntry::RegExp {
-                pattern,
-                flags,
-                properties,
-                ..
-            } => {
-                if let Some(found) = property_lookup(properties, key) {
-                    return Some(found);
-                }
-                if let PropertyKey::Named(name) = key {
-                    let flag = |ascii: &str| {
-                        Found::Value(Value::boolean(
-                            flags.as_units().contains(&u16::from(ascii.as_bytes()[0])),
-                        ))
-                    };
-                    if name.eq_ascii("source") {
-                        return Some(Found::Text(crate::intrinsics::builtins::canonical_source(
-                            pattern,
-                        )));
-                    }
-                    if name.eq_ascii("flags") {
-                        return Some(Found::Text(flags.clone()));
-                    }
-                    if name.eq_ascii("global") {
-                        return Some(flag("g"));
-                    }
-                    if name.eq_ascii("ignoreCase") {
-                        return Some(flag("i"));
-                    }
-                    if name.eq_ascii("multiline") {
-                        return Some(flag("m"));
-                    }
-                    if name.eq_ascii("sticky") {
-                        return Some(flag("y"));
-                    }
-                    if name.eq_ascii("unicode") {
-                        return Some(flag("u"));
-                    }
-                    if name.eq_ascii("dotAll") {
-                        return Some(flag("s"));
-                    }
-                    if name.eq_ascii("lastIndex") {
-                        return Some(Found::Value(Value::int32(0)));
-                    }
-                }
-                None
-            }
+            HeapEntry::RegExp { properties, .. } => property_lookup(properties, key),
             HeapEntry::HashState { update, digest, .. } => {
                 let PropertyKey::Named(name) = key else {
                     return None;
@@ -8825,6 +9266,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
+            | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::TypedArray { properties, .. }
@@ -8856,6 +9299,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Function { prototype, .. }
             | HeapEntry::RegExp { prototype, .. }
             | HeapEntry::Date { prototype, .. }
+            | HeapEntry::Temporal { prototype, .. }
+            | HeapEntry::Intl { prototype, .. }
             | HeapEntry::BuiltinIterator { prototype, .. }
             | HeapEntry::Collection { prototype, .. }
             | HeapEntry::TypedArray { prototype, .. }
@@ -8938,6 +9383,10 @@ impl<'a, H: Host> Machine<'a, H> {
         value: Value,
         receiver: Value,
     ) -> Result<bool, EvalFailure> {
+        let wrapper = self.value_to_object(object)?;
+        if wrapper != object {
+            return self.resolve_set(wrapper, key, value, receiver);
+        }
         let index = match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => index,
             None => {
@@ -8947,9 +9396,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
         };
         if matches!(self.heap[index], HeapEntry::ModuleNamespace { .. }) {
-            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "assign to module namespace",
-            }));
+            return Ok(false);
         }
         if matches!(self.heap[index], HeapEntry::ProcessEnv { .. }) {
             let PropertyKey::Named(name) = &key else {
@@ -9047,12 +9494,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     )
                     .map(|_| true);
             }
-            let index = self
-                .runtime_slot(receiver)
-                .map_err(EvalFailure::Runtime)?
-                .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "set property on primitive",
-                }))?;
+            let Some(index) = self.object_slot(receiver)? else {
+                return Ok(false);
+            };
             self.set_own_data(index, key, value)?;
             return Ok(true);
         };
@@ -9077,14 +9521,30 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         // Ordinary receiver: the stored-property fast path keeps the exact
         // attributes and handles Array element / TypedArray virtual writes.
-        let index = self
-            .runtime_slot(receiver)
-            .map_err(EvalFailure::Runtime)?
-            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "set property on primitive",
-            }))?;
+        let Some(index) = self.object_slot(receiver)? else {
+            return Ok(false);
+        };
+        if self.is_array_length_key(index, &key) {
+            let descriptor = crate::builtins::property_descriptor::PropertyDescriptor {
+                value: Some(value),
+                ..Default::default()
+            };
+            return self.array_define_length(index, descriptor);
+        }
         self.set_own_data(index, key, value)?;
         Ok(true)
+    }
+
+    /// The heap slot of `value` when it is an object. A primitive receiver is
+    /// valid in `[[Set]]`, but it can hold nothing.
+    fn object_slot(&self, value: Value) -> Result<Option<usize>, EvalFailure> {
+        let slot = self.runtime_slot(value).map_err(EvalFailure::Runtime)?;
+        Ok(slot.filter(|index| {
+            !matches!(
+                self.heap[*index],
+                HeapEntry::String(_) | HeapEntry::BigInt(_) | HeapEntry::Symbol { .. }
+            )
+        }))
     }
 
     pub(crate) fn set_super(
@@ -9165,7 +9625,108 @@ impl<'a, H: Host> Machine<'a, H> {
         key: &PropertyKey,
     ) -> Result<Value, EvalFailure> {
         let base = self.super_base(home)?;
+        if base == Value::NULL {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "get super property through null prototype",
+            }));
+        }
         self.internal_get(base, key, receiver)
+    }
+
+    pub(crate) fn is_array_length_key(&self, index: usize, key: &PropertyKey) -> bool {
+        matches!(key, PropertyKey::Named(name) if name.eq_ascii("length"))
+            && matches!(self.heap[index], HeapEntry::Array { .. })
+    }
+
+    /// `ToUint32` and then `ToNumber`, which both run user code and must agree.
+    fn array_length_value(&mut self, value: Value) -> Result<usize, EvalFailure> {
+        let first = self.coerce_number_observable(value)?;
+        let second = self.coerce_number_observable(value)?;
+        let length = numeric_f64(first).map_or(0, to_uint32);
+        if numeric_f64(second) == Some(f64::from(length)) {
+            Ok(length as usize)
+        } else {
+            Err(EvalFailure::Throw(ThrowOrigin::RangeError {
+                operation: "set array length",
+            }))
+        }
+    }
+
+    /// `ArraySetLength`. A non-configurable element stops a truncation there,
+    /// which is reported as `false` after the elements above it have gone.
+    pub(crate) fn array_define_length(
+        &mut self,
+        index: usize,
+        descriptor: crate::builtins::property_descriptor::PropertyDescriptor,
+    ) -> Result<bool, EvalFailure> {
+        let length = descriptor
+            .value
+            .map(|value| self.array_length_value(value))
+            .transpose()?;
+        let HeapEntry::Array {
+            elements,
+            length_writable,
+            ..
+        } = &self.heap[index]
+        else {
+            unreachable!("array_define_length requires an array");
+        };
+        let (old_length, writable) = (elements.len(), *length_writable);
+        if descriptor.is_accessor()
+            || descriptor.enumerable == Some(true)
+            || descriptor.configurable == Some(true)
+            || (!writable
+                && (descriptor.writable == Some(true)
+                    || length.is_some_and(|length| length != old_length)))
+        {
+            return Ok(false);
+        }
+        let reached = match length {
+            Some(length) if length != old_length => self.resize_array(index, length)?,
+            _ => true,
+        };
+        if descriptor.writable == Some(false)
+            && let HeapEntry::Array {
+                length_writable, ..
+            } = &mut self.heap[index]
+        {
+            *length_writable = false;
+        }
+        Ok(reached)
+    }
+
+    /// Resizes with the heap accounting, and says whether `length` was reached.
+    fn resize_array(&mut self, index: usize, length: usize) -> Result<bool, EvalFailure> {
+        let old_length_and_bytes = |entry: &HeapEntry| match entry {
+            HeapEntry::Array {
+                elements,
+                properties,
+                ..
+            } => (elements.len(), properties.charge_bytes()),
+            _ => unreachable!("resize_array requires an array"),
+        };
+        let (old_length, old_property_bytes) = old_length_and_bytes(&self.heap[index]);
+        let growth = length
+            .saturating_sub(old_length)
+            .saturating_mul(std::mem::size_of::<Value>());
+        self.charge_slot(index, growth)
+            .map_err(EvalFailure::Runtime)?;
+        let HeapEntry::Array {
+            elements,
+            properties,
+            ..
+        } = &mut self.heap[index]
+        else {
+            unreachable!("resize_array requires an array");
+        };
+        let reached = apply_array_length(elements, properties, length);
+        let (new_length, new_property_bytes) = old_length_and_bytes(&self.heap[index]);
+        let released = old_length
+            .saturating_sub(new_length)
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(old_property_bytes.saturating_sub(new_property_bytes));
+        self.refund_slot(index, released);
+        Ok(reached)
     }
 
     fn set_own_data(
@@ -9185,57 +9746,18 @@ impl<'a, H: Host> Machine<'a, H> {
             typedarray_all::write_element(self, view, offset, value)?;
             return Ok(());
         }
-        if matches!(&key, PropertyKey::Named(name) if name.eq_ascii("length"))
-            && matches!(self.heap[index], HeapEntry::Array { .. })
-        {
-            let length =
-                exact_array_length(value).ok_or(EvalFailure::Throw(ThrowOrigin::RangeError {
+        if self.is_array_length_key(index, &key) {
+            let descriptor = crate::builtins::property_descriptor::PropertyDescriptor {
+                value: Some(value),
+                ..Default::default()
+            };
+            return if self.array_define_length(index, descriptor)? {
+                Ok(())
+            } else {
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "set array length",
-                }))?;
-            let (old_length, old_property_bytes, length_writable) = match &self.heap[index] {
-                HeapEntry::Array {
-                    elements,
-                    properties,
-                    length_writable,
-                    ..
-                } => (elements.len(), properties.charge_bytes(), *length_writable),
-                _ => unreachable!("array checked above"),
+                }))
             };
-            if !length_writable {
-                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "set array length",
-                }));
-            }
-            let growth = length
-                .saturating_sub(old_length)
-                .saturating_mul(std::mem::size_of::<Value>());
-            self.charge_slot(index, growth)
-                .map_err(EvalFailure::Runtime)?;
-            let result = {
-                let HeapEntry::Array {
-                    elements,
-                    properties,
-                    ..
-                } = &mut self.heap[index]
-                else {
-                    unreachable!("array checked above");
-                };
-                apply_array_length(elements, properties, length, "set array length")
-            };
-            let (new_length, new_property_bytes) = match &self.heap[index] {
-                HeapEntry::Array {
-                    elements,
-                    properties,
-                    ..
-                } => (elements.len(), properties.charge_bytes()),
-                _ => unreachable!("array checked above"),
-            };
-            let released = old_length
-                .saturating_sub(new_length)
-                .saturating_mul(std::mem::size_of::<Value>())
-                .saturating_add(old_property_bytes.saturating_sub(new_property_bytes));
-            self.refund_slot(index, released);
-            return result;
         }
         if let HeapEntry::Array {
             elements,
@@ -9292,6 +9814,16 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             }
             | HeapEntry::Date {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Temporal {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Intl {
                 properties,
                 extensible,
                 ..
@@ -9397,6 +9929,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
+            | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::TypedArray { properties, .. }
@@ -9480,6 +10014,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
+            | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::TypedArray { properties, .. }
@@ -9533,7 +10069,14 @@ impl<'a, H: Host> Machine<'a, H> {
                                     "set array index",
                                 )?;
                             }
-                            elements[offset] = value;
+                            let key = PropertyKey::Named(name);
+                            if let Some(Property::Data { value: stored, .. }) =
+                                properties.get_mut(&key)
+                            {
+                                *stored = value;
+                            } else {
+                                elements[offset] = value;
+                            }
                         } else {
                             let key = PropertyKey::Named(name);
                             let descriptor = match properties.get(&key) {
@@ -9658,6 +10201,16 @@ impl<'a, H: Host> Machine<'a, H> {
                         extensible,
                         ..
                     }
+                    | HeapEntry::Temporal {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::Intl {
+                        properties,
+                        extensible,
+                        ..
+                    }
                     | HeapEntry::BuiltinIterator {
                         properties,
                         extensible,
@@ -9748,6 +10301,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::NativeFunction { properties, .. }
                     | HeapEntry::RegExp { properties, .. }
                     | HeapEntry::Date { properties, .. }
+                    | HeapEntry::Temporal { properties, .. }
+                    | HeapEntry::Intl { properties, .. }
                     | HeapEntry::BuiltinIterator { properties, .. }
                     | HeapEntry::Collection { properties, .. }
                     | HeapEntry::TypedArray { properties, .. }
@@ -9762,21 +10317,25 @@ impl<'a, H: Host> Machine<'a, H> {
                     _ => unreachable!("validated object cannot change heap entry kind"),
                 };
                 match properties.get_mut(&key) {
-                    Some(Property::Accessor { getter, setter, .. }) => match kind {
-                        AccessorKind::Getter => *getter = Some(accessor),
-                        AccessorKind::Setter => *setter = Some(accessor),
-                    },
+                    Some(Property::Accessor { getter, setter, .. }) => {
+                        if kind.is_getter() {
+                            *getter = Some(accessor);
+                        } else {
+                            *setter = Some(accessor);
+                        }
+                    }
                     Some(Property::Data { .. }) | None => {
-                        let (getter, setter) = match kind {
-                            AccessorKind::Getter => (Some(accessor), None),
-                            AccessorKind::Setter => (None, Some(accessor)),
+                        let (getter, setter) = if kind.is_getter() {
+                            (Some(accessor), None)
+                        } else {
+                            (None, Some(accessor))
                         };
                         properties.insert(
                             key,
                             Property::Accessor {
                                 getter,
                                 setter,
-                                enumerable: true,
+                                enumerable: kind.is_enumerable(),
                                 configurable: true,
                             },
                         );
@@ -9802,6 +10361,13 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
+                if self
+                    .boxed_string(index)
+                    .is_some_and(|text| string_own_get(text, key).is_some())
+                {
+                    return Ok(false);
+                }
+                self.reify_function_properties(index)?;
                 if let PropertyKey::Named(name) = key
                     && let Some(typed_index) = typedarray_all::typed_array_index(name)
                     && matches!(self.heap[index], HeapEntry::TypedArray { .. })
@@ -9822,6 +10388,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::NativeFunction { properties, .. }
                     | HeapEntry::RegExp { properties, .. }
                     | HeapEntry::Date { properties, .. }
+                    | HeapEntry::Temporal { properties, .. }
+                    | HeapEntry::Intl { properties, .. }
                     | HeapEntry::BuiltinIterator { properties, .. }
                     | HeapEntry::Collection { properties, .. }
                     | HeapEntry::TypedArray { properties, .. }
@@ -9872,13 +10440,15 @@ impl<'a, H: Host> Machine<'a, H> {
                             0
                         }
                     }
+                    // An environment variable is always configurable, so this
+                    // succeeds whether or not the variable was set, as in Node.
                     HeapEntry::ProcessEnv { .. } => {
-                        let PropertyKey::Named(name) = key else {
-                            return Ok(true);
-                        };
-                        return Ok(name
-                            .to_utf8_strict()
-                            .is_ok_and(|name| self.host.delete_env(&name)));
+                        if let PropertyKey::Named(name) = key
+                            && let Ok(name) = name.to_utf8_strict()
+                        {
+                            self.host.delete_env(&name);
+                        }
+                        return Ok(true);
                     }
                     HeapEntry::String(_)
                     | HeapEntry::BigInt(_)
@@ -10004,17 +10574,23 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn array_extend(&mut self, array: Value, iterable: Value) -> Result<(), EvalFailure> {
-        let iterator = self.create_iterator(iterable, IteratorKind::Sync)?;
-        loop {
-            let (done, value) = self.iterator_next(iterator)?;
-            if done {
-                return Ok(());
+        self.with_temporaries(|machine| {
+            let iterator = machine.create_iterator(iterable, IteratorKind::Sync)?;
+            loop {
+                let (done, value) = machine.iterator_next(iterator)?;
+                if done {
+                    return Ok(());
+                }
+                machine.array_push(array, value)?;
             }
-            self.array_push(array, value)?;
-        }
+        })
     }
 
     fn object_spread(&mut self, target: Value, source: Value) -> Result<(), EvalFailure> {
+        self.with_temporaries(|machine| machine.spread_properties(target, source))
+    }
+
+    fn spread_properties(&mut self, target: Value, source: Value) -> Result<(), EvalFailure> {
         let target_index = match self.runtime_slot(target).map_err(EvalFailure::Runtime)? {
             Some(index)
                 if matches!(
@@ -10247,6 +10823,12 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::Date {
                     prototype: slot, ..
                 }
+                | HeapEntry::Temporal {
+                    prototype: slot, ..
+                }
+                | HeapEntry::Intl {
+                    prototype: slot, ..
+                }
                 | HeapEntry::BuiltinIterator {
                     prototype: slot, ..
                 }
@@ -10299,6 +10881,78 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// Calls a generator function. When its parameters can run code, the
+    /// compiler ended its prologue with a `Suspend`, and running to that point
+    /// now lets a throw from a parameter reach the caller.
+    pub(crate) fn start_generator(
+        &mut self,
+        start: GeneratorStart,
+        flags: bamts_bytecode::FunctionFlags,
+    ) -> Result<Value, EvalFailure> {
+        if flags.is_async {
+            let generator = self
+                .create_async_generator(start)
+                .map_err(EvalFailure::Runtime)?;
+            if flags.binds_at_call {
+                self.run_async_generator_prologue(generator)?;
+            }
+            return Ok(generator);
+        }
+        let generator = self.create_generator(start).map_err(EvalFailure::Runtime)?;
+        if flags.binds_at_call {
+            self.resume_generator(generator, GeneratorCompletion::Normal(Value::UNDEFINED))?;
+        }
+        Ok(generator)
+    }
+
+    /// Runs an async generator to the `Suspend` that ends its prologue. No
+    /// request is queued yet, so the stop settles nothing; the first request
+    /// resumes it the way any later one resumes a `yield`.
+    fn run_async_generator_prologue(&mut self, generator: Value) -> Result<(), EvalFailure> {
+        let AsyncGeneratorState::SuspendedStart(start) =
+            self.take_async_generator_state(generator)?
+        else {
+            unreachable!("a new async generator is suspended at its start")
+        };
+        let stop_depth = self.frames.len();
+        let return_to = self.frames.last().map(|frame| ReturnTo {
+            destination: None,
+            call_pc: frame.pc,
+            constructed: None,
+        });
+        let pushed = self
+            .push_frame(ActivationRequest {
+                target: start.target,
+                captures: &start.captures,
+                context: start.context,
+                this_value: start.this_value,
+                new_target: start.new_target,
+                arguments: &start.args,
+                return_to,
+            })
+            .map_err(|error| EvalFailure::Runtime(error.kind));
+        let step = pushed.and_then(|()| self.drive_async_generator_activation(stop_depth, None));
+        match step {
+            Ok(AsyncGeneratorStep::Yield { activation, .. }) => self
+                .replace_async_generator_state(
+                    generator,
+                    AsyncGeneratorState::SuspendedYield(activation),
+                )
+                .map_err(EvalFailure::Runtime),
+            Ok(AsyncGeneratorStep::Throw { value, origin }) => {
+                self.complete_async_generator(generator)?;
+                Err(EvalFailure::ThrowValueOrigin { value, origin })
+            }
+            Ok(AsyncGeneratorStep::Await { .. } | AsyncGeneratorStep::Return(_)) => {
+                unreachable!("parameters cannot await, and the prologue ends at a Suspend")
+            }
+            Err(failure) => {
+                self.complete_async_generator(generator)?;
+                Err(failure)
+            }
+        }
+    }
+
     pub(crate) fn create_generator(
         &mut self,
         start: GeneratorStart,
@@ -10316,6 +10970,9 @@ impl<'a, H: Host> Machine<'a, H> {
         generator: Value,
         completion: GeneratorCompletion,
     ) -> Result<Value, EvalFailure> {
+        if self.stack_overflows() {
+            return Err(EvalFailure::Throw(STACK_OVERFLOW));
+        }
         let operation =
             crate::vm::generator_async::prepare_generator_operation(self, generator, completion)?;
         let stop_depth = self.frames.len();
@@ -10373,7 +11030,7 @@ impl<'a, H: Host> Machine<'a, H> {
         completion: GeneratorCompletion,
         return_to: Option<ReturnTo>,
     ) -> Result<(), EvalFailure> {
-        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+        if self.call_depth_exhausted() {
             self.release_suspended_activation_registers(activation.registers.len());
             return Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
@@ -10564,7 +11221,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let module_entry = self.async_activation_module(record)?.is_some();
         let activation = self.take_async_activation(record)?;
         let register_count = activation.registers.len();
-        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+        if self.call_depth_exhausted() {
             self.release_suspended_activation_registers(register_count);
             return Err(RuntimeErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
@@ -10786,6 +11443,9 @@ impl<'a, H: Host> Machine<'a, H> {
         generator: Value,
         completion: GeneratorCompletion,
     ) -> Result<Value, EvalFailure> {
+        if self.stack_overflows() {
+            return Err(EvalFailure::Throw(STACK_OVERFLOW));
+        }
         let capability = self.create_promise()?;
         let operation = completion.operation().async_receiver_error();
         let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
@@ -11754,6 +12414,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::NativeFunction { properties, .. }
                 | HeapEntry::RegExp { properties, .. }
                 | HeapEntry::Date { properties, .. }
+                | HeapEntry::Temporal { properties, .. }
+                | HeapEntry::Intl { properties, .. }
                 | HeapEntry::BuiltinIterator { properties, .. }
                 | HeapEntry::Collection { properties, .. }
                 | HeapEntry::Promise { properties, .. }
@@ -11794,9 +12456,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         indices.push((offset, key));
                     }
                     indices.sort_unstable_by_key(|(offset, _)| *offset);
+                    let length = PropertyKey::Named(EcmaString::encode("length"));
                     Ok(indices
                         .into_iter()
                         .map(|(_, key)| key)
+                        .chain(std::iter::once(length))
                         .chain(suffix)
                         .collect())
                 }
@@ -11851,6 +12515,12 @@ impl<'a, H: Host> Machine<'a, H> {
                 .internal_get_own_property(src, key)?
                 .is_some_and(|descriptor| descriptor.enumerable == Some(true)));
         }
+        if self
+            .boxed_string(index)
+            .is_some_and(|text| string_has_index(text, key))
+        {
+            return Ok(true);
+        }
         Ok(match &self.heap[index] {
             HeapEntry::Array {
                 elements,
@@ -11868,9 +12538,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 },
                 Property::enumerable,
             ),
-            HeapEntry::String(text) => key.as_string().is_some_and(|name| {
-                array_index(name).is_some_and(|offset| (offset as usize) < text.len_units())
-            }),
+            HeapEntry::String(text) => string_has_index(text, key),
             HeapEntry::TypedArray { properties, .. } => properties.get(key).map_or_else(
                 || {
                     key.as_string()
@@ -11895,6 +12563,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
+            | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::Promise { properties, .. }
@@ -12150,6 +12820,7 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok((true, Value::UNDEFINED));
         }
         let value = self.get_named_property(result, "value")?;
+        self.keep_temporary(value);
         Ok((false, value))
     }
 
@@ -12446,8 +13117,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 self.allocate(HeapEntry::String(text))
                     .map_err(EvalFailure::Runtime)
             }
-            UnaryOp::Plus => self.to_number(operand),
+            UnaryOp::Plus => self.coerce_number_observable(operand),
             UnaryOp::Negate => {
+                let operand = self.coerce_primitive_observable(operand, false)?;
                 if let Some(value) = intrinsics::builtins::bigint::unary_minus(self, operand)? {
                     return Ok(value);
                 }
@@ -12456,6 +13128,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Ok(number_value(-number))
             }
             UnaryOp::BitwiseNot => {
+                let operand = self.coerce_primitive_observable(operand, false)?;
                 if let Some(value) = intrinsics::builtins::bigint::bitwise_not(self, operand)? {
                     return Ok(value);
                 }
@@ -12464,10 +13137,39 @@ impl<'a, H: Host> Machine<'a, H> {
                 ))
             }
             UnaryOp::LogicalNot => Ok(Value::boolean(!self.truthy(operand))),
+            UnaryOp::ToString => {
+                if self.string_value(operand).is_some() {
+                    return Ok(operand);
+                }
+                let text = self.coerce_string_observable(operand)?;
+                self.allocate(HeapEntry::String(text))
+                    .map_err(EvalFailure::Runtime)
+            }
+            UnaryOp::ToPropertyKey => {
+                if !self.is_object(operand) {
+                    return Ok(operand);
+                }
+                let key = self.observable_property_key(operand)?;
+                intrinsics::builtins::reflect::property_key_value(self, key)
+            }
         }
     }
 
     fn eval_binary(
+        &mut self,
+        op: BinaryOp,
+        left: Value,
+        right: Value,
+    ) -> Result<Value, EvalFailure> {
+        // Converting one operand can run user code while the other's primitive
+        // is only a Rust local.
+        if self.is_object(left) || self.is_object(right) {
+            return self.with_temporaries(|machine| machine.binary_values(op, left, right));
+        }
+        self.binary_values(op, left, right)
+    }
+
+    fn binary_values(
         &mut self,
         op: BinaryOp,
         left: Value,
@@ -12501,7 +13203,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             BinaryOp::InstanceOf => self.instance_of(left, right).map(Value::boolean),
             BinaryOp::In => {
-                let key = self.to_property_key(left)?;
+                let key = self.observable_property_key(left)?;
                 self.internal_has_property(right, &key).map(Value::boolean)
             }
             BinaryOp::Add => self.add(left, right),
@@ -12565,6 +13267,10 @@ impl<'a, H: Host> Machine<'a, H> {
         left: Value,
         right: Value,
     ) -> Result<Value, EvalFailure> {
+        // ToNumeric, left first: an object operand runs its `valueOf` here, and
+        // the operator only ever sees primitives after this.
+        let left = self.coerce_primitive_observable(left, false)?;
+        let right = self.coerce_primitive_observable(right, false)?;
         if let Some(result) =
             intrinsics::builtins::bigint::binary_op(self, bigint_binary_op(op), left, right)?
         {
@@ -12577,7 +13283,7 @@ impl<'a, H: Host> Machine<'a, H> {
             BinaryOp::Multiply => number_value(left * right),
             BinaryOp::Divide => Value::number(left / right),
             BinaryOp::Remainder => Value::number(left % right),
-            BinaryOp::Exponent => Value::number(left.powf(right)),
+            BinaryOp::Exponent => Value::number(number_exponentiate(left, right)),
             BinaryOp::BitAnd => Value::int32((to_int32(left) & to_int32(right)) as u32),
             BinaryOp::BitOr => Value::int32((to_int32(left) | to_int32(right)) as u32),
             BinaryOp::BitXor => Value::int32((to_int32(left) ^ to_int32(right)) as u32),
@@ -12609,11 +13315,7 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn coerce_primitive_default(&mut self, value: Value) -> Result<Value, EvalFailure> {
-        let prefer_string = self
-            .runtime_slot(value)
-            .map_err(EvalFailure::Runtime)?
-            .is_some_and(|index| matches!(self.heap[index], HeapEntry::Date { .. }));
-        self.coerce_primitive_observable(value, prefer_string)
+        self.coerce_primitive_with_hint(value, "default", false)
     }
 
     pub(crate) fn coerce_primitive_observable(
@@ -12621,9 +13323,49 @@ impl<'a, H: Host> Machine<'a, H> {
         value: Value,
         prefer_string: bool,
     ) -> Result<Value, EvalFailure> {
+        let hint = if prefer_string { "string" } else { "number" };
+        self.coerce_primitive_with_hint(value, hint, prefer_string)
+    }
+
+    /// ToPrimitive. `hint` is what a `Symbol.toPrimitive` method receives, and
+    /// `prefer_string` orders the two ordinary methods when there is none.
+    fn coerce_primitive_with_hint(
+        &mut self,
+        value: Value,
+        hint: &str,
+        prefer_string: bool,
+    ) -> Result<Value, EvalFailure> {
         if self.coercion_is_primitive(value)? {
             return Ok(value);
         }
+        let key = self.to_property_key(self.intrinsics.builtins.symbol_to_primitive())?;
+        let exotic = self.get_property_key(value, &key)?;
+        if !matches!(exotic.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            if !self.is_callable(exotic)? {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Symbol.toPrimitive is not a function",
+                }));
+            }
+            let hint = self
+                .allocate(HeapEntry::String(EcmaString::encode(hint)))
+                .map_err(EvalFailure::Runtime)?;
+            let primitive = self.call_value(exotic, value, &[hint])?;
+            if self.coercion_is_primitive(primitive)? {
+                return Ok(primitive);
+            }
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Symbol.toPrimitive returned an object",
+            }));
+        }
+        self.ordinary_to_primitive(value, prefer_string)
+    }
+
+    /// `OrdinaryToPrimitive`: the two ordinary methods, in hint order.
+    pub(crate) fn ordinary_to_primitive(
+        &mut self,
+        value: Value,
+        prefer_string: bool,
+    ) -> Result<Value, EvalFailure> {
         let methods = if prefer_string {
             ["toString", "valueOf"]
         } else {
@@ -12700,6 +13442,8 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::NativeFunction { .. }
                         | HeapEntry::RegExp { .. }
                         | HeapEntry::Date { .. }
+                        | HeapEntry::Temporal { .. }
+                        | HeapEntry::Intl { .. }
                         | HeapEntry::BuiltinIterator { .. }
                         | HeapEntry::Collection { .. }
                         | HeapEntry::TypedArray { .. }
@@ -12756,6 +13500,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::PrivateName { .. }
                     | HeapEntry::RegExp { .. }
                     | HeapEntry::Date { .. }
+                    | HeapEntry::Temporal { .. }
+                    | HeapEntry::Intl { .. }
                     | HeapEntry::BuiltinIterator { .. }
                     | HeapEntry::Collection { .. }
                     | HeapEntry::TypedArray { .. }
@@ -12815,6 +13561,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::HashState { .. }
                     | HeapEntry::RegExp { .. }
                     | HeapEntry::Date { .. }
+                    | HeapEntry::Temporal { .. }
+                    | HeapEntry::Intl { .. }
                     | HeapEntry::BuiltinIterator { .. }
                     | HeapEntry::Collection { .. }
                     | HeapEntry::TypedArray { .. }
@@ -12924,14 +13672,19 @@ impl<'a, H: Host> Machine<'a, H> {
     /// prototype-chain check. A present-but-non-callable handler is a
     /// TypeError, matching `GetMethod`.
     fn instance_of(&mut self, value: Value, constructor: Value) -> Result<bool, EvalFailure> {
-        let constructor = self
-            .bound_target(constructor)
-            .map_err(EvalFailure::Runtime)?;
+        if !self.is_object(constructor) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "instanceof",
+            }));
+        }
         let key = self.has_instance_key()?;
         let handler = self.get_property_key(constructor, &key)?;
         if matches!(handler.decode(), Some(Decoded::Undefined | Decoded::Null)) {
-            // No `@@hasInstance`: ordinary prototype-chain check, byte-for-byte
-            // the pre-symbol `instanceof` behavior.
+            if !self.is_callable(constructor)? {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "instanceof",
+                }));
+            }
             return self.ordinary_has_instance(value, constructor);
         }
         // GetMethod: a present, non-nullish handler must be callable.
@@ -12946,18 +13699,29 @@ impl<'a, H: Host> Machine<'a, H> {
 
     /// `OrdinaryHasInstance` (ECMA-262 §7.3.20): walks `value`'s prototype
     /// chain for the constructor's own `prototype` object, matching by heap
-    /// identity. This is the fallback for a right-hand side that defines no
-    /// callable `Symbol.hasInstance` and is unchanged from the original
-    /// `instanceof` implementation.
+    /// identity. A bound function defers to `instanceof` on its target, and a
+    /// non-callable receiver is simply not a constructor of anything.
     fn ordinary_has_instance(
         &mut self,
         value: Value,
         constructor: Value,
     ) -> Result<bool, EvalFailure> {
         if !self.is_callable(constructor)? {
-            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "instanceof",
-            }));
+            return Ok(false);
+        }
+        if let Some(index) = self
+            .runtime_slot(constructor)
+            .map_err(EvalFailure::Runtime)?
+            && let HeapEntry::NativeFunction {
+                callable: NativeCallable::Bound(bound),
+                ..
+            } = &self.heap[index]
+        {
+            let target = bound.target;
+            return self.instance_of(value, target);
+        }
+        if !self.is_object(value) {
+            return Ok(false);
         }
         let prototype_key = PropertyKey::Named(EcmaString::encode("prototype"));
         let prototype = self.internal_get(constructor, &prototype_key, constructor)?;
@@ -13056,6 +13820,8 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::AsyncFromSync { .. }
                         | HeapEntry::Script { .. }
                         | HeapEntry::Date { .. }
+                        | HeapEntry::Temporal { .. }
+                        | HeapEntry::Intl { .. }
                         | HeapEntry::BuiltinIterator { .. }
                         | HeapEntry::Collection { .. }
                         | HeapEntry::TypedArray { .. }
@@ -13169,6 +13935,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 self.heap[index],
                 HeapEntry::String(_)
                     | HeapEntry::BigInt(_)
+                    | HeapEntry::Symbol { .. }
+                    | HeapEntry::PrivateName { .. }
                     | HeapEntry::PromiseResolver { .. }
                     | HeapEntry::PromiseAll { .. }
                     | HeapEntry::AsyncActivation { .. }
@@ -13255,11 +14023,25 @@ fn numeric_f64(value: Value) -> Option<f64> {
     }
 }
 
+/// What an error object stores under the `[[ErrorData]]` brand key.
+fn error_brand() -> Property {
+    Property::Data {
+        value: Value::TRUE,
+        writable: false,
+        enumerable: false,
+        configurable: false,
+    }
+}
+
+/// The compact encoding for a whole Number. `-0` stays a double: Int32 has no
+/// negative zero, and `1 / -0` and `Object.is` can both tell the difference.
 fn number_value(number: f64) -> Value {
+    // An int32 has no negative zero, so that one integral value stays a double.
     if number.is_finite()
         && number.fract() == 0.0
         && number >= f64::from(i32::MIN)
         && number <= f64::from(i32::MAX)
+        && !(number == 0.0 && number.is_sign_negative())
     {
         Value::int32(number as i32 as u32)
     } else {
@@ -13267,20 +14049,21 @@ fn number_value(number: f64) -> Value {
     }
 }
 
+/// `Number::exponentiate`, which differs from `powf` for a base of 1 or -1 and a
+/// NaN or infinite exponent.
+pub(crate) fn number_exponentiate(base: f64, exponent: f64) -> f64 {
+    if exponent.is_nan() || (base.abs() == 1.0 && exponent.is_infinite()) {
+        f64::NAN
+    } else {
+        base.powf(exponent)
+    }
+}
+
 fn parse_number(text: &EcmaString) -> f64 {
     let Ok(text) = text.to_utf8_strict() else {
         return f64::NAN;
     };
-    parse_number_utf8(&text)
-}
-
-fn parse_number_utf8(text: &str) -> f64 {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        0.0
-    } else {
-        trimmed.parse::<f64>().unwrap_or(f64::NAN)
-    }
+    intrinsics::builtins::string_to_number(&text)
 }
 
 fn to_uint32(number: f64) -> u32 {
@@ -13326,6 +14109,12 @@ fn array_index(key: &EcmaString) -> Option<u32> {
     (index != u32::MAX).then_some(index)
 }
 
+fn string_has_index(text: &EcmaString, key: &PropertyKey) -> bool {
+    key.as_string().is_some_and(|name| {
+        array_index(name).is_some_and(|offset| (offset as usize) < text.len_units())
+    })
+}
+
 fn string_own_get(text: &EcmaString, key: &PropertyKey) -> Option<Found> {
     let PropertyKey::Named(name) = key else {
         return None;
@@ -13354,15 +14143,16 @@ fn exact_array_length(value: Value) -> Option<usize> {
     }
 }
 
+/// Resizes to `length`, stopping above the highest non-configurable element, and
+/// says whether the whole of `length` was reached.
 pub(crate) fn apply_array_length(
     elements: &mut Vec<Value>,
     properties: &mut PropertyMap,
     length: usize,
-    operation: &'static str,
-) -> Result<(), EvalFailure> {
+) -> bool {
     if length >= elements.len() {
         elements.resize(length, Value::HOLE);
-        return Ok(());
+        return true;
     }
     let blocked = properties
         .iter()
@@ -13381,10 +14171,7 @@ pub(crate) fn apply_array_length(
             .is_none_or(|offset| (offset as usize) < effective_length)
     });
     elements.resize(effective_length, Value::HOLE);
-    if blocked.is_some() {
-        return Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }));
-    }
-    Ok(())
+    blocked.is_none()
 }
 
 pub(crate) fn array_set_length(
@@ -13399,7 +14186,11 @@ pub(crate) fn array_set_length(
     if !length_writable {
         return Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }));
     }
-    apply_array_length(elements, properties, length, operation)
+    if apply_array_length(elements, properties, length) {
+        Ok(())
+    } else {
+        Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }))
+    }
 }
 
 fn bigint_binary_op(op: BinaryOp) -> intrinsics::builtins::bigint::BigIntBinaryOp {
@@ -13429,6 +14220,8 @@ pub(crate) fn unary_from_selector(op: u32) -> Option<UnaryOp> {
         3 => Some(UnaryOp::Negate),
         4 => Some(UnaryOp::BitwiseNot),
         5 => Some(UnaryOp::LogicalNot),
+        6 => Some(UnaryOp::ToString),
+        7 => Some(UnaryOp::ToPropertyKey),
         _ => None,
     }
 }
@@ -13474,6 +14267,8 @@ pub(crate) fn accessor_from_selector(kind: u32) -> Option<AccessorKind> {
     match kind {
         0 => Some(AccessorKind::Getter),
         1 => Some(AccessorKind::Setter),
+        2 => Some(AccessorKind::ClassGetter),
+        3 => Some(AccessorKind::ClassSetter),
         _ => None,
     }
 }
@@ -13535,6 +14330,7 @@ mod tests {
                 is_async: false,
                 is_generator: true,
                 is_constructable: false,
+                ..FunctionFlags::default()
             },
             code,
             handlers,
@@ -13556,6 +14352,7 @@ mod tests {
                 is_async: true,
                 is_generator: false,
                 is_constructable: false,
+                ..FunctionFlags::default()
             },
             code,
             handlers,
@@ -13577,6 +14374,7 @@ mod tests {
                 is_async: true,
                 is_generator: true,
                 is_constructable: false,
+                ..FunctionFlags::default()
             },
             code,
             handlers,
@@ -13667,9 +14465,8 @@ mod tests {
         assert_eq!(plain, outcome);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn run_with_telemetry_reports_peak_rss_on_linux() {
+    fn run_with_telemetry_reports_peak_rss() {
         let program = verified(
             vec![],
             vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
@@ -13678,25 +14475,8 @@ mod tests {
         let (_, telemetry) = super::run_with_telemetry(&program, &mut host, &Limits::default());
         assert!(
             telemetry.rss_kb > 0,
-            "peak RSS should be read from /proc on Linux"
+            "peak RSS should be read from the host"
         );
-    }
-
-    #[test]
-    fn parse_peak_rss_kb_selects_vmhwm_not_vmrss() {
-        let status = "Name:	bamts-runtime
-VmRSS:	   64000 kB
-VmHWM:	   32000 kB
-VmPeak:	64000 kB";
-        assert_eq!(super::parse_peak_rss_kb(status), Some(32_000));
-    }
-
-    #[test]
-    fn parse_peak_rss_kb_returns_none_when_only_vmrss_present() {
-        let status = "Name:	bamts-runtime
-VmRSS:	64000 kB
-VmPeak:	64000 kB";
-        assert_eq!(super::parse_peak_rss_kb(status), None);
     }
 
     fn namespace_descriptor_entry() -> Function {
@@ -13758,6 +14538,44 @@ VmPeak:	64000 kB";
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, limits);
         test(&mut machine);
+    }
+
+    /// Descends `levels` frames of at least 4 KiB each, and reports
+    /// [`Machine::stack_overflows`] and [`Machine::call_depth_exhausted`] there.
+    #[inline(never)]
+    fn checks_below(machine: &Machine<'_, TestHost>, levels: usize) -> (bool, bool) {
+        let pad = std::hint::black_box([0_u8; 4096]);
+        if levels == 0 {
+            return (machine.stack_overflows(), machine.call_depth_exhausted());
+        }
+        let checks = checks_below(machine, levels - 1);
+        std::hint::black_box(&pad);
+        checks
+    }
+
+    /// A call past the native stack throws, and a path that did not check that
+    /// ends the run a little later, before the native stack overflows.
+    #[test]
+    fn the_native_stack_ends_the_run_a_little_past_the_guest_stack() {
+        std::thread::Builder::new()
+            .stack_size(16 << 20)
+            .spawn(|| {
+                let limits = Limits {
+                    max_stack_bytes: 256 << 10,
+                    ..Limits::default()
+                };
+                with_machine(limits, |machine| {
+                    assert_eq!(checks_below(machine, 0), (false, false));
+                    assert_eq!(checks_below(machine, 64), (true, false));
+                    assert_eq!(checks_below(machine, 512), (true, true));
+                });
+                with_machine(Limits::default(), |machine| {
+                    assert_eq!(checks_below(machine, 512), (false, false));
+                });
+            })
+            .expect("the test thread starts")
+            .join()
+            .expect("the test thread ends");
     }
 
     #[test]
@@ -14046,6 +14864,21 @@ VmPeak:	64000 kB";
     }
 
     #[test]
+    fn a_large_limit_does_not_delay_the_first_collection() {
+        let large = Limits {
+            max_heap_bytes: 1 << 32,
+            max_heap_slots: 1 << 30,
+            ..Limits::default()
+        };
+        with_machine(large, |machine| {
+            assert_eq!(machine.gc_watermarks_for_test(), (32 << 20, 1 << 19));
+        });
+        with_machine(Limits::default(), |machine| {
+            assert_eq!(machine.gc_watermarks_for_test(), (32 << 20, 1 << 19));
+        });
+    }
+
+    #[test]
     fn gc_recomputes_watermarks_from_live_usage() {
         with_machine(Limits::default(), |machine| {
             let value = machine
@@ -14197,6 +15030,52 @@ VmPeak:	64000 kB";
             machine.heap[machine.runtime_slot(callback).unwrap().unwrap()],
             HeapEntry::Function { .. }
         ));
+    }
+
+    #[test]
+    fn a_class_accessor_is_hidden_and_stays_hidden_when_its_other_half_arrives() {
+        with_machine(Limits::default(), |machine| {
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    extensible: true,
+                    boxed_primitive: None,
+                })
+                .unwrap();
+            let index = machine.runtime_slot(object).unwrap().unwrap();
+            let key = PropertyKey::Named(EcmaString::encode("value"));
+            let enumerable = |machine: &Machine<'_, TestHost>| match &machine.heap[index] {
+                HeapEntry::Object { properties, .. } => properties
+                    .get(&PropertyKey::Named(EcmaString::encode("value")))
+                    .map(Property::enumerable),
+                _ => None,
+            };
+            machine
+                .define_accessor(
+                    object,
+                    key.clone(),
+                    Value::int32(1),
+                    AccessorKind::ClassGetter,
+                )
+                .unwrap();
+            assert_eq!(enumerable(machine), Some(false));
+            machine
+                .define_accessor(object, key, Value::int32(2), AccessorKind::ClassSetter)
+                .unwrap();
+            assert_eq!(enumerable(machine), Some(false));
+            let HeapEntry::Object { properties, .. } = &machine.heap[index] else {
+                panic!("expected an object");
+            };
+            assert!(matches!(
+                properties.get(&PropertyKey::Named(EcmaString::encode("value"))),
+                Some(Property::Accessor {
+                    getter: Some(_),
+                    setter: Some(_),
+                    ..
+                })
+            ));
+        });
     }
 
     #[test]
@@ -19204,6 +20083,55 @@ VmPeak:	64000 kB";
     }
 
     #[test]
+    fn a_failed_global_store_is_silent_only_in_sloppy_code() {
+        fn store_to_read_only_global(is_sloppy: bool) -> Result<Value, RuntimeErrorKind> {
+            let entry = Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags {
+                    is_sloppy,
+                    ..FunctionFlags::default()
+                },
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(1),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(0),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                vec![],
+            );
+            let program = verified(
+                vec![
+                    Constant::String(EcmaString::encode("undefined")),
+                    Constant::Int32(1),
+                ],
+                vec![entry],
+            );
+            let mut host = TestHost;
+            Machine::new(&program, &mut host, Limits::default())
+                .run()
+                .map(|execution| execution.value)
+                .map_err(|error| error.kind)
+        }
+
+        assert_eq!(store_to_read_only_global(true), Ok(Value::int32(1)));
+        assert!(matches!(
+            store_to_read_only_global(false),
+            Err(RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn globals_store_load_and_typeof_undeclared() {
         // StoreGlobal x=5; TypeOfGlobal y (undeclared) -> "undefined";
         // TypeOfGlobal x -> "number"; return LoadGlobal x.
@@ -19516,6 +20444,7 @@ VmPeak:	64000 kB";
                     operation: "global is not defined",
                 },
                 constructor_name: None,
+                message: Some(EcmaString::encode("missing is not defined")),
             }
         );
     }
@@ -19554,6 +20483,7 @@ VmPeak:	64000 kB";
                 value: Value::UNDEFINED,
                 origin: ThrowOrigin::TypeError { operation: "call" },
                 constructor_name: None,
+                message: None,
             }
         );
     }
@@ -19661,6 +20591,130 @@ VmPeak:	64000 kB";
             }
             other => panic!("expected UncaughtThrow, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_builtin_with_no_construct_cannot_be_called_with_new() {
+        // `new Math.abs()`.
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::encode("Math")),
+                Constant::String(EcmaString::encode("abs")),
+            ],
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(2),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::CreateArray { dst: reg(3) },
+                    Instruction::Construct {
+                        dst: reg(4),
+                        callee: reg(2),
+                        arguments: reg(3),
+                    },
+                    Instruction::Return { value: reg(4) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError {
+                    operation: "construct"
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_thrown_error_reports_its_message_and_a_plain_value_reports_none() {
+        // `throw new Error("boom")`.
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::encode("Error")),
+                Constant::String(EcmaString::encode("boom")),
+            ],
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::CreateArray { dst: reg(2) },
+                    Instruction::ArrayPush {
+                        array: reg(2),
+                        value: reg(1),
+                    },
+                    Instruction::Construct {
+                        dst: reg(3),
+                        callee: reg(0),
+                        arguments: reg(2),
+                    },
+                    Instruction::Throw { value: reg(3) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        let RuntimeErrorKind::UncaughtThrow { message, .. } = error.kind else {
+            panic!("expected an uncaught throw");
+        };
+        assert_eq!(
+            message.map(|text| text.to_utf8_lossy()).as_deref(),
+            Some("boom")
+        );
+
+        // `throw "boom"`: a thrown string has no `message` property.
+        let module = verified(
+            vec![Constant::String(EcmaString::encode("boom"))],
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::Throw { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        let RuntimeErrorKind::UncaughtThrow { message, .. } = error.kind else {
+            panic!("expected an uncaught throw");
+        };
+        assert_eq!(message, None);
     }
 
     #[test]
@@ -21301,6 +22355,322 @@ VmPeak:	64000 kB";
     }
 
     #[test]
+    fn computed_property_keys_run_user_conversion() {
+        fn key_text<H: Host>(
+            machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            let text = machine
+                .allocate(HeapEntry::String(EcmaString::encode("converted")))
+                .map_err(EvalFailure::Runtime)?;
+            Ok(intrinsics::BuiltinOutcome::Value(text))
+        }
+        let program = verified(
+            vec![
+                Constant::String(EcmaString::encode("converted")),
+                Constant::String(EcmaString::encode("toString")),
+                Constant::Int32(7),
+            ],
+            vec![function(
+                0,
+                6,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(2),
+                        constant: cid(2),
+                    },
+                    Instruction::SetProperty {
+                        object: reg(0),
+                        key: reg(1),
+                        value: reg(2),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(3),
+                        name: cid(1),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(4),
+                        object: reg(0),
+                        key: reg(3),
+                    },
+                    Instruction::Return { value: reg(4) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let id = machine
+            .intrinsics
+            .builtins
+            .register(intrinsics::BuiltinDef {
+                name: "key text",
+                length: 0,
+                handler: key_text::<TestHost>,
+            });
+        let to_string = intrinsics::native_function(&mut machine.heap, id, "key text", 0);
+        let key = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(key, "toString", to_string)
+            .unwrap();
+        machine.test_set_global("toString", key);
+        assert_eq!(machine.run().unwrap().value, Value::int32(7));
+    }
+
+    #[test]
+    fn closure_prototypes_follow_the_function_kind() {
+        let plain = function(0, 1, vec![Instruction::Halt], Vec::new());
+        let kinded = |is_async, is_generator| {
+            Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags {
+                    is_async,
+                    is_generator,
+                    ..FunctionFlags::default()
+                },
+                vec![Instruction::Halt],
+                Vec::new(),
+            )
+        };
+        let program = verified(
+            Vec::new(),
+            vec![
+                plain,
+                kinded(false, true),
+                kinded(true, false),
+                kinded(true, true),
+            ],
+        );
+        let mut host = TestHost;
+        let machine = Machine::new(&program, &mut host, Limits::default());
+        let kind = |index| machine.closure_prototype(ModuleId::new(0), FunctionId::new(index));
+        let builtins = &machine.intrinsics.builtins;
+        assert_eq!(kind(0), machine.intrinsics.function_prototype);
+        assert_eq!(kind(1), builtins.generator_function_prototype());
+        assert_eq!(kind(2), builtins.async_function_prototype());
+        assert_eq!(kind(3), builtins.async_generator_function_prototype());
+        assert!(
+            !machine.is_callable(kind(1)).unwrap(),
+            "only %Function.prototype% is itself callable"
+        );
+    }
+
+    #[test]
+    fn a_generator_closure_owns_a_prototype_inheriting_from_its_kind() {
+        let generator = Function::new(
+            None,
+            0,
+            0,
+            1,
+            FunctionFlags {
+                is_generator: true,
+                ..FunctionFlags::default()
+            },
+            vec![Instruction::Halt],
+            Vec::new(),
+        );
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator,
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let module = ModuleId::new(0);
+        assert!(
+            machine
+                .closure_properties(module, FunctionId::new(0))
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        let properties = machine
+            .closure_properties(module, FunctionId::new(1))
+            .unwrap();
+        let Some(Property::Data {
+            value,
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        }) = properties.get(&PropertyKey::Named(EcmaString::encode("prototype")))
+        else {
+            panic!("a generator function's prototype is a writable data property");
+        };
+        assert_eq!(
+            machine.internal_get_prototype_of(*value).unwrap(),
+            Some(machine.intrinsics.builtins.generator_prototype())
+        );
+    }
+
+    #[test]
+    fn arithmetic_converts_object_operands_left_first() {
+        fn seven<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            Ok(intrinsics::BuiltinOutcome::Value(Value::int32(7)))
+        }
+        fn fail<H: Host>(
+            _machine: &mut Machine<'_, H>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            Err(EvalFailure::ThrowValue(Value::int32(1)))
+        }
+        let program = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let mut object_with = |name, handler| {
+            let id = machine
+                .intrinsics
+                .builtins
+                .register(intrinsics::BuiltinDef {
+                    name,
+                    length: 0,
+                    handler,
+                });
+            let value_of = intrinsics::native_function(&mut machine.heap, id, name, 0);
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            machine
+                .set_data_property(object, "valueOf", value_of)
+                .unwrap();
+            object
+        };
+        let number = object_with("seven", seven::<TestHost>);
+        let thrower = object_with("fail", fail::<TestHost>);
+        assert_eq!(
+            machine
+                .numeric_binary(BinaryOp::Multiply, number, Value::int32(2))
+                .unwrap(),
+            Value::int32(14)
+        );
+        assert_eq!(
+            machine.eval_unary(UnaryOp::Negate, number).unwrap(),
+            Value::int32(-7i32 as u32)
+        );
+        assert_eq!(
+            machine.eval_unary(UnaryOp::BitwiseNot, number).unwrap(),
+            Value::int32(-8i32 as u32)
+        );
+        assert!(
+            matches!(
+                machine.numeric_binary(BinaryOp::Subtract, thrower, Value::int32(1)),
+                Err(EvalFailure::ThrowValue(_))
+            ),
+            "a conversion failure propagates"
+        );
+    }
+
+    #[test]
+    fn number_value_keeps_the_sign_of_zero() {
+        assert_eq!(number_value(0.0), Value::int32(0));
+        assert!(matches!(
+            number_value(-0.0).decode(),
+            Some(Decoded::Number(zero)) if zero == 0.0 && zero.is_sign_negative()
+        ));
+        assert_eq!(number_value(-1.0), Value::int32(-1i32 as u32));
+    }
+
+    #[test]
+    fn construct_with_no_calling_activation_applies_the_receiver_rule() {
+        // The native tiers keep no interpreter frame, so a constructor entered
+        // from a builtin has nothing to return to. A primitive completion must
+        // still yield the receiver, and an object completion must replace it.
+        let program = verified(
+            vec![Constant::Int32(7)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let mut constructor = |index: u32| {
+            machine
+                .allocate(HeapEntry::Function {
+                    module: ModuleId::new(0),
+                    function: FunctionId::new(index),
+                    captures: Vec::new(),
+                    context: None,
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.function_prototype),
+                    extensible: true,
+                })
+                .unwrap()
+        };
+        let returns_primitive = constructor(1);
+        let returns_object = constructor(2);
+
+        let receiver = machine.construct_value(returns_primitive, &[]).unwrap();
+        let index = machine.runtime_slot(receiver).unwrap().unwrap();
+        assert!(
+            matches!(machine.heap[index], HeapEntry::Object { .. }),
+            "a primitive completion yields the constructed receiver"
+        );
+        let replaced = machine.construct_value(returns_object, &[]).unwrap();
+        let index = machine.runtime_slot(replaced).unwrap().unwrap();
+        assert!(
+            matches!(machine.heap[index], HeapEntry::Array { .. }),
+            "an object completion replaces the receiver"
+        );
+        assert!(machine.frames.is_empty());
+    }
+
+    #[test]
     fn native_callback_throw_uncaught_at_outer_call_site() {
         let entry = function(
             0,
@@ -21387,6 +22757,7 @@ VmPeak:	64000 kB";
                 value: Value::int32(7),
                 origin: ThrowOrigin::Bytecode,
                 constructor_name: None,
+                message: None,
             }
         );
         assert!(machine.callback_boundaries.is_empty());
@@ -22668,8 +24039,10 @@ VmPeak:	64000 kB";
             .unwrap_err();
         assert!(matches!(
             error.kind,
-            RuntimeErrorKind::TemporalDeadZone { module, binding }
-                if module == ModuleId::new(1) && binding == BindingId::new(0)
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::ReferenceError { .. },
+                ..
+            }
         ));
     }
 
@@ -24175,8 +25548,10 @@ VmPeak:	64000 kB";
             .expect_err("descriptor reads uninitialized namespace export");
         assert!(matches!(
             error.kind,
-            RuntimeErrorKind::TemporalDeadZone { module, binding }
-                if module == ModuleId::new(0) && binding == BindingId::new(0)
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::ReferenceError { .. },
+                ..
+            }
         ));
     }
 
@@ -26597,6 +27972,7 @@ VmPeak:	64000 kB";
                 value: Value::int32(7),
                 origin: ThrowOrigin::Bytecode,
                 constructor_name: None,
+                message: None,
             }
         );
         // The later job stays queued and unrun.
@@ -26644,6 +28020,7 @@ VmPeak:	64000 kB";
                 value: Value::int32(7),
                 origin: ThrowOrigin::Bytecode,
                 constructor_name: None,
+                message: None,
             }
         );
         // The exception converts before any drain, so the queued microtask and

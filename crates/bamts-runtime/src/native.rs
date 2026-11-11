@@ -89,6 +89,8 @@ fn unary_to_selector(op: bamts_bytecode::UnaryOp) -> u32 {
         UnaryOp::Negate => 3,
         UnaryOp::BitwiseNot => 4,
         UnaryOp::LogicalNot => 5,
+        UnaryOp::ToString => 6,
+        UnaryOp::ToPropertyKey => 7,
     }
 }
 
@@ -149,6 +151,8 @@ fn accessor_to_selector(kind: bamts_bytecode::AccessorKind) -> u32 {
     match kind {
         AccessorKind::Getter => 0,
         AccessorKind::Setter => 1,
+        AccessorKind::ClassGetter => 2,
+        AccessorKind::ClassSetter => 3,
     }
 }
 
@@ -158,6 +162,7 @@ fn descriptor_slot_to_selector(slot: bamts_bytecode::DescriptorSlot) -> u32 {
         DescriptorSlot::Value => 0,
         DescriptorSlot::Getter => 1,
         DescriptorSlot::Setter => 2,
+        DescriptorSlot::Entire => 4,
     }
 }
 
@@ -167,6 +172,7 @@ fn descriptor_slot_from_selector(selector: u32) -> Option<bamts_bytecode::Descri
         0 => Some(DescriptorSlot::Value),
         1 => Some(DescriptorSlot::Getter),
         2 => Some(DescriptorSlot::Setter),
+        4 => Some(DescriptorSlot::Entire),
         _ => None,
     }
 }
@@ -565,6 +571,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     value,
                     origin,
                     constructor_name: None,
+                    message: None,
                 },
                 site.function.get() as usize,
                 fault_pc,
@@ -576,6 +583,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 value,
                 origin,
                 constructor_name: None,
+                message: None,
             },
             function,
             pc,
@@ -1727,6 +1735,20 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         args: &[Value],
         new_target: Value,
     ) -> InvokeOutcome {
+        let mark = self.machine.borrow_mut().hold_temporaries(&[]);
+        let outcome = self.invoke_callee_forwarding(callee, this, args, new_target);
+        self.machine.borrow_mut().release_temporaries(mark);
+        outcome
+    }
+
+    /// [`Self::invoke_callee`], which releases what this holds for a forward.
+    fn invoke_callee_forwarding(
+        &self,
+        callee: Value,
+        this: Value,
+        args: &[Value],
+        new_target: Value,
+    ) -> InvokeOutcome {
         let mut callee = callee;
         let mut this = this;
         let mut args = Cow::Borrowed(args);
@@ -1779,6 +1801,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                             this_value: next_this,
                             arguments: next_arguments,
                         }) => {
+                            self.machine.borrow_mut().hold_forwarded_call(
+                                next,
+                                next_this,
+                                &next_arguments,
+                            );
                             callee = next;
                             this = next_this;
                             args = Cow::Owned(next_arguments);
@@ -1855,6 +1882,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
 
     /// Re-enters a runtime function with the active recursion and register
     /// ceilings, dispatching to the reference driver or the linked entry table.
+    /// A call past the guest stack throws in place of the activation.
     fn invoke_runtime(
         &self,
         target: crate::RuntimeFunction,
@@ -1864,64 +1892,14 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         new_target: Value,
         args: &[Value],
     ) -> InvokeOutcome {
+        if self.machine.borrow().stack_overflows() {
+            return InvokeOutcome::Threw(Value::UNDEFINED, crate::STACK_OVERFLOW);
+        }
         let index = target.function.get() as usize;
         let handle = self.code_ref(target.module);
         let flags = handle.code(target.module).functions()[index].flags();
-        if flags.is_async && flags.is_generator {
-            let created = self
-                .machine
-                .borrow_mut()
-                .create_async_generator(GeneratorStart {
-                    target,
-                    captures: captures.to_vec(),
-                    context,
-                    this_value: this,
-                    new_target,
-                    args: args.to_vec(),
-                });
-            return match created {
-                Ok(generator) => InvokeOutcome::Value(generator),
-                Err(kind) => {
-                    self.pending_fatal_kind.set(Some(kind));
-                    InvokeOutcome::Fatal
-                }
-            };
-        }
-        if flags.is_generator && !flags.is_async {
-            let created = self.machine.borrow_mut().create_generator(GeneratorStart {
-                target,
-                captures: captures.to_vec(),
-                context,
-                this_value: this,
-                new_target,
-                args: args.to_vec(),
-            });
-            return match created {
-                Ok(generator) => InvokeOutcome::Value(generator),
-                Err(kind) => {
-                    self.pending_fatal_kind.set(Some(kind));
-                    InvokeOutcome::Fatal
-                }
-            };
-        }
-        if flags.is_async && !flags.is_generator {
-            // Async calls route through the shared reference Machine state
-            // machine, which drives the body on the interpreter to its first
-            // await or completion and returns the implicit Promise. No
-            // bytecode, codegen, or ABI change is involved.
-            let outcome = crate::vm::generator_async::start_async_function(
-                &mut self.machine.borrow_mut(),
-                target,
-                captures,
-                context,
-                this,
-                new_target,
-                args,
-            );
-            return match outcome {
-                Ok(promise) => InvokeOutcome::Value(promise),
-                Err(failure) => self.failure_outcome(failure),
-            };
+        if flags.is_async || flags.is_generator {
+            return self.start_suspendable(target, captures, context, this, new_target, args);
         }
         let previous = {
             let mut machine = self.machine.borrow_mut();
@@ -1959,7 +1937,86 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         outcome
     }
 
+    /// The start of a generator or an async function. It stays out of the frame of
+    /// [`Self::invoke_runtime`], which a recursion has on the stack once for each
+    /// level.
+    #[inline(never)]
+    fn start_suspendable(
+        &self,
+        target: crate::RuntimeFunction,
+        captures: &[Value],
+        context: Option<Value>,
+        this: Value,
+        new_target: Value,
+        args: &[Value],
+    ) -> InvokeOutcome {
+        let handle = self.code_ref(target.module);
+        let flags = handle.code(target.module).functions()[target.function.get() as usize].flags();
+        if flags.is_async && flags.is_generator {
+            // An async generator's prologue runs on the shared Machine, like
+            // the rest of its body.
+            let start = GeneratorStart {
+                target,
+                captures: captures.to_vec(),
+                context,
+                this_value: this,
+                new_target,
+                args: args.to_vec(),
+            };
+            let started = self.machine.borrow_mut().start_generator(start, flags);
+            return match started {
+                Ok(generator) => InvokeOutcome::Value(generator),
+                Err(failure) => self.failure_outcome(failure),
+            };
+        }
+        if flags.is_generator {
+            let created = self.machine.borrow_mut().create_generator(GeneratorStart {
+                target,
+                captures: captures.to_vec(),
+                context,
+                this_value: this,
+                new_target,
+                args: args.to_vec(),
+            });
+            let generator = match created {
+                Ok(generator) => generator,
+                Err(kind) => {
+                    self.pending_fatal_kind.set(Some(kind));
+                    return InvokeOutcome::Fatal;
+                }
+            };
+            if flags.binds_at_call {
+                let completion = GeneratorCompletion::Normal(Value::UNDEFINED);
+                match self.resume_generator(generator, completion) {
+                    InvokeOutcome::Value(_) => {}
+                    other => return other,
+                }
+            }
+            return InvokeOutcome::Value(generator);
+        }
+        // Async calls route through the shared reference Machine state
+        // machine, which drives the body on the interpreter to its first
+        // await or completion and returns the implicit Promise. No
+        // bytecode, codegen, or ABI change is involved.
+        let outcome = crate::vm::generator_async::start_async_function(
+            &mut self.machine.borrow_mut(),
+            target,
+            captures,
+            context,
+            this,
+            new_target,
+            args,
+        );
+        match outcome {
+            Ok(promise) => InvokeOutcome::Value(promise),
+            Err(failure) => self.failure_outcome(failure),
+        }
+    }
+
     fn resume_generator(&self, generator: Value, completion: GeneratorCompletion) -> InvokeOutcome {
+        if self.machine.borrow().stack_overflows() {
+            return InvokeOutcome::Threw(Value::UNDEFINED, crate::STACK_OVERFLOW);
+        }
         let operation = crate::vm::generator_async::prepare_generator_operation(
             &mut self.machine.borrow_mut(),
             generator,
@@ -2340,12 +2397,20 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             InvokeOutcome::Value(close) => close,
             outcome => return map_outcome(outcome),
         };
+        if matches!(close.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            return Ok(Value::UNDEFINED);
+        }
         let callable = match self.machine.borrow().is_callable(close) {
             Ok(callable) => callable,
             Err(failure) => return map_outcome(self.failure_outcome(failure)),
         };
         if !callable {
-            return Ok(Value::UNDEFINED);
+            return map_outcome(InvokeOutcome::Threw(
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "iterator return method is not callable",
+                },
+            ));
         }
         frame.set_register(called_reg, Value::TRUE);
         map_outcome(self.invoke_callee(close, target, &[], Value::UNDEFINED))
@@ -2397,11 +2462,23 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     }
 
     fn array_extend_active(&self, array: Value, iterable: Value) -> InvokeOutcome {
+        // The iteration runs user code, and only these locals hold its operands.
+        let mark = self
+            .machine
+            .borrow_mut()
+            .hold_temporaries(&[array, iterable]);
+        let outcome = self.drain_iterable_into(array, iterable);
+        self.machine.borrow_mut().release_temporaries(mark);
+        outcome
+    }
+
+    fn drain_iterable_into(&self, array: Value, iterable: Value) -> InvokeOutcome {
         let iterator = match self.get_iterator_active(iterable, bamts_bytecode::IteratorKind::Sync)
         {
             InvokeOutcome::Value(iterator) => iterator,
             other => return other,
         };
+        self.machine.borrow_mut().hold_temporaries(&[iterator]);
         loop {
             let (done, value) = match self.iterator_next_active(iterator) {
                 Ok(step) => step,
@@ -3155,6 +3232,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         value,
                         origin,
                         constructor_name: None,
+                        message: None,
                     },
                     function.get() as usize,
                     0,
@@ -3208,6 +3286,45 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         HelperResult {
             tag: CompletionTag::FatalTrap,
             value: Value::UNDEFINED,
+        }
+    }
+
+    /// The function the innermost activation runs.
+    fn running_function(&self) -> crate::RuntimeFunction {
+        self.activations
+            .borrow()
+            .last()
+            .expect("a helper runs inside an activation")
+            .target
+    }
+
+    fn running_is_sloppy(&self) -> bool {
+        let target = self.running_function();
+        self.machine
+            .borrow()
+            .is_sloppy(target.module, target.function.get() as usize)
+    }
+
+    fn load_this(&self) -> HelperResult {
+        let target = self.running_function();
+        let this_value = self
+            .activations
+            .borrow()
+            .last()
+            .map_or(Value::UNDEFINED, |activation| activation.this_value);
+        let bound = self.machine.borrow_mut().bind_this(
+            target.module,
+            target.function.get() as usize,
+            this_value,
+        );
+        match bound {
+            Ok(value) => {
+                if let Some(activation) = self.activations.borrow_mut().last_mut() {
+                    activation.this_value = value;
+                }
+                HelperResult::normal(value)
+            }
+            Err(failure) => self.fail(failure),
         }
     }
 
@@ -3290,9 +3407,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             return HelperResult::normal(existing);
         }
         let prototype = self.machine.borrow().intrinsics.array_prototype;
+        let properties = self
+            .machine
+            .borrow()
+            .arguments_properties(self.running_is_sloppy());
         let allocated = self.machine.borrow_mut().allocate(HeapEntry::Array {
             elements: args,
-            properties: PropertyMap::default(),
+            properties,
             prototype: Some(prototype),
             extensible: true,
             length_writable: true,
@@ -3339,6 +3460,22 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         }
         let kind = self.machine.borrow().callee_kind(callee);
         match kind {
+            Ok(CalleeKind::Builtin { id })
+                if !self
+                    .machine
+                    .borrow()
+                    .intrinsics
+                    .builtins
+                    .is_constructable(id) =>
+            {
+                self.pending_throw.set(Some(PendingThrow {
+                    value: Value::UNDEFINED,
+                    origin: ThrowOrigin::TypeError {
+                        operation: "construct",
+                    },
+                }));
+                HelperResult::throw(Value::UNDEFINED)
+            }
             Ok(CalleeKind::Builtin { id }) => {
                 let result = self.machine.borrow_mut().call_builtin_with_new_target(
                     id,
@@ -3392,7 +3529,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     let handle = self.code_ref(target.module);
                     handle.code(target.module).functions()[target.function.get() as usize].flags()
                 };
-                if flags.is_async && !flags.is_generator {
+                if !flags.is_constructable {
                     self.pending_throw.set(Some(PendingThrow {
                         value: Value::UNDEFINED,
                         origin: ThrowOrigin::TypeError {
@@ -3829,7 +3966,6 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
 
     fn dispatch(&self, frame: &mut NativeFrame<'_>, call: HelperCall) -> HelperResult {
         self.prepare_native_helper(frame);
-        let module = ModuleId::new(frame.module_id());
         let amount = match call {
             HelperCall::ResumeValue | HelperCall::ResumeMode => None,
             HelperCall::ConsumeFuel { amount } => Some(u64::from(amount)),
@@ -3840,7 +3976,56 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
         {
             return self.fatal(kind);
         }
-        let result = 'result: {
+        let result = match call {
+            HelperCall::Call {
+                callee,
+                this_value,
+                arguments,
+            } => self.call_helper(callee, this_value, arguments),
+            // Tag 12 has no explicit `new.target`: the callee is it.
+            HelperCall::Construct { callee, arguments } => {
+                self.construct_helper(callee, callee, arguments)
+            }
+            HelperCall::ConstructWithNewTarget {
+                callee,
+                new_target,
+                arguments,
+            } => self.construct_helper(callee, new_target, arguments),
+            call => self.helper(frame, call),
+        };
+        self.finish_helper_result(frame, result)
+    }
+}
+
+impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
+    /// A call from native code. A recursion has this frame on the stack once for
+    /// each level, so the call stays out of [`Self::helper`], whose frame holds the
+    /// locals of every other helper.
+    fn call_helper(&self, callee: Value, this_value: Value, arguments: Value) -> HelperResult {
+        let read = self.machine.borrow().arguments_from_array(arguments);
+        let arguments = match read {
+            Ok(arguments) => arguments,
+            Err(failure) => return self.fail(failure),
+        };
+        let outcome = self.invoke_callee(callee, this_value, &arguments, Value::UNDEFINED);
+        self.outcome_result(outcome)
+    }
+
+    /// A construction from native code, kept out of [`Self::helper`] as a call is.
+    fn construct_helper(&self, callee: Value, new_target: Value, arguments: Value) -> HelperResult {
+        let read = self.machine.borrow().arguments_from_array(arguments);
+        let arguments = match read {
+            Ok(arguments) => arguments,
+            Err(failure) => return self.fail(failure),
+        };
+        self.construct(callee, new_target, &arguments)
+    }
+
+    /// Every helper except a call and a construction.
+    #[inline(never)]
+    fn helper(&self, frame: &mut NativeFrame<'_>, call: HelperCall) -> HelperResult {
+        let module = ModuleId::new(frame.module_id());
+        'result: {
             match call {
                 HelperCall::LoadConstant { const_id } => {
                     let result = self
@@ -3915,13 +4100,22 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     let context = self.machine.borrow().context_global;
                     match materialized {
                         Ok(captures) => {
-                            let prototype = self.machine.borrow().intrinsics.function_prototype;
+                            let prototype =
+                                self.machine.borrow().closure_prototype(module, function);
+                            let properties = self
+                                .machine
+                                .borrow_mut()
+                                .closure_properties(module, function);
+                            let properties = match properties {
+                                Ok(properties) => properties,
+                                Err(kind) => break 'result self.fatal(kind),
+                            };
                             self.allocated(HeapEntry::Function {
                                 module,
                                 function,
                                 captures,
                                 context,
-                                properties: PropertyMap::default(),
+                                properties,
                                 prototype: Some(prototype),
                                 extensible: true,
                             })
@@ -3931,7 +4125,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::GetProperty { object, key } => {
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().computed_property_key(object, key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
@@ -3945,7 +4139,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::SetProperty { object, key, value } => {
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().computed_property_key(object, key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
@@ -3957,6 +4151,9 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         .internal_set(object, key, value, object);
                     match outcome {
                         Ok(true) => HelperResult::normal(Value::UNDEFINED),
+                        Ok(false) if self.running_is_sloppy() => {
+                            HelperResult::normal(Value::UNDEFINED)
+                        }
                         Ok(false) => {
                             self.pending_throw.set(Some(PendingThrow {
                                 value: Value::UNDEFINED,
@@ -3971,13 +4168,21 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::DeleteProperty { object, key } => {
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().computed_property_key(object, key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
                         }
                     };
                     let deleted = self.machine.borrow_mut().internal_delete(object, &key);
+                    let target = self.running_function();
+                    let deleted = deleted.and_then(|deleted| {
+                        self.machine.borrow().deletion_result(
+                            target.module,
+                            target.function.get() as usize,
+                            deleted,
+                        )
+                    });
                     match deleted {
                         Ok(deleted) => HelperResult::normal(Value::boolean(deleted)),
                         Err(failure) => self.fail(failure),
@@ -3998,7 +4203,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         }
                     };
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().observable_property_key(key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
@@ -4015,7 +4220,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::DefineDataProperty { object, key, value } => {
                     let key = {
-                        let coerced = self.machine.borrow().to_property_key(key);
+                        let coerced = self.machine.borrow_mut().observable_property_key(key);
                         match coerced {
                             Ok(key) => key,
                             Err(failure) => break 'result self.fail(failure),
@@ -4092,7 +4297,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     receiver,
                     key,
                 } => {
-                    let key = match self.machine.borrow().to_property_key(key) {
+                    let key = match self.machine.borrow_mut().observable_property_key(key) {
                         Ok(key) => key,
                         Err(failure) => break 'result self.fail(failure),
                     };
@@ -4105,7 +4310,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     key,
                     value,
                 } => {
-                    let key = match self.machine.borrow().to_property_key(key) {
+                    let key = match self.machine.borrow_mut().observable_property_key(key) {
                         Ok(key) => key,
                         Err(failure) => break 'result self.fail(failure),
                     };
@@ -4179,46 +4384,10 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         .template_object_at(site, cooked, raw);
                     self.eval_result(result)
                 }
-                HelperCall::Call {
-                    callee,
-                    this_value,
-                    arguments,
-                } => {
-                    let arguments = {
-                        let read = self.machine.borrow().arguments_from_array(arguments);
-                        match read {
-                            Ok(arguments) => arguments,
-                            Err(failure) => break 'result self.fail(failure),
-                        }
-                    };
-                    let outcome =
-                        self.invoke_callee(callee, this_value, &arguments, Value::UNDEFINED);
-                    self.outcome_result(outcome)
-                }
-                HelperCall::Construct { callee, arguments } => {
-                    let arguments = {
-                        let read = self.machine.borrow().arguments_from_array(arguments);
-                        match read {
-                            Ok(arguments) => arguments,
-                            Err(failure) => break 'result self.fail(failure),
-                        }
-                    };
-                    // Tag 12 has no explicit `new.target`: the callee is it.
-                    self.construct(callee, callee, &arguments)
-                }
-                HelperCall::ConstructWithNewTarget {
-                    callee,
-                    new_target,
-                    arguments,
-                } => {
-                    let arguments = {
-                        let read = self.machine.borrow().arguments_from_array(arguments);
-                        match read {
-                            Ok(arguments) => arguments,
-                            Err(failure) => break 'result self.fail(failure),
-                        }
-                    };
-                    self.construct(callee, new_target, &arguments)
+                HelperCall::Call { .. }
+                | HelperCall::Construct { .. }
+                | HelperCall::ConstructWithNewTarget { .. } => {
+                    unreachable!("`dispatch` runs a call outside this frame")
                 }
                 HelperCall::Import { specifier } => self.import_namespace(module, specifier),
                 HelperCall::LoadImportMeta => {
@@ -4288,10 +4457,12 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     }
                 }
                 HelperCall::StoreGlobal { name, value } => {
+                    let sloppy = self.running_is_sloppy();
                     let stored = self.machine.borrow_mut().store_global(
                         module,
                         ConstantId::new(name),
                         value,
+                        sloppy,
                     );
                     match stored {
                         Ok(()) => HelperResult::normal(Value::UNDEFINED),
@@ -4310,12 +4481,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     };
                     self.allocated(HeapEntry::String(text))
                 }
-                HelperCall::LoadThis => HelperResult::normal(
-                    self.activations
-                        .borrow()
-                        .last()
-                        .map_or(Value::UNDEFINED, |activation| activation.this_value),
-                ),
+                HelperCall::LoadThis => self.load_this(),
                 HelperCall::LoadArguments => self.load_arguments(),
                 HelperCall::LoadNewTarget => HelperResult::normal(
                     self.activations
@@ -4460,8 +4626,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::ConsumeFuel { .. } => HelperResult::normal(Value::UNDEFINED),
             }
-        };
-        self.finish_helper_result(frame, result)
+        }
     }
 }
 
@@ -4664,10 +4829,11 @@ mod tests {
         NativeEntryTable, NativeFrame, NativeHelper, NativeOps, ShadowFrame, Value,
     };
 
+    use crate::intrinsics::{BuiltinDef, BuiltinHandler, BuiltinOutcome, native_function};
     use crate::vm::generator_async::GeneratorCompletion;
     use crate::{
-        GeneratorState, HeapEntry, Host, Limits, Machine, Property, PropertyKey, PropertyMap,
-        RuntimeError, RuntimeErrorKind, ThrowOrigin,
+        EvalFailure, GeneratorState, HeapEntry, Host, Limits, Machine, Property, PropertyKey,
+        PropertyMap, RuntimeError, RuntimeErrorKind, ThrowOrigin,
     };
 
     use super::EcmaString;
@@ -5524,6 +5690,7 @@ mod tests {
                 is_async: true,
                 is_generator: false,
                 is_constructable: false,
+                ..FunctionFlags::default()
             },
             code,
             Vec::new(),
@@ -6182,8 +6349,10 @@ mod tests {
         let error = assert_program_parity(&linked(vec![first, second], 0)).unwrap_err();
         assert!(matches!(
             error.kind,
-            RuntimeErrorKind::TemporalDeadZone { module, binding }
-                if module == ModuleId::new(1) && binding == BindingId::new(0)
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::ReferenceError { .. },
+                ..
+            }
         ));
     }
 
@@ -8743,6 +8912,7 @@ mod tests {
                 is_async: false,
                 is_generator: true,
                 is_constructable: false,
+                ..FunctionFlags::default()
             },
             code,
             Vec::new(),
@@ -9605,6 +9775,7 @@ mod tests {
                         value: Value::UNDEFINED,
                         origin: ThrowOrigin::TypeError { operation },
                         constructor_name: None,
+                        message: None,
                     }
                 );
             };
@@ -9889,6 +10060,7 @@ mod tests {
                         operation: "global is not defined",
                     },
                     constructor_name: None,
+                    message: Some(EcmaString::encode("missing_global is not defined")),
                 }
             );
         };
@@ -11522,5 +11694,88 @@ mod tests {
         )
         .expect_err("cancelled token aborts loop");
         assert_eq!(error, NativeError::Cancelled);
+    }
+
+    /// A getter whose value only the list being read holds.
+    fn fresh_object(
+        machine: &mut Machine<'_, SilentHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let prototype = machine.intrinsics.object_prototype;
+        let object = crate::builtins::ordinary_runtime(machine, Some(prototype))?;
+        machine.set_data_property(object, "marker", Value::int32(7))?;
+        Ok(BuiltinOutcome::Value(object))
+    }
+
+    /// A callee that reaches a collection before it reads what it was given.
+    fn collect_then_read(
+        machine: &mut Machine<'_, SilentHost>,
+        _this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.collect_garbage();
+        machine
+            .get_named_property(args[0], "marker")
+            .map(BuiltinOutcome::Value)
+    }
+
+    fn builtin(
+        machine: &mut Machine<'_, SilentHost>,
+        name: &'static str,
+        handler: BuiltinHandler<SilentHost>,
+    ) -> Value {
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name,
+            length: 0,
+            handler,
+        });
+        native_function(&mut machine.heap, id, name, 0)
+    }
+
+    #[test]
+    fn a_collection_in_the_next_builtin_keeps_the_arguments_of_apply() {
+        let program = trivial_program();
+        let mut host = SilentHost;
+        let engine = NativeEngine::new(&program, &NoEntries, &mut host, Limits::default());
+        let (apply, reflect, target, list) = {
+            let mut machine = engine.machine.borrow_mut();
+            let target = builtin(&mut machine, "collect then read", collect_then_read);
+            let getter = builtin(&mut machine, "fresh object", fresh_object);
+            let prototype = machine.intrinsics.object_prototype;
+            let list = crate::builtins::ordinary_runtime(&mut machine, Some(prototype)).unwrap();
+            machine
+                .set_data_property(list, "length", Value::int32(1))
+                .unwrap();
+            machine
+                .define_descriptor(
+                    list,
+                    PropertyKey::Named(EcmaString::encode("0")),
+                    Property::Accessor {
+                        getter: Some(getter),
+                        setter: None,
+                        enumerable: true,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+            machine.hold_temporaries(&[target, list]);
+            let reflect = machine.intrinsics.global("Reflect").unwrap();
+            let apply = machine.get_named_property(reflect, "apply").unwrap();
+            (apply, reflect, target, list)
+        };
+        let held = engine.machine.borrow().builtin_temporaries.len();
+
+        let outcome = engine.invoke_callee(
+            apply,
+            reflect,
+            &[target, Value::UNDEFINED, list],
+            Value::UNDEFINED,
+        );
+
+        assert!(matches!(outcome, InvokeOutcome::Value(value) if value == Value::int32(7)));
+        assert_eq!(engine.machine.borrow().builtin_temporaries.len(), held);
     }
 }

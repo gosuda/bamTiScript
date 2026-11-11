@@ -8,6 +8,8 @@ pub mod r#async;
 pub mod filesystem;
 pub mod language_service;
 pub mod sync;
+#[cfg(test)]
+mod test_support;
 
 use bamts_cancel::CancellationToken;
 use std::{
@@ -811,12 +813,7 @@ fn import_clause_is_type_only(clause: Option<&crate::syntax::ImportClause>) -> b
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::Path,
-        sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{fs, path::Path, sync::Arc};
 
     use super::{
         CancellationToken, ServiceError, ServiceState, SnapshotContent, build_snapshot_with_cancel,
@@ -824,15 +821,7 @@ mod tests {
     use crate::{service::filesystem::OsFileSystem, source::SourceId};
 
     fn state() -> (std::path::PathBuf, ServiceState<OsFileSystem>) {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "bamts-service-state-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir(&root).expect("create root");
+        let root = crate::service::test_support::fresh_dir("bamts-service-state");
         let state = ServiceState::new(OsFileSystem::new(&root).expect("filesystem"));
         (root, state)
     }

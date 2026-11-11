@@ -22,7 +22,7 @@
 //!   loading: it parses module source text into the fresh JSON tree that the
 //!   default export of a JSON module namespace binds.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
@@ -31,9 +31,10 @@ use super::{allocate_array, allocate_string, define_data, install_function, type
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
 
-// JSON input and callbacks are untrusted; stop recursive Rust traversal well
-// before stack exhaustion. Mirrors the core JSON module's budget.
-const MAX_JSON_DEPTH: usize = 256;
+/// The JSON nesting where a machine that does not measure its native stack stops, as
+/// in a test or an embedded script on a thread of unknown size. Each level is one
+/// Rust frame, so this stays far below a small stack.
+const UNMEASURED_JSON_DEPTH: usize = 256;
 
 /// `space` never contributes more than ten indentation units (ECMA-262
 /// clamp), and string gaps truncate to their first ten code units.
@@ -42,10 +43,20 @@ const MAX_GAP_UNITS: usize = 10;
 /// Largest ToLength result; array-like JSON traversal snapshots this bound.
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
+/// Whether one more level of a recursive JSON walk, `JSON.stringify` or a reviver,
+/// passes the stack. A machine that measures its native stack stops only where that
+/// stack is full, so both go at least as deep as in V8. The parser does not recurse.
+fn json_nesting_overflows<H: Host>(machine: &Machine<'_, H>, depth: usize) -> bool {
+    if machine.limits.max_stack_bytes == usize::MAX {
+        depth >= UNMEASURED_JSON_DEPTH
+    } else {
+        machine.native_stack_overflows()
+    }
+}
+
+/// The `RangeError` of a call that passes the stack, which the program can catch.
 fn json_depth_error() -> EvalFailure {
-    EvalFailure::Runtime(crate::RuntimeErrorKind::CallDepthExceeded {
-        limit: MAX_JSON_DEPTH,
-    })
+    EvalFailure::Throw(crate::STACK_OVERFLOW)
 }
 
 fn syntax_error<H: Host>(machine: &mut Machine<'_, H>, message: String) -> EvalFailure {
@@ -344,7 +355,7 @@ fn parse_root<H: Host>(
     let mut parser = Parser::new(source.as_units());
     (|| -> ParseResult<JsonNode> {
         parser.ws();
-        let root = parser.value(machine, 0)?;
+        let root = parser.value(machine)?;
         parser.ws();
         if parser.pos != parser.source.len() {
             return Err(ParseFailure::Syntax(parser.error_unexpected()));
@@ -393,6 +404,88 @@ impl JsonNode {
             _ => None,
         }
     }
+
+    /// Moves the children of this node into `pending`.
+    fn release_children(&mut self, pending: &mut Vec<JsonNode>) {
+        match self {
+            JsonNode::Primitive { .. } => {}
+            JsonNode::Array { children, .. } => pending.append(children),
+            JsonNode::Object { children, .. } => {
+                pending.extend(children.drain(..).map(|(_, node)| node));
+            }
+        }
+    }
+}
+
+impl Drop for JsonNode {
+    /// Drops the subtree from a list, not by recursion, so that a tree of any depth
+    /// drops on a small stack.
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        self.release_children(&mut pending);
+        while let Some(mut node) = pending.pop() {
+            node.release_children(&mut pending);
+        }
+    }
+}
+
+/// An array or object that the parser has opened and not closed, with the members
+/// that it has read.
+enum OpenContainer {
+    Array {
+        values: Vec<Value>,
+        children: Vec<JsonNode>,
+    },
+    /// `key` names the member that the parser reads next.
+    Object {
+        value: Value,
+        children: Vec<(EcmaString, JsonNode)>,
+        key: EcmaString,
+    },
+}
+
+impl OpenContainer {
+    fn push<H: Host>(&mut self, machine: &mut Machine<'_, H>, child: JsonNode) -> ParseResult<()> {
+        match self {
+            OpenContainer::Array { values, children } => {
+                values.push(child.value());
+                children.push(child);
+            }
+            OpenContainer::Object {
+                value,
+                children,
+                key,
+            } => {
+                let key = std::mem::take(key);
+                create_data_property(
+                    machine,
+                    *value,
+                    PropertyKey::Named(key.clone()),
+                    child.value(),
+                )
+                .map_err(ParseFailure::Runtime)?;
+                // Mirror the property map: a duplicate key overwrites in place,
+                // keeping its first-insertion position in enumeration order.
+                match children.iter().position(|(name, _)| *name == key) {
+                    Some(existing) => children[existing] = (key, child),
+                    None => children.push((key, child)),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn close<H: Host>(self, machine: &mut Machine<'_, H>) -> ParseResult<JsonNode> {
+        match self {
+            OpenContainer::Array { values, children } => {
+                let value = allocate_array(machine, values).map_err(ParseFailure::Runtime)?;
+                Ok(JsonNode::Array { value, children })
+            }
+            OpenContainer::Object {
+                value, children, ..
+            } => Ok(JsonNode::Object { value, children }),
+        }
+    }
 }
 
 /// InternalizeJSONProperty with source-text access. Keys and length are
@@ -418,7 +511,7 @@ fn walk_reviver<H: Host>(
     let matched = node.is_some_and(|node| node.value() == live);
     let matched_node = if matched { node } else { None };
     if machine.array_elements(live)?.is_some() {
-        if depth >= MAX_JSON_DEPTH {
+        if json_nesting_overflows(machine, depth) {
             return Err(json_depth_error());
         }
         let child_nodes: Option<&[JsonNode]> = match matched_node {
@@ -430,6 +523,7 @@ fn walk_reviver<H: Host>(
         // come from the holder. Nodes only supply source spans.
         let length = length_of_array_like(machine, live)?;
         for index in 0..length {
+            super::array_generic::tick(machine)?;
             let name = EcmaString::encode(&index.to_string());
             let child_node = child_nodes.and_then(|children| children.get(index));
             let child = walk_reviver(
@@ -449,7 +543,7 @@ fn walk_reviver<H: Host>(
             }
         }
     } else if machine.is_object(live) {
-        if depth >= MAX_JSON_DEPTH {
+        if json_nesting_overflows(machine, depth) {
             return Err(json_depth_error());
         }
         let child_nodes: Option<&[(EcmaString, JsonNode)]> = match matched_node {
@@ -518,10 +612,27 @@ pub(crate) fn evaluate_json_module_source<H: Host>(
 
 // ---- JSON.stringify -------------------------------------------------------
 
-struct SerializeOptions<'a> {
+/// One run of `JSON.stringify`. It writes the whole text into one builder, so a
+/// deep value costs time in proportion to its text.
+struct Serializer<'a> {
     replacer: Option<Value>,
     property_list: Option<&'a [EcmaString]>,
     gap: &'a EcmaString,
+    /// The objects that the serializer is inside. A value that is in it again is a
+    /// cycle.
+    stack: HashSet<Value>,
+    output: EcmaStringBuilder,
+}
+
+/// What a property gives after `toJSON`, the replacer and the unwrapping of a
+/// primitive wrapper, before it is written.
+enum Serialized {
+    /// `undefined`, a function or a symbol: an object leaves the property out, and
+    /// an array writes `null`.
+    Omitted,
+    Text(EcmaString),
+    Array(Value),
+    Object(Value),
 }
 
 fn stringify<H: Host>(
@@ -546,6 +657,7 @@ fn stringify<H: Host>(
             let mut seen: BTreeSet<EcmaString> = BTreeSet::new();
             let mut list = Vec::new();
             for index in 0..length {
+                super::array_generic::tick(machine)?;
                 let item = machine.get_property_key(
                     replacer,
                     &PropertyKey::Named(EcmaString::encode(&index.to_string())),
@@ -623,15 +735,20 @@ fn stringify<H: Host>(
         PropertyKey::Named(root_key.clone()),
         value,
     )?;
-    let options = SerializeOptions {
+    let mut serializer = Serializer {
         replacer: replacer_function,
         property_list: property_list.as_deref(),
         gap: &gap,
+        stack: HashSet::new(),
+        output: EcmaStringBuilder::new(),
     };
-    let mut stack = Vec::new();
-    match serialize_property(machine, wrapper, root_key, &options, 0, &mut stack)? {
-        Some(text) => Ok(BuiltinOutcome::Value(allocate_string(machine, text)?)),
-        None => Ok(BuiltinOutcome::Value(Value::UNDEFINED)),
+    match serializer.property(machine, wrapper, root_key, 0)? {
+        Serialized::Omitted => Ok(BuiltinOutcome::Value(Value::UNDEFINED)),
+        root => {
+            serializer.write(machine, root, 0)?;
+            let text = serializer.output.finish();
+            Ok(BuiltinOutcome::Value(allocate_string(machine, text)?))
+        }
     }
 }
 
@@ -651,175 +768,182 @@ fn gap_from_string(text: EcmaString) -> EcmaString {
         .expect("range is bounded by the string length")
 }
 
-fn serialize_property<H: Host>(
-    machine: &mut Machine<'_, H>,
-    holder: Value,
-    key: EcmaString,
-    options: &SerializeOptions<'_>,
-    depth: usize,
-    stack: &mut Vec<Value>,
-) -> Result<Option<EcmaString>, EvalFailure> {
-    if depth >= MAX_JSON_DEPTH {
-        return Err(json_depth_error());
-    }
-    let mut value = machine.get_property_key(holder, &PropertyKey::Named(key.clone()))?;
-    if machine.is_object(value) || super::bigint::is_bigint(machine, value)? {
-        let to_json = machine.get_named_property(value, "toJSON")?;
-        if machine.is_callable(to_json)? {
-            let key_value = allocate_string(machine, key.clone())?;
-            value = machine.call_value(to_json, value, &[key_value])?;
+impl Serializer<'_> {
+    /// SerializeJSONProperty up to its text: every step that the program can
+    /// observe, in the order of the spec. An object writes the key of a member only
+    /// when this gives more than [`Serialized::Omitted`].
+    fn property<H: Host>(
+        &self,
+        machine: &mut Machine<'_, H>,
+        holder: Value,
+        key: EcmaString,
+        depth: usize,
+    ) -> Result<Serialized, EvalFailure> {
+        if json_nesting_overflows(machine, depth) {
+            return Err(json_depth_error());
         }
-    }
-    if let Some(replacer) = options.replacer {
-        let key_value = allocate_string(machine, key)?;
-        value = machine.call_value(replacer, holder, &[key_value, value])?;
-    }
-    let value = machine.unbox_primitive_or_self(value)?;
-    super::bigint::json_reject(machine, value)?;
-    match value.decode() {
-        Some(Decoded::Null) => Ok(Some(EcmaString::encode("null"))),
-        Some(Decoded::Boolean(value)) => Ok(Some(EcmaString::encode(if value {
-            "true"
-        } else {
-            "false"
-        }))),
-        Some(Decoded::Int32(value)) => Ok(Some(EcmaString::encode(&(value as i32).to_string()))),
-        Some(Decoded::Number(value)) => {
-            let text = if value.is_finite() {
-                crate::format_number(value)
-            } else {
-                "null".to_owned()
-            };
-            Ok(Some(EcmaString::encode(&text)))
+        let mut value = machine.get_property_key(holder, &PropertyKey::Named(key.clone()))?;
+        if machine.is_object(value) || super::bigint::is_bigint(machine, value)? {
+            let to_json = machine.get_named_property(value, "toJSON")?;
+            if machine.is_callable(to_json)? {
+                let key_value = allocate_string(machine, key.clone())?;
+                value = machine.call_value(to_json, value, &[key_value])?;
+            }
         }
-        Some(Decoded::HeapRef(_)) => {
-            if let Some(text) = machine.string_value(value) {
-                return Ok(Some(quote(&text)));
-            }
-            if let Some(raw) = raw_json_text(machine, value) {
-                return Ok(Some(raw));
-            }
-            if !machine.is_object(value) {
-                return Ok(None);
-            }
-            let is_array = machine.array_elements(value)?.is_some();
-            if machine.is_callable(value)? && !is_array {
-                return Ok(None);
-            }
-            if stack.contains(&value) {
-                return Err(type_error("Converting circular structure to JSON"));
-            }
-            stack.push(value);
-            let result = if is_array {
-                serialize_array(machine, value, options, depth, stack)
-            } else {
-                serialize_object(machine, value, options, depth, stack)
-            };
-            stack.pop();
-            result.map(Some)
+        if let Some(replacer) = self.replacer {
+            let key_value = allocate_string(machine, key)?;
+            value = machine.call_value(replacer, holder, &[key_value, value])?;
         }
-        Some(Decoded::Undefined | Decoded::Hole | Decoded::Uninitialized) | None => Ok(None),
+        let value = machine.unbox_primitive_or_self(value)?;
+        super::bigint::json_reject(machine, value)?;
+        let text = |text: &str| Serialized::Text(EcmaString::encode(text));
+        Ok(match value.decode() {
+            Some(Decoded::Null) => text("null"),
+            Some(Decoded::Boolean(value)) => text(if value { "true" } else { "false" }),
+            Some(Decoded::Int32(value)) => text(&(value as i32).to_string()),
+            Some(Decoded::Number(value)) if value.is_finite() => text(&crate::format_number(value)),
+            Some(Decoded::Number(_)) => text("null"),
+            Some(Decoded::HeapRef(_)) => {
+                if let Some(string) = machine.string_value(value) {
+                    Serialized::Text(quote(&string))
+                } else if let Some(raw) = raw_json_text(machine, value) {
+                    Serialized::Text(raw)
+                } else if !machine.is_object(value) {
+                    Serialized::Omitted
+                } else {
+                    let is_array = machine.array_elements(value)?.is_some();
+                    if machine.is_callable(value)? && !is_array {
+                        Serialized::Omitted
+                    } else if is_array {
+                        Serialized::Array(value)
+                    } else {
+                        Serialized::Object(value)
+                    }
+                }
+            }
+            Some(Decoded::Undefined | Decoded::Hole | Decoded::Uninitialized) | None => {
+                Serialized::Omitted
+            }
+        })
     }
-}
 
-fn serialize_array<H: Host>(
-    machine: &mut Machine<'_, H>,
-    array: Value,
-    options: &SerializeOptions<'_>,
-    depth: usize,
-    stack: &mut Vec<Value>,
-) -> Result<EcmaString, EvalFailure> {
-    let length = length_of_array_like(machine, array)?;
-    let mut partial = Vec::new();
-    for index in 0..length {
-        partial.push(
-            serialize_property(
+    /// Writes a value that [`Self::property`] gave at `depth`. An array element
+    /// that was left out is `null`.
+    fn write<H: Host>(
+        &mut self,
+        machine: &mut Machine<'_, H>,
+        value: Serialized,
+        depth: usize,
+    ) -> Result<(), EvalFailure> {
+        let (container, is_array) = match value {
+            Serialized::Omitted => {
+                self.output.push_utf8("null");
+                return Ok(());
+            }
+            Serialized::Text(text) => {
+                append(&mut self.output, &text);
+                return Ok(());
+            }
+            Serialized::Array(array) => (array, true),
+            Serialized::Object(object) => (object, false),
+        };
+        if !self.stack.insert(container) {
+            return Err(type_error("Converting circular structure to JSON"));
+        }
+        let result = if is_array {
+            self.array(machine, container, depth)
+        } else {
+            self.object(machine, container, depth)
+        };
+        self.stack.remove(&container);
+        result
+    }
+
+    fn array<H: Host>(
+        &mut self,
+        machine: &mut Machine<'_, H>,
+        array: Value,
+        depth: usize,
+    ) -> Result<(), EvalFailure> {
+        let length = length_of_array_like(machine, array)?;
+        self.output.push_unit(u16::from(b'['));
+        for index in 0..length {
+            super::array_generic::tick(machine)?;
+            self.open_member(index == 0, depth);
+            let element = self.property(
                 machine,
                 array,
                 EcmaString::encode(&index.to_string()),
-                options,
                 depth + 1,
-                stack,
-            )?
-            .unwrap_or_else(|| EcmaString::encode("null")),
-        );
+            )?;
+            self.write(machine, element, depth + 1)?;
+        }
+        self.close(b']', length != 0, depth);
+        Ok(())
     }
-    Ok(compose(b'[', b']', partial, options.gap, depth))
-}
 
-fn serialize_object<H: Host>(
-    machine: &mut Machine<'_, H>,
-    object: Value,
-    options: &SerializeOptions<'_>,
-    depth: usize,
-    stack: &mut Vec<Value>,
-) -> Result<EcmaString, EvalFailure> {
-    let keys = options
-        .property_list
-        .map_or_else(|| machine.enumerable_keys(object), |keys| Ok(keys.to_vec()))?;
-    let mut partial = Vec::new();
-    for key in keys {
-        if let Some(value) =
-            serialize_property(machine, object, key.clone(), options, depth + 1, stack)?
-        {
-            let mut member = EcmaStringBuilder::new();
-            append(&mut member, &quote(&key));
-            member.push_unit(u16::from(b':'));
-            if !options.gap.is_empty() {
-                member.push_unit(u16::from(b' '));
+    fn object<H: Host>(
+        &mut self,
+        machine: &mut Machine<'_, H>,
+        object: Value,
+        depth: usize,
+    ) -> Result<(), EvalFailure> {
+        let keys = self
+            .property_list
+            .map_or_else(|| machine.enumerable_keys(object), |keys| Ok(keys.to_vec()))?;
+        self.output.push_unit(u16::from(b'{'));
+        let mut empty = true;
+        for key in keys {
+            let member = self.property(machine, object, key.clone(), depth + 1)?;
+            if matches!(member, Serialized::Omitted) {
+                continue;
             }
-            append(&mut member, &value);
-            partial.push(member.finish());
+            self.open_member(empty, depth);
+            empty = false;
+            append(&mut self.output, &quote(&key));
+            self.output.push_unit(u16::from(b':'));
+            if !self.gap.is_empty() {
+                self.output.push_unit(u16::from(b' '));
+            }
+            self.write(machine, member, depth + 1)?;
+        }
+        self.close(b'}', !empty, depth);
+        Ok(())
+    }
+
+    /// Writes what comes before a member of a container at `depth`: a comma after
+    /// the first member, and with a gap a new line and the indent of the member.
+    fn open_member(&mut self, first: bool, depth: usize) {
+        if !first {
+            self.output.push_unit(u16::from(b','));
+        }
+        if !self.gap.is_empty() {
+            self.output.push_unit(u16::from(b'\n'));
+            self.indent(depth + 1);
         }
     }
-    Ok(compose(b'{', b'}', partial, options.gap, depth))
+
+    /// Ends a container at `depth`. With a gap, the close of a container that has
+    /// members goes on a new line at the indent of the container.
+    fn close(&mut self, close: u8, has_members: bool, depth: usize) {
+        if has_members && !self.gap.is_empty() {
+            self.output.push_unit(u16::from(b'\n'));
+            self.indent(depth);
+        }
+        self.output.push_unit(u16::from(close));
+    }
+
+    fn indent(&mut self, depth: usize) {
+        for _ in 0..depth {
+            append(&mut self.output, self.gap);
+        }
+    }
 }
 
 fn append(output: &mut EcmaStringBuilder, text: &EcmaString) {
     for &unit in text.as_units() {
         output.push_unit(unit);
     }
-}
-
-fn compose(
-    open: u8,
-    close: u8,
-    parts: Vec<EcmaString>,
-    gap: &EcmaString,
-    depth: usize,
-) -> EcmaString {
-    let mut output = EcmaStringBuilder::new();
-    output.push_unit(u16::from(open));
-    if parts.is_empty() {
-        output.push_unit(u16::from(close));
-        return output.finish();
-    }
-    if gap.is_empty() {
-        for (index, part) in parts.iter().enumerate() {
-            if index != 0 {
-                output.push_unit(u16::from(b','));
-            }
-            append(&mut output, part);
-        }
-    } else {
-        output.push_unit(u16::from(b'\n'));
-        for (index, part) in parts.iter().enumerate() {
-            if index != 0 {
-                output.push_unit(u16::from(b','));
-                output.push_unit(u16::from(b'\n'));
-            }
-            for _ in 0..=depth {
-                append(&mut output, gap);
-            }
-            append(&mut output, part);
-        }
-        output.push_unit(u16::from(b'\n'));
-        for _ in 0..depth {
-            append(&mut output, gap);
-        }
-    }
-    output.push_unit(u16::from(close));
-    output.finish()
 }
 
 fn push_escape(output: &mut EcmaStringBuilder, escape: &str) {
@@ -900,12 +1024,110 @@ impl<'a> Parser<'a> {
         self.source.get(self.pos).copied()
     }
 
-    fn value<H: Host>(
-        &mut self,
-        machine: &mut Machine<'_, H>,
-        depth: usize,
-    ) -> ParseResult<JsonNode> {
+    /// Reads one JSON value. The arrays and objects that are open wait in a list, not
+    /// on the Rust stack, so text of any depth parses, as in V8.
+    fn value<H: Host>(&mut self, machine: &mut Machine<'_, H>) -> ParseResult<JsonNode> {
+        let mut open: Vec<OpenContainer> = Vec::new();
+        loop {
+            self.ws();
+            let mut node = match self.peek() {
+                Some(unit) if unit == u16::from(b'[') => {
+                    self.pos += 1;
+                    self.ws();
+                    if self.peek() != Some(u16::from(b']')) {
+                        open.push(OpenContainer::Array {
+                            values: Vec::new(),
+                            children: Vec::new(),
+                        });
+                        continue;
+                    }
+                    self.pos += 1;
+                    let value =
+                        allocate_array(machine, Vec::new()).map_err(ParseFailure::Runtime)?;
+                    JsonNode::Array {
+                        value,
+                        children: Vec::new(),
+                    }
+                }
+                Some(unit) if unit == u16::from(b'{') => {
+                    self.pos += 1;
+                    self.ws();
+                    let object = machine
+                        .allocate(HeapEntry::Object {
+                            properties: PropertyMap::default(),
+                            prototype: Some(machine.intrinsics.object_prototype),
+                            extensible: true,
+                            boxed_primitive: None,
+                        })
+                        .map_err(EvalFailure::Runtime)
+                        .map_err(ParseFailure::Runtime)?;
+                    if self.peek() != Some(u16::from(b'}')) {
+                        let key = self.member_key()?;
+                        open.push(OpenContainer::Object {
+                            value: object,
+                            children: Vec::new(),
+                            key,
+                        });
+                        continue;
+                    }
+                    self.pos += 1;
+                    JsonNode::Object {
+                        value: object,
+                        children: Vec::new(),
+                    }
+                }
+                _ => self.primitive(machine)?,
+            };
+            // `node` is the next member of the innermost open container. Close
+            // every container that ends after it.
+            loop {
+                let Some(container) = open.last_mut() else {
+                    return Ok(node);
+                };
+                container.push(machine, node)?;
+                self.ws();
+                let close = match container {
+                    OpenContainer::Array { .. } => b']',
+                    OpenContainer::Object { .. } => b'}',
+                };
+                match self.peek() {
+                    Some(unit) if unit == u16::from(b',') => {
+                        self.pos += 1;
+                        self.ws();
+                        if let OpenContainer::Object { key, .. } = container {
+                            *key = self.member_key()?;
+                        }
+                        break;
+                    }
+                    Some(unit) if unit == u16::from(close) => {
+                        self.pos += 1;
+                        node = open.pop().expect("a container is open").close(machine)?;
+                    }
+                    _ => return Err(ParseFailure::Syntax(self.error_unexpected())),
+                }
+            }
+        }
+    }
+
+    /// Reads the key of an object member and the `:` after it.
+    fn member_key(&mut self) -> ParseResult<EcmaString> {
+        if self.peek() != Some(u16::from(b'"')) {
+            return Err(ParseFailure::Syntax(
+                self.at("Expected property name or '}' in JSON"),
+            ));
+        }
+        let key = self.string()?;
         self.ws();
+        if self.peek() != Some(u16::from(b':')) {
+            return Err(ParseFailure::Syntax(
+                self.at("Expected ':' after property name in JSON"),
+            ));
+        }
+        self.pos += 1;
+        Ok(key)
+    }
+
+    fn primitive<H: Host>(&mut self, machine: &mut Machine<'_, H>) -> ParseResult<JsonNode> {
         let start = self.pos;
         match self.peek() {
             Some(unit) if unit == u16::from(b'n') => {
@@ -937,8 +1159,6 @@ impl<'a> Parser<'a> {
                     })
                     .map_err(ParseFailure::Runtime)
             }),
-            Some(unit) if unit == u16::from(b'[') => self.array(machine, depth),
-            Some(unit) if unit == u16::from(b'{') => self.object(machine, depth),
             Some(unit)
                 if unit == u16::from(b'-')
                     || (u16::from(b'0')..=u16::from(b'9')).contains(&unit) =>
@@ -1083,118 +1303,6 @@ impl<'a> Parser<'a> {
             .ok_or_else(|| ParseFailure::Syntax(self.error_unexpected()))
     }
 
-    fn array<H: Host>(
-        &mut self,
-        machine: &mut Machine<'_, H>,
-        depth: usize,
-    ) -> ParseResult<JsonNode> {
-        if depth >= MAX_JSON_DEPTH {
-            return Err(ParseFailure::Runtime(json_depth_error()));
-        }
-        self.pos += 1;
-        self.ws();
-        let mut values = Vec::new();
-        let mut children = Vec::new();
-        if self.peek() == Some(u16::from(b']')) {
-            self.pos += 1;
-            let value = allocate_array(machine, values).map_err(ParseFailure::Runtime)?;
-            return Ok(JsonNode::Array { value, children });
-        }
-        loop {
-            let child = self.value(machine, depth + 1)?;
-            values.push(child.value());
-            children.push(child);
-            self.ws();
-            match self.peek() {
-                Some(unit) if unit == u16::from(b',') => {
-                    self.pos += 1;
-                    self.ws();
-                }
-                Some(unit) if unit == u16::from(b']') => {
-                    self.pos += 1;
-                    break;
-                }
-                _ => return Err(ParseFailure::Syntax(self.error_unexpected())),
-            }
-        }
-        let value = allocate_array(machine, values).map_err(ParseFailure::Runtime)?;
-        Ok(JsonNode::Array { value, children })
-    }
-
-    fn object<H: Host>(
-        &mut self,
-        machine: &mut Machine<'_, H>,
-        depth: usize,
-    ) -> ParseResult<JsonNode> {
-        if depth >= MAX_JSON_DEPTH {
-            return Err(ParseFailure::Runtime(json_depth_error()));
-        }
-        self.pos += 1;
-        self.ws();
-        let object = machine
-            .allocate(HeapEntry::Object {
-                properties: PropertyMap::default(),
-                prototype: Some(machine.intrinsics.object_prototype),
-                extensible: true,
-                boxed_primitive: None,
-            })
-            .map_err(EvalFailure::Runtime)
-            .map_err(ParseFailure::Runtime)?;
-        let mut children: Vec<(EcmaString, JsonNode)> = Vec::new();
-        if self.peek() == Some(u16::from(b'}')) {
-            self.pos += 1;
-            return Ok(JsonNode::Object {
-                value: object,
-                children,
-            });
-        }
-        loop {
-            if self.peek() != Some(u16::from(b'"')) {
-                return Err(ParseFailure::Syntax(
-                    self.at("Expected property name or '}' in JSON"),
-                ));
-            }
-            let key = self.string()?;
-            self.ws();
-            if self.peek() != Some(u16::from(b':')) {
-                return Err(ParseFailure::Syntax(
-                    self.at("Expected ':' after property name in JSON"),
-                ));
-            }
-            self.pos += 1;
-            let child = self.value(machine, depth + 1)?;
-            create_data_property(
-                machine,
-                object,
-                PropertyKey::Named(key.clone()),
-                child.value(),
-            )
-            .map_err(ParseFailure::Runtime)?;
-            // Mirror the property map: a duplicate key overwrites in place,
-            // keeping its first-insertion position in enumeration order.
-            match children.iter().position(|(name, _)| *name == key) {
-                Some(existing) => children[existing] = (key, child),
-                None => children.push((key, child)),
-            }
-            self.ws();
-            match self.peek() {
-                Some(unit) if unit == u16::from(b',') => {
-                    self.pos += 1;
-                    self.ws();
-                }
-                Some(unit) if unit == u16::from(b'}') => {
-                    self.pos += 1;
-                    break;
-                }
-                _ => return Err(ParseFailure::Syntax(self.error_unexpected())),
-            }
-        }
-        Ok(JsonNode::Object {
-            value: object,
-            children,
-        })
-    }
-
     fn error_unexpected(&self) -> String {
         match self.peek() {
             None => self.at("Unexpected end of JSON input"),
@@ -1229,7 +1337,7 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
     use crate::intrinsics::{BuiltinDef, BuiltinHandler, native_function};
-    use crate::{Limits, RuntimeErrorKind, ThrowOrigin};
+    use crate::{Limits, ThrowOrigin};
 
     macro_rules! test_machine {
         ($program:ident, $host:ident, $machine:ident) => {
@@ -2259,30 +2367,147 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deep_nesting_hits_the_shared_depth_budget() {
-        test_machine!(program, host, machine);
-        let source = format!(
-            "{}0{}",
-            "[".repeat(MAX_JSON_DEPTH + 1),
-            "]".repeat(MAX_JSON_DEPTH + 1)
-        );
-        let source = text(&mut machine, &source);
-        assert!(matches!(
-            json_parse(&mut machine, &[source]),
-            Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
-                limit: MAX_JSON_DEPTH
-            }))
-        ));
+    fn nested_text(depth: usize) -> String {
+        format!("{}0{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    fn nested_array(machine: &mut Machine<'_, TestHost>, depth: usize) -> Value {
         let mut value = Value::int32(0);
-        for _ in 0..(MAX_JSON_DEPTH + 1) {
-            value = allocate_array(&mut machine, vec![value]).expect("array allocation succeeds");
+        for _ in 0..depth {
+            value = allocate_array(machine, vec![value]).expect("array allocation succeeds");
         }
-        assert!(matches!(
-            json_stringify(&mut machine, &[value]),
-            Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
-                limit: MAX_JSON_DEPTH
-            }))
-        ));
+        value
+    }
+
+    fn is_stack_overflow(result: &Result<Value, EvalFailure>) -> bool {
+        matches!(result, Err(EvalFailure::Throw(origin)) if *origin == crate::STACK_OVERFLOW)
+    }
+
+    fn identity_reviver(machine: &mut Machine<'_, TestHost>) -> Value {
+        native(
+            machine,
+            "identityReviver",
+            2,
+            |_: &mut Machine<'_, TestHost>, _: Value, args: &[Value], _: bool| {
+                Ok(BuiltinOutcome::Value(
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                ))
+            },
+        )
+    }
+
+    #[test]
+    fn a_recursive_walk_without_a_measured_stack_throws_range_error() {
+        test_machine!(program, host, machine);
+        let reviver = identity_reviver(&mut machine);
+        let fits = text(&mut machine, &nested_text(UNMEASURED_JSON_DEPTH - 1));
+        assert!(json_parse(&mut machine, &[fits, reviver]).is_ok());
+        let deep = text(&mut machine, &nested_text(UNMEASURED_JSON_DEPTH + 1));
+        assert!(is_stack_overflow(&json_parse(
+            &mut machine,
+            &[deep, reviver]
+        )));
+        let fits = nested_array(&mut machine, UNMEASURED_JSON_DEPTH - 1);
+        assert!(json_stringify(&mut machine, &[fits]).is_ok());
+        let deep = nested_array(&mut machine, UNMEASURED_JSON_DEPTH + 1);
+        assert!(is_stack_overflow(&json_stringify(&mut machine, &[deep])));
+    }
+
+    #[test]
+    fn text_of_any_depth_parses_on_a_small_stack() {
+        with_measured_stack(1 << 20, |machine| {
+            let depth = 1 << 18;
+            let mut source = "[{\"a\":".repeat(depth);
+            source.push('0');
+            source.push_str(&"}]".repeat(depth));
+            let deep = text(machine, &source);
+            let mut value =
+                json_parse(machine, &[deep]).unwrap_or_else(|error| panic!("{error:?}"));
+            for _ in 0..depth {
+                let object = machine
+                    .get_named_property(value, "0")
+                    .expect("element exists");
+                value = machine
+                    .get_named_property(object, "a")
+                    .expect("member exists");
+            }
+            assert_eq!(value, Value::int32(0));
+        });
+        test_machine!(program, host, machine);
+        let deep = text(&mut machine, &nested_text(UNMEASURED_JSON_DEPTH + 1));
+        assert!(json_parse(&mut machine, &[deep]).is_ok());
+    }
+
+    /// Runs `body` with a machine that measures its native stack, on a thread whose
+    /// stack holds `max_stack_bytes` and the slack past it.
+    fn with_measured_stack(max_stack_bytes: usize, body: fn(&mut Machine<'_, TestHost>)) {
+        std::thread::Builder::new()
+            .stack_size(max_stack_bytes + (8 << 20))
+            .spawn(move || {
+                let program = blank_program("<json-edge>");
+                let mut host = TestHost;
+                let limits = Limits {
+                    max_stack_bytes,
+                    ..Limits::default()
+                };
+                let mut machine = Machine::new(&program, &mut host, limits);
+                install(
+                    &mut machine.heap,
+                    &mut machine.intrinsics.globals,
+                    &mut machine.intrinsics.builtins,
+                );
+                body(&mut machine);
+            })
+            .expect("the thread starts")
+            .join()
+            .expect("the body does not panic");
+    }
+
+    #[test]
+    fn a_measured_stack_holds_json_as_deep_as_it_fits() {
+        with_measured_stack(64 << 20, |machine| {
+            let deep = text(machine, &nested_text(4_000));
+            assert!(json_parse(machine, &[deep]).is_ok());
+            let deep = nested_array(machine, 4_000);
+            let Ok(output) = json_stringify(machine, &[deep]) else {
+                panic!("a nesting of 4,000 arrays fits the stack");
+            };
+            let output = machine
+                .string_value(output)
+                .expect("stringify gives a string");
+            assert_eq!(output.to_utf8_lossy(), nested_text(4_000));
+        });
+    }
+
+    #[test]
+    fn a_recursive_walk_past_a_measured_stack_throws_range_error() {
+        with_measured_stack(1 << 20, |machine| {
+            let reviver = identity_reviver(machine);
+            let deep = text(machine, &nested_text(1 << 16));
+            assert!(is_stack_overflow(&json_parse(machine, &[deep, reviver])));
+            let deep = nested_array(machine, 1 << 16);
+            assert!(is_stack_overflow(&json_stringify(machine, &[deep])));
+        });
+    }
+
+    #[test]
+    fn an_indented_value_is_written_as_before() {
+        test_machine!(program, host, machine);
+        let script = r#"{"a":[1,[],{},[{"b":null}],"x"],"c":{},"d":{"e":[true]}}"#;
+        let source = text(&mut machine, script);
+        let Ok(value) = json_parse(&mut machine, &[source]) else {
+            panic!("the text parses");
+        };
+        let gap = text(&mut machine, "--");
+        let Ok(output) = json_stringify(&mut machine, &[value, Value::UNDEFINED, gap]) else {
+            panic!("the value serializes");
+        };
+        let output = machine
+            .string_value(output)
+            .expect("stringify gives a string");
+        assert_eq!(
+            output.to_utf8_lossy(),
+            "{\n--\"a\": [\n----1,\n----[],\n----{},\n----[\n------{\n--------\"b\": null\n------}\n----],\n----\"x\"\n--],\n--\"c\": {},\n--\"d\": {\n----\"e\": [\n------true\n----]\n--}\n}"
+        );
     }
 }

@@ -10,6 +10,7 @@ use std::mem::size_of;
 use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
+use super::array_generic::tick;
 use super::{allocate_array, define_data, install_function, range_error, type_error, value_number};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey, RuntimeErrorKind};
@@ -72,7 +73,10 @@ fn argument(args: &[Value], index: usize) -> Value {
     args.get(index).copied().unwrap_or(Value::UNDEFINED)
 }
 
-fn to_object<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<Value, EvalFailure> {
+pub(super) fn to_object<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<Value, EvalFailure> {
     machine.value_to_object(value)
 }
 
@@ -80,7 +84,7 @@ fn number<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<f64, Ev
     machine.coerce_number_observable(value).map(value_number)
 }
 
-fn integer_or_infinity<H: Host>(
+pub(super) fn integer_or_infinity<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<f64, EvalFailure> {
@@ -92,7 +96,7 @@ fn integer_or_infinity<H: Host>(
     })
 }
 
-fn length_of_array_like<H: Host>(
+pub(super) fn length_of_array_like<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
 ) -> Result<usize, EvalFailure> {
@@ -107,14 +111,14 @@ fn length_of_array_like<H: Host>(
     Ok(length.trunc().min(MAX_SAFE_INTEGER) as usize)
 }
 
-fn index_key(index: usize) -> PropertyKey {
+pub(super) fn index_key(index: usize) -> PropertyKey {
     PropertyKey::Named(EcmaString::encode(&index.to_string()))
 }
 
 /// `ArrayCreate(length)` with a preflight before Rust allocates the backing
 /// vector. Copy-by-change methods always create the intrinsic Array, never a
 /// species-derived result.
-fn array_create<H: Host>(
+pub(super) fn array_create<H: Host>(
     machine: &mut Machine<'_, H>,
     length: usize,
 ) -> Result<Value, EvalFailure> {
@@ -145,7 +149,7 @@ fn array_create<H: Host>(
     allocate_array(machine, elements)
 }
 
-fn create_data_property<H: Host>(
+pub(super) fn create_data_property<H: Host>(
     machine: &mut Machine<'_, H>,
     array: Value,
     index: usize,
@@ -233,6 +237,7 @@ fn find_via_predicate<H: Host>(
         return Err(type_error("Array predicate is not callable"));
     }
     for index in (0..length).rev() {
+        tick(machine)?;
         let value = machine.get_property_key(object, &index_key(index))?;
         if machine.call_truthy(
             predicate,
@@ -295,6 +300,7 @@ fn to_reversed<H: Host>(
     let length = length_of_array_like(machine, object)?;
     let result = array_create(machine, length)?;
     for index in 0..length {
+        tick(machine)?;
         let value = machine.get_property_key(object, &index_key(length - index - 1))?;
         create_data_property(machine, result, index, value)?;
     }
@@ -340,12 +346,21 @@ fn stable_sort<H: Host>(
     values: &mut [Value],
     comparator: Option<Value>,
 ) -> Result<(), EvalFailure> {
+    // The comparator can remove these from wherever they came from.
+    for value in values.iter() {
+        machine.keep_temporary(*value);
+    }
     for end in 1..values.len() {
         let mut index = end;
-        while index > 0
-            && compare_array_elements(machine, values[index], values[index - 1], comparator)?
-                == Ordering::Less
-        {
+        while index > 0 {
+            // This sort takes quadratic steps, and a charge for each would make a
+            // short array run out of fuel. A comparator pays for its own work.
+            machine.check_cancel().map_err(EvalFailure::Runtime)?;
+            let order =
+                compare_array_elements(machine, values[index], values[index - 1], comparator)?;
+            if order != Ordering::Less {
+                break;
+            }
             values.swap(index, index - 1);
             index -= 1;
         }
@@ -374,6 +389,7 @@ fn to_sorted<H: Host>(
         })
     })?;
     for index in 0..length {
+        tick(machine)?;
         values.push(machine.get_property_key(object, &index_key(index))?);
     }
     stable_sort(machine, &mut values, comparator)?;
@@ -416,6 +432,7 @@ fn to_spliced<H: Host>(
     let result = array_create(machine, new_length)?;
     let mut destination = 0;
     while destination < actual_start {
+        tick(machine)?;
         let value = machine.get_property_key(object, &index_key(destination))?;
         create_data_property(machine, result, destination, value)?;
         destination += 1;
@@ -426,6 +443,7 @@ fn to_spliced<H: Host>(
     }
     let mut source = actual_start + skip_count;
     while destination < new_length {
+        tick(machine)?;
         let value = machine.get_property_key(object, &index_key(source))?;
         create_data_property(machine, result, destination, value)?;
         destination += 1;
@@ -451,6 +469,7 @@ fn with<H: Host>(
     let result = array_create(machine, length)?;
     let replacement = argument(args, 1);
     for index in 0..length {
+        tick(machine)?;
         let value = if index == actual {
             replacement
         } else {

@@ -904,6 +904,9 @@ pub struct AssignmentObjectProperty {
     pub name: PropertyName,
     pub target: AssignmentTargetNode,
     pub initializer: Option<Box<Expr>>,
+    /// `...target`, which collects the properties the others left. It has no
+    /// name, and kept here it is visited with the targets around it.
+    pub rest: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -916,6 +919,8 @@ pub enum AssignmentArrayElement {
     Target(AssignmentTargetNode),
     Elision,
     Missing(MissingNode),
+    /// `...target`, which collects what the iterator has left.
+    Rest(AssignmentTargetNode),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1071,6 +1076,8 @@ pub enum ClassMember {
     StaticBlock(BlockNode),
     IndexSignature(IndexSignature),
     Missing(MissingNode),
+    /// A bare `;` between members. It declares nothing, and emit keeps it.
+    Semicolon,
 }
 
 impl NodeData for ClassMember {
