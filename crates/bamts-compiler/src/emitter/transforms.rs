@@ -8376,28 +8376,28 @@ impl<'a> Rewriter<'a> {
             Statement::Variable(declaration) => {
                 let mut declarations = declaration.declarations;
                 if declarations.len() == 1
-                    && let Some(declarator) = declarations.pop() {
-                        let range = declarator.range();
-                        if let VariableDeclarator {
-                            binding,
-                            initializer: Some(init),
-                            ..
-                        } = declarator.into_data()
-                        {
-                            if let BindingPattern::Identifier(name) = binding.into_data() {
-                                let left =
-                                    self.syn_node(name.range(), AssignmentTarget::Identifier(name));
-                                return self.syn_node(
-                                    range,
-                                    Expression::Assignment(AssignmentExpression {
-                                        operator: AssignmentOperator::Assign,
-                                        left,
-                                        right: init,
-                                    }),
-                                );
-                            }
-                        }
+                    && let Some(declarator) = declarations.pop()
+                {
+                    let range = declarator.range();
+                    if let VariableDeclarator {
+                        binding,
+                        initializer: Some(init),
+                        ..
+                    } = declarator.into_data()
+                        && let BindingPattern::Identifier(name) = binding.into_data()
+                    {
+                        let left =
+                            self.syn_node(name.range(), AssignmentTarget::Identifier(name));
+                        return self.syn_node(
+                            range,
+                            Expression::Assignment(AssignmentExpression {
+                                operator: AssignmentOperator::Assign,
+                                left,
+                                right: init,
+                            }),
+                        );
                     }
+                }
                 unreachable!("class lowering sequences single declarator temps");
             }
             _ => unreachable!("class lowering sequences expression statements"),

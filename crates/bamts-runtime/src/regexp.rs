@@ -3565,7 +3565,7 @@ mod tests {
     }
     fn gen_atom(rng: &mut XorShift64) -> String {
         match rng.below(9) {
-            0 | 1 | 2 => ["a", "b", "c"][rng.below(3)].to_string(),
+            0..=2 => ["a", "b", "c"][rng.below(3)].to_string(),
             3 => ".".to_string(),
             4 => "[ab]".to_string(),
             5 => "\\d".to_string(),
