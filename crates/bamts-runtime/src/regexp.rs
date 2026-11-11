@@ -10,7 +10,6 @@ use bamts_bytecode::EcmaString;
 /// silent non-match.
 pub(crate) const STEP_BUDGET: usize = 100_000;
 
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Flags {
     pub(crate) global: bool,
@@ -152,24 +151,81 @@ enum UnitBody {
 
 #[derive(Clone, Debug)]
 enum RegexOp {
-    Literal { value: u32, flags: Flags },
-    Dot { flags: Flags },
-    Class { class: CharacterClass, flags: Flags },
-    Start { multiline: bool },
-    End { multiline: bool },
-    WordBoundary { positive: bool, flags: Flags },
-    GroupStart { group: usize },
-    GroupEnd { group: usize, backward: bool },
-    BackRef { index: usize, flags: Flags },
-    NamedBackRef { name_idx: usize, flags: Flags },
-    Split { primary: usize, secondary: usize },
-    Jump { target: usize },
-    Look { positive: bool, body_start: usize, body_end: usize },
-    LoopEnter { loop_id: usize },
-    LoopHead { loop_id: usize, min: usize, max: Option<usize>, greedy: bool, body_start: usize, next: usize },
-    ClearCaptures { start: usize, end: usize },
-    LoopEnd { loop_id: usize, head: usize, min: usize },
-    RepeatUnit { min: usize, max: Option<usize>, greedy: bool, unit: UnitBody, flags: Flags },
+    Literal {
+        value: u32,
+        flags: Flags,
+    },
+    Dot {
+        flags: Flags,
+    },
+    Class {
+        class: CharacterClass,
+        flags: Flags,
+    },
+    Start {
+        multiline: bool,
+    },
+    End {
+        multiline: bool,
+    },
+    WordBoundary {
+        positive: bool,
+        flags: Flags,
+    },
+    GroupStart {
+        group: usize,
+    },
+    GroupEnd {
+        group: usize,
+        backward: bool,
+    },
+    BackRef {
+        index: usize,
+        flags: Flags,
+    },
+    NamedBackRef {
+        name_idx: usize,
+        flags: Flags,
+    },
+    Split {
+        primary: usize,
+        secondary: usize,
+    },
+    Jump {
+        target: usize,
+    },
+    Look {
+        positive: bool,
+        body_start: usize,
+        body_end: usize,
+    },
+    LoopEnter {
+        loop_id: usize,
+    },
+    LoopHead {
+        loop_id: usize,
+        min: usize,
+        max: Option<usize>,
+        greedy: bool,
+        body_start: usize,
+        next: usize,
+    },
+    ClearCaptures {
+        start: usize,
+        end: usize,
+    },
+    LoopEnd {
+        loop_id: usize,
+        head: usize,
+        min: usize,
+    },
+    RepeatUnit {
+        min: usize,
+        max: Option<usize>,
+        greedy: bool,
+        unit: UnitBody,
+        flags: Flags,
+    },
     Accept,
 }
 
@@ -187,11 +243,26 @@ struct Backtrack {
 }
 
 enum Undo {
-    Capture { index: usize, old: Option<Range<usize>> },
-    Open { index: usize, old: Option<usize> },
-    LoopCount { id: usize, old: usize },
-    LoopAct { id: usize, old: usize },
-    LoopIter { id: usize, old: usize },
+    Capture {
+        index: usize,
+        old: Option<Range<usize>>,
+    },
+    Open {
+        index: usize,
+        old: Option<usize>,
+    },
+    LoopCount {
+        id: usize,
+        old: usize,
+    },
+    LoopAct {
+        id: usize,
+        old: usize,
+    },
+    LoopIter {
+        id: usize,
+        old: usize,
+    },
 }
 
 impl Regex {
@@ -210,12 +281,22 @@ impl Regex {
         let capture_count = parser.capture_count;
         let names = parser.names;
         let (program, num_loops) = lower_program(&expression, flags, &names)?;
-        Ok(Self { program, flags, capture_count, names, num_loops })
+        Ok(Self {
+            program,
+            flags,
+            capture_count,
+            names,
+            num_loops,
+        })
     }
     pub(crate) fn flags(&self) -> Flags {
         self.flags
     }
-    pub(crate) fn exec(&self, input: &EcmaString, start: usize) -> Result<Option<Match>, RegexError> {
+    pub(crate) fn exec(
+        &self,
+        input: &EcmaString,
+        start: usize,
+    ) -> Result<Option<Match>, RegexError> {
         let input = input.as_units();
         if start > input.len() {
             return Ok(None);
@@ -228,11 +309,19 @@ impl Regex {
             if let Some(end_pos) = end {
                 let mut captures = matcher.captures;
                 captures[0] = Some(position..end_pos);
-                let named = self.names.iter().map(|(name, indices)| {
-                    let participant = indices.iter().find_map(|index| captures[*index].clone());
-                    (name.clone(), participant)
-                }).collect();
-                return Ok(Some(Match { range: position..end_pos, captures, named }));
+                let named = self
+                    .names
+                    .iter()
+                    .map(|(name, indices)| {
+                        let participant = indices.iter().find_map(|index| captures[*index].clone());
+                        (name.clone(), participant)
+                    })
+                    .collect();
+                return Ok(Some(Match {
+                    range: position..end_pos,
+                    captures,
+                    named,
+                }));
             }
             if self.flags.sticky || position == input.len() {
                 return Ok(None);
@@ -242,8 +331,15 @@ impl Regex {
     }
 }
 
-fn lower_program(expression: &Node, flags: Flags, names: &[(String, Vec<usize>)]) -> Result<(Vec<RegexOp>, usize), RegexError> {
-    let mut compiler = Compiler { prog: Vec::new(), num_loops: 0 };
+fn lower_program(
+    expression: &Node,
+    flags: Flags,
+    names: &[(String, Vec<usize>)],
+) -> Result<(Vec<RegexOp>, usize), RegexError> {
+    let mut compiler = Compiler {
+        prog: Vec::new(),
+        num_loops: 0,
+    };
     compiler.compile_node(expression, flags, names)?;
     compiler.prog.push(RegexOp::Accept);
     Ok((compiler.prog, compiler.num_loops))
@@ -255,27 +351,60 @@ struct Compiler {
 }
 
 impl Compiler {
-    fn compile_node(&mut self, node: &Node, flags: Flags, names: &[(String, Vec<usize>)]) -> Result<(), RegexError> {
+    fn compile_node(
+        &mut self,
+        node: &Node,
+        flags: Flags,
+        names: &[(String, Vec<usize>)],
+    ) -> Result<(), RegexError> {
         match node {
-            Node::Sequence(..) | Node::Alternation(..) | Node::Group { .. } | Node::Modified { .. } => self.compile_structure(node, flags, names),
-            Node::Literal(..) | Node::Dot | Node::Class(..) | Node::Start | Node::End | Node::WordBoundary(..) => self.compile_atom(node, flags),
-            Node::BackReference(..) | Node::NamedBackReference(..) | Node::Look { .. } => self.compile_assertion(node, flags, names),
+            Node::Sequence(..)
+            | Node::Alternation(..)
+            | Node::Group { .. }
+            | Node::Modified { .. } => self.compile_structure(node, flags, names),
+            Node::Literal(..)
+            | Node::Dot
+            | Node::Class(..)
+            | Node::Start
+            | Node::End
+            | Node::WordBoundary(..) => self.compile_atom(node, flags),
+            Node::BackReference(..) | Node::NamedBackReference(..) | Node::Look { .. } => {
+                self.compile_assertion(node, flags, names)
+            }
             Node::Repeat { .. } => self.compile_repeat(node, flags, names),
         }
     }
     fn compile_atom(&mut self, node: &Node, flags: Flags) -> Result<(), RegexError> {
         match node {
-            Node::Literal(value) => self.prog.push(RegexOp::Literal { value: *value, flags }),
+            Node::Literal(value) => self.prog.push(RegexOp::Literal {
+                value: *value,
+                flags,
+            }),
             Node::Dot => self.prog.push(RegexOp::Dot { flags }),
-            Node::Class(class) => self.prog.push(RegexOp::Class { class: class.clone(), flags }),
-            Node::Start => self.prog.push(RegexOp::Start { multiline: flags.multiline }),
-            Node::End => self.prog.push(RegexOp::End { multiline: flags.multiline }),
-            Node::WordBoundary(positive) => self.prog.push(RegexOp::WordBoundary { positive: *positive, flags }),
+            Node::Class(class) => self.prog.push(RegexOp::Class {
+                class: class.clone(),
+                flags,
+            }),
+            Node::Start => self.prog.push(RegexOp::Start {
+                multiline: flags.multiline,
+            }),
+            Node::End => self.prog.push(RegexOp::End {
+                multiline: flags.multiline,
+            }),
+            Node::WordBoundary(positive) => self.prog.push(RegexOp::WordBoundary {
+                positive: *positive,
+                flags,
+            }),
             _ => return Err(RegexError::new("internal dispatch")),
         }
         Ok(())
     }
-    fn compile_structure(&mut self, node: &Node, flags: Flags, names: &[(String, Vec<usize>)]) -> Result<(), RegexError> {
+    fn compile_structure(
+        &mut self,
+        node: &Node,
+        flags: Flags,
+        names: &[(String, Vec<usize>)],
+    ) -> Result<(), RegexError> {
         match node {
             Node::Sequence(nodes) => self.compile_sequence(nodes, flags, names),
             Node::Alternation(branches) => self.compile_alternation(branches, flags, names),
@@ -283,23 +412,40 @@ impl Compiler {
                 if let Some(group) = index {
                     self.prog.push(RegexOp::GroupStart { group: *group });
                     self.compile_node(body, flags, names)?;
-                    self.prog.push(RegexOp::GroupEnd { group: *group, backward: flags.backward });
+                    self.prog.push(RegexOp::GroupEnd {
+                        group: *group,
+                        backward: flags.backward,
+                    });
                 } else {
                     self.compile_node(body, flags, names)?;
                 }
                 Ok(())
             }
-            Node::Modified { flags: modified, body } => {
-                let inner = Flags { backward: flags.backward, ..*modified };
+            Node::Modified {
+                flags: modified,
+                body,
+            } => {
+                let inner = Flags {
+                    backward: flags.backward,
+                    ..*modified
+                };
                 self.compile_node(body, inner, names)
             }
             _ => Err(RegexError::new("internal dispatch")),
         }
     }
-    fn compile_assertion(&mut self, node: &Node, flags: Flags, names: &[(String, Vec<usize>)]) -> Result<(), RegexError> {
+    fn compile_assertion(
+        &mut self,
+        node: &Node,
+        flags: Flags,
+        names: &[(String, Vec<usize>)],
+    ) -> Result<(), RegexError> {
         match node {
             Node::BackReference(index) => {
-                self.prog.push(RegexOp::BackRef { index: *index, flags });
+                self.prog.push(RegexOp::BackRef {
+                    index: *index,
+                    flags,
+                });
                 Ok(())
             }
             Node::NamedBackReference(name) => {
@@ -309,42 +455,93 @@ impl Compiler {
                 self.prog.push(RegexOp::NamedBackRef { name_idx, flags });
                 Ok(())
             }
-            Node::Look { body, behind, positive } => {
+            Node::Look {
+                body,
+                behind,
+                positive,
+            } => {
                 let look_at = self.prog.len();
-                self.prog.push(RegexOp::Look { positive: *positive, body_start: 0, body_end: 0 });
+                self.prog.push(RegexOp::Look {
+                    positive: *positive,
+                    body_start: 0,
+                    body_end: 0,
+                });
                 let jump_at = self.prog.len();
                 self.prog.push(RegexOp::Jump { target: 0 });
                 let body_start = self.prog.len();
-                let inner = Flags { backward: *behind, ..flags };
+                let inner = Flags {
+                    backward: *behind,
+                    ..flags
+                };
                 self.compile_node(body, inner, names)?;
                 let body_end = self.prog.len();
                 self.prog[jump_at] = RegexOp::Jump { target: body_end };
-                self.prog[look_at] = RegexOp::Look { positive: *positive, body_start, body_end };
+                self.prog[look_at] = RegexOp::Look {
+                    positive: *positive,
+                    body_start,
+                    body_end,
+                };
                 Ok(())
             }
             _ => Err(RegexError::new("internal dispatch")),
         }
     }
-    fn compile_repeat(&mut self, node: &Node, flags: Flags, names: &[(String, Vec<usize>)]) -> Result<(), RegexError> {
+    fn compile_repeat(
+        &mut self,
+        node: &Node,
+        flags: Flags,
+        names: &[(String, Vec<usize>)],
+    ) -> Result<(), RegexError> {
         match node {
-            Node::Repeat { body, min, max, greedy, captures } => {
-                if captures.is_empty() {
-                    if let Some((unit, unit_flags)) = unit_template(body, flags) {
-                        self.prog.push(RegexOp::RepeatUnit { min: *min, max: *max, greedy: *greedy, unit, flags: unit_flags });
-                        return Ok(());
-                    }
+            Node::Repeat {
+                body,
+                min,
+                max,
+                greedy,
+                captures,
+            } => {
+                if captures.is_empty()
+                    && let Some((unit, unit_flags)) = unit_template(body, flags)
+                {
+                    self.prog.push(RegexOp::RepeatUnit {
+                        min: *min,
+                        max: *max,
+                        greedy: *greedy,
+                        unit,
+                        flags: unit_flags,
+                    });
+                    return Ok(());
                 }
                 let loop_id = self.num_loops;
                 self.num_loops += 1;
                 self.prog.push(RegexOp::LoopEnter { loop_id });
                 let head_at = self.prog.len();
-                self.prog.push(RegexOp::LoopHead { loop_id, min: *min, max: *max, greedy: *greedy, body_start: 0, next: 0 });
+                self.prog.push(RegexOp::LoopHead {
+                    loop_id,
+                    min: *min,
+                    max: *max,
+                    greedy: *greedy,
+                    body_start: 0,
+                    next: 0,
+                });
                 let body_start = self.prog.len();
-                self.prog.push(RegexOp::ClearCaptures { start: captures.start, end: captures.end });
+                self.prog.push(RegexOp::ClearCaptures {
+                    start: captures.start,
+                    end: captures.end,
+                });
                 self.compile_node(body, flags, names)?;
-                self.prog.push(RegexOp::LoopEnd { loop_id, head: head_at, min: *min });
+                self.prog.push(RegexOp::LoopEnd {
+                    loop_id,
+                    head: head_at,
+                    min: *min,
+                });
                 let next = self.prog.len();
-                if let RegexOp::LoopHead { body_start: ref mut bs, next: ref mut nx, .. } = self.prog[head_at] {
+                if let RegexOp::LoopHead {
+                    body_start: ref mut bs,
+                    next: ref mut nx,
+                    ..
+                } = self.prog[head_at]
+                {
                     *bs = body_start;
                     *nx = next;
                 }
@@ -353,7 +550,12 @@ impl Compiler {
             _ => Err(RegexError::new("internal dispatch")),
         }
     }
-    fn compile_sequence(&mut self, nodes: &[Node], flags: Flags, names: &[(String, Vec<usize>)]) -> Result<(), RegexError> {
+    fn compile_sequence(
+        &mut self,
+        nodes: &[Node],
+        flags: Flags,
+        names: &[(String, Vec<usize>)],
+    ) -> Result<(), RegexError> {
         if flags.backward {
             for node in nodes.iter().rev() {
                 self.compile_node(node, flags, names)?;
@@ -365,12 +567,20 @@ impl Compiler {
         }
         Ok(())
     }
-    fn compile_alternation(&mut self, branches: &[Node], flags: Flags, names: &[(String, Vec<usize>)]) -> Result<(), RegexError> {
+    fn compile_alternation(
+        &mut self,
+        branches: &[Node],
+        flags: Flags,
+        names: &[(String, Vec<usize>)],
+    ) -> Result<(), RegexError> {
         if branches.len() == 1 {
             return self.compile_node(&branches[0], flags, names);
         }
         let split_at = self.prog.len();
-        self.prog.push(RegexOp::Split { primary: 0, secondary: 0 });
+        self.prog.push(RegexOp::Split {
+            primary: 0,
+            secondary: 0,
+        });
         let primary = self.prog.len();
         self.compile_node(&branches[0], flags, names)?;
         let jump_at = self.prog.len();
@@ -389,8 +599,14 @@ fn unit_template(node: &Node, flags: Flags) -> Option<(UnitBody, Flags)> {
         Node::Literal(value) => Some((UnitBody::Literal(*value), flags)),
         Node::Dot => Some((UnitBody::Dot, flags)),
         Node::Class(class) => Some((UnitBody::Class(class.clone()), flags)),
-        Node::Modified { flags: modified, body } => {
-            let inner = Flags { backward: flags.backward, ..*modified };
+        Node::Modified {
+            flags: modified,
+            body,
+        } => {
+            let inner = Flags {
+                backward: flags.backward,
+                ..*modified
+            };
             unit_template(body, inner)
         }
         Node::Group { index: None, body } => unit_template(body, flags),
@@ -406,7 +622,9 @@ fn unit_template(node: &Node, flags: Flags) -> Option<(UnitBody, Flags)> {
 }
 
 fn code_point_eq(flags: Flags, left: u32, right: u32) -> bool {
-    left == right || (flags.ignore_case && canonicalize(left, flags.unicode) == canonicalize(right, flags.unicode))
+    left == right
+        || (flags.ignore_case
+            && canonicalize(left, flags.unicode) == canonicalize(right, flags.unicode))
 }
 
 fn match_unit(input: &[u16], pos: usize, unit: &UnitBody, flags: Flags) -> Option<usize> {
@@ -470,10 +688,24 @@ enum OpClass {
 impl RegexOp {
     fn op_class(&self) -> OpClass {
         match self {
-            RegexOp::Literal { .. } | RegexOp::Dot { .. } | RegexOp::Class { .. } | RegexOp::Start { .. } | RegexOp::End { .. } | RegexOp::WordBoundary { .. } => OpClass::Atom,
-            RegexOp::GroupStart { .. } | RegexOp::GroupEnd { .. } | RegexOp::BackRef { .. } | RegexOp::NamedBackRef { .. } => OpClass::Group,
-            RegexOp::Split { .. } | RegexOp::Jump { .. } | RegexOp::ClearCaptures { .. } | RegexOp::Accept => OpClass::Control,
-            RegexOp::LoopEnter { .. } | RegexOp::LoopHead { .. } | RegexOp::LoopEnd { .. } | RegexOp::RepeatUnit { .. } => OpClass::Loop,
+            RegexOp::Literal { .. }
+            | RegexOp::Dot { .. }
+            | RegexOp::Class { .. }
+            | RegexOp::Start { .. }
+            | RegexOp::End { .. }
+            | RegexOp::WordBoundary { .. } => OpClass::Atom,
+            RegexOp::GroupStart { .. }
+            | RegexOp::GroupEnd { .. }
+            | RegexOp::BackRef { .. }
+            | RegexOp::NamedBackRef { .. } => OpClass::Group,
+            RegexOp::Split { .. }
+            | RegexOp::Jump { .. }
+            | RegexOp::ClearCaptures { .. }
+            | RegexOp::Accept => OpClass::Control,
+            RegexOp::LoopEnter { .. }
+            | RegexOp::LoopHead { .. }
+            | RegexOp::LoopEnd { .. }
+            | RegexOp::RepeatUnit { .. } => OpClass::Loop,
             RegexOp::Look { .. } => OpClass::Look,
         }
     }
@@ -508,7 +740,13 @@ struct Matcher<'a> {
 }
 
 impl<'a> Matcher<'a> {
-    fn new(regex: &'a Regex, input: &'a [u16], start_pc: usize, end_pc: usize, start_pos: usize) -> Self {
+    fn new(
+        regex: &'a Regex,
+        input: &'a [u16],
+        start_pc: usize,
+        end_pc: usize,
+        start_pos: usize,
+    ) -> Self {
         Self {
             program: &regex.program,
             input,
@@ -627,7 +865,9 @@ impl<'a> Matcher<'a> {
                 let multiline = *multiline;
                 let input = self.input;
                 let pos = self.pos;
-                if pos == 0 || (multiline && pos > 0 && is_line_terminator(u32::from(input[pos - 1]))) {
+                if pos == 0
+                    || (multiline && pos > 0 && is_line_terminator(u32::from(input[pos - 1])))
+                {
                     self.pc += 1;
                     Ok(true)
                 } else {
@@ -638,7 +878,12 @@ impl<'a> Matcher<'a> {
                 let multiline = *multiline;
                 let input = self.input;
                 let pos = self.pos;
-                if pos == input.len() || (multiline && input.get(pos).is_some_and(|value| is_line_terminator(u32::from(*value)))) {
+                if pos == input.len()
+                    || (multiline
+                        && input
+                            .get(pos)
+                            .is_some_and(|value| is_line_terminator(u32::from(*value))))
+                {
                     self.pc += 1;
                     Ok(true)
                 } else {
@@ -654,14 +899,20 @@ impl<'a> Matcher<'a> {
                     false
                 } else {
                     let low = input[pos - 1];
-                    let value = if flags.unicode && (0xdc00..=0xdfff).contains(&low) && pos >= 2 && (0xd800..=0xdbff).contains(&input[pos - 2]) {
+                    let value = if flags.unicode
+                        && (0xdc00..=0xdfff).contains(&low)
+                        && pos >= 2
+                        && (0xd800..=0xdbff).contains(&input[pos - 2])
+                    {
                         combine_surrogates(input[pos - 2], low)
                     } else {
                         u32::from(low)
                     };
                     is_word(value, flags.ignore_case, flags.unicode)
                 };
-                let right = (pos < input.len()).then(|| next_code_point(input, pos, flags.unicode).0).is_some_and(|value| is_word(value, flags.ignore_case, flags.unicode));
+                let right = (pos < input.len())
+                    .then(|| next_code_point(input, pos, flags.unicode).0)
+                    .is_some_and(|value| is_word(value, flags.ignore_case, flags.unicode));
                 if (left != right) == positive {
                     self.pc += 1;
                     Ok(true)
@@ -677,7 +928,10 @@ impl<'a> Matcher<'a> {
         match &prog[self.pc] {
             RegexOp::GroupStart { group, .. } => {
                 let group = *group;
-                self.undo.push(Undo::Open { index: group, old: self.opens[group] });
+                self.undo.push(Undo::Open {
+                    index: group,
+                    old: self.opens[group],
+                });
                 self.opens[group] = Some(self.pos);
                 self.pc += 1;
                 Ok(true)
@@ -700,7 +954,11 @@ impl<'a> Matcher<'a> {
             RegexOp::Split { primary, secondary } => {
                 let primary = *primary;
                 let secondary = *secondary;
-                self.backtrack.push(Backtrack { pc: secondary, pos: self.pos, undo_len: self.undo.len() });
+                self.backtrack.push(Backtrack {
+                    pc: secondary,
+                    pos: self.pos,
+                    undo_len: self.undo.len(),
+                });
                 self.pc = primary;
                 Ok(true)
             }
@@ -713,7 +971,10 @@ impl<'a> Matcher<'a> {
                 let end = *end;
                 for index in start..end {
                     if self.captures[index].is_some() {
-                        self.undo.push(Undo::Capture { index, old: self.captures[index].clone() });
+                        self.undo.push(Undo::Capture {
+                            index,
+                            old: self.captures[index].clone(),
+                        });
                         self.captures[index] = None;
                     }
                 }
@@ -729,18 +990,44 @@ impl<'a> Matcher<'a> {
             RegexOp::LoopEnter { loop_id } => {
                 let loop_id = *loop_id;
                 let id = self.frames.len();
-                self.frames.push(LoopFrame { set: HashSet::new(), steps: 0 });
-                self.undo.push(Undo::LoopAct { id: loop_id, old: self.acts[loop_id] });
+                self.frames.push(LoopFrame {
+                    set: HashSet::new(),
+                    steps: 0,
+                });
+                self.undo.push(Undo::LoopAct {
+                    id: loop_id,
+                    old: self.acts[loop_id],
+                });
                 self.acts[loop_id] = id;
-                self.undo.push(Undo::LoopCount { id: loop_id, old: self.counts[loop_id] });
+                self.undo.push(Undo::LoopCount {
+                    id: loop_id,
+                    old: self.counts[loop_id],
+                });
                 self.counts[loop_id] = 0;
-                self.undo.push(Undo::LoopIter { id: loop_id, old: self.iters[loop_id] });
+                self.undo.push(Undo::LoopIter {
+                    id: loop_id,
+                    old: self.iters[loop_id],
+                });
                 self.iters[loop_id] = self.pos;
                 self.pc += 1;
                 Ok(true)
             }
-            RegexOp::LoopHead { loop_id, min, max, greedy, body_start, next } => {
-                let op = HeadJump { loop_id: *loop_id, min: *min, max: *max, greedy: *greedy, body_start: *body_start, next: *next };
+            RegexOp::LoopHead {
+                loop_id,
+                min,
+                max,
+                greedy,
+                body_start,
+                next,
+            } => {
+                let op = HeadJump {
+                    loop_id: *loop_id,
+                    min: *min,
+                    max: *max,
+                    greedy: *greedy,
+                    body_start: *body_start,
+                    next: *next,
+                };
                 self.op_head(op)
             }
             RegexOp::LoopEnd { loop_id, head, min } => {
@@ -751,12 +1038,21 @@ impl<'a> Matcher<'a> {
                 if count >= min && self.pos == self.iters[loop_id] {
                     return Ok(self.fail());
                 }
-                self.undo.push(Undo::LoopCount { id: loop_id, old: self.counts[loop_id] });
+                self.undo.push(Undo::LoopCount {
+                    id: loop_id,
+                    old: self.counts[loop_id],
+                });
                 self.counts[loop_id] = count + 1;
                 self.pc = head;
                 Ok(true)
             }
-            RegexOp::RepeatUnit { min, max, greedy, unit: _, flags } => {
+            RegexOp::RepeatUnit {
+                min,
+                max,
+                greedy,
+                unit: _,
+                flags,
+            } => {
                 let min = *min;
                 let max = *max;
                 let greedy = *greedy;
@@ -778,7 +1074,12 @@ impl<'a> Matcher<'a> {
     fn step_look(&mut self) -> Result<bool, RegexError> {
         let prog = self.program;
         let (positive, body_start, body_end) = match &prog[self.pc] {
-            RegexOp::Look { positive, body_start, body_end, .. } => (*positive, *body_start, *body_end),
+            RegexOp::Look {
+                positive,
+                body_start,
+                body_end,
+                ..
+            } => (*positive, *body_start, *body_end),
             _ => return Err(RegexError::new("internal dispatch")),
         };
         if positive {
@@ -808,7 +1109,10 @@ impl<'a> Matcher<'a> {
         Ok(true)
     }
     fn capture_group(&mut self, group: usize, range: Range<usize>) {
-        self.undo.push(Undo::Capture { index: group, old: self.captures[group].clone() });
+        self.undo.push(Undo::Capture {
+            index: group,
+            old: self.captures[group].clone(),
+        });
         self.captures[group] = Some(range);
         self.pc += 1;
     }
@@ -827,7 +1131,10 @@ impl<'a> Matcher<'a> {
         }
     }
     fn op_named(&mut self, name_idx: usize, flags: Flags) -> Result<bool, RegexError> {
-        let found = self.names[name_idx].1.iter().find_map(|index| self.captures.get(*index).and_then(|entry| entry.clone()));
+        let found = self.names[name_idx]
+            .1
+            .iter()
+            .find_map(|index| self.captures.get(*index).and_then(|entry| entry.clone()));
         let Some(range) = found else {
             self.pc += 1;
             return Ok(true);
@@ -844,7 +1151,11 @@ impl<'a> Matcher<'a> {
     fn op_head(&mut self, op: HeadJump) -> Result<bool, RegexError> {
         let count = self.counts[op.loop_id];
         let act = self.acts[op.loop_id];
-        let tracked = if op.max.is_some() { count } else { count.min(op.min) };
+        let tracked = if op.max.is_some() {
+            count
+        } else {
+            count.min(op.min)
+        };
         let mut key_caps = Vec::with_capacity(self.captures.len());
         for entry in self.captures.iter() {
             key_caps.push(entry.as_ref().map(|range| (range.start, range.end)));
@@ -856,7 +1167,10 @@ impl<'a> Matcher<'a> {
         if self.frames[act].steps > self.limit {
             return Err(RegexError::budget_exhausted());
         }
-        self.undo.push(Undo::LoopIter { id: op.loop_id, old: self.iters[op.loop_id] });
+        self.undo.push(Undo::LoopIter {
+            id: op.loop_id,
+            old: self.iters[op.loop_id],
+        });
         self.iters[op.loop_id] = self.pos;
         let can_enter = op.max.is_none_or(|bound| count < bound);
         let can_exit = count >= op.min;
@@ -872,29 +1186,53 @@ impl<'a> Matcher<'a> {
             return Ok(true);
         }
         if op.greedy {
-            self.backtrack.push(Backtrack { pc: op.next, pos: self.pos, undo_len: self.undo.len() });
+            self.backtrack.push(Backtrack {
+                pc: op.next,
+                pos: self.pos,
+                undo_len: self.undo.len(),
+            });
             self.pc = op.body_start;
         } else {
-            self.backtrack.push(Backtrack { pc: op.body_start, pos: self.pos, undo_len: self.undo.len() });
+            self.backtrack.push(Backtrack {
+                pc: op.body_start,
+                pos: self.pos,
+                undo_len: self.undo.len(),
+            });
             self.pc = op.next;
         }
         Ok(true)
     }
-    fn op_repeat_greedy(&mut self, min: usize, max: Option<usize>, unit: &UnitBody, flags: Flags) -> Result<bool, RegexError> {
+    fn op_repeat_greedy(
+        &mut self,
+        min: usize,
+        max: Option<usize>,
+        unit: &UnitBody,
+        flags: Flags,
+    ) -> Result<bool, RegexError> {
         let positions = self.repeat_positions(max, unit, flags);
         let have = positions.len() - 1;
         if have < min {
             return Ok(self.fail());
         }
         let next_pc = self.pc + 1;
-        for index in min..have {
-            self.backtrack.push(Backtrack { pc: next_pc, pos: positions[index], undo_len: self.undo.len() });
+        for &pos in &positions[min..have] {
+            self.backtrack.push(Backtrack {
+                pc: next_pc,
+                pos,
+                undo_len: self.undo.len(),
+            });
         }
         self.pos = positions[have];
         self.pc = next_pc;
         Ok(true)
     }
-    fn op_repeat_lazy(&mut self, min: usize, max: Option<usize>, unit: &UnitBody, flags: Flags) -> Result<bool, RegexError> {
+    fn op_repeat_lazy(
+        &mut self,
+        min: usize,
+        max: Option<usize>,
+        unit: &UnitBody,
+        flags: Flags,
+    ) -> Result<bool, RegexError> {
         let positions = self.repeat_positions(max, unit, flags);
         let have = positions.len() - 1;
         if have < min {
@@ -902,7 +1240,11 @@ impl<'a> Matcher<'a> {
         }
         let next_pc = self.pc + 1;
         for index in (min + 1..=have).rev() {
-            self.backtrack.push(Backtrack { pc: next_pc, pos: positions[index], undo_len: self.undo.len() });
+            self.backtrack.push(Backtrack {
+                pc: next_pc,
+                pos: positions[index],
+                undo_len: self.undo.len(),
+            });
         }
         self.pos = positions[min];
         self.pc = next_pc;
@@ -913,10 +1255,8 @@ impl<'a> Matcher<'a> {
         positions.push(self.pos);
         let mut cursor = self.pos;
         loop {
-            if let Some(bound) = max {
-                if positions.len() - 1 >= bound {
-                    break;
-                }
+            if max.is_some_and(|bound| positions.len() > bound) {
+                break;
             }
             let Some(next) = match_unit(self.input, cursor, unit, flags) else {
                 break;
@@ -953,7 +1293,11 @@ impl<'a> Matcher<'a> {
             }
         }
     }
-    fn exec_look_body(&mut self, body_start: usize, body_end: usize) -> Result<Option<usize>, RegexError> {
+    fn exec_look_body(
+        &mut self,
+        body_start: usize,
+        body_end: usize,
+    ) -> Result<Option<usize>, RegexError> {
         let entry_undo = self.undo.len();
         let entry_pos = self.pos;
         let saved_backtrack = std::mem::take(&mut self.backtrack);
@@ -1043,7 +1387,6 @@ pub(crate) fn next_code_point(input: &[u16], position: usize, unicode: bool) -> 
     }
     (u32::from(first), 1)
 }
-
 
 #[derive(Clone, Debug)]
 enum Node {
@@ -2753,10 +3096,13 @@ mod tests {
         );
     }
     mod oracle {
+        use super::super::{
+            Flags, Match, Node, Parser, RegexError, STEP_BUDGET, adjacent_code_point, canonicalize,
+            combine_surrogates, is_line_terminator, is_word, next_code_point,
+        };
+        use bamts_bytecode::EcmaString;
         use std::collections::HashSet;
         use std::ops::Range;
-        use bamts_bytecode::EcmaString;
-        use super::super::{Flags, Match, Node, Parser, RegexError, STEP_BUDGET, adjacent_code_point, canonicalize, combine_surrogates, is_line_terminator, is_word, next_code_point};
         type OracleKey = (usize, usize, Vec<Option<(usize, usize)>>);
         pub(super) struct OracleRegex {
             expression: Node,
@@ -2791,7 +3137,10 @@ mod tests {
             captures: &'a Range<usize>,
         }
         impl OracleRegex {
-            pub(super) fn compile(pattern: &EcmaString, flags: &EcmaString) -> Result<Self, RegexError> {
+            pub(super) fn compile(
+                pattern: &EcmaString,
+                flags: &EcmaString,
+            ) -> Result<Self, RegexError> {
                 let flags = Flags::parse(flags)?;
                 let mut parser = Parser::new(pattern.as_units(), flags);
                 let expression = parser.parse_disjunction(None)?;
@@ -2803,25 +3152,50 @@ mod tests {
                         return Err(parser.error("invalid named reference"));
                     }
                 }
-                Ok(Self { expression, flags, capture_count: parser.capture_count, names: parser.names })
+                Ok(Self {
+                    expression,
+                    flags,
+                    capture_count: parser.capture_count,
+                    names: parser.names,
+                })
             }
-            pub(super) fn exec(&self, input: &EcmaString, start: usize) -> Result<Option<Match>, RegexError> {
+            pub(super) fn exec(
+                &self,
+                input: &EcmaString,
+                start: usize,
+            ) -> Result<Option<Match>, RegexError> {
                 let input = input.as_units();
                 if start > input.len() {
                     return Ok(None);
                 }
                 let mut position = start;
                 loop {
-                    let state = OracleState { position, captures: vec![None; self.capture_count + 1] };
-                    if let Some(matched) = self.match_node(self.flags, &self.expression, input, state)?.into_iter().next() {
+                    let state = OracleState {
+                        position,
+                        captures: vec![None; self.capture_count + 1],
+                    };
+                    if let Some(matched) = self
+                        .match_node(self.flags, &self.expression, input, state)?
+                        .into_iter()
+                        .next()
+                    {
                         let end = matched.position;
                         let mut captures = matched.captures;
                         captures[0] = Some(position..end);
-                        let named = self.names.iter().map(|(name, indices)| {
-                            let participant = indices.iter().find_map(|index| captures[*index].clone());
-                            (name.clone(), participant)
-                        }).collect();
-                        return Ok(Some(Match { range: position..end, captures, named }));
+                        let named = self
+                            .names
+                            .iter()
+                            .map(|(name, indices)| {
+                                let participant =
+                                    indices.iter().find_map(|index| captures[*index].clone());
+                                (name.clone(), participant)
+                            })
+                            .collect();
+                        return Ok(Some(Match {
+                            range: position..end,
+                            captures,
+                            named,
+                        }));
                     }
                     if self.flags.sticky || position == input.len() {
                         return Ok(None);
@@ -2829,7 +3203,13 @@ mod tests {
                     position += next_code_point(input, position, self.flags.unicode).1;
                 }
             }
-            fn match_node(&self, flags: Flags, node: &Node, input: &[u16], state: OracleState) -> Result<Vec<OracleState>, RegexError> {
+            fn match_node(
+                &self,
+                flags: Flags,
+                node: &Node,
+                input: &[u16],
+                state: OracleState,
+            ) -> Result<Vec<OracleState>, RegexError> {
                 match node {
                     Node::Sequence(nodes) => self.match_sequence(flags, nodes, input, state),
                     Node::Alternation(branches) => {
@@ -2840,51 +3220,122 @@ mod tests {
                         Ok(out)
                     }
                     Node::Literal(expected) => {
-                        let Some((actual, width)) = adjacent_code_point(input, state.position, flags) else {
+                        let Some((actual, width)) =
+                            adjacent_code_point(input, state.position, flags)
+                        else {
                             return Ok(Vec::new());
                         };
-                        Ok(self.oracle_eq(flags, actual, *expected).then(|| if flags.backward { state.moved_backward(width) } else { state.moved_forward(width) }).into_iter().collect())
+                        Ok(self
+                            .oracle_eq(flags, actual, *expected)
+                            .then(|| {
+                                if flags.backward {
+                                    state.moved_backward(width)
+                                } else {
+                                    state.moved_forward(width)
+                                }
+                            })
+                            .into_iter()
+                            .collect())
                     }
                     Node::Dot => {
-                        let Some((actual, width)) = adjacent_code_point(input, state.position, flags) else {
+                        let Some((actual, width)) =
+                            adjacent_code_point(input, state.position, flags)
+                        else {
                             return Ok(Vec::new());
                         };
-                        Ok((flags.dot_all || !is_line_terminator(actual)).then(|| if flags.backward { state.moved_backward(width) } else { state.moved_forward(width) }).into_iter().collect())
+                        Ok((flags.dot_all || !is_line_terminator(actual))
+                            .then(|| {
+                                if flags.backward {
+                                    state.moved_backward(width)
+                                } else {
+                                    state.moved_forward(width)
+                                }
+                            })
+                            .into_iter()
+                            .collect())
                     }
                     Node::Class(class) => {
-                        let Some((actual, width)) = adjacent_code_point(input, state.position, flags) else {
+                        let Some((actual, width)) =
+                            adjacent_code_point(input, state.position, flags)
+                        else {
                             return Ok(Vec::new());
                         };
-                        Ok(class.matches(actual, flags.ignore_case, flags.unicode).then(|| if flags.backward { state.moved_backward(width) } else { state.moved_forward(width) }).into_iter().collect())
+                        Ok(class
+                            .matches(actual, flags.ignore_case, flags.unicode)
+                            .then(|| {
+                                if flags.backward {
+                                    state.moved_backward(width)
+                                } else {
+                                    state.moved_forward(width)
+                                }
+                            })
+                            .into_iter()
+                            .collect())
                     }
-                    Node::Start => Ok((state.position == 0 || (flags.multiline && state.position > 0 && is_line_terminator(u32::from(input[state.position - 1])))).then_some(state).into_iter().collect()),
-                    Node::End => Ok((state.position == input.len() || (flags.multiline && input.get(state.position).is_some_and(|value| is_line_terminator(u32::from(*value))))).then_some(state).into_iter().collect()),
+                    Node::Start => Ok((state.position == 0
+                        || (flags.multiline
+                            && state.position > 0
+                            && is_line_terminator(u32::from(input[state.position - 1]))))
+                    .then_some(state)
+                    .into_iter()
+                    .collect()),
+                    Node::End => Ok((state.position == input.len()
+                        || (flags.multiline
+                            && input
+                                .get(state.position)
+                                .is_some_and(|value| is_line_terminator(u32::from(*value)))))
+                    .then_some(state)
+                    .into_iter()
+                    .collect()),
                     Node::WordBoundary(positive) => {
                         let left = if state.position == 0 {
                             false
                         } else {
                             let low = input[state.position - 1];
-                            let value = if flags.unicode && (0xdc00..=0xdfff).contains(&low) && state.position >= 2 && (0xd800..=0xdbff).contains(&input[state.position - 2]) {
+                            let value = if flags.unicode
+                                && (0xdc00..=0xdfff).contains(&low)
+                                && state.position >= 2
+                                && (0xd800..=0xdbff).contains(&input[state.position - 2])
+                            {
                                 combine_surrogates(input[state.position - 2], low)
                             } else {
                                 u32::from(low)
                             };
                             is_word(value, flags.ignore_case, flags.unicode)
                         };
-                        let right = (state.position < input.len()).then(|| next_code_point(input, state.position, flags.unicode).0).is_some_and(|value| is_word(value, flags.ignore_case, flags.unicode));
-                        Ok(((left != right) == *positive).then_some(state).into_iter().collect())
+                        let right = (state.position < input.len())
+                            .then(|| next_code_point(input, state.position, flags.unicode).0)
+                            .is_some_and(|value| is_word(value, flags.ignore_case, flags.unicode));
+                        Ok(((left != right) == *positive)
+                            .then_some(state)
+                            .into_iter()
+                            .collect())
                     }
                     Node::Group { index, body } => {
                         let begin = state.position;
-                        Ok(self.match_node(flags, body, input, state)?.into_iter().map(|mut matched| {
-                            if let Some(index) = index {
-                                matched.captures[*index] = Some(if flags.backward { matched.position..begin } else { begin..matched.position });
-                            }
-                            matched
-                        }).collect())
+                        Ok(self
+                            .match_node(flags, body, input, state)?
+                            .into_iter()
+                            .map(|mut matched| {
+                                if let Some(index) = index {
+                                    matched.captures[*index] = Some(if flags.backward {
+                                        matched.position..begin
+                                    } else {
+                                        begin..matched.position
+                                    });
+                                }
+                                matched
+                            })
+                            .collect())
                     }
-                    Node::Modified { flags: modified, body } => {
-                        let inside = Flags { backward: flags.backward, ..*modified };
+                    Node::Modified {
+                        flags: modified,
+                        body,
+                    } => {
+                        let inside = Flags {
+                            backward: flags.backward,
+                            ..*modified
+                        };
                         self.match_node(inside, body, input, state)
                     }
                     Node::BackReference(index) => {
@@ -2894,32 +3345,55 @@ mod tests {
                         Ok(self.match_backreference(flags, input, range, state))
                     }
                     Node::NamedBackReference(name) => {
-                        let Some((_, indices)) = self.names.iter().find(|(known, _)| known == name) else {
+                        let Some((_, indices)) = self.names.iter().find(|(known, _)| known == name)
+                        else {
                             return Ok(Vec::new());
                         };
-                        match indices.iter().find_map(|index| state.captures[*index].clone()) {
+                        match indices
+                            .iter()
+                            .find_map(|index| state.captures[*index].clone())
+                        {
                             Some(range) => Ok(self.match_backreference(flags, input, range, state)),
                             None => Ok(vec![state]),
                         }
                     }
-                    Node::Look { body, behind, positive } => {
-                        let direction = Flags { backward: *behind, ..flags };
+                    Node::Look {
+                        body,
+                        behind,
+                        positive,
+                    } => {
+                        let direction = Flags {
+                            backward: *behind,
+                            ..flags
+                        };
                         let candidates = self.match_node(direction, body, input, state.clone())?;
                         Ok(if *positive {
-                            candidates.into_iter().take(1).map(|mut matched| {
-                                matched.position = state.position;
-                                matched
-                            }).collect()
+                            candidates
+                                .into_iter()
+                                .take(1)
+                                .map(|mut matched| {
+                                    matched.position = state.position;
+                                    matched
+                                })
+                                .collect()
                         } else if candidates.is_empty() {
                             vec![state]
                         } else {
                             Vec::new()
                         })
                     }
-                    Node::Repeat { .. } => unreachable!("repeat is handled by its containing sequence"),
+                    Node::Repeat { .. } => {
+                        unreachable!("repeat is handled by its containing sequence")
+                    }
                 }
             }
-            fn match_backreference(&self, flags: Flags, input: &[u16], range: Range<usize>, state: OracleState) -> Vec<OracleState> {
+            fn match_backreference(
+                &self,
+                flags: Flags,
+                input: &[u16],
+                range: Range<usize>,
+                state: OracleState,
+            ) -> Vec<OracleState> {
                 let width = range.len();
                 let start = if flags.backward {
                     state.position.checked_sub(width)
@@ -2945,15 +3419,48 @@ mod tests {
                 if candidate != start + width {
                     return Vec::new();
                 }
-                vec![if flags.backward { state.moved_backward(width) } else { state.moved_forward(width) }]
+                vec![if flags.backward {
+                    state.moved_backward(width)
+                } else {
+                    state.moved_forward(width)
+                }]
             }
-            fn match_sequence(&self, flags: Flags, nodes: &[Node], input: &[u16], state: OracleState) -> Result<Vec<OracleState>, RegexError> {
-                let split = if flags.backward { nodes.split_last() } else { nodes.split_first() };
+            fn match_sequence(
+                &self,
+                flags: Flags,
+                nodes: &[Node],
+                input: &[u16],
+                state: OracleState,
+            ) -> Result<Vec<OracleState>, RegexError> {
+                let split = if flags.backward {
+                    nodes.split_last()
+                } else {
+                    nodes.split_first()
+                };
                 let Some((first, rest)) = split else {
                     return Ok(vec![state]);
                 };
-                if let Node::Repeat { body, min, max, greedy, captures } = first {
-                    self.match_repeat(flags, &OracleRepeat { body, min: *min, max: *max, greedy: *greedy, captures }, rest, input, state)
+                if let Node::Repeat {
+                    body,
+                    min,
+                    max,
+                    greedy,
+                    captures,
+                } = first
+                {
+                    self.match_repeat(
+                        flags,
+                        &OracleRepeat {
+                            body,
+                            min: *min,
+                            max: *max,
+                            greedy: *greedy,
+                            captures,
+                        },
+                        rest,
+                        input,
+                        state,
+                    )
                 } else {
                     let mut result = Vec::new();
                     for matched in self.match_node(flags, first, input, state)? {
@@ -2962,7 +3469,14 @@ mod tests {
                     Ok(result)
                 }
             }
-            fn match_repeat(&self, flags: Flags, repeat: &OracleRepeat<'_>, rest: &[Node], input: &[u16], state: OracleState) -> Result<Vec<OracleState>, RegexError> {
+            fn match_repeat(
+                &self,
+                flags: Flags,
+                repeat: &OracleRepeat<'_>,
+                rest: &[Node],
+                input: &[u16],
+                state: OracleState,
+            ) -> Result<Vec<OracleState>, RegexError> {
                 enum Step {
                     Expand { state: OracleState, count: usize },
                     Continue(OracleState),
@@ -2979,8 +3493,20 @@ mod tests {
                         }
                         Step::Expand { state, count } => (state, count),
                     };
-                    let tracked = if repeat.max.is_some() { count } else { count.min(repeat.min) };
-                    let key = (tracked, state.position, state.captures.iter().map(|capture| capture.as_ref().map(|range| (range.start, range.end))).collect());
+                    let tracked = if repeat.max.is_some() {
+                        count
+                    } else {
+                        count.min(repeat.min)
+                    };
+                    let key = (
+                        tracked,
+                        state.position,
+                        state
+                            .captures
+                            .iter()
+                            .map(|capture| capture.as_ref().map(|range| (range.start, range.end)))
+                            .collect(),
+                    );
                     if !seen.insert(key) {
                         continue;
                     }
@@ -2993,10 +3519,15 @@ mod tests {
                         let mut attempt = state.clone();
                         attempt.captures[repeat.captures.clone()].fill(None);
                         iterations = self.match_node(flags, repeat.body, input, attempt)?;
-                        iterations.retain(|matched| count < repeat.min || matched.position != state.position);
+                        iterations.retain(|matched| {
+                            count < repeat.min || matched.position != state.position
+                        });
                     }
                     let stop = (count >= repeat.min).then_some(Step::Continue(state));
-                    let next = iterations.into_iter().rev().map(|state| Step::Expand { state, count: count + 1 });
+                    let next = iterations.into_iter().rev().map(|state| Step::Expand {
+                        state,
+                        count: count + 1,
+                    });
                     if repeat.greedy {
                         stack.extend(stop);
                         stack.extend(next);
@@ -3008,7 +3539,9 @@ mod tests {
                 Ok(result)
             }
             fn oracle_eq(&self, flags: Flags, left: u32, right: u32) -> bool {
-                left == right || (flags.ignore_case && canonicalize(left, flags.unicode) == canonicalize(right, flags.unicode))
+                left == right
+                    || (flags.ignore_case
+                        && canonicalize(left, flags.unicode) == canonicalize(right, flags.unicode))
             }
         }
     }
@@ -3084,8 +3617,14 @@ mod tests {
                     let o_exec = o.exec(&text(&subject), 0);
                     let n_exec = n.exec(&text(&subject), 0);
                     match (o_exec, n_exec) {
-                        (Err(a), Err(b)) => assert_eq!(a.kind(), b.kind(), "kinds differ on {pattern:?} {flags:?} {subject:?}"),
-                        (Ok(a), Ok(b)) => assert_eq!(a, b, "matches differ on {pattern:?} {flags:?} {subject:?}"),
+                        (Err(a), Err(b)) => assert_eq!(
+                            a.kind(),
+                            b.kind(),
+                            "kinds differ on {pattern:?} {flags:?} {subject:?}"
+                        ),
+                        (Ok(a), Ok(b)) => {
+                            assert_eq!(a, b, "matches differ on {pattern:?} {flags:?} {subject:?}")
+                        }
                         _ => panic!("exec diverged on {pattern:?} {flags:?} {subject:?}"),
                     }
                 }

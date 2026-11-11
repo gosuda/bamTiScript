@@ -864,7 +864,6 @@ fn pathdiff_relative(from_dir: &Path, to: &Path) -> String {
     if parts.is_empty() {
         ".".to_string()
     } else {
-
         parts.join("/")
     }
 }
@@ -915,12 +914,13 @@ fn probe_legacy_fields(
                 if field == "typesVersions" {
                     return None;
                 }
-                let direct = resolved.extension().is_some_and(|extension| {
-                    extension == "ts" || extension == "tsx"
-                }) || resolved
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.ends_with(".d.ts"));
+                let direct = resolved
+                    .extension()
+                    .is_some_and(|extension| extension == "ts" || extension == "tsx")
+                    || resolved
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(".d.ts"));
                 if direct {
                     if let Some(found) = probe_candidate(host, trace, resolved) {
                         return Some(found);
@@ -1195,10 +1195,7 @@ fn resolve_installed_package(
         .last()
         .map(|(path, _)| path.clone())
         .unwrap_or_else(|| package_root.join("package.json"));
-    if let Some(source) = chain
-        .last()
-        .and_then(|(_, content)| content.clone())
-    {
+    if let Some(source) = chain.last().and_then(|(_, content)| content.clone()) {
         let package = PackageJson::parse(root, &package_json_path, &source)?;
         let has_exports = package.raw().get("exports").is_some();
         if has_exports {
@@ -1215,7 +1212,12 @@ fn resolve_installed_package(
         } else {
             mode.package_mode()
         };
-        match package.resolve_export(root, &export_subpath, package_mode, &conditions_for(kind, mode, flavor)) {
+        match package.resolve_export(
+            root,
+            &export_subpath,
+            package_mode,
+            &conditions_for(kind, mode, flavor),
+        ) {
             Ok(target) => {
                 return finalize_package_target(
                     (root, options),
@@ -1254,10 +1256,7 @@ fn resolve_installed_package(
         })
     {
         let mut stems = vec![walk_start.clone()];
-        if chain
-            .first()
-            .is_some_and(|(_, content)| content.is_none())
-        {
+        if chain.first().is_some_and(|(_, content)| content.is_none()) {
             stems.push(walk_start.join("index"));
         }
         if let Some(found) = probe_loose_stems(host, trace, &stems, &["ts", "tsx", "d.ts"]) {
@@ -1266,9 +1265,7 @@ fn resolve_installed_package(
     }
     if kind == ModuleResolutionKind::Bundler
         && !chain_has_exports
-        && chain
-            .first()
-            .is_some_and(|(_, content)| content.is_some())
+        && chain.first().is_some_and(|(_, content)| content.is_some())
         && let Some(found) = probe_legacy_fields(host, trace, &chain)
     {
         return confined_hit(root, trace, kind, mode, &found);
@@ -2289,7 +2286,10 @@ mod tests {
             },
         )
         .expect("loose declaration hit");
-        assert_eq!(resolved.path(), abs("/workspace/a/b/node_modules/foo.d.ts").as_path());
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/a/b/node_modules/foo.d.ts").as_path()
+        );
         let expected: &[&str] = &[
             "======== Resolving module 'foo' from '/workspace/a/b/c/d/e/app.ts'. ========",
             "Explicitly specified module resolution kind: 'Bundler'.",

@@ -620,10 +620,26 @@ mod tests {
 
     #[test]
     fn legacy_octal_integer_value_is_base_eight() {
-        assert_eq!(number_value("070"), Some(56.0), "test262/language/literals/numeric/legacy-octal-integer.js 070 must be 56");
-        assert_eq!(number_value("077"), Some(63.0), "legacy-octal-integer.js 077 must be 63");
-        assert_eq!(number_value("08"), Some(8.0), "test262/language/literals/numeric/non-octal-decimal-integer.js 08 stays decimal");
-        assert_eq!(number_value("0708"), Some(708.0), "non-octal-decimal-integer.js 0708 stays decimal");
+        assert_eq!(
+            number_value("070"),
+            Some(56.0),
+            "test262/language/literals/numeric/legacy-octal-integer.js 070 must be 56"
+        );
+        assert_eq!(
+            number_value("077"),
+            Some(63.0),
+            "legacy-octal-integer.js 077 must be 63"
+        );
+        assert_eq!(
+            number_value("08"),
+            Some(8.0),
+            "test262/language/literals/numeric/non-octal-decimal-integer.js 08 stays decimal"
+        );
+        assert_eq!(
+            number_value("0708"),
+            Some(708.0),
+            "non-octal-decimal-integer.js 0708 stays decimal"
+        );
     }
     #[test]
     fn legacy_octal_integer_literal_rejects_fraction_and_exponent() {
@@ -636,7 +652,6 @@ mod tests {
         assert_eq!(number_value("08.5"), Some(8.5));
         assert_eq!(number_value("09e1"), Some(90.0));
     }
-
 
     #[test]
     fn cooks_line_continuations() {

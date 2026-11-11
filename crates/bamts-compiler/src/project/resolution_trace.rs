@@ -56,8 +56,7 @@ impl ResolutionTraceLog {
     ) {
         if !(specifier.starts_with("./") || specifier.starts_with("../")) {
             if specifier.starts_with('#') {
-                self.unsupported
-                    .insert(UnsupportedTraceKind::PackageImport);
+                self.unsupported.insert(UnsupportedTraceKind::PackageImport);
                 return;
             }
             if strategy.0 == ModuleResolutionKind::Bundler
@@ -143,7 +142,6 @@ impl ResolutionTraceLog {
         }
     }
 
-
     fn render_bundler_bare(
         &mut self,
         importer: &Path,
@@ -183,7 +181,11 @@ impl ResolutionTraceLog {
                         in_fallback = true;
                     }
                     if !*exists {
-                        let items = if *is_fallback { &mut fallback } else { &mut preferred };
+                        let items = if *is_fallback {
+                            &mut fallback
+                        } else {
+                            &mut preferred
+                        };
                         items.push(format!(
                             "Directory '{}/node_modules' does not exist, skipping all lookups in it.",
                             display_path(directory)
@@ -199,7 +201,11 @@ impl ResolutionTraceLog {
                         return false;
                     }
                     scope.push((path, *exists));
-                    let items = if in_fallback { &mut fallback } else { &mut preferred };
+                    let items = if in_fallback {
+                        &mut fallback
+                    } else {
+                        &mut preferred
+                    };
                     items.push(if *exists {
                         format!("Found 'package.json' at '{}'.", display_path(path))
                     } else {
@@ -207,11 +213,15 @@ impl ResolutionTraceLog {
                     });
                 }
                 ResolutionTraceStep::LegacyField { field, target } => {
-                    let items = if in_fallback { &mut fallback } else { &mut preferred };
+                    let items = if in_fallback {
+                        &mut fallback
+                    } else {
+                        &mut preferred
+                    };
                     match target {
-                        None => items.push(format!(
-                            "'package.json' does not have a '{field}' field."
-                        )),
+                        None => {
+                            items.push(format!("'package.json' does not have a '{field}' field."))
+                        }
                         Some((value, resolved)) => {
                             if field.as_ref() == "typesVersions" {
                                 return false;
@@ -224,7 +234,11 @@ impl ResolutionTraceLog {
                     }
                 }
                 ResolutionTraceStep::StripExtension { path } => {
-                    let items = if in_fallback { &mut fallback } else { &mut preferred };
+                    let items = if in_fallback {
+                        &mut fallback
+                    } else {
+                        &mut preferred
+                    };
                     let extension = path
                         .extension()
                         .and_then(|extension| extension.to_str())
@@ -235,7 +249,11 @@ impl ResolutionTraceLog {
                     ));
                 }
                 ResolutionTraceStep::Candidate { path, exists } => {
-                    let items = if in_fallback { &mut fallback } else { &mut preferred };
+                    let items = if in_fallback {
+                        &mut fallback
+                    } else {
+                        &mut preferred
+                    };
                     items.push(if *exists {
                         format!(
                             "File '{}' exists - use it as a name resolution result.",
@@ -282,7 +300,8 @@ impl ResolutionTraceLog {
             "Resolving in CJS mode with conditions '{condition}', 'types'."
         ));
         for path in &probes {
-            self.lines.push(format!("File '{}' does not exist.", display_path(path)));
+            self.lines
+                .push(format!("File '{}' does not exist.", display_path(path)));
         }
         self.lines.push(format!(
             "Loading module '{specifier}' from 'node_modules' folder, target file types: TypeScript, JavaScript, Declaration, JSON."

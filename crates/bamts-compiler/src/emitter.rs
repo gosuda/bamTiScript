@@ -3259,11 +3259,15 @@ impl<'a> Emitter<'a> {
             let mut carry = u64::from(digit.to_digit(radix)?);
             for limb in limbs.iter_mut() {
                 let unit = u64::from(*limb) * u64::from(radix) + carry;
-                *limb = u32::try_from(unit % 1_000_000_000).expect("a remainder below one billion fits u32");
+                *limb = u32::try_from(unit % 1_000_000_000)
+                    .expect("a remainder below one billion fits u32");
                 carry = unit / 1_000_000_000;
             }
             while carry > 0 {
-                limbs.push(u32::try_from(carry % 1_000_000_000).expect("a remainder below one billion fits u32"));
+                limbs.push(
+                    u32::try_from(carry % 1_000_000_000)
+                        .expect("a remainder below one billion fits u32"),
+                );
                 carry /= 1_000_000_000;
             }
         }
@@ -3432,9 +3436,7 @@ impl<'a> Emitter<'a> {
             }
             Literal::BigInt(node) => {
                 let token = node.data().token();
-                let normalized = self
-                    .text(token)
-                    .and_then(Self::normalize_bigint_literal);
+                let normalized = self.text(token).and_then(Self::normalize_bigint_literal);
                 self.emit_normalized_token(token, node.range(), normalized);
             }
             Literal::Boolean(node) => self.emit_token(node.data().token()),

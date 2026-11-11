@@ -10,8 +10,10 @@
 
 use bamts_bytecode::EcmaString;
 use bamts_compiler::diagnostic::Diagnostic;
-use bamts_compiler::program::{ModuleEdgeKind, ProgramLoadError, ProgramLowerError, ProgramLowerErrorKind};
 use bamts_compiler::lint::{LintLevel, LintOverride, LintProfile, LintTable};
+use bamts_compiler::program::{
+    ModuleEdgeKind, ProgramLoadError, ProgramLowerError, ProgramLowerErrorKind,
+};
 use bamts_runtime::{
     CancellationToken, RuntimeErrorKind, ThrowOrigin, WarmupPolicy, run_linked_program,
     run_linked_program_tiered,
@@ -3310,11 +3312,15 @@ function $ERROR(message) {\n\
         };
         let outcome = runner.run(&request);
         match &outcome {
-            RunOutcome::Completed { thrown: Some(thrown) } => {
+            RunOutcome::Completed {
+                thrown: Some(thrown),
+            } => {
                 assert_eq!(thrown.phase, NegativePhase::Resolution);
                 assert_eq!(thrown.error_type, NegativeType::SyntaxError);
             }
-            other => panic!("resolution load failure must report Resolution/SyntaxError, got {other:?}"),
+            other => {
+                panic!("resolution load failure must report Resolution/SyntaxError, got {other:?}")
+            }
         }
         assert_eq!(judge_run(&request, &outcome), Ok(()));
         fs::remove_dir_all(root).expect("remove scratch");
@@ -3364,7 +3370,9 @@ function $ERROR(message) {\n\
             },
         };
         match resolution_lower_outcome(&link) {
-            Some(RunOutcome::Completed { thrown: Some(thrown) }) => {
+            Some(RunOutcome::Completed {
+                thrown: Some(thrown),
+            }) => {
                 assert_eq!(thrown.phase, NegativePhase::Resolution);
                 assert_eq!(thrown.error_type, NegativeType::SyntaxError);
             }
@@ -3382,7 +3390,9 @@ function $ERROR(message) {\n\
             }),
         };
         match resolution_lower_outcome(&instantiated) {
-            Some(RunOutcome::Completed { thrown: Some(thrown) }) => {
+            Some(RunOutcome::Completed {
+                thrown: Some(thrown),
+            }) => {
                 assert_eq!(thrown.phase, NegativePhase::Resolution);
                 assert_eq!(thrown.error_type, NegativeType::SyntaxError);
             }
@@ -3532,8 +3542,14 @@ function $ERROR(message) {\n\
             Ok(()) => panic!("second async error must fail"),
         };
         assert_ne!(first_detail, second_detail);
-        assert!(first_detail.contains("TypeError: bad length"), "{first_detail}");
-        assert!(second_detail.contains("ReferenceError: missing"), "{second_detail}");
+        assert!(
+            first_detail.contains("TypeError: bad length"),
+            "{first_detail}"
+        );
+        assert!(
+            second_detail.contains("ReferenceError: missing"),
+            "{second_detail}"
+        );
     }
 
     #[test]

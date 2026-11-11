@@ -1728,11 +1728,7 @@ fn emit_unit_types(
             range,
             slice_source(source, range),
             render_type(model, model.symbol_type(occurrence.symbol)),
-            writes_caret(
-                model,
-                model.symbol_type(occurrence.symbol),
-                has_diagnostics,
-            ),
+            writes_caret(model, model.symbol_type(occurrence.symbol), has_diagnostics),
         ) {
             records.push(annotation);
         }
@@ -2108,7 +2104,11 @@ pub fn emit_javascript_baseline(
                 if is_config_unit_name(&name) || name.eq_ignore_ascii_case("package.json") {
                     continue;
                 }
-                if unit.virtual_path.split('/').any(|part| part == "node_modules") {
+                if unit
+                    .virtual_path
+                    .split('/')
+                    .any(|part| part == "node_modules")
+                {
                     continue;
                 }
                 if !imported.contains(&output.source_file().source_id()) {
@@ -4691,14 +4691,18 @@ error TS5107: Option 'moduleResolution=classic' is deprecated and will stop func
 
     #[test]
     fn error_records_stay_bare_without_diagnostics() {
-        with_model("var x: any;\n", "tests/cases/compiler/errorBarePin.ts", |model| {
-            let any = model.types().any();
-            let error = model.types().error_type();
-            assert!(writes_caret(model, any, false));
-            assert!(writes_caret(model, any, true));
-            assert!(!writes_caret(model, error, false));
-            assert!(writes_caret(model, error, true));
-        });
+        with_model(
+            "var x: any;\n",
+            "tests/cases/compiler/errorBarePin.ts",
+            |model| {
+                let any = model.types().any();
+                let error = model.types().error_type();
+                assert!(writes_caret(model, any, false));
+                assert!(writes_caret(model, any, true));
+                assert!(!writes_caret(model, error, false));
+                assert!(writes_caret(model, error, true));
+            },
+        );
     }
     #[test]
     fn comment_only_preamble_is_not_a_unit() {
@@ -6268,7 +6272,8 @@ export const t = 1;
 
     #[test]
     fn javascript_baseline_emits_json_with_out_dir() {
-        let logical = "tests/cases/compiler/isolatedModules_resolveJsonModule_strict_outDir_commonJsPin.ts";
+        let logical =
+            "tests/cases/compiler/isolatedModules_resolveJsonModule_strict_outDir_commonJsPin.ts";
         let case_text = "\
 // @resolveJsonModule: true
 // @outDir: dist
@@ -6321,11 +6326,7 @@ export const t = 1;
             .collect();
         assert_eq!(
             heads,
-            vec![
-                "//// [package.json]",
-                "//// [test.ts]",
-                "//// [test.js]"
-            ],
+            vec!["//// [package.json]", "//// [test.ts]", "//// [test.js]"],
             "{emitted}"
         );
     }

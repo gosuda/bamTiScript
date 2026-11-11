@@ -138,7 +138,14 @@ pub(super) fn install<H: Host>(
     let all_settled = install_function(heap, atoms, builtins, "allSettled", 1, all_settled::<H>);
     let any = install_function(heap, atoms, builtins, "any", 1, any::<H>);
     let all_keyed = install_function(heap, atoms, builtins, "allKeyed", 1, all_keyed::<H>);
-    let all_settled_keyed = install_function(heap, atoms, builtins, "allSettledKeyed", 1, all_settled_keyed::<H>);
+    let all_settled_keyed = install_function(
+        heap,
+        atoms,
+        builtins,
+        "allSettledKeyed",
+        1,
+        all_settled_keyed::<H>,
+    );
     let try_method = install_function(heap, atoms, builtins, "try", 1, promise_try::<H>);
     let with_resolvers = install_function(
         heap,
@@ -155,7 +162,13 @@ pub(super) fn install<H: Host>(
     define_static(heap, atoms, constructor, "allSettled", all_settled);
     define_static(heap, atoms, constructor, "any", any);
     define_static(heap, atoms, constructor, "allKeyed", all_keyed);
-    define_static(heap, atoms, constructor, "allSettledKeyed", all_settled_keyed);
+    define_static(
+        heap,
+        atoms,
+        constructor,
+        "allSettledKeyed",
+        all_settled_keyed,
+    );
     define_static(heap, atoms, constructor, "try", try_method);
     define_static(heap, atoms, constructor, "withResolvers", with_resolvers);
     builtins.set_promise_capability_executor(capability_executor);
@@ -761,7 +774,12 @@ fn perform_keyed<H: Host>(
         }
     };
     let target = machine.intrinsics.builtins.promise_all_target();
-    let record = completion_record(machine, ReactionKind::KeyedComplete, capability.resolve, capability.reject)?;
+    let record = completion_record(
+        machine,
+        ReactionKind::KeyedComplete,
+        capability.resolve,
+        capability.reject,
+    )?;
     let keys_placeholder = super::allocate_array(machine, Vec::new())?;
     let keys_key = PropertyKey::Named(machine.intern_str("keys"));
     machine.create_data_property_key(record, keys_key, keys_placeholder)?;
@@ -833,14 +851,16 @@ fn perform_keyed<H: Host>(
                 };
                 (on_fulfilled, capability.reject)
             }
-            KeyedVariant::AllSettled => match aggregate_callbacks(machine, AggregateKind::AllSettled, element, capability) {
-                Ok(callbacks) => callbacks,
-                Err(failure) => {
-                    machine.mark_promise_all_settled(aggregate)?;
-                    reject_failure(machine, capability.reject, failure)?;
-                    return Ok(());
+            KeyedVariant::AllSettled => {
+                match aggregate_callbacks(machine, AggregateKind::AllSettled, element, capability) {
+                    Ok(callbacks) => callbacks,
+                    Err(failure) => {
+                        machine.mark_promise_all_settled(aggregate)?;
+                        reject_failure(machine, capability.reject, failure)?;
+                        return Ok(());
+                    }
                 }
-            },
+            }
         };
         let resolved = match machine.call_value(resolve_method, receiver, &[property_value]) {
             Ok(resolved) => resolved,
@@ -894,12 +914,8 @@ fn keyed_complete<H: Host>(
 ) -> Result<(), EvalFailure> {
     let resolve = machine.get_named_property(record, "resolve")?;
     let keys_array = machine.get_named_property(record, "keys")?;
-    let keys = machine
-        .array_elements(keys_array)?
-        .unwrap_or_default();
-    let values = machine
-        .array_elements(values_array)?
-        .unwrap_or_default();
+    let keys = machine.array_elements(keys_array)?.unwrap_or_default();
+    let values = machine.array_elements(values_array)?.unwrap_or_default();
     let result = super::ordinary_runtime(machine, None)?;
     let len = keys.len().min(values.len());
     for i in 0..len {
@@ -3052,7 +3068,10 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let constructor = machine.intrinsics.global("Promise").unwrap();
         let method = machine.get_named_property(constructor, "allKeyed").unwrap();
-        assert!(machine.is_callable(method).unwrap(), "Promise.allKeyed is callable");
+        assert!(
+            machine.is_callable(method).unwrap(),
+            "Promise.allKeyed is callable"
+        );
         let proto = machine.intrinsics.object_prototype;
         let input = super::super::ordinary_runtime(&mut machine, Some(proto)).unwrap();
         let promise = machine.call_value(method, constructor, &[input]).unwrap();
@@ -3060,7 +3079,10 @@ mod tests {
         match state(&machine, promise) {
             PromiseState::Fulfilled { value } => {
                 let proto = machine.internal_get_prototype_of(value).unwrap();
-                assert_eq!(proto, None, "resolves-empty-object.js result has null prototype");
+                assert_eq!(
+                    proto, None,
+                    "resolves-empty-object.js result has null prototype"
+                );
                 let keys = machine.internal_own_property_keys(value).unwrap();
                 assert!(keys.is_empty(), "empty input resolves to empty object");
             }

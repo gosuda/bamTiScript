@@ -247,8 +247,14 @@ fn raw_json<H: Host>(
     let text =
         machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let units = text.as_units();
-    if units.is_empty() || matches!(units[0], 0x09 | 0x0A | 0x0D | 0x20) || matches!(units[units.len() - 1], 0x09 | 0x0A | 0x0D | 0x20) {
-        return Err(raw_json_error(machine, "empty or whitespace-padded text is not valid raw JSON"));
+    if units.is_empty()
+        || matches!(units[0], 0x09 | 0x0A | 0x0D | 0x20)
+        || matches!(units[units.len() - 1], 0x09 | 0x0A | 0x0D | 0x20)
+    {
+        return Err(raw_json_error(
+            machine,
+            "empty or whitespace-padded text is not valid raw JSON",
+        ));
     }
     match parse_root(machine, &text)? {
         JsonNode::Primitive { .. } => {}
@@ -1865,7 +1871,8 @@ mod tests {
         let json = global(&mut machine, "JSON");
         let raw = method(&mut machine, json, "rawJSON");
         for input in [
-            "", "   ", "\t\n ", ",", "] 1", "}0", "tru", "0 1", "null x", "[1]", "{}", " 0", "\ttrue ", " 123", "123 ",
+            "", "   ", "\t\n ", ",", "] 1", "}0", "tru", "0 1", "null x", "[1]", "{}", " 0",
+            "\ttrue ", " 123", "123 ",
         ] {
             let argument = text(&mut machine, input);
             let error = machine
