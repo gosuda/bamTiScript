@@ -601,6 +601,19 @@ struct GroupDef {
     name: Vec<u16>,
     context: Vec<(usize, usize)>,
 }
+enum ClassAtom {
+    Single(u32),
+    Multi,
+}
+
+impl ClassAtom {
+    fn range_valid(first: &ClassAtom, second: &ClassAtom) -> bool {
+        match (first, second) {
+            (ClassAtom::Single(low), ClassAtom::Single(high)) => low <= high,
+            _ => false,
+        }
+    }
+}
 
 struct Parser<'a> {
     units: &'a [u16],
@@ -682,6 +695,11 @@ impl<'a> Parser<'a> {
                 Some(format!("invalid regular expression"))
             }
             _ => {
+                if matches!(self.mode, RegexMode::Unicode | RegexMode::UnicodeSets)
+                    && matches!(self.peek(), Some(0x7B) | Some(0x7D) | Some(0x5D))
+                {
+                    return Some(format!("invalid regular expression"));
+                }
                 self.pos += 1;
                 if let Some(message) = self.skip_quantifier() { return Some(message); }
                 None
@@ -966,6 +984,9 @@ impl<'a> Parser<'a> {
         if matches!(self.mode, RegexMode::UnicodeSets) {
             return self.parse_class_sets();
         }
+        if matches!(self.mode, RegexMode::Unicode) {
+            return self.parse_class_unicode();
+        }
         loop {
             match self.peek() {
                 None => return Some(format!("invalid regular expression")),
@@ -992,6 +1013,185 @@ impl<'a> Parser<'a> {
         }
         if let Some(message) = self.skip_quantifier() { return Some(message); }
         None
+    }
+
+    fn parse_class_unicode(&mut self) -> Option<String> {
+        loop {
+            match self.peek() {
+                None => return Some(format!("invalid regular expression")),
+                Some(0x5D) => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => {
+                    let Some(first) = self.parse_class_atom_unicode() else {
+                        return Some(format!("invalid regular expression"));
+                    };
+                    if self.peek() == Some(0x2D) && self.units.get(self.pos + 1) != Some(&0x5D) {
+                        self.pos += 1;
+                        let Some(second) = self.parse_class_atom_unicode() else {
+                            return Some(format!("invalid regular expression"));
+                        };
+                        if !ClassAtom::range_valid(&first, &second) {
+                            return Some(format!("invalid regular expression"));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(message) = self.skip_quantifier() { return Some(message); }
+        None
+    }
+
+    fn parse_class_atom_unicode(&mut self) -> Option<ClassAtom> {
+        match self.peek() {
+            Some(0x5C) => {
+                let escaped = self.units.get(self.pos + 1).copied()?;
+                match escaped {
+                    0x62 => {
+                        self.pos += 2;
+                        Some(ClassAtom::Single(0x08))
+                    }
+                    0x66 => {
+                        self.pos += 2;
+                        Some(ClassAtom::Single(0x0C))
+                    }
+                    0x6E => {
+                        self.pos += 2;
+                        Some(ClassAtom::Single(0x0A))
+                    }
+                    0x72 => {
+                        self.pos += 2;
+                        Some(ClassAtom::Single(0x0D))
+                    }
+                    0x74 => {
+                        self.pos += 2;
+                        Some(ClassAtom::Single(0x09))
+                    }
+                    0x76 => {
+                        self.pos += 2;
+                        Some(ClassAtom::Single(0x0B))
+                    }
+                    0x63 => {
+                        let letter = self.units.get(self.pos + 2).copied()?;
+                        if !matches!(letter, 0x41..=0x5A | 0x61..=0x7A) {
+                            return None;
+                        }
+                        self.pos += 3;
+                        Some(ClassAtom::Single(u32::from(letter) & 31))
+                    }
+                    0x78 => {
+                        let high = self.units.get(self.pos + 2).copied()?;
+                        let low = self.units.get(self.pos + 3).copied()?;
+                        if !is_hex_digit(high) || !is_hex_digit(low) {
+                            return None;
+                        }
+                        self.pos += 4;
+                        Some(ClassAtom::Single(hex_value(high) * 16 + hex_value(low)))
+                    }
+                    0x75 => self.parse_class_unicode_escape(),
+                    0x30 => {
+                        if matches!(self.units.get(self.pos + 2).copied(), Some(0x30..=0x39)) {
+                            return None;
+                        }
+                        self.pos += 2;
+                        Some(ClassAtom::Single(0))
+                    }
+                    0x31..=0x39 => {
+                        let mut idx = self.pos + 1;
+                        let mut value: usize = 0;
+                        while idx < self.units.len() && (0x30..=0x39).contains(&self.units[idx]) {
+                            value = value.saturating_mul(10).saturating_add(usize::from(self.units[idx] - 0x30));
+                            idx += 1;
+                        }
+                        self.decimals.push(value);
+                        self.pos = idx;
+                        Some(ClassAtom::Multi)
+                    }
+                    0x64 | 0x44 | 0x77 | 0x57 | 0x73 | 0x53 => {
+                        self.pos += 2;
+                        Some(ClassAtom::Multi)
+                    }
+                    0x70 | 0x50 => {
+                        if self.parse_property_escape().is_some() {
+                            return None;
+                        }
+                        Some(ClassAtom::Multi)
+                    }
+                    0x6B => {
+                        self.parse_k_reference();
+                        Some(ClassAtom::Multi)
+                    }
+                    _ if is_valid_u_single(escaped, true) => {
+                        self.pos += 2;
+                        Some(ClassAtom::Single(u32::from(escaped)))
+                    }
+                    _ => None,
+                }
+            }
+            Some(0x2D) => {
+                self.pos += 1;
+                Some(ClassAtom::Single(0x2D))
+            }
+            Some(unit) if (0xD800..0xDC00).contains(&unit) => {
+                let low = self.units.get(self.pos + 1).copied()?;
+                if !(0xDC00..0xE000).contains(&low) {
+                    return None;
+                }
+                self.pos += 2;
+                let value = 0x10000 + ((u32::from(unit - 0xD800)) << 10) + u32::from(low - 0xDC00);
+                Some(ClassAtom::Single(value))
+            }
+            Some(unit) => {
+                if (0xDC00..0xE000).contains(&unit) {
+                    return None;
+                }
+                self.pos += 1;
+                Some(ClassAtom::Single(u32::from(unit)))
+            }
+            None => None,
+        }
+    }
+
+    fn parse_class_unicode_escape(&mut self) -> Option<ClassAtom> {
+        if self.units.get(self.pos + 2).copied() == Some(0x7B) {
+            let mut idx = self.pos + 3;
+            let mut digits = 0;
+            let mut value: u32 = 0;
+            while idx < self.units.len() && self.units[idx] != 0x7D {
+                if !is_hex_digit(self.units[idx]) {
+                    return None;
+                }
+                value = value.saturating_mul(16).saturating_add(hex_value(self.units[idx]));
+                idx += 1;
+                digits += 1;
+                if digits > 6 {
+                    return None;
+                }
+            }
+            if digits == 0 || idx >= self.units.len() {
+                return None;
+            }
+            if value > 0x10FFFF || (0xD800..=0xDFFF).contains(&value) {
+                return None;
+            }
+            self.pos = idx + 1;
+            return Some(ClassAtom::Single(value));
+        }
+        let mut idx = self.pos + 2;
+        let mut count = 0;
+        let mut value: u32 = 0;
+        while count < 4 {
+            let unit = self.units.get(idx).copied()?;
+            if !is_hex_digit(unit) {
+                return None;
+            }
+            value = value * 16 + hex_value(unit);
+            idx += 1;
+            count += 1;
+        }
+        self.pos = idx;
+        Some(ClassAtom::Single(value))
     }
 
     fn parse_class_sets(&mut self) -> Option<String> {
