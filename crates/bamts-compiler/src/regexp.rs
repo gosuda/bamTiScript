@@ -590,6 +590,8 @@ fn validate_pattern(pattern: &[u16], mode: RegexMode) -> Option<String> {
         references: Vec::new(),
         bare_k: 0,
         incomplete_k: 0,
+        captures: 0,
+        decimals: Vec::new(),
     };
     parser.parse_top()
 }
@@ -609,6 +611,8 @@ struct Parser<'a> {
     references: Vec<Vec<u16>>,
     bare_k: usize,
     incomplete_k: usize,
+    captures: usize,
+    decimals: Vec<usize>,
 }
 
 impl<'a> Parser<'a> {
@@ -627,7 +631,10 @@ impl<'a> Parser<'a> {
         if self.pos != self.units.len() {
             return Some(format!("invalid regular expression"));
         }
-        self.check_named_groups()
+        if let Some(message) = self.check_named_groups() {
+            return Some(message);
+        }
+        self.check_decimals()
     }
 
     fn parse_disjunction(&mut self) -> Option<String> {
@@ -670,56 +677,90 @@ impl<'a> Parser<'a> {
             Some(0x5C) => self.parse_escape(),
             Some(0x29) => Some(format!("invalid regular expression")),
             None => None,
+            Some(0x7B) if is_braced_quantifier_at(self.units, self.pos) => {
+                Some(format!("invalid regular expression"))
+            }
             _ => {
                 self.pos += 1;
-                self.skip_quantifier();
+                if let Some(message) = self.skip_quantifier() { return Some(message); }
                 None
             }
         }
     }
 
-    fn skip_quantifier(&mut self) {
+    fn skip_quantifier(&mut self) -> Option<String> {
         match self.peek() {
             Some(0x2A) | Some(0x2B) | Some(0x3F) => {
                 self.pos += 1;
                 if self.peek() == Some(0x3F) {
                     self.pos += 1;
                 }
+                None
             }
-            Some(0x7B) => {
-                let start = self.pos;
-                self.pos += 1;
-                let mut digits = 0;
-                while matches!(self.peek(), Some(0x30..=0x39)) {
-                    self.pos += 1;
-                    digits += 1;
-                }
-                if digits == 0 {
-                    self.pos = start;
-                    return;
-                }
-                if self.peek() == Some(0x2C) {
-                    self.pos += 1;
-                    while matches!(self.peek(), Some(0x30..=0x39)) {
-                        self.pos += 1;
-                    }
-                }
-                if self.peek() != Some(0x7D) {
-                    self.pos = start;
-                    return;
-                }
-                self.pos += 1;
-                if self.peek() == Some(0x3F) {
-                    self.pos += 1;
-                }
+            Some(0x7B) => self.skip_braced_quantifier(),
+            _ => None,
+        }
+    }
+
+    fn skip_braced_quantifier(&mut self) -> Option<String> {
+        let start = self.pos;
+        self.pos += 1;
+        let first = self.parse_quantifier_number();
+        if first.is_none() {
+            self.pos = start;
+            return None;
+        }
+        let low = first.unwrap_or(0);
+        let mut high = Some(low);
+        if self.peek() == Some(0x2C) {
+            self.pos += 1;
+            high = self.parse_quantifier_number();
+        }
+        if self.peek() != Some(0x7D) {
+            self.pos = start;
+            return None;
+        }
+        self.pos += 1;
+        if self.peek() == Some(0x3F) {
+            self.pos += 1;
+        }
+        if let Some(hi) = high {
+            if hi < low && matches!(self.mode, RegexMode::Unicode | RegexMode::UnicodeSets) {
+                return Some(format!("invalid regular expression"));
             }
-            _ => {}
+        }
+        None
+    }
+
+    fn parse_quantifier_number(&mut self) -> Option<usize> {
+        let mut value: usize = 0;
+        let mut digits = 0;
+        while let Some(unit) = self.peek() {
+            if !(0x30..=0x39).contains(&unit) {
+                break;
+            }
+            value = value.saturating_mul(10).saturating_add((unit - 0x30) as usize);
+            self.pos += 1;
+            digits += 1;
+        }
+        if digits == 0 {
+            return None;
+        }
+        Some(value)
+    }
+
+    fn is_quantifier_ahead(&self) -> bool {
+        match self.peek() {
+            Some(0x2A) | Some(0x2B) | Some(0x3F) => true,
+            Some(0x7B) => is_braced_quantifier_at(self.units, self.pos),
+            _ => false,
         }
     }
 
     fn parse_group(&mut self) -> Option<String> {
         self.pos += 1;
         if self.peek() != Some(0x3F) {
+            self.captures += 1;
             if let Some(message) = self.parse_disjunction() {
                 return Some(message);
             }
@@ -727,7 +768,7 @@ impl<'a> Parser<'a> {
                 return Some(format!("invalid regular expression"));
             }
             self.pos += 1;
-            self.skip_quantifier();
+            if let Some(message) = self.skip_quantifier() { return Some(message); }
             return None;
         }
         self.pos += 1;
@@ -741,7 +782,7 @@ impl<'a> Parser<'a> {
                     return Some(format!("invalid regular expression"));
                 }
                 self.pos += 1;
-                self.skip_quantifier();
+                if let Some(message) = self.skip_quantifier() { return Some(message); }
                 None
             }
             Some(0x3D) | Some(0x21) => {
@@ -753,7 +794,12 @@ impl<'a> Parser<'a> {
                     return Some(format!("invalid regular expression"));
                 }
                 self.pos += 1;
-                self.skip_quantifier();
+                if matches!(self.mode, RegexMode::Unicode | RegexMode::UnicodeSets)
+                    && self.is_quantifier_ahead()
+                {
+                    return Some(format!("invalid regular expression"));
+                }
+                if let Some(message) = self.skip_quantifier() { return Some(message); }
                 None
             }
             Some(0x3C) => {
@@ -766,7 +812,10 @@ impl<'a> Parser<'a> {
                         return Some(format!("invalid regular expression"));
                     }
                     self.pos += 1;
-                    self.skip_quantifier();
+                    if self.is_quantifier_ahead() {
+                        return Some(format!("invalid regular expression"));
+                    }
+                    if let Some(message) = self.skip_quantifier() { return Some(message); }
                     return None;
                 }
                 self.parse_named_group()
@@ -805,6 +854,7 @@ impl<'a> Parser<'a> {
             name,
             context: self.disjunctions.clone(),
         });
+        self.captures += 1;
         if let Some(message) = self.parse_disjunction() {
             return Some(message);
         }
@@ -812,7 +862,7 @@ impl<'a> Parser<'a> {
             return Some(format!("invalid regular expression"));
         }
         self.pos += 1;
-        self.skip_quantifier();
+        if let Some(message) = self.skip_quantifier() { return Some(message); }
         None
     }
 
@@ -846,6 +896,7 @@ impl<'a> Parser<'a> {
             name,
             context: self.disjunctions.clone(),
         });
+        self.captures += 1;
         if let Some(message) = self.parse_disjunction() {
             return Some(message);
         }
@@ -853,7 +904,7 @@ impl<'a> Parser<'a> {
             return Some(format!("invalid regular expression"));
         }
         self.pos += 1;
-        self.skip_quantifier();
+        if let Some(message) = self.skip_quantifier() { return Some(message); }
         None
     }
 
@@ -897,7 +948,7 @@ impl<'a> Parser<'a> {
             return Some(format!("invalid regular expression"));
         }
         self.pos += 1;
-        self.skip_quantifier();
+        if let Some(message) = self.skip_quantifier() { return Some(message); }
         None
     }
     fn parse_class(&mut self) -> Option<String> {
@@ -932,7 +983,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        self.skip_quantifier();
+        if let Some(message) = self.skip_quantifier() { return Some(message); }
         None
     }
 
@@ -969,7 +1020,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        self.skip_quantifier();
+        if let Some(message) = self.skip_quantifier() { return Some(message); }
         None
     }
 
@@ -978,20 +1029,153 @@ impl<'a> Parser<'a> {
             if let Some(message) = self.parse_property_escape() {
                 return Some(message);
             }
-            self.skip_quantifier();
+            if let Some(message) = self.skip_quantifier() { return Some(message); }
             return None;
         }
         if self.is_k_prefix() {
             self.parse_k_reference();
-            self.skip_quantifier();
+            if let Some(message) = self.skip_quantifier() { return Some(message); }
             return None;
+        }
+        if matches!(self.mode, RegexMode::Unicode | RegexMode::UnicodeSets) {
+            return self.parse_u_escape(false);
         }
         self.pos += 1;
         if self.peek().is_none() {
             return Some(format!("invalid regular expression"));
         }
         self.pos += 1;
-        self.skip_quantifier();
+        if let Some(message) = self.skip_quantifier() { return Some(message); }
+        None
+    }
+
+    fn parse_u_escape(&mut self, in_class: bool) -> Option<String> {
+        let escaped = match self.units.get(self.pos + 1).copied() {
+            Some(unit) => unit,
+            None => return Some(format!("invalid regular expression")),
+        };
+        if escaped == 0x63 {
+            return self.parse_control_escape();
+        }
+        if escaped == 0x78 {
+            return self.parse_hex_escape();
+        }
+        if escaped == 0x75 {
+            return self.parse_unicode_escape();
+        }
+        if escaped == 0x30 {
+            if matches!(self.units.get(self.pos + 2).copied(), Some(0x30..=0x39)) {
+                return Some(format!("invalid regular expression"));
+            }
+            self.pos += 2;
+            if let Some(message) = self.skip_quantifier() { return Some(message); }
+            return None;
+        }
+        if (0x31..=0x39).contains(&escaped) {
+            return self.parse_decimal_escape();
+        }
+        if is_valid_u_single(escaped, in_class) {
+            self.pos += 2;
+            if let Some(message) = self.skip_quantifier() { return Some(message); }
+            return None;
+        }
+        Some(format!("invalid regular expression"))
+    }
+
+    fn parse_control_escape(&mut self) -> Option<String> {
+        match self.units.get(self.pos + 2).copied() {
+            Some(0x41..=0x5A) | Some(0x61..=0x7A) => {
+                self.pos += 3;
+                if let Some(message) = self.skip_quantifier() { return Some(message); }
+                None
+            }
+            _ => Some(format!("invalid regular expression")),
+        }
+    }
+
+    fn parse_hex_escape(&mut self) -> Option<String> {
+        let first = self.units.get(self.pos + 2).copied();
+        let second = self.units.get(self.pos + 3).copied();
+        match (first, second) {
+            (Some(a), Some(b)) if is_hex_digit(a) && is_hex_digit(b) => {
+                self.pos += 4;
+                if let Some(message) = self.skip_quantifier() { return Some(message); }
+                None
+            }
+            _ => Some(format!("invalid regular expression")),
+        }
+    }
+
+    fn parse_unicode_escape(&mut self) -> Option<String> {
+        if self.units.get(self.pos + 2).copied() == Some(0x7B) {
+            return self.parse_unicode_braced_escape();
+        }
+        let mut idx = self.pos + 2;
+        let mut count = 0;
+        while count < 4 {
+            match self.units.get(idx).copied() {
+                Some(unit) if is_hex_digit(unit) => {
+                    idx += 1;
+                    count += 1;
+                }
+                _ => return Some(format!("invalid regular expression")),
+            }
+        }
+        self.pos = idx;
+        if let Some(message) = self.skip_quantifier() { return Some(message); }
+        None
+    }
+
+    fn parse_unicode_braced_escape(&mut self) -> Option<String> {
+        let mut idx = self.pos + 3;
+        let mut digits = 0;
+        let mut value: u32 = 0;
+        loop {
+            match self.units.get(idx).copied() {
+                Some(0x7D) => break,
+                Some(unit) if is_hex_digit(unit) => {
+                    let digit = if unit <= 0x39 {
+                        unit - 0x30
+                    } else if unit <= 0x46 {
+                        unit - 0x41 + 10
+                    } else {
+                        unit - 0x61 + 10
+                    };
+                    value = value.saturating_mul(16).saturating_add(u32::from(digit));
+                    idx += 1;
+                    digits += 1;
+                    if digits > 6 {
+                        return Some(format!("invalid regular expression"));
+                    }
+                }
+                _ => return Some(format!("invalid regular expression")),
+            }
+        }
+        if digits == 0 {
+            return Some(format!("invalid regular expression"));
+        }
+        if value > 0x10FFFF || (0xD800..=0xDFFF).contains(&value) {
+            return Some(format!("invalid regular expression"));
+        }
+        self.pos = idx + 1;
+        if let Some(message) = self.skip_quantifier() { return Some(message); }
+        None
+    }
+
+    fn parse_decimal_escape(&mut self) -> Option<String> {
+        let mut idx = self.pos + 1;
+        let mut value: usize = 0;
+        while idx < self.units.len() {
+            let unit = self.units[idx];
+            if !(0x30..=0x39).contains(&unit) {
+                break;
+            }
+            value = value.saturating_mul(10).saturating_add((unit - 0x30) as usize);
+            idx += 1;
+        }
+        self.decimals.push(value);
+        self.pos = idx;
+        if let Some(message) = self.skip_quantifier() { return Some(message); }
         None
     }
 
@@ -1068,6 +1252,18 @@ impl<'a> Parser<'a> {
                 return Some(format!("invalid regular expression"));
             }
             if !self.groups.iter().any(|group| group.name == *reference) {
+                return Some(format!("invalid regular expression"));
+            }
+        }
+        None
+    }
+
+    fn check_decimals(&self) -> Option<String> {
+        if !matches!(self.mode, RegexMode::Unicode | RegexMode::UnicodeSets) {
+            return None;
+        }
+        for value in &self.decimals {
+            if *value == 0 || *value > self.captures {
                 return Some(format!("invalid regular expression"));
             }
         }
@@ -1194,6 +1390,54 @@ fn can_both_participate(first: &[(usize, usize)], second: &[(usize, usize)]) -> 
         }
     }
     true
+}
+
+fn is_hex_digit(unit: u16) -> bool {
+    matches!(unit, 0x30..=0x39 | 0x41..=0x46 | 0x61..=0x66)
+}
+
+fn is_braced_quantifier_at(units: &[u16], pos: usize) -> bool {
+    let mut idx = pos + 1;
+    let mut digits = 0;
+    while idx < units.len() && (0x30..=0x39).contains(&units[idx]) {
+        idx += 1;
+        digits += 1;
+    }
+    if digits == 0 {
+        return false;
+    }
+    if idx < units.len() && units[idx] == 0x2C {
+        idx += 1;
+        while idx < units.len() && (0x30..=0x39).contains(&units[idx]) {
+            idx += 1;
+        }
+    }
+    idx < units.len() && units[idx] == 0x7D
+}
+
+fn is_syntax_character(unit: u16) -> bool {
+    matches!(
+        unit,
+        0x5E | 0x24 | 0x5C | 0x2E | 0x2A | 0x2B | 0x3F | 0x28 | 0x29 | 0x5B | 0x5D | 0x7B
+            | 0x7D | 0x7C
+    )
+}
+
+fn is_valid_u_single(escaped: u16, in_class: bool) -> bool {
+    if matches!(
+        escaped,
+        0x64 | 0x44 | 0x77 | 0x57 | 0x73 | 0x53 | 0x62 | 0x42 | 0x66 | 0x6E | 0x72
+            | 0x74 | 0x76
+    ) {
+        return true;
+    }
+    if is_syntax_character(escaped) || escaped == 0x2F {
+        return true;
+    }
+    if in_class && escaped == 0x2D {
+        return true;
+    }
+    false
 }
 
 fn validate_single_modifier(first: &[u16]) -> Option<String> {
