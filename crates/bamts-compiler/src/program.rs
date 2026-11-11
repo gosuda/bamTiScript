@@ -74,6 +74,7 @@ pub enum ModuleEdgeKind {
 pub enum ReferenceDirectiveKind {
     Path,
     Types,
+    Lib,
 }
 
 /// The canonical identity of a resolved module dependency.
@@ -990,6 +991,11 @@ impl ProgramLoader {
     ) -> Result<ResolvedEdge, ProgramLoadError> {
         let flavor = ResolutionFlavor::Types;
         match directive {
+            ReferenceDirectiveKind::Lib => Ok(ResolvedEdge {
+                target: ResolvedEdgeTarget::External(Arc::from(format!("lib:{}", edge.specifier))),
+                type_overlay: None,
+                flavor,
+            }),
             ReferenceDirectiveKind::Types => {
                 if let Some(path) = self.resolve_type_directive(importer, &edge.specifier, edge.mode)?
                 {
@@ -1892,6 +1898,7 @@ fn parse_reference_directive(
         let kind = match attribute.name {
             "path" => ReferenceDirectiveKind::Path,
             "types" => ReferenceDirectiveKind::Types,
+            "lib" => ReferenceDirectiveKind::Lib,
             _ => continue,
         };
         edges.push(UnresolvedEdge {
@@ -5581,6 +5588,39 @@ mod tests {
         assert_eq!(
             entry.dependencies()[0].reference_directive(),
             Some(ReferenceDirectiveKind::Path)
+        );
+    }
+
+    #[test]
+    fn reference_lib_directive_records_external_lib_edge() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "/// <reference lib=\"dom\" />\nexport const x = 1;\n",
+        );
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("lib directive loads");
+        assert_eq!(resolved.modules().len(), 1);
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(edge.kind(), ModuleEdgeKind::TypeOnly);
+        assert_eq!(
+            edge.reference_directive(),
+            Some(ReferenceDirectiveKind::Lib)
+        );
+        assert_eq!(edge.specifier(), "dom");
+        assert!(matches!(
+            edge.target(),
+            ModuleTarget::External(name) if name.as_ref() == "lib:dom"
+        ));
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main_wire = module(&executable, "main.ts");
+        assert!(
+            main_wire.edges().is_empty(),
+            "a reference directive creates no runtime edge"
         );
     }
 
