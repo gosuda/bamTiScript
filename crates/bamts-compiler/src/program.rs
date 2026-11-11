@@ -1453,8 +1453,37 @@ impl LoadState<'_> {
                             let Some(edge) = frame.remaining.next() else {
                                 break None;
                             };
-                            let resolved =
-                                self.loader.resolve_edge(&frame.path, &edge, self.cancel)?;
+                            let resolved = match self.loader.resolve_edge(&frame.path, &edge, self.cancel) {
+                                Ok(resolved) => resolved,
+                                Err(error)
+                                    if edge.kind == ModuleEdgeKind::DynamicRuntime
+                                        && matches!(
+                                            error,
+                                            ProgramLoadError::UnresolvedModule(_)
+                                                | ProgramLoadError::InvalidSpecifier { .. }
+                                                | ProgramLoadError::InvalidPackage { .. }
+                                                | ProgramLoadError::UnsupportedSource(_)
+                                                | ProgramLoadError::Read { .. }
+                                                | ProgramLoadError::Source { .. }
+                                                | ProgramLoadError::IllFormedModuleSpecifier { .. }
+                                                | ProgramLoadError::TraversalRejected { .. }
+                                                | ProgramLoadError::JsxPlan { .. }
+                                        ) =>
+                                {
+                                    frame.dependencies.push(ModuleEdge {
+                                        kind: edge.kind,
+                                        flavor: crate::project::ResolutionFlavor::Runtime,
+                                        mode: edge.mode,
+                                        specifier: Arc::clone(&edge.specifier),
+                                        target: ModuleTarget::External(Arc::clone(&edge.specifier)),
+                                        type_target: None,
+                                        range: edge.range,
+                                        unresolved: true,
+                                    });
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
                             match resolved.target {
                                 ResolvedEdgeTarget::Local(target_path) => {
                                     frame.pending_edge = Some(PendingEdge {
@@ -4801,6 +4830,49 @@ mod tests {
                 .any(|instruction| matches!(instruction, Instruction::ImportDynamic { .. }))
         );
     }
+    #[test]
+    fn dynamic_missing_literal_does_not_fail_program_load() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "const pending = import('./THIS_FILE_DOES_NOT_EXIST.js'); pending;",
+        );
+        let resolved = fixture.loader().load("main.ts").expect("missing dynamic target loads");
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(edge.kind(), ModuleEdgeKind::DynamicRuntime);
+        assert!(edge.is_unresolved());
+    }
+
+    #[test]
+    fn dynamic_empty_specifier_does_not_fail_program_load() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "{ import(''); }");
+        let resolved = fixture.loader().load("main.ts").expect("empty dynamic specifier loads");
+        let main = resolved.entrypoint();
+        assert!(main
+            .dependencies()
+            .iter()
+            .all(|edge| edge.kind() != ModuleEdgeKind::StaticRuntime));
+    }
+
+    #[test]
+    fn dynamic_valid_target_stays_local() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 1;");
+        fixture.write("main.ts", "const pending = import('./dep.js'); pending;");
+        let resolved = fixture.loader().load("main.ts").expect("valid dynamic target loads");
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(edge.kind(), ModuleEdgeKind::DynamicRuntime);
+        assert!(!edge.is_unresolved());
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main_wire = module(&executable, "main.ts");
+        assert_eq!(main_wire.edges()[0].kind, EdgeKind::Dynamic);
+    }
+
 
     #[test]
     fn program_lowering_coalesces_static_and_dynamic_imports_of_one_target() {
