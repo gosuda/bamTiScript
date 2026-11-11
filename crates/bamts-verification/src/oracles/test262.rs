@@ -94,9 +94,9 @@ pub struct ModeFailure {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DoneFailure {
-    Error,
+    Error(String),
     Duplicate,
     Missing,
     Late,
@@ -666,15 +666,15 @@ pub fn judge_done(trace: &AsyncTrace) -> Result<(), DoneFailure> {
                 return Err(DoneFailure::Duplicate);
             }
             match first.kind {
-                DoneEventKind::Error => Err(DoneFailure::Error),
+                DoneEventKind::Error => Err(DoneFailure::Error(
+                    trace.failure_value.clone().unwrap_or_default(),
+                )),
                 DoneEventKind::Success => Ok(()),
             }
         }
     }
 }
 
-/// What a failed run reports. A mismatch reads as its cause, so runs that failed
-/// the same way group together in a sweep report.
 fn failure_detail(error: &OracleError) -> String {
     match error {
         OracleError::ExpectationMismatch {
@@ -687,6 +687,10 @@ fn failure_detail(error: &OracleError) -> String {
             actual,
             message,
         } => format!("expected {expected}, got {actual}: {message}"),
+        OracleError::Done(DoneFailure::Error(value)) if value.is_empty() => {
+            "Done(Error)".to_owned()
+        }
+        OracleError::Done(DoneFailure::Error(value)) => format!("Done(Error): {value}"),
         other => format!("{other:?}"),
     }
 }
@@ -718,8 +722,8 @@ pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), Oracl
                         message: String::new(),
                     }),
                 },
-                Err(DoneFailure::Error) => match &request.negative {
-                    None => Err(OracleError::Done(DoneFailure::Error)),
+                Err(error @ DoneFailure::Error(_)) => match &request.negative {
+                    None => Err(OracleError::Done(error)),
                     Some(expected) => {
                         // The failure surfaced through the async completion
                         // callback after the body ran, so it is a runtime
@@ -1837,7 +1841,7 @@ function $ERROR(message) {\n\
             exited_at: None,
             deadline,
         };
-        assert_eq!(judge_done(&error), Err(DoneFailure::Error));
+        assert_eq!(judge_done(&error), Err(DoneFailure::Error(String::new())));
 
         let duplicate = AsyncTrace {
             events: vec![
@@ -1889,7 +1893,7 @@ function $ERROR(message) {\n\
         assert_eq!(DEFAULT_ASYNC_DEADLINE, Duration::from_millis(500));
         for (kind, at_boundary) in [
             (DoneEventKind::Success, Ok(())),
-            (DoneEventKind::Error, Err(DoneFailure::Error)),
+            (DoneEventKind::Error, Err(DoneFailure::Error(String::new()))),
         ] {
             let mut trace = AsyncTrace {
                 events: vec![DoneEvent {
@@ -3257,8 +3261,27 @@ function $ERROR(message) {\n\
 
         assert_eq!(
             judge_run(&request, &outcome),
-            Err(OracleError::Done(DoneFailure::Error))
+            Err(OracleError::Done(DoneFailure::Error(
+                "Test262Error: unexpected".to_owned()
+            )))
         );
+    }
+    #[test]
+    fn async_done_error_detail_carries_name_and_message() {
+        let request = negative_async_request(None);
+        let first = async_done_outcome(DoneEventKind::Error, Some("TypeError: bad length"));
+        let second = async_done_outcome(DoneEventKind::Error, Some("ReferenceError: missing"));
+        let first_detail = match judge_run(&request, &first) {
+            Err(error) => failure_detail(&error),
+            Ok(()) => panic!("first async error must fail"),
+        };
+        let second_detail = match judge_run(&request, &second) {
+            Err(error) => failure_detail(&error),
+            Ok(()) => panic!("second async error must fail"),
+        };
+        assert_ne!(first_detail, second_detail);
+        assert!(first_detail.contains("TypeError: bad length"), "{first_detail}");
+        assert!(second_detail.contains("ReferenceError: missing"), "{second_detail}");
     }
 
     #[test]
@@ -3465,10 +3488,10 @@ function $ERROR(message) {\n\
         let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
         let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
         for variant in &plan.variants {
-            assert_eq!(
+            assert!(matches!(
                 run_variant(&runner, &parsed, &plan, &sources, variant),
-                Err(OracleError::Done(DoneFailure::Error))
-            );
+                Err(OracleError::Done(DoneFailure::Error(_)))
+            ));
         }
     }
 

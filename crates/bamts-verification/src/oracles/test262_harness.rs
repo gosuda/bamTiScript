@@ -191,7 +191,7 @@ impl DoneRecorder {
         }
         match judge_done(&self.trace()) {
             Ok(()) => Ok(()),
-            Err(DoneFailure::Error) => Err(HarnessError::DoneFailed {
+            Err(DoneFailure::Error(_)) => Err(HarnessError::DoneFailed {
                 value: self
                     .first
                     .as_ref()
