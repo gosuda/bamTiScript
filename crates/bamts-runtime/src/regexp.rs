@@ -1428,16 +1428,116 @@ enum Node {
 struct CharacterClass {
     negated: bool,
     items: Vec<ClassItem>,
+    /// Sorted, merged ranges of every `Character` and `Range` item, present
+    /// only when the class holds no other kind of item. Membership is a binary
+    /// search; a property escape expands to hundreds of ranges, so a linear
+    /// scan per code point is quadratic over a whole-string test.
+    simple: Option<Vec<(u32, u32)>>,
+    /// `Character` items whose canonical form differs from the item itself,
+    /// paired with that canonical form. Only the `i` path consults them.
+    char_aliases: Vec<(u32, u32)>,
 }
 
 impl CharacterClass {
-    fn matches(&self, value: u32, ignore_case: bool, unicode: bool) -> bool {
-        let matched = self
-            .items
+    fn new(negated: bool, items: Vec<ClassItem>) -> Self {
+        let simple = if items.iter().all(|item| {
+            matches!(item, ClassItem::Character(_) | ClassItem::Range(_, _))
+        }) {
+            let mut ranges: Vec<(u32, u32)> = items
+                .iter()
+                .map(|item| match item {
+                    ClassItem::Character(value) => (*value, *value),
+                    ClassItem::Range(start, end) => (*start, *end),
+                    _ => unreachable!("filtered above"),
+                })
+                .collect();
+            ranges.sort_unstable();
+            let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+            for (start, end) in ranges {
+                match merged.last_mut() {
+                    Some(last) if start <= last.1.saturating_add(1) => {
+                        last.1 = last.1.max(end);
+                    }
+                    _ => merged.push((start, end)),
+                }
+            }
+            Some(merged)
+        } else {
+            None
+        };
+        let char_aliases = items
             .iter()
-            .any(|item| item.matches(value, ignore_case, unicode));
+            .filter_map(|item| match item {
+                ClassItem::Character(value) => {
+                    let canonical = canonicalize(*value, true);
+                    (canonical != *value).then_some((*value, canonical))
+                }
+                _ => None,
+            })
+            .collect();
+        Self {
+            negated,
+            items,
+            simple,
+            char_aliases,
+        }
+    }
+
+    fn matches(&self, value: u32, ignore_case: bool, unicode: bool) -> bool {
+        let matched = match &self.simple {
+            Some(ranges) => self.simple_matches(ranges, value, ignore_case, unicode),
+            None => self
+                .items
+                .iter()
+                .any(|item| item.matches(value, ignore_case, unicode)),
+        };
         matched != self.negated
     }
+
+    /// The same disjunction `ClassItem::matches` makes for `Character` and
+    /// `Range` items, with binary search replacing the per-item linear scan.
+    fn simple_matches(&self, ranges: &[(u32, u32)], value: u32, ignore_case: bool, unicode: bool) -> bool {
+        if ranges_contain(ranges, value) {
+            return true;
+        }
+        if !ignore_case {
+            return false;
+        }
+        let canonical = canonicalize(value, unicode);
+        if ranges_contain(ranges, canonical)
+            || ranges_contain(ranges, unicode_simple_fold(canonical))
+            || self
+                .char_aliases
+                .iter()
+                .any(|&(_, target)| target == canonical)
+        {
+            return true;
+        }
+        UNICODE_SIMPLE_FOLD_RANGES.iter().any(|(first, last, step, delta)| {
+            let source = offset_code_point(canonical, -*delta);
+            source.is_some_and(|source| {
+                (*first..=*last).contains(&source)
+                    && (source - *first).is_multiple_of(*step)
+                    && ranges_contain(ranges, source)
+                    && canonicalize(source, unicode) == canonical
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static RANGE_PROBES: Cell<u64> = const { Cell::new(0) };
+}
+
+fn ranges_contain(ranges: &[(u32, u32)], value: u32) -> bool {
+    #[cfg(test)]
+    RANGE_PROBES.with(|probes| probes.set(probes.get() + 1));
+    let index = ranges.partition_point(|&(start, _)| start <= value);
+    index > 0 && value <= ranges[index - 1].1
 }
 
 #[derive(Clone, Debug)]
@@ -2095,7 +2195,7 @@ impl<'a> Parser<'a> {
         while let Some(token) = self.peek() {
             if token == 0x5d {
                 self.position += 1;
-                return Ok(CharacterClass { negated, items });
+                return Ok(CharacterClass::new(negated, items));
             }
             let left = self.parse_class_item()?;
             if self.peek() == Some(0x2d) && self.units.get(self.position + 1) != Some(&0x5d) {
@@ -2472,10 +2572,7 @@ impl<'a> Parser<'a> {
 }
 
 fn class_node(item: ClassItem) -> Node {
-    Node::Class(CharacterClass {
-        negated: false,
-        items: vec![item],
-    })
+    Node::Class(CharacterClass::new(false, vec![item]))
 }
 
 fn is_octal_digit(unit: u16) -> bool {
@@ -2561,6 +2658,43 @@ mod tests {
             .unwrap()
             .unwrap()
             .captures
+    }
+
+    #[test]
+    fn property_class_probes_stay_logarithmic_per_code_point() {
+        let mut pattern = String::from("^[");
+        for index in 0..200u32 {
+            let start = 0x100 * index + 0x41;
+            let end = start + 0x20;
+            pattern.push_str(&format!(
+                "\\u{{{:x}}}-\\u{{{:x}}}",
+                start, end
+            ));
+        }
+        pattern.push_str("]+$");
+        let compiled = regex(&pattern, "u");
+        let run = |units: usize| -> u64 {
+            let input: String = (0..units)
+                .map(|index| {
+                    let index = u32::try_from(index).expect("unit index fits u32");
+                    let start = 0x100 * (index % 200) + 0x41;
+                    char::from_u32(start + index % 0x21).unwrap()
+                })
+                .collect();
+            super::RANGE_PROBES.with(|probes| probes.set(0));
+            assert!(compiled.exec(&text(&input), 0).unwrap().is_some());
+            super::RANGE_PROBES.with(|probes| probes.get())
+        };
+        let small = run(100_000);
+        let large = run(200_000);
+        assert!(
+            (large as f64) < 2.5 * small as f64,
+            "probe count must scale linearly: {small} then {large}"
+        );
+        assert!(
+            large < 8 * 200_000,
+            "probe count must stay a small constant per code point: {large}"
+        );
     }
 
     #[test]

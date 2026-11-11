@@ -2373,6 +2373,61 @@ mod tests {
         }
     }
 
+    /// Range endpoints copied from the test262 generated property-escape
+    /// tests (`General_Category_-_Letter.js`, `Script_-_Latin.js`,
+    /// `Script_Extensions_-_Han.js`): every listed code point matches the
+    /// positive class, the negated class, and rejects their complements.
+    #[test]
+    fn property_ranges_match_listed_points_and_reject_complement() {
+        let cases: &[(&str, &[u32], &[u32])] = &[
+            (
+                "Script=Latin",
+                &[0xaa, 0xba, 0x41, 0x5a, 0x61, 0x7a, 0x1d00, 0xff21, 0xff3a],
+                &[0x30, 0x370, 0x4e00, 0x1f600],
+            ),
+            (
+                "Script_Extensions=Han",
+                &[0x2e80, 0x3005, 0x4e00, 0x9fff],
+                &[0x41, 0x370, 0x1f600],
+            ),
+            (
+                "General_Category=Letter",
+                &[0x41, 0xb5, 0x1e00, 0x10400],
+                &[0x21, 0x37e],
+            ),
+        ];
+        for (property, inside, outside) in cases {
+            for flags in ["u", "iu"] {
+                let members: String = inside
+                    .iter()
+                    .filter_map(|&value| char::from_u32(value))
+                    .collect();
+                let strangers: String = outside
+                    .iter()
+                    .filter_map(|&value| char::from_u32(value))
+                    .collect();
+                let positive = format!("^\\p{{{property}}}+$");
+                let negated = format!("^[^\\p{{{property}}}]+$");
+                assert!(
+                    matched(&positive, flags, &members).is_some(),
+                    "\\p{{{property}}} must match every listed code point ({flags})"
+                );
+                assert!(
+                    matched(&positive, flags, &strangers).is_none(),
+                    "\\p{{{property}}} must reject excluded code points ({flags})"
+                );
+                assert!(
+                    matched(&negated, flags, &strangers).is_some(),
+                    "[^\\p{{{property}}}] must match excluded code points ({flags})"
+                );
+                assert!(
+                    matched(&negated, flags, &members).is_none(),
+                    "[^\\p{{{property}}}] must reject listed code points ({flags})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn property_escapes_compose_with_nested_set_operations() {
         assert_eq!(
