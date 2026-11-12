@@ -1679,10 +1679,7 @@ impl<'a> FunctionContext<'a> {
         }
         let id = builder.intern(Constant::String(EcmaString::encode(name)), range)?;
         if self.strict {
-            // Strict code cannot create a global by assigning to it. The value
-            // is already computed here, which is when the specification checks.
-            let dst = self.alloc_register(range)?;
-            self.emit(range, Instruction::LoadGlobal { dst, name: id })?;
+            self.emit(range, Instruction::RequireGlobalBinding { name: id })?;
         }
         self.emit(range, Instruction::StoreGlobal { name: id, value })?;
         Ok(())
@@ -11820,8 +11817,8 @@ mod tests {
         );
     }
     use bamts_bytecode::{
-        BinaryOp, Constant, DecodeLimits, Function, Instruction, IteratorKind, Module, Pc,
-        RESUME_RETURN, RESUME_THROW, Register, UnaryOp, Verified, decode_verified,
+        BinaryOp, Constant, ConstantId, DecodeLimits, Function, Instruction, IteratorKind, Module,
+        Pc, RESUME_RETURN, RESUME_THROW, Register, UnaryOp, Verified, decode_verified,
     };
     fn lower_js_result(src: &str) -> Result<Module<Verified>, LowerError> {
         let source = Arc::new(
@@ -11891,6 +11888,44 @@ mod tests {
                 "{statement}"
             );
         }
+    }
+    #[test]
+    fn strict_global_writes_test_the_binding_without_reading_it() {
+        let global_ops = |src: &str, name: &str| {
+            let source = Arc::new(SourceText::new(src.to_owned()).expect("small test source"));
+            let parsed = parse(scan(SourceId::new(0), ScriptKind::JavaScript, source));
+            let module = lower(
+                parsed.product(),
+                LowerOptions {
+                    javascript_compatibility: true,
+                    ..LowerOptions::default()
+                },
+            )
+            .expect("snippet lowers to a verified module");
+            let constants = module.constants();
+            let named = |id: ConstantId| {
+                matches!(&constants[id.get() as usize], Constant::String(text) if text.eq_ascii(name))
+            };
+            module.functions()[module.entry().get() as usize]
+                .code()
+                .iter()
+                .filter_map(|instruction| match *instruction {
+                    Instruction::LoadGlobal { name, .. } if named(name) => Some("load"),
+                    Instruction::RequireGlobalBinding { name } if named(name) => Some("require"),
+                    Instruction::StoreGlobal { name, .. } if named(name) => Some("store"),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            global_ops("'use strict'; x = 1;", "x"),
+            ["require", "store"]
+        );
+        assert_eq!(
+            global_ops("'use strict'; y += 1;", "y"),
+            ["load", "require", "store"]
+        );
+        assert_eq!(global_ops("q = 5;", "q"), ["store"]);
     }
     #[test]
     fn class_decorators_lower_in_reverse_and_bind_the_final_class_once() {

@@ -1,4 +1,4 @@
-//! Bytecode ISA gap closures (E1.1): append-only opcodes 52..=57.
+//! Bytecode ISA gap closures (E1.1): append-only opcodes 52..=58.
 //!
 //! Existing opcodes `0..=51` keep their crate-root [`crate::Instruction`] wire
 //! tags. This module owns every later tag: operand layout, canonical LEB128
@@ -19,6 +19,7 @@
 //! | 55 | `ImportDynamicAttributes` | `lower_import_expression` evaluates `ImportExpression::options` then discards it |
 //! | 56 | `CopyDataProperties` | `rest_object` emits `ObjectSpread` + per-key `DeleteProperty`, which invokes an excluded key's getter a second time |
 //! | 57 | `GetTemplateObject` | `lower_tagged_template` rebuilds the strings array per evaluation and installs `raw` with `SetProperty` (enumerable, writable) |
+//! | 58 | `RequireGlobalBinding` | strict `x = v` guarded the write with `LoadGlobal`, which runs a global accessor's getter before the setter |
 //!
 //! Candidates deliberately **not** added, because no callsite proves them:
 //! private brand install/check, private `in`, direct `eval`, a home-object
@@ -39,8 +40,8 @@ use crate::{ConstantId, DecodeError, DecodeErrorKind, Pc, Register};
 
 /// First append-only tag. Tags `0..=51` remain the crate-root algebra.
 pub const FIRST_EXTENSION_TAG: u8 = 52;
-/// Exclusive end of the extension tag range (`52..=57`).
-pub const EXTENSION_TAG_END: u8 = 58;
+/// Exclusive end of the extension tag range (`52..=58`).
+pub const EXTENSION_TAG_END: u8 = 59;
 
 /// Append-only production opcodes closing callsite-proven ISA gaps.
 ///
@@ -116,10 +117,20 @@ pub enum Instruction {
         cooked: Register,
         raw: Register,
     },
+    /// Require the global name to be bound without reading its value.
+    ///
+    /// Wire tag 58. Strict-mode `PutValue` on an unresolvable reference throws
+    /// a `ReferenceError`, but the guard it replaces (`LoadGlobal`) also ran
+    /// the getter of a global accessor before `StoreGlobal` ran the setter.
+    /// This opcode performs the existence check only: the declarative global
+    /// record (`let`/`const`/`class` bindings) counts as bound, and
+    /// `HasProperty` on the global object answers for the object record
+    /// without invoking any accessor.
+    RequireGlobalBinding { name: ConstantId },
 }
 
 impl Instruction {
-    /// Stable wire tag in `52..=57`.
+    /// Stable wire tag in `52..=58`.
     #[must_use]
     pub const fn wire_tag(self) -> u8 {
         match self {
@@ -129,6 +140,7 @@ impl Instruction {
             Self::ImportDynamicAttributes { .. } => 55,
             Self::CopyDataProperties { .. } => 56,
             Self::GetTemplateObject { .. } => 57,
+            Self::RequireGlobalBinding { .. } => 58,
         }
     }
 
@@ -178,6 +190,7 @@ impl Instruction {
                 visit(cooked);
                 visit(raw);
             }
+            Self::RequireGlobalBinding { .. } => {}
         }
     }
 
@@ -188,7 +201,9 @@ impl Instruction {
             | Self::ImportAttributes { dst, .. }
             | Self::ImportDynamicAttributes { dst, .. }
             | Self::GetTemplateObject { dst, .. } => visit(dst),
-            Self::SetSuper { .. } | Self::CopyDataProperties { .. } => {}
+            Self::SetSuper { .. }
+            | Self::CopyDataProperties { .. }
+            | Self::RequireGlobalBinding { .. } => {}
         }
     }
 
@@ -256,6 +271,9 @@ impl Instruction {
                 write_u32(cooked.get(), output);
                 write_u32(raw.get(), output);
             }
+            Self::RequireGlobalBinding { name } => {
+                write_u32(name.get(), output);
+            }
         }
     }
 }
@@ -269,7 +287,7 @@ impl Instruction {
 /// # Errors
 ///
 /// Returns [`DecodeErrorKind::InvalidOpcode`] for a tag outside
-/// `52..=57`, or the first unexpected EOF, overlong integer, or overflowing
+/// `52..=58`, or the first unexpected EOF, overlong integer, or overflowing
 /// integer among the operands.
 pub fn decode_from_tag(
     tag: u8,
@@ -310,6 +328,9 @@ pub fn decode_from_tag(
             dst: Register::new(cursor.leb128()?),
             cooked: Register::new(cursor.leb128()?),
             raw: Register::new(cursor.leb128()?),
+        },
+        58 => Instruction::RequireGlobalBinding {
+            name: ConstantId::new(cursor.leb128()?),
         },
         opcode => {
             return Err(DecodeError {
@@ -395,7 +416,7 @@ mod tests {
     use super::{EXTENSION_TAG_END, FIRST_EXTENSION_TAG, Instruction, decode_from_tag};
     use crate::{ConstantId, DecodeErrorKind, Pc, Register};
 
-    fn catalog() -> [Instruction; 6] {
+    fn catalog() -> [Instruction; 7] {
         [
             Instruction::GetSuper {
                 dst: Register::new(1),
@@ -429,6 +450,9 @@ mod tests {
                 cooked: Register::new(19),
                 raw: Register::new(20),
             },
+            Instruction::RequireGlobalBinding {
+                name: ConstantId::new(21),
+            },
         ]
     }
 
@@ -441,7 +465,7 @@ mod tests {
     #[test]
     fn extension_tags_are_append_only_and_dense() {
         assert_eq!(FIRST_EXTENSION_TAG, 52, "tags 0..=51 stay crate-root");
-        assert_eq!(EXTENSION_TAG_END, 58);
+        assert_eq!(EXTENSION_TAG_END, 59);
         let catalog = catalog();
         assert_eq!(
             (EXTENSION_TAG_END - FIRST_EXTENSION_TAG) as usize,
@@ -484,8 +508,8 @@ mod tests {
 
     #[test]
     fn decode_rejects_pre_extension_and_unknown_tags() {
-        for tag in [0_u8, 51, 58, 64, 255] {
-            let error = decode_encoding(&[tag, 0, 0, 0]).expect_err("only 52..=57 decode here");
+        for tag in [0_u8, 51, 59, 64, 255] {
+            let error = decode_encoding(&[tag, 0, 0, 0]).expect_err("only 52..=58 decode here");
             assert_eq!(error.kind, DecodeErrorKind::InvalidOpcode { opcode: tag });
             assert_eq!(error.offset, 0, "error points at the tag byte");
         }

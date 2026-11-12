@@ -37,7 +37,7 @@ use crate::{Completion, CompletionTag, ShadowFrame, Value};
 // -- The helper algebra ------------------------------------------------------
 
 /// The number of runtime helpers, `0..HELPER_COUNT`.
-pub const HELPER_COUNT: u32 = 53;
+pub const HELPER_COUNT: u32 = 54;
 
 /// A runtime helper, identified by its stable ABI index. The variant order is
 /// the canonical `external_index` order (0..52) and is byte-identical to
@@ -158,6 +158,8 @@ pub enum NativeHelper {
     CopyDataProperties = 51,
     /// `bamts_get_template_object` — index 52.
     GetTemplateObject = 52,
+    /// `bamts_require_global_binding` — index 53.
+    RequireGlobalBinding = 53,
 }
 
 impl NativeHelper {
@@ -219,6 +221,7 @@ impl NativeHelper {
             NativeHelper::ImportDynamicAttributes => "bamts_import_dynamic_attributes",
             NativeHelper::CopyDataProperties => "bamts_copy_data_properties",
             NativeHelper::GetTemplateObject => "bamts_get_template_object",
+            NativeHelper::RequireGlobalBinding => "bamts_require_global_binding",
         }
     }
 
@@ -286,6 +289,7 @@ impl NativeHelper {
             50 => Some(NativeHelper::ImportDynamicAttributes),
             51 => Some(NativeHelper::CopyDataProperties),
             52 => Some(NativeHelper::GetTemplateObject),
+            53 => Some(NativeHelper::RequireGlobalBinding),
             _ => None,
         }
     }
@@ -491,6 +495,8 @@ pub enum HelperCall {
     },
     /// Return the template object interned by cooked-array identity.
     GetTemplateObject { cooked: Value, raw: Value },
+    /// Throw a `ReferenceError` unless the global `name` is bound.
+    RequireGlobalBinding { name: u32 },
 }
 
 impl HelperCall {
@@ -573,6 +579,7 @@ impl HelperCall {
                 cooked: _cooked,
                 raw: _raw,
             } => NativeHelper::GetTemplateObject,
+            HelperCall::RequireGlobalBinding { .. } => NativeHelper::RequireGlobalBinding,
         }
     }
 }
@@ -2139,6 +2146,22 @@ pub unsafe extern "C" fn bamts_get_template_object(
     )
 }
 
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`. Both
+/// remain valid and unaliased for the full call.
+///
+/// `bamts_require_global_binding(frame, name, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_require_global_binding(
+    frame: *mut ShadowFrame,
+    name: u32,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(frame, out, HelperCall::RequireGlobalBinding { name })
+}
+
 impl NativeHelper {
     /// The address of the extern "C" wrapper generated code calls.
     ///
@@ -2205,6 +2228,7 @@ impl NativeHelper {
             NativeHelper::ImportDynamicAttributes => bamts_import_dynamic_attributes as *const u8,
             NativeHelper::CopyDataProperties => bamts_copy_data_properties as *const u8,
             NativeHelper::GetTemplateObject => bamts_get_template_object as *const u8,
+            NativeHelper::RequireGlobalBinding => bamts_require_global_binding as *const u8,
         }
     }
 }
@@ -2298,6 +2322,8 @@ const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, *mut Completion) 
     bamts_copy_data_properties; // 51
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
     bamts_get_template_object; // 52
+const _: unsafe extern "C" fn(*mut ShadowFrame, u32, *mut Completion) -> u32 =
+    bamts_require_global_binding; // 53
 
 // -- Native entry invocation seam --------------------------------------------
 
@@ -2990,7 +3016,7 @@ mod tests {
     /// this crate under `host-jit`, so importing it would be a cycle), so this
     /// literal is the pinned contract; it must stay byte-identical to
     /// `bamts_codegen::Helper::{external_index, symbol}`.
-    const CODEGEN_HELPERS: [(u32, &str); 53] = [
+    const CODEGEN_HELPERS: [(u32, &str); 54] = [
         (0, "bamts_load_constant"),
         (1, "bamts_unary"),
         (2, "bamts_binary"),
@@ -3044,6 +3070,7 @@ mod tests {
         (50, "bamts_import_dynamic_attributes"),
         (51, "bamts_copy_data_properties"),
         (52, "bamts_get_template_object"),
+        (53, "bamts_require_global_binding"),
     ];
 
     /// A recording dispatcher: captures the last call and returns a fixed
@@ -3250,6 +3277,7 @@ mod tests {
             bamts_import_dynamic_attributes as *const u8,
             bamts_copy_data_properties as *const u8,
             bamts_get_template_object as *const u8,
+            bamts_require_global_binding as *const u8,
         ];
         assert_eq!(expected.len(), HELPER_COUNT as usize);
         for index in 0..HELPER_COUNT {

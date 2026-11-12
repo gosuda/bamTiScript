@@ -991,6 +991,11 @@ pub enum Instruction {
         cooked: Register,
         raw: Register,
     },
+    /// Throw a `ReferenceError` when the global `name` is unbound, without
+    /// reading its value or invoking any accessor.
+    RequireGlobalBinding {
+        name: ConstantId,
+    },
     /// Terminate the current activation (identical to the formal `Halt`).
     Halt,
 }
@@ -1050,6 +1055,7 @@ impl From<isa::Instruction> for Instruction {
             isa::Instruction::GetTemplateObject { dst, cooked, raw } => {
                 Self::GetTemplateObject { dst, cooked, raw }
             }
+            isa::Instruction::RequireGlobalBinding { name } => Self::RequireGlobalBinding { name },
         }
     }
 }
@@ -1109,6 +1115,7 @@ impl Instruction {
             Self::GetTemplateObject { dst, cooked, raw } => {
                 isa::Instruction::GetTemplateObject { dst, cooked, raw }
             }
+            Self::RequireGlobalBinding { name } => isa::Instruction::RequireGlobalBinding { name },
             _ => return None,
         })
     }
@@ -1281,6 +1288,7 @@ impl Instruction {
             | Self::CreateRegExp { .. }
             | Self::Jump { .. }
             | Self::Import { .. }
+            | Self::RequireGlobalBinding { .. }
             | Self::Halt => {}
         }
     }
@@ -1359,6 +1367,7 @@ impl Instruction {
             | Self::Return { .. }
             | Self::Throw { .. }
             | Self::RequireCloseResult { .. }
+            | Self::RequireGlobalBinding { .. }
             | Self::Halt => {}
         }
     }
@@ -1424,6 +1433,7 @@ impl Instruction {
             | Self::ImportDynamicAttributes { .. }
             | Self::CopyDataProperties { .. }
             | Self::GetTemplateObject { .. }
+            | Self::RequireGlobalBinding { .. }
             | Self::Export { .. } => visit(Pc::new(pc + 1)),
         }
     }
@@ -2669,7 +2679,8 @@ fn verify_instruction(
         | Instruction::ImportAttributes { .. }
         | Instruction::ImportDynamicAttributes { .. }
         | Instruction::CopyDataProperties { .. }
-        | Instruction::GetTemplateObject { .. } => {}
+        | Instruction::GetTemplateObject { .. }
+        | Instruction::RequireGlobalBinding { .. } => {}
         Instruction::Halt => {}
     }
 
@@ -3946,7 +3957,8 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
         | Instruction::ImportAttributes { .. }
         | Instruction::ImportDynamicAttributes { .. }
         | Instruction::CopyDataProperties { .. }
-        | Instruction::GetTemplateObject { .. } => unreachable!("handled above"),
+        | Instruction::GetTemplateObject { .. }
+        | Instruction::RequireGlobalBinding { .. } => unreachable!("handled above"),
     }
 }
 
@@ -7306,6 +7318,9 @@ mod tests {
                 cooked: Register::new(1),
                 raw: Register::new(2),
             },
+            Instruction::RequireGlobalBinding {
+                name: ConstantId::new(0),
+            },
         ];
         let limits = DecodeLimits::default();
         for instruction in instructions {
@@ -7344,7 +7359,7 @@ mod tests {
     #[test]
     fn root_decoder_rejects_truncated_and_unknown_extension_bytes() {
         let limits = DecodeLimits::default();
-        for bytes in [&[52_u8][..], &[54, 0, 0][..], &[57, 0, 0][..]] {
+        for bytes in [&[52_u8][..], &[54, 0, 0][..], &[57, 0, 0][..], &[58][..]] {
             let mut decoder = Decoder {
                 bytes,
                 offset: 0,
@@ -7361,7 +7376,7 @@ mod tests {
         }
 
         let mut decoder = Decoder {
-            bytes: &[58],
+            bytes: &[59],
             offset: 0,
             limits: &limits,
             total_instructions: 0,
@@ -7369,7 +7384,7 @@ mod tests {
         assert!(matches!(
             decoder.instruction(),
             Err(DecodeError {
-                kind: DecodeErrorKind::InvalidOpcode { opcode: 58 },
+                kind: DecodeErrorKind::InvalidOpcode { opcode: 59 },
                 ..
             })
         ));

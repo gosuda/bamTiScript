@@ -1356,6 +1356,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 },
                 Some(dst.get()),
             ),
+            Instruction::RequireGlobalBinding { name } => (
+                HelperCall::RequireGlobalBinding { name: name.get() },
+                None,
+            ),
             Instruction::Call {
                 dst,
                 callee,
@@ -4437,6 +4441,16 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         .template_object_at(site, cooked, raw);
                     self.eval_result(result)
                 }
+                HelperCall::RequireGlobalBinding { name } => {
+                    let required = self
+                        .machine
+                        .borrow_mut()
+                        .require_global_binding(module, ConstantId::new(name));
+                    match required {
+                        Ok(()) => HelperResult::normal(Value::UNDEFINED),
+                        Err(failure) => self.fail(failure),
+                    }
+                }
                 HelperCall::Call { .. }
                 | HelperCall::Construct { .. }
                 | HelperCall::ConstructWithNewTarget { .. } => {
@@ -4749,6 +4763,7 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::ImportDynamicAttributes { .. }
         | Instruction::CopyDataProperties { .. }
         | Instruction::GetTemplateObject { .. }
+        | Instruction::RequireGlobalBinding { .. }
         | Instruction::Export { .. } => false,
     }
 }
@@ -10924,7 +10939,7 @@ mod tests {
             "bamts_with_has_binding"
         );
         assert_eq!(NativeHelper::ResumeMode.as_u32(), 46);
-        assert_eq!(HELPER_COUNT, 53);
+        assert_eq!(HELPER_COUNT, 54);
     }
 
     #[test]
