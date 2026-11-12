@@ -65,7 +65,7 @@ fn syntax_error<H: Host>(machine: &mut Machine<'_, H>, message: String) -> EvalF
         .builtins
         .id_named("SyntaxError")
         .expect("SyntaxError installed");
-    machine.throw_error(id, message)
+    machine.throw_error(id, EcmaString::encode(&message))
 }
 
 /// Creates and installs the complete `JSON` namespace.
