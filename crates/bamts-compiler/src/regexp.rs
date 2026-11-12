@@ -1294,7 +1294,7 @@ impl<'a> Parser<'a> {
                 let Some(low) = single else {
                     return Some(invalid_pattern());
                 };
-                if operator.is_some() || ranged {
+                if operator.is_some() {
                     return Some(invalid_pattern());
                 }
                 match self.units.get(self.pos + 1).copied() {
@@ -2099,4 +2099,19 @@ fn check_modifier_list(flags: &[u16]) -> Option<()> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_regex_literal;
+
+    #[test]
+    fn unicode_sets_union_accepts_several_ranges() {
+        for literal in ["/[a-cx-z]/v", "/[0-9a-z]/v", "/[a-cb-d]/v", "/[a-cx-z0-9]/v"] {
+            assert_eq!(validate_regex_literal(literal), None, "{literal}");
+        }
+        for literal in ["/[a-c&&d]/v", "/[a-c--d]/v", "/[a-c-d]/v", "/[a-cx&&y]/v"] {
+            assert!(validate_regex_literal(literal).is_some(), "{literal}");
+        }
+    }
 }
