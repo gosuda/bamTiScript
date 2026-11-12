@@ -5163,10 +5163,10 @@ impl<'a> FunctionContext<'a> {
                 target: Pc::new(0),
             },
         )?;
-        let message = format!(
-            "Class constructor {} cannot be invoked without 'new'",
-            class_name.unwrap_or_default()
-        );
+        let message = match class_name {
+            Some(name) => format!("Class constructor {name} cannot be invoked without 'new'"),
+            None => "Class constructors cannot be invoked without 'new'".to_owned(),
+        };
         self.throw_intrinsic_error(builder, range, IntrinsicErrorKind::TypeError, &message)?;
         self.patch_jump(constructed, self.next_pc());
         Ok(())
@@ -6890,7 +6890,7 @@ impl<'a> FunctionContext<'a> {
             }
             ExportDeclaration::Default(default) => match &default.value {
                 ExportDefaultValue::Expression(expression) => {
-                    let value = self.lower_expression(builder, expression)?;
+                    let value = self.lower_maybe_named(builder, expression, Some("default"))?;
                     self.export_value(builder, range, "default", value)
                 }
                 ExportDefaultValue::Function(function) => {
@@ -6908,6 +6908,9 @@ impl<'a> FunctionContext<'a> {
                     }
                 }
                 ExportDefaultValue::Class(class) => {
+                    if class.name.is_none() {
+                        self.inferred_class_name = Some("default".to_owned());
+                    }
                     let value = self.lower_class_value(builder, range, class, None, None)?;
                     if let Some(identifier) = &class.name {
                         let name = self.identifier_text(identifier)?;
@@ -11943,6 +11946,51 @@ mod tests {
                 code().any(|instruction| matches!(*instruction, Instruction::ThrowIntrinsicError { kind: thrown, message: text } if thrown == kind && names(text, &[message]))),
                 "{src}"
             );
+        }
+    }
+    #[test]
+    fn class_call_messages_name_only_statically_named_classes() {
+        let plural = "Class constructors cannot be invoked without 'new'";
+        for (src, message) in [
+            ("(class {})();", plural),
+            ("({['c' + 'k']: class {}}).ck();", plural),
+            ("({['ck']: class {}}).ck();", plural),
+            ("const o: any = {}; o.p = class {}; o.p();", plural),
+            ("[class {}][0]();", plural),
+            (
+                "({ck: class {}}).ck();",
+                "Class constructor ck cannot be invoked without 'new'",
+            ),
+            (
+                "const K = class {}; K();",
+                "Class constructor K cannot be invoked without 'new'",
+            ),
+            (
+                "export default class {}",
+                "Class constructor default cannot be invoked without 'new'",
+            ),
+            (
+                "export default (class {});",
+                "Class constructor default cannot be invoked without 'new'",
+            ),
+        ] {
+            let module = lower_js(src);
+            let constants = module.constants();
+            let messages: Vec<String> = module
+                .functions()
+                .iter()
+                .flat_map(|function| function.code())
+                .filter_map(|instruction| match *instruction {
+                    Instruction::ThrowIntrinsicError { message, .. } => {
+                        match &constants[message.get() as usize] {
+                            Constant::String(text) => Some(text.to_utf8_lossy().to_string()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(messages, [message], "{src}");
         }
     }
     #[test]
