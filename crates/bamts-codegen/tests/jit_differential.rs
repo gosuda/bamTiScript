@@ -1523,8 +1523,6 @@ fn intrinsic_errors_ignore_a_replaced_or_deleted_global_constructor() {
             "ReferenceError",
             "Invalid left-hand side in assignment",
         ),
-        (IntrinsicErrorKind::SyntaxError, "SyntaxError", "syntax"),
-        (IntrinsicErrorKind::RangeError, "RangeError", "range"),
     ] {
         for (tamper, how) in [(replace, "replaced"), (delete, "deleted")] {
             let program = intrinsic_error_program(kind, constructor, message, tamper);

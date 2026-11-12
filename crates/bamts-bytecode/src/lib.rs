@@ -674,8 +674,6 @@ impl DescriptorSlot {
 pub enum IntrinsicErrorKind {
     TypeError,
     ReferenceError,
-    SyntaxError,
-    RangeError,
 }
 
 impl IntrinsicErrorKind {
@@ -685,8 +683,6 @@ impl IntrinsicErrorKind {
         match self {
             Self::TypeError => "TypeError",
             Self::ReferenceError => "ReferenceError",
-            Self::SyntaxError => "SyntaxError",
-            Self::RangeError => "RangeError",
         }
     }
 
@@ -696,8 +692,6 @@ impl IntrinsicErrorKind {
         match self {
             Self::TypeError => 0,
             Self::ReferenceError => 1,
-            Self::SyntaxError => 2,
-            Self::RangeError => 3,
         }
     }
 
@@ -707,8 +701,6 @@ impl IntrinsicErrorKind {
         match selector {
             0 => Some(Self::TypeError),
             1 => Some(Self::ReferenceError),
-            2 => Some(Self::SyntaxError),
-            3 => Some(Self::RangeError),
             _ => None,
         }
     }
@@ -7392,7 +7384,7 @@ mod tests {
                 name: ConstantId::new(0),
             },
             Instruction::ThrowIntrinsicError {
-                kind: IntrinsicErrorKind::RangeError,
+                kind: IntrinsicErrorKind::ReferenceError,
                 message: ConstantId::new(0),
             },
         ];
