@@ -675,10 +675,8 @@ fn iterate<H: Host>(
         keep_root(machine, depth, target);
         let mut selected = 0;
         for index in 0..length {
-            // A present element is real storage or runs user code, and its callback
-            // is charged for itself. Only a gap can spin on a claimed length.
+            tick(machine)?;
             if !has_index(machine, object, index)? {
-                tick(machine)?;
                 continue;
             }
             let value = get_index(machine, object, index)?;
@@ -1348,7 +1346,11 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
     use crate::intrinsics::{BuiltinDef, BuiltinHandler, native_function};
-    use crate::{Limits, ThrowOrigin};
+    use crate::{Limits, RuntimeErrorKind, ThrowOrigin};
+    use bamts_bytecode::{
+        BinaryOp, Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module,
+        ModuleId, Program, ProgramModule, Register, Verified,
+    };
 
     fn numbers(machine: &mut Machine<'_, TestHost>, values: &[i32]) -> Value {
         let elements = values.iter().map(|value| Value::int32(*value as u32));
@@ -1533,6 +1535,154 @@ mod tests {
         assert_eq!(sorted.len(), length);
         assert_eq!(sorted[..2], [Value::int32(1), Value::int32(2)]);
         assert!(sorted[2..].iter().all(|element| *element == Value::HOLE));
+    }
+
+    fn array_like_with_length(machine: &mut Machine<'_, TestHost>, length: Value) -> Value {
+        let target = ordinary_object(machine);
+        machine.set_data_property(target, "length", length).unwrap();
+        target
+    }
+
+    fn proxy_with_has_trap(
+        machine: &mut Machine<'_, TestHost>,
+        target: Value,
+        trap: Value,
+    ) -> Value {
+        let handler = ordinary_object(machine);
+        machine.set_data_property(handler, "has", trap).unwrap();
+        super::super::proxy::create(machine, target, handler).unwrap()
+    }
+
+    fn cancel_on_call(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.cancel.cancel();
+        Ok(BuiltinOutcome::Value(Value::TRUE))
+    }
+
+    /// A claimed length with a native `has` trap and a native callback: no user
+    /// code runs, so the loop itself is the only thing that can stop it.
+    #[test]
+    fn a_present_element_with_a_native_callback_still_charges_fuel() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let limits = Limits {
+            fuel: 4,
+            ..Limits::default()
+        };
+        let mut machine = Machine::new(&module, &mut host, limits);
+        let target = array_like_with_length(&mut machine, Value::int32(8));
+        let has = machine.intrinsics.global("Boolean").unwrap();
+        let proxy = proxy_with_has_trap(&mut machine, target, has);
+        let math = machine.intrinsics.global("Math").unwrap();
+        let abs = machine.get_named_property(math, "abs").unwrap();
+        assert!(matches!(
+            invoke(&mut machine, proxy, "forEach", &[abs]),
+            Err(EvalFailure::Runtime(RuntimeErrorKind::FuelExhausted {
+                limit: 4
+            }))
+        ));
+    }
+
+    #[test]
+    fn a_cancelled_iteration_stops_at_the_next_index() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let token = crate::CancellationToken::new();
+        let mut machine =
+            Machine::new_with_cancel(&module, &mut host, Limits::default(), token.clone());
+        let target = array_like_with_length(&mut machine, Value::int32(8));
+        let has = native(&mut machine, "cancel", cancel_on_call);
+        let proxy = proxy_with_has_trap(&mut machine, target, has);
+        let math = machine.intrinsics.global("Math").unwrap();
+        let abs = machine.get_named_property(math, "abs").unwrap();
+        assert!(matches!(
+            invoke(&mut machine, proxy, "forEach", &[abs]),
+            Err(EvalFailure::Runtime(RuntimeErrorKind::Cancelled))
+        ));
+    }
+
+    fn summing_callback_program() -> Program<Verified> {
+        let constants = vec![
+            Constant::String(EcmaString::encode("acc")),
+            Constant::String(EcmaString::encode("<test>")),
+        ];
+        let entry = Function::new(
+            None,
+            0,
+            0,
+            0,
+            FunctionFlags::default(),
+            vec![Instruction::Halt],
+            Vec::new(),
+        );
+        let callback = Function::new(
+            None,
+            0,
+            3,
+            4,
+            FunctionFlags::default(),
+            vec![
+                Instruction::LoadGlobal {
+                    dst: Register::new(3),
+                    name: ConstantId::new(0),
+                },
+                Instruction::Binary {
+                    dst: Register::new(3),
+                    op: BinaryOp::Add,
+                    left: Register::new(3),
+                    right: Register::new(0),
+                },
+                Instruction::StoreGlobal {
+                    name: ConstantId::new(0),
+                    value: Register::new(3),
+                },
+                Instruction::Return {
+                    value: Register::new(3),
+                },
+            ],
+            Vec::new(),
+        );
+        let code = Module::new(constants, vec![entry, callback], FunctionId::new(0))
+            .verify()
+            .expect("valid summing callback module");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(1),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("valid summing callback program")
+    }
+
+    #[test]
+    fn a_guest_callback_over_a_thousand_elements_completes_unchanged() {
+        let program = summing_callback_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.test_set_global("acc", Value::int32(0));
+        let elements = (1..=1000).map(Value::int32).collect();
+        let array = allocate_array(&mut machine, elements).unwrap();
+        let callback = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                context: None,
+                properties: crate::PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        invoke(&mut machine, array, "forEach", &[callback]).unwrap();
+        assert_eq!(machine.test_global("acc"), Some(Value::int32(500_500)));
     }
 
     #[test]
