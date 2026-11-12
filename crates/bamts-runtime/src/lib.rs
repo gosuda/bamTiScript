@@ -19786,7 +19786,7 @@ mod tests {
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let value = uncaught_value(machine.evaluate().unwrap_err());
         assert_intrinsic_error(
-            &mut machine,
+            &machine,
             value,
             "ReferenceError",
             "undeclared is not defined",
@@ -20025,7 +20025,7 @@ mod tests {
                 let mut host = TestHost;
                 let mut machine = Machine::new(&program, &mut host, Limits::default());
                 let caught = machine.evaluate().unwrap().value;
-                assert_intrinsic_error(&mut machine, caught, constructor, message);
+                assert_intrinsic_error(&machine, caught, constructor, message);
                 assert_eq!(machine.test_global("called"), Some(Value::int32(0)));
             }
         }
