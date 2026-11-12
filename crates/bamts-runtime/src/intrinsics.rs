@@ -1086,7 +1086,10 @@ impl<H: Host> Intrinsics<H> {
             shapes,
             &mut globals,
             &mut builtins,
-            builtins::InstallOptions { timers_available, script_compiler },
+            builtins::InstallOptions {
+                timers_available,
+                script_compiler,
+            },
         );
         crate::host_objects::install(heap, atoms, shapes, &mut globals, &mut builtins);
         Self {

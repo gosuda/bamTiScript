@@ -286,10 +286,10 @@ fn static_reachable_sources(program: &ResolvedProgram) -> HashSet<SourceId> {
             if dependency.kind() != ModuleEdgeKind::StaticRuntime {
                 continue;
             }
-            if let ModuleTarget::Local(target) = dependency.target() {
-                if reachable.insert(*target) {
-                    worklist.push(*target);
-                }
+            if let ModuleTarget::Local(target) = dependency.target()
+                && reachable.insert(*target)
+            {
+                worklist.push(*target);
             }
         }
     }

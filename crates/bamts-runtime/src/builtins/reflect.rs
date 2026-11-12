@@ -49,10 +49,26 @@ pub(super) fn install<H: Host>(
         ("set", 3, set::<H>),
         ("setPrototypeOf", 2, set_prototype_of::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, reflect, name, function);
     }
-    define_to_string_tag(heap, shapes, reflect, builtins.symbol_to_string_tag(), "Reflect");
+    define_to_string_tag(
+        heap,
+        shapes,
+        reflect,
+        builtins.symbol_to_string_tag(),
+        "Reflect",
+    );
     globals.insert(EcmaString::encode("Reflect"), reflect);
 }
 
@@ -379,7 +395,14 @@ mod tests {
             length,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            length,
+        )
     }
 
     fn return_this(

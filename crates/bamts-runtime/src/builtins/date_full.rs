@@ -492,8 +492,17 @@ pub(super) fn install<H: Host>(
         prototype: Some(builtins.object_prototype()),
         extensible: true,
     };
-    let constructor =
-        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Date", length: 7, handler: constructor::<H> });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "Date",
+            length: 7,
+            handler: constructor::<H>,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     builtins.set_date_prototype(prototype);
 
@@ -502,8 +511,22 @@ pub(super) fn install<H: Host>(
         ("parse", 1, parse::<H>),
         ("UTC", 7, utc::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
-        native_properties(heap, constructor).insert(shapes, named(atoms, name), builtin_property(function));
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
+        native_properties(heap, constructor).insert(
+            shapes,
+            named(atoms, name),
+            builtin_property(function),
+        );
     }
 
     let methods: &[(&str, u32, BuiltinHandler<H>)] = &[
@@ -555,24 +578,53 @@ pub(super) fn install<H: Host>(
     ];
     let mut utc_string_function = None;
     for &(name, length, handler) in methods {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         if name == "toUTCString" {
             utc_string_function = Some(function);
         }
         define_data(heap, atoms, shapes, prototype, name, function);
     }
-    define_data(heap, atoms, shapes, prototype,
-    "toGMTString",
-    utc_string_function.expect("toUTCString is installed"),);
-    let to_primitive = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "[Symbol.toPrimitive]", length: 1, handler: date_to_primitive::<H> });
-    super::define_symbol_property(heap, shapes, prototype,
-    builtins.symbol_to_primitive(),
-    Property::Data {
-        value: to_primitive,
-        writable: false,
-        enumerable: false,
-        configurable: true,
-    },);
+    define_data(
+        heap,
+        atoms,
+        shapes,
+        prototype,
+        "toGMTString",
+        utc_string_function.expect("toUTCString is installed"),
+    );
+    let to_primitive = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "[Symbol.toPrimitive]",
+            length: 1,
+            handler: date_to_primitive::<H>,
+        },
+    );
+    super::define_symbol_property(
+        heap,
+        shapes,
+        prototype,
+        builtins.symbol_to_primitive(),
+        Property::Data {
+            value: to_primitive,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        },
+    );
     globals.insert(EcmaString::encode("Date"), constructor);
 }
 
@@ -2017,7 +2069,14 @@ mod tests {
                 length: 0,
                 handler,
             });
-            let function = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0);
+            let function = native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                &mut machine.shapes,
+                id,
+                name,
+                0,
+            );
             machine
                 .set_data_property(object, "valueOf", function)
                 .unwrap();
@@ -2097,7 +2156,14 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            0,
+        )
     }
 
     fn generic_value_of(

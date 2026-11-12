@@ -165,18 +165,58 @@ fn install_class<H: Host>(
     class: &Class<'_, H>,
 ) {
     let prototype = builtins.temporal_prototype(class.kind);
-    let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: class.name, length: class.length, handler: class.constructor });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: class.name,
+            length: class.length,
+            handler: class.constructor,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     for &(name, length, handler) in class.statics {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, constructor, name, function);
     }
     for &(property, name, handler) in class.getters {
-        let getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 0, handler: handler });
+        let getter = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length: 0,
+                handler,
+            },
+        );
         define_getter(heap, atoms, shapes, prototype, property, getter);
     }
     for &(name, length, handler) in class.methods {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, prototype, name, function);
     }
     let tag_symbol = builtins.symbol_to_string_tag();

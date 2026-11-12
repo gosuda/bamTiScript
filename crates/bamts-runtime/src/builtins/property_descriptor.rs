@@ -950,7 +950,14 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            0,
+        )
     }
 
     #[test]

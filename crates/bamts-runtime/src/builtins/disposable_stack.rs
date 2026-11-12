@@ -126,12 +126,32 @@ pub(super) fn install<H: Host>(
                 )
             }
         };
-        let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: descriptor.name, length: descriptor.length, handler: stack_constructor_handler::<H> });
+        let constructor = install_constructor_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name: descriptor.name,
+                length: descriptor.length,
+                handler: stack_constructor_handler::<H>,
+            },
+        );
         builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
 
         let mut disposal_method = None;
         for method in methods {
-            let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: method.name, length: method.length, handler: method_handler });
+            let function = install_function(
+                heap,
+                atoms,
+                shapes,
+                builtins,
+                crate::intrinsics::BuiltinDef {
+                    name: method.name,
+                    length: method.length,
+                    handler: method_handler,
+                },
+            );
             if matches!(
                 method.kind,
                 StackMethodKind::Dispose | StackMethodKind::DisposeAsync
@@ -144,13 +164,26 @@ pub(super) fn install<H: Host>(
         for install in installs {
             match *install {
                 StackInstall::DisposedAccessor => {
-                    let getter =
-                        install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get disposed", length: 0, handler: disposed_getter });
+                    let getter = install_function(
+                        heap,
+                        atoms,
+                        shapes,
+                        builtins,
+                        crate::intrinsics::BuiltinDef {
+                            name: "get disposed",
+                            length: 0,
+                            handler: disposed_getter,
+                        },
+                    );
                     define_getter(heap, atoms, shapes, prototype, "disposed", getter);
                 }
-                StackInstall::DisposeAlias => {
-                    define_symbol(heap, shapes, prototype, builtins.symbol_dispose(), disposal_method)
-                }
+                StackInstall::DisposeAlias => define_symbol(
+                    heap,
+                    shapes,
+                    prototype,
+                    builtins.symbol_dispose(),
+                    disposal_method,
+                ),
                 StackInstall::AsyncDisposeAlias => define_symbol(
                     heap,
                     shapes,
@@ -158,9 +191,13 @@ pub(super) fn install<H: Host>(
                     builtins.symbol_async_dispose(),
                     disposal_method,
                 ),
-                StackInstall::ToStringTag(tag) => {
-                    define_to_string_tag(heap, shapes, prototype, builtins.symbol_to_string_tag(), tag)
-                }
+                StackInstall::ToStringTag(tag) => define_to_string_tag(
+                    heap,
+                    shapes,
+                    prototype,
+                    builtins.symbol_to_string_tag(),
+                    tag,
+                ),
             }
         }
         globals.insert(EcmaString::encode(descriptor.name), constructor);
@@ -202,7 +239,13 @@ fn define_getter(
     );
 }
 
-fn define_symbol(heap: &mut [HeapEntry], shapes: &mut crate::ShapeTable, object: Value, symbol: Value, value: Value) {
+fn define_symbol(
+    heap: &mut [HeapEntry],
+    shapes: &mut crate::ShapeTable,
+    object: Value,
+    symbol: Value,
+    value: Value,
+) {
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
         unreachable!("DisposableStack prototype is an ordinary object")
     };

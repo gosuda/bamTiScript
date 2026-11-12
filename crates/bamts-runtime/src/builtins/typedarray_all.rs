@@ -711,7 +711,17 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let shared_prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let shared_constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "%TypedArray%", length: 0, handler: abstract_constructor::<H> });
+    let shared_constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "%TypedArray%",
+            length: 0,
+            handler: abstract_constructor::<H>,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, shared_constructor, shared_prototype);
     builtins.set_typedarray_constructor(shared_constructor);
     builtins.set_typedarray_prototype(shared_prototype);
@@ -719,7 +729,17 @@ pub(super) fn install<H: Host>(
         ("from", 1, from::<H> as BuiltinHandler<H>),
         ("of", 0, of::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, shared_constructor, name, function);
     }
 
@@ -737,7 +757,17 @@ pub(super) fn install<H: Host>(
         ),
         ("length", "get length", get_length::<H> as BuiltinHandler<H>),
     ] {
-        let getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: function_name, length: 0, handler: getter });
+        let getter = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name: function_name,
+                length: 0,
+                handler: getter,
+            },
+        );
         let HeapEntry::Object { properties, .. } = &mut heap[heap_index(shared_prototype)] else {
             unreachable!("%TypedArray%.prototype is ordinary")
         };
@@ -766,14 +796,31 @@ pub(super) fn install<H: Host>(
         };
         *value
     };
-    define_data(heap, atoms, shapes, shared_prototype, "toString", array_to_string);
+    define_data(
+        heap,
+        atoms,
+        shapes,
+        shared_prototype,
+        "toString",
+        array_to_string,
+    );
 
-    let tag_getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get [Symbol.toStringTag]", length: 0, handler: get_to_string_tag::<H> });
+    let tag_getter = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "get [Symbol.toStringTag]",
+            length: 0,
+            handler: get_to_string_tag::<H>,
+        },
+    );
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(shared_prototype)] else {
         unreachable!("%TypedArray%.prototype is ordinary")
     };
     properties.insert(
-            shapes,
+        shapes,
         PropertyKey::Symbol(heap_index(builtins.symbol_to_string_tag()) as u32),
         Property::Accessor {
             getter: Some(tag_getter),
@@ -815,7 +862,17 @@ pub(super) fn install<H: Host>(
         ("toSorted", 1, to_sorted::<H>),
         ("with", 2, with::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, shared_prototype, name, function);
         if name == "values" {
             let HeapEntry::Object { properties, .. } = &mut heap[heap_index(shared_prototype)]
@@ -823,7 +880,7 @@ pub(super) fn install<H: Host>(
                 unreachable!("%TypedArray%.prototype is ordinary")
             };
             properties.insert(
-            shapes,
+                shapes,
                 PropertyKey::Symbol(heap_index(builtins.symbol_iterator()) as u32),
                 builtin_property(function),
             );
@@ -832,8 +889,17 @@ pub(super) fn install<H: Host>(
 
     for kind in ElementKind::ALL {
         let prototype = super::super::ordinary_prototype(heap, shared_prototype);
-        let constructor =
-            install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: kind.name(), length: 3, handler: constructor::<H> });
+        let constructor = install_constructor_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name: kind.name(),
+                length: 3,
+                handler: constructor::<H>,
+            },
+        );
         builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
         let HeapEntry::NativeFunction {
             prototype: parent, ..
@@ -844,19 +910,39 @@ pub(super) fn install<H: Host>(
         *parent = Some(shared_constructor);
         builtins.set_typed_array_constructor(kind, constructor);
         builtins.set_typed_array_prototype(kind, prototype);
-        define_frozen_data(heap, atoms, shapes, constructor,
-        "BYTES_PER_ELEMENT",
-        crate::number_value(kind.element_size() as f64),);
-        define_frozen_data(heap, atoms, shapes, prototype,
-        "BYTES_PER_ELEMENT",
-        crate::number_value(kind.element_size() as f64),);
+        define_frozen_data(
+            heap,
+            atoms,
+            shapes,
+            constructor,
+            "BYTES_PER_ELEMENT",
+            crate::number_value(kind.element_size() as f64),
+        );
+        define_frozen_data(
+            heap,
+            atoms,
+            shapes,
+            prototype,
+            "BYTES_PER_ELEMENT",
+            crate::number_value(kind.element_size() as f64),
+        );
         define_data(heap, atoms, shapes, prototype, "constructor", constructor);
         if kind == ElementKind::Uint8 {
             for (name, length, handler) in [
                 ("fromBase64", 1, from_base64::<H> as BuiltinHandler<H>),
                 ("fromHex", 1, from_hex::<H>),
             ] {
-                let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+                let function = install_function(
+                    heap,
+                    atoms,
+                    shapes,
+                    builtins,
+                    crate::intrinsics::BuiltinDef {
+                        name,
+                        length,
+                        handler,
+                    },
+                );
                 define_data(heap, atoms, shapes, constructor, name, function);
             }
             for (name, length, handler) in [
@@ -869,7 +955,17 @@ pub(super) fn install<H: Host>(
                 ("toBase64", 0, to_base64::<H>),
                 ("toHex", 0, to_hex::<H>),
             ] {
-                let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+                let function = install_function(
+                    heap,
+                    atoms,
+                    shapes,
+                    builtins,
+                    crate::intrinsics::BuiltinDef {
+                        name,
+                        length,
+                        handler,
+                    },
+                );
                 define_data(heap, atoms, shapes, prototype, name, function);
             }
         }
@@ -2936,7 +3032,14 @@ mod tests {
             length: 2,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 2)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            2,
+        )
     }
 
     fn decoded_numbers(machine: &mut Machine<'_, TestHost>, view: Value) -> Vec<f64> {

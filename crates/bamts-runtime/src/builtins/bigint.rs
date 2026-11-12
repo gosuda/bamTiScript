@@ -1668,22 +1668,88 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) -> Value {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let constructor =
-        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "BigInt", length: 1, handler: constructor::<H> });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "BigInt",
+            length: 1,
+            handler: constructor::<H>,
+        },
+    );
     builtins.set_bigint_constructor(constructor);
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
 
-    let as_int_n = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "asIntN", length: 2, handler: as_int_n::<H> });
-    let as_uint_n = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "asUintN", length: 2, handler: as_uint_n::<H> });
+    let as_int_n = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "asIntN",
+            length: 2,
+            handler: as_int_n::<H>,
+        },
+    );
+    let as_uint_n = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "asUintN",
+            length: 2,
+            handler: as_uint_n::<H>,
+        },
+    );
     define_native_property(heap, atoms, shapes, constructor, "asIntN", as_int_n);
     define_native_property(heap, atoms, shapes, constructor, "asUintN", as_uint_n);
 
-    let to_string = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "toString", length: 0, handler: to_string::<H> });
-    let value_of = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "valueOf", length: 0, handler: value_of::<H> });
-    let to_locale_string = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "toLocaleString", length: 0, handler: to_locale_string::<H> });
+    let to_string = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "toString",
+            length: 0,
+            handler: to_string::<H>,
+        },
+    );
+    let value_of = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "valueOf",
+            length: 0,
+            handler: value_of::<H>,
+        },
+    );
+    let to_locale_string = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "toLocaleString",
+            length: 0,
+            handler: to_locale_string::<H>,
+        },
+    );
     define_data(heap, atoms, shapes, prototype, "toString", to_string);
     define_data(heap, atoms, shapes, prototype, "valueOf", value_of);
-    define_data(heap, atoms, shapes, prototype, "toLocaleString", to_locale_string);
+    define_data(
+        heap,
+        atoms,
+        shapes,
+        prototype,
+        "toLocaleString",
+        to_locale_string,
+    );
 
     let tag = super::super::push(heap, HeapEntry::String(EcmaString::encode("BigInt")));
     let to_string_tag = builtins.symbol_to_string_tag();
@@ -1872,7 +1938,17 @@ mod tests {
     }
 
     fn observable_object(machine: &mut Machine<'_, TestHost>, primitive: Value) -> Value {
-        let value_of = install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "valueOf", length: 0, handler: observable_value_of });
+        let value_of = install_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            &mut machine.intrinsics.builtins,
+            crate::intrinsics::BuiltinDef {
+                name: "valueOf",
+                length: 0,
+                handler: observable_value_of,
+            },
+        );
         let object = machine
             .allocate(HeapEntry::Object {
                 properties: Default::default(),

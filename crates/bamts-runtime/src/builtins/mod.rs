@@ -422,12 +422,42 @@ fn install_boolean<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.boolean_prototype();
-    let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Boolean", length: 1, handler: boolean_constructor::<H> });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "Boolean",
+            length: 1,
+            handler: boolean_constructor::<H>,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode("Boolean"), constructor);
-    let value_of = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "valueOf", length: 0, handler: boolean_value_of::<H> });
+    let value_of = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "valueOf",
+            length: 0,
+            handler: boolean_value_of::<H>,
+        },
+    );
     define_data(heap, atoms, shapes, prototype, "valueOf", value_of);
-    let to_string = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "toString", length: 0, handler: boolean_to_string::<H> });
+    let to_string = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "toString",
+            length: 0,
+            handler: boolean_to_string::<H>,
+        },
+    );
     define_data(heap, atoms, shapes, prototype, "toString", to_string);
 }
 fn boolean_constructor<H: Host>(
@@ -505,7 +535,17 @@ fn install_math<H: Host>(
         ("log2", 1, math_log2::<H>),
         ("imul", 2, math_imul::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, math, name, function);
     }
     define_to_string_tag(heap, shapes, math, builtins.symbol_to_string_tag(), "Math");
@@ -712,7 +752,17 @@ fn install_globals<H: Host>(
             structured_clone::structured_clone::<H>,
         ),
     ] {
-        let value = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let value = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         globals.insert(EcmaString::encode(name), value);
     }
     globals.insert(
@@ -739,9 +789,25 @@ fn install_errors<H: Host>(
             boxed_primitive: None,
         },
     );
-    let error_to_string =
-        install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "toString", length: 0, handler: error_to_string::<H> });
-    define_data(heap, atoms, shapes, error_prototype, "toString", error_to_string);
+    let error_to_string = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "toString",
+            length: 0,
+            handler: error_to_string::<H>,
+        },
+    );
+    define_data(
+        heap,
+        atoms,
+        shapes,
+        error_prototype,
+        "toString",
+        error_to_string,
+    );
     install_error_type(
         InstallContext {
             heap: &mut *heap,
@@ -840,8 +906,17 @@ fn install_error_type<H: Host>(
             configurable: true,
         },
     );
-    let constructor =
-        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: error_constructor::<H> });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name,
+            length,
+            handler: error_constructor::<H>,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     builtins.set_error_prototype(heap, constructor, prototype);
     globals.insert(EcmaString::encode(name), constructor);
@@ -1686,7 +1761,10 @@ impl<'a, H: Host> Machine<'a, H> {
                     elements,
                     properties,
                     ..
-                } => (elements.len(), properties.charge_bytes(&self.shapes, &self.atoms)),
+                } => (
+                    elements.len(),
+                    properties.charge_bytes(&self.shapes, &self.atoms),
+                ),
                 _ => unreachable!("array checked above"),
             };
             let released = old_length
@@ -1809,8 +1887,13 @@ impl<'a, H: Host> Machine<'a, H> {
                     ..
                 } => {
                     let exists = properties.contains_key(&self.shapes, &key);
-                    let (property_growth, property_refund) =
-                        property_definition_charges(properties, &self.shapes, &self.atoms, &key, &descriptor);
+                    let (property_growth, property_refund) = property_definition_charges(
+                        properties,
+                        &self.shapes,
+                        &self.atoms,
+                        &key,
+                        &descriptor,
+                    );
                     (
                         *extensible,
                         exists,
@@ -1855,8 +1938,13 @@ impl<'a, H: Host> Machine<'a, H> {
                             .saturating_sub(elements.len())
                             .saturating_mul(std::mem::size_of::<Value>())
                     });
-                    let (property_growth, property_refund) =
-                        property_definition_charges(properties, &self.shapes, &self.atoms, &key, &descriptor);
+                    let (property_growth, property_refund) = property_definition_charges(
+                        properties,
+                        &self.shapes,
+                        &self.atoms,
+                        &key,
+                        &descriptor,
+                    );
                     (
                         *extensible,
                         exists,
@@ -1893,7 +1981,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             *length_writable,
                             crate::number_value((offset + 1) as f64),
                             "define array index",
-                    &self.shapes,
+                            &self.shapes,
                         )?;
                     }
                     elements[offset] = Value::HOLE;
@@ -2003,9 +2091,13 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::DataView { properties, .. }
                 | HeapEntry::Timeout { properties, .. }
                 | HeapEntry::DisposableStack { properties, .. }
-                | HeapEntry::Array { properties, .. } => {
-                    property_definition_charges(properties, &self.shapes, &self.atoms, key, descriptor)
-                }
+                | HeapEntry::Array { properties, .. } => property_definition_charges(
+                    properties,
+                    &self.shapes,
+                    &self.atoms,
+                    key,
+                    descriptor,
+                ),
                 _ => unreachable!("validated object cannot change heap entry kind"),
             };
             growth = growth.saturating_add(added);
@@ -2208,7 +2300,17 @@ mod tests {
         let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let getter = install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "inherited message getter", length: 0, handler: inherited_message_getter::<TestHost> });
+        let getter = install_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            &mut machine.intrinsics.builtins,
+            crate::intrinsics::BuiltinDef {
+                name: "inherited message getter",
+                length: 0,
+                handler: inherited_message_getter::<TestHost>,
+            },
+        );
         let mut properties = PropertyMap::default();
         let key = PropertyKey::Named(machine.intern_str("message"));
         properties.insert(
@@ -3162,9 +3264,19 @@ mod tests {
             Value::UNDEFINED,
             "inherited prototype data must not be visible to own-slot load"
         );
-        let getter = install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "counting getter", length: 0, handler: |_machine, _this, _args, _constructing| {
-            panic!("LoadOwnDescriptorSlot must not invoke accessors");
-        } });
+        let getter = install_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            &mut machine.intrinsics.builtins,
+            crate::intrinsics::BuiltinDef {
+                name: "counting getter",
+                length: 0,
+                handler: |_machine, _this, _args, _constructing| {
+                    panic!("LoadOwnDescriptorSlot must not invoke accessors");
+                },
+            },
+        );
         machine
             .define_descriptor(
                 object,
@@ -3241,7 +3353,17 @@ mod tests {
         machine
             .set_data_property(key_object, "produced", produced)
             .unwrap();
-        let to_string = install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "descriptor key toString", length: 0, handler: key_to_string::<TestHost> });
+        let to_string = install_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            &mut machine.intrinsics.builtins,
+            crate::intrinsics::BuiltinDef {
+                name: "descriptor key toString",
+                length: 0,
+                handler: key_to_string::<TestHost>,
+            },
+        );
         machine
             .set_data_property(key_object, "toString", to_string)
             .unwrap();

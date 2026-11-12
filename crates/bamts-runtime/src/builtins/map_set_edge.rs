@@ -22,8 +22,24 @@ pub(super) fn install<H: Host>(
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let map = replace_constructor(heap, atoms, shapes, globals, builtins, "Map", map_constructor::<H>);
-    let set = replace_constructor(heap, atoms, shapes, globals, builtins, "Set", set_constructor::<H>);
+    let map = replace_constructor(
+        heap,
+        atoms,
+        shapes,
+        globals,
+        builtins,
+        "Map",
+        map_constructor::<H>,
+    );
+    let set = replace_constructor(
+        heap,
+        atoms,
+        shapes,
+        globals,
+        builtins,
+        "Set",
+        set_constructor::<H>,
+    );
     let weak_map = replace_constructor(
         heap,
         atoms,
@@ -44,20 +60,54 @@ pub(super) fn install<H: Host>(
     );
 
     for constructor in [map.constructor, set.constructor] {
-        let species = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get [Symbol.species]", length: 0, handler: super::regexp_protocol::species_getter::<H> });
-        super::define_symbol_property(heap, shapes, constructor,
-        builtins.symbol_species(),
-        crate::Property::Accessor {
-            getter: Some(species),
-            setter: None,
-            enumerable: false,
-            configurable: true,
-        },);
+        let species = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name: "get [Symbol.species]",
+                length: 0,
+                handler: super::regexp_protocol::species_getter::<H>,
+            },
+        );
+        super::define_symbol_property(
+            heap,
+            shapes,
+            constructor,
+            builtins.symbol_species(),
+            crate::Property::Accessor {
+                getter: Some(species),
+                setter: None,
+                enumerable: false,
+                configurable: true,
+            },
+        );
     }
 
-    let group_by = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "groupBy", length: 2, handler: map_group_by::<H> });
+    let group_by = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "groupBy",
+            length: 2,
+            handler: map_group_by::<H>,
+        },
+    );
     define_constructor_data(heap, atoms, shapes, map.constructor, "groupBy", group_by);
-    let map_set = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "set", length: 2, handler: strong_map_set::<H> });
+    let map_set = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "set",
+            length: 2,
+            handler: strong_map_set::<H>,
+        },
+    );
     define_data(heap, atoms, shapes, map.prototype, "set", map_set);
     for (target, name, handler) in [
         (
@@ -81,10 +131,30 @@ pub(super) fn install<H: Host>(
             weak_map_get_or_insert_computed::<H>,
         ),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 2, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length: 2,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, target, name, function);
     }
-    let set_add = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "add", length: 1, handler: strong_set_add::<H> });
+    let set_add = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "add",
+            length: 1,
+            handler: strong_set_add::<H>,
+        },
+    );
     define_data(heap, atoms, shapes, set.prototype, "add", set_add);
 
     // Set.prototype.keys and Set.prototype.values are the same function object.
@@ -124,7 +194,17 @@ fn replace_constructor<H: Host>(
     handler: BuiltinHandler<H>,
 ) -> InstalledConstructor {
     let prototype = prototype_of(heap, atoms, shapes, name, globals);
-    let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 0, handler: handler });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name,
+            length: 0,
+            handler,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode(name), constructor);
     InstalledConstructor {
@@ -159,7 +239,10 @@ fn own_data_property(
         | HeapEntry::NativeFunction { properties, .. } => properties,
         _ => panic!("collection intrinsic property owner must be an object"),
     };
-    match properties.get(shapes, &PropertyKey::Named(atoms.intern(EcmaString::encode(name)))) {
+    match properties.get(
+        shapes,
+        &PropertyKey::Named(atoms.intern(EcmaString::encode(name))),
+    ) {
         Some(Property::Data { value, .. }) => *value,
         _ => panic!("collection intrinsic data property must exist"),
     }
@@ -742,7 +825,14 @@ mod tests {
             length: 1,
             handler,
         });
-        crate::intrinsics::native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 1)
+        crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            1,
+        )
     }
 
     fn new_collection(machine: &mut Machine<'_, TestHost>, name: &str) -> Value {

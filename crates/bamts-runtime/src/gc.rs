@@ -251,7 +251,12 @@ impl GcState {
         for key in machine.shapes.live_keys() {
             match key {
                 PropertyKey::Symbol(index) | PropertyKey::Private(index) => {
-                    mark_index(&machine.heap, &mut self.marks, &mut self.work, *index as usize);
+                    mark_index(
+                        &machine.heap,
+                        &mut self.marks,
+                        &mut self.work,
+                        *index as usize,
+                    );
                 }
                 PropertyKey::Named(_) => {}
             }

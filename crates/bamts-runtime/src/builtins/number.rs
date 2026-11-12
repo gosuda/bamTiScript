@@ -19,8 +19,17 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.number_prototype();
-    let constructor =
-        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Number", length: 1, handler: constructor::<H> });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "Number",
+            length: 1,
+            handler: constructor::<H>,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode("Number"), constructor);
     for (name, length, handler) in [
@@ -29,7 +38,17 @@ pub(super) fn install<H: Host>(
         ("isFinite", 1, is_finite::<H>),
         ("isNaN", 1, is_nan::<H>),
     ] {
-        let f = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let f = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_static(heap, atoms, shapes, constructor, name, f)
     }
     for (name, value) in [
@@ -66,7 +85,17 @@ pub(super) fn install<H: Host>(
         ("toPrecision", 1, to_precision::<H>),
         ("valueOf", 0, value_of::<H>),
     ] {
-        let f = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let f = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, prototype, name, f)
     }
 }

@@ -567,8 +567,17 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let constructor =
-        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "ArrayBuffer", length: 1, handler: constructor::<H> });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "ArrayBuffer",
+            length: 1,
+            handler: constructor::<H>,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     builtins.set_arraybuffer_constructor(constructor);
     builtins.set_arraybuffer_prototype(prototype);
@@ -584,7 +593,17 @@ pub(super) fn install<H: Host>(
             transfer_to_fixed_length::<H> as BuiltinHandler<H>,
         ),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, prototype, name, function);
     }
 
@@ -610,12 +629,22 @@ pub(super) fn install<H: Host>(
             detached::<H> as BuiltinHandler<H>,
         ),
     ] {
-        let getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: function_name, length: 0, handler: getter });
+        let getter = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name: function_name,
+                length: 0,
+                handler: getter,
+            },
+        );
         let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
             unreachable!("ArrayBuffer prototype is ordinary")
         };
         properties.insert(
-        shapes,
+            shapes,
             PropertyKey::Named(atoms.intern_str(property_name)),
             Property::Accessor {
                 getter: Some(getter),
@@ -626,7 +655,17 @@ pub(super) fn install<H: Host>(
         );
     }
 
-    let is_view = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "isView", length: 1, handler: is_view::<H> });
+    let is_view = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "isView",
+            length: 1,
+            handler: is_view::<H>,
+        },
+    );
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)] else {
         unreachable!("ArrayBuffer constructor is native")
     };
@@ -635,7 +674,17 @@ pub(super) fn install<H: Host>(
         PropertyKey::Named(atoms.intern_str("isView")),
         builtin_property(is_view),
     );
-    let species = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get [Symbol.species]", length: 0, handler: species::<H> });
+    let species = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "get [Symbol.species]",
+            length: 0,
+            handler: species::<H>,
+        },
+    );
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)] else {
         unreachable!("ArrayBuffer constructor is native")
     };
@@ -1104,10 +1153,16 @@ mod tests {
             length: 1,
             handler: species_buffer,
         });
-        let constructor = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id,
-        "SpeciesBuffer",
-        1,);
-        let species_key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_species())
+        let constructor = native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            "SpeciesBuffer",
+            1,
+        );
+        let species_key = machine
+            .property_key_from_value(machine.intrinsics.builtins.symbol_species())
             .expect("species key");
         machine
             .set_data_property_key(constructor, species_key, constructor)
@@ -1629,9 +1684,14 @@ mod tests {
                     }))
                 },
             });
-            let getter = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id,
-            "get maxByteLength",
-            0,);
+            let getter = native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                &mut machine.shapes,
+                id,
+                "get maxByteLength",
+                0,
+            );
             let max_key = PropertyKey::Named(machine.intern_str("maxByteLength"));
             machine
                 .define_accessor(

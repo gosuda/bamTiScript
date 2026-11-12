@@ -89,7 +89,13 @@ pub(super) fn install<H: Host>(
         },
     );
     super::define_data(heap, atoms, shapes, prototype, "next", next);
-    super::define_tag(heap, shapes, prototype, builtins.symbol_to_string_tag(), "Segmenter String Iterator");
+    super::define_tag(
+        heap,
+        shapes,
+        prototype,
+        builtins.symbol_to_string_tag(),
+        "Segmenter String Iterator",
+    );
 }
 
 fn constructor<H: Host>(

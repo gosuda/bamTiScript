@@ -19,8 +19,17 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.array_prototype();
-    let constructor =
-        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Array", length: 1, handler: generic::constructor::<H> });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "Array",
+            length: 1,
+            handler: generic::constructor::<H>,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode("Array"), constructor);
     for (name, length, handler) in [
@@ -32,7 +41,17 @@ pub(super) fn install<H: Host>(
         ("from", 1, generic::from::<H>),
         ("of", 0, generic::of::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_static(heap, atoms, shapes, constructor, name, function);
     }
     for (name, length, handler) in [
@@ -65,10 +84,30 @@ pub(super) fn install<H: Host>(
         ("flatMap", 1, generic::flat_map::<H>),
         ("fill", 1, generic::fill::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, prototype, name, function);
     }
-    let species = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get [Symbol.species]", length: 0, handler: super::regexp_protocol::species_getter::<H> });
+    let species = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "get [Symbol.species]",
+            length: 0,
+            handler: super::regexp_protocol::species_getter::<H>,
+        },
+    );
     super::define_symbol_property(
         heap,
         shapes,
@@ -81,9 +120,39 @@ pub(super) fn install<H: Host>(
             configurable: true,
         },
     );
-    let keys = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "keys", length: 0, handler: keys_iterator::<H> });
-    let values = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "values", length: 0, handler: values_iterator::<H> });
-    let entries = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "entries", length: 0, handler: entries_iterator::<H> });
+    let keys = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "keys",
+            length: 0,
+            handler: keys_iterator::<H>,
+        },
+    );
+    let values = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "values",
+            length: 0,
+            handler: values_iterator::<H>,
+        },
+    );
+    let entries = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "entries",
+            length: 0,
+            handler: entries_iterator::<H>,
+        },
+    );
     define_data(heap, atoms, shapes, prototype, "keys", keys);
     define_data(heap, atoms, shapes, prototype, "values", values);
     define_data(heap, atoms, shapes, prototype, "entries", entries);
@@ -430,7 +499,14 @@ mod fuel_tests {
             length: 2,
             handler: cancel_and_keep_order,
         });
-        let comparator = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "cancel", 2);
+        let comparator = native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            "cancel",
+            2,
+        );
         let elements = (0..4).rev().map(Value::int32).collect();
         let array = super::super::allocate_array(&mut machine, elements).unwrap();
         let method = machine.get_named_property(array, "toSorted").unwrap();

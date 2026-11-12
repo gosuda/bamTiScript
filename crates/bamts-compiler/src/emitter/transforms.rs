@@ -8553,16 +8553,11 @@ impl<'a> Rewriter<'a> {
         let mut ranges = Vec::new();
         let mut rights = Vec::new();
         let mut current = expression;
-        loop {
-            match current.data() {
-                Expression::Binary(value) => {
-                    operators.push(value.operator);
-                    ranges.push(current.range());
-                    rights.push(&*value.right);
-                    current = &value.left;
-                }
-                _ => break,
-            }
+        while let Expression::Binary(value) = current.data() {
+            operators.push(value.operator);
+            ranges.push(current.range());
+            rights.push(&*value.right);
+            current = &value.left;
         }
         let mut rebuilt = self.rewrite_expr(current);
         for index in (0..operators.len()).rev() {
@@ -8592,16 +8587,11 @@ impl<'a> Rewriter<'a> {
         let mut ranges = Vec::new();
         let mut rights = Vec::new();
         let mut current = expression;
-        loop {
-            match current.data() {
-                Expression::Logical(value) => {
-                    operators.push(value.operator);
-                    ranges.push(current.range());
-                    rights.push(&*value.right);
-                    current = &value.left;
-                }
-                _ => break,
-            }
+        while let Expression::Logical(value) = current.data() {
+            operators.push(value.operator);
+            ranges.push(current.range());
+            rights.push(&*value.right);
+            current = &value.left;
         }
         let mut rebuilt = self.rewrite_expr(current);
         for index in (0..operators.len()).rev() {
@@ -8625,7 +8615,6 @@ impl<'a> Rewriter<'a> {
         }
         rebuilt
     }
-
 
     fn rewrite_expression(&mut self, expression: &Expr) -> Expr {
         if self.replace_await

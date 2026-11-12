@@ -30,7 +30,17 @@ pub(crate) fn install<H: Host>(
             specifier: util_specifier.clone(),
         },
     );
-    let parse_args = register(heap, atoms, shapes, builtins, BuiltinDef { name: "parseArgs", length: 0, handler: parse_args::<H> });
+    let parse_args = register(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        BuiltinDef {
+            name: "parseArgs",
+            length: 0,
+            handler: parse_args::<H>,
+        },
+    );
 
     let crypto_specifier = EcmaString::encode("node:crypto");
     let crypto_namespace = intrinsics::push(
@@ -39,9 +49,39 @@ pub(crate) fn install<H: Host>(
             specifier: crypto_specifier.clone(),
         },
     );
-    let create_hash = register(heap, atoms, shapes, builtins, BuiltinDef { name: "createHash", length: 2, handler: create_hash::<H> });
-    let hash_update = register(heap, atoms, shapes, builtins, BuiltinDef { name: "update", length: 2, handler: hash_update::<H> });
-    let hash_digest = register(heap, atoms, shapes, builtins, BuiltinDef { name: "digest", length: 1, handler: hash_digest::<H> });
+    let create_hash = register(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        BuiltinDef {
+            name: "createHash",
+            length: 2,
+            handler: create_hash::<H>,
+        },
+    );
+    let hash_update = register(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        BuiltinDef {
+            name: "update",
+            length: 2,
+            handler: hash_update::<H>,
+        },
+    );
+    let hash_digest = register(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        BuiltinDef {
+            name: "digest",
+            length: 1,
+            handler: hash_digest::<H>,
+        },
+    );
 
     let mut modules = vec![
         InstalledModule {
@@ -58,7 +98,13 @@ pub(crate) fn install<H: Host>(
         },
     ];
     if script_compiler {
-        modules.push(crate::vm::install(heap, atoms, shapes, builtins, object_prototype));
+        modules.push(crate::vm::install(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            object_prototype,
+        ));
     }
     modules
 }
@@ -405,7 +451,10 @@ fn object_properties<H: Host>(
     let HeapEntry::Object { properties, .. } = &machine.heap[index] else {
         return Err(type_error("parseArgs configuration must be an object"));
     };
-    let keys: Vec<PropertyKey> = properties.iter(&machine.shapes).map(|(key, _)| key.clone()).collect();
+    let keys: Vec<PropertyKey> = properties
+        .iter(&machine.shapes)
+        .map(|(key, _)| key.clone())
+        .collect();
     let mut result = BTreeMap::new();
     for key in keys {
         let PropertyKey::Named(name) = &key else {

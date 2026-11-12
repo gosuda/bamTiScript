@@ -54,7 +54,7 @@ mod shape;
 mod temporal;
 mod vm;
 pub(crate) use intrinsics::builtins;
-pub(crate) use shape::{SHAPED_CAPACITY, FunctionSites, Which, ShapeId, ShapeTable};
+pub(crate) use shape::{FunctionSites, SHAPED_CAPACITY, ShapeId, ShapeTable, Which};
 
 pub use native::{
     NativeEngine, NativeError, TieredRunReport, UnitTieringSummary, WarmupPolicy,
@@ -731,7 +731,10 @@ impl Property {
 }
 #[derive(Clone, Debug)]
 enum PropertyMap {
-    Shaped { shape: ShapeId, slots: Vec<Property> },
+    Shaped {
+        shape: ShapeId,
+        slots: Vec<Property>,
+    },
     Dictionary {
         entries: Vec<Option<(PropertyKey, Property)>>,
         index: HashMap<PropertyKey, u32>,
@@ -777,12 +780,7 @@ impl PropertyMap {
     fn contains_key(&self, shapes: &ShapeTable, key: &PropertyKey) -> bool {
         self.get(shapes, key).is_some()
     }
-    fn get_ascii(
-        &self,
-        shapes: &ShapeTable,
-        atoms: &AtomTable,
-        ascii: &str,
-    ) -> Option<&Property> {
+    fn get_ascii(&self, shapes: &ShapeTable, atoms: &AtomTable, ascii: &str) -> Option<&Property> {
         debug_assert!(ascii.is_ascii());
         let atom = atoms.find(ascii)?;
         self.get(shapes, &PropertyKey::Named(atom))
@@ -829,9 +827,7 @@ impl PropertyMap {
     fn remove(&mut self, shapes: &ShapeTable, key: &PropertyKey) -> Option<Property> {
         match self {
             PropertyMap::Shaped { shape, slots } => {
-                if shapes.slot_of(*shape, key).is_none() {
-                    return None;
-                }
+                shapes.slot_of(*shape, key)?;
                 let taken = std::mem::take(slots);
                 let mut dictionary = Self::to_dictionary(shapes, *shape, taken);
                 let removed = dictionary.remove(shapes, key);
@@ -840,7 +836,9 @@ impl PropertyMap {
             }
             PropertyMap::Dictionary { entries, index } => {
                 let position = index.remove(key)?;
-                entries[position as usize].take().map(|(_, property)| property)
+                entries[position as usize]
+                    .take()
+                    .map(|(_, property)| property)
             }
         }
     }
@@ -880,7 +878,8 @@ impl PropertyMap {
     ) {
         let dropped: Vec<PropertyKey> = self
             .iter(shapes)
-            .filter_map(|(key, property)| (!keep(key, property)).then(|| key.clone()))
+            .filter(|&(key, property)| !keep(key, property))
+            .map(|(key, _property)| key.clone())
             .collect();
         if dropped.is_empty() {
             return;
@@ -901,9 +900,7 @@ impl PropertyMap {
                 debug_assert_eq!(keys.len(), slots.len());
                 keys.into_iter().cloned().zip(slots).collect()
             }
-            PropertyMap::Dictionary { entries, .. } => {
-                entries.into_iter().flatten().collect()
-            }
+            PropertyMap::Dictionary { entries, .. } => entries.into_iter().flatten().collect(),
         }
     }
     fn charge_bytes(&self, shapes: &ShapeTable, atoms: &AtomTable) -> usize {
@@ -913,11 +910,7 @@ impl PropertyMap {
                 .saturating_add(property.charge_bytes())
         })
     }
-    fn to_dictionary(
-        shapes: &ShapeTable,
-        shape: ShapeId,
-        slots: Vec<Property>,
-    ) -> PropertyMap {
+    fn to_dictionary(shapes: &ShapeTable, shape: ShapeId, slots: Vec<Property>) -> PropertyMap {
         let keys = shapes.ordered_keys(shape);
         debug_assert_eq!(keys.len(), slots.len());
         let mut entries = Vec::with_capacity(slots.len());
@@ -962,10 +955,8 @@ impl<'a> Iterator for PropertyMapIter<'a> {
         match self {
             PropertyMapIter::Shaped { keys, slots } => Some((keys.next()?, slots.next()?)),
             PropertyMapIter::Dictionary { entries } => {
-                for entry in entries.by_ref() {
-                    if let Some((key, property)) = entry {
-                        return Some((key, property));
-                    }
+                if let Some((key, property)) = entries.by_ref().flatten().next() {
+                    return Some((key, property));
                 }
                 None
             }
@@ -1754,7 +1745,9 @@ impl HeapEntry {
                 .byte_length()
                 .saturating_add(properties.charge_bytes(shapes, atoms))
                 .saturating_add(1),
-            Self::WeakRef { properties, .. } => properties.charge_bytes(shapes, atoms).saturating_add(1),
+            Self::WeakRef { properties, .. } => {
+                properties.charge_bytes(shapes, atoms).saturating_add(1)
+            }
             Self::FinalizationRegistry {
                 cells,
                 pending_holdings,
@@ -2515,7 +2508,8 @@ impl<'a, H: Host> Machine<'a, H> {
         let HeapEntry::Object { properties, .. } = &heap[process_index] else {
             unreachable!("process is an ordinary object");
         };
-        let Some(Property::Data { value: argv, .. }) = properties.get_ascii(&shapes, &atoms, "argv")
+        let Some(Property::Data { value: argv, .. }) =
+            properties.get_ascii(&shapes, &atoms, "argv")
         else {
             unreachable!("process owns argv");
         };
@@ -3792,7 +3786,8 @@ impl<'a, H: Host> Machine<'a, H> {
         let name = self
             .allocate(HeapEntry::String(EcmaString::encode("")))
             .map_err(EvalFailure::Runtime)?;
-        let properties = intrinsics::function_properties(&mut self.atoms, &mut self.shapes, 1, name);
+        let properties =
+            intrinsics::function_properties(&mut self.atoms, &mut self.shapes, 1, name);
         self.allocate(HeapEntry::native_function(
             NativeCallable::Bound(Box::new(BoundCallable {
                 target,
@@ -4239,7 +4234,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 },
             );
         }
-        properties.insert(&mut self.shapes, self.intrinsics.builtins.error_brand_key(), error_brand());
+        properties.insert(
+            &mut self.shapes,
+            self.intrinsics.builtins.error_brand_key(),
+            error_brand(),
+        );
         self.allocate(HeapEntry::Object {
             properties,
             prototype: Some(self.intrinsics.error_prototype(id)),
@@ -5071,7 +5070,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let url_value = self.allocate(HeapEntry::String(url))?;
         let mut properties = PropertyMap::default();
         properties.insert(
-                &mut self.shapes,
+            &mut self.shapes,
             url_key,
             Property::Data {
                 value: url_value,
@@ -6438,8 +6437,10 @@ impl<'a, H: Host> Machine<'a, H> {
                 } => {
                     let pattern = self.constant_string(pattern).clone();
                     let flags = self.constant_string(flags).clone();
-                    let properties =
-                        intrinsics::builtins::initial_regexp_properties(&mut self.atoms, &mut self.shapes);
+                    let properties = intrinsics::builtins::initial_regexp_properties(
+                        &mut self.atoms,
+                        &mut self.shapes,
+                    );
                     let value = self
                         .allocate(HeapEntry::RegExp {
                             pattern,
@@ -9372,7 +9373,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 boxed_primitive,
                 ..
             } => {
-                if let Some(found) = property_lookup(properties, &self.shapes, &PropertyKey::Named(atom)) {
+                if let Some(found) =
+                    property_lookup(properties, &self.shapes, &PropertyKey::Named(atom))
+                {
                     return Some(found);
                 }
                 if let Some(primitive) = boxed_primitive
@@ -9439,10 +9442,15 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties,
                 ..
             } => {
-                if let Some(found) = property_lookup(properties, &self.shapes, &PropertyKey::Named(atom)) {
+                if let Some(found) =
+                    property_lookup(properties, &self.shapes, &PropertyKey::Named(atom))
+                {
                     return Some(found);
                 }
-                if properties.contains_key(&self.shapes, &self.intrinsics.builtins.function_reified_key()) {
+                if properties.contains_key(
+                    &self.shapes,
+                    &self.intrinsics.builtins.function_reified_key(),
+                ) {
                     return None;
                 }
                 let metadata = &self.module_code(*module).functions()[function.get() as usize];
@@ -9553,8 +9561,12 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Timeout { properties, .. }
             | HeapEntry::ArrayBuffer { properties, .. }
             | HeapEntry::ProxyRevoker { properties, .. }
-            | HeapEntry::SharedArrayBuffer { properties, .. } => property_lookup(properties, &self.shapes, key),
-            HeapEntry::DataView { properties, .. } => property_lookup(properties, &self.shapes, key),
+            | HeapEntry::SharedArrayBuffer { properties, .. } => {
+                property_lookup(properties, &self.shapes, key)
+            }
+            HeapEntry::DataView { properties, .. } => {
+                property_lookup(properties, &self.shapes, key)
+            }
             HeapEntry::Array {
                 elements,
                 properties,
@@ -9595,7 +9607,10 @@ impl<'a, H: Host> Machine<'a, H> {
                     return Some(found);
                 }
                 if let PropertyKey::Named(atom) = key
-                    && !properties.contains_key(&self.shapes, &self.intrinsics.builtins.function_reified_key())
+                    && !properties.contains_key(
+                        &self.shapes,
+                        &self.intrinsics.builtins.function_reified_key(),
+                    )
                 {
                     let metadata = &self.module_code(*module).functions()[function.get() as usize];
                     if self.atoms.eq_ascii(*atom, "length") {
@@ -9635,7 +9650,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.registry.cells[cell.0].value
                 })))
             }
-            HeapEntry::NativeFunction { properties, .. } => property_lookup(properties, &self.shapes, key),
+            HeapEntry::NativeFunction { properties, .. } => {
+                property_lookup(properties, &self.shapes, key)
+            }
             HeapEntry::RegExp { properties, .. } => property_lookup(properties, &self.shapes, key),
             HeapEntry::HashState { update, digest, .. } => {
                 let PropertyKey::Named(atom) = key else {
@@ -10007,7 +10024,8 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Option<usize> {
         if !self.property_sites.contains_key(&(module, function)) {
             let code = self.module_code(module).functions()[function.get() as usize].code();
-            self.property_sites.insert((module, function), FunctionSites::build(code));
+            self.property_sites
+                .insert((module, function), FunctionSites::build(code));
         }
         let sites = self.property_sites.get_mut(&(module, function))?;
         let index = match which {
@@ -10028,7 +10046,8 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> &mut FunctionSites {
         if !self.property_sites.contains_key(&(module, function)) {
             let code = self.module_code(module).functions()[function.get() as usize].code();
-            self.property_sites.insert((module, function), FunctionSites::build(code));
+            self.property_sites
+                .insert((module, function), FunctionSites::build(code));
         }
         self.property_sites
             .get_mut(&(module, function))
@@ -10048,7 +10067,8 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Option<Value> {
         let site_index = self.get_cache_slot(module, function, site, Which::Get)?;
         let index = self.runtime_slot(receiver).ok().flatten()?;
-        let found = {
+
+        {
             let HeapEntry::Object {
                 properties,
                 boxed_primitive: None,
@@ -10071,8 +10091,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 _ => None,
             }
-        };
-        found
+        }
     }
 
     /// Records `(shape, key)` at `site` when the generic read found the key
@@ -10166,7 +10185,11 @@ impl<'a, H: Host> Machine<'a, H> {
         let HeapEntry::Object { properties, .. } = &mut self.heap[index] else {
             unreachable!("object brand was checked above")
         };
-        let PropertyMap::Shaped { shape: current, slots } = properties else {
+        let PropertyMap::Shaped {
+            shape: current,
+            slots,
+        } = properties
+        else {
             unreachable!("shaped map was checked above")
         };
         debug_assert_eq!(*current, shape);
@@ -10197,12 +10220,10 @@ impl<'a, H: Host> Machine<'a, H> {
             boxed_primitive: None,
             ..
         } = &self.heap[index]
+            && let Some(slot) = self.shapes.slot_of(*shape, key)
+            && let Some(Property::Data { writable: true, .. }) = slots.get(slot as usize)
         {
-            if let Some(slot) = self.shapes.slot_of(*shape, key)
-                && let Some(Property::Data { writable: true, .. }) = slots.get(slot as usize)
-            {
-                cacheable = Some((*shape, slot));
-            }
+            cacheable = Some((*shape, slot));
         }
         let Some((shape, _slot)) = cacheable else {
             return;
@@ -10364,15 +10385,17 @@ impl<'a, H: Host> Machine<'a, H> {
 
     /// Resizes with the heap accounting, and says whether `length` was reached.
     fn resize_array(&mut self, index: usize, length: usize) -> Result<bool, EvalFailure> {
-    let old_length_and_bytes = |entry: &HeapEntry, shapes: &ShapeTable, atoms: &AtomTable| match entry {
-            HeapEntry::Array {
-                elements,
-                properties,
-                ..
-            } => (elements.len(), properties.charge_bytes(shapes, atoms)),
-            _ => unreachable!("resize_array requires an array"),
-        };
-        let (old_length, old_property_bytes) = old_length_and_bytes(&self.heap[index], &self.shapes, &self.atoms);
+        let old_length_and_bytes =
+            |entry: &HeapEntry, shapes: &ShapeTable, atoms: &AtomTable| match entry {
+                HeapEntry::Array {
+                    elements,
+                    properties,
+                    ..
+                } => (elements.len(), properties.charge_bytes(shapes, atoms)),
+                _ => unreachable!("resize_array requires an array"),
+            };
+        let (old_length, old_property_bytes) =
+            old_length_and_bytes(&self.heap[index], &self.shapes, &self.atoms);
         let growth = length
             .saturating_sub(old_length)
             .saturating_mul(std::mem::size_of::<Value>());
@@ -10387,7 +10410,8 @@ impl<'a, H: Host> Machine<'a, H> {
             unreachable!("resize_array requires an array");
         };
         let reached = apply_array_length(elements, properties, &self.atoms, length, &self.shapes);
-        let (new_length, new_property_bytes) = old_length_and_bytes(&self.heap[index], &self.shapes, &self.atoms);
+        let (new_length, new_property_bytes) =
+            old_length_and_bytes(&self.heap[index], &self.shapes, &self.atoms);
         let released = old_length
             .saturating_sub(new_length)
             .saturating_mul(std::mem::size_of::<Value>())
@@ -10568,7 +10592,8 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             _ => (None, true, false),
         };
-        if let Some(property) = properties.and_then(|properties| properties.get(&self.shapes, &key)) {
+        if let Some(property) = properties.and_then(|properties| properties.get(&self.shapes, &key))
+        {
             match property {
                 Property::Data {
                     writable: false, ..
@@ -10610,7 +10635,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::FinalizationRegistry { properties, .. }
             | HeapEntry::ProxyRevoker { properties, .. }
             | HeapEntry::Timeout { properties, .. } => {
-                usize::from(!properties.contains_key(&self.shapes, &key)) * key.charge_bytes(&self.atoms)
+                usize::from(!properties.contains_key(&self.shapes, &key))
+                    * key.charge_bytes(&self.atoms)
             }
             HeapEntry::Array {
                 elements,
@@ -10624,11 +10650,13 @@ impl<'a, H: Host> Machine<'a, H> {
                             .saturating_sub(elements.len())
                             .saturating_mul(std::mem::size_of::<Value>())
                     } else {
-                        usize::from(!properties.contains_key(&self.shapes, &key)) * key.charge_bytes(&self.atoms)
+                        usize::from(!properties.contains_key(&self.shapes, &key))
+                            * key.charge_bytes(&self.atoms)
                     }
                 }
                 PropertyKey::Symbol(_) | PropertyKey::Private(_) => {
-                    usize::from(!properties.contains_key(&self.shapes, &key)) * key.charge_bytes(&self.atoms)
+                    usize::from(!properties.contains_key(&self.shapes, &key))
+                        * key.charge_bytes(&self.atoms)
                 }
             },
             HeapEntry::Proxy { .. } => {
@@ -10734,8 +10762,8 @@ impl<'a, H: Host> Machine<'a, H> {
                                     &self.atoms,
                                     *length_writable,
                                     number_value((offset + 1) as f64),
-                    "set array index",
-                    &self.shapes,
+                                    "set array index",
+                                    &self.shapes,
                                 )?;
                             }
                             let key = PropertyKey::Named(name);
@@ -13260,18 +13288,20 @@ impl<'a, H: Host> Machine<'a, H> {
                 Property::enumerable,
             ),
             HeapEntry::String(text) => string_has_index(text, &self.atoms, key),
-            HeapEntry::TypedArray { properties, .. } => properties.get(&self.shapes, key).map_or_else(
-                || {
-                    key.as_string(&self.atoms)
-                        .and_then(typedarray_all::typed_array_index)
-                        .flatten()
-                        .is_some_and(|offset| {
-                            self.typed_array_length_at(index)
-                                .is_some_and(|length| offset < length)
-                        })
-                },
-                Property::enumerable,
-            ),
+            HeapEntry::TypedArray { properties, .. } => {
+                properties.get(&self.shapes, key).map_or_else(
+                    || {
+                        key.as_string(&self.atoms)
+                            .and_then(typedarray_all::typed_array_index)
+                            .flatten()
+                            .is_some_and(|offset| {
+                                self.typed_array_length_at(index)
+                                    .is_some_and(|length| offset < length)
+                            })
+                    },
+                    Property::enumerable,
+                )
+            }
             HeapEntry::ModuleNamespace { .. } | HeapEntry::ExternalModuleNamespace { .. } => {
                 matches!(key, PropertyKey::Named(_))
             }
@@ -13295,9 +13325,9 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Timeout { properties, .. }
             | HeapEntry::ArrayBuffer { properties, .. }
             | HeapEntry::SharedArrayBuffer { properties, .. }
-            | HeapEntry::DataView { properties, .. } => {
-                properties.get(&self.shapes, key).is_some_and(Property::enumerable)
-            }
+            | HeapEntry::DataView { properties, .. } => properties
+                .get(&self.shapes, key)
+                .is_some_and(Property::enumerable),
             _ => false,
         })
     }
@@ -14671,7 +14701,11 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 }
 
-fn ordered_property_keys(properties: &PropertyMap, shapes: &ShapeTable, atoms: &AtomTable) -> Vec<PropertyKey> {
+fn ordered_property_keys(
+    properties: &PropertyMap,
+    shapes: &ShapeTable,
+    atoms: &AtomTable,
+) -> Vec<PropertyKey> {
     let mut indices = Vec::new();
     let mut strings = Vec::new();
     let mut symbols = Vec::new();
@@ -14694,7 +14728,11 @@ fn ordered_property_keys(properties: &PropertyMap, shapes: &ShapeTable, atoms: &
         .collect()
 }
 
-fn property_lookup(properties: &PropertyMap, shapes: &ShapeTable, key: &PropertyKey) -> Option<Found> {
+fn property_lookup(
+    properties: &PropertyMap,
+    shapes: &ShapeTable,
+    key: &PropertyKey,
+) -> Option<Found> {
     match properties.get(shapes, key) {
         Some(Property::Data { value, .. }) => Some(Found::Value(*value)),
         Some(Property::Accessor { getter, .. }) => Some(match getter {
@@ -15482,7 +15520,9 @@ mod tests {
             let global = machine.global_object;
             let index = machine.runtime_slot(global).unwrap().unwrap();
             let property_bytes = |machine: &Machine<'_, TestHost>| match &machine.heap[index] {
-                HeapEntry::Object { properties, .. } => properties.charge_bytes(&machine.shapes, &machine.atoms),
+                HeapEntry::Object { properties, .. } => {
+                    properties.charge_bytes(&machine.shapes, &machine.atoms)
+                }
                 _ => panic!("global object remains ordinary"),
             };
             let baseline = property_bytes(machine);
@@ -15761,9 +15801,9 @@ mod tests {
             let index = machine.runtime_slot(object).unwrap().unwrap();
             let key = PropertyKey::Named(machine.intern_str("value"));
             let enumerable = |machine: &Machine<'_, TestHost>| match &machine.heap[index] {
-                HeapEntry::Object { properties, .. } => {
-                    properties.get(&machine.shapes, &key).map(Property::enumerable)
-                }
+                HeapEntry::Object { properties, .. } => properties
+                    .get(&machine.shapes, &key)
+                    .map(Property::enumerable),
                 _ => None,
             };
             machine
@@ -15831,7 +15871,9 @@ mod tests {
             let HeapEntry::Object { properties, .. } = &mut machine.heap[index] else {
                 panic!("allocated object remains an object");
             };
-            let Some(Property::Accessor { configurable, .. }) = properties.get_mut(&machine.shapes, &key) else {
+            let Some(Property::Accessor { configurable, .. }) =
+                properties.get_mut(&machine.shapes, &key)
+            else {
                 panic!("accessor definition stored an accessor");
             };
             *configurable = false;
@@ -18871,7 +18913,14 @@ mod tests {
                     length: 0,
                     handler,
                 });
-            intrinsics::native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
+            intrinsics::native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                &mut machine.shapes,
+                id,
+                name,
+                0,
+            )
         };
         let iterator_identity = install(
             "[Symbol.iterator]",
@@ -19179,7 +19228,7 @@ mod tests {
         let next = PropertyKey::Named(machine.intern_str("next"));
         let mut source_properties = PropertyMap::default();
         source_properties.insert(
-                        &mut machine.shapes,
+            &mut machine.shapes,
             first.clone(),
             Property::Accessor {
                 getter: Some(getter),
@@ -19189,7 +19238,7 @@ mod tests {
             },
         );
         source_properties.insert(
-                        &mut machine.shapes,
+            &mut machine.shapes,
             next.clone(),
             Property::Data {
                 value: Value::int32(2),
@@ -19708,7 +19757,7 @@ mod tests {
             let getter = intrinsics::native_function(
                 &mut machine.heap,
                 &mut machine.atoms,
-            &mut machine.shapes,
+                &mut machine.shapes,
                 getter_id,
                 "get @@unscopables",
                 0,
@@ -19718,7 +19767,7 @@ mod tests {
                 .unwrap();
             let mut properties = PropertyMap::default();
             properties.insert(
-                                &mut machine.shapes,
+                &mut machine.shapes,
                 unscopables_key,
                 Property::Accessor {
                     getter: Some(getter),
@@ -20011,7 +20060,14 @@ mod tests {
                         length: 0,
                         handler,
                     });
-                intrinsics::native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
+                intrinsics::native_function(
+                    &mut machine.heap,
+                    &mut machine.atoms,
+                    &mut machine.shapes,
+                    id,
+                    name,
+                    0,
+                )
             };
             let unscopables_get = install(
                 "get @@unscopables",
@@ -20023,17 +20079,17 @@ mod tests {
             let unscopables_key = machine
                 .property_key_from_value(machine.intrinsics.builtins.symbol_unscopables())
                 .unwrap();
-                let mut blocklist_properties = PropertyMap::default();
-                blocklist_properties.insert(
-                    &mut machine.shapes,
-                    name.clone(),
-                    Property::Accessor {
-                        getter: Some(block_get),
-                        setter: None,
-                        enumerable: true,
-                        configurable: true,
-                    },
-                );
+            let mut blocklist_properties = PropertyMap::default();
+            blocklist_properties.insert(
+                &mut machine.shapes,
+                name.clone(),
+                Property::Accessor {
+                    getter: Some(block_get),
+                    setter: None,
+                    enumerable: true,
+                    configurable: true,
+                },
+            );
             let blocklist = machine
                 .allocate(HeapEntry::Object {
                     properties: blocklist_properties,
@@ -20191,7 +20247,7 @@ mod tests {
         );
         let object = machine
             .allocate(HeapEntry::Object {
-                    properties: throw_object_properties,
+                properties: throw_object_properties,
                 prototype: Some(machine.intrinsics.object_prototype),
                 boxed_primitive: None,
                 extensible: true,
@@ -20321,7 +20377,7 @@ mod tests {
             );
             let blocklist = machine
                 .allocate(HeapEntry::Object {
-                        properties: mk_blocklist_properties,
+                    properties: mk_blocklist_properties,
                     prototype: None,
                     boxed_primitive: None,
                     extensible: true,
@@ -20350,7 +20406,7 @@ mod tests {
             );
             machine
                 .allocate(HeapEntry::Object {
-                        properties: mk_object_properties,
+                    properties: mk_object_properties,
                     prototype: Some(machine.intrinsics.object_prototype),
                     boxed_primitive: None,
                     extensible: true,
@@ -23160,8 +23216,14 @@ mod tests {
                 length: 0,
                 handler: key_text::<TestHost>,
             });
-        let to_string =
-            intrinsics::native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "key text", 0);
+        let to_string = intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            "key text",
+            0,
+        );
         let key = machine
             .allocate(HeapEntry::Object {
                 properties: PropertyMap::default(),
@@ -23302,8 +23364,14 @@ mod tests {
                     length: 0,
                     handler,
                 });
-            let value_of =
-                intrinsics::native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0);
+            let value_of = intrinsics::native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                &mut machine.shapes,
+                id,
+                name,
+                0,
+            );
             let object = machine
                 .allocate(HeapEntry::Object {
                     properties: PropertyMap::default(),
@@ -27475,7 +27543,14 @@ mod tests {
                 length: 0,
                 handler,
             });
-        crate::intrinsics::native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
+        crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            0,
+        )
     }
 
     #[test]
@@ -30702,7 +30777,14 @@ mod tests {
                             length: 0,
                             handler,
                         });
-                    intrinsics::native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
+                    intrinsics::native_function(
+                        &mut machine.heap,
+                        &mut machine.atoms,
+                        &mut machine.shapes,
+                        id,
+                        name,
+                        0,
+                    )
                 };
             let getter = install("get super marker", marker_getter::<TestHost>);
             let setter = install("set super hit", hit_setter::<TestHost>);
@@ -30840,7 +30922,14 @@ mod tests {
                             length: 0,
                             handler,
                         });
-                    intrinsics::native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
+                    intrinsics::native_function(
+                        &mut machine.heap,
+                        &mut machine.atoms,
+                        &mut machine.shapes,
+                        id,
+                        name,
+                        0,
+                    )
                 };
             let kept_getter = install("get kept", kept_getter::<TestHost>);
             let excluded_getter = install("get excluded", excluded_getter::<TestHost>);
@@ -31496,8 +31585,10 @@ mod tests {
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let module = ModuleId::new(0);
         let function = FunctionId::new(0);
-        let object =
-            site_object(&mut machine, &[("a", Value::int32(1)), ("b", Value::int32(2))]);
+        let object = site_object(
+            &mut machine,
+            &[("a", Value::int32(1)), ("b", Value::int32(2))],
+        );
         let key_a = PropertyKey::Named(machine.intern_str("a"));
         let key_b = PropertyKey::Named(machine.intern_str("b"));
         machine.property_site_record_get(module, function, 0, object, &key_a);
@@ -31755,8 +31846,10 @@ mod shape_property_tests {
     }
 
     fn check(map: &PropertyMap, shapes: &ShapeTable, oracle: &Oracle) {
-        let live: Vec<(PropertyKey, Property)> =
-            map.iter(shapes).map(|(key, property)| (key.clone(), property.clone())).collect();
+        let live: Vec<(PropertyKey, Property)> = map
+            .iter(shapes)
+            .map(|(key, property)| (key.clone(), property.clone()))
+            .collect();
         assert_eq!(live, oracle.0);
     }
 
@@ -31810,7 +31903,10 @@ mod shape_property_tests {
             let mut keys: Vec<PropertyKey> = Vec::new();
             for text in ["0", "1", "2", "3", "10", "42", "100", "999"] {
                 let atom = atoms.intern_str(text);
-                assert_eq!(atoms.array_index(atom), Some(text.parse().expect("index parses")));
+                assert_eq!(
+                    atoms.array_index(atom),
+                    Some(text.parse().expect("index parses"))
+                );
                 keys.push(PropertyKey::Named(atom));
             }
             for index in 0..12 {
