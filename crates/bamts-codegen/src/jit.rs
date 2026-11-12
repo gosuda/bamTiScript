@@ -427,6 +427,7 @@ fn helper_address(helper: Helper) -> *const u8 {
         Helper::RequireGlobalBinding => {
             bamts_native::bamts_require_global_binding as *const u8
         }
+        Helper::ThrowIntrinsicError => bamts_native::bamts_throw_intrinsic_error as *const u8,
     }
 }
 

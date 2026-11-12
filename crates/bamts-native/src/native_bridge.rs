@@ -37,7 +37,7 @@ use crate::{Completion, CompletionTag, ShadowFrame, Value};
 // -- The helper algebra ------------------------------------------------------
 
 /// The number of runtime helpers, `0..HELPER_COUNT`.
-pub const HELPER_COUNT: u32 = 54;
+pub const HELPER_COUNT: u32 = 55;
 
 /// A runtime helper, identified by its stable ABI index. The variant order is
 /// the canonical `external_index` order (0..52) and is byte-identical to
@@ -160,6 +160,8 @@ pub enum NativeHelper {
     GetTemplateObject = 52,
     /// `bamts_require_global_binding` — index 53.
     RequireGlobalBinding = 53,
+    /// `bamts_throw_intrinsic_error` — index 54.
+    ThrowIntrinsicError = 54,
 }
 
 impl NativeHelper {
@@ -222,6 +224,7 @@ impl NativeHelper {
             NativeHelper::CopyDataProperties => "bamts_copy_data_properties",
             NativeHelper::GetTemplateObject => "bamts_get_template_object",
             NativeHelper::RequireGlobalBinding => "bamts_require_global_binding",
+            NativeHelper::ThrowIntrinsicError => "bamts_throw_intrinsic_error",
         }
     }
 
@@ -290,6 +293,7 @@ impl NativeHelper {
             51 => Some(NativeHelper::CopyDataProperties),
             52 => Some(NativeHelper::GetTemplateObject),
             53 => Some(NativeHelper::RequireGlobalBinding),
+            54 => Some(NativeHelper::ThrowIntrinsicError),
             _ => None,
         }
     }
@@ -497,6 +501,9 @@ pub enum HelperCall {
     GetTemplateObject { cooked: Value, raw: Value },
     /// Throw a `ReferenceError` unless the global `name` is bound.
     RequireGlobalBinding { name: u32 },
+    /// Throw the realm's intrinsic error of selector `kind` with string
+    /// constant `message`.
+    ThrowIntrinsicError { kind: u32, message: u32 },
 }
 
 impl HelperCall {
@@ -580,6 +587,7 @@ impl HelperCall {
                 raw: _raw,
             } => NativeHelper::GetTemplateObject,
             HelperCall::RequireGlobalBinding { .. } => NativeHelper::RequireGlobalBinding,
+            HelperCall::ThrowIntrinsicError { .. } => NativeHelper::ThrowIntrinsicError,
         }
     }
 }
@@ -2162,6 +2170,23 @@ pub unsafe extern "C" fn bamts_require_global_binding(
     dispatch_simple(frame, out, HelperCall::RequireGlobalBinding { name })
 }
 
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`. Both
+/// remain valid and unaliased for the full call.
+///
+/// `bamts_throw_intrinsic_error(frame, kind, message, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_throw_intrinsic_error(
+    frame: *mut ShadowFrame,
+    kind: u32,
+    message: u32,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(frame, out, HelperCall::ThrowIntrinsicError { kind, message })
+}
+
 impl NativeHelper {
     /// The address of the extern "C" wrapper generated code calls.
     ///
@@ -2229,6 +2254,7 @@ impl NativeHelper {
             NativeHelper::CopyDataProperties => bamts_copy_data_properties as *const u8,
             NativeHelper::GetTemplateObject => bamts_get_template_object as *const u8,
             NativeHelper::RequireGlobalBinding => bamts_require_global_binding as *const u8,
+            NativeHelper::ThrowIntrinsicError => bamts_throw_intrinsic_error as *const u8,
         }
     }
 }
@@ -2324,6 +2350,8 @@ const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u3
     bamts_get_template_object; // 52
 const _: unsafe extern "C" fn(*mut ShadowFrame, u32, *mut Completion) -> u32 =
     bamts_require_global_binding; // 53
+const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u32, *mut Completion) -> u32 =
+    bamts_throw_intrinsic_error; // 54
 
 // -- Native entry invocation seam --------------------------------------------
 
@@ -3016,7 +3044,7 @@ mod tests {
     /// this crate under `host-jit`, so importing it would be a cycle), so this
     /// literal is the pinned contract; it must stay byte-identical to
     /// `bamts_codegen::Helper::{external_index, symbol}`.
-    const CODEGEN_HELPERS: [(u32, &str); 54] = [
+    const CODEGEN_HELPERS: [(u32, &str); 55] = [
         (0, "bamts_load_constant"),
         (1, "bamts_unary"),
         (2, "bamts_binary"),
@@ -3071,6 +3099,7 @@ mod tests {
         (51, "bamts_copy_data_properties"),
         (52, "bamts_get_template_object"),
         (53, "bamts_require_global_binding"),
+        (54, "bamts_throw_intrinsic_error"),
     ];
 
     /// A recording dispatcher: captures the last call and returns a fixed
@@ -3278,6 +3307,7 @@ mod tests {
             bamts_copy_data_properties as *const u8,
             bamts_get_template_object as *const u8,
             bamts_require_global_binding as *const u8,
+            bamts_throw_intrinsic_error as *const u8,
         ];
         assert_eq!(expected.len(), HELPER_COUNT as usize);
         for index in 0..HELPER_COUNT {

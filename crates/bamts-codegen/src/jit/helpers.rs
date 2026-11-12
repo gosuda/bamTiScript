@@ -9,7 +9,7 @@
 
 use bamts_bytecode::{
     AccessorKind, BinaryOp, ConstantId, DescriptorSlot, DisposeHint, FunctionId, Instruction,
-    IteratorCloseMode, IteratorKind, Pc, Register, UnaryOp,
+    IntrinsicErrorKind, IteratorCloseMode, IteratorKind, Pc, Register, UnaryOp,
 };
 use bamts_native::HELPER_COUNT;
 use cranelift_codegen::ir::types;
@@ -20,7 +20,7 @@ use crate::Helper;
 /// grows a helper must extend [`helper_demand`] or [`STRUCTURAL_HELPERS`] and
 /// raise this bound; [`verify_helper_coverage`] refuses to certify coverage
 /// against an unexamined helper set.
-pub const EXPECTED_HELPER_COUNT: u32 = 54;
+pub const EXPECTED_HELPER_COUNT: u32 = 55;
 
 /// Helpers that no opcode requests.
 ///
@@ -126,6 +126,7 @@ pub const fn helper_demand(instruction: Instruction) -> HelperDemand {
         Instruction::RequireGlobalBinding { .. } => {
             HelperDemand::Call(Helper::RequireGlobalBinding)
         }
+        Instruction::ThrowIntrinsicError { .. } => HelperDemand::Call(Helper::ThrowIntrinsicError),
 
         // Both conditional branches test the same runtime truthiness predicate,
         // differing only in the native branch polarity.
@@ -146,7 +147,7 @@ pub const fn helper_demand(instruction: Instruction) -> HelperDemand {
 /// only on which variant each entry selects. Keeping one entry per opcode makes
 /// [`verify_helper_coverage`] a statement about the whole algebra rather than
 /// about a sampled subset.
-pub const ISA_REPRESENTATIVES: [Instruction; 59] = [
+pub const ISA_REPRESENTATIVES: [Instruction; 60] = [
     Instruction::LoadConst {
         dst: Register::new(0),
         constant: ConstantId::new(0),
@@ -406,6 +407,10 @@ pub const ISA_REPRESENTATIVES: [Instruction; 59] = [
     Instruction::RequireGlobalBinding {
         name: ConstantId::new(10),
     },
+    Instruction::ThrowIntrinsicError {
+        kind: IntrinsicErrorKind::TypeError,
+        message: ConstantId::new(11),
+    },
     Instruction::Halt,
 ];
 
@@ -616,7 +621,7 @@ mod tests {
             .collect();
         let total = discriminants.len();
         discriminants.dedup();
-        assert_eq!(total, 59, "the algebra has 59 opcodes");
+        assert_eq!(total, 60, "the algebra has 60 opcodes");
         assert_eq!(
             discriminants.len(),
             total,

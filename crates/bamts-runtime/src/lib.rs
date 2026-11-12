@@ -34,7 +34,8 @@ use crate::vm::explicit_resource::DisposalStackState;
 use crate::vm::generator_async::GeneratorCompletion;
 use bamts_bytecode::{
     AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, DisposeHint, EcmaString,
-    EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IteratorCloseMode,
+    EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IntrinsicErrorKind,
+    IteratorCloseMode,
     IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, ResolvedExport, UnaryOp, Verified,
     format_number,
 };
@@ -6831,6 +6832,10 @@ impl<'a, H: Host> Machine<'a, H> {
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
                 }
+                Instruction::ThrowIntrinsicError { kind, message } => {
+                    let failure = self.throw_intrinsic_error(module_id, kind, message);
+                    self.resolve_failure(failure, pc)?;
+                }
                 Instruction::Export { .. } => {
                     return Err(self.error_here_at(
                         RuntimeErrorKind::InvalidVerifiedProgram {
@@ -8673,6 +8678,18 @@ impl<'a, H: Host> Machine<'a, H> {
             .id_named(constructor)
             .expect("error constructor is installed");
         self.throw_error(id, message)
+    }
+
+    /// The failure of [`Instruction::ThrowIntrinsicError`]: the realm's
+    /// intrinsic `kind` error with the module's string constant `message`.
+    pub(crate) fn throw_intrinsic_error(
+        &mut self,
+        module: ModuleId,
+        kind: IntrinsicErrorKind,
+        message: ConstantId,
+    ) -> EvalFailure {
+        let message = self.constant_text(module, message).to_utf8_lossy().to_string();
+        self.intrinsic_error(kind.constructor_name(), message)
     }
 
     pub(crate) fn has_own_property_key(
@@ -19886,6 +19903,118 @@ mod tests {
         let global = machine.global_object;
         let key = PropertyKey::Named(machine.intern_str("gy"));
         assert!(!machine.has_own_property_key(global, &key).unwrap());
+    }
+
+    /// Replaces or deletes the global `constructor` binding through `tamper`
+    /// (`r0` holds `globalThis`, `r1` the binding name, `r2` a replacement
+    /// that counts its calls in global `called`), then throws the intrinsic
+    /// error of `kind` and returns the caught value.
+    fn intrinsic_error_program(
+        kind: IntrinsicErrorKind,
+        constructor: &str,
+        message: &str,
+        tamper: Instruction,
+    ) -> Program<Verified> {
+        let entry = Function::new(
+            None,
+            0,
+            0,
+            5,
+            FunctionFlags::default(),
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(4),
+                    constant: cid(3),
+                },
+                Instruction::StoreGlobal {
+                    name: cid(2),
+                    value: reg(4),
+                },
+                Instruction::LoadGlobal {
+                    dst: reg(0),
+                    name: cid(0),
+                },
+                Instruction::LoadConst {
+                    dst: reg(1),
+                    constant: cid(1),
+                },
+                Instruction::CreateArray { dst: reg(3) },
+                Instruction::CreateClosure {
+                    dst: reg(2),
+                    function: FunctionId::new(1),
+                    captures: reg(3),
+                },
+                tamper,
+                Instruction::ThrowIntrinsicError {
+                    kind,
+                    message: cid(5),
+                },
+                Instruction::Return { value: reg(4) },
+            ],
+            vec![ExceptionHandler {
+                start: pc(7),
+                end: pc(8),
+                handler: pc(8),
+                catch_register: reg(4),
+            }],
+        );
+        let mut replacement = vec![Instruction::LoadConst {
+            dst: reg(1),
+            constant: cid(4),
+        }];
+        replacement.extend(counter_bump(2, 0));
+        replacement.extend([
+            Instruction::CreateObject { dst: reg(0) },
+            Instruction::Return { value: reg(0) },
+        ]);
+        verified(
+            vec![
+                Constant::String(EcmaString::encode("globalThis")),
+                Constant::String(EcmaString::encode(constructor)),
+                Constant::String(EcmaString::encode("called")),
+                Constant::Int32(0),
+                Constant::Int32(1),
+                Constant::String(EcmaString::encode(message)),
+            ],
+            vec![entry, function(0, 2, replacement, Vec::new())],
+        )
+    }
+
+    #[test]
+    fn intrinsic_errors_ignore_a_replaced_or_deleted_global_constructor() {
+        let replace = Instruction::SetProperty {
+            object: reg(0),
+            key: reg(1),
+            value: reg(2),
+        };
+        let delete = Instruction::DeleteProperty {
+            dst: reg(3),
+            object: reg(0),
+            key: reg(1),
+        };
+        for (kind, constructor, message) in [
+            (
+                IntrinsicErrorKind::TypeError,
+                "TypeError",
+                "Class constructor cannot be invoked without 'new'",
+            ),
+            (
+                IntrinsicErrorKind::ReferenceError,
+                "ReferenceError",
+                "Unsupported reference to 'super'",
+            ),
+            (IntrinsicErrorKind::SyntaxError, "SyntaxError", "syntax"),
+            (IntrinsicErrorKind::RangeError, "RangeError", "range"),
+        ] {
+            for tamper in [replace, delete] {
+                let program = intrinsic_error_program(kind, constructor, message, tamper);
+                let mut host = TestHost;
+                let mut machine = Machine::new(&program, &mut host, Limits::default());
+                let caught = machine.evaluate().unwrap().value;
+                assert_intrinsic_error(&mut machine, caught, constructor, message);
+                assert_eq!(machine.test_global("called"), Some(Value::int32(0)));
+            }
+        }
     }
 
     #[test]

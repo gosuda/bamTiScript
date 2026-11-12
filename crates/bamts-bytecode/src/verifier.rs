@@ -1,4 +1,4 @@
-//! Bytecode verifier co-extension (E1.2) for ISA tags 52..=58.
+//! Bytecode verifier co-extension (E1.2) for ISA tags 52..=59.
 //!
 //! Every opcode [`crate::isa`] adds is checked here for constant type,
 //! register/constant/PC bounds, operand aliasing, and control-flow
@@ -167,6 +167,7 @@ pub fn verify_extension(
             check_register(raw)?;
         }
         Instruction::RequireGlobalBinding { name } => check_string_constant(name)?,
+        Instruction::ThrowIntrinsicError { message, .. } => check_string_constant(message)?,
     }
 
     let mut successor_error = None;
@@ -200,7 +201,7 @@ fn instruction_error(function: usize, pc: usize, kind: Kind) -> Error {
 mod tests {
     use super::{Kind, verify_extension};
     use crate::isa::Instruction;
-    use crate::{Constant, ConstantId, EcmaString, Register};
+    use crate::{Constant, ConstantId, EcmaString, IntrinsicErrorKind, Register};
 
     fn strings(names: &[&str]) -> Vec<Constant> {
         names
@@ -414,6 +415,32 @@ mod tests {
             Kind::ConstantOutOfBounds { constant, constant_count: 1 } if constant.get() == 2
         ));
         check(&strings(&["x"]), 0).expect("a string name verifies");
+    }
+
+    #[test]
+    fn throw_intrinsic_error_requires_an_in_bounds_string_message() {
+        let check = |constants: &[Constant], message: u32| {
+            verify_extension(
+                0,
+                0,
+                Instruction::ThrowIntrinsicError {
+                    kind: IntrinsicErrorKind::TypeError,
+                    message: ConstantId::new(message),
+                },
+                1,
+                constants,
+                2,
+            )
+        };
+        assert!(matches!(
+            check(&[Constant::Int32(1)], 0).expect_err("Int32 is not a message").kind,
+            Kind::StringConstantExpected { constant } if constant.get() == 0
+        ));
+        assert!(matches!(
+            check(&strings(&["m"]), 2).expect_err("constant 2 of 1").kind,
+            Kind::ConstantOutOfBounds { constant, constant_count: 1 } if constant.get() == 2
+        ));
+        check(&strings(&["m"]), 0).expect("a string message verifies");
     }
 
     #[test]

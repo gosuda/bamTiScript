@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 
 use bamts_bytecode::{
     AccessorKind, BinaryOp, Constant, ConstantId, EcmaString, ExceptionHandler, Function,
-    FunctionFlags, FunctionId, Instruction, Module, ModuleId, Pc, Program, ProgramModule, Register,
-    Verified,
+    FunctionFlags, FunctionId, Instruction, IntrinsicErrorKind, Module, ModuleId, Pc, Program,
+    ProgramModule, Register, Verified,
 };
 use bamts_codegen::compile_jit;
 use bamts_codegen::helpers::{
@@ -213,8 +213,8 @@ fn every_classified_opcode_and_helper_is_accounted_for() {
 
     let expected: BTreeSet<_> = (0..bamts_native::HELPER_COUNT).collect();
     assert_eq!(helpers, expected, "every runtime helper must be reachable");
-    assert_eq!(ISA_REPRESENTATIVES.len(), 59, "append-only ISA changed");
-    assert_eq!(helpers.len(), 54, "runtime helper namespace changed");
+    assert_eq!(ISA_REPRESENTATIVES.len(), 60, "append-only ISA changed");
+    assert_eq!(helpers.len(), 55, "runtime helper namespace changed");
 }
 
 #[test]
@@ -1315,4 +1315,224 @@ fn strict_compound_assignment_throws_when_the_binding_vanishes_before_the_write(
         "ReferenceError",
         "gy is not defined",
     );
+}
+
+fn intrinsic_error_constants(constructor: &str, message: &str) -> Vec<Constant> {
+    vec![
+        Constant::String(EcmaString::encode("entry")),
+        Constant::String(EcmaString::encode("print")),
+        Constant::Undefined,
+        Constant::String(EcmaString::encode("globalThis")),
+        Constant::String(EcmaString::encode(constructor)),
+        Constant::String(EcmaString::encode("prototype")),
+        Constant::String(EcmaString::encode("Object")),
+        Constant::String(EcmaString::encode("getPrototypeOf")),
+        Constant::String(EcmaString::encode("called")),
+        Constant::Int32(0),
+        Constant::Int32(1),
+        Constant::String(EcmaString::encode(message)),
+        Constant::String(EcmaString::encode(",")),
+        Constant::String(EcmaString::encode("message")),
+    ]
+}
+
+/// Captures `constructor.prototype`, runs `tamper` on the global binding
+/// (`r1` holds `globalThis`, `r2` the binding name, `r6` a counting
+/// replacement), throws the intrinsic error of `kind`, and prints whether the
+/// caught value has the captured prototype, the replacement's call count, and
+/// the caught message.
+fn intrinsic_error_program(
+    kind: IntrinsicErrorKind,
+    constructor: &str,
+    message: &str,
+    tamper: Instruction,
+) -> Program<Verified> {
+    let mut entry = vec![
+        Instruction::LoadConst {
+            dst: reg(0),
+            constant: cid(9),
+        },
+        Instruction::StoreGlobal {
+            name: cid(8),
+            value: reg(0),
+        },
+        Instruction::LoadGlobal {
+            dst: reg(1),
+            name: cid(3),
+        },
+        Instruction::LoadConst {
+            dst: reg(2),
+            constant: cid(4),
+        },
+        Instruction::GetProperty {
+            dst: reg(3),
+            object: reg(1),
+            key: reg(2),
+        },
+        Instruction::LoadConst {
+            dst: reg(4),
+            constant: cid(5),
+        },
+        Instruction::GetProperty {
+            dst: reg(5),
+            object: reg(3),
+            key: reg(4),
+        },
+        Instruction::CreateArray { dst: reg(7) },
+        Instruction::CreateClosure {
+            dst: reg(6),
+            function: FunctionId::new(1),
+            captures: reg(7),
+        },
+        tamper,
+        Instruction::LoadConst {
+            dst: reg(8),
+            constant: cid(2),
+        },
+        Instruction::ThrowIntrinsicError {
+            kind,
+            message: cid(11),
+        },
+        Instruction::LoadGlobal {
+            dst: reg(9),
+            name: cid(6),
+        },
+        Instruction::LoadConst {
+            dst: reg(10),
+            constant: cid(7),
+        },
+        Instruction::GetProperty {
+            dst: reg(10),
+            object: reg(9),
+            key: reg(10),
+        },
+        Instruction::CreateArray { dst: reg(11) },
+        Instruction::ArrayPush {
+            array: reg(11),
+            value: reg(8),
+        },
+        Instruction::Call {
+            dst: reg(12),
+            callee: reg(10),
+            this_value: reg(9),
+            arguments: reg(11),
+        },
+        Instruction::Binary {
+            dst: reg(12),
+            op: BinaryOp::StrictEqual,
+            left: reg(12),
+            right: reg(5),
+        },
+        Instruction::LoadConst {
+            dst: reg(13),
+            constant: cid(12),
+        },
+        Instruction::LoadGlobal {
+            dst: reg(14),
+            name: cid(8),
+        },
+        Instruction::LoadConst {
+            dst: reg(15),
+            constant: cid(13),
+        },
+        Instruction::GetProperty {
+            dst: reg(15),
+            object: reg(8),
+            key: reg(15),
+        },
+    ];
+    for part in [13, 14, 13, 15] {
+        entry.push(Instruction::Binary {
+            dst: reg(12),
+            op: BinaryOp::Add,
+            left: reg(12),
+            right: reg(part),
+        });
+    }
+    entry.extend(print_suffix(reg(12), 16));
+    let replacement = vec![
+        Instruction::LoadGlobal {
+            dst: reg(0),
+            name: cid(8),
+        },
+        Instruction::LoadConst {
+            dst: reg(1),
+            constant: cid(10),
+        },
+        Instruction::Binary {
+            dst: reg(0),
+            op: BinaryOp::Add,
+            left: reg(0),
+            right: reg(1),
+        },
+        Instruction::StoreGlobal {
+            name: cid(8),
+            value: reg(0),
+        },
+        Instruction::CreateObject { dst: reg(0) },
+        Instruction::Return { value: reg(0) },
+    ];
+    let handler = ExceptionHandler {
+        start: Pc::new(11),
+        end: Pc::new(12),
+        handler: Pc::new(12),
+        catch_register: reg(8),
+    };
+    module_program(
+        intrinsic_error_constants(constructor, message),
+        vec![
+            Function::new(
+                None,
+                0,
+                0,
+                20,
+                FunctionFlags::default(),
+                entry,
+                vec![handler],
+            ),
+            function(2, replacement),
+        ],
+    )
+}
+
+#[test]
+fn intrinsic_errors_ignore_a_replaced_or_deleted_global_constructor() {
+    let replace = Instruction::SetProperty {
+        object: reg(1),
+        key: reg(2),
+        value: reg(6),
+    };
+    let delete = Instruction::DeleteProperty {
+        dst: reg(7),
+        object: reg(1),
+        key: reg(2),
+    };
+    for (kind, constructor, message) in [
+        (
+            IntrinsicErrorKind::TypeError,
+            "TypeError",
+            "Class constructor cannot be invoked without 'new'",
+        ),
+        (
+            IntrinsicErrorKind::ReferenceError,
+            "ReferenceError",
+            "Unsupported reference to 'super'",
+        ),
+        (
+            IntrinsicErrorKind::ReferenceError,
+            "ReferenceError",
+            "Invalid left-hand side in assignment",
+        ),
+        (IntrinsicErrorKind::SyntaxError, "SyntaxError", "syntax"),
+        (IntrinsicErrorKind::RangeError, "RangeError", "range"),
+    ] {
+        for (tamper, how) in [(replace, "replaced"), (delete, "deleted")] {
+            let program = intrinsic_error_program(kind, constructor, message, tamper);
+            assert_prints(
+                &format!("{constructor} with the global {how}"),
+                &program,
+                &format!("true,0,{message}\n"),
+            );
+        }
+    }
 }

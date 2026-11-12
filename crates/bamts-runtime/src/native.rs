@@ -54,8 +54,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use bamts_bytecode::{
-    ConstantId, DisposeHint, EcmaString, FunctionId, Instruction, Module, ModuleId, Pc, Program,
-    Verified,
+    ConstantId, DisposeHint, EcmaString, FunctionId, Instruction, IntrinsicErrorKind, Module,
+    ModuleId, Pc, Program, Verified,
 };
 pub use bamts_native::AbiError;
 pub use bamts_native::tiering::WarmupPolicy;
@@ -1358,6 +1358,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             ),
             Instruction::RequireGlobalBinding { name } => (
                 HelperCall::RequireGlobalBinding { name: name.get() },
+                None,
+            ),
+            Instruction::ThrowIntrinsicError { kind, message } => (
+                HelperCall::ThrowIntrinsicError {
+                    kind: kind.selector(),
+                    message: message.get(),
+                },
                 None,
             ),
             Instruction::Call {
@@ -4451,6 +4458,19 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         Err(failure) => self.fail(failure),
                     }
                 }
+                HelperCall::ThrowIntrinsicError { kind, message } => {
+                    let Some(kind) = IntrinsicErrorKind::from_selector(kind) else {
+                        break 'result self.fatal(RuntimeErrorKind::InvalidValue {
+                            value: Value::UNDEFINED,
+                        });
+                    };
+                    let failure = self.machine.borrow_mut().throw_intrinsic_error(
+                        module,
+                        kind,
+                        ConstantId::new(message),
+                    );
+                    self.fail(failure)
+                }
                 HelperCall::Call { .. }
                 | HelperCall::Construct { .. }
                 | HelperCall::ConstructWithNewTarget { .. } => {
@@ -4764,6 +4784,7 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::CopyDataProperties { .. }
         | Instruction::GetTemplateObject { .. }
         | Instruction::RequireGlobalBinding { .. }
+        | Instruction::ThrowIntrinsicError { .. }
         | Instruction::Export { .. } => false,
     }
 }
@@ -10939,7 +10960,7 @@ mod tests {
             "bamts_with_has_binding"
         );
         assert_eq!(NativeHelper::ResumeMode.as_u32(), 46);
-        assert_eq!(HELPER_COUNT, 54);
+        assert_eq!(HELPER_COUNT, 55);
     }
 
     #[test]
