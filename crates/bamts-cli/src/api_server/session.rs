@@ -36,6 +36,12 @@ use crate::{
 use super::wire::{ApiError, Request, Response};
 const MAX_IN_FLIGHT: usize = 64;
 
+/// The instruction budget of one JIT `compiler/execute` request. The server
+/// waits synchronously for the program to end, so a runaway loop answers
+/// `fuel exhausted` instead of hanging the connection. An AOT request runs a
+/// child process that this budget cannot reach; `$/cancelRequest` terminates it.
+const EXECUTE_FUEL: u64 = 1_000_000;
+
 /// Polls a service future that completes without suspending. The async service
 /// contributes bounding and cancellation, never a suspension point, so a pending
 /// poll is a transport invariant failure rather than a wait.
@@ -791,7 +797,16 @@ impl Session {
         let context =
             ExecutionContext::new(compiler.filesystem.root(), std::env::vars_os().collect())
                 .map_err(|error| driver_error(&error))?;
-        match driver::execute_in_context_with_cancel(&args, &context, cancellation.clone()) {
+        let limits = bamts_runtime::Limits {
+            fuel: EXECUTE_FUEL,
+            ..bamts_runtime::Limits::program()
+        };
+        match driver::execute_in_context_with_cancel(
+            &args,
+            &context,
+            cancellation.clone(),
+            limits,
+        ) {
             Ok(outcome) => Ok(json!({
                 "stdout": String::from_utf8_lossy(&outcome.stdout),
                 "stderr": String::from_utf8_lossy(&outcome.stderr),
