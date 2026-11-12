@@ -1104,7 +1104,7 @@ mod tests {
             &compiled,
             &mut host,
             &Limits {
-                fuel: 15,
+                fuel: 16,
                 max_call_depth: 2,
                 max_total_registers: 12,
                 ..Limits::default()
@@ -1116,20 +1116,21 @@ mod tests {
         );
 
         let mut host = SilentHost;
-        assert_fuel_exhausted(
+        let short = assert_fuel_exhausted(
             run_linked_program(
                 &bytecode,
                 &compiled,
                 &mut host,
                 &Limits {
-                    fuel: 14,
+                    fuel: 15,
                     max_call_depth: 2,
                     max_total_registers: 12,
                     ..Limits::default()
                 },
             ),
-            14,
+            15,
         );
+        assert_eq!(short.pc, Pc::new(13));
 
         let mut host = SilentHost;
         let depth = run_linked_program(
