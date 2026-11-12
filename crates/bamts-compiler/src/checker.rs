@@ -4534,6 +4534,42 @@ function check(options: Options = {}) {
     }
 
     #[test]
+    fn optional_chain_continuations_index_the_non_nullish_object() {
+        let source = "interface Box { items: number[]; record: { x: number }; make(): Box }\n\
+             declare const box: Box | null;\n\
+             declare function key(): number;\n\
+             const indexed: number | undefined = box?.items[key()];\n\
+             const deleted: boolean = delete box?.items[key()];\n\
+             const named: number | undefined = box?.record[\"x\"];\n\
+             const called: number | undefined = box?.make().items[key()];\n\
+             const nested: number | undefined = box?.make()?.items[key()];";
+        assert_eq!(checker_codes(&check_text(source)), Vec::<&str>::new());
+        assert_eq!(checker_codes_strict_null(source), Vec::<String>::new());
+    }
+
+    #[test]
+    fn optional_chain_continuations_still_reject_unknown_keys() {
+        let source = "interface Box { items: number[]; record: { x: number } }\n\
+             declare const box: Box | null;\n\
+             declare const prop: string;\n\
+             box?.items[prop];\n\
+             box?.record[prop];";
+        assert_eq!(checker_codes(&check_text(source)), ["BAMTS-C064", "BAMTS-C064"]);
+        assert_eq!(checker_codes_strict_null(source), ["BAMTS-C064", "BAMTS-C064"]);
+    }
+
+    #[test]
+    fn optional_chain_result_adds_undefined_at_the_chain() {
+        let codes = checker_codes_strict_null(
+            "interface Box { items: number[] }\n\
+             declare const box: Box | null;\n\
+             declare function key(): number;\n\
+             const indexed: number = box?.items[key()];",
+        );
+        assert_eq!(codes, ["BAMTS-C004"]);
+    }
+
+    #[test]
     fn control_flow_expressions_are_type_checked() {
         let sources = [
             "if (closed[key]) {}",

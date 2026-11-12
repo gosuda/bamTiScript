@@ -1078,6 +1078,7 @@ struct CallEvaluation {
     return_type: Option<TypeId>,
     abstract_constructor: bool,
     mismatches: Vec<CallMismatch>,
+    short_circuits: bool,
 }
 
 impl CallEvaluation {
@@ -1086,6 +1087,7 @@ impl CallEvaluation {
             return_type: Some(return_type),
             abstract_constructor: false,
             mismatches: Vec::new(),
+            short_circuits: false,
         }
     }
 
@@ -1094,6 +1096,7 @@ impl CallEvaluation {
             return_type: None,
             abstract_constructor: false,
             mismatches: vec![mismatch],
+            short_circuits: false,
         }
     }
 
@@ -1102,6 +1105,7 @@ impl CallEvaluation {
             return_type: None,
             abstract_constructor: false,
             mismatches,
+            short_circuits: false,
         }
     }
 }
@@ -3828,6 +3832,15 @@ impl TypeTable {
     pub fn is_exactly_nullish(&self, type_id: TypeId) -> bool {
         matches!(self.get(type_id), Type::Null | Type::Undefined)
     }
+    fn includes_nullish(&self, type_id: TypeId) -> bool {
+        match self.get(type_id) {
+            Type::Null | Type::Undefined => true,
+            Type::Union(members) => members
+                .iter()
+                .any(|member| matches!(self.get(*member), Type::Null | Type::Undefined)),
+            _ => false,
+        }
+    }
     fn optional_access_view(&mut self, type_id: TypeId) -> TypeId {
         let non_nullable = self.non_nullable(type_id);
         let constrained = self
@@ -6077,6 +6090,7 @@ pub(crate) struct Binder<'src> {
     publication: CheckPublication,
     type_nodes: HashMap<NodeId, TypeId>,
     node_types: HashMap<NodeId, TypeId>,
+    optional_chain_links: HashMap<NodeId, (TypeId, bool)>,
     typed_expressions: Vec<(TextRange, TypeId)>,
     symbol_references: Vec<(TextRange, SymbolId)>,
     pub(crate) diagnostics: Vec<Diagnostic>,
@@ -6350,6 +6364,7 @@ impl<'src> Binder<'src> {
             publication: CheckPublication::default(),
             type_nodes: HashMap::new(),
             node_types: HashMap::new(),
+            optional_chain_links: HashMap::new(),
             typed_expressions: Vec::new(),
             symbol_references: Vec::new(),
             interface_member_occurrences: Vec::new(),
@@ -17439,23 +17454,17 @@ impl<'src> Binder<'src> {
             return CallEvaluation::success(self.types.any());
         }
 
-        let optional = call.optional
-            || matches!(
-                call.callee.data(),
-                Expression::Member(member) if member.optional
-            );
-        let short_circuits = optional
-            && match self.types.get(callee_type) {
-                Type::Null | Type::Undefined => true,
-                Type::Union(members) => members
-                    .iter()
-                    .any(|member| matches!(self.types.get(*member), Type::Null | Type::Undefined)),
-                _ => false,
-            };
-        let callable_type = if short_circuits {
-            self.types.non_nullable(callee_type)
+        let (callable_type, short_circuits) = if call.optional {
+            if self.types.includes_nullish(callee_type) {
+                (self.types.non_nullable(callee_type), true)
+            } else {
+                (callee_type, false)
+            }
+        } else if crate::early_errors::in_optional_chain(&call.callee) {
+            self.optional_chain_base(&call.callee)
+                .unwrap_or((callee_type, false))
         } else {
-            callee_type
+            (callee_type, false)
         };
 
         let arguments = self.resolve_call_arguments(&call.arguments, scope);
@@ -17474,12 +17483,7 @@ impl<'src> Binder<'src> {
             call.callee.range(),
             scope,
         );
-        if short_circuits && let Some(return_type) = evaluation.return_type {
-            evaluation.return_type = Some(
-                self.types
-                    .union(&[return_type, self.types.undefined_type()]),
-            );
-        }
+        evaluation.short_circuits = short_circuits;
         evaluation
     }
 
@@ -18421,6 +18425,7 @@ impl<'src> Binder<'src> {
                     target.id(),
                 );
                 self.type_of_member(&member.object, &member.property, false, false, scope)
+                    .0
             }
             _ => self.types.any(),
         }
@@ -18468,19 +18473,20 @@ impl<'src> Binder<'src> {
         optional: bool,
         read: bool,
         scope: ScopeId,
-    ) -> TypeId {
+    ) -> (TypeId, bool) {
+        let continuation = !optional && crate::early_errors::in_optional_chain(object);
         let Some(name) = enum_plan::cook_member_property_name(self.source, property) else {
             let MemberProperty::Computed(expression) = property else {
-                return self.types.any();
+                return (self.types.any(), false);
             };
-            let object_type = self.legacy_type_of_expr(object, scope);
+            let (object_type, chain_short) = self.chain_receiver(object, continuation, scope);
             let narrowed_object_type = self.flow_narrowed_expression_type(object);
             let object_type = narrowed_object_type.unwrap_or(object_type);
             // An unguarded optional property read must still participate in
             // indexed-access rejection when strict null checks are disabled.
             // Keep the published read type unchanged; this widened view is
             // used only for the C064 decision below.
-            let rejection_object_type = if !optional && narrowed_object_type.is_none() {
+            let rejection_object_type = if !optional && !continuation && narrowed_object_type.is_none() {
                 match object.data() {
                     Expression::Member(member) => {
                         match enum_plan::cook_member_property_name(self.source, &member.property) {
@@ -18501,13 +18507,8 @@ impl<'src> Binder<'src> {
             } else {
                 object_type
             };
-            let object_was_nullish = match self.types.get(rejection_object_type) {
-                Type::Null | Type::Undefined => true,
-                Type::Union(members) => members
-                    .iter()
-                    .any(|member| matches!(self.types.get(*member), Type::Null | Type::Undefined)),
-                _ => false,
-            };
+            let short_circuits =
+                chain_short || (optional && self.types.includes_nullish(rejection_object_type));
             let lookup_type = if optional {
                 self.types.optional_access_view(object_type)
             } else {
@@ -18530,11 +18531,7 @@ impl<'src> Binder<'src> {
             } else {
                 self.types.any()
             };
-            return if optional && object_was_nullish {
-                self.types.union(&[type_id, self.types.undefined_type()])
-            } else {
-                type_id
-            };
+            return (type_id, short_circuits);
         };
         let name_str = Self::semantic_property_key(&name);
         if let Some(object_symbol) = self.resolved_expression_reference(object) {
@@ -18546,7 +18543,7 @@ impl<'src> Binder<'src> {
                 && let Some(member_symbol) =
                     self.scopes[member_scope.0 as usize].value(name_str.as_str())
             {
-                return self.symbol_types[member_symbol.get() as usize];
+                return (self.symbol_types[member_symbol.get() as usize], false);
             } else if kind == SymbolKind::Enum
                 && let Some(member_symbol) = self
                     .enum_member_symbols_by_name
@@ -18554,7 +18551,7 @@ impl<'src> Binder<'src> {
                     .and_then(|members| members.get(&name))
                     .copied()
             {
-                return self.symbol_types[member_symbol.get() as usize];
+                return (self.symbol_types[member_symbol.get() as usize], false);
             } else if let Some(&member_scope) = self.namespace_export_scopes.get(&object_symbol) {
                 // Merged partners (function, class) keep their own kind,
                 // so the arms above miss them; their namespace half still
@@ -18563,7 +18560,7 @@ impl<'src> Binder<'src> {
                 if let Some(member_symbol) =
                     self.scopes[member_scope.0 as usize].value(name_str.as_str())
                 {
-                    return self.value_side_type(member_symbol);
+                    return (self.value_side_type(member_symbol), false);
                 }
                 // A same-named class static is the runtime value; the
                 // namespace type binding must not mask it.
@@ -18577,7 +18574,7 @@ impl<'src> Binder<'src> {
                         .find(|property| property.name() == name_str.as_str())
                     && self.is_member_accessible(property)
                 {
-                    return property.type_id();
+                    return (property.type_id(), false);
                 }
                 // Otherwise a type-only export is not a runtime property:
                 // report the miss instead of falling to a silent `any`.
@@ -18599,21 +18596,15 @@ impl<'src> Binder<'src> {
                         property_range,
                         PROPERTY_DOES_NOT_EXIST_MESSAGE,
                     );
-                    return self.types.error_type();
+                    return (self.types.error_type(), false);
                 }
             }
         }
-        let object_type = self.legacy_type_of_expr(object, scope);
+        let (object_type, chain_short) = self.chain_receiver(object, continuation, scope);
         let object_type = self
             .flow_narrowed_expression_type(object)
             .unwrap_or(object_type);
-        let object_was_nullish = match self.types.get(object_type) {
-            Type::Null | Type::Undefined => true,
-            Type::Union(members) => members
-                .iter()
-                .any(|member| matches!(self.types.get(*member), Type::Null | Type::Undefined)),
-            _ => false,
-        };
+        let short_circuits = chain_short || (optional && self.types.includes_nullish(object_type));
         let lookup_type = if optional {
             self.types.optional_access_view(object_type)
         } else {
@@ -18656,22 +18647,59 @@ impl<'src> Binder<'src> {
             && read
             && let Some(narrowed) = self.flow_narrowed_property_type(object, name_str.as_ref())
         {
-            return narrowed;
+            return (narrowed, short_circuits);
         }
-        if let Some(type_id) = self.property_type_for_member_raw(
-            lookup_type,
-            name_str.as_str(),
-            property_range,
-            read,
-            object_type,
-            None,
-        ) {
-            if optional && object_was_nullish {
-                return self.types.union(&[type_id, self.types.undefined_type()]);
+        let type_id = self
+            .property_type_for_member_raw(
+                lookup_type,
+                name_str.as_str(),
+                property_range,
+                read,
+                object_type,
+                None,
+            )
+            .unwrap_or_else(|| self.types.any());
+        (type_id, short_circuits)
+    }
+
+    fn chain_receiver(
+        &mut self,
+        receiver: &'src Expr,
+        continuation: bool,
+        scope: ScopeId,
+    ) -> (TypeId, bool) {
+        let type_id = self.legacy_type_of_expr(receiver, scope);
+        if continuation && let Some(link) = self.optional_chain_base(receiver) {
+            return link;
+        }
+        (type_id, false)
+    }
+
+    fn optional_chain_base(&mut self, expression: &'src Expr) -> Option<(TypeId, bool)> {
+        match expression.data() {
+            Expression::NonNull(non_null) => {
+                let (type_id, short_circuits) = self.optional_chain_base(&non_null.expression)?;
+                Some((self.types.non_nullable(type_id), short_circuits))
             }
-            return type_id;
+            _ => self.optional_chain_links.get(&expression.id()).copied(),
         }
-        self.types.any()
+    }
+
+    fn optional_chain_result(
+        &mut self,
+        expression: &'src Expr,
+        type_id: TypeId,
+        short_circuits: bool,
+    ) -> TypeId {
+        if crate::early_errors::in_optional_chain(expression) {
+            self.optional_chain_links
+                .insert(expression.id(), (type_id, short_circuits));
+        }
+        if short_circuits {
+            self.types.union(&[type_id, self.types.undefined_type()])
+        } else {
+            type_id
+        }
     }
 
     fn is_member_accessible(&self, property: &PropertyType) -> bool {
@@ -22793,7 +22821,7 @@ impl<'src> Binder<'src> {
             Expression::Arrow(arrow) => self.type_of_arrow(arrow, scope),
             Expression::Member(member) => {
                 let object_type = self.legacy_type_of_expr(&member.object, scope);
-                let type_id = self.type_of_member(
+                let (type_id, short_circuits) = self.type_of_member(
                     &member.object,
                     &member.property,
                     member.optional,
@@ -22808,7 +22836,7 @@ impl<'src> Binder<'src> {
                     expression.range(),
                     expression.id(),
                 );
-                type_id
+                self.optional_chain_result(expression, type_id, short_circuits)
             }
 
             Expression::New(new) => {
@@ -22823,8 +22851,9 @@ impl<'src> Binder<'src> {
                 .unwrap_or_else(|| self.types.any()),
             Expression::Call(call) => {
                 let callee_type = self.legacy_type_of_expr(&call.callee, scope);
-                self.call_return_type(call, callee_type, scope)
-                    .unwrap_or_else(|| self.types.any())
+                let evaluation = self.evaluate_call(call, scope, callee_type);
+                let type_id = evaluation.return_type.unwrap_or_else(|| self.types.any());
+                self.optional_chain_result(expression, type_id, evaluation.short_circuits)
             }
             Expression::Await(await_expression) => {
                 let operand = self.legacy_type_of_expr(&await_expression.argument, scope);
@@ -23449,15 +23478,6 @@ impl<'src> Binder<'src> {
             }
             FunctionBody::Missing(_) => self.types.void(),
         }
-    }
-
-    fn call_return_type(
-        &mut self,
-        call: &'src CallExpression,
-        callee_type: TypeId,
-        scope: ScopeId,
-    ) -> Option<TypeId> {
-        self.evaluate_call(call, scope, callee_type).return_type
     }
 
     fn new_return_type(
