@@ -905,6 +905,65 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&stdout), STACK_OVERFLOW_OUTPUT);
     }
 
+    /// Each compiler-raised language error, first with the global error
+    /// constructor replaced and then with it deleted. Node 24.18 prints
+    /// [`LANGUAGE_ERROR_OUTPUT`] for this script.
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    const LANGUAGE_ERRORS: &str = "// @ts-nocheck\n\
+         const TE = TypeError.prototype, RE = ReferenceError.prototype;\n\
+         let called = 0;\n\
+         function check(label, run, proto) { try { run(); console.log(label, 'no throw'); } catch (e) { console.log(label, Object.getPrototypeOf(e) === proto, e.message, called); } }\n\
+         class C {}\n\
+         class B { m() { return 1; } }\n\
+         class D extends B { m() { delete super.x; } }\n\
+         function f() {}\n\
+         globalThis.TypeError = function () { called++; return { custom: true }; };\n\
+         globalThis.ReferenceError = function () { called++; return { custom: true }; };\n\
+         check('call', () => C(), TE);\n\
+         check('super', () => new D().m(), RE);\n\
+         check('target', () => { f() = 1; }, RE);\n\
+         delete globalThis.TypeError;\n\
+         delete globalThis.ReferenceError;\n\
+         check('call', () => C(), TE);\n\
+         check('super', () => new D().m(), RE);\n\
+         check('target', () => { f() = 1; }, RE);\n";
+
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    const LANGUAGE_ERROR_OUTPUT: &str = "call true Class constructor C cannot be invoked without 'new' 0\n\
+         super true Unsupported reference to 'super' 0\n\
+         target true Invalid left-hand side in assignment 0\n\
+         call true Class constructor C cannot be invoked without 'new' 0\n\
+         super true Unsupported reference to 'super' 0\n\
+         target true Invalid left-hand side in assignment 0\n";
+
+    #[cfg(all(feature = "node-host", feature = "host-jit"))]
+    #[test]
+    fn language_errors_ignore_the_global_constructor_in_the_interpreter_and_jit() {
+        let (directory, entrypoint) =
+            script_fixture("language-errors", LANGUAGE_ERRORS).expect("the fixture");
+        let executable = compile_source_file(&entrypoint).expect("the fixture compiles");
+        let mut host = bamts_node::NodeHost::new();
+        bamts_runtime::run(executable.wire(), &mut host, &bamts_runtime::Limits::default())
+            .expect("the interpreter runs the program");
+        assert_eq!(String::from_utf8_lossy(host.stdout()), LANGUAGE_ERROR_OUTPUT);
+        let compiled = bamts_codegen::compile_jit(executable.wire()).expect("the JIT compiles");
+        let mut host = bamts_node::NodeHost::new();
+        let (tiered, _) = bamts_runtime::run_linked_program_tiered(
+            executable.wire(),
+            &compiled,
+            &mut host,
+            &bamts_runtime::Limits::default(),
+            bamts_runtime::WarmupPolicy::DEFAULT,
+            bamts_cancel::CancellationToken::new(),
+        )
+        .expect("the tiered program links");
+        let outcome = tiered.expect("native code runs the program");
+        let mut stdout = host.stdout().to_vec();
+        stdout.extend_from_slice(&outcome.stdout);
+        assert_eq!(String::from_utf8_lossy(&stdout), LANGUAGE_ERROR_OUTPUT);
+        remove_fixture(&directory).expect("the fixture is removed");
+    }
+
     #[test]
     fn compiles_complete_program_with_module_local_function_ids() -> Result<(), Box<dyn Error>> {
         let (directory, entrypoint) = fixture("compile")?;
