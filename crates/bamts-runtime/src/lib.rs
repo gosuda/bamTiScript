@@ -6825,6 +6825,12 @@ impl<'a, H: Host> Machine<'a, H> {
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
                 }
+                Instruction::RequireGlobalBinding { name } => {
+                    match self.require_global_binding(module_id, name) {
+                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
                 Instruction::Export { .. } => {
                     return Err(self.error_here_at(
                         RuntimeErrorKind::InvalidVerifiedProgram {
@@ -7093,6 +7099,40 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         self.missing_global = Some(name);
         Ok(None)
+    }
+
+    /// `PutValue` on an unresolvable reference in strict code: a declarative
+    /// global binding or any property the global object has, inherited ones
+    /// included, is bound. No getter runs; a binding in its temporal dead
+    /// zone throws the same `ReferenceError` a read would.
+    pub(crate) fn require_global_binding(
+        &mut self,
+        module: ModuleId,
+        name: ConstantId,
+    ) -> Result<(), EvalFailure> {
+        if let Some(cell) = self
+            .registry
+            .modules
+            .get(module.get() as usize)
+            .and_then(|instance| instance.constant_cells.get(name.get() as usize))
+            .copied()
+            .flatten()
+        {
+            if self.registry.cells[cell.0].value.is_uninitialized() {
+                return Err(self.uninitialized_read());
+            }
+            return Ok(());
+        }
+        let name = self.constant_text(module, name).to_owned();
+        let key = PropertyKey::Named(self.intern(name.clone()));
+        let global = self.context_global.unwrap_or(self.global_object);
+        if self.internal_has_property(global, &key)? {
+            return Ok(());
+        }
+        Err(self.intrinsic_error(
+            "ReferenceError",
+            format!("{} is not defined", name.to_utf8_lossy()),
+        ))
     }
 
     fn intern(&mut self, text: EcmaString) -> Atom {
@@ -8621,6 +8661,18 @@ impl<'a, H: Host> Machine<'a, H> {
             Ok(value) => EvalFailure::ThrowValue(value),
             Err(kind) => EvalFailure::Runtime(kind),
         }
+    }
+
+    /// A thrown error object built from the realm's own `constructor`
+    /// intrinsic, whatever guest code has since stored in the global binding
+    /// of that name.
+    pub(crate) fn intrinsic_error(&mut self, constructor: &str, message: String) -> EvalFailure {
+        let id = self
+            .intrinsics
+            .builtins
+            .id_named(constructor)
+            .expect("error constructor is installed");
+        self.throw_error(id, message)
     }
 
     pub(crate) fn has_own_property_key(
@@ -19449,6 +19501,326 @@ mod tests {
             vec![entry, getter],
         );
         assert_eq!(run_ok(&module).value, Value::int32(99));
+    }
+
+    fn global_binding_constants() -> Vec<Constant> {
+        vec![
+            Constant::String(EcmaString::encode("globalThis")),
+            Constant::String(EcmaString::encode("gets")),
+            Constant::String(EcmaString::encode("sets")),
+            Constant::String(EcmaString::encode("x")),
+            Constant::Int32(0),
+            Constant::Int32(1),
+            Constant::Int32(100),
+            Constant::Int32(41),
+            Constant::String(EcmaString::encode("undeclared")),
+        ]
+    }
+
+    fn counter_bump(counter: u32, base: u32) -> [Instruction; 3] {
+        [
+            Instruction::LoadGlobal {
+                dst: reg(base),
+                name: cid(counter),
+            },
+            Instruction::Binary {
+                dst: reg(base),
+                op: BinaryOp::Add,
+                left: reg(base),
+                right: reg(base + 1),
+            },
+            Instruction::StoreGlobal {
+                name: cid(counter),
+                value: reg(base),
+            },
+        ]
+    }
+
+    /// A strict script that installs a counting accessor pair on global `x`,
+    /// ends its getter with `getter_tail`, runs `assignment`, and returns
+    /// `gets * 100 + sets`.
+    fn global_accessor_program(
+        getter_tail: Instruction,
+        assignment: &[Instruction],
+    ) -> Program<Verified> {
+        let mut entry = vec![
+            Instruction::LoadConst {
+                dst: reg(0),
+                constant: cid(4),
+            },
+            Instruction::StoreGlobal {
+                name: cid(1),
+                value: reg(0),
+            },
+            Instruction::StoreGlobal {
+                name: cid(2),
+                value: reg(0),
+            },
+            Instruction::LoadGlobal {
+                dst: reg(1),
+                name: cid(0),
+            },
+            Instruction::CreateArray { dst: reg(2) },
+            Instruction::CreateClosure {
+                dst: reg(3),
+                function: FunctionId::new(1),
+                captures: reg(2),
+            },
+            Instruction::CreateClosure {
+                dst: reg(4),
+                function: FunctionId::new(2),
+                captures: reg(2),
+            },
+            Instruction::LoadConst {
+                dst: reg(5),
+                constant: cid(3),
+            },
+            Instruction::DefineAccessor {
+                object: reg(1),
+                key: reg(5),
+                accessor: reg(3),
+                kind: AccessorKind::Getter,
+            },
+            Instruction::DefineAccessor {
+                object: reg(1),
+                key: reg(5),
+                accessor: reg(4),
+                kind: AccessorKind::Setter,
+            },
+            Instruction::LoadConst {
+                dst: reg(8),
+                constant: cid(5),
+            },
+        ];
+        entry.extend_from_slice(assignment);
+        entry.extend([
+            Instruction::LoadGlobal {
+                dst: reg(9),
+                name: cid(1),
+            },
+            Instruction::LoadConst {
+                dst: reg(10),
+                constant: cid(6),
+            },
+            Instruction::Binary {
+                dst: reg(9),
+                op: BinaryOp::Multiply,
+                left: reg(9),
+                right: reg(10),
+            },
+            Instruction::LoadGlobal {
+                dst: reg(10),
+                name: cid(2),
+            },
+            Instruction::Binary {
+                dst: reg(9),
+                op: BinaryOp::Add,
+                left: reg(9),
+                right: reg(10),
+            },
+            Instruction::Return { value: reg(9) },
+        ]);
+        let mut getter = vec![Instruction::LoadConst {
+            dst: reg(1),
+            constant: cid(5),
+        }];
+        getter.extend(counter_bump(1, 0));
+        getter.extend([getter_tail, Instruction::Return { value: reg(0) }]);
+        let mut setter = vec![Instruction::LoadConst {
+            dst: reg(2),
+            constant: cid(5),
+        }];
+        setter.extend(counter_bump(2, 1));
+        setter.push(Instruction::Return { value: reg(1) });
+        verified(
+            global_binding_constants(),
+            vec![
+                function(0, 11, entry, Vec::new()),
+                function(0, 2, getter, Vec::new()),
+                function(1, 3, setter, Vec::new()),
+            ],
+        )
+    }
+
+    /// Asserts `value` is an error object built on the realm's own
+    /// `constructor` prototype with own `message`.
+    fn assert_intrinsic_error<H: Host>(
+        machine: &mut Machine<'_, H>,
+        value: Value,
+        constructor: &str,
+        message: &str,
+    ) {
+        let id = machine.intrinsics.builtins.id_named(constructor).unwrap();
+        let expected = machine.intrinsics.error_prototype(id);
+        let slot = machine.runtime_slot(value).unwrap().expect("an error object");
+        let HeapEntry::Object { prototype, .. } = &machine.heap[slot] else {
+            panic!("{constructor} must be an ordinary object");
+        };
+        assert_eq!(*prototype, Some(expected), "{constructor} prototype");
+        assert_eq!(
+            machine
+                .own_data_property(slot, "message")
+                .and_then(|text| machine.string_value(text)),
+            Some(EcmaString::encode(message))
+        );
+    }
+
+    fn uncaught_value(error: RuntimeError) -> Value {
+        match error.kind {
+            RuntimeErrorKind::UncaughtThrow { value, .. } => value,
+            kind => panic!("expected an uncaught throw, got {kind:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_simple_global_assignment_runs_only_the_setter() {
+        let program = global_accessor_program(
+            Instruction::Throw { value: reg(0) },
+            &[
+                Instruction::RequireGlobalBinding { name: cid(3) },
+                Instruction::StoreGlobal {
+                    name: cid(3),
+                    value: reg(8),
+                },
+            ],
+        );
+        assert_eq!(run_ok(&program).value, Value::int32(1));
+    }
+
+    #[test]
+    fn strict_compound_global_assignment_runs_the_getter_once() {
+        let program = global_accessor_program(
+            Instruction::LoadConst {
+                dst: reg(0),
+                constant: cid(7),
+            },
+            &[
+                Instruction::LoadGlobal {
+                    dst: reg(6),
+                    name: cid(3),
+                },
+                Instruction::Binary {
+                    dst: reg(6),
+                    op: BinaryOp::Add,
+                    left: reg(6),
+                    right: reg(8),
+                },
+                Instruction::RequireGlobalBinding { name: cid(3) },
+                Instruction::StoreGlobal {
+                    name: cid(3),
+                    value: reg(6),
+                },
+            ],
+        );
+        assert_eq!(run_ok(&program).value, Value::int32(101));
+    }
+
+    #[test]
+    fn strict_assignment_to_an_undeclared_global_throws_and_creates_nothing() {
+        let program = verified(
+            global_binding_constants(),
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(5),
+                    },
+                    Instruction::RequireGlobalBinding { name: cid(8) },
+                    Instruction::StoreGlobal {
+                        name: cid(8),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let value = uncaught_value(machine.evaluate().unwrap_err());
+        assert_intrinsic_error(
+            &mut machine,
+            value,
+            "ReferenceError",
+            "undeclared is not defined",
+        );
+        let global = machine.global_object;
+        let key = PropertyKey::Named(machine.intern_str("undeclared"));
+        assert!(!machine.has_own_property_key(global, &key).unwrap());
+    }
+
+    #[test]
+    fn sloppy_assignment_to_an_undeclared_global_creates_it() {
+        let sloppy = Function::new(
+            None,
+            0,
+            0,
+            1,
+            FunctionFlags {
+                is_sloppy: true,
+                ..FunctionFlags::default()
+            },
+            vec![
+                Instruction::LoadConst {
+                    dst: reg(0),
+                    constant: cid(5),
+                },
+                Instruction::StoreGlobal {
+                    name: cid(8),
+                    value: reg(0),
+                },
+                Instruction::Return { value: reg(0) },
+            ],
+            Vec::new(),
+        );
+        let program = verified(global_binding_constants(), vec![sloppy]);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.evaluate().unwrap();
+        assert_eq!(machine.test_global("undeclared"), Some(Value::int32(1)));
+    }
+
+    #[test]
+    fn strict_assignment_to_a_lexical_global_in_its_dead_zone_throws() {
+        let module = program_module(
+            "tdz",
+            global_binding_constants(),
+            vec![function(
+                0,
+                1,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(6),
+                    },
+                    Instruction::RequireGlobalBinding { name: cid(4) },
+                    Instruction::StoreGlobal {
+                        name: cid(4),
+                        value: reg(0),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            )],
+            Vec::new(),
+            vec![Binding {
+                name: cid(4),
+                kind: BindingKind::Lexical,
+            }],
+            Vec::new(),
+        );
+        let program = linked(vec![module], 0);
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let value = uncaught_value(machine.evaluate().unwrap_err());
+        assert_intrinsic_error(
+            &mut machine,
+            value,
+            "ReferenceError",
+            "Cannot access lexical binding before initialization",
+        );
     }
 
     #[test]

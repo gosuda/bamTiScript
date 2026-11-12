@@ -528,6 +528,9 @@ pub enum Helper {
     /// `bamts_get_template_object(frame, cooked, raw, out)`: return the
     /// template object interned by cooked-array identity.
     GetTemplateObject,
+    /// `bamts_require_global_binding(frame, name, out)`: throw a
+    /// `ReferenceError` unless the global `name` is bound, reading no value.
+    RequireGlobalBinding,
 }
 
 impl Helper {
@@ -588,6 +591,7 @@ impl Helper {
             Helper::ImportDynamicAttributes => "bamts_import_dynamic_attributes",
             Helper::CopyDataProperties => "bamts_copy_data_properties",
             Helper::GetTemplateObject => "bamts_get_template_object",
+            Helper::RequireGlobalBinding => "bamts_require_global_binding",
         }
     }
 
@@ -649,6 +653,7 @@ impl Helper {
             Helper::ImportDynamicAttributes => 50,
             Helper::CopyDataProperties => 51,
             Helper::GetTemplateObject => 52,
+            Helper::RequireGlobalBinding => 53,
         }
     }
 
@@ -710,6 +715,7 @@ impl Helper {
             50 => Some(Helper::ImportDynamicAttributes),
             51 => Some(Helper::CopyDataProperties),
             52 => Some(Helper::GetTemplateObject),
+            53 => Some(Helper::RequireGlobalBinding),
             _ => None,
         }
     }
@@ -739,6 +745,7 @@ impl Helper {
             Helper::Import
             | Helper::LoadGlobal
             | Helper::TypeOfGlobal
+            | Helper::RequireGlobalBinding
             | Helper::CreatePrivateName
             | Helper::ConsumeFuel => &[types::I64, types::I32, types::I64],
             // (frame, value, out)
@@ -1840,6 +1847,14 @@ impl<'a> Lowering<'a> {
                 );
                 self.route_completion(pc, tag, None);
             }
+            Instruction::RequireGlobalBinding { name } => {
+                let name_id = self.iconst32(i64::from(name.get()));
+                let tag = self.call_helper(
+                    Helper::RequireGlobalBinding,
+                    &[self.frame, name_id, self.out],
+                );
+                self.route_completion(pc, tag, None);
+            }
             Instruction::TypeOfGlobal { dst, name } => {
                 let name_id = self.iconst32(i64::from(name.get()));
                 let tag = self.call_helper(Helper::TypeOfGlobal, &[self.frame, name_id, self.out]);
@@ -2562,6 +2577,7 @@ fn routes_to_handler(instruction: Instruction) -> bool {
         | Instruction::ImportDynamicAttributes { .. }
         | Instruction::CopyDataProperties { .. }
         | Instruction::GetTemplateObject { .. }
+        | Instruction::RequireGlobalBinding { .. }
         | Instruction::Suspend { .. }
         | Instruction::Await { .. }
         | Instruction::Throw { .. } => true,
@@ -2641,7 +2657,8 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::ImportAttributes { .. }
         | Instruction::ImportDynamicAttributes { .. }
         | Instruction::CopyDataProperties { .. }
-        | Instruction::GetTemplateObject { .. } => false,
+        | Instruction::GetTemplateObject { .. }
+        | Instruction::RequireGlobalBinding { .. } => false,
     }
 }
 
@@ -2756,7 +2773,8 @@ impl NormalSuccessors for Instruction {
             | Instruction::ImportAttributes { .. }
             | Instruction::ImportDynamicAttributes { .. }
             | Instruction::CopyDataProperties { .. }
-            | Instruction::GetTemplateObject { .. } => visit(pc + 1),
+            | Instruction::GetTemplateObject { .. }
+            | Instruction::RequireGlobalBinding { .. } => visit(pc + 1),
         }
     }
 }
@@ -2962,6 +2980,7 @@ mod tests {
             Helper::ImportDynamicAttributes,
             Helper::CopyDataProperties,
             Helper::GetTemplateObject,
+            Helper::RequireGlobalBinding,
         ];
         let mut symbols = BTreeSet::new();
         for (expected_index, helper) in helpers.iter().copied().enumerate() {
@@ -2974,8 +2993,8 @@ mod tests {
             );
             assert!(symbols.insert(helper.symbol()), "unique symbol {helper:?}");
         }
-        assert_eq!(symbols.len(), 53);
-        assert_eq!(Helper::from_external_index(53), None);
+        assert_eq!(symbols.len(), 54);
+        assert_eq!(Helper::from_external_index(54), None);
     }
     #[test]
     fn iterator_close_helpers_use_the_pinned_abis() {

@@ -20,7 +20,7 @@ use crate::Helper;
 /// grows a helper must extend [`helper_demand`] or [`STRUCTURAL_HELPERS`] and
 /// raise this bound; [`verify_helper_coverage`] refuses to certify coverage
 /// against an unexamined helper set.
-pub const EXPECTED_HELPER_COUNT: u32 = 53;
+pub const EXPECTED_HELPER_COUNT: u32 = 54;
 
 /// Helpers that no opcode requests.
 ///
@@ -123,6 +123,9 @@ pub const fn helper_demand(instruction: Instruction) -> HelperDemand {
         }
         Instruction::CopyDataProperties { .. } => HelperDemand::Call(Helper::CopyDataProperties),
         Instruction::GetTemplateObject { .. } => HelperDemand::Call(Helper::GetTemplateObject),
+        Instruction::RequireGlobalBinding { .. } => {
+            HelperDemand::Call(Helper::RequireGlobalBinding)
+        }
 
         // Both conditional branches test the same runtime truthiness predicate,
         // differing only in the native branch polarity.
@@ -143,7 +146,7 @@ pub const fn helper_demand(instruction: Instruction) -> HelperDemand {
 /// only on which variant each entry selects. Keeping one entry per opcode makes
 /// [`verify_helper_coverage`] a statement about the whole algebra rather than
 /// about a sampled subset.
-pub const ISA_REPRESENTATIVES: [Instruction; 58] = [
+pub const ISA_REPRESENTATIVES: [Instruction; 59] = [
     Instruction::LoadConst {
         dst: Register::new(0),
         constant: ConstantId::new(0),
@@ -400,6 +403,9 @@ pub const ISA_REPRESENTATIVES: [Instruction; 58] = [
         cooked: Register::new(117),
         raw: Register::new(118),
     },
+    Instruction::RequireGlobalBinding {
+        name: ConstantId::new(10),
+    },
     Instruction::Halt,
 ];
 
@@ -610,7 +616,7 @@ mod tests {
             .collect();
         let total = discriminants.len();
         discriminants.dedup();
-        assert_eq!(total, 58, "the algebra has 58 opcodes");
+        assert_eq!(total, 59, "the algebra has 59 opcodes");
         assert_eq!(
             discriminants.len(),
             total,

@@ -424,6 +424,9 @@ fn helper_address(helper: Helper) -> *const u8 {
         }
         Helper::CopyDataProperties => bamts_native::bamts_copy_data_properties as *const u8,
         Helper::GetTemplateObject => bamts_native::bamts_get_template_object as *const u8,
+        Helper::RequireGlobalBinding => {
+            bamts_native::bamts_require_global_binding as *const u8
+        }
     }
 }
 

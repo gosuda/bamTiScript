@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use bamts_bytecode::{
-    BinaryOp, Constant, ConstantId, EcmaString, Function, FunctionFlags, FunctionId, Instruction,
-    Module, ModuleId, Pc, Program, ProgramModule, Register, Verified,
+    AccessorKind, BinaryOp, Constant, ConstantId, EcmaString, Function, FunctionFlags, FunctionId,
+    Instruction, Module, ModuleId, Pc, Program, ProgramModule, Register, Verified,
 };
 use bamts_codegen::compile_jit;
 use bamts_codegen::helpers::{
@@ -16,7 +16,7 @@ use bamts_native::tiering::{
 };
 use bamts_native::{Completion, CompletionTag, NativeEntryTable, ShadowFrame, Value};
 use bamts_runtime::{
-    CancellationToken, Host, Limits, NativeError, RuntimeError, TieredRunReport,
+    CancellationToken, Host, Limits, NativeError, RuntimeError, RuntimeErrorKind, TieredRunReport,
     UnitTieringSummary, run as run_interpreter, run_linked_program, run_linked_program_tiered,
 };
 
@@ -212,8 +212,8 @@ fn every_classified_opcode_and_helper_is_accounted_for() {
 
     let expected: BTreeSet<_> = (0..bamts_native::HELPER_COUNT).collect();
     assert_eq!(helpers, expected, "every runtime helper must be reachable");
-    assert_eq!(ISA_REPRESENTATIVES.len(), 58, "append-only ISA changed");
-    assert_eq!(helpers.len(), 53, "runtime helper namespace changed");
+    assert_eq!(ISA_REPRESENTATIVES.len(), 59, "append-only ISA changed");
+    assert_eq!(helpers.len(), 54, "runtime helper namespace changed");
 }
 
 #[test]
@@ -955,4 +955,251 @@ fn generator_loop_dispatch_accepts_resume_and_osr_tokens() {
     let (tag, _, bits) = run(0x1234);
     assert_eq!(tag, Ok(CompletionTag::FatalTrap));
     assert_eq!(bits, 1);
+}
+
+fn module_program(constants: Vec<Constant>, functions: Vec<Function>) -> Program<Verified> {
+    let module = ProgramModule {
+        name: ConstantId::new(0),
+        code: Module::new(constants, functions, FunctionId::new(0))
+            .verify()
+            .expect("global binding fixture must verify"),
+        edges: Vec::new(),
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+    Program::link(vec![module], ModuleId::new(0)).expect("global binding fixture must link")
+}
+
+fn global_binding_constants() -> Vec<Constant> {
+    vec![
+        Constant::String(EcmaString::encode("entry")),
+        Constant::String(EcmaString::encode("print")),
+        Constant::Undefined,
+        Constant::String(EcmaString::encode("globalThis")),
+        Constant::String(EcmaString::encode("gets")),
+        Constant::String(EcmaString::encode("sets")),
+        Constant::String(EcmaString::encode("x")),
+        Constant::Int32(0),
+        Constant::Int32(1),
+        Constant::Int32(100),
+        Constant::Int32(41),
+        Constant::String(EcmaString::encode("undeclared")),
+    ]
+}
+
+fn counter_bump(counter: u32, base: u32) -> [Instruction; 3] {
+    [
+        Instruction::LoadGlobal {
+            dst: reg(base),
+            name: cid(counter),
+        },
+        Instruction::Binary {
+            dst: reg(base),
+            op: BinaryOp::Add,
+            left: reg(base),
+            right: reg(base + 1),
+        },
+        Instruction::StoreGlobal {
+            name: cid(counter),
+            value: reg(base),
+        },
+    ]
+}
+
+/// A strict script that installs a counting accessor pair on global `x`,
+/// ends its getter with `getter_tail`, runs `assignment`, and prints `gets * 100 + sets`.
+fn global_accessor_program(getter_tail: Instruction, assignment: &[Instruction]) -> Program<Verified> {
+    let mut entry = vec![
+        Instruction::LoadConst {
+            dst: reg(0),
+            constant: cid(7),
+        },
+        Instruction::StoreGlobal {
+            name: cid(4),
+            value: reg(0),
+        },
+        Instruction::StoreGlobal {
+            name: cid(5),
+            value: reg(0),
+        },
+        Instruction::LoadGlobal {
+            dst: reg(1),
+            name: cid(3),
+        },
+        Instruction::CreateArray { dst: reg(2) },
+        Instruction::CreateClosure {
+            dst: reg(3),
+            function: FunctionId::new(1),
+            captures: reg(2),
+        },
+        Instruction::CreateClosure {
+            dst: reg(4),
+            function: FunctionId::new(2),
+            captures: reg(2),
+        },
+        Instruction::LoadConst {
+            dst: reg(5),
+            constant: cid(6),
+        },
+        Instruction::DefineAccessor {
+            object: reg(1),
+            key: reg(5),
+            accessor: reg(3),
+            kind: AccessorKind::Getter,
+        },
+        Instruction::DefineAccessor {
+            object: reg(1),
+            key: reg(5),
+            accessor: reg(4),
+            kind: AccessorKind::Setter,
+        },
+        Instruction::LoadConst {
+            dst: reg(8),
+            constant: cid(8),
+        },
+    ];
+    entry.extend_from_slice(assignment);
+    entry.extend([
+        Instruction::LoadGlobal {
+            dst: reg(9),
+            name: cid(4),
+        },
+        Instruction::LoadConst {
+            dst: reg(10),
+            constant: cid(9),
+        },
+        Instruction::Binary {
+            dst: reg(9),
+            op: BinaryOp::Multiply,
+            left: reg(9),
+            right: reg(10),
+        },
+        Instruction::LoadGlobal {
+            dst: reg(10),
+            name: cid(5),
+        },
+        Instruction::Binary {
+            dst: reg(9),
+            op: BinaryOp::Add,
+            left: reg(9),
+            right: reg(10),
+        },
+    ]);
+    entry.extend(print_suffix(reg(9), 11));
+    let mut getter = vec![Instruction::LoadConst {
+        dst: reg(1),
+        constant: cid(8),
+    }];
+    getter.extend(counter_bump(4, 0));
+    getter.push(getter_tail);
+    getter.push(Instruction::Return { value: reg(0) });
+    let mut setter = vec![Instruction::LoadConst {
+        dst: reg(2),
+        constant: cid(8),
+    }];
+    setter.extend(counter_bump(5, 1));
+    setter.push(Instruction::Return { value: reg(1) });
+    module_program(
+        global_binding_constants(),
+        vec![
+            function(15, entry),
+            function(2, getter),
+            Function::new(None, 0, 1, 3, FunctionFlags::default(), setter, Vec::new()),
+        ],
+    )
+}
+
+fn assert_prints(name: &str, program: &Program<Verified>, expected: &str) {
+    assert_differential(name, program, &Limits::default());
+    assert_eq!(
+        interpreter(program, &Limits::default()),
+        Observable::Normal {
+            stdout: expected.as_bytes().to_vec(),
+            exit_code: 0,
+        },
+        "{name}"
+    );
+}
+
+fn assert_uncaught(name: &str, program: &Program<Verified>, constructor: &str, message: &str) {
+    assert_differential(name, program, &Limits::default());
+    let Observable::Abrupt(error) = interpreter(program, &Limits::default()) else {
+        panic!("{name} must throw");
+    };
+    let RuntimeErrorKind::UncaughtThrow {
+        constructor_name,
+        message: thrown,
+        ..
+    } = error.kind
+    else {
+        panic!("{name} must end in an uncaught throw: {error:?}");
+    };
+    assert_eq!(constructor_name, Some(EcmaString::encode(constructor)), "{name}");
+    assert_eq!(thrown, Some(EcmaString::encode(message)), "{name}");
+}
+
+#[test]
+fn strict_simple_assignment_runs_only_the_global_setter() {
+    let program = global_accessor_program(
+        Instruction::Throw { value: reg(0) },
+        &[
+            Instruction::RequireGlobalBinding { name: cid(6) },
+            Instruction::StoreGlobal {
+                name: cid(6),
+                value: reg(8),
+            },
+        ],
+    );
+    assert_prints("x = 1 under a throwing getter", &program, "1\n");
+}
+
+#[test]
+fn strict_compound_assignment_runs_the_global_getter_once() {
+    let program = global_accessor_program(
+        Instruction::LoadConst {
+            dst: reg(0),
+            constant: cid(10),
+        },
+        &[
+            Instruction::LoadGlobal {
+                dst: reg(6),
+                name: cid(6),
+            },
+            Instruction::Binary {
+                dst: reg(6),
+                op: BinaryOp::Add,
+                left: reg(6),
+                right: reg(8),
+            },
+            Instruction::RequireGlobalBinding { name: cid(6) },
+            Instruction::StoreGlobal {
+                name: cid(6),
+                value: reg(6),
+            },
+        ],
+    );
+    assert_prints("y += 1 under a counting getter", &program, "101\n");
+}
+
+#[test]
+fn strict_assignment_to_an_undeclared_global_throws_and_creates_nothing() {
+    let mut code = vec![
+        Instruction::LoadConst {
+            dst: reg(0),
+            constant: cid(8),
+        },
+        Instruction::RequireGlobalBinding { name: cid(11) },
+        Instruction::StoreGlobal {
+            name: cid(11),
+            value: reg(0),
+        },
+    ];
+    code.extend(print_suffix(reg(0), 1));
+    let program = module_program(global_binding_constants(), vec![function(5, code)]);
+    assert_uncaught(
+        "undeclared = 1",
+        &program,
+        "ReferenceError",
+        "undeclared is not defined",
+    );
 }

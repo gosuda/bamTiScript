@@ -1,4 +1,4 @@
-//! Bytecode verifier co-extension (E1.2) for ISA tags 52..=57.
+//! Bytecode verifier co-extension (E1.2) for ISA tags 52..=58.
 //!
 //! Every opcode [`crate::isa`] adds is checked here for constant type,
 //! register/constant/PC bounds, operand aliasing, and control-flow
@@ -166,6 +166,7 @@ pub fn verify_extension(
             check_register(cooked)?;
             check_register(raw)?;
         }
+        Instruction::RequireGlobalBinding { name } => check_string_constant(name)?,
     }
 
     let mut successor_error = None;
@@ -388,6 +389,31 @@ mod tests {
             2,
         )
         .expect("a string specifier verifies");
+    }
+
+    #[test]
+    fn require_global_binding_requires_an_in_bounds_string_name() {
+        let check = |constants: &[Constant], name: u32| {
+            verify_extension(
+                0,
+                0,
+                Instruction::RequireGlobalBinding {
+                    name: ConstantId::new(name),
+                },
+                1,
+                constants,
+                2,
+            )
+        };
+        assert!(matches!(
+            check(&[Constant::Int32(1)], 0).expect_err("Int32 is not a name").kind,
+            Kind::StringConstantExpected { constant } if constant.get() == 0
+        ));
+        assert!(matches!(
+            check(&strings(&["x"]), 2).expect_err("constant 2 of 1").kind,
+            Kind::ConstantOutOfBounds { constant, constant_count: 1 } if constant.get() == 2
+        ));
+        check(&strings(&["x"]), 0).expect("a string name verifies");
     }
 
     #[test]
