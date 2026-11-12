@@ -1761,10 +1761,10 @@ impl Walker<'_> {
                 }
             }
             Expression::Literal(Literal::Regex(literal)) => {
-                if let Some(text) = self.file.token_text(literal.data().token()) {
-                    if crate::regexp::validate_regex_literal(text).is_some() {
-                        self.error(expression.range(), "invalid regular expression");
-                    }
+                if let Some(text) = self.file.token_text(literal.data().token())
+                    && crate::regexp::validate_regex_literal(text).is_some()
+                {
+                    self.error(expression.range(), "invalid regular expression");
                 }
             }
             Expression::Literal(Literal::String(literal)) if context.strict => {
@@ -2607,7 +2607,9 @@ mod tests {
         for source in ["/./gig;", "/./G;", "/./uv;", "/./uu;", "/./sG;"] {
             assert!(!errors(source).is_empty(), "{source}");
         }
-        for source in ["/./g;", "/./gi;", "/./d;", "/./s;", "/./y;", "/./v;", "/./u;"] {
+        for source in [
+            "/./g;", "/./gi;", "/./d;", "/./s;", "/./y;", "/./v;", "/./u;",
+        ] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
     }
@@ -2705,7 +2707,8 @@ mod tests {
         ] {
             assert!(!errors(source).is_empty(), "{source}");
         }
-        for source in ["/[\\p{Hex}\\P{Hex}]/u;"] {
+        {
+            let source = "/[\\p{Hex}\\P{Hex}]/u;";
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
     }
@@ -2723,33 +2726,17 @@ mod tests {
         ] {
             assert!(!errors(source).is_empty(), "{source}");
         }
-        for source in [
-            "/\\cA/u;",
-            "/\\n/u;",
-            "/\\d/u;",
-            "/a{2,3}/;",
-            "/(?=a)/;",
-        ] {
+        for source in ["/\\cA/u;", "/\\n/u;", "/\\d/u;", "/a{2,3}/;", "/(?=a)/;"] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
     }
 
     #[test]
     fn invalid_regex_unicode_sets_are_rejected() {
-        for source in [
-            "/[(]/v;",
-            "/[-]/v;",
-            "/[&&]/v;",
-            "/[!!]/v;",
-            "/[^^^]/v;",
-        ] {
+        for source in ["/[(]/v;", "/[-]/v;", "/[&&]/v;", "/[!!]/v;", "/[^^^]/v;"] {
             assert!(!errors(source).is_empty(), "{source}");
         }
-        for source in [
-            "/^[[0-9]--_]+$/v;",
-            "/^[\\d--_]+$/v;",
-            "/[\\(]/v;",
-        ] {
+        for source in ["/^[[0-9]--_]+$/v;", "/^[\\d--_]+$/v;", "/[\\(]/v;"] {
             assert_eq!(errors(source), Vec::<String>::new(), "{source}");
         }
     }
@@ -2873,10 +2860,7 @@ mod tests {
         for source in ["using x = null;", "await using x = null;"] {
             assert!(!script_errors(source).is_empty(), "{source}");
         }
-        for source in [
-            "{ using x = null; }",
-            "function f() { using x = null; }",
-        ] {
+        for source in ["{ using x = null; }", "function f() { using x = null; }"] {
             assert_eq!(script_errors(source), Vec::<String>::new(), "{source}");
         }
         assert_eq!(errors("using x = null;"), Vec::<String>::new());

@@ -1,5 +1,5 @@
-use std::collections::BTreeSet;
 use crate::scanner::{is_id_continue, is_id_start};
+use std::collections::BTreeSet;
 
 const BINARY_PROPS: &[&str] = &[
     "AHex",
@@ -532,7 +532,14 @@ const STRING_PROPS: &[&str] = &[
     "RGI_Emoji_Tag_Sequence",
     "RGI_Emoji_ZWJ_Sequence",
 ];
-const TABLE65_NAMES: &[&str] = &["General_Category", "Script", "Script_Extensions", "gc", "sc", "scx"];
+const TABLE65_NAMES: &[&str] = &[
+    "General_Category",
+    "Script",
+    "Script_Extensions",
+    "gc",
+    "sc",
+    "scx",
+];
 
 #[derive(Clone, Copy)]
 enum RegexMode {
@@ -568,14 +575,14 @@ fn validate_flags(flags: &[u16]) -> Option<String> {
         let flag = u32::from(unit);
         let valid = matches!(flag, 0x64 | 0x67 | 0x69 | 0x6D | 0x73 | 0x75 | 0x76 | 0x79);
         if !valid {
-            return Some(format!("invalid regular expression flag"));
+            return Some("invalid regular expression flag".to_string());
         }
         if !seen.insert(unit) {
-            return Some(format!("duplicate regular expression flag"));
+            return Some("duplicate regular expression flag".to_string());
         }
     }
     if seen.contains(&0x75) && seen.contains(&0x76) {
-        return Some(format!("regular expression flags `u` and `v` cannot be combined"));
+        return Some("regular expression flags `u` and `v` cannot be combined".to_string());
     }
     None
 }
@@ -615,8 +622,20 @@ enum ClassOperand {
 fn is_class_set_syntax_char(unit: u16) -> bool {
     matches!(
         unit,
-        0x28 | 0x29 | 0x5B | 0x5D | 0x7B | 0x7D | 0x2F | 0x7C | 0x2D | 0x5E | 0x24 | 0x2E
-            | 0x2A | 0x2B | 0x3F
+        0x28 | 0x29
+            | 0x5B
+            | 0x5D
+            | 0x7B
+            | 0x7D
+            | 0x2F
+            | 0x7C
+            | 0x2D
+            | 0x5E
+            | 0x24
+            | 0x2E
+            | 0x2A
+            | 0x2B
+            | 0x3F
     )
 }
 
@@ -706,9 +725,7 @@ impl<'a> Parser<'a> {
             Some(0x5C) => self.parse_escape(),
             Some(0x29) => Some(invalid_pattern()),
             None => None,
-            Some(0x7B) if is_braced_quantifier_at(self.units, self.pos) => {
-                Some(invalid_pattern())
-            }
+            Some(0x7B) if is_braced_quantifier_at(self.units, self.pos) => Some(invalid_pattern()),
             _ => {
                 if matches!(self.mode, RegexMode::Unicode | RegexMode::UnicodeSets)
                     && matches!(self.peek(), Some(0x7B) | Some(0x7D) | Some(0x5D))
@@ -716,7 +733,9 @@ impl<'a> Parser<'a> {
                     return Some(invalid_pattern());
                 }
                 self.pos += 1;
-                if let Some(message) = self.skip_quantifier() { return Some(message); }
+                if let Some(message) = self.skip_quantifier() {
+                    return Some(message);
+                }
                 None
             }
         }
@@ -758,10 +777,10 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(0x3F) {
             self.pos += 1;
         }
-        if let Some(hi) = high {
-            if hi < low {
-                return Some(invalid_pattern());
-            }
+        if let Some(hi) = high
+            && hi < low
+        {
+            return Some(invalid_pattern());
         }
         None
     }
@@ -773,7 +792,9 @@ impl<'a> Parser<'a> {
             if !(0x30..=0x39).contains(&unit) {
                 break;
             }
-            value = value.saturating_mul(10).saturating_add((unit - 0x30) as usize);
+            value = value
+                .saturating_mul(10)
+                .saturating_add((unit - 0x30) as usize);
             self.pos += 1;
             digits += 1;
         }
@@ -802,7 +823,9 @@ impl<'a> Parser<'a> {
                 return Some(invalid_pattern());
             }
             self.pos += 1;
-            if let Some(message) = self.skip_quantifier() { return Some(message); }
+            if let Some(message) = self.skip_quantifier() {
+                return Some(message);
+            }
             return None;
         }
         self.pos += 1;
@@ -816,7 +839,9 @@ impl<'a> Parser<'a> {
                     return Some(invalid_pattern());
                 }
                 self.pos += 1;
-                if let Some(message) = self.skip_quantifier() { return Some(message); }
+                if let Some(message) = self.skip_quantifier() {
+                    return Some(message);
+                }
                 None
             }
             Some(0x3D) | Some(0x21) => {
@@ -833,7 +858,9 @@ impl<'a> Parser<'a> {
                 {
                     return Some(invalid_pattern());
                 }
-                if let Some(message) = self.skip_quantifier() { return Some(message); }
+                if let Some(message) = self.skip_quantifier() {
+                    return Some(message);
+                }
                 None
             }
             Some(0x3C) => {
@@ -849,7 +876,9 @@ impl<'a> Parser<'a> {
                     if self.is_quantifier_ahead() {
                         return Some(invalid_pattern());
                     }
-                    if let Some(message) = self.skip_quantifier() { return Some(message); }
+                    if let Some(message) = self.skip_quantifier() {
+                        return Some(message);
+                    }
                     return None;
                 }
                 self.parse_named_group()
@@ -899,7 +928,9 @@ impl<'a> Parser<'a> {
             return Some(invalid_pattern());
         }
         self.pos += 1;
-        if let Some(message) = self.skip_quantifier() { return Some(message); }
+        if let Some(message) = self.skip_quantifier() {
+            return Some(message);
+        }
         None
     }
 
@@ -944,7 +975,9 @@ impl<'a> Parser<'a> {
             return Some(invalid_pattern());
         }
         self.pos += 1;
-        if let Some(message) = self.skip_quantifier() { return Some(message); }
+        if let Some(message) = self.skip_quantifier() {
+            return Some(message);
+        }
         None
     }
 
@@ -988,7 +1021,9 @@ impl<'a> Parser<'a> {
             return Some(invalid_pattern());
         }
         self.pos += 1;
-        if let Some(message) = self.skip_quantifier() { return Some(message); }
+        if let Some(message) = self.skip_quantifier() {
+            return Some(message);
+        }
         None
     }
     fn parse_class(&mut self) -> Option<String> {
@@ -1035,7 +1070,9 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        if let Some(message) = self.skip_quantifier() { return Some(message); }
+        if let Some(message) = self.skip_quantifier() {
+            return Some(message);
+        }
         None
     }
 
@@ -1063,7 +1100,9 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        if let Some(message) = self.skip_quantifier() { return Some(message); }
+        if let Some(message) = self.skip_quantifier() {
+            return Some(message);
+        }
         None
     }
 
@@ -1125,7 +1164,9 @@ impl<'a> Parser<'a> {
                         let mut idx = self.pos + 1;
                         let mut value: usize = 0;
                         while idx < self.units.len() && (0x30..=0x39).contains(&self.units[idx]) {
-                            value = value.saturating_mul(10).saturating_add(usize::from(self.units[idx] - 0x30));
+                            value = value
+                                .saturating_mul(10)
+                                .saturating_add(usize::from(self.units[idx] - 0x30));
                             idx += 1;
                         }
                         self.decimals.push(value);
@@ -1187,7 +1228,9 @@ impl<'a> Parser<'a> {
                 if !is_hex_digit(self.units[idx]) {
                     return None;
                 }
-                value = value.saturating_mul(16).saturating_add(hex_value(self.units[idx]));
+                value = value
+                    .saturating_mul(16)
+                    .saturating_add(hex_value(self.units[idx]));
                 idx += 1;
                 digits += 1;
                 if digits > 6 {
@@ -1356,9 +1399,7 @@ impl<'a> Parser<'a> {
 
     fn parse_class_set_escape(&mut self, strings: &mut bool) -> Option<ClassOperand> {
         self.pos += 1;
-        let Some(escaped) = self.peek() else {
-            return None;
-        };
+        let escaped = self.peek()?;
         self.pos += 1;
         match escaped {
             0x62 => Some(ClassOperand::Single(0x08)),
@@ -1367,9 +1408,7 @@ impl<'a> Parser<'a> {
             0x72 => Some(ClassOperand::Single(0x0D)),
             0x74 => Some(ClassOperand::Single(0x09)),
             0x76 => Some(ClassOperand::Single(0x0B)),
-            0x30 if !matches!(self.peek(), Some(0x30..=0x39)) => {
-                Some(ClassOperand::Single(0))
-            }
+            0x30 if !matches!(self.peek(), Some(0x30..=0x39)) => Some(ClassOperand::Single(0)),
             0x63 => {
                 let letter = self.peek()?;
                 if !matches!(letter, 0x41..=0x5A | 0x61..=0x7A) {
@@ -1412,9 +1451,7 @@ impl<'a> Parser<'a> {
             }
             0x64 | 0x44 | 0x73 | 0x53 | 0x77 | 0x57 => Some(ClassOperand::Set),
             0x71 => {
-                if self.parse_class_set_q_string(strings).is_none() {
-                    return None;
-                }
+                self.parse_class_set_q_string(strings)?;
                 Some(ClassOperand::Set)
             }
             0x70 | 0x50 => {
@@ -1471,9 +1508,7 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                 }
                 Some(0x5C) => {
-                    if self.peek_at(1).is_none() {
-                        return None;
-                    }
+                    self.peek_at(1)?;
                     self.pos += 2;
                     chars += 1;
                 }
@@ -1506,8 +1541,23 @@ impl<'a> Parser<'a> {
         }
         matches!(
             unit,
-            0x21 | 0x23 | 0x24 | 0x25 | 0x2A | 0x2B | 0x2C | 0x2E | 0x3A | 0x3B | 0x3C
-                | 0x3D | 0x3E | 0x3F | 0x40 | 0x60 | 0x7E | 0x5E
+            0x21 | 0x23
+                | 0x24
+                | 0x25
+                | 0x2A
+                | 0x2B
+                | 0x2C
+                | 0x2E
+                | 0x3A
+                | 0x3B
+                | 0x3C
+                | 0x3D
+                | 0x3E
+                | 0x3F
+                | 0x40
+                | 0x60
+                | 0x7E
+                | 0x5E
         )
     }
 
@@ -1517,12 +1567,16 @@ impl<'a> Parser<'a> {
             if let Some(message) = self.parse_property_escape(&mut strings) {
                 return Some(message);
             }
-            if let Some(message) = self.skip_quantifier() { return Some(message); }
+            if let Some(message) = self.skip_quantifier() {
+                return Some(message);
+            }
             return None;
         }
         if self.is_k_prefix() {
             self.parse_k_reference();
-            if let Some(message) = self.skip_quantifier() { return Some(message); }
+            if let Some(message) = self.skip_quantifier() {
+                return Some(message);
+            }
             return None;
         }
         if matches!(self.mode, RegexMode::Unicode | RegexMode::UnicodeSets) {
@@ -1533,7 +1587,9 @@ impl<'a> Parser<'a> {
             return Some(invalid_pattern());
         }
         self.pos += 1;
-        if let Some(message) = self.skip_quantifier() { return Some(message); }
+        if let Some(message) = self.skip_quantifier() {
+            return Some(message);
+        }
         None
     }
 
@@ -1556,7 +1612,9 @@ impl<'a> Parser<'a> {
                 return Some(invalid_pattern());
             }
             self.pos += 2;
-            if let Some(message) = self.skip_quantifier() { return Some(message); }
+            if let Some(message) = self.skip_quantifier() {
+                return Some(message);
+            }
             return None;
         }
         if (0x31..=0x39).contains(&escaped) {
@@ -1564,7 +1622,9 @@ impl<'a> Parser<'a> {
         }
         if is_valid_u_single(escaped, in_class) {
             self.pos += 2;
-            if let Some(message) = self.skip_quantifier() { return Some(message); }
+            if let Some(message) = self.skip_quantifier() {
+                return Some(message);
+            }
             return None;
         }
         Some(invalid_pattern())
@@ -1574,7 +1634,9 @@ impl<'a> Parser<'a> {
         match self.units.get(self.pos + 2).copied() {
             Some(0x41..=0x5A) | Some(0x61..=0x7A) => {
                 self.pos += 3;
-                if let Some(message) = self.skip_quantifier() { return Some(message); }
+                if let Some(message) = self.skip_quantifier() {
+                    return Some(message);
+                }
                 None
             }
             _ => Some(invalid_pattern()),
@@ -1587,7 +1649,9 @@ impl<'a> Parser<'a> {
         match (first, second) {
             (Some(a), Some(b)) if is_hex_digit(a) && is_hex_digit(b) => {
                 self.pos += 4;
-                if let Some(message) = self.skip_quantifier() { return Some(message); }
+                if let Some(message) = self.skip_quantifier() {
+                    return Some(message);
+                }
                 None
             }
             _ => Some(invalid_pattern()),
@@ -1610,7 +1674,9 @@ impl<'a> Parser<'a> {
             }
         }
         self.pos = idx;
-        if let Some(message) = self.skip_quantifier() { return Some(message); }
+        if let Some(message) = self.skip_quantifier() {
+            return Some(message);
+        }
         None
     }
 
@@ -1646,7 +1712,9 @@ impl<'a> Parser<'a> {
             return Some(invalid_pattern());
         }
         self.pos = idx + 1;
-        if let Some(message) = self.skip_quantifier() { return Some(message); }
+        if let Some(message) = self.skip_quantifier() {
+            return Some(message);
+        }
         None
     }
 
@@ -1658,12 +1726,16 @@ impl<'a> Parser<'a> {
             if !(0x30..=0x39).contains(&unit) {
                 break;
             }
-            value = value.saturating_mul(10).saturating_add((unit - 0x30) as usize);
+            value = value
+                .saturating_mul(10)
+                .saturating_add((unit - 0x30) as usize);
             idx += 1;
         }
         self.decimals.push(value);
         self.pos = idx;
-        if let Some(message) = self.skip_quantifier() { return Some(message); }
+        if let Some(message) = self.skip_quantifier() {
+            return Some(message);
+        }
         None
     }
 
@@ -1797,12 +1869,14 @@ impl<'a> Parser<'a> {
     }
 }
 
-
 fn units_eq_str(units: &[u16], text: &str) -> bool {
     if units.len() != text.len() {
         return false;
     }
-    units.iter().zip(text.bytes()).all(|(unit, byte)| *unit == u16::from(byte))
+    units
+        .iter()
+        .zip(text.bytes())
+        .all(|(unit, byte)| *unit == u16::from(byte))
 }
 
 fn is_property_char(unit: u16) -> bool {
@@ -1820,7 +1894,10 @@ fn validate_property_content(content: &[u16], mode: RegexMode) -> Option<String>
     if content.iter().any(|unit| *unit > 0x7F) {
         return Some(invalid_pattern());
     }
-    if content.iter().any(|unit| !is_property_char(*unit) && *unit != 0x3D) {
+    if content
+        .iter()
+        .any(|unit| !is_property_char(*unit) && *unit != 0x3D)
+    {
         return Some(invalid_pattern());
     }
     let equals = content.iter().filter(|unit| **unit == 0x3D).count();
@@ -2039,16 +2116,26 @@ fn is_braced_quantifier_at(units: &[u16], pos: usize) -> bool {
 fn is_syntax_character(unit: u16) -> bool {
     matches!(
         unit,
-        0x5E | 0x24 | 0x5C | 0x2E | 0x2A | 0x2B | 0x3F | 0x28 | 0x29 | 0x5B | 0x5D | 0x7B
-            | 0x7D | 0x7C
+        0x5E | 0x24
+            | 0x5C
+            | 0x2E
+            | 0x2A
+            | 0x2B
+            | 0x3F
+            | 0x28
+            | 0x29
+            | 0x5B
+            | 0x5D
+            | 0x7B
+            | 0x7D
+            | 0x7C
     )
 }
 
 fn is_valid_u_single(escaped: u16, in_class: bool) -> bool {
     if matches!(
         escaped,
-        0x64 | 0x44 | 0x77 | 0x57 | 0x73 | 0x53 | 0x62 | 0x42 | 0x66 | 0x6E | 0x72
-            | 0x74 | 0x76
+        0x64 | 0x44 | 0x77 | 0x57 | 0x73 | 0x53 | 0x62 | 0x42 | 0x66 | 0x6E | 0x72 | 0x74 | 0x76
     ) {
         return true;
     }
@@ -2107,7 +2194,12 @@ mod tests {
 
     #[test]
     fn unicode_sets_union_accepts_several_ranges() {
-        for literal in ["/[a-cx-z]/v", "/[0-9a-z]/v", "/[a-cb-d]/v", "/[a-cx-z0-9]/v"] {
+        for literal in [
+            "/[a-cx-z]/v",
+            "/[0-9a-z]/v",
+            "/[a-cb-d]/v",
+            "/[a-cx-z0-9]/v",
+        ] {
             assert_eq!(validate_regex_literal(literal), None, "{literal}");
         }
         for literal in ["/[a-c&&d]/v", "/[a-c--d]/v", "/[a-c-d]/v", "/[a-cx&&y]/v"] {

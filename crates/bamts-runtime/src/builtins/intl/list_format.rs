@@ -212,7 +212,11 @@ mod tests {
             .get_named_property(format, "format")
             .expect("format method");
         let text = machine.call_value(method, format, &[list]).expect("text");
-        machine.string_value(text).expect("a string").as_units().to_vec()
+        machine
+            .string_value(text)
+            .expect("a string")
+            .as_units()
+            .to_vec()
     }
 
     fn part_units(
@@ -235,7 +239,11 @@ mod tests {
                 let kind = machine
                     .get_named_property(part, "type")
                     .expect("type property");
-                let kind = if machine.string_value(kind).expect("a string").eq_ascii("element") {
+                let kind = if machine
+                    .string_value(kind)
+                    .expect("a string")
+                    .eq_ascii("element")
+                {
                     "element"
                 } else {
                     "literal"
