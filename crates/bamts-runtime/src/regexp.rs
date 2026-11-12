@@ -1428,14 +1428,20 @@ enum Node {
 struct CharacterClass {
     negated: bool,
     items: Vec<ClassItem>,
-    /// Sorted, merged ranges of every `Character` and `Range` item, present
-    /// only when the class holds no other kind of item. Membership is a binary
-    /// search; a property escape expands to hundreds of ranges, so a linear
-    /// scan per code point is quadratic over a whole-string test.
-    simple: Option<Vec<(u32, u32)>>,
-    /// `Character` items whose canonical form differs from the item itself,
-    /// paired with that canonical form. Only the `i` path consults them.
-    char_aliases: Vec<(u32, u32)>,
+    /// Precomputed membership over the `Character` and `Range` items, present
+    /// only when the class holds no other kind of item. Ranges are sorted and
+    /// merged; a property escape expands to hundreds of ranges, so the linear
+    /// per-item scan is quadratic over a whole-string test.
+    simple: Option<SimpleSet>,
+}
+
+#[derive(Clone, Debug)]
+struct SimpleSet {
+    /// Every `Range` item, sorted and merged.
+    ranges: Vec<(u32, u32)>,
+    /// Every `Character` item's raw value, sorted. Character items answer the
+    /// fold disjunction differently from ranges, so they stay separate.
+    characters: Vec<u32>,
 }
 
 impl CharacterClass {
@@ -1443,49 +1449,46 @@ impl CharacterClass {
         let simple = if items.iter().all(|item| {
             matches!(item, ClassItem::Character(_) | ClassItem::Range(_, _))
         }) {
-            let mut ranges: Vec<(u32, u32)> = items
+            let mut raw_ranges: Vec<(u32, u32)> = items
                 .iter()
-                .map(|item| match item {
-                    ClassItem::Character(value) => (*value, *value),
-                    ClassItem::Range(start, end) => (*start, *end),
-                    _ => unreachable!("filtered above"),
+                .filter_map(|item| match item {
+                    ClassItem::Range(start, end) => Some((*start, *end)),
+                    _ => None,
                 })
                 .collect();
-            ranges.sort_unstable();
-            let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
-            for (start, end) in ranges {
-                match merged.last_mut() {
+            raw_ranges.sort_unstable();
+            let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(raw_ranges.len());
+            for (start, end) in raw_ranges {
+                match ranges.last_mut() {
                     Some(last) if start <= last.1.saturating_add(1) => {
                         last.1 = last.1.max(end);
                     }
-                    _ => merged.push((start, end)),
+                    _ => ranges.push((start, end)),
                 }
             }
-            Some(merged)
+            let mut characters: Vec<u32> = items
+                .iter()
+                .filter_map(|item| match item {
+                    ClassItem::Character(value) => Some(*value),
+                    _ => None,
+                })
+                .collect();
+            characters.sort_unstable();
+            characters.dedup();
+            Some(SimpleSet { ranges, characters })
         } else {
             None
         };
-        let char_aliases = items
-            .iter()
-            .filter_map(|item| match item {
-                ClassItem::Character(value) => {
-                    let canonical = canonicalize(*value, true);
-                    (canonical != *value).then_some((*value, canonical))
-                }
-                _ => None,
-            })
-            .collect();
         Self {
             negated,
             items,
             simple,
-            char_aliases,
         }
     }
 
     fn matches(&self, value: u32, ignore_case: bool, unicode: bool) -> bool {
         let matched = match &self.simple {
-            Some(ranges) => self.simple_matches(ranges, value, ignore_case, unicode),
+            Some(simple) => simple.matches(value, ignore_case, unicode),
             None => self
                 .items
                 .iter()
@@ -1493,35 +1496,52 @@ impl CharacterClass {
         };
         matched != self.negated
     }
+}
 
+impl SimpleSet {
     /// The same disjunction `ClassItem::matches` makes for `Character` and
-    /// `Range` items, with binary search replacing the per-item linear scan.
-    fn simple_matches(&self, ranges: &[(u32, u32)], value: u32, ignore_case: bool, unicode: bool) -> bool {
-        if ranges_contain(ranges, value) {
+    /// `Range` items: characters match on raw or canonical equality, ranges on
+    /// raw membership plus `canonicalized_range_contains`. Range membership is
+    /// a binary search; the fold scans run once over the merged union, which
+    /// equals the per-range disjunction.
+    fn matches(&self, value: u32, ignore_case: bool, unicode: bool) -> bool {
+        if ranges_contain(&self.ranges, value) || self.characters.contains(&value) {
             return true;
         }
         if !ignore_case {
             return false;
         }
         let canonical = canonicalize(value, unicode);
-        if ranges_contain(ranges, canonical)
-            || ranges_contain(ranges, unicode_simple_fold(canonical))
-            || self
-                .char_aliases
-                .iter()
-                .any(|&(_, target)| target == canonical)
+        if self
+            .characters
+            .iter()
+            .any(|&character| canonicalize(character, unicode) == canonical)
+            || ranges_contain(&self.ranges, canonical)
         {
             return true;
         }
-        UNICODE_SIMPLE_FOLD_RANGES.iter().any(|(first, last, step, delta)| {
-            let source = offset_code_point(canonical, -*delta);
+        let folded = unicode_simple_fold(canonical);
+        if ranges_contain(&self.ranges, folded) {
+            return true;
+        }
+        if UNICODE_SIMPLE_FOLD_RANGES.iter().any(|(first, last, step, delta)| {
+            let source = offset_code_point(folded, -*delta);
             source.is_some_and(|source| {
                 (*first..=*last).contains(&source)
                     && (source - *first).is_multiple_of(*step)
-                    && ranges_contain(ranges, source)
+                    && ranges_contain(&self.ranges, source)
                     && canonicalize(source, unicode) == canonical
             })
-        })
+        }) {
+            return true;
+        }
+        UNICODE_SIMPLE_FOLD_SINGLETONS
+            .iter()
+            .any(|&(source, target)| {
+                target == folded
+                    && ranges_contain(&self.ranges, source)
+                    && canonicalize(source, unicode) == canonical
+            })
     }
 }
 
@@ -2641,7 +2661,7 @@ fn combine_surrogates(high: u16, low: u16) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Regex, RegexErrorKind};
+    use super::{CharacterClass, ClassItem, Regex, RegexErrorKind};
     use bamts_bytecode::EcmaString;
 
     fn text(value: &str) -> EcmaString {
@@ -2658,6 +2678,90 @@ mod tests {
             .unwrap()
             .unwrap()
             .captures
+    }
+
+    #[test]
+    fn character_items_reject_fold_images_without_unicode() {
+        let kelvin = "\u{212A}";
+        let long_s = "\u{017F}";
+        assert!(!regex(r"[k]", "i").exec(&text(kelvin), 0).unwrap().is_some());
+        assert!(regex(r"[^k]", "i").exec(&text(kelvin), 0).unwrap().is_some());
+        assert!(!regex(r"[s]", "i").exec(&text(long_s), 0).unwrap().is_some());
+        assert!(regex(r"[^s]", "i").exec(&text(long_s), 0).unwrap().is_some());
+    }
+
+    #[test]
+    fn range_items_keep_the_fold_singleton_disjunct() {
+        let kelvin_source = regex(r"[\u{212A}-\u{2130}]", "iu");
+        let long_s_source = regex(r"[\u{17F}-\u{180}]", "iu");
+        assert!(
+            kelvin_source.exec(&text("k"), 0).unwrap().is_some(),
+            "KELVIN SIGN range must admit its fold source k"
+        );
+        assert!(
+            long_s_source.exec(&text("s"), 0).unwrap().is_some(),
+            "long s range must admit its fold source s"
+        );
+        assert!(
+            regex(r"[^\u{212A}-\u{2130}]", "iu")
+                .exec(&text("k"), 0)
+                .unwrap()
+                .is_none(),
+            "negated KELVIN range must reject k"
+        );
+    }
+
+    #[test]
+    fn fast_membership_equals_linear_membership() {
+        struct XorShift64(u64);
+        impl XorShift64 {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn pick(&mut self, bound: usize) -> usize {
+                (self.next() % bound as u64) as usize
+            }
+        }
+        let pool: &[u32] = &[
+            0x212A, 0x17F, 0xB5, 0x41, 0x5A, 0x61, 0x7A, 0x6B, 0x4B, 0x73, 0x53, 0x30, 0x39,
+            0xE9, 0xC9, 0x180, 0x2130, 0x3BC, 0x39C, 0x1E9E, 0xDF, 0x100, 0x101, 0xFF21,
+        ];
+        let mut rng = XorShift64(0x2545F4914F6CDD1D);
+        for _ in 0..4000 {
+            let mut items = Vec::new();
+            for _ in 0..(1 + rng.pick(4)) {
+                items.push(match rng.pick(4) {
+                    0 | 1 => ClassItem::Character(pool[rng.pick(pool.len())]),
+                    2 => {
+                        let start = pool[rng.pick(pool.len())];
+                        let end = start + rng.pick(4) as u32;
+                        ClassItem::Range(start, end)
+                    }
+                    _ => ClassItem::Character(pool[rng.pick(pool.len())]),
+                });
+            }
+            let class = CharacterClass::new(false, items.clone());
+            for flags in [(false, false), (true, false), (false, true), (true, true)] {
+                let (ignore_case, unicode) = flags;
+                let mut values: Vec<u32> = pool.to_vec();
+                values.push(rng.next() as u32);
+                for &value in &values {
+                    let fast = class.matches(value, ignore_case, unicode);
+                    let linear = items
+                        .iter()
+                        .any(|item| item.matches(value, ignore_case, unicode));
+                    assert_eq!(
+                        fast, linear,
+                        "membership diverges at {value:#x} i={ignore_case} u={unicode} items={items:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
