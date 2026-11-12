@@ -19514,6 +19514,7 @@ mod tests {
             Constant::Int32(100),
             Constant::Int32(41),
             Constant::String(EcmaString::encode("undeclared")),
+            Constant::String(EcmaString::encode("gy")),
         ]
     }
 
@@ -19642,14 +19643,13 @@ mod tests {
         )
     }
 
-    /// Asserts `value` is an error object built on the realm's own
-    /// `constructor` prototype with own `message`.
-    fn assert_intrinsic_error<H: Host>(
-        machine: &mut Machine<'_, H>,
+    /// Asserts `value` is an object built on the realm's own `constructor`
+    /// prototype and returns its heap slot.
+    fn assert_intrinsic_prototype<H: Host>(
+        machine: &Machine<'_, H>,
         value: Value,
         constructor: &str,
-        message: &str,
-    ) {
+    ) -> usize {
         let id = machine.intrinsics.builtins.id_named(constructor).unwrap();
         let expected = machine.intrinsics.error_prototype(id);
         let slot = machine.runtime_slot(value).unwrap().expect("an error object");
@@ -19657,6 +19657,18 @@ mod tests {
             panic!("{constructor} must be an ordinary object");
         };
         assert_eq!(*prototype, Some(expected), "{constructor} prototype");
+        slot
+    }
+
+    /// Asserts `value` is an error object built on the realm's own
+    /// `constructor` prototype with own `message`.
+    fn assert_intrinsic_error<H: Host>(
+        machine: &Machine<'_, H>,
+        value: Value,
+        constructor: &str,
+        message: &str,
+    ) {
+        let slot = assert_intrinsic_prototype(machine, value, constructor);
         assert_eq!(
             machine
                 .own_data_property(slot, "message")
@@ -19815,12 +19827,65 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let value = uncaught_value(machine.evaluate().unwrap_err());
-        assert_intrinsic_error(
-            &mut machine,
-            value,
-            "ReferenceError",
-            "Cannot access lexical binding before initialization",
+        assert_intrinsic_prototype(&machine, value, "ReferenceError");
+    }
+
+    #[test]
+    fn strict_compound_assignment_throws_when_the_binding_vanishes_before_the_write() {
+        let program = verified(
+            global_binding_constants(),
+            vec![function(
+                0,
+                4,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(5),
+                    },
+                    Instruction::StoreGlobal {
+                        name: cid(9),
+                        value: reg(0),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(1),
+                        name: cid(9),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: reg(2),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(3),
+                        constant: cid(9),
+                    },
+                    Instruction::DeleteProperty {
+                        dst: reg(3),
+                        object: reg(2),
+                        key: reg(3),
+                    },
+                    Instruction::Binary {
+                        dst: reg(1),
+                        op: BinaryOp::Add,
+                        left: reg(1),
+                        right: reg(0),
+                    },
+                    Instruction::RequireGlobalBinding { name: cid(9) },
+                    Instruction::StoreGlobal {
+                        name: cid(9),
+                        value: reg(1),
+                    },
+                    Instruction::Return { value: reg(1) },
+                ],
+                Vec::new(),
+            )],
         );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let value = uncaught_value(machine.evaluate().unwrap_err());
+        assert_intrinsic_error(&machine, value, "ReferenceError", "gy is not defined");
+        let global = machine.global_object;
+        let key = PropertyKey::Named(machine.intern_str("gy"));
+        assert!(!machine.has_own_property_key(global, &key).unwrap());
     }
 
     #[test]

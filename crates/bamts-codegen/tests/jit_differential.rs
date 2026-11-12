@@ -3,8 +3,9 @@
 use std::collections::BTreeSet;
 
 use bamts_bytecode::{
-    AccessorKind, BinaryOp, Constant, ConstantId, EcmaString, Function, FunctionFlags, FunctionId,
-    Instruction, Module, ModuleId, Pc, Program, ProgramModule, Register, Verified,
+    AccessorKind, BinaryOp, Constant, ConstantId, EcmaString, ExceptionHandler, Function,
+    FunctionFlags, FunctionId, Instruction, Module, ModuleId, Pc, Program, ProgramModule, Register,
+    Verified,
 };
 use bamts_codegen::compile_jit;
 use bamts_codegen::helpers::{
@@ -984,6 +985,9 @@ fn global_binding_constants() -> Vec<Constant> {
         Constant::Int32(100),
         Constant::Int32(41),
         Constant::String(EcmaString::encode("undeclared")),
+        Constant::String(EcmaString::encode(",")),
+        Constant::String(EcmaString::encode("message")),
+        Constant::String(EcmaString::encode("gy")),
     ]
 }
 
@@ -1188,18 +1192,127 @@ fn strict_assignment_to_an_undeclared_global_throws_and_creates_nothing() {
             dst: reg(0),
             constant: cid(8),
         },
+        Instruction::LoadConst {
+            dst: reg(1),
+            constant: cid(2),
+        },
         Instruction::RequireGlobalBinding { name: cid(11) },
         Instruction::StoreGlobal {
             name: cid(11),
             value: reg(0),
         },
+        Instruction::LoadGlobal {
+            dst: reg(2),
+            name: cid(3),
+        },
+        Instruction::LoadConst {
+            dst: reg(3),
+            constant: cid(11),
+        },
+        Instruction::Binary {
+            dst: reg(4),
+            op: BinaryOp::In,
+            left: reg(3),
+            right: reg(2),
+        },
+        Instruction::LoadConst {
+            dst: reg(5),
+            constant: cid(12),
+        },
+        Instruction::Binary {
+            dst: reg(4),
+            op: BinaryOp::Add,
+            left: reg(4),
+            right: reg(5),
+        },
+        Instruction::LoadConst {
+            dst: reg(6),
+            constant: cid(13),
+        },
+        Instruction::GetProperty {
+            dst: reg(6),
+            object: reg(1),
+            key: reg(6),
+        },
+        Instruction::Binary {
+            dst: reg(4),
+            op: BinaryOp::Add,
+            left: reg(4),
+            right: reg(6),
+        },
     ];
-    code.extend(print_suffix(reg(0), 1));
-    let program = module_program(global_binding_constants(), vec![function(5, code)]);
-    assert_uncaught(
+    code.extend(print_suffix(reg(4), 7));
+    let handler = ExceptionHandler {
+        start: Pc::new(2),
+        end: Pc::new(4),
+        handler: Pc::new(4),
+        catch_register: reg(1),
+    };
+    let program = module_program(
+        global_binding_constants(),
+        vec![Function::new(
+            None,
+            0,
+            0,
+            11,
+            FunctionFlags::default(),
+            code,
+            vec![handler],
+        )],
+    );
+    assert_prints(
         "undeclared = 1",
         &program,
+        "false,undeclared is not defined\n",
+    );
+}
+
+#[test]
+fn strict_compound_assignment_throws_when_the_binding_vanishes_before_the_write() {
+    let mut code = vec![
+        Instruction::LoadConst {
+            dst: reg(0),
+            constant: cid(8),
+        },
+        Instruction::StoreGlobal {
+            name: cid(14),
+            value: reg(0),
+        },
+        Instruction::LoadGlobal {
+            dst: reg(1),
+            name: cid(14),
+        },
+        Instruction::LoadGlobal {
+            dst: reg(2),
+            name: cid(3),
+        },
+        Instruction::LoadConst {
+            dst: reg(3),
+            constant: cid(14),
+        },
+        Instruction::DeleteProperty {
+            dst: reg(3),
+            object: reg(2),
+            key: reg(3),
+        },
+        Instruction::Binary {
+            dst: reg(1),
+            op: BinaryOp::Add,
+            left: reg(1),
+            right: reg(0),
+        },
+        Instruction::RequireGlobalBinding { name: cid(14) },
+        Instruction::StoreGlobal {
+            name: cid(14),
+            value: reg(1),
+        },
+    ];
+    code.extend(print_suffix(reg(1), 4));
+    let program = module_program(global_binding_constants(), vec![function(8, code)]);
+    assert_uncaught(
+        "gy += (delete globalThis.gy, 1)",
+        &program,
         "ReferenceError",
-        "undeclared is not defined",
+        "gy is not defined",
     );
 }
