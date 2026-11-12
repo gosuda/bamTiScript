@@ -160,6 +160,67 @@ fn api_execution_reports_bounded_resource_exhaustion() {
     assert!(message.contains("fuel exhausted"), "{message}");
 }
 
+#[test]
+fn api_aot_execution_is_bounded_by_request_cancellation() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", "for (;;) {}\n");
+    let requests = [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "root": project.path },
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "compiler/execute",
+            "params": { "args": ["run", "--target", "aot", "main.ts"] },
+        }),
+    ];
+    let mut child = project
+        .command()
+        .arg("--api")
+        .current_dir(&project.path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("bamts API child starts");
+    let mut stdin = child.stdin.take().expect("API child stdin is piped");
+    for request in requests {
+        let payload = serde_json::to_vec(&request).expect("API request serializes");
+        stdin.write_all(&framed(&payload)).expect("API request is written");
+    }
+    stdin.flush().expect("API requests are flushed");
+    let published = project.path.join("cache").join("run");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while fs::read_dir(&published).map_or(true, |mut entries| entries.next().is_none()) {
+        assert!(Instant::now() < deadline, "the AOT image was never published");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let cancel = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "$/cancelRequest",
+        "params": { "id": 2 },
+    });
+    let payload = serde_json::to_vec(&cancel).expect("cancel request serializes");
+    stdin.write_all(&framed(&payload)).expect("cancel request is written");
+    drop(stdin);
+    let output = wait_for_output_with_timeout(child, "bamts --api", Duration::from_secs(30));
+    assert_success(&output, "bamts --api");
+    let responses = decode_frames(&output.stdout);
+    assert_eq!(responses.len(), 2, "initialize and execute both respond");
+    let message = responses[1]["error"]["message"]
+        .as_str()
+        .expect("a cancelled AOT request is an API error");
+    assert_eq!(message, "request was cancelled");
+    assert!(
+        fs::read_dir(&published).map_or(true, |mut entries| entries.next().is_none()),
+        "the cancelled AOT image is removed"
+    );
+}
+
 /// Node spawns `--api` with `stdio: "pipe"`, which is a socket pair on Unix;
 /// the transport must serve the inherited descriptor because no pathname can
 /// reopen a socket.

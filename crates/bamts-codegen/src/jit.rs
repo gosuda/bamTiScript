@@ -445,12 +445,14 @@ mod tests {
         FunctionFlags, FunctionId, Instruction, Module, ModuleId, Pc, Program, ProgramModule,
         Register,
     };
+    use bamts_native::tiering::WarmupPolicy;
     use bamts_native::{
         AbiError, Completion, CompletionTag, HelperCall, HelperResult, NativeEntryTable,
         NativeFrame, NativeHelper, NativeOps, ShadowFrame, Value, with_native_ops,
     };
     use bamts_runtime::{
-        Host, Limits, Machine, NativeError, RuntimeError, RuntimeErrorKind, run_linked_program,
+        Host, Limits, Machine, NativeError, RuntimeError, RuntimeErrorKind, run as run_interpreter,
+        run_linked_program, run_linked_program_tiered,
     };
     use cranelift_module::Module as _;
 
@@ -992,6 +994,100 @@ mod tests {
             },
         );
         assert_fuel_exhausted(result, 3);
+    }
+
+    #[test]
+    fn tiered_hot_loop_entered_at_header_matches_interpreter_fuel() {
+        let bytecode = one_function_program(
+            vec![
+                Constant::String(EcmaString::encode("entry")),
+                Constant::Int32(10),
+                Constant::Int32(1),
+            ],
+            2,
+            vec![
+                Instruction::LoadConst {
+                    dst: Register::new(0),
+                    constant: ConstantId::new(1),
+                },
+                Instruction::LoadConst {
+                    dst: Register::new(1),
+                    constant: ConstantId::new(2),
+                },
+                Instruction::Binary {
+                    dst: Register::new(0),
+                    op: BinaryOp::Subtract,
+                    left: Register::new(0),
+                    right: Register::new(1),
+                },
+                Instruction::JumpIfTrue {
+                    condition: Register::new(0),
+                    target: Pc::new(2),
+                },
+                Instruction::Halt,
+            ],
+            Vec::new(),
+        );
+        let compiled = compile_jit(&bytecode).expect("counter loop compiles");
+        let policy = WarmupPolicy {
+            baseline_invocations: u32::MAX,
+            optimized_invocations: u32::MAX,
+            osr_back_edges: 2,
+            deopt_budget: 8,
+        };
+        for fuel in [19u64, 23u64] {
+            let mut interpreter_host = SilentHost;
+            let interpreter_result = run_interpreter(
+                &bytecode,
+                &mut interpreter_host,
+                &Limits {
+                    fuel,
+                    ..Limits::default()
+                },
+            );
+            let mut tiered_host = SilentHost;
+            let (tiered_outcome, report) = run_linked_program_tiered(
+                &bytecode,
+                &compiled,
+                &mut tiered_host,
+                &Limits {
+                    fuel,
+                    ..Limits::default()
+                },
+                policy,
+                CancellationToken::new(),
+            )
+            .expect("tiered run links");
+            if fuel == 23 {
+                assert!(
+                    interpreter_result.is_ok(),
+                    "exact fuel fits the interpreter: {interpreter_result:?}"
+                );
+                assert!(
+                    tiered_outcome.is_ok(),
+                    "exact fuel fits the tiered loop: {tiered_outcome:?}"
+                );
+                assert!(
+                    report.units.iter().any(|unit| unit.osr_entries > 0),
+                    "the hot loop must enter compiled code at its header"
+                );
+            } else {
+                let interpreter_error =
+                    interpreter_result.expect_err("fuel 19 exhausts the interpreter");
+                assert_eq!(
+                    interpreter_error.kind,
+                    RuntimeErrorKind::FuelExhausted { limit: 19 }
+                );
+                let tiered_error = match tiered_outcome {
+                    Err(NativeError::Runtime(error)) => error,
+                    outcome => panic!("fuel 19 must exhaust the tiered loop, got {outcome:?}"),
+                };
+                assert_eq!(
+                    tiered_error.kind,
+                    RuntimeErrorKind::FuelExhausted { limit: 19 }
+                );
+            }
+        }
     }
 
     #[test]

@@ -363,7 +363,7 @@ pub fn execute_in_context(
     args: &CliArgs,
     context: &ExecutionContext,
 ) -> Result<CommandOutcome, DriverError> {
-    execute_in_context_with_cancel(args, context, CancellationToken::new())
+    execute_in_context_with_cancel(args, context, CancellationToken::new(), Limits::program())
 }
 
 /// [`execute`] with caller-controlled cooperative cancellation.
@@ -373,14 +373,22 @@ pub fn execute_with_cancel(
 ) -> Result<CommandOutcome, DriverError> {
     cancel.check().map_err(|_| DriverError::Cancelled)?;
     let context = ExecutionContext::ambient()?;
-    execute_in_context_with_cancel(args, &context, cancel)
+    execute_in_context_with_cancel(args, &context, cancel, Limits::program())
 }
 
 /// The canonical CLI execution seam with explicit process inputs and cancellation.
+///
+/// `limits` is the caller's execution budget for the JIT run: the CLI run path
+/// passes [`Limits::program`], which lets a program run for as long as it runs,
+/// and a host that waits synchronously for one request, such as the `--api`
+/// execute method, passes a finite fuel so a runaway loop answers `fuel
+/// exhausted` instead of hanging the host. The AOT image runs in its own
+/// process with [`Limits::program`]; `cancel` is its bound and terminates it.
 pub fn execute_in_context_with_cancel(
     args: &CliArgs,
     context: &ExecutionContext,
     cancel: CancellationToken,
+    limits: Limits,
 ) -> Result<CommandOutcome, DriverError> {
     cancel.check().map_err(|_| DriverError::Cancelled)?;
     match args.mode {
@@ -389,7 +397,7 @@ pub fn execute_in_context_with_cancel(
             match args.mode {
                 Mode::Check => check(args, &frontend),
                 Mode::Compile => compile_in_context_with_cancel(args, &frontend, context, &cancel),
-                Mode::Run => run_in_context_with_cancel(args, &frontend, context, &cancel),
+                Mode::Run => run_in_context_with_cancel(args, &frontend, context, &cancel, &limits),
                 Mode::Explain => unreachable!("explain handled without a program"),
             }
         }
@@ -1809,6 +1817,7 @@ fn run_in_context_with_cancel(
     frontend: &LoadedProgramFrontend,
     context: &ExecutionContext,
     cancel: &CancellationToken,
+    limits: &Limits,
 ) -> Result<CommandOutcome, DriverError> {
     let entrypoint = required_entrypoint(args)?;
     let warnings = require_runnable_frontend(args, frontend)?;
@@ -1819,9 +1828,62 @@ fn run_in_context_with_cancel(
         cancel,
     )
     .map_err(DriverError::Lower)?;
+    let inputs = RunInputs {
+        args,
+        entrypoint,
+        warnings,
+        executable: &executable,
+        context,
+    };
     match args.target {
-        ExecutionTarget::Jit => run_jit(args, entrypoint, warnings, &executable, context, cancel),
-        ExecutionTarget::Aot => run_aot(args, entrypoint, warnings, &executable, context, cancel),
+        ExecutionTarget::Jit => run_jit(inputs, cancel, limits),
+        ExecutionTarget::Aot => run_aot(inputs, cancel),
+    }
+}
+
+/// The inputs that travel together through one run: what the caller asked
+/// for, the lowered program, and where the process stands.
+struct RunInputs<'a> {
+    args: &'a CliArgs,
+    entrypoint: &'a Path,
+    warnings: RenderedDiagnostics,
+    executable: &'a bamts_compiler::program::ExecutableProgram,
+    context: &'a ExecutionContext,
+}
+
+impl RunInputs<'_> {
+    /// Builds the host with the environment, argv, and script compiler that a
+    /// program run observes.
+    fn host(&self) -> Result<bamts_node::NodeHost, DriverError> {
+        let mut host = bamts_node::NodeHost::new();
+        populate_node_environment(&mut host, self.context)?;
+        host.set_script_compiler(Box::new(bamts::ScriptCompiler));
+        host.set_argv(
+            ["bamts".to_owned(), self.entrypoint.display().to_string()]
+                .into_iter()
+                .chain(self.args.program_args.iter().cloned()),
+        );
+        Ok(host)
+    }
+
+    /// Assembles the outcome from the host's captured streams and the engine's
+    /// completion.
+    fn outcome(
+        self,
+        host: &bamts_node::NodeHost,
+        outcome: bamts_runtime::ExecutionOutcome,
+    ) -> CommandOutcome {
+        let mut stdout = host.stdout().to_vec();
+        stdout.extend_from_slice(&outcome.stdout);
+        let exit_code = host.completion_exit_code(outcome.exit_code);
+        let mut stderr = self.warnings.text.into_bytes();
+        stderr.extend_from_slice(host.stderr());
+        CommandOutcome {
+            stdout,
+            stderr,
+            exit_code,
+            truncation: self.warnings.truncation,
+        }
     }
 }
 
@@ -1831,20 +1893,15 @@ fn run_in_context_with_cancel(
 /// frame, so only the native stack bound stops it, and both tiers stop it at the
 /// same depth.
 fn run_jit(
-    args: &CliArgs,
-    entrypoint: &Path,
-    warnings: RenderedDiagnostics,
-    executable: &bamts_compiler::program::ExecutableProgram,
-    context: &ExecutionContext,
+    inputs: RunInputs<'_>,
     cancel: &CancellationToken,
+    limits: &Limits,
 ) -> Result<CommandOutcome, DriverError> {
     std::thread::scope(|scope| {
         let program = std::thread::Builder::new()
             .name("bamts-jit".to_owned())
             .stack_size(Limits::PROGRAM_STACK)
-            .spawn_scoped(scope, || {
-                run_jit_program(args, entrypoint, warnings, executable, context, cancel)
-            })
+            .spawn_scoped(scope, || run_jit_program(inputs, cancel, limits))
             .map_err(DriverError::ProgramThread)?;
         program
             .join()
@@ -1853,70 +1910,51 @@ fn run_jit(
 }
 
 fn run_jit_program(
-    args: &CliArgs,
-    entrypoint: &Path,
-    warnings: RenderedDiagnostics,
-    executable: &bamts_compiler::program::ExecutableProgram,
-    context: &ExecutionContext,
+    inputs: RunInputs<'_>,
     cancel: &CancellationToken,
+    limits: &Limits,
 ) -> Result<CommandOutcome, DriverError> {
-    let program =
-        bamts_codegen::compile_jit_with_cancel(executable.wire(), cancel).map_err(|error| {
+    let program = bamts_codegen::compile_jit_with_cancel(inputs.executable.wire(), cancel)
+        .map_err(|error| {
             match error {
                 bamts_codegen::JitError::Cancelled => DriverError::Cancelled,
                 error => DriverError::Jit(error),
             }
         })?;
-    let mut host = bamts_node::NodeHost::new();
-    populate_node_environment(&mut host, context)?;
-    host.set_script_compiler(Box::new(bamts::ScriptCompiler));
-    host.set_argv(
-        ["bamts".to_owned(), entrypoint.display().to_string()]
-            .into_iter()
-            .chain(args.program_args.iter().cloned()),
-    );
+    let mut host = inputs.host()?;
     let (tiered, _) = run_linked_program_tiered(
-        executable.wire(),
+        inputs.executable.wire(),
         &program,
         &mut host,
-        &Limits::program(),
+        limits,
         WarmupPolicy::DEFAULT,
         cancel.clone(),
     )
     .map_err(DriverError::Native)?;
     let outcome = tiered.map_err(DriverError::Native)?;
-    let mut stdout = host.stdout().to_vec();
-    stdout.extend_from_slice(&outcome.stdout);
-    let exit_code = host.completion_exit_code(outcome.exit_code);
-    let mut stderr = warnings.text.into_bytes();
-    stderr.extend_from_slice(host.stderr());
-    Ok(CommandOutcome {
-        stdout,
-        stderr,
-        exit_code,
-        truncation: warnings.truncation,
-    })
+    Ok(inputs.outcome(&host, outcome))
 }
 
-fn run_aot(
-    args: &CliArgs,
-    entrypoint: &Path,
-    warnings: RenderedDiagnostics,
-    executable: &bamts_compiler::program::ExecutableProgram,
-    context: &ExecutionContext,
-    cancel: &CancellationToken,
-) -> Result<CommandOutcome, DriverError> {
+/// Runs a program in the AOT tier. Its image is a linked executable in its own
+/// process with the program limits and the CLI argv, so the caller's budget does
+/// not reach it; cancellation terminates the child.
+fn run_aot(inputs: RunInputs<'_>, cancel: &CancellationToken) -> Result<CommandOutcome, DriverError> {
+    let args = inputs.args;
+    let entrypoint = inputs.entrypoint;
+    let context = inputs.context;
+    let warnings = inputs.warnings;
     if BUILD_TARGET != HOST_TARGET {
         return Err(DriverError::CrossTargetLink {
             host: HOST_TARGET,
             target: BUILD_TARGET,
         });
     }
-    let object = bamts_codegen::compile_aot_with_cancel(executable.wire(), HOST_TARGET, cancel)
-        .map_err(|error| match error {
-            bamts_codegen::AotError::Cancelled => DriverError::Cancelled,
-            error => DriverError::Aot(error),
-        })?;
+    let object =
+        bamts_codegen::compile_aot_with_cancel(inputs.executable.wire(), HOST_TARGET, cancel)
+            .map_err(|error| match error {
+                bamts_codegen::AotError::Cancelled => DriverError::Cancelled,
+                error => DriverError::Aot(error),
+            })?;
     let id = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     let root = cache_root(context)?;
     let destination = root.join("run").join(format!(
@@ -2941,8 +2979,9 @@ mod tests {
     use crate::context::ExecutionContext;
 
     use super::{
-        CommandOutcome, DriverError, content_hash, execute_in_context, execute_tsc, execute_tsc_in,
-        levels, lower_options, probe_toolchain,
+        CommandOutcome, DriverError, Limits, content_hash, execute_in_context,
+        execute_in_context_with_cancel, execute_tsc, execute_tsc_in, levels, lower_options,
+        probe_toolchain,
     };
     #[cfg(unix)]
     use super::{capture_process_with_cancel, link_executable, probe_toolchain_in_context};
@@ -2990,6 +3029,39 @@ mod tests {
         let args = parse_args(["run", "--jit", "main.ts"])?;
         let outcome = execute_in_context(&args, &context)?;
         assert_eq!(outcome.stdout, b"-1474936480\n");
+        assert_eq!(outcome.exit_code, 0);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_run_path_is_not_bounded_by_the_api_fuel() -> Result<(), Box<dyn std::error::Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("bamts-cli-jit-unbounded-{}", process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)?;
+        fs::write(
+            directory.join("main.ts"),
+            "let sum = 0;\n\
+             for (let i = 0; i < 1000000; i++) { sum = (sum + i) | 0; }\n\
+             console.log(sum);\n",
+        )?;
+        let context = ExecutionContext::new(&directory, BTreeMap::new())?;
+        let args = parse_args(["run", "--jit", "main.ts"])?;
+        let three_api_budgets = Limits {
+            fuel: 3_000_000,
+            ..Limits::program()
+        };
+        let bounded = execute_in_context_with_cancel(
+            &args,
+            &context,
+            CancellationToken::new(),
+            three_api_budgets,
+        )
+        .expect_err("the loop needs more than three API budgets");
+        assert!(bounded.to_string().contains("fuel exhausted"), "{bounded}");
+        let outcome = execute_in_context(&args, &context)?;
+        assert_eq!(outcome.stdout, b"1783293664\n");
         assert_eq!(outcome.exit_code, 0);
         fs::remove_dir_all(directory)?;
         Ok(())
@@ -4051,8 +4123,18 @@ exit 2
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let error = super::run_jit(&args, &entrypoint, warnings, &executable, &context, &cancel)
-            .expect_err("cancelled JIT compilation must not become a backend error");
+        let error = super::run_jit(
+            super::RunInputs {
+                args: &args,
+                entrypoint: &entrypoint,
+                warnings,
+                executable: &executable,
+                context: &context,
+            },
+            &cancel,
+            &bamts_runtime::Limits::program(),
+        )
+        .expect_err("cancelled JIT compilation must not become a backend error");
 
         assert!(matches!(error, DriverError::Cancelled));
         std::fs::remove_dir_all(directory)?;
@@ -4090,8 +4172,17 @@ exit 2
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let error = super::run_aot(&args, &entrypoint, warnings, &executable, &context, &cancel)
-            .expect_err("cancelled AOT compilation must not become a backend error");
+        let error = super::run_aot(
+            super::RunInputs {
+                args: &args,
+                entrypoint: &entrypoint,
+                warnings,
+                executable: &executable,
+                context: &context,
+            },
+            &cancel,
+        )
+        .expect_err("cancelled AOT compilation must not become a backend error");
 
         assert!(matches!(error, DriverError::Cancelled));
         std::fs::remove_dir_all(directory)?;

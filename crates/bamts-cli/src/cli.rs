@@ -7,6 +7,7 @@ use crate::driver::{
     execute_with_cancel,
 };
 use bamts_compiler::CancellationToken;
+use bamts_runtime::Limits;
 
 /// Runs one CLI invocation against the ambient process context.
 #[must_use]
@@ -40,7 +41,7 @@ pub fn cli_outcome_in_context_with_cancel(
     cancel: CancellationToken,
 ) -> CommandOutcome {
     cli_outcome_with(argv, |args| {
-        execute_in_context_with_cancel(args, context, cancel.clone())
+        execute_in_context_with_cancel(args, context, cancel.clone(), Limits::program())
     })
 }
 
