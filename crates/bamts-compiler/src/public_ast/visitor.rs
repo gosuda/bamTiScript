@@ -194,7 +194,11 @@ where
         }
         Statement::Namespace(value) => visit_node(NodeRef::Block(&value.body), visitor)?,
         Statement::Declare(inner) => visit_node(NodeRef::Statement(inner), visitor)?,
-        Statement::Block(block) => visit_node(NodeRef::Block(block), visitor)?,
+        Statement::Block(block) => {
+            for statement in &block.data().statements {
+                visit_node(NodeRef::Statement(statement), visitor)?;
+            }
+        }
         Statement::Expression(value) => {
             visit_node(NodeRef::Expression(&value.expression), visitor)?;
         }
