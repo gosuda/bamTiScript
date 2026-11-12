@@ -531,6 +531,10 @@ pub enum Helper {
     /// `bamts_require_global_binding(frame, name, out)`: throw a
     /// `ReferenceError` unless the global `name` is bound, reading no value.
     RequireGlobalBinding,
+    /// `bamts_throw_intrinsic_error(frame, kind, message, out)`: throw the
+    /// realm's intrinsic error of selector `kind` with string constant
+    /// `message`.
+    ThrowIntrinsicError,
 }
 
 impl Helper {
@@ -592,6 +596,7 @@ impl Helper {
             Helper::CopyDataProperties => "bamts_copy_data_properties",
             Helper::GetTemplateObject => "bamts_get_template_object",
             Helper::RequireGlobalBinding => "bamts_require_global_binding",
+            Helper::ThrowIntrinsicError => "bamts_throw_intrinsic_error",
         }
     }
 
@@ -654,6 +659,7 @@ impl Helper {
             Helper::CopyDataProperties => 51,
             Helper::GetTemplateObject => 52,
             Helper::RequireGlobalBinding => 53,
+            Helper::ThrowIntrinsicError => 54,
         }
     }
 
@@ -716,6 +722,7 @@ impl Helper {
             51 => Some(Helper::CopyDataProperties),
             52 => Some(Helper::GetTemplateObject),
             53 => Some(Helper::RequireGlobalBinding),
+            54 => Some(Helper::ThrowIntrinsicError),
             _ => None,
         }
     }
@@ -806,8 +813,10 @@ impl Helper {
             Helper::StoreGlobal | Helper::Export => {
                 &[types::I64, types::I32, types::I64, types::I64]
             }
-            // (frame, pattern, flags, out)
-            Helper::CreateRegExp => &[types::I64, types::I32, types::I32, types::I64],
+            // (frame, pattern/kind, flags/message, out)
+            Helper::CreateRegExp | Helper::ThrowIntrinsicError => {
+                &[types::I64, types::I32, types::I32, types::I64]
+            }
             // (frame, src, kind, out)
             Helper::GetIterator => &[types::I64, types::I64, types::I32, types::I64],
             // (frame, iterator, out)
@@ -1855,6 +1864,15 @@ impl<'a> Lowering<'a> {
                 );
                 self.route_completion(pc, tag, None);
             }
+            Instruction::ThrowIntrinsicError { kind, message } => {
+                let kind = self.iconst32(i64::from(kind.selector()));
+                let message = self.iconst32(i64::from(message.get()));
+                let tag = self.call_helper(
+                    Helper::ThrowIntrinsicError,
+                    &[self.frame, kind, message, self.out],
+                );
+                self.route_completion(pc, tag, None);
+            }
             Instruction::TypeOfGlobal { dst, name } => {
                 let name_id = self.iconst32(i64::from(name.get()));
                 let tag = self.call_helper(Helper::TypeOfGlobal, &[self.frame, name_id, self.out]);
@@ -2578,6 +2596,7 @@ fn routes_to_handler(instruction: Instruction) -> bool {
         | Instruction::CopyDataProperties { .. }
         | Instruction::GetTemplateObject { .. }
         | Instruction::RequireGlobalBinding { .. }
+        | Instruction::ThrowIntrinsicError { .. }
         | Instruction::Suspend { .. }
         | Instruction::Await { .. }
         | Instruction::Throw { .. } => true,
@@ -2658,7 +2677,8 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::ImportDynamicAttributes { .. }
         | Instruction::CopyDataProperties { .. }
         | Instruction::GetTemplateObject { .. }
-        | Instruction::RequireGlobalBinding { .. } => false,
+        | Instruction::RequireGlobalBinding { .. }
+        | Instruction::ThrowIntrinsicError { .. } => false,
     }
 }
 
@@ -2774,7 +2794,8 @@ impl NormalSuccessors for Instruction {
             | Instruction::ImportDynamicAttributes { .. }
             | Instruction::CopyDataProperties { .. }
             | Instruction::GetTemplateObject { .. }
-            | Instruction::RequireGlobalBinding { .. } => visit(pc + 1),
+            | Instruction::RequireGlobalBinding { .. }
+            | Instruction::ThrowIntrinsicError { .. } => visit(pc + 1),
         }
     }
 }
@@ -2981,6 +3002,7 @@ mod tests {
             Helper::CopyDataProperties,
             Helper::GetTemplateObject,
             Helper::RequireGlobalBinding,
+            Helper::ThrowIntrinsicError,
         ];
         let mut symbols = BTreeSet::new();
         for (expected_index, helper) in helpers.iter().copied().enumerate() {
@@ -2993,8 +3015,8 @@ mod tests {
             );
             assert!(symbols.insert(helper.symbol()), "unique symbol {helper:?}");
         }
-        assert_eq!(symbols.len(), 54);
-        assert_eq!(Helper::from_external_index(54), None);
+        assert_eq!(symbols.len(), 55);
+        assert_eq!(Helper::from_external_index(55), None);
     }
     #[test]
     fn iterator_close_helpers_use_the_pinned_abis() {

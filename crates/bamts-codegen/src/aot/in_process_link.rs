@@ -850,6 +850,7 @@ fn helper_address(helper: crate::Helper) -> usize {
         Helper::CopyDataProperties => fn_addr!(bamts_native::bamts_copy_data_properties),
         Helper::GetTemplateObject => fn_addr!(bamts_native::bamts_get_template_object),
         Helper::RequireGlobalBinding => fn_addr!(bamts_native::bamts_require_global_binding),
+        Helper::ThrowIntrinsicError => fn_addr!(bamts_native::bamts_throw_intrinsic_error),
     }
 }
 

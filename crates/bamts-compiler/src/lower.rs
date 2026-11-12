@@ -33,7 +33,8 @@ use crate::syntax::{
 use bamts_bytecode::{
     AccessorKind, BigIntLiteral, BinaryOp, Constant, ConstantId, DescriptorSlot, DisposeHint,
     EcmaString, ExceptionHandler, Function, FunctionFlags, FunctionId, Instruction,
-    IteratorCloseMode, IteratorKind, MAX_BIGINT_BYTES, MAX_CONSTANTS, MAX_FUNCTIONS,
+    IntrinsicErrorKind, IteratorCloseMode, IteratorKind, MAX_BIGINT_BYTES, MAX_CONSTANTS,
+    MAX_FUNCTIONS,
     MAX_INSTRUCTIONS, MAX_REGISTERS, Module, NumberBits, Pc, RESUME_RETURN, RESUME_THROW, Register,
     UnaryOp, Verified, VerifyError,
 };
@@ -4463,7 +4464,7 @@ impl<'a> FunctionContext<'a> {
         message: &str,
     ) -> Result<Register, LowerError> {
         self.lower_expression(builder, call)?;
-        self.throw_error_message(builder, range, "ReferenceError", Some(message))?;
+        self.throw_intrinsic_error(builder, range, IntrinsicErrorKind::ReferenceError, message)?;
         self.undefined(builder, range)
     }
     fn lower_identifier_assignment(
@@ -5141,6 +5142,7 @@ impl<'a> FunctionContext<'a> {
         &mut self,
         builder: &mut ModuleBuilder,
         range: TextRange,
+        class_name: Option<&str>,
     ) -> Result<(), LowerError> {
         let new_target = self.new_target_value(range)?;
         let undefined = self.undefined(builder, range)?;
@@ -5161,7 +5163,11 @@ impl<'a> FunctionContext<'a> {
                 target: Pc::new(0),
             },
         )?;
-        self.throw_error(builder, range, "TypeError")?;
+        let message = format!(
+            "Class constructor {} cannot be invoked without 'new'",
+            class_name.unwrap_or_default()
+        );
+        self.throw_intrinsic_error(builder, range, IntrinsicErrorKind::TypeError, &message)?;
         self.patch_jump(constructed, self.next_pc());
         Ok(())
     }
@@ -5171,49 +5177,25 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         range: TextRange,
     ) -> Result<Register, LowerError> {
-        self.throw_error(builder, range, "ReferenceError")?;
+        self.throw_intrinsic_error(
+            builder,
+            range,
+            IntrinsicErrorKind::ReferenceError,
+            "Unsupported reference to 'super'",
+        )?;
         self.undefined(builder, range)
     }
-    fn throw_error(
+    /// Throws the realm's own `kind` error, whatever guest code has stored in
+    /// the global binding of that name.
+    fn throw_intrinsic_error(
         &mut self,
         builder: &mut ModuleBuilder,
         range: TextRange,
-        kind: &str,
+        kind: IntrinsicErrorKind,
+        message: &str,
     ) -> Result<(), LowerError> {
-        self.throw_error_message(builder, range, kind, None)
-    }
-    fn throw_error_message(
-        &mut self,
-        builder: &mut ModuleBuilder,
-        range: TextRange,
-        kind: &str,
-        message: Option<&str>,
-    ) -> Result<(), LowerError> {
-        let name = builder.intern(Constant::String(EcmaString::encode(kind)), range)?;
-        let callee = self.alloc_register(range)?;
-        self.emit(range, Instruction::LoadGlobal { dst: callee, name })?;
-        let arguments = self.alloc_register(range)?;
-        self.emit(range, Instruction::CreateArray { dst: arguments })?;
-        if let Some(message) = message {
-            let value = self.string_reg(builder, EcmaString::encode(message), range)?;
-            self.emit(
-                range,
-                Instruction::ArrayPush {
-                    array: arguments,
-                    value,
-                },
-            )?;
-        }
-        let value = self.alloc_register(range)?;
-        self.emit(
-            range,
-            Instruction::Construct {
-                dst: value,
-                callee,
-                arguments,
-            },
-        )?;
-        self.emit(range, Instruction::Throw { value })?;
+        let message = builder.intern(Constant::String(EcmaString::encode(message)), range)?;
+        self.emit(range, Instruction::ThrowIntrinsicError { kind, message })?;
         Ok(())
     }
     /// The key of a reference that is read and then written, converted now so
@@ -9433,7 +9415,7 @@ impl<'a> FunctionContext<'a> {
                 });
             }
         }
-        inner.reject_plain_call(builder, range)?;
+        inner.reject_plain_call(builder, range, source_name)?;
         inner.bind_parameters(builder, parameters, range, &parameter_slots, rest_index)?;
         if let Some(block) = body {
             inner.hoist_vars(builder, &block.statements, range)?;
@@ -11817,8 +11799,9 @@ mod tests {
         );
     }
     use bamts_bytecode::{
-        BinaryOp, Constant, ConstantId, DecodeLimits, Function, Instruction, IteratorKind, Module,
-        Pc, RESUME_RETURN, RESUME_THROW, Register, UnaryOp, Verified, decode_verified,
+        BinaryOp, Constant, ConstantId, DecodeLimits, Function, Instruction, IntrinsicErrorKind,
+        IteratorKind, Module, Pc, RESUME_RETURN, RESUME_THROW, Register, UnaryOp, Verified,
+        decode_verified,
     };
     fn lower_js_result(src: &str) -> Result<Module<Verified>, LowerError> {
         let source = Arc::new(
@@ -11926,6 +11909,41 @@ mod tests {
             ["load", "require", "store"]
         );
         assert_eq!(global_ops("q = 5;", "q"), ["store"]);
+    }
+    #[test]
+    fn language_errors_never_read_a_global_error_constructor() {
+        for (src, kind, message) in [
+            (
+                "class C {} C();",
+                IntrinsicErrorKind::TypeError,
+                "Class constructor C cannot be invoked without 'new'",
+            ),
+            (
+                "class B {} class D extends B { m() { delete super.x; } }",
+                IntrinsicErrorKind::ReferenceError,
+                "Unsupported reference to 'super'",
+            ),
+            (
+                "function f() {} f() = 1;",
+                IntrinsicErrorKind::ReferenceError,
+                "Invalid left-hand side in assignment",
+            ),
+        ] {
+            let module = lower_js(src);
+            let constants = module.constants();
+            let names = |id: ConstantId, wanted: &[&str]| {
+                matches!(&constants[id.get() as usize], Constant::String(text) if wanted.iter().any(|name| text.eq_ascii(name)))
+            };
+            let code = || module.functions().iter().flat_map(|function| function.code());
+            assert!(
+                !code().any(|instruction| matches!(*instruction, Instruction::LoadGlobal { name, .. } if names(name, &["TypeError", "ReferenceError"]))),
+                "{src}"
+            );
+            assert!(
+                code().any(|instruction| matches!(*instruction, Instruction::ThrowIntrinsicError { kind: thrown, message: text } if thrown == kind && names(text, &[message]))),
+                "{src}"
+            );
+        }
     }
     #[test]
     fn class_decorators_lower_in_reverse_and_bind_the_final_class_once() {

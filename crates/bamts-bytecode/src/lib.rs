@@ -667,6 +667,53 @@ impl DescriptorSlot {
     }
 }
 
+/// The realm intrinsic error constructor [`Instruction::ThrowIntrinsicError`]
+/// throws. The thrown object takes the realm's own prototype, never the
+/// value of the mutable global binding of the same name.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum IntrinsicErrorKind {
+    TypeError,
+    ReferenceError,
+    SyntaxError,
+    RangeError,
+}
+
+impl IntrinsicErrorKind {
+    /// The intrinsic constructor's name.
+    #[must_use]
+    pub const fn constructor_name(self) -> &'static str {
+        match self {
+            Self::TypeError => "TypeError",
+            Self::ReferenceError => "ReferenceError",
+            Self::SyntaxError => "SyntaxError",
+            Self::RangeError => "RangeError",
+        }
+    }
+
+    /// The stable selector used on the wire and across the native helper ABI.
+    #[must_use]
+    pub const fn selector(self) -> u32 {
+        match self {
+            Self::TypeError => 0,
+            Self::ReferenceError => 1,
+            Self::SyntaxError => 2,
+            Self::RangeError => 3,
+        }
+    }
+
+    /// Inverts [`Self::selector`]; `None` for an unknown selector.
+    #[must_use]
+    pub const fn from_selector(selector: u32) -> Option<Self> {
+        match selector {
+            0 => Some(Self::TypeError),
+            1 => Some(Self::ReferenceError),
+            2 => Some(Self::SyntaxError),
+            3 => Some(Self::RangeError),
+            _ => None,
+        }
+    }
+}
+
 /// Normal generator resumption (`Generator.prototype.next`).
 pub const RESUME_NEXT: i32 = 0;
 /// Abrupt throw resumption (`Generator.prototype.throw`).
@@ -996,6 +1043,12 @@ pub enum Instruction {
     RequireGlobalBinding {
         name: ConstantId,
     },
+    /// Throw a new error built from the realm's intrinsic `kind` constructor
+    /// with the string constant `message`.
+    ThrowIntrinsicError {
+        kind: IntrinsicErrorKind,
+        message: ConstantId,
+    },
     /// Terminate the current activation (identical to the formal `Halt`).
     Halt,
 }
@@ -1056,6 +1109,9 @@ impl From<isa::Instruction> for Instruction {
                 Self::GetTemplateObject { dst, cooked, raw }
             }
             isa::Instruction::RequireGlobalBinding { name } => Self::RequireGlobalBinding { name },
+            isa::Instruction::ThrowIntrinsicError { kind, message } => {
+                Self::ThrowIntrinsicError { kind, message }
+            }
         }
     }
 }
@@ -1116,6 +1172,9 @@ impl Instruction {
                 isa::Instruction::GetTemplateObject { dst, cooked, raw }
             }
             Self::RequireGlobalBinding { name } => isa::Instruction::RequireGlobalBinding { name },
+            Self::ThrowIntrinsicError { kind, message } => {
+                isa::Instruction::ThrowIntrinsicError { kind, message }
+            }
             _ => return None,
         })
     }
@@ -1289,6 +1348,7 @@ impl Instruction {
             | Self::Jump { .. }
             | Self::Import { .. }
             | Self::RequireGlobalBinding { .. }
+            | Self::ThrowIntrinsicError { .. }
             | Self::Halt => {}
         }
     }
@@ -1368,6 +1428,7 @@ impl Instruction {
             | Self::Throw { .. }
             | Self::RequireCloseResult { .. }
             | Self::RequireGlobalBinding { .. }
+            | Self::ThrowIntrinsicError { .. }
             | Self::Halt => {}
         }
     }
@@ -1434,6 +1495,7 @@ impl Instruction {
             | Self::CopyDataProperties { .. }
             | Self::GetTemplateObject { .. }
             | Self::RequireGlobalBinding { .. }
+            | Self::ThrowIntrinsicError { .. }
             | Self::Export { .. } => visit(Pc::new(pc + 1)),
         }
     }
@@ -2680,7 +2742,8 @@ fn verify_instruction(
         | Instruction::ImportDynamicAttributes { .. }
         | Instruction::CopyDataProperties { .. }
         | Instruction::GetTemplateObject { .. }
-        | Instruction::RequireGlobalBinding { .. } => {}
+        | Instruction::RequireGlobalBinding { .. }
+        | Instruction::ThrowIntrinsicError { .. } => {}
         Instruction::Halt => {}
     }
 
@@ -2879,6 +2942,9 @@ pub enum DecodeErrorKind {
     TrailingBytes {
         count: usize,
     },
+    InvalidIntrinsicErrorKind {
+        selector: u32,
+    },
 }
 
 impl fmt::Display for DecodeError {
@@ -2945,6 +3011,9 @@ impl fmt::Display for DecodeError {
                 actual,
             } => write!(formatter, "{field} value {actual} exceeds limit {limit}"),
             DecodeErrorKind::TrailingBytes { count } => write!(formatter, "{count} trailing bytes"),
+            DecodeErrorKind::InvalidIntrinsicErrorKind { selector } => {
+                write!(formatter, "invalid intrinsic error kind {selector}")
+            }
         }
     }
 }
@@ -3958,7 +4027,8 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
         | Instruction::ImportDynamicAttributes { .. }
         | Instruction::CopyDataProperties { .. }
         | Instruction::GetTemplateObject { .. }
-        | Instruction::RequireGlobalBinding { .. } => unreachable!("handled above"),
+        | Instruction::RequireGlobalBinding { .. }
+        | Instruction::ThrowIntrinsicError { .. } => unreachable!("handled above"),
     }
 }
 
@@ -7321,6 +7391,10 @@ mod tests {
             Instruction::RequireGlobalBinding {
                 name: ConstantId::new(0),
             },
+            Instruction::ThrowIntrinsicError {
+                kind: IntrinsicErrorKind::RangeError,
+                message: ConstantId::new(0),
+            },
         ];
         let limits = DecodeLimits::default();
         for instruction in instructions {
@@ -7359,7 +7433,13 @@ mod tests {
     #[test]
     fn root_decoder_rejects_truncated_and_unknown_extension_bytes() {
         let limits = DecodeLimits::default();
-        for bytes in [&[52_u8][..], &[54, 0, 0][..], &[57, 0, 0][..], &[58][..]] {
+        for bytes in [
+            &[52_u8][..],
+            &[54, 0, 0][..],
+            &[57, 0, 0][..],
+            &[58][..],
+            &[59, 0][..],
+        ] {
             let mut decoder = Decoder {
                 bytes,
                 offset: 0,
@@ -7376,7 +7456,7 @@ mod tests {
         }
 
         let mut decoder = Decoder {
-            bytes: &[59],
+            bytes: &[60],
             offset: 0,
             limits: &limits,
             total_instructions: 0,
@@ -7384,7 +7464,7 @@ mod tests {
         assert!(matches!(
             decoder.instruction(),
             Err(DecodeError {
-                kind: DecodeErrorKind::InvalidOpcode { opcode: 59 },
+                kind: DecodeErrorKind::InvalidOpcode { opcode: 60 },
                 ..
             })
         ));
