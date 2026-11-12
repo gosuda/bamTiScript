@@ -569,13 +569,13 @@ pub(super) fn define_field<H: Host>(
 pub(super) fn part_object<H: Host>(
     machine: &mut Machine<'_, H>,
     part_type: &str,
-    value: &str,
+    value: EcmaString,
     extra: Option<(&str, &str)>,
 ) -> Result<Value, EvalFailure> {
     let part = new_object(machine)?;
     let type_value = string_value(machine, part_type)?;
     define_field(machine, part, "type", type_value)?;
-    let text = string_value(machine, value)?;
+    let text = allocate_string(machine, value)?;
     define_field(machine, part, "value", text)?;
     if let Some((name, text)) = extra {
         let text = string_value(machine, text)?;
@@ -656,7 +656,7 @@ fn define_tag(
 pub(super) fn string_iterable_to_list<H: Host>(
     machine: &mut Machine<'_, H>,
     iterable: Value,
-) -> Result<Vec<String>, EvalFailure> {
+) -> Result<Vec<EcmaString>, EvalFailure> {
     let mut list = Vec::new();
     if iterable == Value::UNDEFINED {
         return Ok(list);
@@ -686,7 +686,7 @@ pub(super) fn string_iterable_to_list<H: Host>(
             let _ = machine.close_iterator_raw(iterator);
             return Err(failure);
         };
-        list.push(text.to_utf8_lossy());
+        list.push(text);
     })();
     machine.pop_native_roots(depth);
     result?;

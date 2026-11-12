@@ -1,5 +1,6 @@
 //! `Intl.DateTimeFormat`.
 
+use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::super::date_full::TimeZoneRule;
@@ -500,7 +501,7 @@ fn format_to_parts<H: Host>(
         elements.push(part_object(
             machine,
             part.part_type.as_str(),
-            &part.value,
+            EcmaString::encode(&part.value),
             None,
         )?);
     }
@@ -580,7 +581,7 @@ fn format_range_to_parts<H: Host>(
         elements.push(part_object(
             machine,
             part.part_type.as_str(),
-            &part.value,
+            EcmaString::encode(&part.value),
             Some(("source", source_name(part.source))),
         )?);
     }

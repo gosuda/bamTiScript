@@ -2,15 +2,15 @@
 
 use bamts_native::Value;
 
-use super::super::allocate_array;
+use super::super::{allocate_array, allocate_string};
 use super::options::{
     canonicalize_locale_list, get_options_object, locale_matcher_option, matcher_name,
     string_option,
 };
 use super::{
     Class, allocate, arg, define_field, install_class, instance_prototype, intl_record, new_object,
-    part_object, require_new, service_failure, string_iterable_to_list, string_outcome,
-    string_value, supported_locales_outcome, type_error,
+    part_object, require_new, service_failure, string_iterable_to_list, string_value,
+    supported_locales_outcome, type_error,
 };
 use crate::intl::locale_data::{DATA, IntlData};
 use crate::intl::number_data::NoHostLocale;
@@ -116,7 +116,7 @@ fn format<H: Host>(
     };
     let text = format.format(&elements);
     let text = text.map_err(|error| service_failure(machine, &error))?;
-    string_outcome(machine, &text)
+    allocate_string(machine, text).map(BuiltinOutcome::Value)
 }
 
 fn format_to_parts<H: Host>(
@@ -140,7 +140,7 @@ fn format_to_parts<H: Host>(
             ListPartKind::Element => "element",
             ListPartKind::Literal => "literal",
         };
-        elements.push(part_object(machine, part_type, &part.value, None)?);
+        elements.push(part_object(machine, part_type, part.value.clone(), None)?);
     }
     allocate_array(machine, elements).map(BuiltinOutcome::Value)
 }
@@ -165,4 +165,165 @@ fn resolved_options<H: Host>(
         define_field(machine, result, name, value)?;
     }
     Ok(BuiltinOutcome::Value(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::allocate_string;
+    use super::super::super::test_support::{TestHost, blank_program};
+    use super::*;
+    use crate::Limits;
+    use bamts_bytecode::EcmaString;
+
+    const LONE_SURROGATE_UNITS: [[u16; 1]; 2] = [[0xD800], [0xDC00]];
+    const TYPES: [(&str, &str); 2] = [("conjunction", ", and "), ("disjunction", ", or ")];
+
+    fn list_format(machine: &mut Machine<'_, TestHost>, list_type: &str) -> Value {
+        let intl = machine.intrinsics.global("Intl").expect("Intl");
+        let constructor = machine
+            .get_named_property(intl, "ListFormat")
+            .expect("Intl.ListFormat");
+        let options = super::new_object(machine).expect("options object");
+        let type_name = super::string_value(machine, list_type).expect("type string");
+        super::define_field(machine, options, "type", type_name).expect("type option");
+        let locales = super::string_value(machine, "en").expect("locales string");
+        machine
+            .construct_value(constructor, &[locales, options])
+            .expect("a list format")
+    }
+
+    fn element_array(machine: &mut Machine<'_, TestHost>, elements: &[&[u16]]) -> Value {
+        let mut values = Vec::with_capacity(elements.len());
+        for element in elements {
+            values.push(
+                allocate_string(machine, EcmaString::from_units(element)).expect("element string"),
+            );
+        }
+        allocate_array(machine, values).expect("element array")
+    }
+
+    fn formatted_units(
+        machine: &mut Machine<'_, TestHost>,
+        format: Value,
+        elements: &[&[u16]],
+    ) -> Vec<u16> {
+        let list = element_array(machine, elements);
+        let method = machine
+            .get_named_property(format, "format")
+            .expect("format method");
+        let text = machine.call_value(method, format, &[list]).expect("text");
+        machine.string_value(text).expect("a string").as_units().to_vec()
+    }
+
+    fn part_units(
+        machine: &mut Machine<'_, TestHost>,
+        format: Value,
+        elements: &[&[u16]],
+    ) -> Vec<(&'static str, Vec<u16>)> {
+        let list = element_array(machine, elements);
+        let method = machine
+            .get_named_property(format, "formatToParts")
+            .expect("formatToParts method");
+        let parts = machine.call_value(method, format, &[list]).expect("parts");
+        let parts = machine
+            .array_elements(parts)
+            .expect("an array")
+            .expect("an array");
+        parts
+            .into_iter()
+            .map(|part| {
+                let kind = machine
+                    .get_named_property(part, "type")
+                    .expect("type property");
+                let kind = if machine.string_value(kind).expect("a string").eq_ascii("element") {
+                    "element"
+                } else {
+                    "literal"
+                };
+                let value = machine
+                    .get_named_property(part, "value")
+                    .expect("value property");
+                let value = machine.string_value(value).expect("a string");
+                (kind, value.as_units().to_vec())
+            })
+            .collect()
+    }
+
+    fn joined_units(elements: &[Vec<u16>], separators: &[&str]) -> Vec<u16> {
+        let mut joined = Vec::new();
+        for (element, separator) in elements.iter().zip(separators) {
+            joined.extend(separator.encode_utf16());
+            joined.extend_from_slice(element);
+        }
+        joined
+    }
+
+    fn elements_with(lone: [u16; 1], position: usize) -> Vec<Vec<u16>> {
+        let mut elements: Vec<Vec<u16>> = ["a", "b", "c"]
+            .iter()
+            .map(|text| text.encode_utf16().collect())
+            .collect();
+        elements[position] = lone.to_vec();
+        elements
+    }
+
+    fn borrowed(elements: &[Vec<u16>]) -> Vec<&[u16]> {
+        elements.iter().map(Vec::as_slice).collect()
+    }
+
+    fn element_values(parts: &[(&'static str, Vec<u16>)]) -> Vec<Vec<u16>> {
+        parts
+            .iter()
+            .filter(|(kind, _)| *kind == "element")
+            .map(|(_, value)| value.clone())
+            .collect()
+    }
+
+    fn literal_values(parts: &[(&'static str, Vec<u16>)]) -> Vec<Vec<u16>> {
+        parts
+            .iter()
+            .filter(|(kind, _)| *kind == "literal")
+            .map(|(_, value)| value.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_lone_surrogate_element_keeps_its_code_unit_in_formatted_text() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        for (list_type, separator) in TYPES {
+            let format = list_format(&mut machine, list_type);
+            let separators = ["", ", ", separator];
+            for lone in LONE_SURROGATE_UNITS {
+                for position in 0..3 {
+                    let elements = elements_with(lone, position);
+                    let text = formatted_units(&mut machine, format, &borrowed(&elements));
+                    assert_eq!(text, joined_units(&elements, &separators));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_lone_surrogate_element_keeps_its_code_unit_in_every_part() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        for (list_type, separator) in TYPES {
+            let format = list_format(&mut machine, list_type);
+            let literals = vec![
+                ", ".encode_utf16().collect::<Vec<u16>>(),
+                separator.encode_utf16().collect::<Vec<u16>>(),
+            ];
+            for lone in LONE_SURROGATE_UNITS {
+                for position in 0..3 {
+                    let elements = elements_with(lone, position);
+                    let parts = part_units(&mut machine, format, &borrowed(&elements));
+                    assert_eq!(element_values(&parts), elements);
+                    assert_eq!(literal_values(&parts), literals);
+                }
+            }
+        }
+    }
 }

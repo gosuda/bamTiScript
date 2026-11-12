@@ -2,9 +2,10 @@
 
 use std::collections::BTreeMap;
 
+use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
-use super::super::allocate_array;
+use super::super::{allocate_array, allocate_string};
 use super::super::temporal::to_temporal_duration;
 use super::options::{
     Options, canonicalize_locale_list, get_options_object, locale_matcher_option, number_option,
@@ -12,8 +13,8 @@ use super::options::{
 };
 use super::{
     Class, allocate, arg, define_field, install_class, instance_prototype, intl_record,
-    is_type_sequence, new_object, part_object, range_error, require_new, string_outcome,
-    string_value, supported_locales_outcome, type_error,
+    is_type_sequence, new_object, part_object, range_error, require_new, string_value,
+    supported_locales_outcome, type_error,
 };
 use crate::intl::duration_format::{
     DurationFormat, DurationPart, UNITS, UnitOptions, UnitStyle, default_unit_options,
@@ -247,8 +248,11 @@ fn format<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let parts = parts(machine, this, arg(args, 0))?;
-    let text: String = parts.iter().map(|part| part.value.as_str()).collect();
-    string_outcome(machine, &text)
+    let mut text = Vec::new();
+    for part in &parts {
+        text.extend_from_slice(part.value.as_units());
+    }
+    allocate_string(machine, EcmaString::from_units(&text)).map(BuiltinOutcome::Value)
 }
 
 fn format_to_parts<H: Host>(
@@ -261,7 +265,7 @@ fn format_to_parts<H: Host>(
     let mut elements = Vec::with_capacity(parts.len());
     for part in &parts {
         let extra = part.unit.map(|unit| ("unit", unit));
-        elements.push(part_object(machine, part.part_type, &part.value, extra)?);
+        elements.push(part_object(machine, part.part_type, part.value.clone(), extra)?);
     }
     allocate_array(machine, elements).map(BuiltinOutcome::Value)
 }

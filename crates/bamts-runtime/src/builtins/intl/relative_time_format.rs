@@ -1,5 +1,6 @@
 //! `Intl.RelativeTimeFormat`.
 
+use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::super::allocate_array;
@@ -182,7 +183,7 @@ fn format_to_parts<H: Host>(
             RelativeTimePartKind::Number(kind) => number_part_type(kind),
         };
         let extra = part.unit.map(|unit| ("unit", unit.as_str()));
-        elements.push(part_object(machine, part_type, &part.value, extra)?);
+        elements.push(part_object(machine, part_type, EcmaString::encode(&part.value), extra)?);
     }
     allocate_array(machine, elements).map(BuiltinOutcome::Value)
 }
