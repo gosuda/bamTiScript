@@ -10,18 +10,28 @@
 //! composes the existing scanner, parser, checker, and emitter surfaces.
 
 use bamts_cancel::{CancellationToken, Cancelled};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::checker::diagnostic_messages::{Args, by_u32};
 use crate::checker::{self, ProgramCheckInput, ResolvedModuleEdge, SemanticModel};
-use crate::diagnostic::{Diagnostic, Recovered};
+use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
 use crate::emitter::{self, EmitFileNames, EmitOptions, EmitOutput, ModuleKind};
 use crate::lint::{LintProfile, LintTable};
 use crate::parser;
-use crate::program::{JsxRoutingDecision, ModuleTarget, ProgramOutputKind, ResolvedProgram};
+use crate::program::{
+    JsxRoutingDecision, ModuleEdge, ModuleTarget, ProgramOutputKind, ResolvedModule,
+    ResolvedProgram,
+};
 use crate::scanner;
 use crate::source::{ScriptKind, SourceId, SourceText};
-use crate::syntax::{ExportDeclaration, ExportNamedDeclaration, SourceFile};
+use crate::syntax::{
+    ExportDeclaration, ExportNamedDeclaration, NamespaceName, SourceFile, Statement, Stmt,
+};
 use crate::telemetry::{Phase, Telemetry};
+
+/// An import nothing satisfies, in `tsc`'s own numbering.
+const CANNOT_FIND_MODULE: DiagnosticCode = DiagnosticCode::new("TS2307");
 
 struct EdgeNode {
     id: crate::syntax::NodeId,
@@ -199,6 +209,32 @@ impl FrontendMode {
     }
 }
 
+fn dependencies_of(program: &ResolvedProgram, source_id: SourceId) -> &[ModuleEdge] {
+    program
+        .modules()
+        .iter()
+        .find(|module| module.source_id() == source_id)
+        .map_or(&[], |module| module.dependencies())
+}
+
+/// The local module an edge's names come from; types may resolve apart.
+fn edge_target(edge: &ModuleEdge) -> Option<SourceId> {
+    edge.type_target()
+        .unwrap_or_else(|| edge.target())
+        .local_source_id()
+}
+
+fn local_dependency(
+    program: &ResolvedProgram,
+    source_id: SourceId,
+    specifier: &str,
+) -> Option<SourceId> {
+    dependencies_of(program, source_id)
+        .iter()
+        .find(|edge| edge.specifier() == specifier)
+        .and_then(edge_target)
+}
+
 fn program_emit_options(program: &ResolvedProgram, mode: FrontendMode) -> Option<EmitOptions> {
     let mut options = mode.emit_options()?;
 
@@ -219,6 +255,8 @@ fn program_emit_options(program: &ResolvedProgram, mode: FrontendMode) -> Option
         program.import_helpers(),
     );
     options.no_emit_helpers = check.no_emit_helpers();
+    options.remove_comments = check.remove_comments();
+    options.verbatim_module_syntax = program.verbatim_module_syntax();
 
     // JSX routing is JavaScript-specific and already shared with the CLI path,
     // which applies the same overrides from `program.jsx()` after its base
@@ -346,6 +384,100 @@ impl ProgramFrontendOutput {
         &self.modules
     }
 
+    /// Each module's export names with no runtime form. A name forwarded from
+    /// another module, by a re-export or `export *`, takes that module's answer.
+    #[must_use]
+    pub fn erased_exports(&self, program: &ResolvedProgram) -> HashMap<SourceId, BTreeSet<String>> {
+        let mut erased = HashMap::new();
+        for module in &self.modules {
+            let source_id = module.source_file().source_id();
+            self.resolve_erased_exports(program, source_id, &mut erased, &mut HashSet::new());
+        }
+        erased
+    }
+
+    fn resolve_erased_exports(
+        &self,
+        program: &ResolvedProgram,
+        source_id: SourceId,
+        erased: &mut HashMap<SourceId, BTreeSet<String>>,
+        visiting: &mut HashSet<SourceId>,
+    ) -> BTreeSet<String> {
+        if let Some(names) = erased.get(&source_id) {
+            return names.clone();
+        }
+        let Some(module) = self.module(source_id) else {
+            return BTreeSet::new();
+        };
+        // A cycle decides nothing: a name stays until something proves it erased.
+        if !visiting.insert(source_id) {
+            return BTreeSet::new();
+        }
+        let exports =
+            emitter::transforms::module_exports(module.source_file(), module.semantic_model());
+        let mut names = exports.types;
+        let forwarded: BTreeSet<String> = exports
+            .forwards
+            .iter()
+            .map(|(exported, ..)| exported.clone())
+            .collect();
+        for (exported, specifier, imported) in exports.forwards {
+            if let Some(target) = local_dependency(program, source_id, &specifier)
+                && self
+                    .resolve_erased_exports(program, target, erased, visiting)
+                    .contains(&imported)
+            {
+                names.insert(exported);
+            } else {
+                // An explicit export outranks a local type of the same name.
+                names.remove(&exported);
+            }
+        }
+        let mut star_values = BTreeSet::new();
+        for specifier in exports.stars {
+            if let Some(target) = local_dependency(program, source_id, &specifier) {
+                let starred = self.resolve_erased_exports(program, target, erased, visiting);
+                if let Some(module) = self.module(target) {
+                    let exports = emitter::transforms::module_exports(
+                        module.source_file(),
+                        module.semantic_model(),
+                    );
+                    star_values.extend(exports.values);
+                }
+                // An explicit export of the same name shadows what a star brings.
+                names.extend(
+                    starred
+                        .into_iter()
+                        .filter(|name| name != "default" && !forwarded.contains(name)),
+                );
+            }
+        }
+        // A name stays if any star brings it as a value.
+        names.retain(|name| !exports.values.contains(name) && !star_values.contains(name));
+        erased.insert(source_id, names.clone());
+        names
+    }
+
+    /// `(specifier, name)` for what the module's imports can name that has no
+    /// runtime form. Emit cannot see other files, and an ES module naming one
+    /// of these fails at load.
+    #[must_use]
+    pub fn erased_imports(
+        &self,
+        program: &ResolvedProgram,
+        erased: &HashMap<SourceId, BTreeSet<String>>,
+        source_id: SourceId,
+    ) -> BTreeSet<(String, String)> {
+        let mut pairs = BTreeSet::new();
+        for edge in dependencies_of(program, source_id) {
+            let names = edge_target(edge).and_then(|target| erased.get(&target));
+            for name in names.into_iter().flatten() {
+                pairs.insert((edge.specifier().to_owned(), name.clone()));
+            }
+        }
+        pairs
+    }
+
     #[must_use]
     pub fn module(&self, source_id: SourceId) -> Option<&FrontendOutput> {
         self.modules
@@ -385,6 +517,72 @@ pub fn compile_program_frontend_with_lints(
 /// Cancellation is observed between frontend stages and at every source and
 /// dependency iteration boundary. A completed result is otherwise identical to
 /// compile_program_frontend_with_lints.
+/// The names of every `declare module "name"` in the program, which satisfy
+/// an import that no file does.
+fn ambient_module_names(parsed: &[Recovered<SourceFile>]) -> Vec<String> {
+    fn collect(file: &SourceFile, statement: &Stmt, names: &mut Vec<String>) {
+        match statement.data() {
+            Statement::Declare(inner) => collect(file, inner, names),
+            Statement::Namespace(namespace) => {
+                if let NamespaceName::StringLiteral(literal) = &namespace.name
+                    && let Some(text) = file.token_text(literal.data().token())
+                {
+                    names.push(text.trim_matches(['\'', '"']).to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut names = Vec::new();
+    for file in parsed {
+        for statement in file.product().statements() {
+            collect(file.product(), statement, &mut names);
+        }
+    }
+    names
+}
+
+/// Whether an ambient module `pattern` covers `specifier`. One `*` matches
+/// any text, as in `declare module "*.css"`.
+fn ambient_module_matches(pattern: &str, specifier: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => {
+            specifier.len() >= prefix.len() + suffix.len()
+                && specifier.starts_with(prefix)
+                && specifier.ends_with(suffix)
+        }
+        None => pattern == specifier,
+    }
+}
+
+/// TS2307 for each import of `module` that nothing satisfies.
+fn unresolved_import_diagnostics(
+    module: &ResolvedModule,
+    ambient_modules: &[String],
+) -> Vec<Diagnostic> {
+    module
+        .dependencies()
+        .iter()
+        .filter(|edge| {
+            edge.is_unresolved()
+                && !ambient_modules
+                    .iter()
+                    .any(|pattern| ambient_module_matches(pattern, edge.specifier()))
+        })
+        .map(|edge| {
+            let message = by_u32(2307)
+                .and_then(|entry| entry.format(Args::new([edge.specifier()])).ok())
+                .unwrap_or_else(|| "Cannot find module.".to_owned());
+            Diagnostic::error(
+                CANNOT_FIND_MODULE,
+                module.source_id(),
+                edge.range(),
+                message,
+            )
+        })
+        .collect()
+}
+
 pub fn compile_program_frontend_with_cancel(
     program: &ResolvedProgram,
     mode: FrontendMode,
@@ -417,6 +615,7 @@ pub fn compile_program_frontend_with_cancel(
 
         let edges = resolved_checker_edges_with_cancel(program, &parsed, cancel)?;
         cancel.check()?;
+        let ambient_modules = ambient_module_names(&parsed);
         let checked = Telemetry::measure(Phase::Check, || {
             checker::check_program_with_options_and_cancel(
                 ProgramCheckInput {
@@ -483,6 +682,7 @@ pub fn compile_program_frontend_with_cancel(
                     .filter(|diagnostic| diagnostic.source_id() == source_id)
                     .cloned(),
             );
+            diagnostics.extend(unresolved_import_diagnostics(module, &ambient_modules));
             if let Some(output) = &emit {
                 diagnostics.extend(output.diagnostics.iter().cloned());
             }
@@ -684,6 +884,82 @@ mod tests {
             .load("main.ts")
             .expect("load fixture program");
         (root_path, program)
+    }
+
+    /// Writes `files` to a fresh project and returns its root and config.
+    fn project(files: &[(&str, &str)]) -> (PathBuf, ProjectRoot, ProjectConfig) {
+        let root_path = std::env::temp_dir().join(format!(
+            "bamts-pipeline-unresolved-{}-{}",
+            std::process::id(),
+            files.len()
+        ));
+        let _ = std::fs::remove_dir_all(&root_path);
+        for (name, text) in files {
+            let path = root_path.join(name);
+            std::fs::create_dir_all(path.parent().expect("a file has a parent"))
+                .expect("create fixture directory");
+            std::fs::write(path, text).expect("write fixture file");
+        }
+        let root = ProjectRoot::new(std::fs::canonicalize(&root_path).expect("canonical fixture"))
+            .expect("valid project root");
+        let config = ProjectConfig::parse(
+            &root,
+            root_path.join("tsconfig.json"),
+            r#"{"compilerOptions":{"moduleResolution":"bundler"}}"#,
+        )
+        .expect("valid project config");
+        (root_path, root, config)
+    }
+
+    #[test]
+    fn a_check_run_reports_every_unresolved_import() {
+        let (root_path, root, config) = project(&[
+            (
+                "main.ts",
+                "import a from 'missing';\n\
+                 import b from './gone';\n\
+                 import c from 'declared';\n\
+                 import d from 'pattern.css';\n\
+                 import e from 'typed';\n\
+                 declare module 'declared' {}\n\
+                 declare module '*.css' {}\n",
+            ),
+            (
+                "node_modules/typed/package.json",
+                r#"{"name":"typed","types":"./lib/index.d.ts"}"#,
+            ),
+            ("node_modules/typed/lib/index.d.ts", "export default 1;\n"),
+        ]);
+        let loader = ProgramLoader::new(&root, config.options()).expect("construct loader");
+        assert!(
+            loader.clone().load("main.ts").is_err(),
+            "a run that executes must still refuse an unresolved import"
+        );
+        let program = loader
+            .tolerating_unresolved_imports()
+            .load("main.ts")
+            .expect("a check run keeps going");
+        assert_eq!(
+            program.modules().len(),
+            2,
+            "`typed` resolves as `tsc` would"
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        let entry = output
+            .modules()
+            .iter()
+            .find(|module| module.source_file().source_id() == output.entrypoint_id())
+            .expect("entrypoint module present");
+        let reported: Vec<_> = entry
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code().as_str() == "TS2307")
+            .map(|diagnostic| diagnostic.message().to_owned())
+            .collect();
+        assert_eq!(reported.len(), 2, "{reported:?}");
+        assert!(reported[0].contains("'missing'"), "{reported:?}");
+        assert!(reported[1].contains("'./gone'"), "{reported:?}");
+        let _ = std::fs::remove_dir_all(root_path);
     }
 
     fn entrypoint_javascript(output: &ProgramFrontendOutput) -> String {

@@ -5,7 +5,7 @@ use bamts_native::Value;
 
 use super::{
     allocate_array, allocate_string, heap_index, install_constructor_function, install_function,
-    type_error,
+    type_error, with_roots,
 };
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
@@ -30,72 +30,119 @@ const ERROR_TYPES: [(&str, u32); 9] = [
 /// prototypes. Main must call this after the baseline error installation.
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let error_prototype = prototype_of(heap, globals, "Error");
-    let stack_getter = install_function(heap, builtins, "get stack", 0, stack_get::<H>);
-    let stack_setter = install_function(heap, builtins, "set stack", 1, stack_set::<H>);
-    define_hidden(heap, error_prototype, STACK_GETTER, stack_getter);
-    define_hidden(heap, error_prototype, STACK_SETTER, stack_setter);
+    let brand = crate::intrinsics::push(
+        heap,
+        HeapEntry::PrivateName {
+            description: EcmaString::encode("[[ErrorData]]"),
+        },
+    );
+    builtins.set_error_brand(brand);
+    let error_prototype = prototype_of(heap, atoms, shapes, globals, "Error");
+    let stack_getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get stack", length: 0, handler: stack_get::<H> });
+    let stack_setter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "set stack", length: 1, handler: stack_set::<H> });
+    define_hidden(heap, atoms, shapes, error_prototype, STACK_GETTER, stack_getter);
+    define_hidden(heap, atoms, shapes, error_prototype, STACK_SETTER, stack_setter);
+    let getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get stack", length: 0, handler: prototype_stack_get::<H> });
+    let setter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "set stack", length: 1, handler: prototype_stack_set::<H> });
+    let HeapEntry::Object { properties, .. } = &mut heap[heap_index(error_prototype)] else {
+        panic!("Error.prototype is an ordinary object")
+    };
+    properties.insert(
+        shapes,
+        PropertyKey::Named(atoms.intern(EcmaString::encode("stack"))),
+        Property::Accessor {
+            getter: Some(getter),
+            setter: Some(setter),
+            enumerable: false,
+            configurable: true,
+        },
+    );
 
     for (name, length) in ERROR_TYPES {
-        let prototype = prototype_of(heap, globals, name);
-        let constructor =
-            install_constructor_function(heap, builtins, name, length, error_constructor::<H>);
-        builtins.set_constructor_prototype(heap, constructor, prototype);
+        let prototype = prototype_of(heap, atoms, shapes, globals, name);
+        let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: error_constructor::<H> });
+        builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
         builtins.set_error_prototype(heap, constructor, prototype);
         if name == "Error" {
-            let capture = install_function(
-                heap,
-                builtins,
-                "captureStackTrace",
-                1,
-                capture_stack_trace::<H>,
-            );
-            define_static(heap, constructor, "captureStackTrace", capture);
+            let capture = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "captureStackTrace", length: 1, handler: capture_stack_trace::<H> });
+            define_static(heap, atoms, shapes, constructor, "captureStackTrace", capture);
+            let is_error = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "isError", length: 1, handler: is_error::<H> });
+            define_static(heap, atoms, shapes, constructor, "isError", is_error);
+        } else {
+            let HeapEntry::NativeFunction { prototype, .. } = &mut heap[heap_index(constructor)]
+            else {
+                panic!("error constructors are native");
+            };
+            *prototype = Some(globals[&EcmaString::encode("Error")]);
         }
         globals.insert(EcmaString::encode(name), constructor);
     }
 }
 
-fn prototype_of(heap: &[HeapEntry], globals: &BTreeMap<EcmaString, Value>, name: &str) -> Value {
+fn prototype_of(
+    heap: &[HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &crate::ShapeTable,
+    globals: &BTreeMap<EcmaString, Value>,
+    name: &str,
+) -> Value {
     let constructor = globals
         .get(&EcmaString::encode(name))
         .copied()
         .expect("baseline error constructor is installed first");
-    own_data(heap, constructor, "prototype")
+    own_data(heap, atoms, shapes, constructor, "prototype")
 }
 
-fn own_data(heap: &[HeapEntry], object: Value, name: &str) -> Value {
+fn own_data(heap: &[HeapEntry], atoms: &mut crate::AtomTable, shapes: &crate::ShapeTable, object: Value, name: &str) -> Value {
     let properties = match &heap[heap_index(object)] {
         HeapEntry::Object { properties, .. } | HeapEntry::NativeFunction { properties, .. } => {
             properties
         }
         _ => panic!("error intrinsic property owner is an object"),
     };
-    match properties.get(&PropertyKey::Named(EcmaString::encode(name))) {
+    match properties.get(shapes, &PropertyKey::Named(atoms.intern(EcmaString::encode(name)))) {
         Some(Property::Data { value, .. }) => *value,
         _ => panic!("error intrinsic data property exists"),
     }
 }
 
-fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
+fn define_static(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+    constructor: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)] else {
         panic!("error constructor is a native function")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        shapes,
+        PropertyKey::Named(atoms.intern(EcmaString::encode(name))),
         super::builtin_property(value),
     );
 }
 
-fn define_hidden(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
+fn define_hidden(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+    object: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
         panic!("Error.prototype is an ordinary object")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        shapes,
+        PropertyKey::Named(atoms.intern(EcmaString::encode(name))),
         Property::Data {
             value,
             writable: false,
@@ -120,11 +167,35 @@ fn define_own<H: Host>(
     name: &str,
     value: Value,
 ) -> Result<(), EvalFailure> {
-    machine.define_descriptor(
-        object,
-        PropertyKey::Named(EcmaString::encode(name)),
-        data(value),
-    )
+    let key = PropertyKey::Named(machine.intern_str(name));
+    machine.define_descriptor(object, key, data(value))
+}
+
+fn has_error_brand<H: Host>(machine: &Machine<'_, H>, value: Value) -> Result<bool, EvalFailure> {
+    let brand = machine.intrinsics.builtins.error_brand_key();
+    Ok(machine
+        .runtime_slot(value)
+        .map_err(EvalFailure::Runtime)?
+        .is_some_and(|index| {
+            matches!(
+                &machine.heap[index],
+                HeapEntry::Object { properties, .. } if properties.contains_key(&machine.shapes, &brand)
+            )
+        }))
+}
+
+/// `Error.isError`: true only for objects an Error constructor made. The brand
+/// is a private key, so a proxy for an error or an object that merely inherits
+/// from `Error.prototype` does not have it.
+fn is_error<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let value = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let branded = has_error_brand(machine, value)?;
+    Ok(BuiltinOutcome::Value(Value::boolean(branded)))
 }
 
 pub(super) fn error_constructor<H: Host>(
@@ -162,58 +233,63 @@ pub(super) fn error_constructor<H: Host>(
             .map_err(EvalFailure::Runtime)?
     };
 
+    let brand = machine.intrinsics.builtins.error_brand_key();
+    machine.define_descriptor(object, brand, crate::error_brand())?;
+
     let (message_index, options_index) = match name {
         "AggregateError" => (1, 2),
         "SuppressedError" => (2, 3),
         _ => (0, 1),
     };
-    let message = args
-        .get(message_index)
-        .copied()
-        .filter(|value| *value != Value::UNDEFINED)
-        .map(|value| machine.to_string(value))
-        .transpose()?;
-    if let Some(text) = &message {
-        let value = allocate_string(machine, text.clone())?;
-        define_own(machine, object, "message", value)?;
-    }
-
-    if let Some(options) = args.get(options_index).copied()
-        && machine.is_object(options)
-    {
-        let key = PropertyKey::Named(EcmaString::encode("cause"));
-        if machine.internal_has_property(options, &key)? {
-            let cause = machine.get_named_property(options, "cause")?;
-            define_own(machine, object, "cause", cause)?;
+    with_roots(machine, &[object], |machine, _| {
+        let message = args
+            .get(message_index)
+            .copied()
+            .filter(|value| *value != Value::UNDEFINED)
+            .map(|value| machine.coerce_string_observable(value))
+            .transpose()?;
+        if let Some(text) = &message {
+            let value = allocate_string(machine, text.clone())?;
+            define_own(machine, object, "message", value)?;
         }
-    }
 
-    match name {
-        "AggregateError" => {
-            let source = args.first().copied().unwrap_or(Value::UNDEFINED);
-            let values = machine.iterable_values(source)?;
-            let array = allocate_array(machine, values)?;
-            define_own(machine, object, "errors", array)?;
+        if let Some(options) = args.get(options_index).copied()
+            && machine.is_object(options)
+        {
+            let key = PropertyKey::Named(machine.intern_str("cause"));
+            if machine.internal_has_property(options, &key)? {
+                let cause = machine.get_named_property(options, "cause")?;
+                define_own(machine, object, "cause", cause)?;
+            }
         }
-        "SuppressedError" => {
-            define_own(
-                machine,
-                object,
-                "error",
-                args.first().copied().unwrap_or(Value::UNDEFINED),
-            )?;
-            define_own(
-                machine,
-                object,
-                "suppressed",
-                args.get(1).copied().unwrap_or(Value::UNDEFINED),
-            )?;
-        }
-        _ => {}
-    }
 
-    install_stack(machine, object, name, message.as_ref(), None)?;
-    Ok(BuiltinOutcome::Value(object))
+        match name {
+            "AggregateError" => {
+                let source = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let values = machine.iterable_values(source)?;
+                let array = allocate_array(machine, values)?;
+                define_own(machine, object, "errors", array)?;
+            }
+            "SuppressedError" => {
+                define_own(
+                    machine,
+                    object,
+                    "error",
+                    args.first().copied().unwrap_or(Value::UNDEFINED),
+                )?;
+                define_own(
+                    machine,
+                    object,
+                    "suppressed",
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                )?;
+            }
+            _ => {}
+        }
+
+        install_stack(machine, object, name, message.as_ref(), None)?;
+        Ok(BuiltinOutcome::Value(object))
+    })
 }
 
 fn install_stack<H: Host>(
@@ -249,9 +325,10 @@ fn install_stack<H: Host>(
         ],
     )?;
     let setter = machine.get_named_property(error_prototype, STACK_SETTER)?;
+    let stack_key = PropertyKey::Named(machine.intern_str("stack"));
     machine.define_descriptor(
         object,
-        PropertyKey::Named(EcmaString::encode("stack")),
+        stack_key,
         Property::Accessor {
             getter: Some(getter),
             setter: Some(setter),
@@ -355,7 +432,7 @@ fn append_cause_chain<H: Host>(
     text: &mut EcmaStringBuilder,
     root: Value,
 ) -> Result<(), EvalFailure> {
-    let cause_key = PropertyKey::Named(EcmaString::encode("cause"));
+    let cause_key = PropertyKey::Named(machine.intern_str("cause"));
     let mut current = root;
     let mut seen = vec![root];
 
@@ -404,6 +481,56 @@ fn stack_set<H: Host>(
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 
+/// `get Error.prototype.stack`, reached by an error that has lost its own `stack`.
+fn prototype_stack_get<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_object(this) {
+        return Err(type_error("Error.prototype.stack requires an object"));
+    }
+    if has_error_brand(machine, this)? {
+        return super::error_to_string(machine, this, &[], constructing);
+    }
+    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
+
+/// `set Error.prototype.stack`, which never writes to the prototype itself.
+fn prototype_stack_set<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_object(this) {
+        return Err(type_error("Error.prototype.stack requires an object"));
+    }
+    let value = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if machine.string_value(value).is_none() {
+        return Err(type_error("Error.prototype.stack requires a string"));
+    }
+    if this == prototype_of_error(machine)? {
+        return Err(type_error("Cannot set stack on Error.prototype"));
+    }
+    let key = PropertyKey::Named(machine.intern_str("stack"));
+    if machine.internal_get_own_property(this, &key)?.is_some() {
+        machine.set_data_property_key(this, key, value)?;
+    } else {
+        machine.create_data_property_key(this, key, value)?;
+    }
+    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
+
+fn prototype_of_error<H: Host>(machine: &mut Machine<'_, H>) -> Result<Value, EvalFailure> {
+    let error = machine
+        .intrinsics
+        .global("Error")
+        .ok_or_else(|| type_error("Error constructor is not installed"))?;
+    machine.get_named_property(error, "prototype")
+}
+
 fn capture_stack_trace<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
@@ -432,6 +559,75 @@ fn capture_stack_trace<H: Host>(
 }
 
 #[cfg(test)]
+mod is_error_tests {
+    use super::super::test_support::{TestHost, blank_program, ordinary_object};
+    use super::*;
+    use crate::{Limits, ThrowOrigin};
+
+    fn is_error_of(machine: &mut Machine<'_, TestHost>, value: Value) -> Value {
+        let error = machine.intrinsics.global("Error").unwrap();
+        let method = machine.get_named_property(error, "isError").unwrap();
+        machine.call_value(method, error, &[value]).unwrap()
+    }
+
+    #[test]
+    fn the_brand_decides_rather_than_the_prototype_chain() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("RangeError").unwrap();
+        let real = machine.construct_value(constructor, &[]).unwrap();
+        assert_eq!(is_error_of(&mut machine, real), Value::TRUE);
+
+        let engine = machine
+            .materialize_engine_origin(ThrowOrigin::TypeError { operation: "test" })
+            .unwrap();
+        assert_eq!(
+            is_error_of(&mut machine, engine),
+            Value::TRUE,
+            "errors the engine throws carry the brand too"
+        );
+
+        let prototype = machine
+            .get_named_property(constructor, "prototype")
+            .unwrap();
+        assert_eq!(is_error_of(&mut machine, prototype), Value::FALSE);
+        let fake = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .unwrap();
+        assert_eq!(
+            is_error_of(&mut machine, fake),
+            Value::FALSE,
+            "inheriting from an error prototype does not make an error"
+        );
+        let handler = ordinary_object(&mut machine);
+        let proxy = super::super::proxy::create(&mut machine, real, handler).unwrap();
+        assert_eq!(is_error_of(&mut machine, proxy), Value::FALSE);
+        assert_eq!(is_error_of(&mut machine, Value::int32(1)), Value::FALSE);
+    }
+
+    #[test]
+    fn the_brand_is_invisible_to_reflection() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Error").unwrap();
+        let error = machine.construct_value(constructor, &[]).unwrap();
+        let keys = machine.internal_own_property_keys(error).unwrap();
+        assert!(
+            !keys
+                .iter()
+                .any(|key| matches!(key, PropertyKey::Private(_)))
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::test_support::{TestHost, blank_program, custom_iterable, ordinary_object};
     use super::*;
@@ -454,8 +650,9 @@ mod tests {
     }
 
     fn descriptor(machine: &mut Machine<'_, TestHost>, object: Value, name: &str) -> Property {
+        let key = PropertyKey::Named(machine.intern_str(name));
         machine
-            .own_descriptor(object, &PropertyKey::Named(EcmaString::encode(name)))
+            .own_descriptor(object, &key)
             .unwrap()
             .expect("own descriptor")
     }
@@ -541,16 +738,59 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
+    }
+
+    #[test]
+    fn error_prototype_stack_setter_ignores_the_prototype_itself() {
+        machine!(machine);
+        let error = machine.intrinsics.global("Error").unwrap();
+        let prototype = machine.get_named_property(error, "prototype").unwrap();
+        let key = PropertyKey::Named(machine.intern_str("stack"));
+        let Some(Property::Accessor {
+            setter: Some(setter),
+            ..
+        }) = machine.own_descriptor(prototype, &key).unwrap()
+        else {
+            panic!("Error.prototype.stack is an accessor");
+        };
+        let text = allocate_string(&mut machine, EcmaString::encode("trace")).unwrap();
+        assert!(machine.call_value(setter, prototype, &[text]).is_err());
+        let plain = ordinary_object(&mut machine);
+        assert!(
+            machine
+                .call_value(setter, plain, &[Value::int32(1)])
+                .is_err()
+        );
+        machine.call_value(setter, plain, &[text]).unwrap();
+        assert_eq!(machine.get_named_property(plain, "stack").unwrap(), text);
+    }
+
+    #[test]
+    fn error_to_string_defaults_missing_fields_and_requires_an_object() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let error = machine.intrinsics.global("Error").unwrap();
+        let prototype = machine.get_named_property(error, "prototype").unwrap();
+        let to_string = machine.get_named_property(prototype, "toString").unwrap();
+        assert!(matches!(
+            machine.call_value(to_string, Value::UNDEFINED, &[]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        let plain = ordinary_object(&mut machine);
+        let text = machine.call_value(to_string, plain, &[]).unwrap();
+        assert!(machine.string_value(text).unwrap().eq_ascii("Error"));
     }
 
     #[test]
     fn cause_distinguishes_absence_from_present_undefined() {
         machine!(machine);
+        let cause_key = PropertyKey::Named(machine.intern_str("cause"));
         let absent = call_error(&mut machine, "Error", &[]);
         assert!(
             machine
-                .own_descriptor(absent, &PropertyKey::Named(EcmaString::encode("cause")))
+                .own_descriptor(absent, &cause_key)
                 .unwrap()
                 .is_none()
         );
@@ -558,10 +798,7 @@ mod tests {
         let null_options = call_error(&mut machine, "Error", &[Value::UNDEFINED, Value::NULL]);
         assert!(
             machine
-                .own_descriptor(
-                    null_options,
-                    &PropertyKey::Named(EcmaString::encode("cause")),
-                )
+                .own_descriptor(null_options, &cause_key,)
                 .unwrap()
                 .is_none()
         );
@@ -647,7 +884,7 @@ mod tests {
         let iterable = ordinary_object(&mut machine);
         let iterator_throw = native(&mut machine, "iterator throw", iterator_throw);
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let iterator_key = machine.property_key_from_value(iterator_symbol).unwrap();
         machine
             .set_data_property_key(iterable, iterator_key, iterator_throw)
             .unwrap();
@@ -665,10 +902,11 @@ mod tests {
         machine!(machine);
         let source_and_options = ordinary_object(&mut machine);
         let cause_getter = native(&mut machine, "cause getter", cause_then_iterator);
+        let cause_key = PropertyKey::Named(machine.intern_str("cause"));
         machine
             .define_descriptor(
                 source_and_options,
-                PropertyKey::Named(EcmaString::encode("cause")),
+                cause_key,
                 Property::Accessor {
                     getter: Some(cause_getter),
                     setter: None,
@@ -679,7 +917,7 @@ mod tests {
             .unwrap();
         let iterator = native(&mut machine, "iterator", iterator_after_cause);
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let iterator_key = machine.property_key_from_value(iterator_symbol).unwrap();
         machine
             .set_data_property_key(source_and_options, iterator_key, iterator)
             .unwrap();
@@ -708,10 +946,11 @@ mod tests {
         machine!(machine);
         let source_and_options = ordinary_object(&mut machine);
         let cause_getter = native(&mut machine, "cause getter", cause_abrupt);
+        let cause_key = PropertyKey::Named(machine.intern_str("cause"));
         machine
             .define_descriptor(
                 source_and_options,
-                PropertyKey::Named(EcmaString::encode("cause")),
+                cause_key,
                 Property::Accessor {
                     getter: Some(cause_getter),
                     setter: None,
@@ -722,7 +961,7 @@ mod tests {
             .unwrap();
         let iterator = native(&mut machine, "iterator", iterator_after_cause);
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+        let iterator_key = machine.property_key_from_value(iterator_symbol).unwrap();
         machine
             .set_data_property_key(source_and_options, iterator_key, iterator)
             .unwrap();
@@ -783,10 +1022,11 @@ mod tests {
         let name_getter = native(&mut machine, "name getter", chain_name);
         let message_getter = native(&mut machine, "message getter", chain_message);
         for (name, getter) in [("name", name_getter), ("message", message_getter)] {
+            let key = PropertyKey::Named(machine.intern_str(name));
             machine
                 .define_descriptor(
                     cause,
-                    PropertyKey::Named(EcmaString::encode(name)),
+                    key,
                     Property::Accessor {
                         getter: Some(getter),
                         setter: None,

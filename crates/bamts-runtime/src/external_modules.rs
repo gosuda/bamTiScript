@@ -17,6 +17,8 @@ pub(crate) struct InstalledModule {
 
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
     object_prototype: Value,
     script_compiler: bool,
@@ -28,7 +30,7 @@ pub(crate) fn install<H: Host>(
             specifier: util_specifier.clone(),
         },
     );
-    let parse_args = register(heap, builtins, "parseArgs", 0, parse_args::<H>);
+    let parse_args = register(heap, atoms, shapes, builtins, BuiltinDef { name: "parseArgs", length: 0, handler: parse_args::<H> });
 
     let crypto_specifier = EcmaString::encode("node:crypto");
     let crypto_namespace = intrinsics::push(
@@ -37,9 +39,9 @@ pub(crate) fn install<H: Host>(
             specifier: crypto_specifier.clone(),
         },
     );
-    let create_hash = register(heap, builtins, "createHash", 2, create_hash::<H>);
-    let hash_update = register(heap, builtins, "update", 2, hash_update::<H>);
-    let hash_digest = register(heap, builtins, "digest", 1, hash_digest::<H>);
+    let create_hash = register(heap, atoms, shapes, builtins, BuiltinDef { name: "createHash", length: 2, handler: create_hash::<H> });
+    let hash_update = register(heap, atoms, shapes, builtins, BuiltinDef { name: "update", length: 2, handler: hash_update::<H> });
+    let hash_digest = register(heap, atoms, shapes, builtins, BuiltinDef { name: "digest", length: 1, handler: hash_digest::<H> });
 
     let mut modules = vec![
         InstalledModule {
@@ -56,24 +58,21 @@ pub(crate) fn install<H: Host>(
         },
     ];
     if script_compiler {
-        modules.push(crate::vm::install(heap, builtins, object_prototype));
+        modules.push(crate::vm::install(heap, atoms, shapes, builtins, object_prototype));
     }
     modules
 }
 
 fn register<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
-    name: &'static str,
-    length: u32,
-    handler: crate::intrinsics::BuiltinHandler<H>,
+    definition: BuiltinDef<H>,
 ) -> Value {
-    let id = builtins.register(BuiltinDef {
-        name,
-        length,
-        handler,
-    });
-    intrinsics::native_function(heap, id, name, length)
+    let id = builtins.register(definition);
+    let installed = builtins.get(id);
+    intrinsics::native_function(heap, atoms, shapes, id, installed.name, installed.length)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -406,13 +405,16 @@ fn object_properties<H: Host>(
     let HeapEntry::Object { properties, .. } = &machine.heap[index] else {
         return Err(type_error("parseArgs configuration must be an object"));
     };
-    let keys: Vec<PropertyKey> = properties.iter().map(|(key, _)| key.clone()).collect();
+    let keys: Vec<PropertyKey> = properties.iter(&machine.shapes).map(|(key, _)| key.clone()).collect();
     let mut result = BTreeMap::new();
     for key in keys {
         let PropertyKey::Named(name) = &key else {
             continue;
         };
-        let name = strict_host_text(name, "parseArgs option name must be well-formed UTF-16")?;
+        let name = strict_host_text(
+            machine.atoms.resolve(*name),
+            "parseArgs option name must be well-formed UTF-16",
+        )?;
         let property_value = machine.get_property_key(value, &key)?;
         result.insert(name, property_value);
     }
@@ -645,6 +647,7 @@ fn put<H: Host>(
     name: &str,
     value: Value,
 ) -> Result<(), EvalFailure> {
+    let key = PropertyKey::Named(machine.intern_str(name));
     let index = machine
         .runtime_slot(object)
         .map_err(EvalFailure::Runtime)?
@@ -654,7 +657,8 @@ fn put<H: Host>(
         _ => unreachable!("external module result is object-like"),
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        &mut machine.shapes,
+        key,
         Property::Data {
             value,
             writable: true,
@@ -1132,8 +1136,9 @@ mod tests {
         let namespace = machine.registry.cells[bindings[2].unwrap().0].value;
         assert_eq!(default, namespace);
         let namespace_index = machine.runtime_slot(namespace).unwrap().unwrap();
+        let parse_args_key = PropertyKey::Named(machine.intern_str("parseArgs"));
         assert!(matches!(
-            machine.own_get(namespace_index, &PropertyKey::Named(EcmaString::encode("parseArgs"))),
+            machine.own_get(namespace_index, &parse_args_key),
             Some(crate::Found::Value(value)) if value == named
         ));
     }
@@ -1188,11 +1193,13 @@ mod tests {
         let config = config(&mut machine, &["positional"], &[], &[]);
         let boolean = machine.intrinsics.global("Boolean").unwrap();
         let index = machine.runtime_slot(config).unwrap().unwrap();
+        let strict_key = PropertyKey::Named(machine.intern_str("strict"));
         let HeapEntry::Object { properties, .. } = &mut machine.heap[index] else {
             unreachable!()
         };
         properties.insert(
-            PropertyKey::Named(EcmaString::encode("strict")),
+            &mut machine.shapes,
+            strict_key,
             Property::Accessor {
                 getter: Some(boolean),
                 setter: None,
@@ -1273,22 +1280,10 @@ mod tests {
         let result = call_parse_args(&mut machine, defaults).unwrap();
         let values = machine_value(&machine, result, "values");
         let values_index = machine.runtime_slot(values).unwrap().unwrap();
-        assert!(
-            machine
-                .own_get(
-                    values_index,
-                    &PropertyKey::Named(EcmaString::encode("absent")),
-                )
-                .is_none()
-        );
-        assert!(
-            machine
-                .own_get(
-                    values_index,
-                    &PropertyKey::Named(EcmaString::encode("undefined")),
-                )
-                .is_none()
-        );
+        let absent_key = PropertyKey::Named(machine.intern_str("absent"));
+        assert!(machine.own_get(values_index, &absent_key,).is_none());
+        let undefined_key = PropertyKey::Named(machine.intern_str("undefined"));
+        assert!(machine.own_get(values_index, &undefined_key,).is_none());
 
         let invalid_default = alloc_string(&mut machine, "invalid").unwrap();
         let boolean_with_invalid_default =

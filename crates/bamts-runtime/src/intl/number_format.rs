@@ -16,7 +16,7 @@ use std::error::Error;
 use std::fmt;
 
 use super::locale_negotiation::{
-    default_locale, resolve_locale, HostLocaleHook, LocaleDataProvider, LocaleError, LocaleMatcher,
+    HostLocaleHook, LocaleDataProvider, LocaleError, LocaleMatcher, default_locale, resolve_locale,
 };
 
 /// The failure category visible to a runtime adapter.
@@ -43,19 +43,31 @@ pub struct NumberFormatError {
 
 impl NumberFormatError {
     fn range(message: impl Into<String>) -> Self {
-        Self { kind: NumberFormatErrorKind::RangeError, message: message.into() }
+        Self {
+            kind: NumberFormatErrorKind::RangeError,
+            message: message.into(),
+        }
     }
 
     fn type_error(message: impl Into<String>) -> Self {
-        Self { kind: NumberFormatErrorKind::TypeError, message: message.into() }
+        Self {
+            kind: NumberFormatErrorKind::TypeError,
+            message: message.into(),
+        }
     }
 
     fn missing(message: impl Into<String>) -> Self {
-        Self { kind: NumberFormatErrorKind::MissingData, message: message.into() }
+        Self {
+            kind: NumberFormatErrorKind::MissingData,
+            message: message.into(),
+        }
     }
 
     fn invalid_data(message: impl Into<String>) -> Self {
-        Self { kind: NumberFormatErrorKind::InvalidData, message: message.into() }
+        Self {
+            kind: NumberFormatErrorKind::InvalidData,
+            message: message.into(),
+        }
     }
 }
 
@@ -245,10 +257,18 @@ impl RoundingMode {
 
     const fn unsigned(self, negative: bool) -> UnsignedRoundingMode {
         match (self, negative) {
-            (Self::Ceil, false) | (Self::Floor, true) | (Self::Expand, _) => UnsignedRoundingMode::Infinity,
-            (Self::Ceil, true) | (Self::Floor, false) | (Self::Trunc, _) => UnsignedRoundingMode::Zero,
-            (Self::HalfCeil, false) | (Self::HalfFloor, true) | (Self::HalfExpand, _) => UnsignedRoundingMode::HalfInfinity,
-            (Self::HalfCeil, true) | (Self::HalfFloor, false) | (Self::HalfTrunc, _) => UnsignedRoundingMode::HalfZero,
+            (Self::Ceil, false) | (Self::Floor, true) | (Self::Expand, _) => {
+                UnsignedRoundingMode::Infinity
+            }
+            (Self::Ceil, true) | (Self::Floor, false) | (Self::Trunc, _) => {
+                UnsignedRoundingMode::Zero
+            }
+            (Self::HalfCeil, false) | (Self::HalfFloor, true) | (Self::HalfExpand, _) => {
+                UnsignedRoundingMode::HalfInfinity
+            }
+            (Self::HalfCeil, true) | (Self::HalfFloor, false) | (Self::HalfTrunc, _) => {
+                UnsignedRoundingMode::HalfZero
+            }
             (Self::HalfEven, _) => UnsignedRoundingMode::HalfEven,
         }
     }
@@ -421,8 +441,8 @@ pub struct PluralOperands {
     pub fraction_digits: String,
     /// Visible fraction digits after removing trailing zeros.
     pub fraction_digits_without_trailing_zeros: String,
-    pub visible_fraction_digits: u8,
-    pub visible_fraction_digits_without_trailing_zeros: u8,
+    pub visible_fraction_digits: usize,
+    pub visible_fraction_digits_without_trailing_zeros: usize,
     /// Compact decimal exponent (`e`/`c` in CLDR operands).
     pub exponent: i32,
 }
@@ -436,10 +456,19 @@ pub struct PluralOperands {
 pub trait NumberFormatDataProvider: LocaleDataProvider {
     fn number_symbols(&self, data_locale: &str, numbering_system: &str) -> Option<NumberSymbols>;
     fn grouping_sizes(&self, data_locale: &str, numbering_system: &str) -> Option<GroupingSizes>;
-    fn number_patterns(&self, data_locale: &str, request: NumberPatternRequest<'_>) -> Option<NumberPatternSet>;
+    fn number_patterns(
+        &self,
+        data_locale: &str,
+        request: NumberPatternRequest<'_>,
+    ) -> Option<NumberPatternSet>;
     fn scientific_pattern(&self, data_locale: &str) -> Option<String>;
     /// ILD `ComputeExponentForMagnitude` result for compact notation.
-    fn compact_exponent(&self, data_locale: &str, display: CompactDisplay, magnitude: i32) -> Option<i32>;
+    fn compact_exponent(
+        &self,
+        data_locale: &str,
+        display: CompactDisplay,
+        magnitude: i32,
+    ) -> Option<i32>;
     fn compact_pattern(
         &self,
         data_locale: &str,
@@ -581,7 +610,7 @@ pub struct ResolvedNumberFormatOptions {
 
 /// Exact finite decimal magnitude, normalized without leading or trailing zeroes.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct Decimal {
+pub struct Decimal {
     digits: Vec<u8>,
     /// Value is `digits × 10^exponent`.
     exponent: i32,
@@ -589,7 +618,10 @@ struct Decimal {
 
 impl Decimal {
     fn zero() -> Self {
-        Self { digits: vec![0], exponent: 0 }
+        Self {
+            digits: vec![0],
+            exponent: 0,
+        }
     }
 
     fn new(mut digits: Vec<u8>, mut exponent: i32) -> Result<Self, NumberFormatError> {
@@ -615,6 +647,19 @@ impl Decimal {
         self.is_zero() || self.exponent >= 0
     }
 
+    /// The value, when it is an integer of at most 19 digits.
+    fn small_integer(&self) -> Option<i128> {
+        let zeros = usize::try_from(self.exponent).ok()?;
+        if self.digits.len().saturating_add(zeros) > 19 {
+            return None;
+        }
+        let coefficient = self
+            .digits
+            .iter()
+            .fold(0_i128, |value, digit| value * 10 + i128::from(*digit));
+        Some((0..zeros).fold(coefficient, |value, _| value * 10))
+    }
+
     fn magnitude(&self) -> Result<i32, NumberFormatError> {
         if self.is_zero() {
             return Ok(0);
@@ -635,7 +680,10 @@ impl Decimal {
             .exponent
             .checked_add(places)
             .ok_or_else(|| NumberFormatError::range("decimal exponent is out of range"))?;
-        Ok(Self { digits: self.digits.clone(), exponent })
+        Ok(Self {
+            digits: self.digits.clone(),
+            exponent,
+        })
     }
 }
 
@@ -667,19 +715,28 @@ impl IntlMathematicalValue {
         }
         let negative = value.is_sign_negative();
         let text = value.abs().to_string();
-        let magnitude = parse_decimal_magnitude(&text).expect("finite f64 renders as a decimal literal");
-        Self::Finite { negative, magnitude }
+        let magnitude =
+            parse_decimal_magnitude(&text).expect("finite f64 renders as a decimal literal");
+        Self::Finite {
+            negative,
+            magnitude,
+        }
     }
 
     /// Parses an exact BigInt decimal representation.
     pub fn from_bigint(value: &str) -> Result<Self, NumberFormatError> {
         let (negative, body) = split_sign(value);
         if body.is_empty() || !body.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(NumberFormatError::range("invalid BigInt decimal representation"));
+            return Err(NumberFormatError::range(
+                "invalid BigInt decimal representation",
+            ));
         }
         let digits = body.bytes().map(|byte| byte - b'0').collect();
         let magnitude = Decimal::new(digits, 0)?;
-        Ok(Self::Finite { negative: negative && !magnitude.is_zero(), magnitude })
+        Ok(Self::Finite {
+            negative: negative && !magnitude.is_zero(),
+            magnitude,
+        })
     }
 
     /// Parses an exact decimal literal for a future JavaScript String adapter.
@@ -689,12 +746,18 @@ impl IntlMathematicalValue {
         if negative && magnitude.is_zero() {
             return Ok(Self::NegativeZero);
         }
-        Ok(Self::Finite { negative, magnitude })
+        Ok(Self::Finite {
+            negative,
+            magnitude,
+        })
     }
 
     fn shifted(&self, places: i32) -> Result<Self, NumberFormatError> {
         match self {
-            Self::Finite { negative, magnitude } => Ok(Self::Finite {
+            Self::Finite {
+                negative,
+                magnitude,
+            } => Ok(Self::Finite {
                 negative: *negative,
                 magnitude: magnitude.shifted(places)?,
             }),
@@ -707,6 +770,102 @@ impl IntlMathematicalValue {
 
     fn is_nan(&self) -> bool {
         matches!(self, Self::Nan)
+    }
+
+    fn is_negative(&self) -> bool {
+        match self {
+            Self::Finite { negative, .. } => *negative,
+            Self::NegativeZero | Self::NegativeInfinity => true,
+            Self::PositiveInfinity | Self::Nan => false,
+        }
+    }
+
+    fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::NegativeZero => Some(0),
+            Self::Finite {
+                negative,
+                magnitude,
+            } => {
+                let value = magnitude.small_integer()?;
+                i64::try_from(if *negative { -value } else { value }).ok()
+            }
+            _ => None,
+        }
+    }
+
+    fn nearest_number(&self) -> f64 {
+        match self {
+            Self::Finite {
+                negative,
+                magnitude,
+            } => {
+                let digits: String = magnitude
+                    .digits
+                    .iter()
+                    .map(|digit| char::from(b'0' + digit))
+                    .collect();
+                let value = format!("{digits}e{}", magnitude.exponent)
+                    .parse()
+                    .unwrap_or(f64::NAN);
+                if *negative { -value } else { value }
+            }
+            Self::NegativeZero => -0.0,
+            Self::PositiveInfinity => f64::INFINITY,
+            Self::NegativeInfinity => f64::NEG_INFINITY,
+            Self::Nan => f64::NAN,
+        }
+    }
+}
+
+/// One end of a range, as V8 hands it to ICU. ICU compares the two ends before it
+/// rounds them, and the result of that comparison depends on the form of each end.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RangeEnd {
+    /// The value that `ToIntlMathematicalValue` read.
+    pub value: IntlMathematicalValue,
+    /// Whether V8 hands the value to ICU as a double, as it does a Number.
+    pub as_double: bool,
+}
+
+impl RangeEnd {
+    /// A Number, which V8 hands to ICU as a double.
+    #[must_use]
+    pub fn number(value: f64) -> Self {
+        Self {
+            value: IntlMathematicalValue::from_f64(value),
+            as_double: true,
+        }
+    }
+
+    /// A BigInt or a numeric string, which V8 hands to ICU as decimal digits.
+    #[must_use]
+    pub fn digits(value: IntlMathematicalValue) -> Self {
+        Self {
+            value,
+            as_double: false,
+        }
+    }
+
+    /// Whether ICU holds both ends as one value. ICU holds the digits of an integer
+    /// that fits 64 bits as that integer, and any other end as the nearest double.
+    /// Ends in different forms are never one value. Thus `"1e-400"` and `"2e-400"`
+    /// are one value, and so are the Number `1` and `"1.00000000000000001"`, but
+    /// `"1"` and `"1.00000000000000001"` are not.
+    fn same_in_icu(&self, other: &Self) -> bool {
+        match (self.integer_in_icu(), other.integer_in_icu()) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => self.value.nearest_number() == other.value.nearest_number(),
+            _ => false,
+        }
+    }
+
+    fn integer_in_icu(&self) -> Option<i64> {
+        if self.as_double {
+            None
+        } else {
+            self.value.as_i64()
+        }
     }
 }
 
@@ -793,7 +952,10 @@ struct QuantumRound {
 }
 
 fn normalize_integer(mut digits: Vec<u8>) -> Vec<u8> {
-    let first = digits.iter().position(|digit| *digit != 0).unwrap_or(digits.len());
+    let first = digits
+        .iter()
+        .position(|digit| *digit != 0)
+        .unwrap_or(digits.len());
     if first == digits.len() {
         return vec![0];
     }
@@ -802,7 +964,9 @@ fn normalize_integer(mut digits: Vec<u8>) -> Vec<u8> {
 }
 
 fn mod_small(digits: &[u8], divisor: u32) -> u32 {
-    digits.iter().fold(0, |remainder, digit| (remainder * 10 + u32::from(*digit)) % divisor)
+    digits.iter().fold(0, |remainder, digit| {
+        (remainder * 10 + u32::from(*digit)) % divisor
+    })
 }
 
 fn add_small(mut digits: Vec<u8>, mut addend: u32) -> Vec<u8> {
@@ -960,18 +1124,26 @@ fn round_to_quantum(
                                 upper
                             }
                         }
-                        UnsignedRoundingMode::Zero | UnsignedRoundingMode::Infinity => unreachable!(),
+                        UnsignedRoundingMode::Zero | UnsignedRoundingMode::Infinity => {
+                            unreachable!()
+                        }
                     },
                 }
             }
         }
     };
     let rounded = Decimal::new(chosen.clone(), quantum_exponent)?;
-    Ok(QuantumRound { integer: chosen, rounded })
+    Ok(QuantumRound {
+        integer: chosen,
+        rounded,
+    })
 }
 
 fn digits_to_ascii(digits: &[u8]) -> String {
-    digits.iter().map(|digit| char::from(b'0' + *digit)).collect()
+    digits
+        .iter()
+        .map(|digit| char::from(b'0' + *digit))
+        .collect()
 }
 
 fn trim_fraction(mut formatted: String, maximum: u8, minimum: u8) -> String {
@@ -1022,6 +1194,11 @@ fn to_raw_fixed(
     })
 }
 
+/// The most zeros that a formatted number spells out after its decimal point. A
+/// short decimal string can ask for any number of them, and the text exists before
+/// the heap limit can refuse it. The default heap of 64 MiB holds no more units.
+const MAX_LEADING_ZEROS: usize = 1 << 25;
+
 fn to_raw_precision(
     value: &Decimal,
     minimum_precision: u8,
@@ -1029,7 +1206,7 @@ fn to_raw_precision(
     mode: UnsignedRoundingMode,
 ) -> Result<RawResult, NumberFormatError> {
     let precision = usize::from(maximum_precision);
-    let (mut coefficient, mut exponent, rounded_value) = if value.is_zero() {
+    let (mut coefficient, exponent, rounded_value) = if value.is_zero() {
         (vec![0; precision], 0, Decimal::zero())
     } else {
         let mut exponent = value.magnitude()?;
@@ -1041,7 +1218,9 @@ fn to_raw_precision(
         let mut coefficient = rounded.integer;
         while coefficient.len() > precision {
             if coefficient.last() != Some(&0) {
-                return Err(NumberFormatError::invalid_data("precision carry is not a power of ten"));
+                return Err(NumberFormatError::invalid_data(
+                    "precision carry is not a power of ten",
+                ));
             }
             coefficient.pop();
             exponent = exponent
@@ -1055,7 +1234,11 @@ fn to_raw_precision(
             .checked_sub(i32::from(maximum_precision))
             .and_then(|result| result.checked_add(1))
             .ok_or_else(|| NumberFormatError::range("rounding magnitude is out of range"))?;
-        (coefficient.clone(), exponent, Decimal::new(coefficient, final_quantum)?)
+        (
+            coefficient.clone(),
+            exponent,
+            Decimal::new(coefficient, final_quantum)?,
+        )
     };
 
     let mut formatted = digits_to_ascii(&coefficient);
@@ -1074,6 +1257,9 @@ fn to_raw_precision(
     } else {
         let zeros = usize::try_from(-(exponent + 1))
             .map_err(|_| NumberFormatError::range("decimal magnitude is out of range"))?;
+        if zeros > MAX_LEADING_ZEROS {
+            return Err(NumberFormatError::range("formatted number is too long"));
+        }
         formatted.insert_str(0, &format!("0.{}", "0".repeat(zeros)));
         integer_digits_count = 1;
     }
@@ -1123,6 +1309,8 @@ pub struct NumberFormat<'a> {
     symbols: NumberSymbols,
     grouping: GroupingSizes,
     patterns: NumberPatternSet,
+    /// The patterns of a value that takes a compact suffix, where they differ.
+    compact_patterns: Option<NumberPatternSet>,
     scientific_pattern: Option<String>,
     range_patterns: RangePatterns,
 }
@@ -1139,12 +1327,18 @@ impl<'a> NumberFormat<'a> {
         let locale_matcher = match options.locale_matcher.as_deref().unwrap_or("best fit") {
             "lookup" => LocaleMatcher::Lookup,
             "best fit" => LocaleMatcher::BestFit,
-            value => return Err(NumberFormatError::range(format!("invalid localeMatcher: {value}"))),
+            value => {
+                return Err(NumberFormatError::range(format!(
+                    "invalid localeMatcher: {value}"
+                )));
+            }
         };
         let numbering_option = match &options.numbering_system {
             Some(value) => {
                 if !is_unicode_type(value) {
-                    return Err(NumberFormatError::range(format!("invalid numberingSystem: {value}")));
+                    return Err(NumberFormatError::range(format!(
+                        "invalid numberingSystem: {value}"
+                    )));
                 }
                 Some(value.to_ascii_lowercase())
             }
@@ -1175,32 +1369,43 @@ impl<'a> NumberFormat<'a> {
         }
 
         let style = parse_style(options.style.as_deref())?;
-        let currency = options.currency.as_deref().map(validate_currency).transpose()?;
+        let currency = options
+            .currency
+            .as_deref()
+            .map(validate_currency)
+            .transpose()?;
         if style == NumberStyle::Currency && currency.is_none() {
-            return Err(NumberFormatError::type_error("currency is required when style is currency"));
+            return Err(NumberFormatError::type_error(
+                "currency is required when style is currency",
+            ));
         }
         let currency_display = parse_currency_display(options.currency_display.as_deref())?;
         let currency_sign = parse_currency_sign(options.currency_sign.as_deref())?;
         let unit = options.unit.as_deref().map(validate_unit).transpose()?;
         if style == NumberStyle::Unit && unit.is_none() {
-            return Err(NumberFormatError::type_error("unit is required when style is unit"));
+            return Err(NumberFormatError::type_error(
+                "unit is required when style is unit",
+            ));
         }
         let unit_display = parse_unit_display(options.unit_display.as_deref())?;
         let notation = parse_notation(options.notation.as_deref())?;
 
-        let (minimum_fraction_default, maximum_fraction_default) = if style == NumberStyle::Currency
-            && notation == Notation::Standard
-        {
-            let digits = provider.currency_minor_units(currency.as_deref().expect("currency style validated")).unwrap_or(2);
-            if digits > 100 {
-                return Err(NumberFormatError::invalid_data("currency minor-unit digits exceed 100"));
-            }
-            (digits, digits)
-        } else if style == NumberStyle::Percent {
-            (0, 0)
-        } else {
-            (0, 3)
-        };
+        let (minimum_fraction_default, maximum_fraction_default) =
+            if style == NumberStyle::Currency && notation == Notation::Standard {
+                let digits = provider
+                    .currency_minor_units(currency.as_deref().expect("currency style validated"))
+                    .unwrap_or(2);
+                if digits > 100 {
+                    return Err(NumberFormatError::invalid_data(
+                        "currency minor-unit digits exceed 100",
+                    ));
+                }
+                (digits, digits)
+            } else if style == NumberStyle::Percent {
+                (0, 0)
+            } else {
+                (0, 3)
+            };
         let digits = resolve_digit_options(
             options,
             minimum_fraction_default,
@@ -1209,24 +1414,35 @@ impl<'a> NumberFormat<'a> {
         )?;
         let compact_display_value = parse_compact_display(options.compact_display.as_deref())?;
         let compact_display = (notation == Notation::Compact).then_some(compact_display_value);
-        let default_grouping = if notation == Notation::Compact { UseGrouping::Min2 } else { UseGrouping::Auto };
+        let default_grouping = if notation == Notation::Compact {
+            UseGrouping::Min2
+        } else {
+            UseGrouping::Auto
+        };
         let use_grouping = resolve_grouping(options.use_grouping.as_ref(), default_grouping)?;
         let sign_display = parse_sign_display(options.sign_display.as_deref())?;
 
         let symbols = provider
             .number_symbols(&resolved.data_locale, &numbering_system)
-            .ok_or_else(|| NumberFormatError::missing(format!(
-                "missing symbols for {}/{}",
-                resolved.data_locale, numbering_system
-            )))?;
+            .ok_or_else(|| {
+                NumberFormatError::missing(format!(
+                    "missing symbols for {}/{}",
+                    resolved.data_locale, numbering_system
+                ))
+            })?;
         let grouping = provider
             .grouping_sizes(&resolved.data_locale, &numbering_system)
-            .ok_or_else(|| NumberFormatError::missing(format!(
-                "missing grouping data for {}/{}",
-                resolved.data_locale, numbering_system
-            )))?;
-        if grouping.primary == 0 || grouping.secondary == 0 || grouping.minimum_grouping_digits == 0 {
-            return Err(NumberFormatError::invalid_data("grouping sizes must be non-zero"));
+            .ok_or_else(|| {
+                NumberFormatError::missing(format!(
+                    "missing grouping data for {}/{}",
+                    resolved.data_locale, numbering_system
+                ))
+            })?;
+        if grouping.primary == 0 || grouping.secondary == 0 || grouping.minimum_grouping_digits == 0
+        {
+            return Err(NumberFormatError::invalid_data(
+                "grouping sizes must be non-zero",
+            ));
         }
         let request = NumberPatternRequest {
             style,
@@ -1240,7 +1456,25 @@ impl<'a> NumberFormat<'a> {
             .number_patterns(&resolved.data_locale, request)
             .ok_or_else(|| NumberFormatError::missing("missing number pattern"))?;
         validate_number_patterns(&patterns)?;
-        let scientific_pattern = if matches!(notation, Notation::Scientific | Notation::Engineering) {
+        // CLDR has no accounting form of a compact currency pattern, so a value
+        // that takes a compact suffix is signed as in the standard form.
+        let compact_patterns = if notation == Notation::Compact
+            && request.currency_sign == Some(CurrencySign::Accounting)
+        {
+            let request = NumberPatternRequest {
+                currency_sign: Some(CurrencySign::Standard),
+                ..request
+            };
+            let patterns = provider
+                .number_patterns(&resolved.data_locale, request)
+                .ok_or_else(|| NumberFormatError::missing("missing number pattern"))?;
+            validate_number_patterns(&patterns)?;
+            Some(patterns)
+        } else {
+            None
+        };
+        let scientific_pattern = if matches!(notation, Notation::Scientific | Notation::Engineering)
+        {
             let pattern = provider
                 .scientific_pattern(&resolved.data_locale)
                 .ok_or_else(|| NumberFormatError::missing("missing scientific notation pattern"))?;
@@ -1260,10 +1494,10 @@ impl<'a> NumberFormat<'a> {
             data_locale: resolved.data_locale,
             numbering_system,
             style,
-            currency: (style == NumberStyle::Currency).then_some(currency.expect("currency style validated")),
+            currency: currency.filter(|_| style == NumberStyle::Currency),
             currency_display: (style == NumberStyle::Currency).then_some(currency_display),
             currency_sign: (style == NumberStyle::Currency).then_some(currency_sign),
-            unit: (style == NumberStyle::Unit).then_some(unit.expect("unit style validated")),
+            unit: unit.filter(|_| style == NumberStyle::Unit),
             unit_display: (style == NumberStyle::Unit).then_some(unit_display),
             minimum_integer_digits: digits.minimum_integer,
             minimum_fraction_digits: digits.minimum_fraction,
@@ -1282,6 +1516,7 @@ impl<'a> NumberFormat<'a> {
             symbols,
             grouping,
             patterns,
+            compact_patterns,
             scientific_pattern,
             range_patterns,
         })
@@ -1336,7 +1571,10 @@ impl<'a> NumberFormat<'a> {
     }
 
     /// Partitions an exact BigInt decimal representation.
-    pub fn format_bigint_to_parts(&self, value: &str) -> Result<Vec<NumberPart>, NumberFormatError> {
+    pub fn format_bigint_to_parts(
+        &self,
+        value: &str,
+    ) -> Result<Vec<NumberPart>, NumberFormatError> {
         self.format_to_parts(&IntlMathematicalValue::from_bigint(value)?)
     }
 
@@ -1352,8 +1590,8 @@ impl<'a> NumberFormat<'a> {
     /// Formats a range. Number ranges are not ordered; only NaN endpoints are rejected.
     pub fn format_range(
         &self,
-        start: &IntlMathematicalValue,
-        end: &IntlMathematicalValue,
+        start: &RangeEnd,
+        end: &RangeEnd,
     ) -> Result<String, NumberFormatError> {
         Ok(self
             .format_range_to_parts(start, end)?
@@ -1362,41 +1600,111 @@ impl<'a> NumberFormat<'a> {
             .collect())
     }
 
-    /// ECMA-402 `PartitionNumberRangePattern` with the conforming trivial
-    /// `CollapseNumberRange` implementation explicitly permitted by the spec.
+    /// ECMA-402 `PartitionNumberRangePattern`, with the collapse choices of ICU, which
+    /// V8 uses. An end has three layers around its digits: an exponent, the sign and
+    /// symbols, and a unit or currency name. A name always collapses, in the plural
+    /// form of a range. The sign and symbols collapse when both ends share them and
+    /// they are longer than one code point, so `+$2.90–3.10` shares its `+$` and
+    /// `$3 – $5` repeats its `$`. An exponent or a sign or symbol that the start keeps
+    /// spaces out the separator, so `-1 – 1` has spaces and `1–-1` does not.
     pub fn format_range_to_parts(
         &self,
-        start: &IntlMathematicalValue,
-        end: &IntlMathematicalValue,
+        start: &RangeEnd,
+        end: &RangeEnd,
     ) -> Result<Vec<NumberRangePart>, NumberFormatError> {
-        if start.is_nan() || end.is_nan() {
-            return Err(NumberFormatError::range("number range endpoints must not be NaN"));
+        if start.value.is_nan() || end.value.is_nan() {
+            return Err(NumberFormatError::range(
+                "number range endpoints must not be NaN",
+            ));
         }
-        let start_parts = self.format_to_parts(start)?;
-        let end_parts = self.format_to_parts(end)?;
-        if concatenate_parts(&start_parts) == concatenate_parts(&end_parts) {
-            return self.approximate_range(start_parts);
+        let start_prepared = self.prepare_format(&start.value)?;
+        let end_prepared = self.prepare_format(&end.value)?;
+        let start_parts = self.partition_for_category(&start_prepared, PluralCategory::Other)?;
+        let end_parts = self.partition_for_category(&end_prepared, PluralCategory::Other)?;
+        let same_text = concatenate_parts(&start_parts) == concatenate_parts(&end_parts)
+            && start.value.is_negative() == end.value.is_negative();
+        if same_text
+            || (start.same_in_icu(end) && beside_digits(&start_parts).eq(beside_digits(&end_parts)))
+        {
+            return self.approximate_range(&start_prepared);
         }
+        let (start_prefix, start_number, start_suffix) = split_number(&start_parts);
+        let (end_prefix, end_number, end_suffix) = split_number(&end_parts);
+        let (start_suffix, name) = self.split_name(start_suffix);
+        let (end_suffix, _) = self.split_name(end_suffix);
+        let symbols = code_points(start_prefix) + code_points(start_suffix);
+        let shared = symbols > 1
+            && without_digit_space(start_prefix).eq(without_digit_space(end_prefix))
+            && start_suffix == end_suffix;
+        let exponent = start_number
+            .iter()
+            .any(|part| part.part_type == NumberPartType::ExponentSeparator);
+        let separator = if exponent || (!shared && symbols > 0) {
+            format!(" {} ", self.range_patterns.separator)
+        } else {
+            self.range_patterns.separator.clone()
+        };
         let mut result = Vec::with_capacity(start_parts.len() + end_parts.len() + 1);
-        result.extend(start_parts.into_iter().map(|part| NumberRangePart {
-            part_type: part.part_type,
-            value: part.value,
-            source: RangeSource::StartRange,
-        }));
-        result.push(NumberRangePart {
-            part_type: NumberPartType::Literal,
-            value: self.range_patterns.separator.clone(),
-            source: RangeSource::Shared,
-        });
-        result.extend(end_parts.into_iter().map(|part| NumberRangePart {
-            part_type: part.part_type,
-            value: part.value,
-            source: RangeSource::EndRange,
-        }));
+        let mut push = |parts: &[NumberPart], source| {
+            result.extend(parts.iter().map(|part| NumberRangePart {
+                part_type: part.part_type,
+                value: part.value.clone(),
+                source,
+            }));
+        };
+        if shared {
+            push(start_prefix, RangeSource::Shared);
+        } else {
+            push(start_prefix, RangeSource::StartRange);
+        }
+        push(start_number, RangeSource::StartRange);
+        if !shared {
+            push(start_suffix, RangeSource::StartRange);
+        }
+        push(
+            &[NumberPart {
+                part_type: NumberPartType::Literal,
+                value: separator,
+            }],
+            RangeSource::Shared,
+        );
+        if !shared {
+            push(end_prefix, RangeSource::EndRange);
+        }
+        push(end_number, RangeSource::EndRange);
+        if shared {
+            push(start_suffix, RangeSource::Shared);
+        } else {
+            push(end_suffix, RangeSource::EndRange);
+        }
+        push(name, RangeSource::Shared);
         Ok(result)
     }
 
-    fn prepare_format(&self, value: &IntlMathematicalValue) -> Result<PreparedFormat, NumberFormatError> {
+    /// Splits what follows a number at its unit or currency name and the space before.
+    /// A percent sign is a symbol, unless compact notation or the word makes it a name.
+    fn split_name<'p>(&self, suffix: &'p [NumberPart]) -> (&'p [NumberPart], &'p [NumberPart]) {
+        let percent_is_name = matches!(self.notation, Notation::Compact)
+            || self.unit_display == Some(UnitDisplay::Long);
+        let is_name = |part: &NumberPart| match part.part_type {
+            NumberPartType::Unit => percent_is_name || self.unit.as_deref() != Some("percent"),
+            NumberPartType::Currency => self.currency_display == Some(CurrencyDisplay::Name),
+            NumberPartType::PercentSign => percent_is_name,
+            _ => false,
+        };
+        let Some(name) = suffix.iter().position(is_name) else {
+            return (suffix, &[]);
+        };
+        let spaced = name
+            .checked_sub(1)
+            .filter(|space| suffix[*space].part_type == NumberPartType::Literal);
+        suffix.split_at(spaced.unwrap_or(name))
+    }
+
+    fn prepare_format(
+        &self,
+        value: &IntlMathematicalValue,
+    ) -> Result<PreparedFormat, NumberFormatError> {
         match value {
             IntlMathematicalValue::Nan => Ok(PreparedFormat {
                 rounded: IntlMathematicalValue::Nan,
@@ -1422,7 +1730,11 @@ impl<'a> NumberFormat<'a> {
                 let exponent = self.compute_exponent(&scaled_percent)?;
                 let scaled = scaled_percent.shifted(-exponent)?;
                 let (rounded, ascii) = self.format_numeric_to_string(&scaled)?;
-                Ok(PreparedFormat { rounded, ascii, exponent })
+                Ok(PreparedFormat {
+                    rounded,
+                    ascii,
+                    exponent,
+                })
             }
         }
     }
@@ -1433,43 +1745,57 @@ impl<'a> NumberFormat<'a> {
     ) -> Result<(IntlMathematicalValue, String), NumberFormatError> {
         let (negative, magnitude) = match value {
             IntlMathematicalValue::NegativeZero => (true, Decimal::zero()),
-            IntlMathematicalValue::Finite { negative, magnitude } => (*negative, magnitude.clone()),
+            IntlMathematicalValue::Finite {
+                negative,
+                magnitude,
+            } => (*negative, magnitude.clone()),
             IntlMathematicalValue::PositiveInfinity
             | IntlMathematicalValue::NegativeInfinity
             | IntlMathematicalValue::Nan => {
-                return Err(NumberFormatError::invalid_data("non-finite value reached rounding"));
+                return Err(NumberFormatError::invalid_data(
+                    "non-finite value reached rounding",
+                ));
             }
         };
         let mode = self.rounding_mode.unsigned(negative);
         let result = match self.rounding_type {
             RoundingType::SignificantDigits => to_raw_precision(
                 &magnitude,
-                self.minimum_significant_digits.expect("significant rounding has minimum"),
-                self.maximum_significant_digits.expect("significant rounding has maximum"),
+                self.minimum_significant_digits
+                    .expect("significant rounding has minimum"),
+                self.maximum_significant_digits
+                    .expect("significant rounding has maximum"),
                 mode,
             )?,
             RoundingType::FractionDigits => to_raw_fixed(
                 &magnitude,
-                self.minimum_fraction_digits.expect("fraction rounding has minimum"),
-                self.maximum_fraction_digits.expect("fraction rounding has maximum"),
+                self.minimum_fraction_digits
+                    .expect("fraction rounding has minimum"),
+                self.maximum_fraction_digits
+                    .expect("fraction rounding has maximum"),
                 self.rounding_increment,
                 mode,
             )?,
             RoundingType::MorePrecision | RoundingType::LessPrecision => {
                 let significant = to_raw_precision(
                     &magnitude,
-                    self.minimum_significant_digits.expect("priority rounding has significant minimum"),
-                    self.maximum_significant_digits.expect("priority rounding has significant maximum"),
+                    self.minimum_significant_digits
+                        .expect("priority rounding has significant minimum"),
+                    self.maximum_significant_digits
+                        .expect("priority rounding has significant maximum"),
                     mode,
                 )?;
                 let fraction = to_raw_fixed(
                     &magnitude,
-                    self.minimum_fraction_digits.expect("priority rounding has fraction minimum"),
-                    self.maximum_fraction_digits.expect("priority rounding has fraction maximum"),
+                    self.minimum_fraction_digits
+                        .expect("priority rounding has fraction minimum"),
+                    self.maximum_fraction_digits
+                        .expect("priority rounding has fraction maximum"),
                     self.rounding_increment,
                     mode,
                 )?;
-                let fixed_is_more_precise = fraction.rounding_magnitude < significant.rounding_magnitude;
+                let fixed_is_more_precise =
+                    fraction.rounding_magnitude < significant.rounding_magnitude;
                 if (self.rounding_type == RoundingType::MorePrecision && fixed_is_more_precise)
                     || (self.rounding_type == RoundingType::LessPrecision && !fixed_is_more_precise)
                 {
@@ -1480,22 +1806,32 @@ impl<'a> NumberFormat<'a> {
             }
         };
         let mut ascii = result.formatted;
-        if self.trailing_zero_display == TrailingZeroDisplay::StripIfInteger && result.rounded.is_integer() {
-            if let Some(index) = ascii.find('.') {
-                ascii.truncate(index);
-            }
+        if self.trailing_zero_display == TrailingZeroDisplay::StripIfInteger
+            && result.rounded.is_integer()
+            && let Some(index) = ascii.find('.')
+        {
+            ascii.truncate(index);
         }
         if result.integer_digits_count < usize::from(self.minimum_integer_digits) {
-            ascii.insert_str(0, &"0".repeat(usize::from(self.minimum_integer_digits) - result.integer_digits_count));
+            ascii.insert_str(
+                0,
+                &"0".repeat(usize::from(self.minimum_integer_digits) - result.integer_digits_count),
+            );
         }
         let rounded = if negative {
             if result.rounded.is_zero() {
                 IntlMathematicalValue::NegativeZero
             } else {
-                IntlMathematicalValue::Finite { negative: true, magnitude: result.rounded }
+                IntlMathematicalValue::Finite {
+                    negative: true,
+                    magnitude: result.rounded,
+                }
             }
         } else {
-            IntlMathematicalValue::Finite { negative: false, magnitude: result.rounded }
+            IntlMathematicalValue::Finite {
+                negative: false,
+                magnitude: result.rounded,
+            }
         };
         Ok((rounded, ascii))
     }
@@ -1515,7 +1851,9 @@ impl<'a> NumberFormat<'a> {
         };
         let (rounded, _) = self.format_numeric_to_string(&scaled)?;
         let new_magnitude = match rounded {
-            IntlMathematicalValue::Finite { magnitude, .. } if magnitude.is_zero() => return Ok(exponent),
+            IntlMathematicalValue::Finite { magnitude, .. } if magnitude.is_zero() => {
+                return Ok(exponent);
+            }
             IntlMathematicalValue::Finite { magnitude, .. } => magnitude.magnitude()?,
             IntlMathematicalValue::NegativeZero => return Ok(exponent),
             _ => return Err(NumberFormatError::invalid_data("non-finite exponent probe")),
@@ -1531,6 +1869,18 @@ impl<'a> NumberFormat<'a> {
         }
     }
 
+    /// The compact form in use. The long form has no place for a currency symbol or
+    /// code, which keep the short form, and only a currency name can follow a long word.
+    fn compact_form(&self) -> CompactDisplay {
+        let currency_symbol = self.style == NumberStyle::Currency
+            && self.currency_display != Some(CurrencyDisplay::Name);
+        if currency_symbol {
+            CompactDisplay::Short
+        } else {
+            self.compact_display.expect("compact display is resolved")
+        }
+    }
+
     fn compute_exponent_for_magnitude(&self, magnitude: i32) -> Result<i32, NumberFormatError> {
         match self.notation {
             Notation::Standard => Ok(0),
@@ -1538,19 +1888,19 @@ impl<'a> NumberFormat<'a> {
             Notation::Engineering => Ok(magnitude.div_euclid(3) * 3),
             Notation::Compact => self
                 .provider
-                .compact_exponent(
-                    &self.data_locale,
-                    self.compact_display.expect("compact display is resolved"),
-                    magnitude,
-                )
-                .ok_or_else(|| NumberFormatError::missing(format!(
-                    "missing compact exponent for magnitude {magnitude}"
-                ))),
+                .compact_exponent(&self.data_locale, self.compact_form(), magnitude)
+                .ok_or_else(|| {
+                    NumberFormatError::missing(format!(
+                        "missing compact exponent for magnitude {magnitude}"
+                    ))
+                }),
         }
     }
 
-    fn partition_outer_pattern(&self, prepared: &PreparedFormat) -> Result<Vec<NumberPart>, NumberFormatError> {
-        let pattern = self.pattern_for_value(&prepared.rounded);
+    fn partition_outer_pattern(
+        &self,
+        prepared: &PreparedFormat,
+    ) -> Result<Vec<NumberPart>, NumberFormatError> {
         let operands = operands_from_ascii(&prepared.ascii, prepared.exponent);
         let category = match prepared.rounded {
             IntlMathematicalValue::Finite { .. } | IntlMathematicalValue::NegativeZero => {
@@ -1558,17 +1908,46 @@ impl<'a> NumberFormat<'a> {
             }
             _ => PluralCategory::Other,
         };
+        self.partition_for_category(prepared, category)
+    }
+
+    fn partition_for_category(
+        &self,
+        prepared: &PreparedFormat,
+        category: PluralCategory,
+    ) -> Result<Vec<NumberPart>, NumberFormatError> {
+        let pattern = self.pattern_for(prepared);
         let tokens = partition_pattern(pattern)?;
+        let digits = matches!(
+            prepared.rounded,
+            IntlMathematicalValue::Finite { .. } | IntlMathematicalValue::NegativeZero
+        );
         let mut result = Vec::new();
         for token in tokens {
             match token {
-                PatternToken::Literal(value) => push_part(&mut result, NumberPartType::Literal, value),
+                // A no-break space sets a currency off from digits only.
+                PatternToken::Literal(value) if value == " " && !digits => {}
+                PatternToken::Literal(value) => {
+                    push_part(&mut result, NumberPartType::Literal, value)
+                }
                 PatternToken::Placeholder(name) => match name.as_str() {
                     "number" => result.extend(self.partition_notation(prepared, category)?),
-                    "plusSign" => push_part(&mut result, NumberPartType::PlusSign, self.symbols.plus_sign.clone()),
-                    "minusSign" => push_part(&mut result, NumberPartType::MinusSign, self.symbols.minus_sign.clone()),
+                    "plusSign" => push_part(
+                        &mut result,
+                        NumberPartType::PlusSign,
+                        self.symbols.plus_sign.clone(),
+                    ),
+                    "minusSign" => push_part(
+                        &mut result,
+                        NumberPartType::MinusSign,
+                        self.symbols.minus_sign.clone(),
+                    ),
                     "percentSign" if self.style == NumberStyle::Percent => {
-                        push_part(&mut result, NumberPartType::PercentSign, self.symbols.percent_sign.clone());
+                        push_part(
+                            &mut result,
+                            NumberPartType::PercentSign,
+                            self.symbols.percent_sign.clone(),
+                        );
                     }
                     "currencyCode" if self.style == NumberStyle::Currency => {
                         push_part(
@@ -1596,9 +1975,11 @@ impl<'a> NumberFormat<'a> {
                                 self.unit_display.expect("unit style"),
                                 category,
                             )
-                            .ok_or_else(|| NumberFormatError::missing(format!(
-                                "missing display name for unit {unit}"
-                            )))?;
+                            .ok_or_else(|| {
+                                NumberFormatError::missing(format!(
+                                    "missing display name for unit {unit}"
+                                ))
+                            })?;
                         push_part(&mut result, NumberPartType::Unit, value);
                     }
                     _ => push_part(&mut result, NumberPartType::Unknown, name),
@@ -1615,17 +1996,26 @@ impl<'a> NumberFormat<'a> {
     ) -> Result<Vec<NumberPart>, NumberFormatError> {
         match prepared.rounded {
             IntlMathematicalValue::Nan => {
-                return Ok(vec![NumberPart { part_type: NumberPartType::Nan, value: prepared.ascii.clone() }]);
+                return Ok(vec![NumberPart {
+                    part_type: NumberPartType::Nan,
+                    value: prepared.ascii.clone(),
+                }]);
             }
             IntlMathematicalValue::PositiveInfinity | IntlMathematicalValue::NegativeInfinity => {
-                return Ok(vec![NumberPart { part_type: NumberPartType::Infinity, value: prepared.ascii.clone() }]);
+                return Ok(vec![NumberPart {
+                    part_type: NumberPartType::Infinity,
+                    value: prepared.ascii.clone(),
+                }]);
             }
             _ => {}
         }
         let (pattern, compact_display) = match self.notation {
             Notation::Standard => (String::from("{number}"), None),
             Notation::Scientific | Notation::Engineering => (
-                self.scientific_pattern.as_ref().expect("scientific pattern resolved").clone(),
+                self.scientific_pattern
+                    .as_ref()
+                    .expect("scientific pattern resolved")
+                    .clone(),
                 None,
             ),
             Notation::Compact if prepared.exponent == 0 => (String::from("{number}"), None),
@@ -1634,14 +2024,16 @@ impl<'a> NumberFormat<'a> {
                     .provider
                     .compact_pattern(
                         &self.data_locale,
-                        self.compact_display.expect("compact display resolved"),
+                        self.compact_form(),
                         prepared.exponent,
                         category,
                     )
-                    .ok_or_else(|| NumberFormatError::missing(format!(
-                        "missing compact pattern for exponent {}",
-                        prepared.exponent
-                    )))?;
+                    .ok_or_else(|| {
+                        NumberFormatError::missing(format!(
+                            "missing compact pattern for exponent {}",
+                            prepared.exponent
+                        ))
+                    })?;
                 validate_pattern(&compact.pattern)?;
                 (compact.pattern, Some(compact.display))
             }
@@ -1650,14 +2042,18 @@ impl<'a> NumberFormat<'a> {
         let mut result = Vec::new();
         for token in tokens {
             match token {
-                PatternToken::Literal(value) => push_part(&mut result, NumberPartType::Literal, value),
+                PatternToken::Literal(value) => {
+                    push_part(&mut result, NumberPartType::Literal, value)
+                }
                 PatternToken::Placeholder(name) => match name.as_str() {
                     "number" => result.extend(self.partition_ascii_number(&prepared.ascii)),
                     "compactSymbol" | "compactName" => push_part(
                         &mut result,
                         NumberPartType::Compact,
                         compact_display.clone().ok_or_else(|| {
-                            NumberFormatError::invalid_data("compact placeholder without compact display")
+                            NumberFormatError::invalid_data(
+                                "compact placeholder without compact display",
+                            )
                         })?,
                     ),
                     "scientificSeparator" => push_part(
@@ -1690,18 +2086,36 @@ impl<'a> NumberFormat<'a> {
     }
 
     fn partition_ascii_number(&self, ascii: &str) -> Vec<NumberPart> {
-        let (integer, fraction) = ascii.split_once('.').map_or((ascii, None), |(left, right)| (left, Some(right)));
+        let (integer, fraction) = ascii
+            .split_once('.')
+            .map_or((ascii, None), |(left, right)| (left, Some(right)));
         let groups = grouped_slices(integer, self.use_grouping, self.grouping);
         let mut result = Vec::with_capacity(groups.len() * 2 + usize::from(fraction.is_some()));
         for (index, group) in groups.iter().enumerate() {
-            push_part(&mut result, NumberPartType::Integer, self.transliterate_digits(group));
+            push_part(
+                &mut result,
+                NumberPartType::Integer,
+                self.transliterate_digits(group),
+            );
             if index + 1 < groups.len() {
-                push_part(&mut result, NumberPartType::Group, self.symbols.group.clone());
+                push_part(
+                    &mut result,
+                    NumberPartType::Group,
+                    self.symbols.group.clone(),
+                );
             }
         }
         if let Some(fraction) = fraction {
-            push_part(&mut result, NumberPartType::Decimal, self.symbols.decimal.clone());
-            push_part(&mut result, NumberPartType::Fraction, self.transliterate_digits(fraction));
+            push_part(
+                &mut result,
+                NumberPartType::Decimal,
+                self.symbols.decimal.clone(),
+            );
+            push_part(
+                &mut result,
+                NumberPartType::Fraction,
+                self.transliterate_digits(fraction),
+            );
         }
         result
     }
@@ -1712,44 +2126,67 @@ impl<'a> NumberFormat<'a> {
             .map(|character| {
                 character
                     .to_digit(10)
-                    .and_then(|digit| self.symbols.digits.get(usize::try_from(digit).expect("digit index")))
+                    .and_then(|digit| {
+                        self.symbols
+                            .digits
+                            .get(usize::try_from(digit).expect("digit index"))
+                    })
                     .copied()
                     .unwrap_or(character)
             })
             .collect()
     }
 
-    fn pattern_for_value(&self, value: &IntlMathematicalValue) -> &str {
-        let category = value_category(value);
+    /// The sign patterns of `prepared`: those of a compact suffix where it has one.
+    fn patterns_for(&self, prepared: &PreparedFormat) -> &NumberPatternSet {
+        match &self.compact_patterns {
+            Some(patterns) if prepared.exponent != 0 => patterns,
+            _ => &self.patterns,
+        }
+    }
+
+    fn pattern_for(&self, prepared: &PreparedFormat) -> &str {
+        let patterns = self.patterns_for(prepared);
+        let category = value_category(&prepared.rounded);
         match self.sign_display {
-            SignDisplay::Never => &self.patterns.zero,
+            SignDisplay::Never => &patterns.zero,
             SignDisplay::Auto => match category {
-                ValueCategory::PositiveNonZero | ValueCategory::PositiveZero => &self.patterns.zero,
-                ValueCategory::NegativeNonZero | ValueCategory::NegativeZero => &self.patterns.negative,
+                ValueCategory::Positive | ValueCategory::ZeroPositive => &patterns.zero,
+                ValueCategory::Negative | ValueCategory::ZeroNegative => &patterns.negative,
             },
             SignDisplay::Always => match category {
-                ValueCategory::PositiveNonZero | ValueCategory::PositiveZero => &self.patterns.positive,
-                ValueCategory::NegativeNonZero | ValueCategory::NegativeZero => &self.patterns.negative,
+                ValueCategory::Positive | ValueCategory::ZeroPositive => &patterns.positive,
+                ValueCategory::Negative | ValueCategory::ZeroNegative => &patterns.negative,
             },
             SignDisplay::ExceptZero => match category {
-                ValueCategory::PositiveZero | ValueCategory::NegativeZero => &self.patterns.zero,
-                ValueCategory::PositiveNonZero => &self.patterns.positive,
-                ValueCategory::NegativeNonZero => &self.patterns.negative,
+                ValueCategory::ZeroPositive | ValueCategory::ZeroNegative => &patterns.zero,
+                ValueCategory::Positive => &patterns.positive,
+                ValueCategory::Negative => &patterns.negative,
             },
             SignDisplay::Negative => match category {
-                ValueCategory::NegativeNonZero => &self.patterns.negative,
-                ValueCategory::PositiveNonZero | ValueCategory::PositiveZero | ValueCategory::NegativeZero => {
-                    &self.patterns.zero
-                }
+                ValueCategory::Negative => &patterns.negative,
+                ValueCategory::Positive
+                | ValueCategory::ZeroPositive
+                | ValueCategory::ZeroNegative => &patterns.zero,
             },
         }
     }
 
+    /// The range of one value. The approximately sign stands with the sign of a pattern,
+    /// so a negative pattern with no minus sign, as in accounting, has no place for it.
     fn approximate_range(
         &self,
-        number_parts: Vec<NumberPart>,
+        prepared: &PreparedFormat,
     ) -> Result<Vec<NumberRangePart>, NumberFormatError> {
-        let tokens = partition_pattern(&self.range_patterns.approximate)?;
+        let number_parts = self.partition_outer_pattern(prepared)?;
+        let pattern = self.pattern_for(prepared);
+        let unsigned =
+            pattern == self.patterns_for(prepared).negative && !pattern.contains("{minusSign}");
+        let tokens = partition_pattern(if unsigned {
+            "{number}"
+        } else {
+            &self.range_patterns.approximate
+        })?;
         let mut result = Vec::new();
         for token in tokens {
             match token {
@@ -1794,23 +2231,26 @@ struct PreparedFormat {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ValueCategory {
-    PositiveNonZero,
-    PositiveZero,
-    NegativeNonZero,
-    NegativeZero,
+    Positive,
+    ZeroPositive,
+    Negative,
+    ZeroNegative,
 }
 
 fn value_category(value: &IntlMathematicalValue) -> ValueCategory {
     match value {
-        IntlMathematicalValue::Nan => ValueCategory::PositiveZero,
-        IntlMathematicalValue::PositiveInfinity => ValueCategory::PositiveNonZero,
-        IntlMathematicalValue::NegativeInfinity => ValueCategory::NegativeNonZero,
-        IntlMathematicalValue::NegativeZero => ValueCategory::NegativeZero,
-        IntlMathematicalValue::Finite { negative: true, magnitude } if !magnitude.is_zero() => {
-            ValueCategory::NegativeNonZero
+        IntlMathematicalValue::Nan => ValueCategory::ZeroPositive,
+        IntlMathematicalValue::PositiveInfinity => ValueCategory::Positive,
+        IntlMathematicalValue::NegativeInfinity => ValueCategory::Negative,
+        IntlMathematicalValue::NegativeZero => ValueCategory::ZeroNegative,
+        IntlMathematicalValue::Finite {
+            negative: true,
+            magnitude,
+        } if !magnitude.is_zero() => ValueCategory::Negative,
+        IntlMathematicalValue::Finite { magnitude, .. } if magnitude.is_zero() => {
+            ValueCategory::ZeroPositive
         }
-        IntlMathematicalValue::Finite { magnitude, .. } if magnitude.is_zero() => ValueCategory::PositiveZero,
-        IntlMathematicalValue::Finite { .. } => ValueCategory::PositiveNonZero,
+        IntlMathematicalValue::Finite { .. } => ValueCategory::Positive,
     }
 }
 
@@ -1818,6 +2258,54 @@ fn push_part(parts: &mut Vec<NumberPart>, part_type: NumberPartType, value: Stri
     if !value.is_empty() {
         parts.push(NumberPart { part_type, value });
     }
+}
+
+/// Splits parts into what precedes the number, the number, and what follows.
+fn split_number(parts: &[NumberPart]) -> (&[NumberPart], &[NumberPart], &[NumberPart]) {
+    let is_number = |part: &NumberPart| {
+        matches!(
+            part.part_type,
+            NumberPartType::Integer
+                | NumberPartType::Group
+                | NumberPartType::Decimal
+                | NumberPartType::Fraction
+                | NumberPartType::Nan
+                | NumberPartType::Infinity
+                | NumberPartType::ExponentInteger
+                | NumberPartType::ExponentMinusSign
+                | NumberPartType::ExponentSeparator
+        )
+    };
+    let Some(first) = parts.iter().position(is_number) else {
+        return (parts, &[], &[]);
+    };
+    let last = parts.iter().rposition(is_number).unwrap_or(first) + 1;
+    (&parts[..first], &parts[first..last], &parts[last..])
+}
+
+/// The parts of a prefix other than the space that only digits take.
+fn without_digit_space(parts: &[NumberPart]) -> impl Iterator<Item = &NumberPart> {
+    parts.iter().filter(|part| part.value != " ")
+}
+
+/// The parts of a number other than its coefficient. An end beyond the range of
+/// a double is the same value as `Infinity`, so `∞` counts as a coefficient, and
+/// so does the space that only digits take.
+fn beside_digits(parts: &[NumberPart]) -> impl Iterator<Item = &NumberPart> {
+    without_digit_space(parts).filter(|part| {
+        !matches!(
+            part.part_type,
+            NumberPartType::Integer
+                | NumberPartType::Group
+                | NumberPartType::Decimal
+                | NumberPartType::Fraction
+                | NumberPartType::Infinity
+        )
+    })
+}
+
+fn code_points(parts: &[NumberPart]) -> usize {
+    parts.iter().map(|part| part.value.chars().count()).sum()
 }
 
 fn concatenate_parts(parts: &[NumberPart]) -> String {
@@ -1850,15 +2338,18 @@ fn grouped_slices(integer: &str, use_grouping: UseGrouping, grouping: GroupingSi
 fn operands_from_ascii(ascii: &str, exponent: i32) -> PluralOperands {
     let (integer, fraction) = ascii.split_once('.').unwrap_or((ascii, ""));
     let integer = integer.trim_start_matches('0');
-    let integer_digits = if integer.is_empty() { String::from("0") } else { integer.to_owned() };
+    let integer_digits = if integer.is_empty() {
+        String::from("0")
+    } else {
+        integer.to_owned()
+    };
     let without_trailing = fraction.trim_end_matches('0').to_owned();
     PluralOperands {
         integer_digits,
         fraction_digits: fraction.to_owned(),
         fraction_digits_without_trailing_zeros: without_trailing.clone(),
-        visible_fraction_digits: u8::try_from(fraction.len()).expect("fraction option is at most 100"),
-        visible_fraction_digits_without_trailing_zeros: u8::try_from(without_trailing.len())
-            .expect("fraction option is at most 100"),
+        visible_fraction_digits: fraction.len(),
+        visible_fraction_digits_without_trailing_zeros: without_trailing.len(),
         exponent,
     }
 }
@@ -1895,13 +2386,19 @@ fn number_option(
 
 fn resolve_digit_options(
     options: &NumberFormatOptions,
-    mut minimum_fraction_default: u8,
+    minimum_fraction_default: u8,
     mut maximum_fraction_default: u8,
     notation: Notation,
 ) -> Result<ResolvedDigits, NumberFormatError> {
     let minimum_integer = u8::try_from(
-        number_option("minimumIntegerDigits", options.minimum_integer_digits, 1, 21, Some(1))?
-            .expect("fallback provided"),
+        number_option(
+            "minimumIntegerDigits",
+            options.minimum_integer_digits,
+            1,
+            21,
+            Some(1),
+        )?
+        .expect("fallback provided"),
     )
     .expect("minimum integer range fits u8");
     let mut minimum_fraction = options.minimum_fraction_digits;
@@ -1916,13 +2413,16 @@ fn resolve_digit_options(
         Some(1),
     )?
     .expect("fallback provided");
-    const ALLOWED_INCREMENTS: [u16; 15] = [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000];
+    const ALLOWED_INCREMENTS: [u16; 15] = [
+        1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000,
+    ];
     if !ALLOWED_INCREMENTS.contains(&rounding_increment) {
         return Err(NumberFormatError::range("invalid roundingIncrement"));
     }
     let rounding_mode = parse_rounding_mode(options.rounding_mode.as_deref())?;
     let requested_priority = parse_rounding_priority(options.rounding_priority.as_deref())?;
-    let trailing_zero_display = parse_trailing_zero_display(options.trailing_zero_display.as_deref())?;
+    let trailing_zero_display =
+        parse_trailing_zero_display(options.trailing_zero_display.as_deref())?;
     if rounding_increment != 1 {
         maximum_fraction_default = minimum_fraction_default;
     }
@@ -1940,8 +2440,14 @@ fn resolve_digit_options(
     let (minimum_significant_resolved, maximum_significant_resolved) = if need_significant {
         if has_significant {
             let minimum = u8::try_from(
-                number_option("minimumSignificantDigits", minimum_significant, 1, 21, Some(1))?
-                    .expect("fallback provided"),
+                number_option(
+                    "minimumSignificantDigits",
+                    minimum_significant,
+                    1,
+                    21,
+                    Some(1),
+                )?
+                .expect("fallback provided"),
             )
             .expect("significant digit range fits u8");
             let maximum = u8::try_from(
@@ -1965,11 +2471,27 @@ fn resolve_digit_options(
 
     let (minimum_fraction_resolved, maximum_fraction_resolved) = if need_fraction {
         if has_fraction {
-            let minimum = number_option("minimumFractionDigits", minimum_fraction.take(), 0, 100, None)?;
-            let maximum = number_option("maximumFractionDigits", maximum_fraction.take(), 0, 100, None)?;
+            let minimum = number_option(
+                "minimumFractionDigits",
+                minimum_fraction.take(),
+                0,
+                100,
+                None,
+            )?;
+            let maximum = number_option(
+                "maximumFractionDigits",
+                maximum_fraction.take(),
+                0,
+                100,
+                None,
+            )?;
             let (minimum, maximum) = match (minimum, maximum) {
-                (None, Some(maximum)) => (u16::from(minimum_fraction_default).min(maximum), maximum),
-                (Some(minimum), None) => (minimum, u16::from(maximum_fraction_default).max(minimum)),
+                (None, Some(maximum)) => {
+                    (u16::from(minimum_fraction_default).min(maximum), maximum)
+                }
+                (Some(minimum), None) => {
+                    (minimum, u16::from(maximum_fraction_default).max(minimum))
+                }
                 (Some(minimum), Some(maximum)) if minimum <= maximum => (minimum, maximum),
                 (Some(_), Some(_)) => {
                     return Err(NumberFormatError::range(
@@ -1983,7 +2505,10 @@ fn resolve_digit_options(
                 Some(u8::try_from(maximum).expect("fraction range fits u8")),
             )
         } else {
-            (Some(minimum_fraction_default), Some(maximum_fraction_default))
+            (
+                Some(minimum_fraction_default),
+                Some(maximum_fraction_default),
+            )
         }
     } else {
         (None, None)
@@ -1997,7 +2522,14 @@ fn resolve_digit_options(
         rounding_type,
         computed_priority,
     ) = if !need_significant && !need_fraction {
-        (Some(0), Some(0), Some(1), Some(2), RoundingType::MorePrecision, RoundingPriority::MorePrecision)
+        (
+            Some(0),
+            Some(0),
+            Some(1),
+            Some(2),
+            RoundingType::MorePrecision,
+            RoundingPriority::MorePrecision,
+        )
     } else if requested_priority == RoundingPriority::MorePrecision {
         (
             minimum_fraction_resolved,
@@ -2079,7 +2611,9 @@ fn parse_currency_display(value: Option<&str>) -> Result<CurrencyDisplay, Number
         "symbol" => Ok(CurrencyDisplay::Symbol),
         "narrowSymbol" => Ok(CurrencyDisplay::NarrowSymbol),
         "name" => Ok(CurrencyDisplay::Name),
-        value => Err(NumberFormatError::range(format!("invalid currencyDisplay: {value}"))),
+        value => Err(NumberFormatError::range(format!(
+            "invalid currencyDisplay: {value}"
+        ))),
     }
 }
 
@@ -2087,7 +2621,9 @@ fn parse_currency_sign(value: Option<&str>) -> Result<CurrencySign, NumberFormat
     match value.unwrap_or("standard") {
         "standard" => Ok(CurrencySign::Standard),
         "accounting" => Ok(CurrencySign::Accounting),
-        value => Err(NumberFormatError::range(format!("invalid currencySign: {value}"))),
+        value => Err(NumberFormatError::range(format!(
+            "invalid currencySign: {value}"
+        ))),
     }
 }
 
@@ -2096,7 +2632,9 @@ fn parse_unit_display(value: Option<&str>) -> Result<UnitDisplay, NumberFormatEr
         "short" => Ok(UnitDisplay::Short),
         "narrow" => Ok(UnitDisplay::Narrow),
         "long" => Ok(UnitDisplay::Long),
-        value => Err(NumberFormatError::range(format!("invalid unitDisplay: {value}"))),
+        value => Err(NumberFormatError::range(format!(
+            "invalid unitDisplay: {value}"
+        ))),
     }
 }
 
@@ -2106,7 +2644,9 @@ fn parse_notation(value: Option<&str>) -> Result<Notation, NumberFormatError> {
         "scientific" => Ok(Notation::Scientific),
         "engineering" => Ok(Notation::Engineering),
         "compact" => Ok(Notation::Compact),
-        value => Err(NumberFormatError::range(format!("invalid notation: {value}"))),
+        value => Err(NumberFormatError::range(format!(
+            "invalid notation: {value}"
+        ))),
     }
 }
 
@@ -2114,7 +2654,9 @@ fn parse_compact_display(value: Option<&str>) -> Result<CompactDisplay, NumberFo
     match value.unwrap_or("short") {
         "short" => Ok(CompactDisplay::Short),
         "long" => Ok(CompactDisplay::Long),
-        value => Err(NumberFormatError::range(format!("invalid compactDisplay: {value}"))),
+        value => Err(NumberFormatError::range(format!(
+            "invalid compactDisplay: {value}"
+        ))),
     }
 }
 
@@ -2125,7 +2667,9 @@ fn parse_sign_display(value: Option<&str>) -> Result<SignDisplay, NumberFormatEr
         "always" => Ok(SignDisplay::Always),
         "exceptZero" => Ok(SignDisplay::ExceptZero),
         "negative" => Ok(SignDisplay::Negative),
-        value => Err(NumberFormatError::range(format!("invalid signDisplay: {value}"))),
+        value => Err(NumberFormatError::range(format!(
+            "invalid signDisplay: {value}"
+        ))),
     }
 }
 
@@ -2140,7 +2684,9 @@ fn parse_rounding_mode(value: Option<&str>) -> Result<RoundingMode, NumberFormat
         "halfExpand" => Ok(RoundingMode::HalfExpand),
         "halfTrunc" => Ok(RoundingMode::HalfTrunc),
         "halfEven" => Ok(RoundingMode::HalfEven),
-        value => Err(NumberFormatError::range(format!("invalid roundingMode: {value}"))),
+        value => Err(NumberFormatError::range(format!(
+            "invalid roundingMode: {value}"
+        ))),
     }
 }
 
@@ -2149,15 +2695,21 @@ fn parse_rounding_priority(value: Option<&str>) -> Result<RoundingPriority, Numb
         "auto" => Ok(RoundingPriority::Auto),
         "morePrecision" => Ok(RoundingPriority::MorePrecision),
         "lessPrecision" => Ok(RoundingPriority::LessPrecision),
-        value => Err(NumberFormatError::range(format!("invalid roundingPriority: {value}"))),
+        value => Err(NumberFormatError::range(format!(
+            "invalid roundingPriority: {value}"
+        ))),
     }
 }
 
-fn parse_trailing_zero_display(value: Option<&str>) -> Result<TrailingZeroDisplay, NumberFormatError> {
+fn parse_trailing_zero_display(
+    value: Option<&str>,
+) -> Result<TrailingZeroDisplay, NumberFormatError> {
     match value.unwrap_or("auto") {
         "auto" => Ok(TrailingZeroDisplay::Auto),
         "stripIfInteger" => Ok(TrailingZeroDisplay::StripIfInteger),
-        value => Err(NumberFormatError::range(format!("invalid trailingZeroDisplay: {value}"))),
+        value => Err(NumberFormatError::range(format!(
+            "invalid trailingZeroDisplay: {value}"
+        ))),
     }
 }
 
@@ -2174,19 +2726,23 @@ fn resolve_grouping(
             "auto" => Ok(UseGrouping::Auto),
             "always" => Ok(UseGrouping::Always),
             "true" | "false" => Ok(fallback),
-            _ => Err(NumberFormatError::range(format!("invalid useGrouping: {value}"))),
+            _ => Err(NumberFormatError::range(format!(
+                "invalid useGrouping: {value}"
+            ))),
         },
     }
 }
 
 fn validate_currency(value: &str) -> Result<String, NumberFormatError> {
     if value.len() != 3 || !value.bytes().all(|byte| byte.is_ascii_alphabetic()) {
-        return Err(NumberFormatError::range(format!("invalid currency code: {value}")));
+        return Err(NumberFormatError::range(format!(
+            "invalid currency code: {value}"
+        )));
     }
     Ok(value.to_ascii_uppercase())
 }
 
-const SANCTIONED_UNITS: [&str; 45] = [
+pub const SANCTIONED_UNITS: [&str; 45] = [
     "acre",
     "bit",
     "byte",
@@ -2234,15 +2790,22 @@ const SANCTIONED_UNITS: [&str; 45] = [
     "year",
 ];
 
-fn validate_unit(value: &str) -> Result<String, NumberFormatError> {
-    let valid = SANCTIONED_UNITS.contains(&value)
+/// IsWellFormedUnitIdentifier.
+#[must_use]
+pub fn is_well_formed_unit(value: &str) -> bool {
+    SANCTIONED_UNITS.contains(&value)
         || value
             .split_once("-per-")
             .is_some_and(|(numerator, denominator)| {
                 SANCTIONED_UNITS.contains(&numerator) && SANCTIONED_UNITS.contains(&denominator)
-            });
-    if !valid {
-        return Err(NumberFormatError::range(format!("invalid unit identifier: {value}")));
+            })
+}
+
+fn validate_unit(value: &str) -> Result<String, NumberFormatError> {
+    if !is_well_formed_unit(value) {
+        return Err(NumberFormatError::range(format!(
+            "invalid unit identifier: {value}"
+        )));
     }
     Ok(value.to_owned())
 }
@@ -2250,7 +2813,8 @@ fn validate_unit(value: &str) -> Result<String, NumberFormatError> {
 fn is_unicode_type(value: &str) -> bool {
     !value.is_empty()
         && value.split('-').all(|subtag| {
-            (3..=8).contains(&subtag.len()) && subtag.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            (3..=8).contains(&subtag.len())
+                && subtag.bytes().all(|byte| byte.is_ascii_alphanumeric())
         })
 }
 
@@ -2278,7 +2842,9 @@ fn partition_pattern(pattern: &str) -> Result<Vec<PatternToken>, NumberFormatErr
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         {
-            return Err(NumberFormatError::invalid_data("invalid pattern placeholder"));
+            return Err(NumberFormatError::invalid_data(
+                "invalid pattern placeholder",
+            ));
         }
         result.push(PatternToken::Placeholder(name.to_owned()));
         cursor = end + 1;
@@ -2296,8 +2862,13 @@ fn validate_pattern(pattern: &str) -> Result<(), NumberFormatError> {
 fn validate_number_patterns(patterns: &NumberPatternSet) -> Result<(), NumberFormatError> {
     for pattern in [&patterns.zero, &patterns.positive, &patterns.negative] {
         let tokens = partition_pattern(pattern)?;
-        if !tokens.iter().any(|token| matches!(token, PatternToken::Placeholder(name) if name == "number")) {
-            return Err(NumberFormatError::invalid_data("number pattern lacks {number}"));
+        if !tokens
+            .iter()
+            .any(|token| matches!(token, PatternToken::Placeholder(name) if name == "number"))
+        {
+            return Err(NumberFormatError::invalid_data(
+                "number pattern lacks {number}",
+            ));
         }
     }
     Ok(())
@@ -2308,8 +2879,13 @@ fn validate_range_patterns(patterns: &RangePatterns) -> Result<(), NumberFormatE
         return Err(NumberFormatError::invalid_data("range separator is empty"));
     }
     let tokens = partition_pattern(&patterns.approximate)?;
-    if !tokens.iter().any(|token| matches!(token, PatternToken::Placeholder(name) if name == "number")) {
-        return Err(NumberFormatError::invalid_data("approximate pattern lacks {number}"));
+    if !tokens
+        .iter()
+        .any(|token| matches!(token, PatternToken::Placeholder(name) if name == "number"))
+    {
+        return Err(NumberFormatError::invalid_data(
+            "approximate pattern lacks {number}",
+        ));
     }
     Ok(())
 }
@@ -2394,7 +2970,11 @@ mod tests {
     }
 
     impl NumberFormatDataProvider for TestProvider {
-        fn number_symbols(&self, _data_locale: &str, numbering_system: &str) -> Option<NumberSymbols> {
+        fn number_symbols(
+            &self,
+            _data_locale: &str,
+            numbering_system: &str,
+        ) -> Option<NumberSymbols> {
             let digits = match numbering_system {
                 "latn" => ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'],
                 "deva" => ['०', '१', '२', '३', '४', '५', '६', '७', '८', '९'],
@@ -2414,15 +2994,31 @@ mod tests {
             })
         }
 
-        fn grouping_sizes(&self, data_locale: &str, _numbering_system: &str) -> Option<GroupingSizes> {
+        fn grouping_sizes(
+            &self,
+            data_locale: &str,
+            _numbering_system: &str,
+        ) -> Option<GroupingSizes> {
             Some(if data_locale == "hi" {
-                GroupingSizes { primary: 3, secondary: 2, minimum_grouping_digits: 1 }
+                GroupingSizes {
+                    primary: 3,
+                    secondary: 2,
+                    minimum_grouping_digits: 1,
+                }
             } else {
-                GroupingSizes { primary: 3, secondary: 3, minimum_grouping_digits: 1 }
+                GroupingSizes {
+                    primary: 3,
+                    secondary: 3,
+                    minimum_grouping_digits: 1,
+                }
             })
         }
 
-        fn number_patterns(&self, _data_locale: &str, request: NumberPatternRequest<'_>) -> Option<NumberPatternSet> {
+        fn number_patterns(
+            &self,
+            _data_locale: &str,
+            request: NumberPatternRequest<'_>,
+        ) -> Option<NumberPatternSet> {
             let affixes = match request.style {
                 NumberStyle::Decimal => ("{number}", "{plusSign}{number}", "{minusSign}{number}"),
                 NumberStyle::Percent => (
@@ -2430,11 +3026,15 @@ mod tests {
                     "{plusSign}{number}{percentSign}",
                     "{minusSign}{number}{percentSign}",
                 ),
-                NumberStyle::Currency if request.currency_sign == Some(CurrencySign::Accounting) => (
-                    "{currencyPrefix}{number}",
-                    "{plusSign}{currencyPrefix}{number}",
-                    "({currencyPrefix}{number})",
-                ),
+                NumberStyle::Currency
+                    if request.currency_sign == Some(CurrencySign::Accounting) =>
+                {
+                    (
+                        "{currencyPrefix}{number}",
+                        "{plusSign}{currencyPrefix}{number}",
+                        "({currencyPrefix}{number})",
+                    )
+                }
                 NumberStyle::Currency => (
                     "{currencyPrefix}{number}",
                     "{plusSign}{currencyPrefix}{number}",
@@ -2454,11 +3054,22 @@ mod tests {
         }
 
         fn scientific_pattern(&self, _data_locale: &str) -> Option<String> {
-            Some(String::from("{number}{scientificSeparator}{scientificExponent}"))
+            Some(String::from(
+                "{number}{scientificSeparator}{scientificExponent}",
+            ))
         }
 
-        fn compact_exponent(&self, _data_locale: &str, _display: CompactDisplay, magnitude: i32) -> Option<i32> {
-            Some(if magnitude < 3 { 0 } else { (magnitude / 3).min(4) * 3 })
+        fn compact_exponent(
+            &self,
+            _data_locale: &str,
+            _display: CompactDisplay,
+            magnitude: i32,
+        ) -> Option<i32> {
+            Some(if magnitude < 3 {
+                0
+            } else {
+                (magnitude / 3).min(4) * 3
+            })
         }
 
         fn compact_pattern(
@@ -2520,11 +3131,13 @@ mod tests {
                     "CLF" => Some(String::from("UF")),
                     _ => None,
                 },
-                CurrencyDisplay::Name if currency == "USD" => Some(if category == PluralCategory::One {
-                    String::from("US dollar")
-                } else {
-                    String::from("US dollars")
-                }),
+                CurrencyDisplay::Name if currency == "USD" => {
+                    Some(if category == PluralCategory::One {
+                        String::from("US dollar")
+                    } else {
+                        String::from("US dollars")
+                    })
+                }
                 CurrencyDisplay::Name => None,
             }
         }
@@ -2549,14 +3162,21 @@ mod tests {
         }
 
         fn plural_category(&self, _data_locale: &str, operands: &PluralOperands) -> PluralCategory {
-            if operands.integer_digits == "1" && operands.visible_fraction_digits == 0 && operands.exponent == 0 {
+            if operands.integer_digits == "1"
+                && operands.visible_fraction_digits == 0
+                && operands.exponent == 0
+            {
                 PluralCategory::One
             } else {
                 PluralCategory::Other
             }
         }
 
-        fn range_patterns(&self, _data_locale: &str, _numbering_system: &str) -> Option<RangePatterns> {
+        fn range_patterns(
+            &self,
+            _data_locale: &str,
+            _numbering_system: &str,
+        ) -> Option<RangePatterns> {
             Some(RangePatterns {
                 separator: String::from("–"),
                 approximate: String::from("{approximatelySign}{number}"),
@@ -2582,9 +3202,17 @@ mod tests {
     #[test]
     fn finite_non_finite_percent_and_negative_zero() {
         let decimal = formatter(NumberFormatOptions::default()).expect("formatter");
-        assert_eq!(decimal.format_number(12_345.678).expect("finite"), "12,345.678");
+        assert_eq!(
+            decimal.format_number(12_345.678).expect("finite"),
+            "12,345.678"
+        );
         assert_eq!(decimal.format_number(f64::INFINITY).expect("infinity"), "∞");
-        assert_eq!(decimal.format_number(f64::NEG_INFINITY).expect("negative infinity"), "−∞");
+        assert_eq!(
+            decimal
+                .format_number(f64::NEG_INFINITY)
+                .expect("negative infinity"),
+            "−∞"
+        );
         assert_eq!(decimal.format_number(f64::NAN).expect("NaN"), "NaN");
         assert_eq!(decimal.format_number(-0.0).expect("negative zero"), "−0");
 
@@ -2611,9 +3239,21 @@ mod tests {
                 ..NumberFormatOptions::default()
             })
             .expect("sign formatter");
-            assert_eq!(formatter.format_number(-0.0).expect("-0"), negative_zero, "{mode}");
-            assert_eq!(formatter.format_number(0.0).expect("0"), positive_zero, "{mode}");
-            assert_eq!(formatter.format_number(-1.0).expect("-1"), negative, "{mode}");
+            assert_eq!(
+                formatter.format_number(-0.0).expect("-0"),
+                negative_zero,
+                "{mode}"
+            );
+            assert_eq!(
+                formatter.format_number(0.0).expect("0"),
+                positive_zero,
+                "{mode}"
+            );
+            assert_eq!(
+                formatter.format_number(-1.0).expect("-1"),
+                negative,
+                "{mode}"
+            );
             assert_eq!(formatter.format_number(1.0).expect("1"), positive, "{mode}");
         }
     }
@@ -2627,7 +3267,12 @@ mod tests {
                 .expect("large bigint"),
             "123,456,789,012,345,678,901,234,567,890"
         );
-        assert_eq!(formatter.format_bigint("-100000000000000000001").expect("negative bigint"), "−100,000,000,000,000,000,001");
+        assert_eq!(
+            formatter
+                .format_bigint("-100000000000000000001")
+                .expect("negative bigint"),
+            "−100,000,000,000,000,000,001"
+        );
     }
 
     #[test]
@@ -2645,7 +3290,11 @@ mod tests {
                 ..NumberFormatOptions::default()
             })
             .expect("currency formatter");
-            assert_eq!(formatter.format_number(1.23456).expect("currency"), expected, "{currency}");
+            assert_eq!(
+                formatter.format_number(1.23456).expect("currency"),
+                expected,
+                "{currency}"
+            );
         }
         let accounting = formatter(NumberFormatOptions {
             style: Some(String::from("currency")),
@@ -2654,7 +3303,10 @@ mod tests {
             ..NumberFormatOptions::default()
         })
         .expect("accounting formatter");
-        assert_eq!(accounting.format_number(-2.0).expect("accounting"), "($2.00)");
+        assert_eq!(
+            accounting.format_number(-2.0).expect("accounting"),
+            "($2.00)"
+        );
     }
 
     #[test]
@@ -2716,6 +3368,51 @@ mod tests {
     }
 
     #[test]
+    fn a_fraction_of_any_length_has_plural_operands() {
+        let significant = formatter(NumberFormatOptions {
+            maximum_significant_digits: Some(3.0),
+            ..NumberFormatOptions::default()
+        })
+        .expect("significant");
+        assert_eq!(
+            significant.format_number(1e-300).expect("a Number"),
+            format!("0.{}1", "0".repeat(299))
+        );
+    }
+
+    #[test]
+    fn a_value_below_the_range_of_a_number_is_formatted_exactly() {
+        let tiny = IntlMathematicalValue::from_decimal_string("1e-400").expect("a decimal");
+        let scientific = formatter(NumberFormatOptions {
+            notation: Some("scientific".to_owned()),
+            ..NumberFormatOptions::default()
+        })
+        .expect("scientific");
+        assert_eq!(scientific.format(&tiny).expect("scientific"), "1E−400");
+        let plain = formatter(NumberFormatOptions::default()).expect("plain");
+        assert_eq!(plain.format(&tiny).expect("plain"), "0");
+        let significant = formatter(NumberFormatOptions {
+            maximum_significant_digits: Some(3.0),
+            ..NumberFormatOptions::default()
+        })
+        .expect("significant");
+        assert_eq!(
+            significant.format(&tiny).expect("significant"),
+            format!("0.{}1", "0".repeat(399))
+        );
+
+        // The text of this value would not fit in the heap, and only that form needs it.
+        let far = IntlMathematicalValue::from_decimal_string("1e-2000000000").expect("a decimal");
+        let refused = significant.format(&far).expect_err("too many zeros");
+        assert_eq!(refused.kind, NumberFormatErrorKind::RangeError);
+        assert_eq!(plain.format(&far).expect("plain"), "0");
+        assert_eq!(
+            scientific.format(&far).expect("scientific"),
+            "1E−2000000000"
+        );
+    }
+
+    #[test]
     fn rounding_ties_cover_all_direction_families() {
         let half_even = formatter(fixed_options(0.0, "halfEven")).expect("half even");
         assert_eq!(half_even.format_number(0.5).expect("0.5"), "0");
@@ -2746,7 +3443,10 @@ mod tests {
     #[test]
     fn number_shortest_decimal_not_binary_expansion_is_rounded() {
         let formatter = formatter(fixed_options(2.0, "halfExpand")).expect("fixed formatter");
-        assert_eq!(formatter.format_number(1.005).expect("shortest decimal"), "1.01");
+        assert_eq!(
+            formatter.format_number(1.005).expect("shortest decimal"),
+            "1.01"
+        );
         assert_eq!(formatter.format_number(0.1 + 0.2).expect("sum"), "0.30");
     }
 
@@ -2799,18 +3499,36 @@ mod tests {
             ..NumberFormatOptions::default()
         })
         .expect("scientific");
-        assert_eq!(scientific.format_number(12_345.0).expect("scientific"), "1.235E4");
+        assert_eq!(
+            scientific.format_number(12_345.0).expect("scientific"),
+            "1.235E4"
+        );
         let scientific_parts = scientific.format_number_to_parts(0.0123).expect("parts");
-        assert!(scientific_parts.iter().any(|part| part.part_type == NumberPartType::ExponentSeparator));
-        assert!(scientific_parts.iter().any(|part| part.part_type == NumberPartType::ExponentMinusSign));
-        assert!(scientific_parts.iter().any(|part| part.part_type == NumberPartType::ExponentInteger));
+        assert!(
+            scientific_parts
+                .iter()
+                .any(|part| part.part_type == NumberPartType::ExponentSeparator)
+        );
+        assert!(
+            scientific_parts
+                .iter()
+                .any(|part| part.part_type == NumberPartType::ExponentMinusSign)
+        );
+        assert!(
+            scientific_parts
+                .iter()
+                .any(|part| part.part_type == NumberPartType::ExponentInteger)
+        );
 
         let engineering = formatter(NumberFormatOptions {
             notation: Some(String::from("engineering")),
             ..NumberFormatOptions::default()
         })
         .expect("engineering");
-        assert_eq!(engineering.format_number(12_345.0).expect("engineering"), "12.345E3");
+        assert_eq!(
+            engineering.format_number(12_345.0).expect("engineering"),
+            "12.345E3"
+        );
 
         let compact = formatter(NumberFormatOptions {
             notation: Some(String::from("compact")),
@@ -2818,12 +3536,17 @@ mod tests {
         })
         .expect("compact");
         assert_eq!(compact.format_number(1_234_567.0).expect("compact"), "1.2M");
-        assert_eq!(compact.format_number(999_500.0).expect("compact carry"), "1M");
-        assert!(compact
-            .format_number_to_parts(1_200.0)
-            .expect("compact parts")
-            .iter()
-            .any(|part| part.part_type == NumberPartType::Compact && part.value == "K"));
+        assert_eq!(
+            compact.format_number(999_500.0).expect("compact carry"),
+            "1M"
+        );
+        assert!(
+            compact
+                .format_number_to_parts(1_200.0)
+                .expect("compact parts")
+                .iter()
+                .any(|part| part.part_type == NumberPartType::Compact && part.value == "K")
+        );
     }
 
     #[test]
@@ -2834,7 +3557,9 @@ mod tests {
             ..NumberFormatOptions::default()
         })
         .expect("currency");
-        let parts = currency.format_number_to_parts(-1_234.5).expect("currency parts");
+        let parts = currency
+            .format_number_to_parts(-1_234.5)
+            .expect("currency parts");
         assert_eq!(
             parts.iter().map(|part| part.part_type).collect::<Vec<_>>(),
             vec![
@@ -2867,27 +3592,55 @@ mod tests {
             ..NumberFormatOptions::default()
         })
         .expect("formatter");
-        let start = IntlMathematicalValue::from_f64(1.2);
-        let end = IntlMathematicalValue::from_f64(2.3);
-        let parts = formatter.format_range_to_parts(&start, &end).expect("range parts");
-        assert!(parts.iter().any(|part| part.source == RangeSource::StartRange));
-        assert!(parts.iter().any(|part| part.source == RangeSource::EndRange));
-        assert!(parts.iter().any(|part| part.source == RangeSource::Shared && part.value == "–"));
-        assert_eq!(formatter.format_range(&start, &end).expect("range"), "1.2–2.3");
-        assert_eq!(formatter.format_range(&end, &start).expect("reversed range"), "2.3–1.2");
+        let start = RangeEnd::number(1.2);
+        let end = RangeEnd::number(2.3);
+        let parts = formatter
+            .format_range_to_parts(&start, &end)
+            .expect("range parts");
+        assert!(
+            parts
+                .iter()
+                .any(|part| part.source == RangeSource::StartRange)
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|part| part.source == RangeSource::EndRange)
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|part| part.source == RangeSource::Shared && part.value == "–")
+        );
+        assert_eq!(
+            formatter.format_range(&start, &end).expect("range"),
+            "1.2–2.3"
+        );
+        assert_eq!(
+            formatter
+                .format_range(&end, &start)
+                .expect("reversed range"),
+            "2.3–1.2"
+        );
 
         let equal = formatter
-            .format_range_to_parts(
-                &IntlMathematicalValue::from_f64(1.21),
-                &IntlMathematicalValue::from_f64(1.24),
-            )
+            .format_range_to_parts(&RangeEnd::number(1.21), &RangeEnd::number(1.24))
             .expect("approximately equal");
         assert!(equal.iter().all(|part| part.source == RangeSource::Shared));
-        assert_eq!(equal.first().map(|part| part.part_type), Some(NumberPartType::ApproximatelySign));
-        assert_eq!(equal.iter().map(|part| part.value.as_str()).collect::<String>(), "≈1.2");
+        assert_eq!(
+            equal.first().map(|part| part.part_type),
+            Some(NumberPartType::ApproximatelySign)
+        );
+        assert_eq!(
+            equal
+                .iter()
+                .map(|part| part.value.as_str())
+                .collect::<String>(),
+            "≈1.2"
+        );
 
         let nan_error = formatter
-            .format_range(&IntlMathematicalValue::Nan, &IntlMathematicalValue::from_f64(1.0))
+            .format_range(&RangeEnd::number(f64::NAN), &RangeEnd::number(1.0))
             .expect_err("NaN endpoint");
         assert_eq!(nan_error.kind, NumberFormatErrorKind::RangeError);
     }
@@ -2897,14 +3650,22 @@ mod tests {
         let provider = TestProvider::new();
         let formatter = NumberFormat::new(
             &[String::from("hi-u-nu-latn")],
-            &NumberFormatOptions { numbering_system: Some(String::from("deva")), ..NumberFormatOptions::default() },
+            &NumberFormatOptions {
+                numbering_system: Some(String::from("deva")),
+                ..NumberFormatOptions::default()
+            },
             &provider,
             &TestHost,
         )
         .expect("resolved formatter");
         assert_eq!(formatter.resolved_options().locale, "hi");
         assert_eq!(formatter.resolved_options().numbering_system, "deva");
-        assert_eq!(formatter.format_number(12_345_678.0).expect("Indian grouping"), "१,२३,४५,६७८");
+        assert_eq!(
+            formatter
+                .format_number(12_345_678.0)
+                .expect("Indian grouping"),
+            "१,२३,४५,६७८"
+        );
 
         let no_group = NumberFormat::new(
             &[String::from("en")],
@@ -2916,22 +3677,29 @@ mod tests {
             &TestHost,
         )
         .expect("no grouping");
-        assert_eq!(no_group.format_number(12_345.0).expect("ungrouped"), "12345");
+        assert_eq!(
+            no_group.format_number(12_345.0).expect("ungrouped"),
+            "12345"
+        );
     }
 
     #[test]
     fn provider_determinism_and_no_hidden_english_fallback() {
-        let options = NumberFormatOptions { maximum_fraction_digits: Some(1.0), ..NumberFormatOptions::default() };
+        let options = NumberFormatOptions {
+            maximum_fraction_digits: Some(1.0),
+            ..NumberFormatOptions::default()
+        };
         let first_provider = TestProvider::new().with_decimal("·");
         let second_provider = TestProvider::new().with_decimal("·");
         let first = NumberFormat::new(&[String::from("en")], &options, &first_provider, &TestHost)
             .expect("first formatter")
             .format_number(12.5)
             .expect("first output");
-        let second = NumberFormat::new(&[String::from("en")], &options, &second_provider, &TestHost)
-            .expect("second formatter")
-            .format_number(12.5)
-            .expect("second output");
+        let second =
+            NumberFormat::new(&[String::from("en")], &options, &second_provider, &TestHost)
+                .expect("second formatter")
+                .format_number(12.5)
+                .expect("second output");
         assert_eq!(first, "12·5");
         assert_eq!(first, second);
     }
@@ -2940,8 +3708,14 @@ mod tests {
     fn free_to_locale_string_entry_points_share_the_core() {
         let provider = TestProvider::new();
         assert_eq!(
-            number_to_locale_string(1_234.5, &[], &NumberFormatOptions::default(), &provider, &TestHost)
-                .expect("Number toLocaleString"),
+            number_to_locale_string(
+                1_234.5,
+                &[],
+                &NumberFormatOptions::default(),
+                &provider,
+                &TestHost
+            )
+            .expect("Number toLocaleString"),
             "1,234.5"
         );
         assert_eq!(

@@ -8,6 +8,7 @@ use super::{
     allocate_string, define_data, install_constructor_function, install_function, range_error,
     type_error, value_number,
 };
+use crate::intl::date_time_format::{DefaultComponents, RequiredComponents};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
 
@@ -476,6 +477,8 @@ fn time_clip(time: f64) -> f64 {
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -489,8 +492,9 @@ pub(super) fn install<H: Host>(
         prototype: Some(builtins.object_prototype()),
         extensible: true,
     };
-    let constructor = install_constructor_function(heap, builtins, "Date", 7, constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Date", length: 7, handler: constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     builtins.set_date_prototype(prototype);
 
     for (name, length, handler) in [
@@ -498,8 +502,8 @@ pub(super) fn install<H: Host>(
         ("parse", 1, parse::<H>),
         ("UTC", 7, utc::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        native_properties(heap, constructor).insert(named(name), builtin_property(function));
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        native_properties(heap, constructor).insert(shapes, named(atoms, name), builtin_property(function));
     }
 
     let methods: &[(&str, u32, BuiltinHandler<H>)] = &[
@@ -545,29 +549,66 @@ pub(super) fn install<H: Host>(
         ("toDateString", 0, to_date_string::<H>),
         ("toTimeString", 0, to_time_string::<H>),
         ("toUTCString", 0, to_utc_string::<H>),
-        ("toLocaleString", 0, to_string::<H>),
-        ("toLocaleDateString", 0, to_date_string::<H>),
-        ("toLocaleTimeString", 0, to_time_string::<H>),
+        ("toLocaleString", 0, to_locale_string::<H>),
+        ("toLocaleDateString", 0, to_locale_date_string::<H>),
+        ("toLocaleTimeString", 0, to_locale_time_string::<H>),
     ];
     let mut utc_string_function = None;
     for &(name, length, handler) in methods {
-        let function = install_function(heap, builtins, name, length, handler);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
         if name == "toUTCString" {
             utc_string_function = Some(function);
         }
-        define_data(heap, prototype, name, function);
+        define_data(heap, atoms, shapes, prototype, name, function);
     }
-    define_data(
-        heap,
-        prototype,
-        "toGMTString",
-        utc_string_function.expect("toUTCString is installed"),
-    );
+    define_data(heap, atoms, shapes, prototype,
+    "toGMTString",
+    utc_string_function.expect("toUTCString is installed"),);
+    let to_primitive = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "[Symbol.toPrimitive]", length: 1, handler: date_to_primitive::<H> });
+    super::define_symbol_property(heap, shapes, prototype,
+    builtins.symbol_to_primitive(),
+    Property::Data {
+        value: to_primitive,
+        writable: false,
+        enumerable: false,
+        configurable: true,
+    },);
     globals.insert(EcmaString::encode("Date"), constructor);
 }
 
-fn named(name: &str) -> PropertyKey {
-    PropertyKey::Named(EcmaString::encode(name))
+/// `Date.prototype[@@toPrimitive]`: unlike every other object, a Date reads
+/// the `default` hint as `string`.
+fn date_to_primitive<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_object(this) {
+        return Err(type_error(
+            "Date.prototype[Symbol.toPrimitive] requires an object receiver",
+        ));
+    }
+    let hint = args
+        .first()
+        .and_then(|value| machine.string_value(*value))
+        .ok_or_else(|| type_error("Invalid Date.prototype[Symbol.toPrimitive] hint"))?;
+    let prefer_string = if hint.eq_ascii("string") || hint.eq_ascii("default") {
+        true
+    } else if hint.eq_ascii("number") {
+        false
+    } else {
+        return Err(type_error(
+            "Invalid Date.prototype[Symbol.toPrimitive] hint",
+        ));
+    };
+    Ok(BuiltinOutcome::Value(
+        machine.ordinary_to_primitive(this, prefer_string)?,
+    ))
+}
+
+fn named(atoms: &mut crate::AtomTable, name: &str) -> PropertyKey {
+    PropertyKey::Named(atoms.intern_str(name))
 }
 fn builtin_property(value: Value) -> Property {
     Property::Data {
@@ -657,7 +698,7 @@ fn constructor<H: Host>(
         if let Some(time) = copied {
             time
         } else {
-            let primitive = machine.coerce_primitive_observable(value, false)?;
+            let primitive = machine.coerce_primitive_default(value)?;
             if let Some(text) = machine.string_value(primitive) {
                 let text = text.to_utf8_lossy();
                 let zone = if date_text_uses_local_zone(&text) {
@@ -674,11 +715,13 @@ fn constructor<H: Host>(
         let values = numbers(machine, &args[..args.len().min(7)])?;
         components_to_time(&values, &timezone(machine)?, true)
     };
+    let default_prototype = machine.intrinsics.builtins.date_prototype();
+    let prototype = super::prototype_from_new_target(machine, default_prototype)?;
     let object = machine
         .allocate(HeapEntry::Date {
             time: milliseconds,
             properties: PropertyMap::default(),
-            prototype: Some(machine.intrinsics.builtins.date_prototype()),
+            prototype: Some(prototype),
             extensible: true,
         })
         .map_err(EvalFailure::Runtime)?;
@@ -837,7 +880,7 @@ fn set_time_fields<H: Host>(
         supplied.push(f64::NAN);
     }
     if raw.is_nan() {
-        return write_date_time(machine, this, f64::NAN);
+        return Ok(BuiltinOutcome::Value(Value::number(f64::NAN)));
     }
     let zone = if local {
         Some(timezone(machine)?)
@@ -875,7 +918,7 @@ fn set_calendar_fields<H: Host>(
         supplied.push(f64::NAN);
     }
     if raw.is_nan() && !invalid_zero {
-        return write_date_time(machine, this, f64::NAN);
+        return Ok(BuiltinOutcome::Value(Value::number(f64::NAN)));
     }
     let zone = if local {
         Some(timezone(machine)?)
@@ -1001,6 +1044,62 @@ enum DateStringKind {
     Date,
     Time,
 }
+/// The shared body of the three `toLocale*` methods. ECMA-402 gives each a
+/// component requirement and defaults of its own.
+fn locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    required: RequiredComponents,
+    defaults: DefaultComponents,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let time = date_time(machine, this)?;
+    let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    super::intl::date_to_locale_string(machine, time, locales, options, required, defaults)
+}
+fn to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    locale_string(
+        machine,
+        this,
+        args,
+        RequiredComponents::Any,
+        DefaultComponents::All,
+    )
+}
+fn to_locale_date_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    locale_string(
+        machine,
+        this,
+        args,
+        RequiredComponents::Date,
+        DefaultComponents::Date,
+    )
+}
+fn to_locale_time_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    locale_string(
+        machine,
+        this,
+        args,
+        RequiredComponents::Time,
+        DefaultComponents::Time,
+    )
+}
 fn to_string<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -1081,13 +1180,19 @@ fn iso_string(time: f64) -> Option<String> {
         ms_from_time(time)
     ))
 }
+/// At least four digits, after a `-` for a negative year.
+fn year_string(year: impl Into<i64>) -> String {
+    let year = year.into();
+    let sign = if year < 0 { "-" } else { "" };
+    format!("{sign}{:04}", year.unsigned_abs())
+}
 fn utc_string(time: f64) -> String {
     format!(
         "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
         WEEKDAYS[week_day(time) as usize],
         date_from_time(time),
         MONTHS[month_from_time(time) as usize],
-        year_from_time(time),
+        year_string(year_from_time(time)),
         hour_from_time(time),
         min_from_time(time),
         sec_from_time(time)
@@ -1103,7 +1208,7 @@ fn date_string(time: f64, zone: &TimeZoneRule, kind: DateStringKind) -> String {
         WEEKDAYS[week_day(local) as usize],
         MONTHS[month_from_time(local) as usize],
         date_from_time(local),
-        year_from_time(local)
+        year_string(year_from_time(local))
     );
     let offset = zone.offset_at_utc(time);
     let sign = if offset < 0 { '-' } else { '+' };
@@ -1306,6 +1411,68 @@ fn parse_local_output(text: &str, zone: &TimeZoneRule) -> Option<f64> {
         return Some(time_clip(zone.utc_time(local)));
     };
     Some(time_clip(local - f64::from(offset) * MS_PER_SECOND))
+}
+
+#[cfg(test)]
+mod to_primitive_tests {
+    use super::super::test_support::{TestHost, blank_program, ordinary_object};
+    use super::*;
+    use crate::{Limits, ThrowOrigin};
+
+    fn hint(machine: &mut Machine<'_, TestHost>, text: &str) -> Value {
+        machine
+            .allocate(HeapEntry::String(EcmaString::encode(text)))
+            .unwrap()
+    }
+
+    #[test]
+    fn to_primitive_reads_each_hint_and_rejects_the_rest() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let date_constructor = machine.intrinsics.global("Date").unwrap();
+        let prototype = machine
+            .get_named_property(date_constructor, "prototype")
+            .unwrap();
+        let key = machine
+            .property_key_from_value(machine.intrinsics.builtins.symbol_to_primitive())
+            .unwrap();
+        let method = machine.get_property_key(prototype, &key).unwrap();
+
+        let object = ordinary_object(&mut machine);
+        let to_string = hint(&mut machine, "from toString");
+        let to_string_fn = machine
+            .get_named_property(machine.intrinsics.object_prototype, "valueOf")
+            .unwrap();
+        machine
+            .set_data_property(object, "toString", to_string_fn)
+            .unwrap();
+        machine.set_data_property(object, "tag", to_string).unwrap();
+
+        for valid in ["string", "default", "number"] {
+            let argument = hint(&mut machine, valid);
+            assert!(matches!(
+                machine.call_value(method, object, &[argument]),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        }
+        for invalid in [hint(&mut machine, "bogus"), Value::UNDEFINED] {
+            let failure = machine.call_value(method, object, &[invalid]);
+            assert!(matches!(
+                failure,
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "Invalid Date.prototype[Symbol.toPrimitive] hint"
+                }))
+            ));
+        }
+        let number_hint = hint(&mut machine, "number");
+        assert!(matches!(
+            machine.call_value(method, Value::int32(1), &[number_hint]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Date.prototype[Symbol.toPrimitive] requires an object receiver"
+            }))
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -1596,13 +1763,14 @@ mod tests {
         let mut machine = machine(&module, &mut host);
         let constructor = machine.intrinsics.global("Date").unwrap();
         let date_prototype = machine.intrinsics.builtins.date_prototype();
+        let prototype_key = PropertyKey::Named(machine.intern_str("prototype"));
         let Property::Data {
             writable,
             enumerable,
             configurable,
             ..
         } = machine
-            .own_descriptor(constructor, &named("prototype"))
+            .own_descriptor(constructor, &prototype_key)
             .unwrap()
             .unwrap()
         else {
@@ -1734,6 +1902,73 @@ mod tests {
         );
     }
 
+    /// With no `timeZone` option, a format is in the fixed offset of the host, as
+    /// `getHours` is. Before, `toLocaleTimeString` was in UTC whatever the host said.
+    #[test]
+    fn locale_strings_are_in_the_fixed_offset_of_the_host() {
+        let module = blank_program("<date locale zone>");
+        for (zone, hours, time, date, resolved) in [
+            ("UTC", 23.0, "11:30:00 PM", "1/15/2026", "UTC"),
+            ("+02:00", 1.0, "1:30:00 AM", "1/16/2026", "+02:00"),
+            ("UTC-05:30", 18.0, "6:00:00 PM", "1/15/2026", "-05:30"),
+            // POSIX allows an offset of 24 hours, which no format can hold.
+            ("XYZ24", 23.0, "11:30:00 PM", "1/15/2026", "UTC"),
+        ] {
+            let mut host = ControlledHost { zone };
+            let mut machine = machine(&module, &mut host);
+            let instant = parse_iso("2026-01-15T23:30:00.000Z", &TimeZoneRule::utc()).unwrap();
+            let value = construct_date(&mut machine, &[Value::number(instant)]);
+            assert_eq!(
+                value_number(call(&mut machine, value, "getHours", &[]).unwrap()),
+                hours,
+                "{zone}"
+            );
+            let locale = allocate_string(&mut machine, EcmaString::encode("en-US")).unwrap();
+            // The space before AM or PM is U+202F.
+            let shown =
+                |machine: &mut Machine<'_, ControlledHost>, method: &str, args: &[Value]| {
+                    let text = call(machine, value, method, args).unwrap();
+                    let text = machine.string_value(text).unwrap().to_utf8_lossy();
+                    text.replace('\u{202f}', " ")
+                };
+            assert_eq!(
+                shown(&mut machine, "toLocaleTimeString", &[locale]),
+                time,
+                "{zone}"
+            );
+            assert_eq!(
+                shown(&mut machine, "toLocaleDateString", &[locale]),
+                date,
+                "{zone}"
+            );
+            assert_eq!(
+                shown(&mut machine, "toLocaleString", &[locale]),
+                format!("{date}, {time}"),
+                "{zone}"
+            );
+            // An explicit option wins over the host.
+            let options = ordinary_object(&mut machine);
+            let utc = allocate_string(&mut machine, EcmaString::encode("UTC")).unwrap();
+            machine.set_data_property(options, "timeZone", utc).unwrap();
+            assert_eq!(
+                shown(&mut machine, "toLocaleTimeString", &[locale, options]),
+                "11:30:00 PM",
+                "{zone}"
+            );
+            // A new format reports the zone that it took from the host.
+            let intl = machine.intrinsics.global("Intl").unwrap();
+            let constructor = machine.get_named_property(intl, "DateTimeFormat").unwrap();
+            let format = machine.construct_value(constructor, &[]).unwrap();
+            let options = call(&mut machine, format, "resolvedOptions", &[]).unwrap();
+            let time_zone = machine.get_named_property(options, "timeZone").unwrap();
+            assert_eq!(
+                machine.string_value(time_zone).unwrap().to_utf8_lossy(),
+                resolved,
+                "{zone}"
+            );
+        }
+    }
+
     static COERCION_STEP: AtomicUsize = AtomicUsize::new(0);
 
     fn first_value_of(
@@ -1782,7 +2017,7 @@ mod tests {
                 length: 0,
                 handler,
             });
-            let function = native_function(&mut machine.heap, id, name, 0);
+            let function = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0);
             machine
                 .set_data_property(object, "valueOf", function)
                 .unwrap();
@@ -1790,6 +2025,24 @@ mod tests {
         let value = call(&mut machine, invalid, "setHours", &[first, second]).unwrap();
         assert!(value_number(value).is_nan());
         assert_eq!(COERCION_STEP.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_setter_on_an_invalid_date_leaves_the_stored_time_alone() {
+        let module = blank_program("<date invalid setter>");
+        let mut host = ControlledHost { zone: "UTC" };
+        let mut machine = machine(&module, &mut host);
+        let date = construct_date(&mut machine, &[Value::number(f64::NAN)]);
+        let result = call(&mut machine, date, "setUTCHours", &[Value::int32(1)]).unwrap();
+        assert!(value_number(result).is_nan());
+        assert!(value_number(call(&mut machine, date, "getTime", &[]).unwrap()).is_nan());
+    }
+
+    #[test]
+    fn years_print_with_four_digits_and_a_sign() {
+        assert_eq!(year_string(20), "0020");
+        assert_eq!(year_string(-1), "-0001");
+        assert_eq!(year_string(12345), "12345");
     }
 
     static RECEIVER_ARGUMENT_COERCED: AtomicBool = AtomicBool::new(false);
@@ -1844,7 +2097,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
     }
 
     fn generic_value_of(

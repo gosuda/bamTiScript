@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
-#[cfg(test)]
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use bamts_bytecode::EcmaString;
+use bamts_cancel::CancellationToken;
 use bamts_native::{Decoded, Value};
 
 use super::{
@@ -15,9 +15,110 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, Proper
 
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
+/// How often a suspended agent looks for cancellation, which has no wake signal.
+const CANCELLATION_POLL: Duration = Duration::from_millis(20);
+
+/// One agent suspended in `Atomics.wait`.
+#[derive(Debug, Default)]
+pub(crate) struct Suspension {
+    notified: Mutex<bool>,
+    ready: Condvar,
+}
+
+impl Suspension {
+    pub(crate) fn wake(&self) {
+        *self
+            .notified
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.ready.notify_one();
+    }
+
+    /// Suspends until woken, past `deadline`, or until `cancel` fires, and
+    /// reports whether this agent was woken.
+    pub(crate) fn wait(&self, deadline: Option<Instant>, cancel: &CancellationToken) -> bool {
+        let mut notified = self
+            .notified
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*notified && !cancel.is_cancelled() {
+            let remaining = deadline.map_or(CANCELLATION_POLL, |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
+            if remaining.is_zero() {
+                break;
+            }
+            (notified, _) = self
+                .ready
+                .wait_timeout(notified, remaining.min(CANCELLATION_POLL))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *notified
+    }
+}
+
+/// A Waiter Record.
+#[derive(Clone, Debug)]
+pub(crate) enum Waiter {
+    Blocking(Arc<Suspension>),
+    /// `Atomics.waitAsync`, as the id of the machine's record of it.
+    Async(u64),
+}
+
+impl Waiter {
+    fn is(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Blocking(left), Self::Blocking(right)) => Arc::ptr_eq(left, right),
+            (Self::Async(left), Self::Async(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+/// The WaiterList of one shared block: a queue per byte position, oldest first.
+#[derive(Debug, Default)]
+pub(crate) struct WaiterList {
+    queues: BTreeMap<usize, VecDeque<Waiter>>,
+}
+
+impl WaiterList {
+    pub(crate) fn add(&mut self, position: usize, waiter: Waiter) {
+        self.queues.entry(position).or_default().push_back(waiter);
+    }
+
+    /// Reports whether `waiter` was still queued. It is not once a notifier has
+    /// taken it, which is how a timeout that lost that race learns it did.
+    pub(crate) fn remove(&mut self, position: usize, waiter: &Waiter) -> bool {
+        let Some(queue) = self.queues.get_mut(&position) else {
+            return false;
+        };
+        let Some(index) = queue.iter().position(|queued| queued.is(waiter)) else {
+            return false;
+        };
+        queue.remove(index);
+        if queue.is_empty() {
+            self.queues.remove(&position);
+        }
+        true
+    }
+
+    /// RemoveWaiters: up to `count` waiters at `position`, oldest first.
+    pub(crate) fn take(&mut self, position: usize, count: usize) -> Vec<Waiter> {
+        let Some(queue) = self.queues.get_mut(&position) else {
+            return Vec::new();
+        };
+        let taken = queue.drain(..count.min(queue.len())).collect();
+        if queue.is_empty() {
+            self.queues.remove(&position);
+        }
+        taken
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SharedBlock {
     state: Mutex<SharedBlockState>,
+    waiters: Mutex<WaiterList>,
 }
 
 #[derive(Debug)]
@@ -27,14 +128,21 @@ struct SharedBlockState {
 }
 
 impl SharedBlock {
-    #[cfg(test)]
     pub(crate) fn new(bytes: Vec<u8>, max_byte_length: Option<usize>) -> Self {
         Self {
             state: Mutex::new(SharedBlockState {
                 bytes,
                 max_byte_length,
             }),
+            waiters: Mutex::default(),
         }
+    }
+
+    /// Enters this block's waiter critical section.
+    pub(crate) fn waiters(&self) -> MutexGuard<'_, WaiterList> {
+        self.waiters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub(crate) fn byte_length(&self) -> usize {
@@ -45,7 +153,6 @@ impl SharedBlock {
             .len()
     }
 
-    #[cfg(test)]
     pub(crate) fn max_byte_length(&self) -> usize {
         let state = self
             .state
@@ -84,7 +191,6 @@ impl SharedBlock {
 
     /// Mutates the shared backing store after the caller has charged the owning
     /// heap slot. Length validation belongs to [`grow_shared_array_buffer`].
-    #[cfg(test)]
     fn resize_backing(&self, new_length: usize) -> Result<(), ()> {
         let mut state = self
             .state
@@ -112,7 +218,6 @@ impl SharedBlock {
 /// Grows a SharedArrayBuffer through its owning runtime slot so the byte delta
 /// is charged exactly once, even when other heap entries alias the same
 /// `Arc<SharedBlock>`.
-#[cfg(test)]
 pub(crate) fn grow_shared_array_buffer<H: Host>(
     machine: &mut Machine<'_, H>,
     buffer: Value,
@@ -456,16 +561,18 @@ pub(crate) fn detach_for_host<H: Host>(
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
     let constructor =
-        install_constructor_function(heap, builtins, "ArrayBuffer", 1, constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "ArrayBuffer", length: 1, handler: constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     builtins.set_arraybuffer_constructor(constructor);
     builtins.set_arraybuffer_prototype(prototype);
-    define_data(heap, prototype, "constructor", constructor);
+    define_data(heap, atoms, shapes, prototype, "constructor", constructor);
 
     for (name, length, handler) in [
         ("resize", 1, resize::<H> as BuiltinHandler<H>),
@@ -477,8 +584,8 @@ pub(super) fn install<H: Host>(
             transfer_to_fixed_length::<H> as BuiltinHandler<H>,
         ),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, prototype, name, function);
     }
 
     for (property_name, function_name, getter) in [
@@ -503,12 +610,13 @@ pub(super) fn install<H: Host>(
             detached::<H> as BuiltinHandler<H>,
         ),
     ] {
-        let getter = install_function(heap, builtins, function_name, 0, getter);
+        let getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: function_name, length: 0, handler: getter });
         let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
             unreachable!("ArrayBuffer prototype is ordinary")
         };
         properties.insert(
-            PropertyKey::Named(EcmaString::encode(property_name)),
+        shapes,
+            PropertyKey::Named(atoms.intern_str(property_name)),
             Property::Accessor {
                 getter: Some(getter),
                 setter: None,
@@ -518,19 +626,21 @@ pub(super) fn install<H: Host>(
         );
     }
 
-    let is_view = install_function(heap, builtins, "isView", 1, is_view::<H>);
+    let is_view = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "isView", length: 1, handler: is_view::<H> });
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)] else {
         unreachable!("ArrayBuffer constructor is native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode("isView")),
+        shapes,
+        PropertyKey::Named(atoms.intern_str("isView")),
         builtin_property(is_view),
     );
-    let species = install_function(heap, builtins, "get [Symbol.species]", 0, species::<H>);
+    let species = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get [Symbol.species]", length: 0, handler: species::<H> });
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)] else {
         unreachable!("ArrayBuffer constructor is native")
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(heap_index(builtins.symbol_species()) as u32),
         Property::Accessor {
             getter: Some(species),
@@ -544,6 +654,7 @@ pub(super) fn install<H: Host>(
         unreachable!("ArrayBuffer prototype is ordinary")
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(heap_index(builtins.symbol_to_string_tag()) as u32),
         Property::Data {
             value: tag,
@@ -748,7 +859,7 @@ fn clamp_index(relative: f64, length: usize) -> usize {
         relative.min(length as f64) as usize
     }
 }
-fn to_clamped_index<H: Host>(
+pub(super) fn to_clamped_index<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
     length: usize,
@@ -766,11 +877,11 @@ fn to_clamped_index<H: Host>(
     Ok(clamp_index(integer, length))
 }
 
-fn species_constructor<H: Host>(
+pub(super) fn species_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
+    default: Value,
 ) -> Result<Value, EvalFailure> {
-    let default = machine.intrinsics.builtins.arraybuffer_constructor();
     let constructor = machine.get_named_property(object, "constructor")?;
     if constructor == Value::UNDEFINED {
         return Ok(default);
@@ -780,7 +891,7 @@ fn species_constructor<H: Host>(
             "ArrayBuffer constructor property is not an object",
         ));
     }
-    let key = machine.to_property_key(machine.intrinsics.builtins.symbol_species())?;
+    let key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_species())?;
     let species = machine.get_property_key(constructor, &key)?;
     match species.decode() {
         Some(Decoded::Undefined | Decoded::Null) => Ok(default),
@@ -810,7 +921,8 @@ fn slice<H: Host>(
         Some(value) => to_clamped_index(machine, value, source_length)?,
     };
     let new_length = end.saturating_sub(start);
-    let constructor = species_constructor(machine, this)?;
+    let default = machine.intrinsics.builtins.arraybuffer_constructor();
+    let constructor = species_constructor(machine, this, default)?;
     let target_value =
         machine.construct_value(constructor, &[crate::number_value(new_length as f64)])?;
     let target = handle(machine, target_value)?;
@@ -992,9 +1104,10 @@ mod tests {
             length: 1,
             handler: species_buffer,
         });
-        let constructor = native_function(&mut machine.heap, id, "SpeciesBuffer", 1);
-        let species_key = machine
-            .to_property_key(machine.intrinsics.builtins.symbol_species())
+        let constructor = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id,
+        "SpeciesBuffer",
+        1,);
+        let species_key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_species())
             .expect("species key");
         machine
             .set_data_property_key(constructor, species_key, constructor)
@@ -1063,7 +1176,9 @@ mod tests {
                 enumerable,
                 configurable,
                 ..
-            } = properties.get_ascii("resize").expect("resize method")
+            } = properties
+                .get_ascii(&machine.shapes, &machine.atoms, "resize")
+                .expect("resize method")
             else {
                 panic!("resize is a data property")
             };
@@ -1076,7 +1191,7 @@ mod tests {
                 enumerable,
                 configurable,
             } = properties
-                .get_ascii("byteLength")
+                .get_ascii(&machine.shapes, &machine.atoms, "byteLength")
                 .expect("byteLength accessor")
             else {
                 panic!("byteLength is a getter-only accessor")
@@ -1103,7 +1218,7 @@ mod tests {
                 machine.intrinsics.builtins.symbol_species(),
             ) as u32);
             assert!(matches!(
-                properties.get(&species_key),
+                properties.get(&machine.shapes, &species_key),
                 Some(Property::Accessor {
                     getter: Some(_),
                     setter: None,
@@ -1514,11 +1629,14 @@ mod tests {
                     }))
                 },
             });
-            let getter = native_function(&mut machine.heap, id, "get maxByteLength", 0);
+            let getter = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id,
+            "get maxByteLength",
+            0,);
+            let max_key = PropertyKey::Named(machine.intern_str("maxByteLength"));
             machine
                 .define_accessor(
                     options,
-                    PropertyKey::Named(EcmaString::encode("maxByteLength")),
+                    max_key,
                     getter,
                     bamts_bytecode::AccessorKind::Getter,
                 )

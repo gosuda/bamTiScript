@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use super::locale_negotiation::{
     HostLocaleHook, LanguageTag, LocaleDataProvider, LocaleError, LocaleMatcher,
@@ -656,11 +657,7 @@ pub trait IntlServiceDataProvider {
     fn locale_data(&self) -> &dyn LocaleDataProvider;
 
     /// Ordered plural categories exposed by `resolvedOptions()`.
-    fn plural_categories(
-        &self,
-        _locale: &str,
-        _rule_type: PluralRuleType,
-    ) -> &[PluralCategory] {
+    fn plural_categories(&self, _locale: &str, _rule_type: PluralRuleType) -> &[PluralCategory] {
         &[]
     }
 
@@ -776,6 +773,10 @@ pub struct PluralRulesOptions {
     pub rounding_mode: Option<String>,
     /// `trailingZeroDisplay`.
     pub trailing_zero_display: Option<String>,
+    /// `notation`.
+    pub notation: Option<String>,
+    /// `compactDisplay`.
+    pub compact_display: Option<String>,
 }
 
 /// PluralRules rounding-priority mode.
@@ -931,8 +932,12 @@ impl DigitOptions {
             TrailingZeroDisplay::parse(options.trailing_zero_display.as_deref())?;
         let has_significant = options.minimum_significant_digits.is_some()
             || options.maximum_significant_digits.is_some();
+        let has_fraction =
+            options.minimum_fraction_digits.is_some() || options.maximum_fraction_digits.is_some();
+        let compact = options.notation.as_deref() == Some("compact");
         let need_significant = priority != RoundingPriority::Auto || has_significant;
-        let need_fraction = priority != RoundingPriority::Auto || !has_significant;
+        let need_fraction =
+            priority != RoundingPriority::Auto || !(has_significant || (compact && !has_fraction));
 
         let (minimum_fraction_digits, maximum_fraction_digits) = if need_fraction {
             fraction_digit_bounds(options)?
@@ -959,6 +964,21 @@ impl DigitOptions {
             return Err(IntlError::InvalidOption {
                 name: "roundingIncrement",
                 value: rounding_increment.to_string(),
+            });
+        }
+        if !need_significant && !need_fraction {
+            return Ok(Self {
+                minimum_integer_digits,
+                minimum_fraction_digits: 0,
+                maximum_fraction_digits: 0,
+                minimum_significant_digits: 1,
+                maximum_significant_digits: 2,
+                has_significant_digits: true,
+                rounding_increment,
+                rounding_mode,
+                rounding_priority: RoundingPriority::MorePrecision,
+                rounding_type: RoundingType::MorePrecision,
+                trailing_zero_display,
             });
         }
         let rounding_type = match priority {
@@ -1088,7 +1108,9 @@ fn resolve_service_locale(
     keys: &[String],
 ) -> Result<super::locale_negotiation::ResolvedLocale, IntlError> {
     let requested = requested_with_default(requested, host, provider)?;
-    Ok(resolve_locale(&requested, options, keys, matcher, provider)?)
+    Ok(resolve_locale(
+        &requested, options, keys, matcher, provider,
+    )?)
 }
 
 /// The exact values reported by `PluralRules.prototype.resolvedOptions`.
@@ -1118,6 +1140,10 @@ pub struct PluralRulesResolvedOptions {
     pub trailing_zero_display: TrailingZeroDisplay,
     /// Provider-defined observable category order.
     pub plural_categories: Vec<PluralCategory>,
+    /// Resolved notation.
+    pub notation: String,
+    /// Resolved compact display, for compact notation.
+    pub compact_display: Option<String>,
 }
 
 /// ECMA-402 PluralRules service core.
@@ -1129,6 +1155,8 @@ pub struct PluralRules<'a> {
     rule_type: PluralRuleType,
     digits: DigitOptions,
     categories: Vec<PluralCategory>,
+    notation: String,
+    compact_display: Option<String>,
 }
 
 impl<'a> PluralRules<'a> {
@@ -1165,6 +1193,16 @@ impl<'a> PluralRules<'a> {
             rule_type,
             digits,
             categories,
+            notation: options
+                .notation
+                .clone()
+                .unwrap_or_else(|| String::from("standard")),
+            compact_display: (options.notation.as_deref() == Some("compact")).then(|| {
+                options
+                    .compact_display
+                    .clone()
+                    .unwrap_or_else(|| String::from("short"))
+            }),
         })
     }
 
@@ -1205,16 +1243,16 @@ impl<'a> PluralRules<'a> {
     pub fn resolved_options(&self) -> PluralRulesResolvedOptions {
         let fraction_active = matches!(
             self.digits.rounding_type,
-            RoundingType::FractionDigits | RoundingType::MorePrecision | RoundingType::LessPrecision
+            RoundingType::FractionDigits
+                | RoundingType::MorePrecision
+                | RoundingType::LessPrecision
         );
         PluralRulesResolvedOptions {
             locale: self.locale.clone(),
             plural_type: self.rule_type,
             minimum_integer_digits: self.digits.minimum_integer_digits,
-            minimum_fraction_digits: fraction_active
-                .then_some(self.digits.minimum_fraction_digits),
-            maximum_fraction_digits: fraction_active
-                .then_some(self.digits.maximum_fraction_digits),
+            minimum_fraction_digits: fraction_active.then_some(self.digits.minimum_fraction_digits),
+            maximum_fraction_digits: fraction_active.then_some(self.digits.maximum_fraction_digits),
             minimum_significant_digits: self
                 .digits
                 .has_significant_digits
@@ -1228,6 +1266,8 @@ impl<'a> PluralRules<'a> {
             rounding_priority: self.digits.rounding_priority,
             trailing_zero_display: self.digits.trailing_zero_display,
             plural_categories: self.categories.clone(),
+            notation: self.notation.clone(),
+            compact_display: self.compact_display.clone(),
         }
     }
 
@@ -1333,11 +1373,7 @@ fn round_finite(value: f64, options: DigitOptions) -> RoundedDecimal {
     }
 }
 
-fn round_fraction(
-    exact: &ExactDecimal,
-    negative: bool,
-    options: DigitOptions,
-) -> RoundedDecimal {
+fn round_fraction(exact: &ExactDecimal, negative: bool, options: DigitOptions) -> RoundedDecimal {
     let magnitude = -i32::from(options.maximum_fraction_digits);
     let coefficient = quantize(
         exact,
@@ -1399,13 +1435,7 @@ fn quantize(
     let has_remainder = integer_remainder != 0 || has_fraction;
     let relation = compare_half(integer_remainder, &fraction, increment);
     let quotient_is_odd = quotient.last().is_some_and(|digit| digit % 2 == 1);
-    if should_increment(
-        mode,
-        negative,
-        has_remainder,
-        relation,
-        quotient_is_odd,
-    ) {
+    if should_increment(mode, negative, has_remainder, relation, quotient_is_odd) {
         add_one(&mut quotient);
     }
     multiply_small(&quotient, increment)
@@ -1503,8 +1533,7 @@ fn should_increment(
         RoundingMode::HalfExpand => relation != HalfRelation::Below,
         RoundingMode::HalfTrunc => relation == HalfRelation::Above,
         RoundingMode::HalfEven => {
-            relation == HalfRelation::Above
-                || (relation == HalfRelation::Equal && quotient_is_odd)
+            relation == HalfRelation::Above || (relation == HalfRelation::Equal && quotient_is_odd)
         }
     }
 }
@@ -1608,6 +1637,8 @@ fn format_significant_result(
     finish_decimal(integer, fraction, trailing_zero_display)
 }
 
+/// The significant digits of a plain decimal. Every digit of a zero counts, so
+/// `0.00` has three.
 fn significant_digit_count(integer: &str, fraction: &str) -> usize {
     let combined = integer.bytes().chain(fraction.bytes());
     let mut seen_nonzero = false;
@@ -1620,7 +1651,11 @@ fn significant_digit_count(integer: &str, fraction: &str) -> usize {
             count += 1;
         }
     }
-    count.max(1)
+    if seen_nonzero {
+        count
+    } else {
+        fraction.len() + 1
+    }
 }
 
 fn finish_decimal(
@@ -1801,12 +1836,9 @@ impl<'a> RelativeTimeFormat<'a> {
             && value.fract() == 0.0
             && value >= i64::MIN as f64
             && value <= i64::MAX as f64
-            && let Some(term) = self.provider.relative_time_auto(
-                &self.data_locale,
-                self.style,
-                unit,
-                value as i64,
-            )
+            && let Some(term) =
+                self.provider
+                    .relative_time_auto(&self.data_locale, self.style, unit, value as i64)
         {
             return Ok(vec![RelativeTimePart {
                 kind: RelativeTimePartKind::Literal,
@@ -1884,7 +1916,11 @@ impl<'a> RelativeTimeFormat<'a> {
 
 fn validate_formatted_number(number: &FormattedNumber) -> Result<(), IntlError> {
     if number.parts.is_empty()
-        || number.parts.iter().map(|part| part.value.as_str()).collect::<String>()
+        || number
+            .parts
+            .iter()
+            .map(|part| part.value.as_str())
+            .collect::<String>()
             != number.value
     {
         return Err(IntlError::InvalidData(
@@ -1894,11 +1930,7 @@ fn validate_formatted_number(number: &FormattedNumber) -> Result<(), IntlError> 
     Ok(())
 }
 
-fn push_relative_literal(
-    parts: &mut Vec<RelativeTimePart>,
-    literal: &str,
-    index: &mut usize,
-) {
+fn push_relative_literal(parts: &mut Vec<RelativeTimePart>, literal: &str, index: &mut usize) {
     if literal.is_empty() {
         return;
     }
@@ -1911,7 +1943,10 @@ fn push_relative_literal(
     *index += utf16_len(literal);
 }
 
-fn one_placeholder<'a>(pattern: &'a str, placeholder: &str) -> Result<(&'a str, &'a str), IntlError> {
+fn one_placeholder<'a>(
+    pattern: &'a str,
+    placeholder: &str,
+) -> Result<(&'a str, &'a str), IntlError> {
     let (prefix, suffix) = pattern
         .split_once(placeholder)
         .ok_or(IntlError::InvalidData("pattern is missing a placeholder"))?;
@@ -2212,11 +2247,12 @@ pub struct SegmentRecord {
     pub is_word_like: Option<bool>,
 }
 
-/// A segmented UTF-16 string without per-segment input copies.
+/// A segmented UTF-16 string. A `Segments` object and each iterator over it share
+/// one copy of the input and of the records, so a clone costs nothing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SegmentedText {
-    input: Vec<u16>,
-    records: Vec<SegmentRecord>,
+    input: Arc<[u16]>,
+    records: Arc<[SegmentRecord]>,
 }
 
 impl SegmentedText {
@@ -2241,12 +2277,8 @@ impl SegmentedText {
     /// Implements `Segments.prototype.containing` with a UTF-16 code-unit index.
     #[must_use]
     pub fn containing(&self, index: usize) -> Option<&SegmentRecord> {
-        if index >= self.input.len() {
-            return None;
-        }
-        self.records
-            .iter()
-            .find(|record| record.start <= index && index < record.end)
+        let position = self.records.partition_point(|record| record.end <= index);
+        self.records.get(position)
     }
 }
 
@@ -2296,8 +2328,8 @@ impl<'a> Segmenter<'a> {
     pub fn segment_utf16(&self, input: &[u16]) -> Result<SegmentedText, IntlError> {
         if input.is_empty() {
             return Ok(SegmentedText {
-                input: Vec::new(),
-                records: Vec::new(),
+                input: Arc::from([]),
+                records: Arc::from([]),
             });
         }
         let boundaries = self
@@ -2332,8 +2364,8 @@ impl<'a> Segmenter<'a> {
             ));
         }
         Ok(SegmentedText {
-            input: input.to_vec(),
-            records,
+            input: Arc::from(input),
+            records: Arc::from(records),
         })
     }
 
@@ -2563,41 +2595,17 @@ fn canonical_calendar_code(
 fn canonical_date_time_field(code: &str) -> Result<String, IntlError> {
     const FIELDS: &[&str] = &[
         "era",
-        "era-short",
-        "era-narrow",
         "year",
-        "year-short",
-        "year-narrow",
         "quarter",
-        "quarter-short",
-        "quarter-narrow",
         "month",
-        "month-short",
-        "month-narrow",
         "weekOfYear",
-        "weekOfYear-short",
-        "weekOfYear-narrow",
         "weekday",
-        "weekday-short",
-        "weekday-narrow",
         "day",
-        "day-short",
-        "day-narrow",
         "dayPeriod",
-        "dayPeriod-short",
-        "dayPeriod-narrow",
         "hour",
-        "hour-short",
-        "hour-narrow",
         "minute",
-        "minute-short",
-        "minute-narrow",
         "second",
-        "second-short",
-        "second-narrow",
-        "zone",
-        "zone-short",
-        "zone-narrow",
+        "timeZoneName",
     ];
     if FIELDS.contains(&code) {
         Ok(code.to_owned())
@@ -2628,9 +2636,10 @@ fn is_unicode_language_id(value: &str) -> bool {
         return false;
     }
     let mut index = 0;
-    if rest.get(index).is_some_and(|part| {
-        part.len() == 4 && part.bytes().all(|byte| byte.is_ascii_alphabetic())
-    }) {
+    if rest
+        .get(index)
+        .is_some_and(|part| part.len() == 4 && part.bytes().all(|byte| byte.is_ascii_alphabetic()))
+    {
         index += 1;
     }
     if rest.get(index).is_some_and(|part| is_region_subtag(part)) {
@@ -2659,11 +2668,65 @@ fn is_region_subtag(value: &str) -> bool {
 fn is_unicode_type(value: &str) -> bool {
     !value.is_empty()
         && value.split('-').all(|part| {
-            (3..=8).contains(&part.len())
-                && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            (3..=8).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
         })
 }
 
 fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::locale_data::DATA;
+    use super::super::number_data::NoHostLocale;
+    use super::{PluralCategory, PluralRules, PluralRulesOptions};
+
+    fn rules(options: &PluralRulesOptions) -> PluralRules<'static> {
+        PluralRules::try_new(&["en".to_owned()], options, &*DATA, &NoHostLocale).expect("rules")
+    }
+
+    #[test]
+    fn a_zero_has_as_many_significant_digits_as_it_shows() {
+        let minimum = rules(&PluralRulesOptions {
+            minimum_significant_digits: Some(3),
+            ..PluralRulesOptions::default()
+        });
+        assert_eq!(minimum.select(0.0).expect("zero"), PluralCategory::Other);
+        assert_eq!(minimum.select(-0.0).expect("zero"), PluralCategory::Other);
+        assert_eq!(minimum.select(1.0).expect("one"), PluralCategory::Other);
+    }
+
+    #[test]
+    fn an_ordinal_reads_the_value_and_not_the_digits_shown() {
+        let padded = rules(&PluralRulesOptions {
+            plural_type: Some("ordinal".to_owned()),
+            minimum_significant_digits: Some(3),
+            ..PluralRulesOptions::default()
+        });
+        assert_eq!(padded.select(1.0).expect("1.00"), PluralCategory::One);
+        assert_eq!(padded.select(2.0).expect("2.00"), PluralCategory::Two);
+        assert_eq!(padded.select(3.0).expect("3.00"), PluralCategory::Few);
+        assert_eq!(padded.select(1.5).expect("1.50"), PluralCategory::Other);
+        assert_eq!(padded.select(11.0).expect("11.0"), PluralCategory::Other);
+    }
+
+    #[test]
+    fn every_english_range_is_other() {
+        let cardinal = rules(&PluralRulesOptions::default());
+        let ordinal = rules(&PluralRulesOptions {
+            plural_type: Some("ordinal".to_owned()),
+            ..PluralRulesOptions::default()
+        });
+        for (start, end) in [(0.0, 1.0), (1.0, 1.0), (1.0, 2.0), (2.0, 1.0), (1.0, 3.0)] {
+            assert_eq!(
+                cardinal.select_range(start, end).expect("cardinal"),
+                PluralCategory::Other
+            );
+            assert_eq!(
+                ordinal.select_range(start, end).expect("ordinal"),
+                PluralCategory::Other
+            );
+        }
+    }
 }

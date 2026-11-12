@@ -57,7 +57,7 @@ pub const SOURCE_NAMES: [&str; 27] = [
     "icu-properties-data",
 ];
 
-pub const CATALOG_NAMES: [&str; 9] = [
+pub const CATALOG_NAMES: [&str; 7] = [
     "typescript-7.0.2",
     "typescript-6.0.2",
     "typescript-5.9.3",
@@ -65,8 +65,6 @@ pub const CATALOG_NAMES: [&str; 9] = [
     "formal-quint",
     "formal-lean",
     "formal-redex",
-    "target-cells",
-    "benchmarks",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

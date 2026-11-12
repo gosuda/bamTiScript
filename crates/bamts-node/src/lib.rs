@@ -476,8 +476,28 @@ fn decode_aot_program(
     bamts_bytecode::decode_verified_program(bytes, &bamts_bytecode::ProgramDecodeLimits::default())
 }
 
+/// Runs the program on a thread with the stack that [`bamts_runtime::Limits::program`]
+/// needs, which is far more than a main thread has. A panic on that thread ends the
+/// process, as a panic in `main` does.
 #[cfg(all(feature = "aot-main", not(test)))]
 fn run_aot_main() -> i32 {
+    let program = std::thread::Builder::new()
+        .stack_size(bamts_runtime::Limits::PROGRAM_STACK)
+        .spawn(run_aot_program);
+    match program {
+        Ok(program) => program.join().unwrap_or_else(|_| std::process::abort()),
+        Err(error) => {
+            let host = NodeHost::new();
+            finish_aot_process(
+                &host,
+                AotCompletion::Failure(AotMainFailure::Thread(error.to_string())),
+            )
+        }
+    }
+}
+
+#[cfg(all(feature = "aot-main", not(test)))]
+fn run_aot_program() -> i32 {
     use bamts_native::linked_program;
     use bamts_runtime::{Limits, run_linked_program};
 
@@ -510,7 +530,7 @@ fn run_aot_main() -> i32 {
             AotCompletion::Failure(AotMainFailure::Context(error)),
         );
     }
-    let outcome = match run_linked_program(&program, &linked, &mut host, &Limits::default()) {
+    let outcome = match run_linked_program(&program, &linked, &mut host, &Limits::program()) {
         Ok(outcome) => outcome,
         Err(error) => {
             return finish_aot_process(
@@ -525,6 +545,7 @@ fn run_aot_main() -> i32 {
 #[cfg(any(feature = "aot-main", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AotMainFailure {
+    Thread(String),
     Link(String),
     Decode(String),
     Context(AotProcessContextError),
@@ -535,6 +556,7 @@ enum AotMainFailure {
 impl std::fmt::Display for AotMainFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Thread(detail) => write!(formatter, "aot thread: {detail}"),
             Self::Link(detail) => write!(formatter, "aot link: {detail}"),
             Self::Decode(detail) => write!(formatter, "aot decode: {detail}"),
             Self::Context(AotProcessContextError::Argument) => {
@@ -939,6 +961,10 @@ mod tests {
 
     #[test]
     fn aot_failure_labels_are_stable() {
+        assert_eq!(
+            AotMainFailure::Thread("no memory".to_owned()).to_string(),
+            "aot thread: no memory"
+        );
         assert_eq!(
             AotMainFailure::Link("link failed".to_owned()).to_string(),
             "aot link: link failed"

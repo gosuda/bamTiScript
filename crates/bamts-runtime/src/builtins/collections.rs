@@ -7,7 +7,7 @@ use super::{
     allocate_array, builtin_property, define_data, heap_index, install_constructor_function,
     install_function, type_error,
 };
-use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
+use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable, IteratorFamily};
 use crate::vm::async_iterators::{ASYNC_FROM_SYNC_METHODS, ASYNC_GENERATOR_METHODS};
 use crate::vm::generator_async::{GENERATOR_METHODS, GeneratorCompletion, GeneratorOperation};
 use crate::{
@@ -18,24 +18,29 @@ use bamts_bytecode::IteratorKind;
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    install_map(heap, globals, builtins);
-    install_set(heap, globals, builtins);
-    install_weak_map(heap, globals, builtins);
-    install_weak_set(heap, globals, builtins);
+    install_map(heap, atoms, shapes, globals, builtins);
+    install_set(heap, atoms, shapes, globals, builtins);
+    install_weak_map(heap, atoms, shapes, globals, builtins);
+    install_weak_set(heap, atoms, shapes, globals, builtins);
 }
 
 fn install_map<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     builtins.set_map_prototype(prototype);
-    let constructor = install_constructor_function(heap, builtins, "Map", 0, map_constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Map", length: 0, handler: map_constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     for (name, length, handler) in [
         ("set", 2, map_set::<H> as BuiltinHandler<H>),
         ("get", 1, map_get::<H>),
@@ -47,28 +52,31 @@ fn install_map<H: Host>(
         ("entries", 0, map_entries::<H>),
         ("forEach", 1, map_for_each::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, prototype, name, function);
     }
-    let size = install_function(heap, builtins, "get size", 0, map_size::<H>);
-    define_getter(heap, prototype, "size", size);
-    let entries = named_property(heap, prototype, "entries");
-    define_symbol(heap, prototype, builtins.symbol_iterator(), entries);
+    let size = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get size", length: 0, handler: map_size::<H> });
+    define_getter(heap, atoms, shapes, prototype, "size", size);
+    let entries = named_property(heap, atoms, shapes, prototype, "entries");
+    define_symbol(heap, shapes, prototype, builtins.symbol_iterator(), entries);
     let map_tag = super::super::push(heap, HeapEntry::String(EcmaString::encode("Map")));
-    define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), map_tag);
+    define_to_string_tag(heap, shapes, prototype, builtins.symbol_to_string_tag(), map_tag);
     globals.insert(EcmaString::encode("Map"), constructor);
 }
 
 fn install_set<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     builtins.set_set_prototype(prototype);
-    super::set_methods::install(heap, builtins, prototype);
-    let constructor = install_constructor_function(heap, builtins, "Set", 0, set_constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    super::set_methods::install(heap, atoms, shapes, builtins, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Set", length: 0, handler: set_constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     for (name, length, handler) in [
         ("add", 1, set_add::<H> as BuiltinHandler<H>),
         ("has", 1, set_has::<H>),
@@ -79,97 +87,108 @@ fn install_set<H: Host>(
         ("entries", 0, set_entries::<H>),
         ("forEach", 1, set_for_each::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, prototype, name, function);
     }
-    let size = install_function(heap, builtins, "get size", 0, set_size::<H>);
-    define_getter(heap, prototype, "size", size);
-    let values = named_property(heap, prototype, "values");
-    define_symbol(heap, prototype, builtins.symbol_iterator(), values);
+    let size = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get size", length: 0, handler: set_size::<H> });
+    define_getter(heap, atoms, shapes, prototype, "size", size);
+    let values = named_property(heap, atoms, shapes, prototype, "values");
+    define_symbol(heap, shapes, prototype, builtins.symbol_iterator(), values);
     let set_tag = super::super::push(heap, HeapEntry::String(EcmaString::encode("Set")));
-    define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), set_tag);
+    define_to_string_tag(heap, shapes, prototype, builtins.symbol_to_string_tag(), set_tag);
     globals.insert(EcmaString::encode("Set"), constructor);
 }
 
 fn install_weak_map<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     builtins.set_weak_map_prototype(prototype);
-    let constructor =
-        install_constructor_function(heap, builtins, "WeakMap", 0, weak_map_constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "WeakMap", length: 0, handler: weak_map_constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     for (name, length, handler) in [
         ("set", 2, weak_map_set::<H> as BuiltinHandler<H>),
         ("get", 1, weak_map_get::<H>),
         ("has", 1, weak_map_has::<H>),
         ("delete", 1, weak_map_delete::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, prototype, name, function);
     }
     globals.insert(EcmaString::encode("WeakMap"), constructor);
 }
 
 fn install_weak_set<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     builtins.set_weak_set_prototype(prototype);
-    let constructor =
-        install_constructor_function(heap, builtins, "WeakSet", 0, weak_set_constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "WeakSet", length: 0, handler: weak_set_constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     for (name, length, handler) in [
         ("add", 1, weak_set_add::<H> as BuiltinHandler<H>),
         ("has", 1, weak_set_has::<H>),
         ("delete", 1, weak_set_delete::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, prototype, name, function);
     }
     globals.insert(EcmaString::encode("WeakSet"), constructor);
 }
 
 pub(super) fn install_iterator_prototype<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
-    let next = install_function(heap, builtins, "next", 0, iterator_next::<H>);
-    let identity = install_function(
-        heap,
-        builtins,
-        "[Symbol.iterator]",
-        0,
-        iterator_identity::<H>,
-    );
-    define_data(heap, prototype, "next", next);
-    define_symbol(heap, prototype, builtins.symbol_iterator(), identity);
+    let identity = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "[Symbol.iterator]", length: 0, handler: iterator_identity::<H> });
+    define_symbol(heap, shapes, prototype, builtins.symbol_iterator(), identity);
     builtins.set_iterator_prototype(prototype);
+    let family_prototypes = [
+        (
+            "Array Iterator",
+            array_iterator_next::<H> as BuiltinHandler<H>,
+        ),
+        ("Map Iterator", map_iterator_next::<H>),
+        ("Set Iterator", set_iterator_next::<H>),
+        ("String Iterator", string_iterator_next::<H>),
+    ]
+    .map(|(tag, handler)| {
+        let family = ordinary(heap, Some(prototype));
+        let next = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "next", length: 0, handler: handler });
+        define_data(heap, atoms, shapes, family, "next", next);
+        super::define_to_string_tag(heap, shapes, family, builtins.symbol_to_string_tag(), tag);
+        family
+    });
+    builtins.set_iterator_family_prototypes(family_prototypes);
 }
 
 pub(super) fn install_async_iterator_prototype<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
-    let identity = install_function(
-        heap,
-        builtins,
-        "[Symbol.asyncIterator]",
-        0,
-        iterator_identity::<H>,
-    );
-    define_symbol(heap, prototype, builtins.symbol_async_iterator(), identity);
+    let identity = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "[Symbol.asyncIterator]", length: 0, handler: iterator_identity::<H> });
+    define_symbol(heap, shapes, prototype, builtins.symbol_async_iterator(), identity);
     builtins.set_async_iterator_prototype(prototype);
 }
 
 pub(super) fn install_generator_prototype<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.iterator_prototype()));
@@ -179,14 +198,16 @@ pub(super) fn install_generator_prototype<H: Host>(
         generator_throw::<H> as BuiltinHandler<H>,
     ];
     for (method, handler) in GENERATOR_METHODS.into_iter().zip(handlers) {
-        let function = install_function(heap, builtins, method.name, method.length, handler);
-        define_data(heap, prototype, method.name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: method.name, length: method.length, handler: handler });
+        define_data(heap, atoms, shapes, prototype, method.name, function);
     }
     builtins.set_generator_prototype(prototype);
 }
 
 pub(super) fn install_async_generator_prototype<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.async_iterator_prototype()));
@@ -196,8 +217,8 @@ pub(super) fn install_async_generator_prototype<H: Host>(
         async_generator_throw::<H> as BuiltinHandler<H>,
     ];
     for (method, handler) in ASYNC_GENERATOR_METHODS.into_iter().zip(handlers) {
-        let function = install_function(heap, builtins, method.name, method.length, handler);
-        define_data(heap, prototype, method.name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: method.name, length: method.length, handler: handler });
+        define_data(heap, atoms, shapes, prototype, method.name, function);
     }
     let adapter_prototype = ordinary(heap, Some(builtins.async_iterator_prototype()));
     let adapter_handlers = [
@@ -206,8 +227,8 @@ pub(super) fn install_async_generator_prototype<H: Host>(
         async_from_sync_throw::<H> as BuiltinHandler<H>,
     ];
     for (method, handler) in ASYNC_FROM_SYNC_METHODS.into_iter().zip(adapter_handlers) {
-        let function = install_function(heap, builtins, method.name, method.length, handler);
-        define_data(heap, adapter_prototype, method.name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: method.name, length: method.length, handler: handler });
+        define_data(heap, atoms, shapes, adapter_prototype, method.name, function);
     }
     builtins.set_async_from_sync_iterator_prototype(adapter_prototype);
     builtins.set_async_generator_prototype(prototype);
@@ -327,18 +348,46 @@ fn generator_throw<H: Host>(
     })
 }
 
+fn iterator_family<H: Host>(
+    machine: &Machine<'_, H>,
+    source: Value,
+    kind: IterationKind,
+) -> Result<IteratorFamily, EvalFailure> {
+    if kind == IterationKind::StringCodePoint {
+        return Ok(IteratorFamily::String);
+    }
+    let index = machine.runtime_slot(source).map_err(EvalFailure::Runtime)?;
+    Ok(match index.map(|index| &machine.heap[index]) {
+        Some(HeapEntry::Collection {
+            kind: CollectionKind::Map,
+            ..
+        }) => IteratorFamily::Map,
+        Some(HeapEntry::Collection {
+            kind: CollectionKind::Set,
+            ..
+        }) => IteratorFamily::Set,
+        _ => IteratorFamily::Array,
+    })
+}
+
 pub(super) fn iterator<H: Host>(
     machine: &mut Machine<'_, H>,
     source: Value,
     kind: IterationKind,
 ) -> Result<Value, EvalFailure> {
+    let family = iterator_family(machine, source, kind)?;
     machine
         .allocate(HeapEntry::BuiltinIterator {
             source,
             kind,
             position: Some(0),
             properties: PropertyMap::default(),
-            prototype: Some(machine.intrinsics.builtins.iterator_prototype()),
+            prototype: Some(
+                machine
+                    .intrinsics
+                    .builtins
+                    .iterator_family_prototype(family),
+            ),
             extensible: true,
         })
         .map_err(EvalFailure::Runtime)
@@ -353,11 +402,46 @@ fn iterator_identity<H: Host>(
     Ok(BuiltinOutcome::Value(this))
 }
 
-fn iterator_next<H: Host>(
+fn array_iterator_next<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     _args: &[Value],
     _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    iterator_next(machine, this, IteratorFamily::Array)
+}
+
+fn map_iterator_next<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    iterator_next(machine, this, IteratorFamily::Map)
+}
+
+fn set_iterator_next<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    iterator_next(machine, this, IteratorFamily::Set)
+}
+
+fn string_iterator_next<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    iterator_next(machine, this, IteratorFamily::String)
+}
+
+fn iterator_next<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    family: IteratorFamily,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let Some(iterator_index) = machine.runtime_slot(this).map_err(EvalFailure::Runtime)? else {
         return Err(type_error("iterator next called on incompatible receiver"));
@@ -371,6 +455,16 @@ fn iterator_next<H: Host>(
     else {
         return Err(type_error("iterator next called on incompatible receiver"));
     };
+    let builtin_family = matches!(
+        kind,
+        IterationKind::Key
+            | IterationKind::Value
+            | IterationKind::Entry
+            | IterationKind::StringCodePoint
+    );
+    if !builtin_family || iterator_family(machine, source, kind)? != family {
+        return Err(type_error("iterator next called on incompatible receiver"));
+    }
     let (done, value, next_position) = match position {
         None => (true, Value::UNDEFINED, None),
         Some(cursor) => {
@@ -382,6 +476,9 @@ fn iterator_next<H: Host>(
                 let bounds = crate::intrinsics::builtins::typedarray_all::typed_array_bounds(
                     machine, source,
                 )?;
+                if bounds.out_of_bounds {
+                    return Err(type_error("iterated typed array is out of bounds"));
+                }
                 match usize::try_from(cursor) {
                     Ok(index) if !bounds.out_of_bounds && index < bounds.element_length => {
                         let value = crate::intrinsics::builtins::typedarray_all::read_element(
@@ -439,8 +536,13 @@ fn iterator_next<H: Host>(
                 Some((next, key, item_value)) => {
                     let value = match kind {
                         IterationKind::Key => key,
-                        IterationKind::Value => item_value,
+                        IterationKind::Value | IterationKind::StringCodePoint => item_value,
                         IterationKind::Entry => allocate_array(machine, vec![key, item_value])?,
+                        IterationKind::RegExpString
+                        | IterationKind::IteratorHelper(_)
+                        | IterationKind::WrapForValid => {
+                            unreachable!("the family check admits only the four families")
+                        }
                     };
                     (false, value, Some(next))
                 }
@@ -920,7 +1022,7 @@ fn map_for_each<H: Host>(
         collection_next(machine, this, CollectionKind::Map, cursor)?
     {
         cursor = next;
-        machine.call_value(
+        machine.call_callback(
             callback,
             args.get(1).copied().unwrap_or(Value::UNDEFINED),
             &[value, key, this],
@@ -1048,7 +1150,7 @@ fn set_for_each<H: Host>(
     while let Some((next, _, value)) = collection_next(machine, this, CollectionKind::Set, cursor)?
     {
         cursor = next;
-        machine.call_value(
+        machine.call_callback(
             callback,
             args.get(1).copied().unwrap_or(Value::UNDEFINED),
             &[value, value, this],
@@ -1057,7 +1159,7 @@ fn set_for_each<H: Host>(
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 
-fn map_put<H: Host>(
+pub(super) fn map_put<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
     key: Value,
@@ -1196,7 +1298,7 @@ fn collection<H: Host>(
         .map_err(EvalFailure::Runtime)
 }
 
-fn collection_slot<H: Host>(
+pub(super) fn collection_slot<H: Host>(
     machine: &Machine<'_, H>,
     object: Value,
     expected: CollectionKind,
@@ -1254,7 +1356,10 @@ fn collection_iterator<H: Host>(
     Ok(BuiltinOutcome::Value(iterator(machine, object, kind)?))
 }
 
-fn require_weak_key<H: Host>(machine: &Machine<'_, H>, key: Value) -> Result<(), EvalFailure> {
+pub(super) fn require_weak_key<H: Host>(
+    machine: &Machine<'_, H>,
+    key: Value,
+) -> Result<(), EvalFailure> {
     let Some(index) = machine.runtime_slot(key).map_err(EvalFailure::Runtime)? else {
         return Err(type_error("Invalid value used as weak collection key"));
     };
@@ -1279,6 +1384,8 @@ fn require_weak_key<H: Host>(machine: &Machine<'_, H>, key: Value) -> Result<(),
         | HeapEntry::HashState { .. }
         | HeapEntry::RegExp { .. }
         | HeapEntry::Date { .. }
+        | HeapEntry::Temporal { .. }
+        | HeapEntry::Intl { .. }
         | HeapEntry::Collection { .. }
         | HeapEntry::TypedArray { .. }
         | HeapEntry::ArrayBuffer { .. }
@@ -1327,6 +1434,9 @@ fn constructor_prototype<H: Host>(
     };
     Ok(prototype)
 }
+pub(super) fn ordinary_intrinsic(heap: &mut Vec<HeapEntry>, prototype: Value) -> Value {
+    ordinary(heap, Some(prototype))
+}
 fn ordinary(heap: &mut Vec<HeapEntry>, prototype: Option<Value>) -> Value {
     super::super::push(
         heap,
@@ -1351,12 +1461,20 @@ pub(crate) fn ordinary_runtime<H: Host>(
         })
         .map_err(EvalFailure::Runtime)
 }
-fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
+fn define_getter(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+    object: Value,
+    name: &str,
+    getter: Value,
+) {
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        shapes,
+        PropertyKey::Named(atoms.intern_str(name)),
         Property::Accessor {
             getter: Some(getter),
             setter: None,
@@ -1365,20 +1483,22 @@ fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Valu
         },
     );
 }
-fn define_symbol(heap: &mut [HeapEntry], object: Value, symbol: Value, value: Value) {
+fn define_symbol(heap: &mut [HeapEntry], shapes: &mut crate::ShapeTable, object: Value, symbol: Value, value: Value) {
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
         unreachable!()
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(heap_index(symbol) as u32),
         builtin_property(value),
     );
 }
-fn define_to_string_tag(heap: &mut [HeapEntry], object: Value, symbol: Value, value: Value) {
+fn define_to_string_tag(heap: &mut [HeapEntry], shapes: &mut crate::ShapeTable, object: Value, symbol: Value, value: Value) {
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
         unreachable!()
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(heap_index(symbol) as u32),
         Property::Data {
             value,
@@ -1388,11 +1508,17 @@ fn define_to_string_tag(heap: &mut [HeapEntry], object: Value, symbol: Value, va
         },
     );
 }
-fn named_property(heap: &[HeapEntry], object: Value, name: &str) -> Value {
+fn named_property(
+    heap: &[HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &crate::ShapeTable,
+    object: Value,
+    name: &str,
+) -> Value {
     let HeapEntry::Object { properties, .. } = &heap[heap_index(object)] else {
         unreachable!()
     };
-    match properties.get(&PropertyKey::Named(EcmaString::encode(name))) {
+    match properties.get(shapes, &PropertyKey::Named(atoms.intern_str(name))) {
         Some(Property::Data { value, .. }) => *value,
         _ => unreachable!(),
     }
@@ -1813,6 +1939,35 @@ mod tests {
     // ---- %GeneratorPrototype% tests ----------------------------------------
 
     #[test]
+    fn each_iterator_family_owns_next_and_rejects_the_others() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let iterator_prototype = machine.intrinsics.builtins.iterator_prototype();
+        assert_eq!(
+            machine
+                .get_named_property(iterator_prototype, "next")
+                .unwrap(),
+            Value::UNDEFINED,
+            "a subclass of Iterator must not inherit a builtin next"
+        );
+        let array = allocate_array(&mut machine, Vec::new()).unwrap();
+        let array_iterator = iterator(&mut machine, array, IterationKind::Value).unwrap();
+        let map_constructor = machine.intrinsics.global("Map").unwrap();
+        let map = machine.construct_value(map_constructor, &[]).unwrap();
+        let map_iterator = iterator(&mut machine, map, IterationKind::Entry).unwrap();
+
+        let array_next = machine.get_named_property(array_iterator, "next").unwrap();
+        let map_next = machine.get_named_property(map_iterator, "next").unwrap();
+        assert_ne!(array_next, map_next);
+        assert!(machine.call_value(array_next, array_iterator, &[]).is_ok());
+        assert!(matches!(
+            machine.call_value(array_next, map_iterator, &[]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+    }
+
+    #[test]
     fn generator_prototype_chains_to_iterator_prototype() {
         let module = blank_program("<test>");
         let mut host = TestHost;
@@ -1861,7 +2016,7 @@ mod tests {
             ),
         ] {
             for name in ["next", "return", "throw"] {
-                let key = PropertyKey::Named(EcmaString::encode(name));
+                let key = PropertyKey::Named(machine.intern_str(name));
                 let method_descriptor = machine
                     .own_descriptor(prototype, &key)
                     .unwrap()
@@ -1898,8 +2053,9 @@ mod tests {
                 assert_eq!(definition.length, 1, "{label}.prototype.{name} length");
 
                 for metadata in ["name", "length"] {
+                    let metadata_key = PropertyKey::Named(machine.intern_str(metadata));
                     let descriptor = machine
-                        .own_descriptor(method, &PropertyKey::Named(EcmaString::encode(metadata)))
+                        .own_descriptor(method, &metadata_key)
                         .unwrap()
                         .unwrap_or_else(|| {
                             panic!("{label}.prototype.{name}.{metadata} must exist")
@@ -2146,7 +2302,7 @@ mod tests {
                 enumerable,
                 configurable,
                 ..
-            }) = properties.get(&tag_key)
+            }) = properties.get(&machine.shapes, &tag_key)
             else {
                 panic!("{name}.prototype must own Symbol.toStringTag");
             };
@@ -2897,7 +3053,6 @@ mod tests {
     }
 
     use crate::intrinsics::{BuiltinDef, BuiltinHandler, native_function};
-
     fn native_callback(
         machine: &mut Machine<'_, TestHost>,
         name: &'static str,
@@ -2908,7 +3063,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
     }
 
     fn push_log(machine: &mut Machine<'_, TestHost>, event: u32) {
@@ -2942,7 +3097,7 @@ mod tests {
         let iterable = ordinary_object(machine);
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
         let iterator_key = machine
-            .to_property_key(iterator_symbol)
+            .property_key_from_value(iterator_symbol)
             .expect("Symbol.iterator is a property key");
         machine
             .set_data_property_key(iterable, iterator_key, get_iter)

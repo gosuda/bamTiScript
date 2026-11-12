@@ -1114,12 +1114,13 @@ pub fn clean(
 #[cfg(test)]
 mod tests {
     use super::super::references::ReferenceGraph;
+    use super::super::test_paths::{abs, abs_json, abs_text};
     use super::super::tsconfig::TsConfig;
     use super::super::{ProjectConfig, ProjectRoot};
     use super::*;
 
     fn test_root() -> ProjectRoot {
-        ProjectRoot::new("/workspace/test").expect("absolute test root")
+        ProjectRoot::new(abs("/workspace/test")).expect("absolute test root")
     }
 
     fn parse_tsconfig(root: &ProjectRoot, path: impl AsRef<Path>, source: &str) -> TsConfig {
@@ -1276,16 +1277,16 @@ mod tests {
     }
 
     fn lib_path() -> PathBuf {
-        PathBuf::from("/workspace/test/lib/tsconfig.json")
+        abs("/workspace/test/lib/tsconfig.json")
     }
 
     fn app_path() -> PathBuf {
-        PathBuf::from("/workspace/test/app/tsconfig.json")
+        abs("/workspace/test/app/tsconfig.json")
     }
 
-    fn build_output(path: &str) -> BuildOutputs {
+    fn build_output(path: impl AsRef<Path>) -> BuildOutputs {
         let mut files = BTreeMap::new();
-        files.insert(PathBuf::from(path), vec![b'j', b's']);
+        files.insert(path.as_ref().to_path_buf(), vec![b'j', b's']);
         BuildOutputs { files }
     }
 
@@ -1302,8 +1303,8 @@ mod tests {
                 &app_path(),
                 parse_config(&root, app_path(), r#"{"references": [{"path": "../lib"}]}"#),
             )
-            .with_compile_output(&lib_path(), build_output("/workspace/test/lib/lib.js"))
-            .with_compile_output(&app_path(), build_output("/workspace/test/app/app.js"));
+            .with_compile_output(&lib_path(), build_output(abs("/workspace/test/lib/lib.js")))
+            .with_compile_output(&app_path(), build_output(abs("/workspace/test/app/app.js")));
 
         let options = BuildOptions {
             force: true,
@@ -1328,8 +1329,8 @@ mod tests {
                 &app_path(),
                 parse_config(&root, app_path(), r#"{"references": [{"path": "../lib"}]}"#),
             )
-            .with_compile_output(&lib_path(), build_output("/workspace/test/lib/lib.js"))
-            .with_compile_output(&app_path(), build_output("/workspace/test/app/app.js"));
+            .with_compile_output(&lib_path(), build_output(abs("/workspace/test/lib/lib.js")))
+            .with_compile_output(&app_path(), build_output(abs("/workspace/test/app/app.js")));
 
         let options = BuildOptions {
             dry_run: true,
@@ -1375,14 +1376,10 @@ mod tests {
             .clone()
             .unwrap();
 
-        let lib_sources = BTreeMap::from([(
-            PathBuf::from("/workspace/test/lib/a.ts"),
-            source_signature("lib v1"),
-        )]);
-        let app_sources = BTreeMap::from([(
-            PathBuf::from("/workspace/test/app/b.ts"),
-            source_signature("app v1"),
-        )]);
+        let lib_sources =
+            BTreeMap::from([(abs("/workspace/test/lib/a.ts"), source_signature("lib v1"))]);
+        let app_sources =
+            BTreeMap::from([(abs("/workspace/test/app/b.ts"), source_signature("app v1"))]);
 
         let lib_config = parse_config(
             &root,
@@ -1400,15 +1397,15 @@ mod tests {
             .with_config(&app_path(), app_config.clone())
             .with_source_signatures(&lib_path(), lib_sources.clone())
             .with_source_signatures(&app_path(), app_sources.clone())
-            .with_compile_output(&lib_path(), build_output("/workspace/test/lib/lib.js"))
-            .with_compile_output(&app_path(), build_output("/workspace/test/app/app.js"))
+            .with_compile_output(&lib_path(), build_output(abs("/workspace/test/lib/lib.js")))
+            .with_compile_output(&app_path(), build_output(abs("/workspace/test/app/app.js")))
             .with_declared_outputs(
                 &lib_path(),
-                BTreeSet::from([PathBuf::from("/workspace/test/lib/lib.js")]),
+                BTreeSet::from([abs("/workspace/test/lib/lib.js")]),
             )
             .with_declared_outputs(
                 &app_path(),
-                BTreeSet::from([PathBuf::from("/workspace/test/app/app.js")]),
+                BTreeSet::from([abs("/workspace/test/app/app.js")]),
             );
 
         // First build.
@@ -1439,7 +1436,7 @@ mod tests {
                     version: Arc::from(BUILD_INFO_SCHEMA),
                     options: options_signature(&lib_config),
                     sources: lib_sources,
-                    outputs: BTreeSet::from([PathBuf::from("/workspace/test/lib/lib.js")]),
+                    outputs: BTreeSet::from([abs("/workspace/test/lib/lib.js")]),
                     signature: lib_sig,
                 },
             )
@@ -1449,7 +1446,7 @@ mod tests {
                     version: Arc::from(BUILD_INFO_SCHEMA),
                     options: options_signature(&app_config),
                     sources: app_sources,
-                    outputs: BTreeSet::from([PathBuf::from("/workspace/test/app/app.js")]),
+                    outputs: BTreeSet::from([abs("/workspace/test/app/app.js")]),
                     signature: app_sig,
                 },
             );
@@ -1482,10 +1479,8 @@ mod tests {
             .clone()
             .unwrap();
 
-        let lib_sources = BTreeMap::from([(
-            PathBuf::from("/workspace/test/lib/a.ts"),
-            source_signature("lib v1"),
-        )]);
+        let lib_sources =
+            BTreeMap::from([(abs("/workspace/test/lib/a.ts"), source_signature("lib v1"))]);
         let lib_config = parse_config(
             &root,
             lib_path(),
@@ -1495,10 +1490,10 @@ mod tests {
         let mut host = InMemoryHost::new()
             .with_config(&lib_path(), lib_config.clone())
             .with_source_signatures(&lib_path(), lib_sources.clone())
-            .with_compile_output(&lib_path(), build_output("/workspace/test/lib/lib.js"))
+            .with_compile_output(&lib_path(), build_output(abs("/workspace/test/lib/lib.js")))
             .with_declared_outputs(
                 &lib_path(),
-                BTreeSet::from([PathBuf::from("/workspace/test/lib/lib.js")]),
+                BTreeSet::from([abs("/workspace/test/lib/lib.js")]),
             );
 
         execute(&graph, &mut host, &root, &BuildOptions::default()).unwrap();
@@ -1511,10 +1506,7 @@ mod tests {
         );
 
         let mut changed_sources = lib_sources;
-        changed_sources.insert(
-            PathBuf::from("/workspace/test/lib/a.ts"),
-            source_signature("lib v2"),
-        );
+        changed_sources.insert(abs("/workspace/test/lib/a.ts"), source_signature("lib v2"));
 
         host = host
             .with_source_signatures(&lib_path(), changed_sources.clone())
@@ -1524,7 +1516,7 @@ mod tests {
                     version: Arc::from(BUILD_INFO_SCHEMA),
                     options: options_signature(&lib_config),
                     sources: changed_sources.clone(),
-                    outputs: BTreeSet::from([PathBuf::from("/workspace/test/lib/lib.js")]),
+                    outputs: BTreeSet::from([abs("/workspace/test/lib/lib.js")]),
                     signature: lib_sig,
                 },
             );
@@ -1572,8 +1564,8 @@ mod tests {
         let app = parse_tsconfig(&root, app_path(), r#"{"references": [{"path": "../lib"}]}"#);
         let graph = ReferenceGraph::from_tsconfigs(&root, &[&app, &lib]).unwrap();
 
-        let lib_out = PathBuf::from("/workspace/test/lib/lib.js");
-        let app_out = PathBuf::from("/workspace/test/app/app.js");
+        let lib_out = abs("/workspace/test/lib/lib.js");
+        let app_out = abs("/workspace/test/app/app.js");
 
         let mut host = InMemoryHost::new()
             .with_declared_outputs(&lib_path(), BTreeSet::from([lib_out.clone()]))
@@ -1595,8 +1587,8 @@ mod tests {
         let app = parse_tsconfig(&root, app_path(), r#"{"references": [{"path": "../lib"}]}"#);
         let graph = ReferenceGraph::from_tsconfigs(&root, &[&app, &lib]).unwrap();
 
-        let lib_out = PathBuf::from("/workspace/test/lib/lib.js");
-        let app_out = PathBuf::from("/workspace/test/app/app.js");
+        let lib_out = abs("/workspace/test/lib/lib.js");
+        let app_out = abs("/workspace/test/app/app.js");
 
         let mut host = InMemoryHost::new()
             .with_declared_outputs(&lib_path(), BTreeSet::from([lib_out.clone()]))
@@ -1621,10 +1613,8 @@ mod tests {
         let lib = parse_tsconfig(&root, lib_path(), r#"{}"#);
         let graph = ReferenceGraph::from_tsconfigs(&root, &[&lib]).unwrap();
 
-        let mut host = InMemoryHost::new().with_declared_outputs(
-            &lib_path(),
-            BTreeSet::from([PathBuf::from("/outside/root.js")]),
-        );
+        let mut host = InMemoryHost::new()
+            .with_declared_outputs(&lib_path(), BTreeSet::from([abs("/outside/root.js")]));
 
         let options = BuildOptions {
             clean: true,
@@ -1642,7 +1632,7 @@ mod tests {
 
         let mut host = InMemoryHost::new()
             .with_config(&lib_path(), parse_config(&root, lib_path(), r#"{}"#))
-            .with_compile_output(&lib_path(), build_output("/workspace/test/lib/lib.js"));
+            .with_compile_output(&lib_path(), build_output(abs("/workspace/test/lib/lib.js")));
 
         let options = BuildOptions {
             verbose: true,
@@ -1676,10 +1666,8 @@ mod tests {
             lib_path(),
             r#"{"compilerOptions": {"composite": true}}"#,
         );
-        let lib_sources = BTreeMap::from([(
-            PathBuf::from("/workspace/test/lib/a.ts"),
-            source_signature("lib v1"),
-        )]);
+        let lib_sources =
+            BTreeMap::from([(abs("/workspace/test/lib/a.ts"), source_signature("lib v1"))]);
         let lib_sig = project_signature(
             graph.node(lib_path().as_path()).unwrap(),
             &options_signature(&lib_config),
@@ -1691,7 +1679,7 @@ mod tests {
             version: Arc::from(BUILD_INFO_SCHEMA),
             options: options_signature(&lib_config),
             sources: lib_sources.clone(),
-            outputs: BTreeSet::from([PathBuf::from("/workspace/test/lib/lib.js")]),
+            outputs: BTreeSet::from([abs("/workspace/test/lib/lib.js")]),
             signature: lib_sig,
         };
 
@@ -1701,12 +1689,9 @@ mod tests {
             .with_build_info(&lib_info, build_info)
             .with_declared_outputs(
                 &lib_path(),
-                BTreeSet::from([PathBuf::from("/workspace/test/lib/lib.js")]),
+                BTreeSet::from([abs("/workspace/test/lib/lib.js")]),
             )
-            .with_output(
-                PathBuf::from("/workspace/test/lib/lib.js"),
-                vec![b'j', b's'],
-            );
+            .with_output(abs("/workspace/test/lib/lib.js"), vec![b'j', b's']);
 
         let first = execute(&graph, &mut host, &root, &BuildOptions::default()).unwrap();
         let second = execute(&graph, &mut host, &root, &BuildOptions::default()).unwrap();
@@ -1720,10 +1705,10 @@ mod tests {
         let lib = parse_tsconfig(&root, lib_path(), r#"{}"#);
         let graph = ReferenceGraph::from_tsconfigs(&root, &[&lib]).unwrap();
 
-        let out = PathBuf::from("/workspace/test/lib/lib.js");
+        let out = abs("/workspace/test/lib/lib.js");
         let mut host = InMemoryHost::new()
             .with_config(&lib_path(), parse_config(&root, lib_path(), r#"{}"#))
-            .with_compile_output(&lib_path(), build_output(out.to_str().unwrap()));
+            .with_compile_output(&lib_path(), build_output(&out));
 
         execute(&graph, &mut host, &root, &BuildOptions::default()).unwrap();
 
@@ -1741,17 +1726,17 @@ mod tests {
             options: Arc::from(r#"{"composite":true,"strict":false}"#),
             sources: BTreeMap::from([
                 (
-                    PathBuf::from("/workspace/test/app/a.ts"),
+                    abs("/workspace/test/app/a.ts"),
                     source_signature("export const a = 1;"),
                 ),
                 (
-                    PathBuf::from("/workspace/test/app/b.ts"),
+                    abs("/workspace/test/app/b.ts"),
                     source_signature("export const b = 2;"),
                 ),
             ]),
             outputs: BTreeSet::from([
-                PathBuf::from("/workspace/test/app/a.js"),
-                PathBuf::from("/workspace/test/app/b.js"),
+                abs("/workspace/test/app/a.js"),
+                abs("/workspace/test/app/b.js"),
             ]),
             signature: Arc::from("0123456789abcdef"),
         }
@@ -1833,32 +1818,35 @@ mod tests {
     #[test]
     fn build_info_decoder_rejects_duplicate_and_unsorted_paths() {
         let digest = source_signature("source");
+        let a = abs_json("/workspace/a.ts");
         let duplicate = format!(
-            "{{\"version\":\"{BUILD_INFO_SCHEMA}\",\"options\":\"null\",\"signature\":\"0123456789abcdef\",\"sources\":[[\"/workspace/a.ts\",\"{digest}\"],[\"/workspace/a.ts\",\"{digest}\"]],\"outputs\":[]}}"
+            "{{\"version\":\"{BUILD_INFO_SCHEMA}\",\"options\":\"null\",\"signature\":\"0123456789abcdef\",\"sources\":[[\"{a}\",\"{digest}\"],[\"{a}\",\"{digest}\"]],\"outputs\":[]}}"
         );
         assert_eq!(
             BuildInfo::decode(duplicate.as_bytes()),
             Err(BuildInfoDecodeError::DuplicatePath {
-                path: PathBuf::from("/workspace/a.ts")
+                path: abs("/workspace/a.ts")
             })
         );
 
+        let b = abs_json("/workspace/b.ts");
         let unsorted = format!(
-            "{{\"version\":\"{BUILD_INFO_SCHEMA}\",\"options\":\"null\",\"signature\":\"0123456789abcdef\",\"sources\":[[\"/workspace/b.ts\",\"{digest}\"],[\"/workspace/a.ts\",\"{digest}\"]],\"outputs\":[]}}"
+            "{{\"version\":\"{BUILD_INFO_SCHEMA}\",\"options\":\"null\",\"signature\":\"0123456789abcdef\",\"sources\":[[\"{b}\",\"{digest}\"],[\"{a}\",\"{digest}\"]],\"outputs\":[]}}"
         );
         assert_eq!(
             BuildInfo::decode(unsorted.as_bytes()),
             Err(BuildInfoDecodeError::UnsortedPath {
-                previous: PathBuf::from("/workspace/b.ts"),
-                found: PathBuf::from("/workspace/a.ts")
+                previous: abs("/workspace/b.ts"),
+                found: abs("/workspace/a.ts")
             })
         );
     }
 
     #[test]
     fn build_info_decoder_rejects_invalid_digest_and_path() {
+        let a = abs_json("/workspace/a.ts");
         let invalid_digest = format!(
-            "{{\"version\":\"{BUILD_INFO_SCHEMA}\",\"options\":\"null\",\"signature\":\"0123456789abcdef\",\"sources\":[[\"/workspace/a.ts\",\"g{}\"]],\"outputs\":[]}}",
+            "{{\"version\":\"{BUILD_INFO_SCHEMA}\",\"options\":\"null\",\"signature\":\"0123456789abcdef\",\"sources\":[[\"{a}\",\"g{}\"]],\"outputs\":[]}}",
             "0".repeat(SOURCE_DIGEST_HEX_LEN - 1)
         );
         assert!(matches!(
@@ -1867,13 +1855,14 @@ mod tests {
         ));
 
         let digest = source_signature("source");
+        let outside = abs_json("/workspace/../outside.ts");
         let traversal = format!(
-            "{{\"version\":\"{BUILD_INFO_SCHEMA}\",\"options\":\"null\",\"signature\":\"0123456789abcdef\",\"sources\":[[\"/workspace/../outside.ts\",\"{digest}\"]],\"outputs\":[]}}"
+            "{{\"version\":\"{BUILD_INFO_SCHEMA}\",\"options\":\"null\",\"signature\":\"0123456789abcdef\",\"sources\":[[\"{outside}\",\"{digest}\"]],\"outputs\":[]}}"
         );
         assert_eq!(
             BuildInfo::decode(traversal.as_bytes()),
             Err(BuildInfoDecodeError::InvalidPath {
-                path: "/workspace/../outside.ts".to_string()
+                path: abs_text("/workspace/../outside.ts")
             })
         );
     }
@@ -1906,9 +1895,9 @@ mod tests {
             r#"{"compilerOptions":{"composite":true}}"#,
         );
         let options = options_signature(&config);
-        let source_path = PathBuf::from("/workspace/test/lib/a.ts");
+        let source_path = abs("/workspace/test/lib/a.ts");
         let sources = BTreeMap::from([(source_path.clone(), source_signature("original"))]);
-        let outputs = BTreeSet::from([PathBuf::from("/workspace/test/lib/lib.js")]);
+        let outputs = BTreeSet::from([abs("/workspace/test/lib/lib.js")]);
         let signature = project_signature(node, &options, &sources, &BTreeMap::new());
         let info = BuildInfo {
             version: Arc::from(BUILD_INFO_SCHEMA),
@@ -1956,10 +1945,10 @@ mod tests {
             .build_info_path
             .clone()
             .unwrap();
-        let source_path = PathBuf::from("/workspace/test/lib/a.ts");
+        let source_path = abs("/workspace/test/lib/a.ts");
         let source_signatures =
             BTreeMap::from([(source_path, source_signature("export const a = 1;"))]);
-        let output_path = PathBuf::from("/workspace/test/lib/lib.js");
+        let output_path = abs("/workspace/test/lib/lib.js");
         let mut host = InMemoryHost::new()
             .with_config(
                 &lib_path(),
@@ -1970,7 +1959,7 @@ mod tests {
                 ),
             )
             .with_source_signatures(&lib_path(), source_signatures)
-            .with_compile_output(&lib_path(), build_output(output_path.to_str().unwrap()))
+            .with_compile_output(&lib_path(), build_output(&output_path))
             .with_declared_outputs(&lib_path(), BTreeSet::from([output_path]));
 
         execute(&graph, &mut host, &root, &BuildOptions::default()).unwrap();

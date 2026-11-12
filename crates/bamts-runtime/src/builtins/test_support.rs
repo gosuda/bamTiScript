@@ -128,13 +128,17 @@ pub(super) fn custom_iterable<H: Host>(machine: &mut Machine<'_, H>, values: Vec
         length: 0,
         handler: custom_iterator_next::<H>,
     });
-    let next_fn = native_function(&mut machine.heap, next_id, "custom next", 0);
+    let next_fn = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, next_id,
+    "custom next",
+    0,);
     let create_id = machine.intrinsics.builtins.register(BuiltinDef {
         name: "custom iterator",
         length: 0,
         handler: custom_iterator_create::<H>,
     });
-    let create_fn = native_function(&mut machine.heap, create_id, "custom iterator", 0);
+    let create_fn = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, create_id,
+    "custom iterator",
+    0,);
     let iterable = ordinary_object(machine);
     let values_array = super::allocate_array(machine, values).expect("array allocation succeeds");
     machine
@@ -145,7 +149,7 @@ pub(super) fn custom_iterable<H: Host>(machine: &mut Machine<'_, H>, values: Vec
         .expect("next install succeeds");
     let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
     let iterator_key = machine
-        .to_property_key(iterator_symbol)
+        .property_key_from_value(iterator_symbol)
         .expect("Symbol.iterator is a property key");
     machine
         .set_data_property_key(iterable, iterator_key, create_fn)

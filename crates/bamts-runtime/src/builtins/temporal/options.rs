@@ -1,0 +1,495 @@
+//! Option reading. Every function here performs exactly the property reads and
+//! conversions its abstract operation does; callers sequence them in the
+//! proposal's alphabetical order, which test262 observes through Proxies.
+
+use bamts_native::{Decoded, Value};
+
+use super::{OrThrow, is_object, range_error, type_error};
+use crate::temporal::instant_duration::{
+    Overflow, RoundingMode, Unit, UnitCategory, validate_rounding_increment,
+};
+use crate::temporal::now_rounding::{
+    FractionalSecondDigits, SecondsStringPrecision, ShowCalendar, ShowOffset, ShowTimeZone,
+};
+use crate::temporal::zoned_date_time::{Disambiguation, OffsetOption};
+use crate::{EvalFailure, Host, Machine};
+
+/// A resolved options argument. `None` stands for the empty null-prototype
+/// object of `GetOptionsObject(undefined)`, which no read can observe.
+pub(super) type Options = Option<Value>;
+
+/// GetOptionsObject.
+pub(super) fn get_options_object<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<Options, EvalFailure> {
+    if value == Value::UNDEFINED {
+        Ok(None)
+    } else if is_object(machine, value)? {
+        Ok(Some(value))
+    } else {
+        Err(type_error(machine, "options must be an object"))
+    }
+}
+
+fn read<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+    name: &str,
+) -> Result<Value, EvalFailure> {
+    match options {
+        Some(object) => machine.get_named_property(object, name),
+        None => Ok(Value::UNDEFINED),
+    }
+}
+
+/// GetOption with type string, no default, and a closed set of values.
+fn string_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+    name: &str,
+    allowed: &[&str],
+) -> Result<Option<String>, EvalFailure> {
+    let value = read(machine, options, name)?;
+    if value == Value::UNDEFINED {
+        return Ok(None);
+    }
+    let text = machine.coerce_string_observable(value)?.to_utf8_lossy();
+    if allowed.contains(&text.as_str()) {
+        Ok(Some(text))
+    } else {
+        Err(range_error(
+            machine,
+            format!("{text} is not a valid value for {name}"),
+        ))
+    }
+}
+
+/// GetTemporalOverflowOption.
+pub(super) fn overflow_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<Overflow, EvalFailure> {
+    let value = string_option(machine, options, "overflow", &["constrain", "reject"])?;
+    Ok(value
+        .as_deref()
+        .and_then(Overflow::from_name)
+        .unwrap_or_default())
+}
+
+/// GetTemporalDisambiguationOption.
+pub(super) fn disambiguation_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<Disambiguation, EvalFailure> {
+    let value = string_option(
+        machine,
+        options,
+        "disambiguation",
+        &["compatible", "earlier", "later", "reject"],
+    )?;
+    Ok(match value.as_deref() {
+        Some("earlier") => Disambiguation::Earlier,
+        Some("later") => Disambiguation::Later,
+        Some("reject") => Disambiguation::Reject,
+        _ => Disambiguation::Compatible,
+    })
+}
+
+/// GetTemporalOffsetOption.
+pub(super) fn offset_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+    fallback: OffsetOption,
+) -> Result<OffsetOption, EvalFailure> {
+    let value = string_option(
+        machine,
+        options,
+        "offset",
+        &["prefer", "use", "ignore", "reject"],
+    )?;
+    Ok(match value.as_deref() {
+        Some("prefer") => OffsetOption::Prefer,
+        Some("use") => OffsetOption::Use,
+        Some("ignore") => OffsetOption::Ignore,
+        Some("reject") => OffsetOption::Reject,
+        _ => fallback,
+    })
+}
+
+/// GetTemporalShowCalendarNameOption.
+pub(super) fn show_calendar_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<ShowCalendar, EvalFailure> {
+    let value = string_option(
+        machine,
+        options,
+        "calendarName",
+        &["auto", "always", "never", "critical"],
+    )?;
+    Ok(match value.as_deref() {
+        Some("always") => ShowCalendar::Always,
+        Some("never") => ShowCalendar::Never,
+        Some("critical") => ShowCalendar::Critical,
+        _ => ShowCalendar::Auto,
+    })
+}
+
+/// GetTemporalShowTimeZoneNameOption.
+pub(super) fn show_time_zone_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<ShowTimeZone, EvalFailure> {
+    let value = string_option(
+        machine,
+        options,
+        "timeZoneName",
+        &["auto", "never", "critical"],
+    )?;
+    Ok(match value.as_deref() {
+        Some("never") => ShowTimeZone::Never,
+        Some("critical") => ShowTimeZone::Critical,
+        _ => ShowTimeZone::Auto,
+    })
+}
+
+/// GetTemporalShowOffsetOption.
+pub(super) fn show_offset_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<ShowOffset, EvalFailure> {
+    let value = string_option(machine, options, "offset", &["auto", "never"])?;
+    Ok(if value.as_deref() == Some("never") {
+        ShowOffset::Never
+    } else {
+        ShowOffset::Auto
+    })
+}
+
+/// GetDirectionOption, which has no default.
+pub(super) fn direction_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<String, EvalFailure> {
+    match string_option(machine, options, "direction", &["next", "previous"])? {
+        Some(direction) => Ok(direction),
+        None => Err(range_error(machine, "direction is required")),
+    }
+}
+
+/// GetRoundingModeOption.
+pub(super) fn rounding_mode_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+    fallback: RoundingMode,
+) -> Result<RoundingMode, EvalFailure> {
+    let value = string_option(
+        machine,
+        options,
+        "roundingMode",
+        &[
+            "ceil",
+            "floor",
+            "expand",
+            "trunc",
+            "halfCeil",
+            "halfFloor",
+            "halfExpand",
+            "halfTrunc",
+            "halfEven",
+        ],
+    )?;
+    Ok(value
+        .as_deref()
+        .and_then(RoundingMode::from_name)
+        .unwrap_or(fallback))
+}
+
+/// GetRoundingIncrementOption.
+pub(super) fn rounding_increment_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<i128, EvalFailure> {
+    let value = read(machine, options, "roundingIncrement")?;
+    if value == Value::UNDEFINED {
+        return Ok(1);
+    }
+    let increment = super::fields::to_integer_with_truncation(machine, value)?;
+    if !(1.0..=1e9).contains(&increment) {
+        return Err(range_error(machine, "roundingIncrement is out of range"));
+    }
+    Ok(increment as i128)
+}
+
+/// ValidateTemporalRoundingIncrement for an explicit dividend.
+pub(super) fn validate_increment<H: Host>(
+    machine: &mut Machine<'_, H>,
+    increment: i128,
+    dividend: i128,
+    inclusive: bool,
+) -> Result<(), EvalFailure> {
+    let maximum = if inclusive { dividend } else { dividend - 1 };
+    if increment > maximum || dividend % increment != 0 {
+        return Err(range_error(
+            machine,
+            format!("roundingIncrement {increment} does not divide {dividend}"),
+        ));
+    }
+    Ok(())
+}
+
+/// GetTemporalFractionalSecondDigitsOption.
+pub(super) fn fractional_second_digits_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+) -> Result<FractionalSecondDigits, EvalFailure> {
+    let value = read(machine, options, "fractionalSecondDigits")?;
+    if value == Value::UNDEFINED {
+        return Ok(FractionalSecondDigits::Auto);
+    }
+    let number = match value.decode() {
+        Some(Decoded::Int32(number)) => f64::from(number as i32),
+        Some(Decoded::Number(number)) => number,
+        _ => {
+            let text = machine.coerce_string_observable(value)?.to_utf8_lossy();
+            if text == "auto" {
+                return Ok(FractionalSecondDigits::Auto);
+            }
+            return Err(range_error(
+                machine,
+                format!("{text} is not a valid value for fractionalSecondDigits"),
+            ));
+        }
+    };
+    let digits = number.floor();
+    if !digits.is_finite() || digits < 0.0 {
+        return Err(range_error(
+            machine,
+            "fractionalSecondDigits must be from 0 to 9",
+        ));
+    }
+    FractionalSecondDigits::digits(digits.min(255.0) as u8).or_throw(machine)
+}
+
+/// The value of a unit option before it is validated against a unit group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum UnitOption {
+    Unset,
+    Auto,
+    Unit(Unit),
+}
+
+const UNIT_NAMES: [&str; 21] = [
+    "year",
+    "years",
+    "month",
+    "months",
+    "week",
+    "weeks",
+    "day",
+    "days",
+    "hour",
+    "hours",
+    "minute",
+    "minutes",
+    "second",
+    "seconds",
+    "millisecond",
+    "milliseconds",
+    "microsecond",
+    "microseconds",
+    "nanosecond",
+    "nanoseconds",
+    "auto",
+];
+
+/// GetTemporalUnitValuedOption.
+pub(super) fn unit_valued_option<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Options,
+    name: &str,
+) -> Result<UnitOption, EvalFailure> {
+    Ok(match string_option(machine, options, name, &UNIT_NAMES)? {
+        None => UnitOption::Unset,
+        Some(text) if text == "auto" => UnitOption::Auto,
+        Some(text) => Unit::from_name(&text).map_or(UnitOption::Unset, UnitOption::Unit),
+    })
+}
+
+/// The argument of `round` and `total`: a string is shorthand for the one
+/// required unit option.
+pub(super) struct UnitArgument {
+    pub(super) options: Options,
+    shorthand: Option<String>,
+}
+
+/// Reads such an argument. `undefined` is not an empty options object here.
+pub(super) fn unit_argument<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<UnitArgument, EvalFailure> {
+    if value == Value::UNDEFINED {
+        return Err(type_error(machine, "a unit or options object is required"));
+    }
+    if let Some(text) = machine.string_value(value) {
+        return Ok(UnitArgument {
+            options: None,
+            shorthand: Some(text.to_utf8_lossy()),
+        });
+    }
+    Ok(UnitArgument {
+        options: get_options_object(machine, value)?,
+        shorthand: None,
+    })
+}
+
+impl UnitArgument {
+    /// The string form of the argument, for an option that is not a unit.
+    pub(super) fn shorthand(&self) -> Option<&str> {
+        self.shorthand.as_deref()
+    }
+
+    /// The unit under `key`, unset when neither form supplies one.
+    pub(super) fn unit<H: Host>(
+        &self,
+        machine: &mut Machine<'_, H>,
+        key: &str,
+    ) -> Result<UnitOption, EvalFailure> {
+        let Some(text) = &self.shorthand else {
+            return unit_valued_option(machine, self.options, key);
+        };
+        if text == "auto" {
+            return Ok(UnitOption::Auto);
+        }
+        match Unit::from_name(text) {
+            Some(unit) => Ok(UnitOption::Unit(unit)),
+            None => Err(range_error(machine, format!("{text} is not a valid unit"))),
+        }
+    }
+
+    /// The same, for an operation that cannot proceed without it.
+    pub(super) fn required_unit<H: Host>(
+        &self,
+        machine: &mut Machine<'_, H>,
+        key: &str,
+    ) -> Result<UnitOption, EvalFailure> {
+        match self.unit(machine, key)? {
+            UnitOption::Unset => Err(range_error(machine, format!("{key} is required"))),
+            value => Ok(value),
+        }
+    }
+}
+
+/// The units an option may name: one category, or both.
+pub(super) type UnitGroup = Option<UnitCategory>;
+pub(super) const DATE_UNITS: UnitGroup = Some(UnitCategory::Date);
+pub(super) const TIME_UNITS: UnitGroup = Some(UnitCategory::Time);
+pub(super) const ALL_UNITS: UnitGroup = None;
+
+/// ValidateTemporalUnitValue. `extra` is a unit allowed outside the group.
+pub(super) fn validate_unit_value<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: UnitOption,
+    group: UnitGroup,
+    extra: Option<UnitOption>,
+) -> Result<(), EvalFailure> {
+    if value == UnitOption::Unset || Some(value) == extra {
+        return Ok(());
+    }
+    let valid = match value {
+        UnitOption::Unit(unit) => group.is_none_or(|category| category == unit.category()),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(range_error(machine, "unit is not allowed in this context"))
+    }
+}
+
+/// Result of GetDifferenceSettings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DifferenceSettings {
+    pub(super) largest_unit: Unit,
+    pub(super) smallest_unit: Unit,
+    pub(super) rounding_increment: i128,
+    pub(super) rounding_mode: RoundingMode,
+}
+
+/// What varies between the classes' `GetDifferenceSettings` calls.
+#[derive(Clone, Copy)]
+pub(super) struct DifferencePolicy<'a> {
+    pub(super) group: UnitGroup,
+    pub(super) disallowed: &'a [Unit],
+    pub(super) fallback_smallest: Unit,
+    pub(super) smallest_largest_default: Unit,
+}
+
+/// GetDifferenceSettings. `since` negates the rounding mode: the operation
+/// computes in the `until` direction and negates afterward.
+pub(super) fn difference_settings<H: Host>(
+    machine: &mut Machine<'_, H>,
+    since: bool,
+    options: Options,
+    policy: DifferencePolicy<'_>,
+) -> Result<DifferenceSettings, EvalFailure> {
+    let largest = unit_valued_option(machine, options, "largestUnit")?;
+    let rounding_increment = rounding_increment_option(machine, options)?;
+    let mode = rounding_mode_option(machine, options, RoundingMode::Trunc)?;
+    let smallest = unit_valued_option(machine, options, "smallestUnit")?;
+    validate_unit_value(machine, largest, policy.group, Some(UnitOption::Auto))?;
+    if let UnitOption::Unit(unit) = largest
+        && policy.disallowed.contains(&unit)
+    {
+        return Err(range_error(
+            machine,
+            format!("largestUnit {} is not allowed here", unit.name()),
+        ));
+    }
+    validate_unit_value(machine, smallest, policy.group, None)?;
+    let smallest_unit = match smallest {
+        UnitOption::Unit(unit) => unit,
+        _ => policy.fallback_smallest,
+    };
+    if policy.disallowed.contains(&smallest_unit) {
+        return Err(range_error(
+            machine,
+            format!("smallestUnit {} is not allowed here", smallest_unit.name()),
+        ));
+    }
+    let default_largest = policy.smallest_largest_default.larger(smallest_unit);
+    let largest_unit = match largest {
+        UnitOption::Unit(unit) => unit,
+        _ => default_largest,
+    };
+    if largest_unit.larger(smallest_unit) != largest_unit {
+        return Err(range_error(
+            machine,
+            "smallestUnit must not be larger than largestUnit",
+        ));
+    }
+    if smallest_unit.max_rounding_increment().is_some() {
+        validate_rounding_increment(smallest_unit, rounding_increment, false).or_throw(machine)?;
+    }
+    Ok(DifferenceSettings {
+        largest_unit,
+        smallest_unit,
+        rounding_increment,
+        rounding_mode: if since { mode.negated() } else { mode },
+    })
+}
+
+/// ToSecondsStringPrecisionRecord. `smallestUnit` takes precedence, and a
+/// `fractionalSecondDigits` it overrides has already been read and validated.
+pub(super) fn seconds_precision<H: Host>(
+    machine: &mut Machine<'_, H>,
+    smallest: UnitOption,
+    digits: FractionalSecondDigits,
+) -> Result<SecondsStringPrecision, EvalFailure> {
+    let unit = match smallest {
+        UnitOption::Unit(unit) => Some(unit),
+        _ => None,
+    };
+    SecondsStringPrecision::resolve(unit, digits).or_throw(machine)
+}

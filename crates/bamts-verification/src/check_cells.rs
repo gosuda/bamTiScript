@@ -20,10 +20,8 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(test)]
-use bamts_compiler::checker::Type;
 use bamts_compiler::checker::{
-    DeclarationOccurrence, SemanticModel, SymbolId, SymbolKind, render_type,
+    DeclarationOccurrence, SemanticModel, SymbolId, SymbolKind, Type, TypeId, render_type,
 };
 use bamts_compiler::diagnostic::DiagnosticSeverity;
 use bamts_compiler::emitter::{EmitFileNames, EmitOptions, ModuleKind, emit_checked};
@@ -36,6 +34,7 @@ use bamts_compiler::program::{
 use bamts_compiler::project::build_mode::{
     BUILD_INFO_SCHEMA, BuildInfo, canonical_json, source_signature,
 };
+use bamts_compiler::project::canonical::canonicalize;
 use bamts_compiler::project::resolution::{
     ModuleResolutionKind, ResolutionCache, ResolutionHost, TraceResolutionServices,
     resolve_module_name_with_trace,
@@ -43,14 +42,14 @@ use bamts_compiler::project::resolution::{
 use bamts_compiler::project::resolution_trace::ResolutionTraceLog;
 use bamts_compiler::project::{CompilerOptions, ProjectConfig, ProjectRoot};
 use bamts_compiler::source::SourceText;
-use bamts_compiler::source::{JsxEmit, TextRange, Utf16Pos};
+use bamts_compiler::source::{JsxEmit, SourceId, TextRange, Utf16Pos};
 use bamts_compiler::syntax::{Token, TokenKind};
 
 use crate::catalog::CaseConfiguration;
 use crate::facets::{
     DiagnosticCategory, DiagnosticCodeMap, FacetDiagnostic, FacetSeverity, FacetVerdict,
-    SourcePosition, compare_diagnostics, compare_js_emit, compare_source_map, compare_symbols,
-    compare_types,
+    SourcePosition, compare_declaration_emit, compare_diagnostics, compare_js_emit,
+    compare_source_map, compare_symbols, compare_types,
 };
 use crate::suite::{
     CellResult, FailureClass, IndexEntry, PlannedCell, SnapshotAssets, SuiteIndex, TempDir,
@@ -220,6 +219,20 @@ impl CheckedCase {
         self.units
             .iter()
             .filter_map(|(unit, index)| index.map(|index| (unit, &self.output.modules()[index])))
+    }
+
+    /// `(unit, output)` pairs in the order upstream's `.types` and `.symbols`
+    /// documents list them. A last unit that names its dependencies is the one
+    /// the harness compiles, so it comes first and the others follow.
+    pub fn units_in_document_order(&self) -> Vec<(&CaseUnit, &FrontendOutput)> {
+        let mut units: Vec<_> = self.reached_units().collect();
+        let last_is_root = units.last().is_some_and(|(unit, _)| {
+            unit.text.contains("require(") || unit.text.contains("reference path")
+        });
+        if last_is_root && let Some(last) = units.pop() {
+            units.insert(0, last);
+        }
+        units
     }
 
     /// `(unit, output)` pairs for every reached unit, sorted by ascending
@@ -406,6 +419,44 @@ fn is_option_directive_line(line: &str) -> bool {
     rest[name_len..].trim_start().starts_with(':')
 }
 
+/// The preamble text is directive-stripped already, so only comments,
+/// blanks, strings, and compiled lines remain; block comments may span
+/// lines, and a quote hides comment openers.
+fn preamble_has_compiled_content(text: &str) -> bool {
+    let stripped = strip_directive_lines(text);
+    let bytes = stripped.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            b'"' | b'\'' | b'`' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    index += usize::from(bytes[index] == b'\\') + 1;
+                }
+                index += 1;
+            }
+            byte if byte.is_ascii_whitespace() => index += 1,
+            _ => return true,
+        }
+    }
+    false
+}
+
 /// Split a case blob at `// @filename:` boundaries.
 ///
 /// A directive must be a whole-line comment. Text before the first directive
@@ -499,7 +550,7 @@ pub fn split_case_units(logical_path: &str, text: &str) -> Vec<CaseUnit> {
                 // phantom `//// [<case>.ts]` section and emits a phantom
                 // `//// [<case>.js]`/`.d.ts` output that shifts every
                 // baseline section the emit facets compare.
-                if end > 0 && !strip_directive_lines(&text[..end]).trim().is_empty() {
+                if end > 0 && preamble_has_compiled_content(&text[..end]) {
                     push_unit(case_name.to_owned(), &text[..end], &mut units);
                 }
             }
@@ -987,6 +1038,7 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             | "resolvejsonmodule"
             | "noemit"
             | "noemithelpers"
+            | "removecomments"
             | "declaration"
             | "alwaysstrict"
             | "exactoptionalpropertytypes"
@@ -1019,10 +1071,12 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             "resolvejsonmodule" => "resolveJsonModule",
             "moduleresolution" => "moduleResolution",
             "noemithelpers" => "noEmitHelpers",
+            "removecomments" => "removeComments",
             "noemit" => "noEmit",
             "alwaysstrict" => "alwaysStrict",
             "usedefineforclassfields" => "useDefineForClassFields",
             "importhelpers" => "importHelpers",
+            "verbatimmodulesyntax" => "verbatimModuleSyntax",
             "exactoptionalpropertytypes" => "exactOptionalPropertyTypes",
             "nouncheckedindexedaccess" => "noUncheckedIndexedAccess",
             "strictpropertyinitialization" => "strictPropertyInitialization",
@@ -1124,7 +1178,8 @@ pub fn compile_case_frontend(
             .map_err(|error| CaseCompileError::Load(format!("config: {error}")))?;
         let options = config.options().clone();
         let loader = ProgramLoader::new(&root, config.options())
-            .map_err(|error| CaseCompileError::Load(format!("loader: {error}")))?;
+            .map_err(|error| CaseCompileError::Load(format!("loader: {error}")))?
+            .tolerating_unresolved_imports();
         let program = loader
             .load(Path::new(ENTRY))
             .map_err(|error| CaseCompileError::Load(error.to_string()))?;
@@ -1163,7 +1218,7 @@ fn pair_units_with_modules(
     units
         .iter()
         .map(|unit| {
-            let canonical = fs::canonicalize(root.join(&unit.virtual_path)).ok();
+            let canonical = canonicalize(root.join(&unit.virtual_path)).ok();
             let index = canonical.and_then(|canonical| {
                 program
                     .modules()
@@ -1246,7 +1301,6 @@ pub fn collect_facet_diagnostics(case: &CheckedCase) -> Vec<FacetDiagnostic> {
 /// The unit basename printed by the baseline is carried through so a
 /// cross-unit position collision cannot pass the check.
 pub fn expected_facet_diagnostics(
-    _snapshot: &(impl SnapshotAssets + ?Sized),
     baselines: &DiagnosticsBaselines,
 ) -> Result<Vec<FacetDiagnostic>> {
     let mut expected = Vec::new();
@@ -1285,20 +1339,14 @@ pub fn expected_facet_diagnostics(
 }
 
 /// Run the diagnostics comparison for one compiled case.
-///
-/// The compile uses the default lint profile, but TS error baselines carry no
-/// lint output: actual diagnostics are filtered to the code map's BAMTS
-/// L/P/C families (every mapped compiler diagnostic) before comparing, so
-/// `BAMTS-W…` lint warnings never fail a row.
 pub fn check_diagnostics(
     ctx: &CheckContext,
-    snapshot: &(impl SnapshotAssets + ?Sized),
     case: &CheckedCase,
     baselines: &DiagnosticsBaselines,
 ) -> Result<DiagnosticsOutcome> {
     let mut actual = collect_facet_diagnostics(case);
-    actual.retain(|diagnostic| ctx.code_map.get(&diagnostic.code).is_some());
-    let expected = expected_facet_diagnostics(snapshot, baselines)?;
+    actual.retain(|diagnostic| !diagnostic.code.starts_with("BAMTS-W"));
+    let expected = expected_facet_diagnostics(baselines)?;
     let verdict = compare_diagnostics(&expected, &actual, &ctx.code_map);
     Ok(DiagnosticsOutcome {
         actual,
@@ -1395,7 +1443,7 @@ pub(crate) fn observe_diagnostics(
     match compile_case_with_pragmas(&units, &entry, pragmas) {
         Err(error) => compile_failure_observation(error),
         Ok(case) => {
-            let outcome = match check_diagnostics(ctx, snapshot, &case, &baselines) {
+            let outcome = match check_diagnostics(ctx, &case, &baselines) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     return CompilerCheckObservation {
@@ -1513,6 +1561,7 @@ struct TypeAnnotation {
     line: usize,
     display: String,
     rendered: String,
+    caret: bool,
 }
 
 /// Emit the `.types` baseline for a compiled case in the upstream framing:
@@ -1524,7 +1573,13 @@ struct TypeAnnotation {
 #[must_use]
 pub fn emit_types_baseline(case: &CheckedCase, logical_path: &str) -> String {
     let mut out = format!("//// [{logical_path}] ////\n\n");
-    for (unit, output) in case.reached_units() {
+    let has_diagnostics = case.reached_units().any(|(_, output)| {
+        output
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| !diagnostic.code().as_str().starts_with("BAMTS-W"))
+    });
+    for (unit, output) in case.units_in_document_order() {
         if is_config_unit_name(&unit.display_name) {
             continue;
         }
@@ -1544,6 +1599,7 @@ pub fn emit_types_baseline(case: &CheckedCase, logical_path: &str) -> String {
             output.semantic_model(),
             output.source_file().source_text(),
             &unit.display_name,
+            has_diagnostics,
             &mut out,
         );
     }
@@ -1584,7 +1640,13 @@ fn dedup_type_records(mut records: Vec<TypeAnnotation>) -> Vec<TypeAnnotation> {
     records
 }
 
-fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, out: &mut String) {
+fn emit_unit_types(
+    model: &SemanticModel,
+    source: &SourceText,
+    section: &str,
+    has_diagnostics: bool,
+    out: &mut String,
+) {
     let mut records: Vec<TypeAnnotation> = Vec::new();
     // Symbols covered by interface-member declaration occurrences emit one
     // record per written occurrence below; the covered symbol's own row is
@@ -1634,6 +1696,7 @@ fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, ou
             range,
             symbol.name().to_owned(),
             render_type(model, type_id),
+            writes_caret(model, type_id, has_diagnostics),
         ) {
             records.push(annotation);
         }
@@ -1665,6 +1728,7 @@ fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, ou
             range,
             slice_source(source, range),
             render_type(model, model.symbol_type(occurrence.symbol)),
+            writes_caret(model, model.symbol_type(occurrence.symbol), has_diagnostics),
         ) {
             records.push(annotation);
         }
@@ -1672,9 +1736,13 @@ fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, ou
     // Expression records come from the checker's expression-type index.
     for (range, type_id) in model.typed_expressions() {
         let display = slice_source(source, *range);
-        if let Some(annotation) =
-            annotation_for(source, *range, display, render_type(model, *type_id))
-        {
+        if let Some(annotation) = annotation_for(
+            source,
+            *range,
+            display,
+            render_type(model, *type_id),
+            writes_caret(model, *type_id, has_diagnostics),
+        ) {
             records.push(annotation);
         }
     }
@@ -1695,11 +1763,13 @@ fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, ou
         for record in line_records {
             let display = collapse_whitespace(&record.display);
             out.push_str(&format!(">{display} : {}\n", record.rendered));
-            out.push_str(&format!(
-                ">{} : {}\n",
-                " ".repeat(display.chars().count()),
-                "^".repeat(record.rendered.chars().count())
-            ));
+            if record.caret {
+                out.push_str(&format!(
+                    ">{} : {}\n",
+                    " ".repeat(display.chars().count()),
+                    "^".repeat(record.rendered.chars().count())
+                ));
+            }
         }
     }
 }
@@ -1711,6 +1781,7 @@ fn annotation_for(
     range: TextRange,
     display: String,
     rendered: String,
+    caret: bool,
 ) -> Option<TypeAnnotation> {
     let (line, _) = source.line_column(range.start()).ok()?;
     Some(TypeAnnotation {
@@ -1719,7 +1790,12 @@ fn annotation_for(
         line,
         display,
         rendered,
+        caret,
     })
+}
+
+fn writes_caret(model: &SemanticModel, type_id: TypeId, has_diagnostics: bool) -> bool {
+    has_diagnostics || !matches!(model.types().get(type_id), Type::Error)
 }
 
 /// Slice the raw source text covered by a UTF-16 range.
@@ -1812,9 +1888,10 @@ fn resolve_stem_baseline(
 pub fn check_types(
     snapshot: &(impl SnapshotAssets + ?Sized),
     case: &CheckedCase,
+    logical_path: &str,
     baseline_path: &str,
 ) -> Result<TypesOutcome> {
-    let emitted = emit_types_baseline(case, &case.entry);
+    let emitted = emit_types_baseline(case, logical_path);
     let bytes = read_verified_snapshot_asset(snapshot, baseline_path)?;
     let expected = String::from_utf8_lossy(&bytes).into_owned();
     let verdict = compare_types(&expected, &emitted);
@@ -1874,16 +1951,17 @@ pub(crate) fn observe_types(
                     artifact: None,
                 };
             };
-            let outcome = match check_types(snapshot, &case, &baseline_path) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    return CompilerCheckObservation {
-                        class: FailureClass::HarnessError,
-                        detail: error.to_string(),
-                        artifact: None,
-                    };
-                }
-            };
+            let outcome =
+                match check_types(snapshot, &case, &index_entry.logical_path, &baseline_path) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return CompilerCheckObservation {
+                            class: FailureClass::HarnessError,
+                            detail: error.to_string(),
+                            artifact: None,
+                        };
+                    }
+                };
             match outcome.verdict {
                 FacetVerdict::Pass => CompilerCheckObservation {
                     class: FailureClass::Pass,
@@ -2008,12 +2086,41 @@ pub fn emit_javascript_baseline(
     // the document carries no `.js` sections at all; its `result.DTS` is empty
     // unless declaration emit is on. The section set follows those two maps.
     let mut outputs = 0usize;
+    let imported = runtime_imported_source_ids(case);
+    let emitted = case.reached_units_in_module_order();
     if !options.emit_declaration_only() {
-        for (unit, output) in &units {
+        for (unit, output) in &emitted {
             let name = unit_basename(&unit.virtual_path);
-            // A `.d.ts` input is never a JavaScript output: upstream's output
-            // mapping skips declaration files outright.
             if is_declaration_input_name(&name) {
+                continue;
+            }
+            if is_json_input_name(&name) {
+                if bundle.is_some() {
+                    continue;
+                }
+                if options.out_dir().is_none() {
+                    continue;
+                }
+                if is_config_unit_name(&name) || name.eq_ignore_ascii_case("package.json") {
+                    continue;
+                }
+                if unit
+                    .virtual_path
+                    .split('/')
+                    .any(|part| part == "node_modules")
+                {
+                    continue;
+                }
+                if !imported.contains(&output.source_file().source_id()) {
+                    continue;
+                }
+                let body = output
+                    .emit()
+                    .and_then(|emit| emit.javascript.as_ref())
+                    .map(|javascript| javascript.code.as_str())
+                    .unwrap_or("");
+                push_output_section(&mut out, &name, body);
+                outputs += 1;
                 continue;
             }
             let Some(emit) = output.emit() else {
@@ -2037,7 +2144,7 @@ pub fn emit_javascript_baseline(
     }
     if options.declaration() || options.emit_declaration_only() {
         let mut declarations = Vec::new();
-        for (unit, output) in &units {
+        for (unit, output) in &emitted {
             let name = unit_basename(&unit.virtual_path);
             if is_declaration_input_name(&name) {
                 continue;
@@ -2081,6 +2188,28 @@ fn bundle_output_name(options: &CompilerOptions) -> std::result::Result<Option<S
         return Err("outFile path is not valid UTF-8".to_owned());
     };
     Ok(Some(basename.to_owned()))
+}
+fn runtime_imported_source_ids(case: &CheckedCase) -> HashSet<SourceId> {
+    let program = case.program();
+    let entry = program.entrypoint_id();
+    let mut imported = HashSet::new();
+    for module in program.modules() {
+        if module.source_id() == entry {
+            continue;
+        }
+        for edge in module.dependencies() {
+            if edge.is_unresolved() {
+                continue;
+            }
+            if edge.kind() == ModuleEdgeKind::TypeOnly {
+                continue;
+            }
+            if let Some(target) = edge.target().local_source_id() {
+                imported.insert(target);
+            }
+        }
+    }
+    imported
 }
 
 /// The `//// [<name>]` section header for one unit's output of a given kind.
@@ -2395,7 +2524,7 @@ pub(crate) fn observe_declaration(
                 }
             };
             let expected = extract_dts_sections(&String::from_utf8_lossy(&bytes), units.len());
-            match compare_js_emit(&expected, &emitted) {
+            match compare_declaration_emit(&expected, &emitted) {
                 FacetVerdict::Pass => CompilerCheckObservation {
                     class: FailureClass::Pass,
                     detail: "declaration parity".to_owned(),
@@ -2497,6 +2626,8 @@ pub fn emit_source_map_baseline(
             prog.import_helpers(),
         );
         options.no_emit_helpers = check.no_emit_helpers();
+        options.remove_comments = check.remove_comments();
+        options.verbatim_module_syntax = prog.verbatim_module_syntax();
         match prog.jsx_routing_decision(ProgramOutputKind::JavaScript) {
             JsxRoutingDecision::Emit | JsxRoutingDecision::TransformAndEmit => {
                 options.jsx = prog.jsx();
@@ -2900,12 +3031,28 @@ pub(crate) fn collect_resolution_trace(
     program: &ResolvedProgram,
     options: &CompilerOptions,
 ) -> ResolutionTraceLog {
+    collect_trace_with_skip(program, options, None)
+}
+
+pub(crate) fn collect_case_resolution_trace(case: &CheckedCase) -> ResolutionTraceLog {
+    let program = case.program();
+    collect_trace_with_skip(program, case.options(), Some(program.entrypoint_id()))
+}
+
+fn collect_trace_with_skip(
+    program: &ResolvedProgram,
+    options: &CompilerOptions,
+    skip: Option<SourceId>,
+) -> ResolutionTraceLog {
     let root = program.root();
     let kind = resolution_kind(options);
     let host = FilesystemResolutionHost;
     let mut cache = ResolutionCache::new();
     let mut log = ResolutionTraceLog::default();
     for module in program.modules() {
+        if Some(module.source_id()) == skip {
+            continue;
+        }
         let importer = module.path();
         for edge in module.dependencies() {
             if edge.kind() == ModuleEdgeKind::DynamicRuntime {
@@ -2970,7 +3117,7 @@ pub(crate) fn observe_trace(
             artifact: None,
         };
     };
-    let log = collect_resolution_trace(case.program(), case.options());
+    let log = collect_case_resolution_trace(&case);
     let unsupported: Vec<&str> = log
         .unsupported()
         .iter()
@@ -3064,7 +3211,7 @@ pub(crate) fn observe_trace(
 #[must_use]
 pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
     let mut out = format!("//// [{logical_path}] ////\n\n");
-    let units: Vec<_> = case.reached_units().collect();
+    let units = case.units_in_document_order();
     let mut declaration_anchors: HashMap<(String, SymbolKind), Vec<SymbolDeclAnchor>> =
         HashMap::new();
     for (unit, output) in &units {
@@ -3149,6 +3296,7 @@ pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
         emit_unit_symbols(
             output.semantic_model(),
             output.source_file(),
+            &unit.display_name,
             &section,
             &declaration_anchors,
             &mut out,
@@ -3176,6 +3324,7 @@ struct SymbolRecord {
 fn emit_unit_symbols(
     model: &SemanticModel,
     source_file: &bamts_compiler::syntax::SourceFile,
+    heading: &str,
     section: &str,
     declaration_anchors: &HashMap<(String, SymbolKind), Vec<SymbolDeclAnchor>>,
     out: &mut String,
@@ -3337,7 +3486,7 @@ fn emit_unit_symbols(
         by_line.entry(record.line).or_default().push(record);
     }
 
-    out.push_str(&format!("=== {section} ===\n"));
+    out.push_str(&format!("=== {heading} ===\n"));
     for (line_index, raw_line) in source.as_str().split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         out.push_str(line);
@@ -3636,9 +3785,10 @@ pub fn resolve_symbols_baseline(groups: &BaselineGroups, logical_path: &str) -> 
 pub fn check_symbols(
     snapshot: &(impl SnapshotAssets + ?Sized),
     case: &CheckedCase,
+    logical_path: &str,
     baseline_path: &str,
 ) -> Result<SymbolsOutcome> {
-    let emitted = emit_symbols_baseline(case, &case.entry);
+    let emitted = emit_symbols_baseline(case, logical_path);
     let bytes = read_verified_snapshot_asset(snapshot, baseline_path)?;
     let expected = String::from_utf8_lossy(&bytes).into_owned();
     let verdict = compare_symbols(&expected, &emitted);
@@ -3704,16 +3854,17 @@ pub(crate) fn observe_symbols(
                     artifact: None,
                 };
             };
-            let outcome = match check_symbols(snapshot, &case, &baseline_path) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    return CompilerCheckObservation {
-                        class: FailureClass::HarnessError,
-                        detail: error.to_string(),
-                        artifact: None,
-                    };
-                }
-            };
+            let outcome =
+                match check_symbols(snapshot, &case, &index_entry.logical_path, &baseline_path) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return CompilerCheckObservation {
+                            class: FailureClass::HarnessError,
+                            detail: error.to_string(),
+                            artifact: None,
+                        };
+                    }
+                };
             match outcome.verdict {
                 FacetVerdict::Pass => CompilerCheckObservation {
                     class: FailureClass::Pass,
@@ -3785,6 +3936,46 @@ mod tests {
         }];
         let verdict = compare_diagnostics(&expected, &actual, &code_map);
         assert_eq!(verdict, FacetVerdict::Pass);
+    }
+
+    /// Every emitted diagnostic counts: a raw `TS....` spelling compares as
+    /// itself (`asyncAwaitIsolatedModules_es2017.errors.txt` expects
+    /// `error TS2307: Cannot find module 'missing'.`, and the pipeline emits
+    /// the raw spelling), and a BAMTS code without a map row still counts
+    /// instead of vanishing before the comparison.
+    #[test]
+    fn diagnostics_count_raw_ts_and_unmapped_bamts_codes() {
+        let code_map = repo_code_map();
+        let ctx = CheckContext {
+            code_map: code_map.clone(),
+            baseline_groups: BaselineGroups::default(),
+        };
+
+        let import_case = "import { helper } from \"./missing\";\nexport const user = helper;\n";
+        let units = split_case_units("tests/cases/compiler/rawTsCodePin.ts", import_case);
+        let entry = entry_virtual_path("tests/cases/compiler/rawTsCodePin.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let baselines = DiagnosticsBaselines {
+            owned: vec!["rawTsCodePin.errors.txt".to_owned()],
+            contents: BTreeMap::from([("rawTsCodePin.errors.txt".to_owned(), String::new())]),
+        };
+        let outcome = check_diagnostics(&ctx, &case, &baselines).expect("diagnostics outcome");
+        assert!(
+            outcome.actual.iter().any(|d| d.code == "TS2307"),
+            "a raw TS spelling must count as itself: {:?}",
+            outcome.actual
+        );
+
+        let decorator_case = "const frozen = 1;\nfrozen = 2;\n";
+        let units = split_case_units("tests/cases/compiler/unmappedCodePin.ts", decorator_case);
+        let entry = entry_virtual_path("tests/cases/compiler/unmappedCodePin.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let outcome = check_diagnostics(&ctx, &case, &baselines).expect("diagnostics outcome");
+        assert!(
+            outcome.actual.iter().any(|d| d.code == "BAMTS-C060"),
+            "a checker code must count even before correspondence: {:?}",
+            outcome.actual
+        );
     }
 
     /// Multi-unit cases with an empty leading unit must still load every file,
@@ -4453,6 +4644,118 @@ error TS5107: Option 'moduleResolution=classic' is deprecated and will stop func
         assert_eq!(units[0].text, "const b: string = a;\n");
     }
 
+    /// Upstream drops a comment-only or directive-only preamble before the
+    /// first `@filename:` marker: global settings are not a compiled unit, so
+    /// the first baseline section is the first named file
+    /// (`exportDefaultProperty2.types` opens with `=== a.ts ===`, no
+    /// `=== exportDefaultProperty2.ts ===`). A preamble holding code does
+    /// keep the implicit case-named unit.
+    #[test]
+    fn any_typed_records_keep_caret_line() {
+        let case_text = "var ANY: any;\nvar n: number;\n++ANY;\n";
+        let units = split_case_units("tests/cases/compiler/anyCaretPin.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/anyCaretPin.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, "tests/cases/compiler/anyCaretPin.ts");
+        assert!(
+            emitted.contains(">ANY : any\n>    : ^^^\n"),
+            "clean any keeps its caret, as jsxPreserveWithJsInput.types shows for >b : any: {emitted}"
+        );
+        assert!(
+            emitted.contains(">n : number\n>  : ^^^^^^\n"),
+            "full-width caret under a number record: {emitted}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_keep_full_width_caret_lines() {
+        let error_text = "var p: any = missingRef;\n";
+        let units = split_case_units("tests/cases/compiler/anyCaretErrorsPin.ts", error_text);
+        let entry = entry_virtual_path("tests/cases/compiler/anyCaretErrorsPin.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, "tests/cases/compiler/anyCaretErrorsPin.ts");
+        assert!(
+            emitted.contains(">p : any\n>  : ^^^\n"),
+            "diagnostics keep the underline under an any record: {emitted}"
+        );
+        let clean_text = "var p: any = 1;\n";
+        let units = split_case_units("tests/cases/compiler/anyCaretCleanPin.ts", clean_text);
+        let entry = entry_virtual_path("tests/cases/compiler/anyCaretCleanPin.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, "tests/cases/compiler/anyCaretCleanPin.ts");
+        assert!(
+            emitted.contains(">p : any\n>  : ^^^\n"),
+            "clean any keeps its caret, as tsxEmitSpreadAttribute(target=es2015).types shows for >div : any (its >a : any parameter records are bare): {emitted}"
+        );
+    }
+
+    #[test]
+    fn error_records_stay_bare_without_diagnostics() {
+        with_model(
+            "var x: any;\n",
+            "tests/cases/compiler/errorBarePin.ts",
+            |model| {
+                let any = model.types().any();
+                let error = model.types().error_type();
+                assert!(writes_caret(model, any, false));
+                assert!(writes_caret(model, any, true));
+                assert!(!writes_caret(model, error, false));
+                assert!(writes_caret(model, error, true));
+            },
+        );
+    }
+    #[test]
+    fn comment_only_preamble_is_not_a_unit() {
+        let case = "\
+// @module: commonjs
+// @target: es2015
+// This test is just like exportEqualsProperty2, but with `export default`.
+
+// @filename: a.ts
+class C {
+    static B: number;
+}
+
+// @filename: b.ts
+import B from \"./a\";
+";
+        let units = split_case_units("tests/cases/compiler/exportDefaultProperty2.ts", case);
+        assert_eq!(units.len(), 2, "{units:#?}");
+        assert_eq!(units[0].display_name, "a.ts");
+        assert_eq!(units[1].display_name, "b.ts");
+
+        let compiled = "let x = 1;\n// @filename: b.ts\nlet y = 2;\n";
+        let units = split_case_units("tests/cases/compiler/preambleCode.ts", compiled);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].display_name, "preambleCode.ts");
+        assert_eq!(units[1].display_name, "b.ts");
+    }
+
+    /// Code on a preamble line keeps the implicit unit even when a block
+    /// comment follows it on the same line or opens after it and closes
+    /// later, and a `/*` inside a string literal or after `//` opens no
+    /// comment.
+    #[test]
+    fn preamble_block_comment_edges() {
+        let cases: [(&str, usize); 4] = [
+            ("let x = 1; /* note */\n// @filename: b.ts\nlet y = 2;\n", 2),
+            (
+                "let x = 1; /* open\nstill open */\n// @filename: b.ts\nlet y = 2;\n",
+                2,
+            ),
+            ("const s = \"a /* b\";\n// @filename: b.ts\nlet y = 2;\n", 2),
+            ("// note /* not open\n// @filename: b.ts\nlet y = 2;\n", 1),
+        ];
+        for (index, (case, expected)) in cases.into_iter().enumerate() {
+            let units = split_case_units(&format!("tests/cases/compiler/edge{index}.ts"), case);
+            assert_eq!(
+                units.len(),
+                expected,
+                "case {index}: {case:?} -> {units:#?}"
+            );
+        }
+    }
+
     #[test]
     fn split_case_units_single_unit_case() {
         let units = split_case_units(
@@ -4863,7 +5166,9 @@ export const a2 = 3;
 
     /// H4 pin: an annotated scalar case the checker fully types reproduces its
     /// upstream `.types` baseline (marker, section, source echo, `>expr : type`
-    /// records, and underline widths) under `compare_types`.
+    /// records, and underline widths) under `compare_types`. The declared-any
+    /// record keeps its caret, as the clean `ambientShorthand_reExport.types`
+    /// prints `>x : any` with a `>  : ^^^` underline.
     #[test]
     fn emit_types_baseline_matches_fully_typed_scalar_case() {
         let logical = "tests/cases/compiler/scalarPin.ts";
@@ -4878,7 +5183,6 @@ export const a2 = 3;
             var x: any;\n\
             >x : any\n\
             >  : ^^^\n\
-            \n\
             var s: string = \"hi\";\n\
             >s : string\n\
             >  : ^^^^^^\n\
@@ -4887,7 +5191,7 @@ export const a2 = 3;
         assert_eq!(
             compare_types(baseline, &emitted),
             FacetVerdict::Pass,
-            "emitted:\n{emitted}"
+            "clean any keeps its caret, as ambientShorthand_reExport.types shows for >x : any: emitted:\n{emitted}"
         );
     }
 
@@ -4939,6 +5243,7 @@ export const a2 = 3;
             line: 0,
             display: display.to_owned(),
             rendered: rendered.to_owned(),
+            caret: true,
         };
         let records = vec![
             record(4, 5, "x", "any"),
@@ -4971,6 +5276,7 @@ export const a2 = 3;
             line: 0,
             display: display.to_owned(),
             rendered: rendered.to_owned(),
+            caret: true,
         };
         let deduped = dedup_type_records(vec![
             record("Foo", "Foo<T>"),
@@ -4987,13 +5293,12 @@ export const a2 = 3;
         );
     }
 
-    /// Authority pin from `witness.types` (case
-    /// `tests/cases/conformance/types/witness/witness.ts`, line 7): upstream
-    /// prints TWO identical `>varInit : any` pairs for `var varInit =
-    /// varInit;` — declaration name and resolving reference at different
-    /// ranges are both legitimate records. Only exact (start, end, display,
-    /// rendered) tuples collapse; text-identical records at distinct
-    /// positions stay.
+    /// A clean self-reference carries two `>varInit : any` records for
+    /// `var varInit = varInit;`: declaration name and resolving reference at
+    /// different ranges are both legitimate records. Only exact (start, end,
+    /// display, rendered) tuples collapse; text-identical records at distinct
+    /// positions stay. Each record keeps its caret, as `witness.types` prints
+    /// both `>varInit : any` records with a `>        : ^^^` underline.
     #[test]
     fn emit_types_baseline_keeps_distinct_position_records() {
         let logical = "tests/cases/conformance/types/witness/witnessPin.ts";
@@ -5012,7 +5317,7 @@ export const a2 = 3;
         assert_eq!(
             compare_types(baseline, &emitted),
             FacetVerdict::Pass,
-            "distinct-position identical records must both stay; emitted:\n{emitted}"
+            "distinct-position identical records must both stay, each with its caret as witness.types shows for >varInit : any; emitted:\n{emitted}"
         );
     }
 
@@ -5915,6 +6220,262 @@ export const t = 1;
                 "//// [test.d.ts]"
             ],
             "{emitted}"
+        );
+    }
+
+    #[test]
+    fn declaration_facet_labels_its_own_failures() {
+        let baseline_doc = "//// [tests/cases/compiler/declPin.ts] ////\n\
+            \n\
+            //// [declPin.ts]\nvar x: number = 1;\n\
+            \n\
+            //// [declPin.d.ts]\ndeclare var x: number;\n";
+        let emitted = "//// [declPin.d.ts]\ndeclare var x: number;\nlet y: number;\n";
+        let verdict = compare_declaration_emit(&extract_dts_sections(baseline_doc, 1), emitted);
+        match verdict {
+            FacetVerdict::Fail { reason } => {
+                assert!(
+                    reason.starts_with("declaration structural mismatch"),
+                    "declaration rows must carry the declaration facet label: {reason}"
+                );
+            }
+            other => panic!("expected a Fail verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn javascript_baseline_skips_json_input_outputs() {
+        let logical = "tests/cases/compiler/jsonInputPin.ts";
+        let case_text = "\
+// @resolveJsonModule: true
+// @filename: data.json
+{\"k\": 1}
+// @filename: test.ts
+export const t = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let heads: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with("//// [") && !line.ends_with(" ////"))
+            .collect();
+        assert_eq!(
+            heads,
+            vec!["//// [data.json]", "//// [test.ts]", "//// [test.js]"],
+            "{emitted}"
+        );
+    }
+
+    #[test]
+    fn javascript_baseline_emits_json_with_out_dir() {
+        let logical =
+            "tests/cases/compiler/isolatedModules_resolveJsonModule_strict_outDir_commonJsPin.ts";
+        let case_text = "\
+// @resolveJsonModule: true
+// @outDir: dist
+// @module: commonjs
+// @filename: a.ts
+import * as j from \"./j.json\";
+// @filename: j.json
+{}";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let heads: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with("//// [") && !line.ends_with(" ////"))
+            .collect();
+        assert_eq!(
+            heads,
+            vec![
+                "//// [a.ts]",
+                "//// [j.json]",
+                "//// [j.json]",
+                "//// [a.js]"
+            ],
+            "{emitted}"
+        );
+    }
+
+    #[test]
+    fn javascript_baseline_skips_package_json_with_out_dir() {
+        let logical = "tests/cases/compiler/packageJsonPin.ts";
+        let case_text = "\
+// @outDir: dist
+// @filename: package.json
+{\"name\": \"typescript\"}
+// @filename: test.ts
+export const t = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let heads: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with("//// [") && !line.ends_with(" ////"))
+            .collect();
+        assert_eq!(
+            heads,
+            vec!["//// [package.json]", "//// [test.ts]", "//// [test.js]"],
+            "{emitted}"
+        );
+    }
+    #[test]
+    fn javascript_baseline_skips_node_modules_json_with_out_dir() {
+        let logical = "tests/cases/compiler/nodeModulesJsonPin.ts";
+        let case_text = "\
+// @resolveJsonModule: true
+// @outDir: dist
+// @module: commonjs
+// @filename: a.ts
+import * as b from \"./node_modules/b.json\";
+// @filename: node_modules/b.json
+{\"a\": true}
+:";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let heads: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with("//// [") && !line.ends_with(" ////"))
+            .collect();
+        assert_eq!(
+            heads,
+            vec!["//// [a.ts]", "//// [b.json]", "//// [a.js]"],
+            "requireOfJsonFileNonRelative.js omits node_modules json outputs: {emitted}"
+        );
+    }
+
+    #[test]
+    fn javascript_baseline_skips_unimported_json_with_out_dir() {
+        let logical = "tests/cases/compiler/unimportedJsonPin.ts";
+        let case_text = "\
+// @resolveJsonModule: true
+// @outDir: dist
+// @module: commonjs
+// @filename: a.ts
+import * as c from \"./c.json\";
+// @filename: b.json
+{\"a\": true}
+// @filename: c.json
+{\"a\": true}
+:";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let heads: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with("//// [") && !line.ends_with(" ////"))
+            .collect();
+        assert_eq!(
+            heads,
+            vec![
+                "//// [a.ts]",
+                "//// [b.json]",
+                "//// [c.json]",
+                "//// [c.json]",
+                "//// [a.js]"
+            ],
+            "requireOfJsonFileWithoutExtensionResolvesToTs.js emits only the imported c.json: {emitted}"
+        );
+    }
+    #[test]
+    fn javascript_baseline_json_section_carries_compiler_emit() {
+        let logical = "tests/cases/compiler/emptyJsonPin.ts";
+        let case_text = "\
+// @resolveJsonModule: true
+// @outDir: dist
+// @module: commonjs
+// @filename: file1.ts
+import * as b1 from \"./b.json\";
+let x = b1;
+// @filename: b.json
+{
+}";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let compiler_body = case
+            .reached_units_in_module_order()
+            .into_iter()
+            .find(|(unit, _)| unit.virtual_path.ends_with("b.json"))
+            .and_then(|(_, output)| output.emit().and_then(|emit| emit.javascript.as_ref()))
+            .map(|javascript| javascript.code.clone())
+            .expect("json module carries compiler emit");
+        assert!(
+            !compiler_body.is_empty(),
+            "the harness must have compiler output to carry: {emitted}"
+        );
+        assert!(
+            emitted.contains(&format!("//// [b.json]\n{compiler_body}")),
+            "the json output section carries the compiler's emit for that unit, not the raw unit text (requireOfJsonFileWithEmptyObject.js re-serializes that input to {{}}; the compiler has no json output mapping, crates/bamts-compiler/src/project/output.rs:417, and emits the file through the TS transform instead, crates/bamts-compiler/src/emitter/transforms.rs:231): {emitted}"
+        );
+    }
+    #[test]
+    fn javascript_baseline_empty_json_section_carries_compiler_emit() {
+        let logical = "tests/cases/compiler/emptyJsonContentPin.ts";
+        let case_text = "\
+// @resolveJsonModule: true
+// @outDir: dist
+// @module: commonjs
+// @filename: file1.ts
+import * as b1 from \"./b.json\";
+let x = b1;
+// @filename: b.json
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let compiler_body = case
+            .reached_units_in_module_order()
+            .into_iter()
+            .find(|(unit, _)| unit.virtual_path.ends_with("b.json"))
+            .and_then(|(_, output)| output.emit().and_then(|emit| emit.javascript.as_ref()))
+            .map(|javascript| javascript.code.clone())
+            .expect("json module carries compiler emit");
+        assert!(
+            !compiler_body.is_empty(),
+            "the harness must have compiler output to carry: {emitted}"
+        );
+        assert!(
+            emitted.contains(&format!("//// [b.json]\n{compiler_body}")),
+            "the json output section carries the compiler's emit for that unit, not the raw unit text (requireOfJsonFileWithNoContent.js prints an empty out/b.json body; the compiler has no json output mapping, crates/bamts-compiler/src/project/output.rs:417, and emits its own prelude instead): {emitted}"
+        );
+    }
+    #[test]
+    fn trace_lib_replacement_case_requests_no_resolutions() {
+        let logical = "tests/cases/compiler/libReplacement.ts";
+        let case_text = "// @target: es2015\n// @lib: esnext\n// @traceResolution: true\n// @noTypesAndSymbols: true\n// @noEmit: true\n// @libReplacement: true,false\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let log = collect_case_resolution_trace(&case);
+        assert!(
+            log.lines().is_empty(),
+            "libReplacement(libreplacement=false).trace.json is []: a case with no imports requests no resolutions: {:?}",
+            log.lines()
         );
     }
 

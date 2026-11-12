@@ -15,25 +15,30 @@
 //!   ES2015, and generators below ES2015 produce typed diagnostics instead of
 //!   silently emitting later syntax.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::checker::SemanticModel;
+use crate::checker::{SemanticModel, SymbolId};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::jsx_desugar::{
     JsxEmitOptions, JsxRuntimeBinding, JsxRuntimeImportStyle, JsxSourceDesugarPlan,
     desugar_source_jsx,
 };
 use crate::source::{
-    JsxEmit, NodeIdSource, SourceId, SourcePositionError, SourceText, TextRange, Utf16Pos,
+    JsxEmit, NodeIdSource, ScriptKind, SourceId, SourcePositionError, SourceText, TextRange,
+    Utf16Pos,
 };
 use crate::syntax::*;
 
 use super::helpers::{self, HelperKind, HelperOptions};
 use super::{
-    EmitFileNames, EmitOutput, ModuleKind, Newline, PrintOptions, PrintSource, Surface,
-    print_with_jsx_plan,
+    EmitFileNames, EmitOutput, EmittedFile, ModuleKind, Newline, PrintOptions, PrintSource,
+    Surface, print_json_value, print_with_jsx_plan,
 };
+
+mod namespaces;
+
+use namespaces::{ContainerBinding, NamespaceFrame, is_qualified_alias};
 
 /// Stable diagnostic identifiers produced by target transforms.
 pub mod codes {
@@ -133,6 +138,12 @@ impl ScriptTarget {
 pub struct TransformOptions {
     /// Language target that drives downlevel decisions.
     pub target: ScriptTarget,
+    /// Keeps every import as written instead of eliding by use.
+    pub verbatim_module_syntax: bool,
+    /// `(specifier, name)` pairs the program knows have no runtime form.
+    pub erased_imports: std::sync::Arc<BTreeSet<(String, String)>>,
+    /// Something outside the source reads imports, so none can be proven unused.
+    pub keeps_imports: bool,
     /// Whether the emitted file begins with a `"use strict"` prologue.
     pub always_strict: bool,
     /// When true, class fields that survive downlevel use `define` semantics.
@@ -158,6 +169,8 @@ pub struct TransformOptions {
     pub inline_source_map: bool,
     /// Whether JavaScript source maps include the original source text.
     pub inline_sources: bool,
+    /// Leave authored comments out of the output.
+    pub remove_comments: bool,
 }
 
 /// Features found in a file, helpers they require, and diagnostics they produce.
@@ -214,6 +227,158 @@ pub fn analyze(file: &SourceFile, options: &TransformOptions) -> TransformPlan {
     }
 }
 
+fn emit_json_file(
+    file: &SourceFile,
+    model: &SemanticModel,
+    options: &TransformOptions,
+    names: &EmitFileNames,
+) -> EmitOutput {
+    let print_options = PrintOptions {
+        newline: options.newline,
+        indent_width: options.indent_width,
+        target: options.target,
+        source_map: options.source_map,
+        inline_source_map: options.inline_source_map,
+        inline_sources: options.inline_sources,
+        remove_comments: options.remove_comments,
+        module_marker: false,
+        verbatim_module_syntax: options.verbatim_module_syntax,
+    };
+    let statements = file.statements();
+    if statements.is_empty() {
+        return EmitOutput {
+            javascript: Some(EmittedFile {
+                code: String::new(),
+                source_map: None,
+            }),
+            ..EmitOutput::default()
+        };
+    }
+    let print_original = |expression: &Expr| {
+        print_json_value(
+            PrintSource {
+                file,
+                original_content: file.source_text().as_str(),
+                synthesized: None,
+                synthesized_floor: u32::MAX,
+                inline_lines: None,
+            },
+            model,
+            print_options,
+            names,
+            expression,
+        )
+    };
+    if let [statement] = statements {
+        match statement.data() {
+            Statement::Expression(expression) => {
+                return print_original(&expression.expression);
+            }
+            Statement::Block(block) if block.data().statements.is_empty() => {
+                let mut ids = NodeIdSource::after(file.id());
+                let empty = Node::new(
+                    ids.fresh(),
+                    file.range(),
+                    Expression::Object(ObjectLiteral {
+                        members: Vec::new(),
+                    }),
+                );
+                return print_original(&empty);
+            }
+            Statement::Block(_) => {
+                return emit_json_object(file, model, &print_options, names);
+            }
+            _ => {}
+        }
+    }
+    let identifiers: Option<Vec<&IdentifierNode>> = statements
+        .iter()
+        .map(|statement| match statement.data() {
+            Statement::Expression(expression) => match expression.expression.data() {
+                Expression::Identifier(identifier) => Some(identifier),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let Some(identifiers) = identifiers else {
+        return EmitOutput::default();
+    };
+    let mut ids = NodeIdSource::after(file.id());
+    let mut members = Vec::with_capacity(identifiers.len());
+    for identifier in identifiers {
+        let value = Node::new(
+            ids.fresh(),
+            identifier.range(),
+            Expression::Identifier(identifier.clone()),
+        );
+        members.push(Node::new(
+            ids.fresh(),
+            identifier.range(),
+            ObjectMember::Property(ObjectProperty {
+                name: PropertyName::Identifier(identifier.clone()),
+                value: Box::new(value),
+                modifier: PropertyModifier::None,
+                shorthand: true,
+            }),
+        ));
+    }
+    let object = Node::new(
+        ids.fresh(),
+        file.range(),
+        Expression::Object(ObjectLiteral { members }),
+    );
+    print_original(&object)
+}
+
+fn emit_json_object(
+    file: &SourceFile,
+    model: &SemanticModel,
+    options: &PrintOptions,
+    names: &EmitFileNames,
+) -> EmitOutput {
+    let wrapped = format!("({})", file.source_text().as_str());
+    let text = match SourceText::new(wrapped.as_str()) {
+        Ok(text) => Arc::new(text),
+        Err(_) => {
+            return EmitOutput {
+                diagnostics: vec![Diagnostic::error(
+                    codes::SOURCE_TOO_LARGE,
+                    file.source_id(),
+                    file.range(),
+                    "transformed source text exceeds the per-file budget",
+                )],
+                ..EmitOutput::default()
+            };
+        }
+    };
+    let reparsed = crate::parser::parse(crate::scanner::scan(
+        file.source_id(),
+        ScriptKind::TypeScript,
+        text,
+    ))
+    .into_product();
+    if let [statement] = reparsed.statements()
+        && let Statement::Expression(expression) = statement.data()
+        && let Expression::Parenthesized(inner) = expression.expression.data()
+    {
+        return print_json_value(
+            PrintSource {
+                file: &reparsed,
+                original_content: reparsed.source_text().as_str(),
+                synthesized: None,
+                synthesized_floor: u32::MAX,
+                inline_lines: None,
+            },
+            model,
+            *options,
+            names,
+            inner,
+        );
+    }
+    EmitOutput::default()
+}
+
 /// Rewrites `file` for `options.target` and prints it through the core printer.
 #[must_use]
 pub fn emit_transformed(
@@ -222,6 +387,9 @@ pub fn emit_transformed(
     options: &TransformOptions,
     names: &EmitFileNames,
 ) -> EmitOutput {
+    if file.script_kind() == ScriptKind::Json {
+        return emit_json_file(file, model, options, names);
+    }
     let plan = analyze(file, options);
     let mut ids = NodeIdSource::after(file.id());
     let jsx_plan = executable_jsx_plan(file, options, names, &mut ids);
@@ -282,12 +450,11 @@ pub fn emit_transformed(
     let helper_emit =
         helpers::emit_helpers_for_source(&used_helpers, &options.helpers, &rewritten, is_module);
     let cjs_marker = rewriter.cjs_marker_prelude(!runtime_prelude.is_empty());
-    let cjs_requires = rewriter.cjs_require_prelude();
     let prelude = join_preludes(
         &strict_prelude(file, options, is_module),
         &join_preludes(
             &helper_emit.prelude,
-            &join_preludes(&cjs_marker, &join_preludes(&runtime_prelude, &cjs_requires)),
+            &join_preludes(&cjs_marker, &runtime_prelude),
         ),
     );
     let mut output = print_with_jsx_plan(
@@ -296,14 +463,23 @@ pub fn emit_transformed(
             original_content: file.source_text().as_str(),
             synthesized: Some(&rewriter.synthesized_ids),
             synthesized_floor: rewriter.synthesized_floor,
+            inline_lines: Some(&rewriter.inline_lines),
         },
         model,
         PrintOptions {
             newline: options.newline,
             indent_width: options.indent_width,
+            target: options.target,
             source_map: options.source_map,
             inline_source_map: options.inline_source_map,
             inline_sources: options.inline_sources,
+            remove_comments: options.remove_comments,
+            verbatim_module_syntax: options.verbatim_module_syntax,
+            module_marker: is_module
+                && matches!(
+                    options.module_kind,
+                    Some(ModuleKind::Es2015 | ModuleKind::EsNext)
+                ),
         },
         names,
         Surface::JavaScript,
@@ -593,7 +769,33 @@ struct Rewriter<'a> {
     expression_temp_scopes: Vec<Vec<IdentifierNode>>,
     parameter_initializer_depths: Vec<usize>,
     cjs: Option<CjsPlan>,
+    /// Names `import type` binds, which an `export { name }` cannot publish.
+    type_imports: BTreeSet<String>,
+    /// Names the file reads as values, or `None` when imports stay as written.
+    import_reads: Option<BTreeSet<String>>,
+    /// Raw lines for marker statements, keyed by the marker's node.
+    inline_lines: HashMap<NodeId, String>,
+    /// The expression of the expression statement being rewritten, whose value
+    /// nothing reads.
+    statement_expression: Option<NodeId>,
+    /// `module.exports = value;`, which closes the module.
+    export_assignment: Option<Stmt>,
     synthesized_ids: BTreeSet<NodeId>,
+    file: &'a SourceFile,
+    /// Namespace bodies being lowered, innermost last.
+    namespace_frames: Vec<NamespaceFrame>,
+    /// Names each enclosing statement list has declared so far.
+    declared_names: Vec<BTreeSet<String>>,
+    /// Identifiers a generated name must avoid, once one is needed.
+    occupied_names: Option<BTreeSet<String>>,
+    /// Where each value name is declared, once a namespace needs to know.
+    value_symbol_ranges: Option<std::collections::HashMap<String, Vec<TextRange>>>,
+    /// Where each alias read as a value is declared, once one needs to know.
+    read_aliases: Option<BTreeSet<Utf16Pos>>,
+    /// Temporaries taken outside any namespace body.
+    module_temps: usize,
+    /// The parameter holding each alias a namespace body publishes.
+    published_aliases: BTreeMap<crate::checker::SymbolId, String>,
 }
 
 /// Per-file CommonJS lowering plan built before the rewrite walk.
@@ -603,10 +805,30 @@ struct CjsPlan {
     is_module: bool,
     /// Exported names needing `exports.<name> = void 0;` in the prelude.
     void_0: Vec<String>,
-    /// `require` prelude lines in import-statement order.
+    /// The CommonJS lines of the statement being planned.
     requires: Vec<String>,
+    /// Each import or re-export's lines, printed where the statement stood:
+    /// upstream keeps them in source order among the other statements.
+    statement_lines: HashMap<NodeId, String>,
     /// Import binding replacement by resolved module-scope symbol.
     imports: BTreeMap<crate::checker::SymbolId, CjsImportRef>,
+    /// Exported `var`/`let` bindings, which live only on `exports`.
+    exported_variables: BTreeSet<crate::checker::SymbolId>,
+    /// Helpers the prelude's re-exports call.
+    helpers: BTreeSet<HelperKind>,
+    /// `(exported, local)` for functions. They hoist, so their assignments run
+    /// before any require, which also keeps a star export off those names.
+    hoisted_exports: Vec<(String, String)>,
+    /// Exported names an import's own lines publish.
+    import_exports: BTreeSet<String>,
+    /// `(exported, local)` to publish right after a statement declares them.
+    declared_exports: HashMap<NodeId, Vec<(String, String)>>,
+    /// Exported names a declaration publishes.
+    published_locals: BTreeSet<String>,
+    /// Exported names of a local, which every write to it must update.
+    live_locals: BTreeMap<crate::checker::SymbolId, Vec<String>>,
+    /// `export =` replaces `exports`, so the file is no ES module interop.
+    export_assignment: bool,
     /// Require-local names whose member calls become `(0, m.p)()`.
     require_roots: BTreeSet<String>,
 }
@@ -636,21 +858,28 @@ impl RequireNames {
     }
 
     fn allocate(&mut self, module: &str) -> String {
-        let base = module.rsplit('/').next().unwrap_or(module);
-        let counter = self.counters.entry(base.to_owned()).or_insert(0);
-        // tsc binds require locals as `<slug>_<n>` when the path's last
-        // segment can start an identifier (`enum_1`) and sanitizes with a
-        // leading underscore only when it cannot (`_10_lib_1`).
-        let starts_identifier = base
+        // tsc binds require locals as `<slug>_<n>`, where the path's last segment
+        // becomes an identifier: other characters turn into `_` (`m_js_1`) and a
+        // leading digit gets a `_` (`_10_lib_1`).
+        let segment = module.rsplit('/').next().unwrap_or(module);
+        let slug: String = segment
             .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$');
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let counter = self.counters.entry(slug.clone()).or_insert(0);
+        let leading_digit = slug.starts_with(|c: char| c.is_ascii_digit());
         loop {
             *counter += 1;
-            let candidate = if starts_identifier {
-                format!("{base}_{}", *counter)
+            let candidate = if leading_digit {
+                format!("_{slug}_{}", *counter)
             } else {
-                format!("_{base}_{}", *counter)
+                format!("{slug}_{}", *counter)
             };
             if self.occupied.insert(candidate.clone()) {
                 return candidate;
@@ -671,6 +900,9 @@ impl<'a> Rewriter<'a> {
         } else {
             None
         };
+        let used_helpers = cjs
+            .as_ref()
+            .map_or_else(BTreeSet::new, |plan| plan.helpers.clone());
         let synthesized_floor = ids.position();
         Self {
             options,
@@ -684,12 +916,25 @@ impl<'a> Rewriter<'a> {
             next_temp: 0,
             diagnostics: Vec::new(),
             replace_await: false,
-            used_helpers: BTreeSet::new(),
+            used_helpers,
             key_prelude: Vec::new(),
             expression_temp_scopes: Vec::new(),
             parameter_initializer_depths: Vec::new(),
             cjs,
+            type_imports: type_import_names(file, options),
+            import_reads: import_reads(file, options, model),
+            inline_lines: HashMap::new(),
+            statement_expression: None,
+            export_assignment: None,
             synthesized_ids: BTreeSet::new(),
+            file,
+            namespace_frames: Vec::new(),
+            declared_names: Vec::new(),
+            occupied_names: None,
+            value_symbol_ranges: None,
+            read_aliases: None,
+            module_temps: 0,
+            published_aliases: BTreeMap::new(),
         }
     }
     /// Scans top-level module syntax into a CommonJS lowering plan.
@@ -698,26 +943,14 @@ impl<'a> Rewriter<'a> {
         options: &TransformOptions,
         model: &SemanticModel,
     ) -> Option<CjsPlan> {
-        let occupied: BTreeSet<String> = file
-            .tokens()
-            .iter()
-            .filter(|token| token.kind() == TokenKind::Identifier)
-            .filter_map(|token| {
-                let start = file
-                    .source_text()
-                    .utf16_to_byte(token.range().start())
-                    .ok()?;
-                let end = file.source_text().utf16_to_byte(token.range().end()).ok()?;
-                file.source_text()
-                    .as_str()
-                    .get(start..end)
-                    .map(str::to_owned)
-            })
-            .collect();
-        let mut names = RequireNames::new(occupied);
+        let mut names = RequireNames::new(identifier_names(file));
         let mut plan = CjsPlan::default();
         let module_scope = model.module_scope();
         let symbol_of = |name: &str| model.scope(module_scope).value(name);
+        let hoisted_functions = hoisted_function_names(file);
+        let type_imports = type_import_names(file, options);
+        let reads = import_reads(file, options, Some(model));
+        let exported_locals = exported_locals(file);
         for statement in file.statements() {
             match statement.data() {
                 Statement::Import(import) => {
@@ -725,15 +958,24 @@ impl<'a> Rewriter<'a> {
                         continue;
                     }
                     plan.is_module = true;
-                    let Some(clause) = &import.clause else {
-                        continue;
-                    };
                     let raw = raw_token_text(file, import.source.data().token());
                     let module = raw.trim_matches(['"', '\'']);
-                    let local = names.allocate(module);
                     // Upstream re-quotes module specifiers with double
                     // quotes in every require form.
                     let quoted = quote_module_specifier(module);
+                    let Some(clause) = &import.clause else {
+                        plan.statement_lines
+                            .insert(statement.id(), format!("require({quoted});"));
+                        continue;
+                    };
+                    let clause = match &reads {
+                        Some(reads) => kept_import_clause(file, clause, reads),
+                        None => Some(clause.clone()),
+                    };
+                    let Some(clause) = &clause else {
+                        continue;
+                    };
+                    let local = names.allocate(module);
                     let line = format!(
                         "{} {local} = require({quoted});",
                         if options.target <= ScriptTarget::Es5 {
@@ -746,6 +988,11 @@ impl<'a> Rewriter<'a> {
                     plan.require_roots.insert(local.clone());
                     if let Some(default) = &clause.default {
                         let text = identifier_text(file, default);
+                        for exported in exported_locals.get(&text).into_iter().flatten() {
+                            plan.import_exports.insert(exported.clone());
+                            plan.requires
+                                .push(format!("{} = {local}.default;", exports_member(exported)));
+                        }
                         if let Some(symbol) = symbol_of(&text) {
                             plan.imports.insert(
                                 symbol,
@@ -759,6 +1006,11 @@ impl<'a> Rewriter<'a> {
                     match &clause.binding {
                         Some(ImportBinding::Namespace(name)) => {
                             let text = identifier_text(file, name);
+                            for exported in exported_locals.get(&text).into_iter().flatten() {
+                                plan.import_exports.insert(exported.clone());
+                                plan.requires
+                                    .push(format!("{} = {local};", exports_member(exported)));
+                            }
                             if let Some(symbol) = symbol_of(&text) {
                                 plan.imports.insert(
                                     symbol,
@@ -775,16 +1027,12 @@ impl<'a> Rewriter<'a> {
                                 if !matches!(specifier.mode, ImportSpecifierMode::Value) {
                                     continue;
                                 }
-                                let imported = match &specifier.imported {
-                                    ModuleExportName::Identifier(ident) => {
-                                        Some(identifier_text(file, ident))
-                                    }
-                                    _ => None,
-                                };
-                                let Some(property) = imported else {
-                                    continue;
-                                };
+                                let property = module_export_text(file, &specifier.imported);
                                 let text = identifier_text(file, &specifier.local);
+                                for exported in exported_locals.get(&text).into_iter().flatten() {
+                                    plan.import_exports.insert(exported.clone());
+                                    plan.requires.push(live_export(exported, &local, &property));
+                                }
                                 if let Some(symbol) = symbol_of(&text) {
                                     plan.imports.insert(
                                         symbol,
@@ -805,6 +1053,12 @@ impl<'a> Rewriter<'a> {
                 }
                 Statement::Export(export) => {
                     plan.is_module = true;
+                    plan.export_assignment |= matches!(export, ExportDeclaration::Assignment(_));
+                    plan_cjs_reexport(file, export, &mut names, &mut plan, &options.erased_imports);
+                    let binds_type = |name: &str| {
+                        type_imports.contains(name) || is_type_only_export(model, name)
+                    };
+                    plan_cjs_local_exports(file, export, &hoisted_functions, binds_type, &mut plan);
                     if let ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) =
                         export
                     {
@@ -817,17 +1071,56 @@ impl<'a> Rewriter<'a> {
                             Statement::Function(_)
                             | Statement::Interface(_)
                             | Statement::TypeAlias(_) => {}
-                            _ => {
-                                for name in declared_binding_names(file, inner) {
-                                    plan.void_0.push(name);
+                            Statement::ImportEquals(import) if is_qualified_alias(import) => {
+                                let name = identifier_text(file, &import.local);
+                                plan.exported_variables.extend(symbol_of(&name));
+                                plan.void_0.push(name);
+                            }
+                            Statement::ImportEquals(ImportEqualsDeclaration {
+                                is_type_only: false,
+                                local,
+                                reference: ExternalModuleReference::Require(source),
+                                ..
+                            }) => {
+                                let name = identifier_text(file, local);
+                                plan.exported_variables.extend(symbol_of(&name));
+                                plan.requires.push(format!(
+                                    "{} = require({});",
+                                    exports_member(&name),
+                                    quote_module_specifier(&module_specifier(file, source))
+                                ));
+                            }
+                            Statement::Namespace(namespace) => {
+                                if let NamespaceName::Identifier { name, .. } = &namespace.name
+                                    && model
+                                        .namespace_facts()
+                                        .declaration(inner.id())
+                                        .is_some_and(|plan| plan.is_value_bearing())
+                                {
+                                    plan.void_0.push(identifier_text(file, name));
                                 }
+                            }
+                            _ => {
+                                let names = declared_binding_names(file, inner);
+                                if let Statement::Variable(declaration) = inner.data()
+                                    && is_reassignable(declaration)
+                                {
+                                    plan.exported_variables
+                                        .extend(names.iter().filter_map(|name| symbol_of(name)));
+                                }
+                                plan.void_0.extend(names);
                             }
                         }
                     }
                 }
                 _ => {}
             }
+            if !plan.requires.is_empty() {
+                let lines = std::mem::take(&mut plan.requires).join("\n");
+                plan.statement_lines.insert(statement.id(), lines);
+            }
         }
+        plan_cjs_declared_exports(file, model, &exported_locals, &mut plan);
         // Script files keep the plan too: the marker stays off until a
         // require prelude (for example the JSX runtime) forces module form.
         plan.void_0.sort();
@@ -877,7 +1170,7 @@ impl<'a> Rewriter<'a> {
     fn cjs_export_target(&mut self, exported: &str, range: TextRange) -> AssignmentTargetNode {
         let exports_ident = self.ident("exports");
         let object = self.syn_node(range, Expression::Identifier(exports_ident));
-        let property = MemberProperty::Named(self.ident(exported));
+        let property = self.named_or_computed(exported, range);
         self.syn_node(
             range,
             AssignmentTarget::Member(AssignmentMemberTarget {
@@ -887,51 +1180,12 @@ impl<'a> Rewriter<'a> {
         )
     }
 
-    /// `require("./m");` for a side-effect import, with the specifier
-    /// re-quoted the way upstream prints module text.
-    fn cjs_require_statement(&mut self, source: &StringLiteralNode) -> Stmt {
-        let range = source.range();
-        let raw = self.token_text(source.data().token()).to_owned();
-        let module = raw.trim_matches(['"', '\'']);
-        let require = self.ident("require");
-        let callee = self.syn_node(range, Expression::Identifier(require));
-        let literal = self.string_literal(module);
-        let module = self.syn_node(range, Expression::Literal(Literal::String(literal)));
-        let call = self.syn_node(
-            range,
-            Expression::Call(CallExpression {
-                callee: Box::new(callee),
-                optional: false,
-                type_arguments: None,
-                arguments: vec![CallArgument::Expression(Box::new(module))],
-            }),
-        );
-        self.syn_node(
-            range,
-            Statement::Expression(ExpressionStatement {
-                expression: Box::new(call),
-            }),
-        )
-    }
-
     /// Replaces `export <declaration>` with assignments around the
-    /// declaration. Functions hoist, so the export assignment precedes them;
+    /// declaration. A function's assignment is hoisted into the prelude;
     /// classes and variables receive the `void 0` preamble instead.
     fn cjs_export_declaration(&mut self, range: TextRange, inner: &Stmt) -> Vec<Stmt> {
         match inner.data() {
-            Statement::Function(function) => {
-                let Some(name) = function
-                    .function
-                    .name
-                    .as_ref()
-                    .map(|ident| self.token_text(ident.data().token()).to_owned())
-                else {
-                    return self.rewrite_statement(inner);
-                };
-                let mut out = vec![self.cjs_export_assignment(&name, &name, range)];
-                out.extend(self.rewrite_statement(inner));
-                out
-            }
+            Statement::Function(_) => self.rewrite_statement(inner),
             Statement::Class(class) => {
                 let Some(name) = class
                     .name
@@ -944,8 +1198,12 @@ impl<'a> Rewriter<'a> {
                 out.push(self.cjs_export_assignment(&name, &name, range));
                 out
             }
+            Statement::Variable(declaration) if is_reassignable(declaration) => {
+                self.namespace_export_variables(declaration, "exports", range)
+            }
             _ => {
-                let names = self.cjs_declared_names(inner);
+                // A const never changes, so its local copy stays accurate.
+                let names = declared_binding_names(self.file, inner);
                 let mut out = self.rewrite_statement(inner);
                 for name in &names {
                     out.push(self.cjs_export_assignment(name, name, range));
@@ -988,39 +1246,176 @@ impl<'a> Rewriter<'a> {
                 ModuleExportName::Identifier(local) => local.range(),
                 _ => continue,
             };
-            let (local, exported) = match (&specifier.local, &specifier.exported) {
-                (ModuleExportName::Identifier(local), ModuleExportName::Identifier(exported)) => (
-                    self.token_text(local.data().token()).to_owned(),
-                    self.token_text(exported.data().token()).to_owned(),
-                ),
-                _ => continue,
+            let ModuleExportName::Identifier(local) = &specifier.local else {
+                continue;
             };
-            out.push(self.cjs_export_assignment(&exported, &local, local_range));
+            let local = self.token_text(local.data().token()).to_owned();
+            let exported = module_export_text(self.file, &specifier.exported);
+            if self.exports_only_a_type(&local) {
+                continue;
+            }
+            let published = self.cjs.as_ref().is_some_and(|plan| {
+                plan.import_exports.contains(&exported)
+                    || plan.published_locals.contains(&exported)
+                    || plan
+                        .hoisted_exports
+                        .iter()
+                        .any(|(name, value)| *name == exported && *value == local)
+            });
+            if published {
+                continue;
+            }
+            let value = self.cjs_local_value(&local, local_range);
+            let left = self.cjs_export_target(&exported, local_range);
+            let assignment = self.syn_node(
+                local_range,
+                Expression::Assignment(AssignmentExpression {
+                    operator: AssignmentOperator::Assign,
+                    left,
+                    right: Box::new(value),
+                }),
+            );
+            out.push(self.syn_node(
+                local_range,
+                Statement::Expression(ExpressionStatement {
+                    expression: Box::new(assignment),
+                }),
+            ));
         }
         out
     }
 
-    /// Declared value names of a statement, via the rewrite text.
-    fn cjs_declared_names(&self, statement: &Stmt) -> Vec<String> {
-        match statement.data() {
-            Statement::Variable(declaration) => declaration
-                .declarations
-                .iter()
-                .filter_map(|declarator| match declarator.data().binding.data() {
-                    BindingPattern::Identifier(ident) => {
-                        Some(self.token_text(ident.data().token()).to_owned())
-                    }
-                    _ => None,
-                })
-                .collect(),
-            Statement::Enum(declaration) => {
-                vec![self.token_text(declaration.name.data().token()).to_owned()]
+    /// An ES import keeps only the bindings something reads as a value, and
+    /// goes away with the last one: naming a type would fail at load.
+    fn rewrite_esm_import(&mut self, statement: &Stmt, import: &ImportDeclaration) -> Vec<Stmt> {
+        let (Some(reads), Some(clause), false) =
+            (&self.import_reads, &import.clause, import.type_only)
+        else {
+            return vec![statement.clone()];
+        };
+        let Some(kept) = kept_import_clause(self.file, clause, reads) else {
+            return Vec::new();
+        };
+        if kept == *clause {
+            return vec![statement.clone()];
+        }
+        vec![self.node(
+            statement.range(),
+            Statement::Import(ImportDeclaration {
+                clause: Some(kept),
+                ..import.clone()
+            }),
+        )]
+    }
+
+    fn exports_only_a_type(&self, local: &str) -> bool {
+        self.type_imports.contains(local)
+            || self
+                .model
+                .is_some_and(|model| is_type_only_export(model, local))
+    }
+
+    /// `export { I }` of an interface or alias has no runtime form, so an ES
+    /// module must not name it, and a re-export with nothing left goes away.
+    fn rewrite_esm_export_specifiers(
+        &mut self,
+        statement: &Stmt,
+        specifiers: &[ExportSpecifierNode],
+        source: &Option<StringLiteralNode>,
+    ) -> Vec<Stmt> {
+        let module = source
+            .as_ref()
+            .map(|source| module_specifier(self.file, source));
+        let kept: Vec<ExportSpecifierNode> = specifiers
+            .iter()
+            .filter(|specifier| match (&module, &specifier.data().local) {
+                (Some(module), _) => reexport_survives(
+                    self.file,
+                    specifier.data(),
+                    module,
+                    &self.options.erased_imports,
+                ),
+                (None, ModuleExportName::Identifier(local)) => {
+                    !self.exports_only_a_type(self.token_text(local.data().token()))
+                }
+                (None, _) => true,
+            })
+            .cloned()
+            .collect();
+        if kept.len() == specifiers.len() {
+            return vec![statement.clone()];
+        }
+        if kept.is_empty() && module.is_some() {
+            return Vec::new();
+        }
+        let Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+            attributes,
+            ..
+        })) = statement.data()
+        else {
+            return vec![statement.clone()];
+        };
+        vec![self.node(
+            statement.range(),
+            Statement::Export(ExportDeclaration::Named(
+                ExportNamedDeclaration::Specifiers {
+                    type_only: false,
+                    specifiers: kept,
+                    source: source.clone(),
+                    attributes: attributes.clone(),
+                },
+            )),
+        )]
+    }
+
+    /// What a module-scope name reads under CommonJS, where an exported
+    /// variable lives on `exports` and an import on its required module.
+    fn cjs_local_value(&mut self, local: &str, range: TextRange) -> Expr {
+        let symbol = self
+            .model
+            .and_then(|model| model.scope(model.module_scope()).value(local));
+        let reference = symbol.and_then(|symbol| {
+            let plan = self.cjs.as_ref()?;
+            if plan.exported_variables.contains(&symbol) {
+                return Some(("exports".to_owned(), Some(local.to_owned())));
             }
-            _ => Vec::new(),
+            let import = plan.imports.get(&symbol)?;
+            Some((import.root.clone(), import.property.clone()))
+        });
+        match reference {
+            Some((root, Some(property))) => self.namespace_member(&root, &property, range),
+            Some((root, None)) => self.ident_expr(&root),
+            None => self.ident_expr(local),
         }
     }
 
+    /// Declared value names of a statement, via the rewrite text.
     fn rewrite_export_named_declaration(&mut self, statement: &Stmt, inner: &Stmt) -> Vec<Stmt> {
+        if self
+            .cjs
+            .as_ref()
+            .is_some_and(|plan| plan.statement_lines.contains_key(&statement.id()))
+        {
+            return self.cjs_statement_lines(statement);
+        }
+        let binding = if self.cjs.is_some() {
+            ContainerBinding::CommonJs
+        } else {
+            ContainerBinding::Export
+        };
+        match inner.data() {
+            Statement::Namespace(namespace) => {
+                return self.lower_namespace(inner, namespace, binding, statement.range());
+            }
+            Statement::Enum(declaration) if declaration.is_const => return Vec::new(),
+            Statement::Enum(declaration) => {
+                return self.lower_enum(inner, declaration, binding, statement.range());
+            }
+            Statement::ImportEquals(import) if is_qualified_alias(import) => {
+                return self.lower_exported_alias(inner, import, binding, statement.range());
+            }
+            _ => {}
+        }
         if self.cjs.is_some() {
             return self.cjs_export_declaration(statement.range(), inner);
         }
@@ -1042,24 +1437,26 @@ impl<'a> Rewriter<'a> {
     }
     /// `export default function f() {}` / anonymous `default_1` renaming.
     fn cjs_default_function(&mut self, range: TextRange, function: &FunctionLike) -> Vec<Stmt> {
-        let (function, name) = match &function.name {
-            Some(ident) => (
-                function.clone(),
-                self.token_text(ident.data().token()).to_owned(),
-            ),
-            None => {
-                let ident = self.ident("default_1");
-                let mut renamed = function.clone();
-                renamed.name = Some(ident);
-                (renamed, String::from("default_1"))
-            }
-        };
+        let mut function = function.clone();
+        if function.name.is_none() {
+            function.name = Some(self.ident("default_1"));
+        }
         let function = self.rewrite_function_like(&function, range);
-        let statement = self.node(range, Statement::Function(FunctionDeclaration { function }));
-        let mut out = vec![statement];
-        let default_value = self.ident_expr(&name);
-        out.push(self.cjs_export_default_assignment(range, default_value));
-        out
+        vec![self.node(range, Statement::Function(FunctionDeclaration { function }))]
+    }
+
+    fn is_const_enum_use(&self, reference: NodeId) -> bool {
+        self.model
+            .is_some_and(|model| model.enum_facts().const_use(reference).is_some())
+    }
+
+    /// Whether a use resolved to a binding that lives only on `exports`.
+    fn cjs_reads_exported_variable(&self, reference: NodeId) -> bool {
+        self.cjs.as_ref().is_some_and(|plan| {
+            self.model
+                .and_then(|model| model.reference(reference))
+                .is_some_and(|symbol| plan.exported_variables.contains(&symbol))
+        })
     }
 
     /// Rewrites a resolved import reference to its CommonJS member form.
@@ -1076,12 +1473,12 @@ impl<'a> Rewriter<'a> {
         let Some(property) = property else {
             return Some(object);
         };
-        let property = self.ident(&property);
+        let property = self.named_or_computed(&property, range);
         Some(self.node(
             range,
             Expression::Member(MemberExpression {
                 object: Box::new(object),
-                property: MemberProperty::Named(property),
+                property,
                 optional: false,
             }),
         ))
@@ -1099,6 +1496,9 @@ impl<'a> Rewriter<'a> {
         let Some(symbol) = self.model.and_then(|model| model.reference(ident.id())) else {
             return false;
         };
+        if plan.exported_variables.contains(&symbol) {
+            return true;
+        }
         plan.imports
             .get(&symbol)
             .is_some_and(|reference| reference.property.is_some())
@@ -1123,34 +1523,190 @@ impl<'a> Rewriter<'a> {
         if !(plan.is_module || force_module) {
             return String::new();
         }
-        let mut prelude =
-            String::from("Object.defineProperty(exports, \"__esModule\", { value: true });\n");
+        let mut prelude = if plan.export_assignment {
+            String::new()
+        } else {
+            String::from("Object.defineProperty(exports, \"__esModule\", { value: true });\n")
+        };
         let mut names = plan.void_0.clone();
         names.sort();
         names.dedup();
         if !names.is_empty() {
-            prelude.push_str("exports.");
-            for (index, name) in names.iter().enumerate() {
-                if index > 0 {
-                    prelude.push_str(" = exports.");
-                }
-                prelude.push_str(name);
-            }
+            let members: Vec<String> = names.iter().map(|name| exports_member(name)).collect();
+            prelude.push_str(&members.join(" = "));
             prelude.push_str(" = void 0;\n");
+        }
+        for (exported, local) in &plan.hoisted_exports {
+            prelude.push_str(&format!("{} = {local};\n", exports_member(exported)));
         }
         prelude
     }
 
-    fn cjs_require_prelude(&self) -> String {
-        let Some(plan) = &self.cjs else {
-            return String::new();
-        };
-        let mut prelude = String::new();
-        for line in &plan.requires {
-            prelude.push_str(line);
-            prelude.push('\n');
+    /// `.name`, or `["a b"]` for a name that is no identifier.
+    fn named_or_computed(&mut self, name: &str, range: TextRange) -> MemberProperty {
+        if is_identifier_name(name) {
+            return MemberProperty::Named(self.ident(name));
         }
-        prelude
+        let quoted = quote_string(name);
+        let literal = self.string_literal(&quoted[1..quoted.len() - 1]);
+        let key = self.syn_node(range, Expression::Literal(Literal::String(literal)));
+        MemberProperty::Computed(Box::new(key))
+    }
+
+    /// `module.exports = value;`, which `export =` means under CommonJS.
+    fn cjs_export_assignment_statement(&mut self, range: TextRange, value: &Expr) -> Stmt {
+        let value = self.rewrite_expr(value);
+        let module = self.ident("module");
+        let object = self.syn_node(range, Expression::Identifier(module));
+        let property = MemberProperty::Named(self.ident("exports"));
+        let left = self.syn_node(
+            range,
+            AssignmentTarget::Member(AssignmentMemberTarget {
+                object: Box::new(object),
+                property,
+            }),
+        );
+        let assignment = self.syn_node(
+            range,
+            Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left,
+                right: Box::new(value),
+            }),
+        );
+        self.syn_node(
+            range,
+            Statement::Expression(ExpressionStatement {
+                expression: Box::new(assignment),
+            }),
+        )
+    }
+
+    /// `exports.name = local;` for what a statement just declared.
+    fn cjs_publish_declared(&mut self, statement: &Stmt) -> Vec<Stmt> {
+        let pairs = self
+            .cjs
+            .as_mut()
+            .and_then(|plan| plan.declared_exports.remove(&statement.id()))
+            .unwrap_or_default();
+        pairs
+            .iter()
+            .map(|(exported, local)| self.cjs_export_assignment(exported, local, statement.range()))
+            .collect()
+    }
+
+    /// Exported names of what an assignment target writes, as `(local, names)`.
+    fn live_exports_of(&self, target: &AssignmentTargetNode) -> Vec<(String, Vec<String>)> {
+        let (Some(plan), Some(model)) = (&self.cjs, self.model) else {
+            return Vec::new();
+        };
+        let mut identifiers = Vec::new();
+        collect_target_identifiers(target, &mut identifiers);
+        identifiers
+            .into_iter()
+            .filter_map(|identifier| {
+                let names = plan.live_locals.get(&model.reference(identifier.id())?)?;
+                Some((identifier_text(self.file, identifier), names.clone()))
+            })
+            .collect()
+    }
+
+    /// `exports.a = exports.b = value`.
+    fn cjs_assign_exports(&mut self, names: &[String], value: Expr, range: TextRange) -> Expr {
+        names.iter().fold(value, |value, name| {
+            let left = self.cjs_export_target(name, range);
+            self.syn_node(
+                range,
+                Expression::Assignment(AssignmentExpression {
+                    operator: AssignmentOperator::Assign,
+                    left,
+                    right: Box::new(value),
+                }),
+            )
+        })
+    }
+
+    fn sequence(&mut self, expressions: Vec<Expr>, range: TextRange) -> Expr {
+        self.syn_node(
+            range,
+            Expression::Sequence(SequenceExpression { expressions }),
+        )
+    }
+
+    /// `temp = value`.
+    fn store_temp(&mut self, temp: &IdentifierNode, value: Expr, range: TextRange) -> Expr {
+        let left = self.syn_node(range, AssignmentTarget::Identifier(temp.clone()));
+        self.syn_node(
+            range,
+            Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left,
+                right: Box::new(value),
+            }),
+        )
+    }
+
+    /// Under CommonJS a local exported by `export { x }` has a copy on `exports`,
+    /// so a write to it also writes there, in the forms upstream prints.
+    fn publish_local_writes(&mut self, source: &Expr, rewritten: Expr) -> Expr {
+        let range = source.range();
+        match source.data() {
+            Expression::Assignment(assignment) => {
+                let written = self.live_exports_of(&assignment.left);
+                if let AssignmentTarget::Identifier(_) = assignment.left.data() {
+                    return match written.into_iter().next() {
+                        Some((_, names)) => self.cjs_assign_exports(&names, rewritten, range),
+                        None => rewritten,
+                    };
+                }
+                if written.is_empty() {
+                    return rewritten;
+                }
+                let temp = self.expression_temp();
+                let mut steps = vec![self.store_temp(&temp, rewritten, range)];
+                for (local, names) in written {
+                    let value = self.ident_expr(&local);
+                    steps.push(self.cjs_assign_exports(&names, value, range));
+                }
+                let result = self.node(range, Expression::Identifier(temp));
+                steps.push(result);
+                self.sequence(steps, range)
+            }
+            Expression::Update(update) => {
+                let Some((local, names)) = self.live_exports_of(&update.argument).pop() else {
+                    return rewritten;
+                };
+                if update.prefix {
+                    return self.cjs_assign_exports(&names, rewritten, range);
+                }
+                let current = self.ident_expr(&local);
+                if self.statement_expression == Some(source.id()) {
+                    let value = self.sequence(vec![rewritten, current], range);
+                    return self.cjs_assign_exports(&names, value, range);
+                }
+                let temp = self.expression_temp();
+                let store = self.store_temp(&temp, rewritten, range);
+                let value = self.sequence(vec![store, current], range);
+                let publish = self.cjs_assign_exports(&names, value, range);
+                let result = self.node(range, Expression::Identifier(temp));
+                self.sequence(vec![publish, result], range)
+            }
+            _ => rewritten,
+        }
+    }
+
+    /// An import or re-export's lines, as a statement the printer fills in.
+    fn cjs_statement_lines(&mut self, statement: &Stmt) -> Vec<Stmt> {
+        let lines = self
+            .cjs
+            .as_mut()
+            .and_then(|plan| plan.statement_lines.remove(&statement.id()));
+        let Some(lines) = lines else {
+            return Vec::new();
+        };
+        let marker = self.node(statement.range(), Statement::Empty);
+        self.inline_lines.insert(marker.id(), lines);
+        vec![marker]
     }
 
     /// Raw source text of a token, with escapes kept verbatim.
@@ -1272,6 +1828,7 @@ impl<'a> Rewriter<'a> {
     fn rewrite_root_statements(&mut self, statements: &[Stmt], range: TextRange) -> Vec<Stmt> {
         self.expression_temp_scopes.push(Vec::new());
         let mut rewritten = self.rewrite_statements(statements);
+        rewritten.extend(self.export_assignment.take());
         let temps = self.expression_temp_scopes.pop().unwrap_or_default();
         if let Some(declaration) = self.temp_declaration(temps, range) {
             rewritten.insert(0, declaration);
@@ -1325,10 +1882,14 @@ impl<'a> Rewriter<'a> {
     }
 
     fn rewrite_statements(&mut self, statements: &[Stmt]) -> Vec<Stmt> {
+        self.declared_names.push(BTreeSet::new());
         let mut out = Vec::new();
         for statement in statements {
+            self.record_declaration(statement);
             out.extend(self.rewrite_statement(statement));
+            out.extend(self.cjs_publish_declared(statement));
         }
+        self.declared_names.pop();
         out
     }
 
@@ -1362,6 +1923,12 @@ impl<'a> Rewriter<'a> {
                     vec![statement.clone()]
                 }
                 ExportDefaultValue::Expression(value) => {
+                    // `export default T` of a type has no runtime form.
+                    if let Expression::Identifier(identifier) = value.data()
+                        && self.exports_only_a_type(self.token_text(identifier.data().token()))
+                    {
+                        return Vec::new();
+                    }
                     if self.cjs.is_some() {
                         let value = self.rewrite_expr(value);
                         return vec![self.cjs_export_default_assignment(statement.range(), value)];
@@ -1384,25 +1951,40 @@ impl<'a> Rewriter<'a> {
                 source,
                 ..
             })) => {
-                if self.cjs.is_some() && source.is_none() && !*type_only {
+                if self.cjs.is_none() {
+                    if *type_only || self.options.verbatim_module_syntax {
+                        return vec![statement.clone()];
+                    }
+                    return self.rewrite_esm_export_specifiers(statement, specifiers, source);
+                }
+                if source.is_none() && !*type_only {
                     return self.cjs_export_specifiers(specifiers);
                 }
-                vec![statement.clone()]
+                // A type-only re-export has no lines, so it is gone.
+                self.cjs_statement_lines(statement)
+            }
+            Statement::Export(ExportDeclaration::All(_)) if self.cjs.is_some() => {
+                self.cjs_statement_lines(statement)
+            }
+            Statement::Export(ExportDeclaration::Assignment(value)) if self.cjs.is_some() => {
+                // Upstream runs it after the module body, whatever its position.
+                let erased = matches!(value.data(), Expression::Identifier(identifier)
+                    if self.exports_only_a_type(self.token_text(identifier.data().token())));
+                if !erased {
+                    self.export_assignment =
+                        Some(self.cjs_export_assignment_statement(statement.range(), value));
+                }
+                Vec::new()
             }
             Statement::Import(import) => {
                 if self.cjs.is_none() {
-                    return vec![statement.clone()];
+                    return self.rewrite_esm_import(statement, import);
                 }
                 if import.type_only {
                     // Type-only imports carry no runtime form.
                     return Vec::new();
                 }
-                match &import.clause {
-                    // A side-effect import stays at its position as a bare
-                    // require; clause imports move into the prelude.
-                    None => vec![self.cjs_require_statement(&import.source)],
-                    Some(_) => Vec::new(),
-                }
+                self.cjs_statement_lines(statement)
             }
             Statement::Block(block) => {
                 let statements = self.rewrite_statements(&block.data().statements);
@@ -1420,6 +2002,7 @@ impl<'a> Rewriter<'a> {
                 )]
             }
             Statement::Expression(expr) => {
+                self.statement_expression = Some(expr.expression.id());
                 let mut candidate = &*expr.expression;
                 while let Expression::Parenthesized(value) = candidate.data() {
                     candidate = value;
@@ -1527,13 +2110,21 @@ impl<'a> Rewriter<'a> {
                 {
                     return self.lower_sync_for_of(statement, for_of);
                 }
+                let binding = match &for_of.binding {
+                    ForBinding::Target(target) => {
+                        ForBinding::Target(self.rewrite_assignment_target(target))
+                    }
+                    ForBinding::Variable(declaration) => {
+                        ForBinding::Variable(self.rewrite_for_declaration(declaration))
+                    }
+                };
                 let iterable = self.rewrite_expr(&for_of.iterable);
                 let body = self.rewrite_single_statement(&for_of.body);
                 vec![self.node(
                     statement.range(),
                     Statement::ForOf(ForOfStatement {
                         mode: for_of.mode,
-                        binding: for_of.binding.clone(),
+                        binding,
                         iterable: Box::new(iterable),
                         body: Box::new(body),
                     }),
@@ -1544,13 +2135,15 @@ impl<'a> Rewriter<'a> {
                 // const/let binding needs var conversion there.
                 let binding = match &for_in.binding {
                     ForBinding::Variable(declaration) => {
-                        let mut declaration = declaration.clone();
+                        let mut declaration = self.rewrite_for_declaration(declaration);
                         if self.options.target <= ScriptTarget::Es5 {
                             declaration.kind = VariableKind::Var;
                         }
                         ForBinding::Variable(declaration)
                     }
-                    target @ ForBinding::Target(_) => target.clone(),
+                    ForBinding::Target(target) => {
+                        ForBinding::Target(self.rewrite_assignment_target(target))
+                    }
                 };
                 let object = self.rewrite_expr(&for_in.object);
                 let body = self.rewrite_single_statement(&for_in.body);
@@ -1572,7 +2165,7 @@ impl<'a> Rewriter<'a> {
                             ForInitializer::Expression(Box::new(self.rewrite_expr(expression)))
                         }
                         ForInitializer::Variable(declaration) => {
-                            ForInitializer::Variable(declaration.clone())
+                            ForInitializer::Variable(self.rewrite_for_declaration(declaration))
                         }
                     });
                 let test = value
@@ -1597,14 +2190,13 @@ impl<'a> Rewriter<'a> {
             Statement::Try(value) => {
                 let block = self.rewrite_block(&value.block);
                 let handler = value.handler.as_ref().map(|handler| {
+                    let binding = handler
+                        .data()
+                        .binding
+                        .as_ref()
+                        .map(|binding| self.rewrite_pattern(binding));
                     let body = self.rewrite_block(&handler.data().body);
-                    self.node(
-                        handler.range(),
-                        CatchClause {
-                            binding: handler.data().binding.clone(),
-                            body,
-                        },
-                    )
+                    self.node(handler.range(), CatchClause { binding, body })
                 });
                 let finalizer = value
                     .finalizer
@@ -1654,12 +2246,22 @@ impl<'a> Rewriter<'a> {
                     vec![statement.clone()]
                 }
             }
-            Statement::ImportEquals(_)
-            | Statement::Export(_)
+            Statement::Namespace(namespace) => self.lower_namespace(
+                statement,
+                namespace,
+                ContainerBinding::Local,
+                statement.range(),
+            ),
+            Statement::Enum(declaration) => self.lower_enum(
+                statement,
+                declaration,
+                ContainerBinding::Local,
+                statement.range(),
+            ),
+            Statement::ImportEquals(import) => self.lower_alias(statement, import),
+            Statement::Export(_)
             | Statement::Interface(_)
             | Statement::TypeAlias(_)
-            | Statement::Enum(_)
-            | Statement::Namespace(_)
             | Statement::Empty
             | Statement::Break(_)
             | Statement::Continue(_)
@@ -1971,13 +2573,73 @@ impl<'a> Rewriter<'a> {
             };
             Box::new(rewritten)
         });
+        let binding = self.rewrite_pattern(&declarator.data().binding);
         self.node(
             declarator.range(),
             VariableDeclarator {
+                binding,
                 initializer,
                 ..declarator.data().clone()
             },
         )
+    }
+
+    fn rewrite_for_declaration(
+        &mut self,
+        declaration: &VariableDeclaration,
+    ) -> VariableDeclaration {
+        let declarations = declaration
+            .declarations
+            .iter()
+            .map(|declarator| self.rewrite_declarator_initializer(declarator))
+            .collect();
+        VariableDeclaration {
+            declarations,
+            ..declaration.clone()
+        }
+    }
+
+    /// A binding pattern with its defaults and computed keys rewritten.
+    fn rewrite_pattern(&mut self, pattern: &Pattern) -> Pattern {
+        let rewritten = match pattern.data() {
+            BindingPattern::Object(object) => BindingPattern::Object(ObjectBindingPattern {
+                properties: object
+                    .properties
+                    .iter()
+                    .map(|property| ObjectBindingProperty {
+                        name: self.rewrite_property_name(&property.name),
+                        binding: self.rewrite_pattern(&property.binding),
+                        initializer: property
+                            .initializer
+                            .as_deref()
+                            .map(|value| Box::new(self.rewrite_expr(value))),
+                    })
+                    .collect(),
+            }),
+            BindingPattern::Array(array) => BindingPattern::Array(ArrayBindingPattern {
+                elements: array
+                    .elements
+                    .iter()
+                    .map(|element| match element {
+                        ArrayBindingElement::Binding(binding) => {
+                            ArrayBindingElement::Binding(self.rewrite_pattern(binding))
+                        }
+                        other => other.clone(),
+                    })
+                    .collect(),
+            }),
+            BindingPattern::Rest(rest) => BindingPattern::Rest(RestBindingPattern {
+                argument: Box::new(self.rewrite_pattern(&rest.argument)),
+            }),
+            BindingPattern::Assignment(assignment) => {
+                BindingPattern::Assignment(AssignmentBindingPattern {
+                    left: Box::new(self.rewrite_pattern(&assignment.left)),
+                    right: Box::new(self.rewrite_expr(&assignment.right)),
+                })
+            }
+            BindingPattern::Identifier(_) | BindingPattern::Missing(_) => return pattern.clone(),
+        };
+        self.node(pattern.range(), rewritten)
     }
     /// Lowers a declaration whose binding carries suspensions (yield in
     /// a default or computed key). Every bound name hoists first; reads
@@ -2667,11 +3329,11 @@ impl<'a> Rewriter<'a> {
         assignment: &AssignmentExpression,
     ) -> Vec<Stmt> {
         let mut statements = Vec::new();
-        let value = if matches!(assignment.right.data(), Expression::Identifier(_)) {
-            (*assignment.right).clone()
+        let right = self.rewrite_expr(&assignment.right);
+        let value = if matches!(right.data(), Expression::Identifier(_)) {
+            right
         } else {
             let temp = self.temp_ident();
-            let right = self.rewrite_expr(&assignment.right);
             statements.push(self.make_temp_declaration(temp.clone(), right, range));
             self.node(temp.range(), Expression::Identifier(temp))
         };
@@ -2688,12 +3350,17 @@ impl<'a> Rewriter<'a> {
     ) {
         match target.data() {
             AssignmentTarget::Identifier(_) | AssignmentTarget::Member(_) => {
+                let published = self.live_exports_of(target).pop();
                 let assignment = Expression::Assignment(AssignmentExpression {
                     operator: AssignmentOperator::Assign,
-                    left: target.clone(),
+                    left: self.rewrite_assignment_target(target),
                     right: Box::new(value.clone()),
                 });
                 let expression = self.node(target.range(), assignment);
+                let expression = match published {
+                    Some((_, names)) => self.cjs_assign_exports(&names, expression, target.range()),
+                    None => expression,
+                };
                 statements.push(self.node(
                     target.range(),
                     Statement::Expression(ExpressionStatement {
@@ -2708,16 +3375,22 @@ impl<'a> Rewriter<'a> {
             }
             AssignmentTarget::Array(pattern) => {
                 for (index, element) in pattern.elements.iter().enumerate() {
-                    let AssignmentArrayElement::Target(inner) = element else {
-                        continue;
-                    };
-                    let index_expr = self.number_expr(&index.to_string());
-                    let member = self.member_expr(
-                        value,
-                        MemberProperty::Computed(Box::new(index_expr)),
-                        range,
-                    );
-                    self.assign_or_recurse(inner, member, statements, range);
+                    match element {
+                        AssignmentArrayElement::Target(inner) => {
+                            let index_expr = self.number_expr(&index.to_string());
+                            let member = self.member_expr(
+                                value,
+                                MemberProperty::Computed(Box::new(index_expr)),
+                                range,
+                            );
+                            self.assign_or_recurse(inner, member, statements, range);
+                        }
+                        AssignmentArrayElement::Rest(inner) => {
+                            let slice = self.slice_of(value, index, range);
+                            self.assign_or_recurse(inner, slice, statements, range);
+                        }
+                        AssignmentArrayElement::Elision | AssignmentArrayElement::Missing(_) => {}
+                    }
                 }
             }
             AssignmentTarget::Missing(_) => {}
@@ -2853,7 +3526,13 @@ impl<'a> Rewriter<'a> {
     }
 
     fn slice_call(&mut self, object: &IdentifierNode, start: usize, range: TextRange) -> Expr {
-        let member = self.member_ident(object, "slice", range);
+        let object = self.node(object.range(), Expression::Identifier(object.clone()));
+        self.slice_of(&object, start, range)
+    }
+
+    fn slice_of(&mut self, object: &Expr, start: usize, range: TextRange) -> Expr {
+        let property = self.ident("slice");
+        let member = self.member_expr(object, MemberProperty::Named(property), range);
         let start_expr = self.number_expr(&start.to_string());
         self.node(
             range,
@@ -3036,6 +3715,19 @@ impl<'a> Rewriter<'a> {
         let mut static_steps = Vec::new();
         let mut members = Vec::new();
         let mut constructor = None;
+        let class_has_suspending_key = class.members.iter().any(|member| {
+            let name = match member.data() {
+                ClassMember::Property(property) => Some(&property.name),
+                ClassMember::Method(method) => Some(&method.name),
+                ClassMember::AutoAccessor(accessor) => Some(&accessor.name),
+                _ => None,
+            };
+            matches!(
+                name,
+                Some(PropertyName::Computed(key))
+                    if contains_yield(key) || contains_await(key)
+            )
+        });
         let has_computed = class.members.iter().any(|member| {
             let name = match member.data() {
                 ClassMember::Property(property) => Some(&property.name),
@@ -3044,7 +3736,8 @@ impl<'a> Rewriter<'a> {
                 ClassMember::Constructor(_)
                 | ClassMember::StaticBlock(_)
                 | ClassMember::IndexSignature(_)
-                | ClassMember::Missing(_) => None,
+                | ClassMember::Missing(_)
+                | ClassMember::Semicolon => None,
             };
             name.is_some_and(|name| matches!(name, PropertyName::Computed(_)))
         });
@@ -3067,6 +3760,7 @@ impl<'a> Rewriter<'a> {
             match member.data() {
                 ClassMember::Constructor(ctor) => {
                     let mut ctor = ctor.clone();
+                    ctor.parameters = self.rewrite_parameters(&ctor.parameters);
                     let statements = self.rewrite_statements(&ctor.body.data().statements);
                     ctor.body = self.node(ctor.body.range(), Block { statements });
                     constructor = Some(self.node(member.range(), ClassMember::Constructor(ctor)));
@@ -3123,7 +3817,8 @@ impl<'a> Rewriter<'a> {
                 }
                 ClassMember::Method(method) => {
                     let mut method = method.clone();
-                    method.name = if matches!(mode, FieldMode::Native) {
+                    let hoist_all = class.extends.is_some() || class_has_suspending_key;
+                    method.name = if matches!(mode, FieldMode::Native) || !hoist_all {
                         self.rewrite_property_name(&method.name)
                     } else {
                         self.lower_class_member_name(&method.name, &mut prelude, member.range())
@@ -3154,18 +3849,28 @@ impl<'a> Rewriter<'a> {
                     members.push(self.node(member.range(), ClassMember::StaticBlock(rewritten)));
                 }
                 ClassMember::StaticBlock(block) => {
-                    let statements = self.rewrite_statements(&block.data().statements);
+                    self.expression_temp_scopes.push(Vec::new());
+                    let mut statements = self.rewrite_statements(&block.data().statements);
+                    let temps = self.expression_temp_scopes.pop().unwrap_or_default();
+                    if let Some(declaration) = self.temp_declaration(temps, block.range()) {
+                        statements.insert(0, declaration);
+                    }
                     static_steps.push(StaticStep::Block(
                         self.node(block.range(), Block { statements }),
                     ));
                 }
-                ClassMember::IndexSignature(_) | ClassMember::Missing(_) => {
+                ClassMember::IndexSignature(_)
+                | ClassMember::Missing(_)
+                | ClassMember::Semicolon => {
                     members.push(member.clone());
                 }
             }
         }
         debug_assert!(
-            !has_computed || class.extends.is_none() || !prelude.is_empty(),
+            matches!(mode, FieldMode::Native)
+                || !has_computed
+                || class.extends.is_none()
+                || !prelude.is_empty(),
             "heritage must be captured before computed keys"
         );
         if matches!(mode, FieldMode::Native) {
@@ -3291,10 +3996,12 @@ impl<'a> Rewriter<'a> {
                 } else {
                     self.syn_node(ctor.body.range(), Block { statements })
                 };
+                let parameters = self.rewrite_parameters(&ctor.parameters);
                 Some(self.syn_node(
                     existing.range(),
                     ClassMember::Constructor(ConstructorDeclaration {
                         body,
+                        parameters,
                         ..ctor.clone()
                     }),
                 ))
@@ -4670,9 +5377,15 @@ impl<'a> Rewriter<'a> {
                     debug_assert_eq!(popped, Some(depth));
                     Box::new(rewritten)
                 });
+                let depth = self.expression_temp_scopes.len();
+                self.parameter_initializer_depths.push(depth);
+                let binding = self.rewrite_pattern(&parameter.data().binding);
+                let popped = self.parameter_initializer_depths.pop();
+                debug_assert_eq!(popped, Some(depth));
                 self.node(
                     parameter.range(),
                     Parameter {
+                        binding,
                         initializer,
                         ..parameter.data().clone()
                     },
@@ -6534,6 +7247,1162 @@ impl<'a> Rewriter<'a> {
         self.node(range, Expression::Array(ArrayLiteral { elements }))
     }
 
+    fn is_class_self_reference(
+        &self,
+        id: NodeId,
+        name: &IdentifierNode,
+        original: &str,
+        class: Option<SymbolId>,
+    ) -> bool {
+        if self.identifier_name(name).as_deref() != Some(original) {
+            return false;
+        }
+        match (class, self.model.and_then(|model| model.reference(id))) {
+            (Some(expected), Some(actual)) => expected == actual,
+            _ => true,
+        }
+    }
+
+    fn rename_class_self_in_name(
+        &mut self,
+        name: PropertyName,
+        _original: &str,
+        _class: Option<SymbolId>,
+        _temp: &IdentifierNode,
+    ) -> PropertyName {
+        name
+    }
+
+    fn rename_class_self_in_members(
+        &mut self,
+        members: Vec<ClassMemberNode>,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> Vec<ClassMemberNode> {
+        members
+            .into_iter()
+            .map(|member| {
+                let (id, range) = (member.id(), member.range());
+                let data = match member.into_data() {
+                    ClassMember::Constructor(mut constructor) => {
+                        constructor.parameters = self.rename_class_self_in_parameters(
+                            constructor.parameters,
+                            original,
+                            class,
+                            temp,
+                        );
+                        constructor.decorators = self.rename_class_self_in_decorators(
+                            constructor.decorators,
+                            original,
+                            class,
+                            temp,
+                        );
+                        constructor.body = self.rename_class_self_in_block(
+                            constructor.body,
+                            original,
+                            class,
+                            temp,
+                        );
+                        ClassMember::Constructor(constructor)
+                    }
+                    ClassMember::Method(mut method) => {
+                        method.name =
+                            self.rename_class_self_in_name(method.name, original, class, temp);
+                        method.function = self.rename_class_self_in_function(
+                            method.function,
+                            original,
+                            class,
+                            temp,
+                        );
+                        ClassMember::Method(method)
+                    }
+                    ClassMember::Property(mut property) => {
+                        property.name =
+                            self.rename_class_self_in_name(property.name, original, class, temp);
+                        property.initializer = property.initializer.map(|init| {
+                            Box::new(
+                                self.rename_class_self_in_expression(*init, original, class, temp),
+                            )
+                        });
+                        ClassMember::Property(property)
+                    }
+                    ClassMember::AutoAccessor(mut accessor) => {
+                        accessor.name =
+                            self.rename_class_self_in_name(accessor.name, original, class, temp);
+                        accessor.initializer = accessor.initializer.map(|init| {
+                            Box::new(
+                                self.rename_class_self_in_expression(*init, original, class, temp),
+                            )
+                        });
+                        ClassMember::AutoAccessor(accessor)
+                    }
+                    ClassMember::StaticBlock(block) => ClassMember::StaticBlock(
+                        self.rename_class_self_in_block(block, original, class, temp),
+                    ),
+                    other => other,
+                };
+                Node::new(id, range, data)
+            })
+            .collect()
+    }
+
+    fn rename_class_self_in_decorators(
+        &mut self,
+        decorators: Vec<DecoratorNode>,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> Vec<DecoratorNode> {
+        decorators
+            .into_iter()
+            .map(|decorator| {
+                let (id, range) = (decorator.id(), decorator.range());
+                let mut decorator = decorator.into_data();
+                decorator.expression = Box::new(self.rename_class_self_in_expression(
+                    *decorator.expression,
+                    original,
+                    class,
+                    temp,
+                ));
+                Node::new(id, range, decorator)
+            })
+            .collect()
+    }
+
+    fn rename_class_self_in_function(
+        &mut self,
+        mut function: FunctionLike,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> FunctionLike {
+        function.decorators =
+            self.rename_class_self_in_decorators(function.decorators, original, class, temp);
+        function.parameters =
+            self.rename_class_self_in_parameters(function.parameters, original, class, temp);
+        function.body = function.body.map(|body| match body {
+            FunctionBody::Block(block) => {
+                FunctionBody::Block(self.rename_class_self_in_block(block, original, class, temp))
+            }
+            FunctionBody::Expression(expression) => FunctionBody::Expression(Box::new(
+                self.rename_class_self_in_expression(*expression, original, class, temp),
+            )),
+            FunctionBody::Missing(missing) => FunctionBody::Missing(missing),
+        });
+        function
+    }
+
+    fn rename_class_self_in_parameters(
+        &mut self,
+        parameters: Vec<ParameterNode>,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> Vec<ParameterNode> {
+        parameters
+            .into_iter()
+            .map(|parameter| {
+                let (id, range) = (parameter.id(), parameter.range());
+                let mut parameter = parameter.into_data();
+                parameter.decorators = self.rename_class_self_in_decorators(
+                    parameter.decorators,
+                    original,
+                    class,
+                    temp,
+                );
+                parameter.binding =
+                    self.rename_class_self_in_pattern(parameter.binding, original, class, temp);
+                parameter.initializer = parameter.initializer.map(|init| {
+                    Box::new(self.rename_class_self_in_expression(*init, original, class, temp))
+                });
+                Node::new(id, range, parameter)
+            })
+            .collect()
+    }
+
+    fn rename_class_self_in_pattern(
+        &mut self,
+        pattern: Pattern,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> Pattern {
+        let (id, range) = (pattern.id(), pattern.range());
+        let data = match pattern.into_data() {
+            BindingPattern::Object(object) => BindingPattern::Object(ObjectBindingPattern {
+                properties: object
+                    .properties
+                    .into_iter()
+                    .map(|mut property| {
+                        property.name =
+                            self.rename_class_self_in_name(property.name, original, class, temp);
+                        property.binding = self.rename_class_self_in_pattern(
+                            property.binding,
+                            original,
+                            class,
+                            temp,
+                        );
+                        property.initializer = property.initializer.map(|init| {
+                            Box::new(
+                                self.rename_class_self_in_expression(*init, original, class, temp),
+                            )
+                        });
+                        property
+                    })
+                    .collect(),
+            }),
+            BindingPattern::Array(array) => BindingPattern::Array(ArrayBindingPattern {
+                elements: array
+                    .elements
+                    .into_iter()
+                    .map(|element| match element {
+                        ArrayBindingElement::Binding(binding) => ArrayBindingElement::Binding(
+                            self.rename_class_self_in_pattern(binding, original, class, temp),
+                        ),
+                        other => other,
+                    })
+                    .collect(),
+            }),
+            BindingPattern::Rest(rest) => BindingPattern::Rest(RestBindingPattern {
+                argument: Box::new(self.rename_class_self_in_pattern(
+                    *rest.argument,
+                    original,
+                    class,
+                    temp,
+                )),
+            }),
+            BindingPattern::Assignment(assignment) => {
+                BindingPattern::Assignment(AssignmentBindingPattern {
+                    left: Box::new(self.rename_class_self_in_pattern(
+                        *assignment.left,
+                        original,
+                        class,
+                        temp,
+                    )),
+                    right: Box::new(self.rename_class_self_in_expression(
+                        *assignment.right,
+                        original,
+                        class,
+                        temp,
+                    )),
+                })
+            }
+            other => other,
+        };
+        Node::new(id, range, data)
+    }
+
+    fn rename_class_self_in_block(
+        &mut self,
+        block: BlockNode,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> BlockNode {
+        let (id, range) = (block.id(), block.range());
+        let statements = self.rename_class_self_in_statements(
+            block.into_data().statements,
+            original,
+            class,
+            temp,
+        );
+        Node::new(id, range, Block { statements })
+    }
+
+    fn rename_class_self_in_statements(
+        &mut self,
+        statements: Vec<Stmt>,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> Vec<Stmt> {
+        statements
+            .into_iter()
+            .map(|statement| {
+                let (id, range) = (statement.id(), statement.range());
+                let data = match statement.into_data() {
+                    Statement::Expression(value) => Statement::Expression(ExpressionStatement {
+                        expression: Box::new(self.rename_class_self_in_expression(
+                            *value.expression,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::Variable(declaration) => Statement::Variable(VariableDeclaration {
+                        declarations: declaration
+                            .declarations
+                            .into_iter()
+                            .map(|declarator| {
+                                let (id, range) = (declarator.id(), declarator.range());
+                                let mut declarator = declarator.into_data();
+                                declarator.binding = self.rename_class_self_in_pattern(
+                                    declarator.binding,
+                                    original,
+                                    class,
+                                    temp,
+                                );
+                                declarator.initializer = declarator.initializer.map(|init| {
+                                    Box::new(self.rename_class_self_in_expression(
+                                        *init, original, class, temp,
+                                    ))
+                                });
+                                Node::new(id, range, declarator)
+                            })
+                            .collect(),
+                        ..declaration
+                    }),
+                    Statement::Function(declaration) => Statement::Function(FunctionDeclaration {
+                        function: self.rename_class_self_in_function(
+                            declaration.function,
+                            original,
+                            class,
+                            temp,
+                        ),
+                    }),
+                    Statement::Class(mut declaration) => {
+                        declaration.members = self.rename_class_self_in_members(
+                            declaration.members,
+                            original,
+                            class,
+                            temp,
+                        );
+                        declaration.extends = declaration.extends.map(|mut heritage| {
+                            heritage.expression = Box::new(self.rename_class_self_in_expression(
+                                *heritage.expression,
+                                original,
+                                class,
+                                temp,
+                            ));
+                            heritage
+                        });
+                        Statement::Class(declaration)
+                    }
+                    Statement::Block(block) => Statement::Block(
+                        self.rename_class_self_in_block(block, original, class, temp),
+                    ),
+                    Statement::If(value) => {
+                        Statement::If(IfStatement {
+                            test: Box::new(self.rename_class_self_in_expression(
+                                *value.test,
+                                original,
+                                class,
+                                temp,
+                            )),
+                            consequent: Box::new(self.rename_class_self_in_statement(
+                                *value.consequent,
+                                original,
+                                class,
+                                temp,
+                            )),
+                            alternate: value.alternate.map(|alternate| {
+                                Box::new(self.rename_class_self_in_statement(
+                                    *alternate, original, class, temp,
+                                ))
+                            }),
+                        })
+                    }
+                    Statement::Switch(value) => Statement::Switch(SwitchStatement {
+                        discriminant: Box::new(self.rename_class_self_in_expression(
+                            *value.discriminant,
+                            original,
+                            class,
+                            temp,
+                        )),
+                        cases: value
+                            .cases
+                            .into_iter()
+                            .map(|case| {
+                                let (id, range) = (case.id(), case.range());
+                                let mut case = case.into_data();
+                                case.test = case.test.map(|test| {
+                                    Box::new(self.rename_class_self_in_expression(
+                                        *test, original, class, temp,
+                                    ))
+                                });
+                                case.consequent = self.rename_class_self_in_statements(
+                                    case.consequent,
+                                    original,
+                                    class,
+                                    temp,
+                                );
+                                Node::new(id, range, case)
+                            })
+                            .collect(),
+                    }),
+                    Statement::For(value) => Statement::For(ForStatement {
+                        initializer: value.initializer.map(|initializer| match initializer {
+                            ForInitializer::Variable(declaration) => {
+                                ForInitializer::Variable(VariableDeclaration {
+                                    declarations: declaration
+                                        .declarations
+                                        .into_iter()
+                                        .map(|declarator| {
+                                            let (id, range) = (declarator.id(), declarator.range());
+                                            let mut declarator = declarator.into_data();
+                                            declarator.binding = self.rename_class_self_in_pattern(
+                                                declarator.binding,
+                                                original,
+                                                class,
+                                                temp,
+                                            );
+                                            declarator.initializer =
+                                                declarator.initializer.map(|init| {
+                                                    Box::new(self.rename_class_self_in_expression(
+                                                        *init, original, class, temp,
+                                                    ))
+                                                });
+                                            Node::new(id, range, declarator)
+                                        })
+                                        .collect(),
+                                    ..declaration
+                                })
+                            }
+                            ForInitializer::Expression(expression) => ForInitializer::Expression(
+                                Box::new(self.rename_class_self_in_expression(
+                                    *expression,
+                                    original,
+                                    class,
+                                    temp,
+                                )),
+                            ),
+                        }),
+                        test: value.test.map(|test| {
+                            Box::new(
+                                self.rename_class_self_in_expression(*test, original, class, temp),
+                            )
+                        }),
+                        update: value.update.map(|update| {
+                            Box::new(
+                                self.rename_class_self_in_expression(
+                                    *update, original, class, temp,
+                                ),
+                            )
+                        }),
+                        body: Box::new(self.rename_class_self_in_statement(
+                            *value.body,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::ForIn(value) => Statement::ForIn(ForInStatement {
+                        binding: self.rename_class_self_in_for_binding(
+                            value.binding,
+                            original,
+                            class,
+                            temp,
+                        ),
+                        object: Box::new(self.rename_class_self_in_expression(
+                            *value.object,
+                            original,
+                            class,
+                            temp,
+                        )),
+                        body: Box::new(self.rename_class_self_in_statement(
+                            *value.body,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::ForOf(value) => Statement::ForOf(ForOfStatement {
+                        mode: value.mode,
+                        binding: self.rename_class_self_in_for_binding(
+                            value.binding,
+                            original,
+                            class,
+                            temp,
+                        ),
+                        iterable: Box::new(self.rename_class_self_in_expression(
+                            *value.iterable,
+                            original,
+                            class,
+                            temp,
+                        )),
+                        body: Box::new(self.rename_class_self_in_statement(
+                            *value.body,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::While(value) => Statement::While(WhileStatement {
+                        test: Box::new(self.rename_class_self_in_expression(
+                            *value.test,
+                            original,
+                            class,
+                            temp,
+                        )),
+                        body: Box::new(self.rename_class_self_in_statement(
+                            *value.body,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::DoWhile(value) => Statement::DoWhile(DoWhileStatement {
+                        body: Box::new(self.rename_class_self_in_statement(
+                            *value.body,
+                            original,
+                            class,
+                            temp,
+                        )),
+                        test: Box::new(self.rename_class_self_in_expression(
+                            *value.test,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::Try(value) => Statement::Try(TryStatement {
+                        block: self.rename_class_self_in_block(value.block, original, class, temp),
+                        handler: value.handler.map(|handler| {
+                            let (id, range) = (handler.id(), handler.range());
+                            let mut handler = handler.into_data();
+                            handler.binding = handler.binding.map(|binding| {
+                                self.rename_class_self_in_pattern(binding, original, class, temp)
+                            });
+                            handler.body = self.rename_class_self_in_block(
+                                handler.body,
+                                original,
+                                class,
+                                temp,
+                            );
+                            Node::new(id, range, handler)
+                        }),
+                        finalizer: value.finalizer.map(|finalizer| {
+                            self.rename_class_self_in_block(finalizer, original, class, temp)
+                        }),
+                    }),
+                    Statement::With(value) => Statement::With(WithStatement {
+                        object: Box::new(self.rename_class_self_in_expression(
+                            *value.object,
+                            original,
+                            class,
+                            temp,
+                        )),
+                        body: Box::new(self.rename_class_self_in_statement(
+                            *value.body,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::Labeled(value) => Statement::Labeled(LabeledStatement {
+                        label: value.label,
+                        body: Box::new(self.rename_class_self_in_statement(
+                            *value.body,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::Return(value) => {
+                        Statement::Return(ReturnStatement {
+                            argument: value.argument.map(|argument| {
+                                Box::new(self.rename_class_self_in_expression(
+                                    *argument, original, class, temp,
+                                ))
+                            }),
+                        })
+                    }
+                    Statement::Throw(value) => Statement::Throw(ThrowStatement {
+                        argument: Box::new(self.rename_class_self_in_expression(
+                            *value.argument,
+                            original,
+                            class,
+                            temp,
+                        )),
+                    }),
+                    Statement::Namespace(mut declaration) => {
+                        declaration.body = self.rename_class_self_in_block(
+                            declaration.body,
+                            original,
+                            class,
+                            temp,
+                        );
+                        Statement::Namespace(declaration)
+                    }
+                    Statement::Enum(mut declaration) => {
+                        declaration.members = declaration
+                            .members
+                            .into_iter()
+                            .map(|member| {
+                                let (id, range) = (member.id(), member.range());
+                                let mut member = member.into_data();
+                                member.initializer = member.initializer.map(|init| {
+                                    Box::new(self.rename_class_self_in_expression(
+                                        *init, original, class, temp,
+                                    ))
+                                });
+                                Node::new(id, range, member)
+                            })
+                            .collect();
+                        Statement::Enum(declaration)
+                    }
+                    Statement::Declare(inner) => Statement::Declare(Box::new(
+                        self.rename_class_self_in_statement(*inner, original, class, temp),
+                    )),
+                    other => other,
+                };
+                Node::new(id, range, data)
+            })
+            .collect()
+    }
+
+    fn rename_class_self_in_statement(
+        &mut self,
+        statement: Stmt,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> Stmt {
+        let mut renamed =
+            self.rename_class_self_in_statements(vec![statement], original, class, temp);
+        match renamed.pop() {
+            Some(statement) => statement,
+            None => unreachable!("renaming preserves statement count"),
+        }
+    }
+
+    fn rename_class_self_in_for_binding(
+        &mut self,
+        binding: ForBinding,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> ForBinding {
+        match binding {
+            ForBinding::Variable(declaration) => ForBinding::Variable(VariableDeclaration {
+                declarations: declaration
+                    .declarations
+                    .into_iter()
+                    .map(|declarator| {
+                        let (id, range) = (declarator.id(), declarator.range());
+                        let mut declarator = declarator.into_data();
+                        declarator.binding = self.rename_class_self_in_pattern(
+                            declarator.binding,
+                            original,
+                            class,
+                            temp,
+                        );
+                        declarator.initializer = declarator.initializer.map(|init| {
+                            Box::new(
+                                self.rename_class_self_in_expression(*init, original, class, temp),
+                            )
+                        });
+                        Node::new(id, range, declarator)
+                    })
+                    .collect(),
+                ..declaration
+            }),
+            ForBinding::Target(target) => {
+                ForBinding::Target(self.rename_class_self_in_target(target, original, class, temp))
+            }
+        }
+    }
+
+    fn rename_class_self_in_target(
+        &mut self,
+        target: AssignmentTargetNode,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> AssignmentTargetNode {
+        let (id, range) = (target.id(), target.range());
+        let data = match target.into_data() {
+            AssignmentTarget::Identifier(name) => {
+                if self.is_class_self_reference(id, &name, original, class) {
+                    AssignmentTarget::Identifier(temp.clone())
+                } else {
+                    AssignmentTarget::Identifier(name)
+                }
+            }
+            AssignmentTarget::Member(member) => AssignmentTarget::Member(AssignmentMemberTarget {
+                object: Box::new(self.rename_class_self_in_expression(
+                    *member.object,
+                    original,
+                    class,
+                    temp,
+                )),
+                property: match member.property {
+                    MemberProperty::Computed(key) => MemberProperty::Computed(Box::new(
+                        self.rename_class_self_in_expression(*key, original, class, temp),
+                    )),
+                    other => other,
+                },
+            }),
+            AssignmentTarget::Invalid(expression) => AssignmentTarget::Invalid(Box::new(
+                self.rename_class_self_in_expression(*expression, original, class, temp),
+            )),
+            other => other,
+        };
+        Node::new(id, range, data)
+    }
+
+    fn rename_class_self_in_expression(
+        &mut self,
+        expression: Expr,
+        original: &str,
+        class: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> Expr {
+        let (id, range) = (expression.id(), expression.range());
+        let data = match expression.into_data() {
+            Expression::Identifier(name) => {
+                if self.is_class_self_reference(id, &name, original, class) {
+                    Expression::Identifier(temp.clone())
+                } else {
+                    Expression::Identifier(name)
+                }
+            }
+            Expression::Template(template) => {
+                Expression::Template(TemplateLiteral {
+                    expressions: template
+                        .expressions
+                        .into_iter()
+                        .map(|element| {
+                            self.rename_class_self_in_expression(element, original, class, temp)
+                        })
+                        .collect(),
+                    ..template
+                })
+            }
+            Expression::TaggedTemplate(tagged) => {
+                Expression::TaggedTemplate(TaggedTemplateExpression {
+                    tag: Box::new(self.rename_class_self_in_expression(
+                        *tagged.tag,
+                        original,
+                        class,
+                        temp,
+                    )),
+                    template: TemplateLiteral {
+                        expressions: tagged
+                            .template
+                            .expressions
+                            .into_iter()
+                            .map(|element| {
+                                self.rename_class_self_in_expression(element, original, class, temp)
+                            })
+                            .collect(),
+                        ..tagged.template
+                    },
+                })
+            }
+            Expression::Array(array) => Expression::Array(ArrayLiteral {
+                elements: array
+                    .elements
+                    .into_iter()
+                    .map(|element| match element {
+                        ArrayElement::Expression(element) => ArrayElement::Expression(Box::new(
+                            self.rename_class_self_in_expression(
+                                *element, original, class, temp,
+                            ),
+                        )),
+                        ArrayElement::Spread(spread) => ArrayElement::Spread(SpreadElement {
+                            argument: Box::new(self.rename_class_self_in_expression(
+                                *spread.argument,
+                                original,
+                                class,
+                                temp,
+                            )),
+                        }),
+                        other => other,
+                    })
+                    .collect(),
+            }),
+            Expression::Object(object) => Expression::Object(ObjectLiteral {
+                members: object
+                    .members
+                    .into_iter()
+                    .map(|member| {
+                        let (id, range) = (member.id(), member.range());
+                        let data = match member.into_data() {
+                            ObjectMember::Property(mut property) => {
+                                if property.shorthand
+                                    && matches!(property.value.data(), Expression::Identifier(name) if self.is_class_self_reference(property.value.id(), name, original, class))
+                                {
+                                    property.shorthand = false;
+                                }
+                                property.name = self.rename_class_self_in_name(
+                                    property.name,
+                                    original,
+                                    class,
+                                    temp,
+                                );
+                                property.value = Box::new(
+                                    self.rename_class_self_in_expression(
+                                        *property.value,
+                                        original,
+                                        class,
+                                        temp,
+                                    ),
+                                );
+                                ObjectMember::Property(property)
+                            }
+                            ObjectMember::Method(method) => {
+                                ObjectMember::Method(ObjectMethod {
+                                    name: self.rename_class_self_in_name(
+                                        method.name,
+                                        original,
+                                        class,
+                                        temp,
+                                    ),
+                                    function: self.rename_class_self_in_function(
+                                        method.function,
+                                        original,
+                                        class,
+                                        temp,
+                                    ),
+                                    ..method
+                                })
+                            }
+                            ObjectMember::Spread(spread) => {
+                                ObjectMember::Spread(SpreadElement {
+                                    argument: Box::new(
+                                        self.rename_class_self_in_expression(
+                                            *spread.argument,
+                                            original,
+                                            class,
+                                            temp,
+                                        ),
+                                    ),
+                                })
+                            }
+                            other => other,
+                        };
+                        Node::new(id, range, data)
+                    })
+                    .collect(),
+            }),
+            Expression::Function(function) => Expression::Function(FunctionExpression {
+                function: self.rename_class_self_in_function(
+                    function.function,
+                    original,
+                    class,
+                    temp,
+                ),
+            }),
+            Expression::Class(nested) => Expression::Class(ClassExpression {
+                class: self.rename_class_self_in_nested_class(nested.class, original, class, temp),
+            }),
+            Expression::Arrow(arrow) => Expression::Arrow(ArrowFunction {
+                parameters: self.rename_class_self_in_parameters(
+                    arrow.parameters,
+                    original,
+                    class,
+                    temp,
+                ),
+                body: match arrow.body {
+                    FunctionBody::Block(block) => FunctionBody::Block(
+                        self.rename_class_self_in_block(block, original, class, temp),
+                    ),
+                    FunctionBody::Expression(expression) => FunctionBody::Expression(Box::new(
+                        self.rename_class_self_in_expression(*expression, original, class, temp),
+                    )),
+                    FunctionBody::Missing(missing) => FunctionBody::Missing(missing),
+                },
+                ..arrow
+            }),
+            Expression::Call(call) => Expression::Call(CallExpression {
+                callee: Box::new(self.rename_class_self_in_expression(
+                    *call.callee,
+                    original,
+                    class,
+                    temp,
+                )),
+                arguments: call
+                    .arguments
+                    .into_iter()
+                    .map(|argument| match argument {
+                        CallArgument::Expression(value) => CallArgument::Expression(Box::new(
+                            self.rename_class_self_in_expression(*value, original, class, temp),
+                        )),
+                        CallArgument::Spread(spread) => CallArgument::Spread(SpreadElement {
+                            argument: Box::new(self.rename_class_self_in_expression(
+                                *spread.argument,
+                                original,
+                                class,
+                                temp,
+                            )),
+                        }),
+                        other => other,
+                    })
+                    .collect(),
+                ..call
+            }),
+            Expression::Member(member) => Expression::Member(MemberExpression {
+                object: Box::new(self.rename_class_self_in_expression(
+                    *member.object,
+                    original,
+                    class,
+                    temp,
+                )),
+                property: match member.property {
+                    MemberProperty::Computed(key) => MemberProperty::Computed(Box::new(
+                        self.rename_class_self_in_expression(*key, original, class, temp),
+                    )),
+                    other => other,
+                },
+                ..member
+            }),
+            Expression::New(call) => Expression::New(NewExpression {
+                callee: Box::new(self.rename_class_self_in_expression(
+                    *call.callee,
+                    original,
+                    class,
+                    temp,
+                )),
+                arguments: call
+                    .arguments
+                    .into_iter()
+                    .map(|argument| match argument {
+                        CallArgument::Expression(value) => CallArgument::Expression(Box::new(
+                            self.rename_class_self_in_expression(*value, original, class, temp),
+                        )),
+                        CallArgument::Spread(spread) => CallArgument::Spread(SpreadElement {
+                            argument: Box::new(self.rename_class_self_in_expression(
+                                *spread.argument,
+                                original,
+                                class,
+                                temp,
+                            )),
+                        }),
+                        other => other,
+                    })
+                    .collect(),
+                ..call
+            }),
+            Expression::Await(awaited) => Expression::Await(AwaitExpression {
+                argument: Box::new(self.rename_class_self_in_expression(
+                    *awaited.argument,
+                    original,
+                    class,
+                    temp,
+                )),
+            }),
+            Expression::Yield(yielded) => Expression::Yield(YieldExpression {
+                argument: yielded.argument.map(|argument| {
+                    Box::new(
+                        self.rename_class_self_in_expression(*argument, original, class, temp),
+                    )
+                }),
+                ..yielded
+            }),
+            Expression::Unary(unary) => Expression::Unary(UnaryExpression {
+                argument: Box::new(self.rename_class_self_in_expression(
+                    *unary.argument,
+                    original,
+                    class,
+                    temp,
+                )),
+                ..unary
+            }),
+            Expression::Update(update) => Expression::Update(UpdateExpression {
+                argument: Box::new(
+                    self.rename_class_self_in_target(*update.argument, original, class, temp),
+                ),
+                ..update
+            }),
+            Expression::Binary(binary) => Expression::Binary(BinaryExpression {
+                left: Box::new(self.rename_class_self_in_expression(
+                    *binary.left,
+                    original,
+                    class,
+                    temp,
+                )),
+                right: Box::new(self.rename_class_self_in_expression(
+                    *binary.right,
+                    original,
+                    class,
+                    temp,
+                )),
+                ..binary
+            }),
+            Expression::Logical(logical) => Expression::Logical(LogicalExpression {
+                left: Box::new(self.rename_class_self_in_expression(
+                    *logical.left,
+                    original,
+                    class,
+                    temp,
+                )),
+                right: Box::new(self.rename_class_self_in_expression(
+                    *logical.right,
+                    original,
+                    class,
+                    temp,
+                )),
+                ..logical
+            }),
+            Expression::Conditional(conditional) => {
+                Expression::Conditional(ConditionalExpression {
+                    test: Box::new(self.rename_class_self_in_expression(
+                        *conditional.test,
+                        original,
+                        class,
+                        temp,
+                    )),
+                    consequent: Box::new(self.rename_class_self_in_expression(
+                        *conditional.consequent,
+                        original,
+                        class,
+                        temp,
+                    )),
+                    alternate: Box::new(self.rename_class_self_in_expression(
+                        *conditional.alternate,
+                        original,
+                        class,
+                        temp,
+                    )),
+                })
+            }
+            Expression::Assignment(assignment) => Expression::Assignment(AssignmentExpression {
+                left: self.rename_class_self_in_target(assignment.left, original, class, temp),
+                right: Box::new(self.rename_class_self_in_expression(
+                    *assignment.right,
+                    original,
+                    class,
+                    temp,
+                )),
+                ..assignment
+            }),
+            Expression::Sequence(sequence) => Expression::Sequence(SequenceExpression {
+                expressions: sequence
+                    .expressions
+                    .into_iter()
+                    .map(|element| {
+                        self.rename_class_self_in_expression(element, original, class, temp)
+                    })
+                    .collect(),
+            }),
+            Expression::Parenthesized(inner) => Expression::Parenthesized(Box::new(
+                self.rename_class_self_in_expression(*inner, original, class, temp),
+            )),
+            Expression::As(cast) => Expression::As(AsExpression {
+                expression: Box::new(self.rename_class_self_in_expression(
+                    *cast.expression,
+                    original,
+                    class,
+                    temp,
+                )),
+                ..cast
+            }),
+            Expression::Satisfies(satisfies) => Expression::Satisfies(SatisfiesExpression {
+                expression: Box::new(self.rename_class_self_in_expression(
+                    *satisfies.expression,
+                    original,
+                    class,
+                    temp,
+                )),
+                ..satisfies
+            }),
+            Expression::TypeAssertion(assertion) => {
+                Expression::TypeAssertion(TypeAssertionExpression {
+                    expression: Box::new(self.rename_class_self_in_expression(
+                        *assertion.expression,
+                        original,
+                        class,
+                        temp,
+                    )),
+                    ..assertion
+                })
+            }
+            Expression::NonNull(assertion) => Expression::NonNull(NonNullExpression {
+                expression: Box::new(self.rename_class_self_in_expression(
+                    *assertion.expression,
+                    original,
+                    class,
+                    temp,
+                )),
+            }),
+            Expression::Import(import) => Expression::Import(ImportExpression {
+                source: Box::new(self.rename_class_self_in_expression(
+                    *import.source,
+                    original,
+                    class,
+                    temp,
+                )),
+                options: import.options.map(|options| {
+                    Box::new(
+                        self.rename_class_self_in_expression(*options, original, class, temp),
+                    )
+                }),
+            }),
+            other => other,
+        };
+        Node::new(id, range, data)
+    }
+
+    fn rename_class_self_in_nested_class(
+        &mut self,
+        mut class: ClassDeclaration,
+        original: &str,
+        class_symbol: Option<SymbolId>,
+        temp: &IdentifierNode,
+    ) -> ClassDeclaration {
+        class.members =
+            self.rename_class_self_in_members(class.members, original, class_symbol, temp);
+        class.extends = class.extends.map(|mut heritage| {
+            heritage.expression = Box::new(self.rename_class_self_in_expression(
+                *heritage.expression,
+                original,
+                class_symbol,
+                temp,
+            ));
+            heritage
+        });
+        class
+    }
+
+    fn class_needs_static_temp(class: &ClassDeclaration, mode: FieldMode) -> bool {
+        class.members.iter().any(|member| match member.data() {
+            ClassMember::StaticBlock(_) => true,
+            ClassMember::Property(property) => {
+                property.modifiers.is_static
+                    && !property.modifiers.is_declare
+                    && !property.modifiers.is_abstract
+                    && !matches!(property.name, PropertyName::Private(_))
+                    && (!matches!(mode, FieldMode::Assign) || property.initializer.is_some())
+            }
+            _ => false,
+        })
+    }
+
+    fn sequence_part(&mut self, statement: Stmt) -> Expr {
+        match statement.into_data() {
+            Statement::Expression(value) => *value.expression,
+            Statement::Variable(declaration) => {
+                let mut declarations = declaration.declarations;
+                if declarations.len() == 1
+                    && let Some(declarator) = declarations.pop()
+                {
+                    let range = declarator.range();
+                    if let VariableDeclarator {
+                        binding,
+                        initializer: Some(init),
+                        ..
+                    } = declarator.into_data()
+                        && let BindingPattern::Identifier(name) = binding.into_data()
+                    {
+                        let left = self.syn_node(name.range(), AssignmentTarget::Identifier(name));
+                        return self.syn_node(
+                            range,
+                            Expression::Assignment(AssignmentExpression {
+                                operator: AssignmentOperator::Assign,
+                                left,
+                                right: init,
+                            }),
+                        );
+                    }
+                }
+                unreachable!("class lowering sequences single declarator temps");
+            }
+            _ => unreachable!("class lowering sequences expression statements"),
+        }
+    }
+
     fn lower_class_expression(
         &mut self,
         expression: &Expr,
@@ -6552,14 +8421,29 @@ impl<'a> Rewriter<'a> {
                 child_marked,
             );
         }
-        let temp = self.temp_ident();
-        let mut lowered =
-            self.lower_class(&class_expression.class, expression.range(), Some(&temp));
+        let hoists_statics = Self::class_needs_static_temp(
+            &class_expression.class,
+            FieldMode::for_options(self.options),
+        );
+        let temp = self.namespace_temp();
+        let mut class = class_expression.class.clone();
+        if hoists_statics
+            && let Some(name) = class.name.as_ref()
+            && let Some(original) = self.identifier_name(name)
+        {
+            let class_symbol = self.model.and_then(|model| model.reference(name.id()));
+            class.members =
+                self.rename_class_self_in_members(class.members, &original, class_symbol, &temp);
+        }
+        let mut lowered = self.lower_class(&class, expression.range(), Some(&temp));
         // Nothing needed the temp — no field statements, computed keys,
         // heritage temps, or static steps — so tsc keeps the class
         // expression inline (classExpressionTest2 emits `var m = class C {`
-        // with type parameters stripped, never a temp IIFE).
+        // with type parameters stripped, with no hoisted temp).
         if lowered.prelude.is_empty() && lowered.postlude.is_empty() {
+            if let Some(scope) = self.expression_temp_scopes.last_mut() {
+                scope.retain(|candidate| candidate.id() != temp.id());
+            }
             let child_marked = self.any_marked(lowered.class.members.iter().map(|m| m.id()));
             return self.wrap_marked(
                 expression.range(),
@@ -6569,15 +8453,12 @@ impl<'a> Rewriter<'a> {
                 child_marked,
             );
         }
-        // A suspending computed key cannot live inside the IIFE: the
-        // arrow is a plain function, so a yield there is a SyntaxError
-        // (tsc 6.0.2 emits exactly that broken shape). Where the caller
-        // drains key_prelude into an enclosing statement list, the
-        // suspending key temps hoist out and the machine splits them;
-        // expression contexts cannot hoist, so they keep the IIFE and
-        // signal the requires-es2015 refusal instead of breaking
-        // silently. Static-field postludes reference the constructed
-        // temp and can never hoist; they refuse the same way.
+        // A suspending computed key cannot hoist out of an expression, so
+        // expression contexts refuse the conversion loudly instead of
+        // breaking silently. Where the caller drains key_prelude into an
+        // enclosing statement list, the suspending key temps hoist out and
+        // the machine splits them; static-field postludes reference the
+        // constructed temp and can never hoist, so they refuse the same way.
         // Whole-prelude move only: partitioning the prelude would
         // reorder mixed suspending and clean keys, and computed keys
         // evaluate in member order. Entries never reference the class
@@ -6604,11 +8485,7 @@ impl<'a> Rewriter<'a> {
             // Returning the unlowered class keeps the failure loud and
             // honest: the machine's class walker (heritage, computed
             // names, field initializers) sees the suspension, refuses
-            // the conversion, and the generator stays native under the
-            // diagnostic. Lowering anyway would bury a raw yield or
-            // await inside a synthesized plain arrow the machine
-            // cannot see through - the postlude (static-field
-            // initializers) included, not just the key prelude.
+            // the conversion, and the generator stays native.
             return expression.clone();
         }
         let class = self.syn_node(
@@ -6617,58 +8494,32 @@ impl<'a> Rewriter<'a> {
                 class: lowered.class,
             }),
         );
-        let declaration = self.make_declarator(temp.clone(), Some(class), expression.range());
-        lowered.prelude.push(self.syn_node(
-            expression.range(),
-            Statement::Variable(VariableDeclaration {
-                range: expression.range(),
-                kind: if self.options.target >= ScriptTarget::Es2015 {
-                    VariableKind::Let
-                } else {
-                    VariableKind::Var
-                },
-                declarations: vec![declaration],
-            }),
-        ));
-        if class_expression.class.name.is_none() {
-            lowered.prelude.push(self.restore_class_name(
-                &temp,
-                inferred_name.unwrap_or(""),
-                expression.range(),
-            ));
+        if class_expression.class.name.is_none()
+            && let Some(inferred) = inferred_name
+        {
+            lowered.postlude.insert(
+                0,
+                self.restore_class_name(&temp, inferred, expression.range()),
+            );
         }
-        lowered.prelude.extend(lowered.postlude);
-        let result = self.syn_node(temp.range(), Expression::Identifier(temp));
-        lowered.prelude.push(self.syn_node(
-            expression.range(),
-            Statement::Return(ReturnStatement {
-                argument: Some(Box::new(result)),
-            }),
-        ));
-        let body = self.syn_node(
-            expression.range(),
-            Block {
-                statements: lowered.prelude,
-            },
+        let mut parts = Vec::with_capacity(lowered.prelude.len() + lowered.postlude.len() + 2);
+        parts.extend(
+            lowered
+                .prelude
+                .into_iter()
+                .map(|statement| self.sequence_part(statement)),
         );
-        let arrow = self.syn_node(
-            expression.range(),
-            Expression::Arrow(ArrowFunction {
-                is_async: false,
-                type_parameters: None,
-                parameters: Vec::new(),
-                return_type: None,
-                body: FunctionBody::Block(body),
-            }),
+        parts.push(self.store_temp(&temp, class, expression.range()));
+        parts.extend(
+            lowered
+                .postlude
+                .into_iter()
+                .map(|statement| self.sequence_part(statement)),
         );
+        parts.push(self.syn_node(temp.range(), Expression::Identifier(temp.clone())));
         self.syn_node(
             expression.range(),
-            Expression::Call(CallExpression {
-                callee: Box::new(arrow),
-                optional: false,
-                type_arguments: None,
-                arguments: Vec::new(),
-            }),
+            Expression::Sequence(SequenceExpression { expressions: parts }),
         )
     }
 
@@ -6687,6 +8538,96 @@ impl<'a> Rewriter<'a> {
             .collect()
     }
     fn rewrite_expr(&mut self, expression: &Expr) -> Expr {
+        let rewritten = self.rewrite_expression(expression);
+        if self
+            .cjs
+            .as_ref()
+            .is_some_and(|plan| !plan.live_locals.is_empty())
+        {
+            return self.publish_local_writes(expression, rewritten);
+        }
+        rewritten
+    }
+    fn rewrite_binary_spine(&mut self, expression: &Expr) -> Expr {
+        let mut operators = Vec::new();
+        let mut ranges = Vec::new();
+        let mut rights = Vec::new();
+        let mut current = expression;
+        loop {
+            match current.data() {
+                Expression::Binary(value) => {
+                    operators.push(value.operator);
+                    ranges.push(current.range());
+                    rights.push(&*value.right);
+                    current = &value.left;
+                }
+                _ => break,
+            }
+        }
+        let mut rebuilt = self.rewrite_expr(current);
+        for index in (0..operators.len()).rev() {
+            let right = self.rewrite_expr(rights[index]);
+            let operator = operators[index];
+            let range = ranges[index];
+            if operator == BinaryOperator::Exponentiate
+                && Self::needs(LanguageFeature::Exponentiation, self.options)
+            {
+                rebuilt = self.math_pow(rebuilt, right, range);
+                continue;
+            }
+            rebuilt = self.node(
+                range,
+                Expression::Binary(BinaryExpression {
+                    operator,
+                    left: Box::new(rebuilt),
+                    right: Box::new(right),
+                }),
+            );
+        }
+        rebuilt
+    }
+
+    fn rewrite_logical_spine(&mut self, expression: &Expr) -> Expr {
+        let mut operators = Vec::new();
+        let mut ranges = Vec::new();
+        let mut rights = Vec::new();
+        let mut current = expression;
+        loop {
+            match current.data() {
+                Expression::Logical(value) => {
+                    operators.push(value.operator);
+                    ranges.push(current.range());
+                    rights.push(&*value.right);
+                    current = &value.left;
+                }
+                _ => break,
+            }
+        }
+        let mut rebuilt = self.rewrite_expr(current);
+        for index in (0..operators.len()).rev() {
+            let right = self.rewrite_expr(rights[index]);
+            let operator = operators[index];
+            let range = ranges[index];
+            if operator == LogicalOperator::Nullish
+                && Self::needs(LanguageFeature::NullishCoalescing, self.options)
+            {
+                rebuilt = self.lower_nullish_coalescing(rebuilt, right, range);
+                continue;
+            }
+            rebuilt = self.node(
+                range,
+                Expression::Logical(LogicalExpression {
+                    operator,
+                    left: Box::new(rebuilt),
+                    right: Box::new(right),
+                }),
+            );
+        }
+        rebuilt
+    }
+
+
+    fn rewrite_expression(&mut self, expression: &Expr) -> Expr {
         if self.replace_await
             && let Expression::Await(awaited) = expression.data()
         {
@@ -6700,6 +8641,8 @@ impl<'a> Rewriter<'a> {
             );
         }
         match expression.data() {
+            // The printer inlines this value by the node's identity.
+            Expression::Member(_) if self.is_const_enum_use(expression.id()) => expression.clone(),
             Expression::Class(class) => {
                 let previous = self.replace_await;
                 self.replace_await = false;
@@ -6828,40 +8771,8 @@ impl<'a> Rewriter<'a> {
                     }),
                 )
             }
-            Expression::Binary(value) => {
-                let left = self.rewrite_expr(&value.left);
-                let right = self.rewrite_expr(&value.right);
-                if value.operator == BinaryOperator::Exponentiate
-                    && Self::needs(LanguageFeature::Exponentiation, self.options)
-                {
-                    return self.math_pow(left, right, expression.range());
-                }
-                self.node(
-                    expression.range(),
-                    Expression::Binary(BinaryExpression {
-                        operator: value.operator,
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    }),
-                )
-            }
-            Expression::Logical(value) => {
-                let left = self.rewrite_expr(&value.left);
-                let right = self.rewrite_expr(&value.right);
-                if value.operator == LogicalOperator::Nullish
-                    && Self::needs(LanguageFeature::NullishCoalescing, self.options)
-                {
-                    return self.lower_nullish_coalescing(left, right, expression.range());
-                }
-                self.node(
-                    expression.range(),
-                    Expression::Logical(LogicalExpression {
-                        operator: value.operator,
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    }),
-                )
-            }
+            Expression::Binary(_) => self.rewrite_binary_spine(expression),
+            Expression::Logical(_) => self.rewrite_logical_spine(expression),
             Expression::Unary(value) => {
                 let argument = self.rewrite_expr(&value.argument);
                 self.node(
@@ -6956,17 +8867,7 @@ impl<'a> Rewriter<'a> {
                     return self.lower_logical_assignment(expression, assignment);
                 }
                 let right = self.rewrite_expr(&assignment.right);
-                let left = if self.replace_await
-                    && let AssignmentTarget::Member(member) = assignment.left.data()
-                    && target_contains_await(&member.object, &member.property)
-                {
-                    // Convert awaits inside the target too, so a
-                    // suspending target becomes a visible machine refusal
-                    // instead of a live `await` in ES5 output.
-                    self.rewrite_member_target(member, assignment.left.range())
-                } else {
-                    assignment.left.clone()
-                };
+                let left = self.rewrite_assignment_target(&assignment.left);
                 self.node(
                     expression.range(),
                     Expression::Assignment(AssignmentExpression {
@@ -6976,15 +8877,238 @@ impl<'a> Rewriter<'a> {
                     }),
                 )
             }
-            Expression::Identifier(_) => {
+            Expression::Identifier(ident) => {
+                if let Some(parameter) = self.namespace_member_parameter(expression.id())
+                    && let Some(name) = self.identifier_name(ident)
+                {
+                    return self.namespace_member(&parameter, &name, expression.range());
+                }
+                if self.cjs_reads_exported_variable(expression.id())
+                    && let Some(name) = self.identifier_name(ident)
+                {
+                    return self.namespace_member("exports", &name, expression.range());
+                }
                 if let Some(replacement) = self.cjs_identifier_replacement(expression) {
                     replacement
                 } else {
                     expression.clone()
                 }
             }
+            Expression::Template(template) => {
+                let template = self.rewrite_template(template);
+                self.node(expression.range(), Expression::Template(template))
+            }
+            Expression::TaggedTemplate(tagged) => {
+                let tag = self.rewrite_expr(&tagged.tag);
+                let template = self.rewrite_template(&tagged.template);
+                self.node(
+                    expression.range(),
+                    Expression::TaggedTemplate(TaggedTemplateExpression {
+                        tag: Box::new(tag),
+                        template,
+                    }),
+                )
+            }
+            Expression::Array(array) => {
+                let elements = array
+                    .elements
+                    .iter()
+                    .map(|element| match element {
+                        ArrayElement::Expression(value) => {
+                            ArrayElement::Expression(Box::new(self.rewrite_expr(value)))
+                        }
+                        ArrayElement::Spread(spread) => ArrayElement::Spread(SpreadElement {
+                            argument: Box::new(self.rewrite_expr(&spread.argument)),
+                        }),
+                        other => other.clone(),
+                    })
+                    .collect();
+                self.node(
+                    expression.range(),
+                    Expression::Array(ArrayLiteral { elements }),
+                )
+            }
+            Expression::Object(object) => {
+                let members = object
+                    .members
+                    .iter()
+                    .map(|member| self.rewrite_object_member(member))
+                    .collect();
+                self.node(
+                    expression.range(),
+                    Expression::Object(ObjectLiteral { members }),
+                )
+            }
+            Expression::Yield(value) => {
+                let argument = value
+                    .argument
+                    .as_deref()
+                    .map(|argument| Box::new(self.rewrite_expr(argument)));
+                self.node(
+                    expression.range(),
+                    Expression::Yield(YieldExpression {
+                        delegate: value.delegate,
+                        argument,
+                    }),
+                )
+            }
+            Expression::Update(value) => {
+                let argument = self.rewrite_assignment_target(&value.argument);
+                self.node(
+                    expression.range(),
+                    Expression::Update(UpdateExpression {
+                        operator: value.operator,
+                        argument: Box::new(argument),
+                        prefix: value.prefix,
+                    }),
+                )
+            }
             _ => expression.clone(),
         }
+    }
+
+    fn rewrite_template(&mut self, template: &TemplateLiteral) -> TemplateLiteral {
+        TemplateLiteral {
+            elements: template.elements.clone(),
+            expressions: template
+                .expressions
+                .iter()
+                .map(|value| self.rewrite_expr(value))
+                .collect(),
+        }
+    }
+
+    fn rewrite_object_member(&mut self, member: &ObjectMemberNode) -> ObjectMemberNode {
+        let rewritten = match member.data() {
+            ObjectMember::Property(property) => {
+                let name = self.rewrite_property_name(&property.name);
+                let value = self.rewrite_expr(&property.value);
+                // A shorthand that no longer reads its own name has to spell
+                // the value out.
+                let shorthand =
+                    property.shorthand && matches!(value.data(), Expression::Identifier(_));
+                ObjectMember::Property(ObjectProperty {
+                    name,
+                    value: Box::new(value),
+                    modifier: property.modifier,
+                    shorthand,
+                })
+            }
+            ObjectMember::Method(method)
+                if (method.function.is_generator
+                    && Self::needs(LanguageFeature::Generators, self.options))
+                    || (method.function.is_async
+                        && Self::needs(LanguageFeature::AsyncFunctions, self.options)) =>
+            {
+                // A method owns its suspensions, so a target without them
+                // keeps the method as written rather than lowering it here.
+                return member.clone();
+            }
+            ObjectMember::Method(method) => {
+                let name = self.rewrite_property_name(&method.name);
+                let previous = self.replace_await;
+                self.replace_await = false;
+                let function = self.rewrite_function_like(&method.function, member.range());
+                self.replace_await = previous;
+                ObjectMember::Method(ObjectMethod {
+                    name,
+                    modifier: method.modifier,
+                    function,
+                })
+            }
+            ObjectMember::Spread(spread) => ObjectMember::Spread(SpreadElement {
+                argument: Box::new(self.rewrite_expr(&spread.argument)),
+            }),
+            ObjectMember::Missing(_) => return member.clone(),
+        };
+        self.node(member.range(), rewritten)
+    }
+
+    /// The object that holds an identifier target when no local does: `exports`
+    /// for an exported variable, or a namespace's parameter for its member.
+    fn identifier_target_owner(
+        &self,
+        target: &AssignmentTargetNode,
+        identifier: &IdentifierNode,
+    ) -> Option<String> {
+        self.namespace_member_parameter(target.id())
+            .or_else(|| self.namespace_member_parameter(identifier.id()))
+            .or_else(|| {
+                self.cjs_reads_exported_variable(identifier.id())
+                    .then(|| "exports".to_owned())
+            })
+    }
+
+    /// A read of what an identifier target writes, for a lowering that reads the
+    /// target too. A copy of the identifier would name a local that may not exist.
+    fn read_of_identifier_target(
+        &mut self,
+        target: &AssignmentTargetNode,
+        identifier: &IdentifierNode,
+    ) -> Expr {
+        let range = identifier.range();
+        let owner = self.identifier_target_owner(target, identifier);
+        match (owner, self.identifier_name(identifier)) {
+            (Some(owner), Some(name)) => self.namespace_member(&owner, &name, range),
+            _ => self.node(range, Expression::Identifier(identifier.clone())),
+        }
+    }
+
+    /// An assignment target with its nested expressions rewritten. A member
+    /// target is how a suspending target reaches the machine as a visible
+    /// refusal instead of a live `await` in ES5 output.
+    fn rewrite_assignment_target(&mut self, target: &AssignmentTargetNode) -> AssignmentTargetNode {
+        let rewritten = match target.data() {
+            AssignmentTarget::Identifier(ident) => {
+                let parameter = self.identifier_target_owner(target, ident);
+                let (Some(parameter), Some(name)) = (parameter, self.identifier_name(ident)) else {
+                    return target.clone();
+                };
+                let object = self.ident_expr(&parameter);
+                let property = MemberProperty::Named(self.ident(&name));
+                AssignmentTarget::Member(AssignmentMemberTarget {
+                    object: Box::new(object),
+                    property,
+                })
+            }
+            AssignmentTarget::Member(member) => {
+                return self.rewrite_member_target(member, target.range());
+            }
+            AssignmentTarget::Object(pattern) => {
+                let properties = pattern
+                    .properties
+                    .iter()
+                    .map(|property| AssignmentObjectProperty {
+                        name: self.rewrite_property_name(&property.name),
+                        target: self.rewrite_assignment_target(&property.target),
+                        initializer: property
+                            .initializer
+                            .as_deref()
+                            .map(|value| Box::new(self.rewrite_expr(value))),
+                        rest: property.rest,
+                    })
+                    .collect();
+                AssignmentTarget::Object(AssignmentObjectPattern { properties })
+            }
+            AssignmentTarget::Array(pattern) => {
+                let elements = pattern
+                    .elements
+                    .iter()
+                    .map(|element| match element {
+                        AssignmentArrayElement::Target(target) => {
+                            AssignmentArrayElement::Target(self.rewrite_assignment_target(target))
+                        }
+                        AssignmentArrayElement::Rest(target) => {
+                            AssignmentArrayElement::Rest(self.rewrite_assignment_target(target))
+                        }
+                        other => other.clone(),
+                    })
+                    .collect();
+                AssignmentTarget::Array(AssignmentArrayPattern { elements })
+            }
+            _ => return target.clone(),
+        };
+        self.node(target.range(), rewritten)
     }
 
     fn rewrite_member_target(
@@ -7149,19 +9273,14 @@ impl<'a> Rewriter<'a> {
         let right = self.rewrite_expr(&assignment.right);
         match assignment.left.data() {
             AssignmentTarget::Identifier(identifier) => {
-                let read = self.node(
-                    identifier.range(),
-                    Expression::Identifier(identifier.clone()),
-                );
-                let plain_read = self.node(
-                    identifier.range(),
-                    Expression::Identifier(identifier.clone()),
-                );
+                let read = self.read_of_identifier_target(&assignment.left, identifier);
+                let plain_read = self.read_of_identifier_target(&assignment.left, identifier);
+                let left = self.rewrite_assignment_target(&assignment.left);
                 let inner_assign = self.node(
                     range,
                     Expression::Assignment(AssignmentExpression {
                         operator: AssignmentOperator::Assign,
-                        left: assignment.left.clone(),
+                        left,
                         right: Box::new(right),
                     }),
                 );
@@ -7474,13 +9593,11 @@ impl<'a> Rewriter<'a> {
         let right = self.rewrite_expr(&assignment.right);
         match assignment.left.data() {
             AssignmentTarget::Identifier(identifier) => {
-                let read = self.node(
-                    identifier.range(),
-                    Expression::Identifier(identifier.clone()),
-                );
+                let read = self.read_of_identifier_target(&assignment.left, identifier);
+                let left = self.rewrite_assignment_target(&assignment.left);
                 let lowered = Expression::Assignment(AssignmentExpression {
                     operator: AssignmentOperator::Assign,
-                    left: assignment.left.clone(),
+                    left,
                     right: Box::new(self.math_pow(read, right, expression.range())),
                 });
                 self.node(expression.range(), lowered)
@@ -8790,22 +10907,797 @@ fn contains_yield(expression: &Expr) -> bool {
     }
 }
 
+/// Every identifier the file spells, which a generated name has to avoid.
+fn identifier_names(file: &SourceFile) -> BTreeSet<String> {
+    file.tokens()
+        .iter()
+        .filter(|token| token.kind() == TokenKind::Identifier)
+        .filter_map(|token| {
+            let start = file
+                .source_text()
+                .utf16_to_byte(token.range().start())
+                .ok()?;
+            let end = file.source_text().utf16_to_byte(token.range().end()).ok()?;
+            file.source_text()
+                .as_str()
+                .get(start..end)
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 fn identifier_text(file: &SourceFile, ident: &IdentifierNode) -> String {
     raw_token_text(file, ident.data().token())
+}
+
+/// Plain ASCII only: `exports["é"]` means the same as `exports.é`, while
+/// telling `x²` from a real identifier would take the Unicode tables.
+fn is_identifier_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && characters.all(|rest| rest.is_ascii_alphanumeric() || rest == '_' || rest == '$')
+}
+
+/// A double-quoted JavaScript string for already decoded text.
+fn quote_string(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\u{2028}' => quoted.push_str("\\u2028"),
+            '\u{2029}' => quoted.push_str("\\u2029"),
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// `exports.name`, or `exports["a b"]` for a name that is no identifier.
+fn exports_member(name: &str) -> String {
+    if is_identifier_name(name) {
+        format!("exports.{name}")
+    } else {
+        format!("exports[{}]", quote_string(name))
+    }
+}
+
+/// A getter on `exports` that reads through to a module, so it stays live.
+fn live_export(exported: &str, module: &str, imported: &str) -> String {
+    let read = if is_identifier_name(imported) {
+        format!("{module}.{imported}")
+    } else {
+        format!("{module}[{}]", quote_string(imported))
+    };
+    format!(
+        "Object.defineProperty(exports, {}, {{ enumerable: true, \
+         get: function () {{ return {read}; }} }});",
+        quote_string(exported)
+    )
+}
+
+fn module_export_text(file: &SourceFile, name: &ModuleExportName) -> String {
+    match name {
+        ModuleExportName::Identifier(ident) => identifier_text(file, ident),
+        ModuleExportName::String(literal) => {
+            let raw = raw_token_text(file, literal.data().token());
+            crate::literal::string_value(&raw)
+                .map_or_else(|| raw.clone(), |text| text.to_utf8_lossy())
+        }
+        ModuleExportName::Missing(_) => String::new(),
+    }
+}
+
+/// What each local is exported as through `export { local as name }`.
+fn exported_locals(file: &SourceFile) -> BTreeMap<String, Vec<String>> {
+    let mut locals: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for statement in file.statements() {
+        let Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+            type_only: false,
+            specifiers,
+            source: None,
+            ..
+        })) = statement.data()
+        else {
+            continue;
+        };
+        for specifier in specifiers {
+            let specifier = specifier.data();
+            if let (ExportSpecifierMode::Value, ModuleExportName::Identifier(local)) =
+                (&specifier.mode, &specifier.local)
+            {
+                locals
+                    .entry(identifier_text(file, local))
+                    .or_default()
+                    .push(module_export_text(file, &specifier.exported));
+            }
+        }
+    }
+    locals
+}
+
+/// Plans `export { local }` of the file's own declarations: each publishes
+/// right after its statement, and writes to it stay in step.
+fn plan_cjs_declared_exports(
+    file: &SourceFile,
+    model: &SemanticModel,
+    exported_locals: &BTreeMap<String, Vec<String>>,
+    plan: &mut CjsPlan,
+) {
+    let scope = model.scope(model.module_scope());
+    let imports = imported_bindings(file);
+    for (local, names) in exported_locals {
+        if !imports.contains_key(local)
+            && let Some(symbol) = scope.value(local)
+            && !plan.exported_variables.contains(&symbol)
+        {
+            plan.live_locals.insert(symbol, names.clone());
+        }
+    }
+    for statement in file.statements() {
+        // An ambient declaration has nothing to publish; its `void 0` stands.
+        if let Statement::Declare(inner) = statement.data() {
+            let mut locals = declared_binding_names(file, inner);
+            if let Statement::Class(class) = inner.data() {
+                locals.extend(class.name.iter().map(|name| identifier_text(file, name)));
+            }
+            for local in locals {
+                let names = exported_locals.get(&local).into_iter().flatten();
+                plan.published_locals.extend(names.cloned());
+            }
+            continue;
+        }
+        let declared = match statement.data() {
+            Statement::Class(class) => class
+                .name
+                .iter()
+                .map(|name| identifier_text(file, name))
+                .collect(),
+            _ => declared_binding_names(file, statement),
+        };
+        let pairs: Vec<(String, String)> = declared
+            .iter()
+            .flat_map(|local| {
+                let names = exported_locals.get(local).into_iter().flatten();
+                names.map(|name| (name.clone(), local.clone()))
+            })
+            .collect();
+        if !pairs.is_empty() {
+            plan.published_locals
+                .extend(pairs.iter().map(|(name, _)| name.clone()));
+            plan.declared_exports.insert(statement.id(), pairs);
+        }
+    }
+}
+
+/// The identifiers an assignment target writes, through any destructuring.
+fn collect_target_identifiers<'t>(
+    target: &'t AssignmentTargetNode,
+    identifiers: &mut Vec<&'t IdentifierNode>,
+) {
+    match target.data() {
+        AssignmentTarget::Identifier(identifier) => identifiers.push(identifier),
+        AssignmentTarget::Object(object) => {
+            for property in &object.properties {
+                collect_target_identifiers(&property.target, identifiers);
+            }
+        }
+        AssignmentTarget::Array(array) => {
+            for element in &array.elements {
+                if let AssignmentArrayElement::Target(inner) | AssignmentArrayElement::Rest(inner) =
+                    element
+                {
+                    collect_target_identifiers(inner, identifiers);
+                }
+            }
+        }
+        AssignmentTarget::Invalid(operand) => {
+            if let Expression::Assignment(assignment) = operand.data() {
+                collect_target_identifiers(&assignment.left, identifiers);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `export { name } from` still has something to publish.
+fn reexport_survives(
+    file: &SourceFile,
+    specifier: &ExportSpecifier,
+    module: &str,
+    erased: &BTreeSet<(String, String)>,
+) -> bool {
+    matches!(specifier.mode, ExportSpecifierMode::Value)
+        && !erased.contains(&(
+            module.to_owned(),
+            module_export_text(file, &specifier.local),
+        ))
+}
+
+/// Plans a re-export's lines: a star export copies the module's names, and a named one reads through to the
+/// module, so it stays a live binding.
+fn plan_cjs_reexport(
+    file: &SourceFile,
+    export: &ExportDeclaration,
+    names: &mut RequireNames,
+    plan: &mut CjsPlan,
+    erased: &BTreeSet<(String, String)>,
+) {
+    let quoted = |source: &StringLiteralNode| {
+        let raw = raw_token_text(file, source.data().token());
+        quote_module_specifier(raw.trim_matches(['"', '\'']))
+    };
+    match export {
+        ExportDeclaration::All(all) if !all.type_only => {
+            let module = quoted(&all.source);
+            match &all.exported {
+                Some(name) => {
+                    let name = module_export_text(file, name);
+                    plan.helpers.insert(HelperKind::ImportStar);
+                    plan.requires.push(format!(
+                        "{} = __importStar(require({module}));",
+                        exports_member(&name)
+                    ));
+                    plan.void_0.push(name);
+                }
+                None => {
+                    plan.helpers.insert(HelperKind::ExportStar);
+                    plan.requires
+                        .push(format!("__exportStar(require({module}), exports);"));
+                }
+            }
+        }
+        ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+            type_only: false,
+            specifiers,
+            source: Some(source),
+            ..
+        }) => {
+            let module = module_specifier(file, source);
+            let kept: Vec<_> = specifiers
+                .iter()
+                .map(|specifier| specifier.data())
+                .filter(|specifier| reexport_survives(file, specifier, &module, erased))
+                .collect();
+            if kept.is_empty() {
+                return;
+            }
+            let local = names.allocate(&module);
+            plan.requires
+                .push(format!("var {local} = require({});", quoted(source)));
+            for specifier in kept {
+                let imported = module_export_text(file, &specifier.local);
+                let exported = module_export_text(file, &specifier.exported);
+                plan.requires
+                    .push(live_export(&exported, &local, &imported));
+                plan.void_0.push(exported);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_type_only_export(model: &SemanticModel, name: &str) -> bool {
+    let scope = model.scope(model.module_scope());
+    scope.value(name).is_none() && scope.type_binding(name).is_some()
+}
+
+/// The names that keep an import in this file. JavaScript keeps every import,
+/// as does `verbatimModuleSyntax`, so those files have no answer.
+fn import_reads(
+    file: &SourceFile,
+    options: &TransformOptions,
+    model: Option<&SemanticModel>,
+) -> Option<BTreeSet<String>> {
+    if options.verbatim_module_syntax
+        || options.keeps_imports
+        || file.source_text().as_str().contains("@jsx")
+        || matches!(
+            file.script_kind(),
+            crate::source::ScriptKind::JavaScript | crate::source::ScriptKind::JavaScriptReact
+        )
+    {
+        return None;
+    }
+    // tsc rejects reading a type as a value, so a read proves the name is one,
+    // whatever another file's exports appear to say. Only an export of the name
+    // is legal for a type, so only exports ask.
+    let mut reads = crate::lower::value_read_names(file, model.map(SemanticModel::enum_facts));
+    let erased = erased_import_locals(file, options);
+    let exported = exported_locals(file)
+        .into_keys()
+        .chain(default_export_name(file));
+    reads.extend(exported.filter(|name| !erased.contains(name)));
+    // The classic JSX factories read a name the source never spells.
+    if matches!(
+        options.jsx,
+        Some(JsxEmit::React | JsxEmit::Preserve | JsxEmit::ReactNative)
+    ) {
+        for factory in [&options.jsx_factory, &options.jsx_fragment_factory] {
+            let factory = factory.as_deref().unwrap_or("React");
+            reads.extend(factory.split('.').next().map(str::to_owned));
+        }
+    }
+    Some(reads)
+}
+
+/// The name in `export default x` or `export = x`.
+fn default_export_name(file: &SourceFile) -> Vec<String> {
+    file.statements()
+        .iter()
+        .filter_map(|statement| match statement.data() {
+            Statement::Export(ExportDeclaration::Default(default)) => match &default.value {
+                ExportDefaultValue::Expression(value) => Some(value),
+                _ => None,
+            },
+            Statement::Export(ExportDeclaration::Assignment(value)) => Some(value),
+            _ => None,
+        })
+        .filter_map(|value| match value.data() {
+            Expression::Identifier(identifier) => Some(identifier_text(file, identifier)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An import clause without the bindings nothing reads, or `None` if none remain.
+fn kept_import_clause(
+    file: &SourceFile,
+    clause: &ImportClause,
+    reads: &BTreeSet<String>,
+) -> Option<ImportClause> {
+    let read = |name: &IdentifierNode| reads.contains(&identifier_text(file, name));
+    let default = clause.default.clone().filter(read);
+    let binding = match &clause.binding {
+        Some(ImportBinding::Namespace(name)) if read(name) => clause.binding.clone(),
+        Some(ImportBinding::Named(specifiers)) => {
+            let kept: Vec<_> = specifiers
+                .iter()
+                .filter(|specifier| {
+                    let specifier = specifier.data();
+                    matches!(specifier.mode, ImportSpecifierMode::Value) && read(&specifier.local)
+                })
+                .cloned()
+                .collect();
+            (!kept.is_empty()).then_some(ImportBinding::Named(kept))
+        }
+        _ => None,
+    };
+    (default.is_some() || binding.is_some()).then_some(ImportClause { default, binding })
+}
+
+/// What a module's own text exports.
+#[derive(Default)]
+pub(crate) struct ModuleExports {
+    /// Names with no runtime form: types and const enums.
+    pub(crate) types: BTreeSet<String>,
+    /// Names with a runtime value.
+    pub(crate) values: BTreeSet<String>,
+    /// Specifiers of `export * from`.
+    pub(crate) stars: Vec<String>,
+    /// `(exported, module, imported)`: a name whose kind another module decides.
+    pub(crate) forwards: Vec<(String, String, String)>,
+}
+
+/// Reads exports rather than declarations: `interface Foo {}` beside
+/// `export { value as Foo }` exports a value.
+pub(crate) fn module_exports(file: &SourceFile, model: &SemanticModel) -> ModuleExports {
+    let scope = model.scope(model.module_scope());
+    let const_enums: BTreeSet<String> = const_enum_names(file).into_iter().collect();
+    let erased_local = |name: &str| {
+        const_enums.contains(name)
+            || (scope.value(name).is_none() && scope.type_binding(name).is_some())
+    };
+    let imports = imported_bindings(file);
+    let type_imports = declared_type_imports(file);
+    let local_values = local_value_names(file);
+    let mut exports = ModuleExports::default();
+    for statement in file.statements() {
+        let Statement::Export(export) = statement.data() else {
+            continue;
+        };
+        match export {
+            ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) => {
+                let (inner, ambient) = match inner.data() {
+                    Statement::Declare(declared) => (declared, true),
+                    _ => (inner, false),
+                };
+                match inner.data() {
+                    Statement::Interface(declaration) => {
+                        exports
+                            .types
+                            .insert(identifier_text(file, &declaration.name));
+                    }
+                    Statement::TypeAlias(declaration) => {
+                        exports
+                            .types
+                            .insert(identifier_text(file, &declaration.name));
+                    }
+                    Statement::Enum(declaration) => {
+                        let name = raw_token_text(file, declaration.name.data().token());
+                        if declaration.is_const {
+                            exports.types.insert(name);
+                        } else {
+                            exports.values.insert(name);
+                        }
+                    }
+                    Statement::Namespace(declaration) => {
+                        if let NamespaceName::Identifier { name, .. } = &declaration.name {
+                            // An ambient namespace can declare values too.
+                            let bearing = ambient
+                                || model
+                                    .namespace_facts()
+                                    .declaration(inner.id())
+                                    .is_some_and(|plan| plan.is_value_bearing());
+                            let name = identifier_text(file, name);
+                            if bearing {
+                                exports.values.insert(name);
+                            } else {
+                                exports.types.insert(name);
+                            }
+                        }
+                    }
+                    Statement::Class(class) => {
+                        exports
+                            .values
+                            .extend(class.name.iter().map(|name| identifier_text(file, name)));
+                    }
+                    Statement::Function(declaration) => {
+                        exports.values.extend(
+                            declaration
+                                .function
+                                .name
+                                .iter()
+                                .map(|name| identifier_text(file, name)),
+                        );
+                    }
+                    _ => exports.values.extend(declared_binding_names(file, inner)),
+                }
+            }
+            ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+                type_only,
+                specifiers,
+                source,
+                ..
+            }) => {
+                for specifier in specifiers {
+                    let specifier = specifier.data();
+                    let local = module_export_text(file, &specifier.local);
+                    let exported = module_export_text(file, &specifier.exported);
+                    if *type_only || !matches!(specifier.mode, ExportSpecifierMode::Value) {
+                        exports.types.insert(exported);
+                    } else if let Some(source) = source {
+                        let module = module_specifier(file, source);
+                        exports.forwards.push((exported, module, local));
+                    } else if local_values.contains(&local) {
+                        exports.values.insert(exported);
+                    } else if type_imports.contains(&local) {
+                        exports.types.insert(exported);
+                    } else if let Some((module, imported)) = imports.get(&local) {
+                        exports
+                            .forwards
+                            .push((exported, module.clone(), imported.clone()));
+                    } else if erased_local(&local) {
+                        exports.types.insert(exported);
+                    } else {
+                        exports.values.insert(exported);
+                    }
+                }
+            }
+            ExportDeclaration::All(all) => match &all.exported {
+                _ if all.type_only => {}
+                Some(name) => {
+                    exports.values.insert(module_export_text(file, name));
+                }
+                None => exports.stars.push(module_specifier(file, &all.source)),
+            },
+            ExportDeclaration::Default(default) => {
+                let read = match &default.value {
+                    ExportDefaultValue::Expression(value) => match value.data() {
+                        Expression::Identifier(identifier) => {
+                            Some(identifier_text(file, identifier))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let read = read.filter(|name| !local_values.contains(name));
+                if let Some((module, imported)) = read.as_ref().and_then(|name| imports.get(name)) {
+                    let default = String::from("default");
+                    exports
+                        .forwards
+                        .push((default, module.clone(), imported.clone()));
+                    continue;
+                }
+                let erased = matches!(default.value, ExportDefaultValue::Interface(_))
+                    || read.is_some_and(|name| erased_local(&name) || type_imports.contains(&name));
+                let names = if erased {
+                    &mut exports.types
+                } else {
+                    &mut exports.values
+                };
+                names.insert(String::from("default"));
+            }
+            _ => {}
+        }
+    }
+    exports
+}
+
+/// Each imported local, by the module and name it comes from.
+fn imported_bindings(file: &SourceFile) -> BTreeMap<String, (String, String)> {
+    let mut bindings = BTreeMap::new();
+    for statement in file.statements() {
+        let Statement::Import(import) = statement.data() else {
+            continue;
+        };
+        let Some(clause) = &import.clause else {
+            continue;
+        };
+        let module = module_specifier(file, &import.source);
+        if let Some(default) = &clause.default {
+            bindings.insert(
+                identifier_text(file, default),
+                (module.clone(), String::from("default")),
+            );
+        }
+        if let Some(ImportBinding::Named(specifiers)) = &clause.binding {
+            for specifier in specifiers {
+                let specifier = specifier.data();
+                bindings.insert(
+                    identifier_text(file, &specifier.local),
+                    (
+                        module.clone(),
+                        module_export_text(file, &specifier.imported),
+                    ),
+                );
+            }
+        }
+    }
+    bindings
+}
+
+/// The file's const enums, which emit erases.
+#[must_use]
+pub(crate) fn const_enum_names(file: &SourceFile) -> Vec<String> {
+    file.statements()
+        .iter()
+        .filter_map(|statement| match statement.data() {
+            Statement::Enum(declaration) => Some(declaration),
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => match inner.data() {
+                Statement::Enum(declaration) => Some(declaration),
+                _ => None,
+            },
+            _ => None,
+        })
+        .filter(|declaration| declaration.is_const)
+        .map(|declaration| raw_token_text(file, declaration.name.data().token()))
+        .collect()
+}
+
+fn module_specifier(file: &SourceFile, source: &StringLiteralNode) -> String {
+    raw_token_text(file, source.data().token())
+        .trim_matches(['"', '\''])
+        .to_owned()
+}
+
+/// Local names with no runtime value: `import type` bindings, imports of a
+/// name its module erases, and const enums.
+fn type_import_names(file: &SourceFile, options: &TransformOptions) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = const_enum_names(file).into_iter().collect();
+    names.extend(erased_import_locals(file, options));
+    names.extend(declared_type_imports(file));
+    // A local value of the same name is the one an export means.
+    let values = local_value_names(file);
+    names.retain(|name| !values.contains(name));
+    names
+}
+
+/// Locals bound to what the imported module erases.
+fn erased_import_locals(file: &SourceFile, options: &TransformOptions) -> BTreeSet<String> {
+    imported_bindings(file)
+        .into_iter()
+        .filter(|(_, binding)| options.erased_imports.contains(binding))
+        .map(|(local, _)| local)
+        .collect()
+}
+
+/// What the file's own top-level statements declare as values.
+fn local_value_names(file: &SourceFile) -> BTreeSet<String> {
+    let mut names = hoisted_function_names(file);
+    for statement in file.statements() {
+        let statement = match statement.data() {
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => inner,
+            _ => statement,
+        };
+        names.extend(declared_binding_names(file, statement));
+        match statement.data() {
+            Statement::Class(class) => {
+                names.extend(class.name.iter().map(|name| identifier_text(file, name)));
+            }
+            Statement::Namespace(NamespaceDeclaration {
+                name: NamespaceName::Identifier { name, .. },
+                ..
+            }) => {
+                names.insert(identifier_text(file, name));
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// The names `import type` and `import { type x }` bind.
+fn declared_type_imports(file: &SourceFile) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for statement in file.statements() {
+        let Statement::Import(import) = statement.data() else {
+            continue;
+        };
+        let Some(clause) = &import.clause else {
+            continue;
+        };
+        if import.type_only {
+            names.extend(
+                clause
+                    .default
+                    .iter()
+                    .map(|name| identifier_text(file, name)),
+            );
+        }
+        match &clause.binding {
+            Some(ImportBinding::Namespace(name)) if import.type_only => {
+                names.insert(identifier_text(file, name));
+            }
+            Some(ImportBinding::Named(specifiers)) => {
+                names.extend(
+                    specifiers
+                        .iter()
+                        .map(|specifier| specifier.data())
+                        .filter(|specifier| {
+                            import.type_only
+                                || matches!(specifier.mode, ImportSpecifierMode::TypeOnly)
+                        })
+                        .map(|specifier| identifier_text(file, &specifier.local)),
+                );
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// A function declaration with a body hoists; a signature is not a binding.
+fn hoisted_function_name(file: &SourceFile, function: &FunctionLike) -> Option<String> {
+    function.body.as_ref()?;
+    function
+        .name
+        .as_ref()
+        .map(|name| identifier_text(file, name))
+}
+
+/// The module's top-level functions, which `export { f }` hoists like
+/// `export function f`.
+fn hoisted_function_names(file: &SourceFile) -> BTreeSet<String> {
+    file.statements()
+        .iter()
+        .filter_map(|statement| match statement.data() {
+            Statement::Function(declaration) => hoisted_function_name(file, &declaration.function),
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => match inner.data() {
+                Statement::Function(declaration) => {
+                    hoisted_function_name(file, &declaration.function)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Plans a local export's prelude line: a function's assignment, or the
+/// `void 0` that claims a specifier's name before any star export runs.
+fn plan_cjs_local_exports(
+    file: &SourceFile,
+    export: &ExportDeclaration,
+    hoisted_functions: &BTreeSet<String>,
+    binds_type: impl Fn(&str) -> bool,
+    plan: &mut CjsPlan,
+) {
+    match export {
+        ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) => {
+            if let Statement::Function(declaration) = inner.data()
+                && let Some(name) = hoisted_function_name(file, &declaration.function)
+            {
+                plan.hoisted_exports.push((name.clone(), name));
+            }
+        }
+        ExportDeclaration::Default(ExportDefaultDeclaration {
+            value: ExportDefaultValue::Function(function),
+        }) if function.body.is_some() => {
+            let local =
+                hoisted_function_name(file, function).unwrap_or_else(|| String::from("default_1"));
+            plan.hoisted_exports.push((String::from("default"), local));
+        }
+        ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+            type_only: false,
+            specifiers,
+            source: None,
+            ..
+        }) => {
+            for specifier in specifiers {
+                let specifier = specifier.data();
+                let ModuleExportName::Identifier(local) = &specifier.local else {
+                    continue;
+                };
+                let local = identifier_text(file, local);
+                if matches!(specifier.mode, ExportSpecifierMode::TypeOnly) || binds_type(&local) {
+                    continue;
+                }
+                let exported = module_export_text(file, &specifier.exported);
+                if hoisted_functions.contains(&local) {
+                    plan.hoisted_exports.push((exported, local));
+                } else {
+                    plan.void_0.push(exported);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a declaration's bindings can change after it runs.
+fn is_reassignable(declaration: &VariableDeclaration) -> bool {
+    matches!(declaration.kind, VariableKind::Var | VariableKind::Let)
+}
+
+fn collect_pattern_names(file: &SourceFile, pattern: &Pattern, names: &mut Vec<String>) {
+    match pattern.data() {
+        BindingPattern::Identifier(ident) => names.push(identifier_text(file, ident)),
+        BindingPattern::Object(object) => {
+            for property in &object.properties {
+                collect_pattern_names(file, &property.binding, names);
+            }
+        }
+        BindingPattern::Array(array) => {
+            for element in &array.elements {
+                if let ArrayBindingElement::Binding(binding) = element {
+                    collect_pattern_names(file, binding, names);
+                }
+            }
+        }
+        BindingPattern::Rest(rest) => collect_pattern_names(file, &rest.argument, names),
+        BindingPattern::Assignment(assignment) => {
+            collect_pattern_names(file, &assignment.left, names);
+        }
+        BindingPattern::Missing(_) => {}
+    }
 }
 
 /// Declared value names of a statement, for export assignment generation.
 fn declared_binding_names(file: &SourceFile, statement: &Stmt) -> Vec<String> {
     match statement.data() {
-        Statement::Variable(declaration) => declaration
-            .declarations
-            .iter()
-            .filter_map(|declarator| match declarator.data().binding.data() {
-                BindingPattern::Identifier(ident) => Some(identifier_text(file, ident)),
-                _ => None,
-            })
-            .collect(),
-        Statement::Enum(declaration) => vec![raw_token_text(file, declaration.name.data().token())],
+        Statement::Variable(declaration) => {
+            let mut names = Vec::new();
+            for declarator in &declaration.declarations {
+                collect_pattern_names(file, &declarator.data().binding, &mut names);
+            }
+            names
+        }
+        Statement::Enum(declaration) if !declaration.is_const => {
+            vec![raw_token_text(file, declaration.name.data().token())]
+        }
         _ => Vec::new(),
     }
 }
@@ -9104,6 +11996,43 @@ fn scan_pattern(pattern: &BindingPattern, features: &mut BTreeSet<LanguageFeatur
 /// exposed, and only exponentiation is lowered in every expression position
 /// the rewriter visits.
 fn scan_expression(expression: &Expr, features: &mut BTreeSet<LanguageFeature>) {
+    match expression.data() {
+        Expression::Binary(_) | Expression::Logical(_) => {
+            scan_left_spine(expression, features);
+            return;
+        }
+        _ => (),
+    }
+    scan_expression_inner(expression, features);
+}
+
+pub(crate) fn scan_left_spine(expression: &Expr, features: &mut BTreeSet<LanguageFeature>) {
+    let mut current = expression;
+    loop {
+        match current.data() {
+            Expression::Binary(value) => {
+                if value.operator == BinaryOperator::Exponentiate {
+                    features.insert(LanguageFeature::Exponentiation);
+                }
+                scan_expression_inner(&value.right, features);
+                current = &value.left;
+            }
+            Expression::Logical(value) => {
+                if value.operator == LogicalOperator::Nullish {
+                    features.insert(LanguageFeature::NullishCoalescing);
+                }
+                scan_expression_inner(&value.right, features);
+                current = &value.left;
+            }
+            _ => {
+                scan_expression_inner(current, features);
+                return;
+            }
+        }
+    }
+}
+
+fn scan_expression_inner(expression: &Expr, features: &mut BTreeSet<LanguageFeature>) {
     match expression.data() {
         Expression::Binary(value) => {
             scan_expression(&value.left, features);
@@ -9498,6 +12427,77 @@ mod tests {
 
     fn javascript(output: &EmitOutput) -> &str {
         &output.javascript.as_ref().expect("JavaScript output").code
+    }
+    fn parse_json(source: &str) -> crate::syntax::SourceFile {
+        parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::Json,
+            Arc::new(SourceText::new(source).expect("test source fits the per-file source budget")),
+        ))
+        .into_product()
+    }
+    fn emit_json_at(source: &str, target: ScriptTarget) -> EmitOutput {
+        let file = parse_json(source);
+        let checked = checker::check(&Recovered::clean(parse_json(source)));
+        let options = options_for(target);
+        emit_transformed(
+            &file,
+            checked.product(),
+            &options.transform_view(),
+            &names(),
+        )
+    }
+    #[test]
+    fn json_empty_object_prints_braces_without_prologue_like_require_of_json_file_with_empty_object()
+     {
+        assert_eq!(
+            javascript(&emit_json_at("{\n}\n", ScriptTarget::Es2015)),
+            "{}\n"
+        );
+    }
+    #[test]
+    fn json_trailing_comma_drops_and_keeps_indent_like_require_of_json_file_with_trailling_comma() {
+        assert_eq!(
+            javascript(&emit_json_at(
+                "{\n    \"a\": true,\n    \"b\": \"hello\",\n}\n",
+                ScriptTarget::Es2015
+            )),
+            "{\n    \"a\": true,\n    \"b\": \"hello\"\n}\n"
+        );
+    }
+    #[test]
+    fn json_invalid_content_prints_shorthand_object_like_require_of_json_file_without_resolve_json_module()
+     {
+        assert_eq!(
+            javascript(&emit_json_at("contents Not read", ScriptTarget::Es2015)),
+            "{ contents, Not, read }\n"
+        );
+    }
+    #[test]
+    fn json_empty_input_prints_empty_without_prologue_like_require_of_json_file_with_no_content() {
+        let output = emit_json_at("", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(code.is_empty(), "{code:?}");
+    }
+    #[test]
+    fn json_values_print_like_require_of_json_file_types() {
+        for (source, expected) in [
+            ("[\"a\", null, \"string\"]\n", "[\"a\", null, \"string\"]\n"),
+            ("\"dConfig\"\n", "\"dConfig\"\n"),
+            ("-10\n", "-10\n"),
+            ("[-10, 30]\n", "[-10, 30]\n"),
+            ("[true, false]\n", "[true, false]\n"),
+            (
+                "{\n    \"a\": true,\n    \"b\": \"hello\",\n    \"c\": null,\n    \"d\": false\n}\n",
+                "{\n    \"a\": true,\n    \"b\": \"hello\",\n    \"c\": null,\n    \"d\": false\n}\n",
+            ),
+        ] {
+            assert_eq!(
+                javascript(&emit_json_at(source, ScriptTarget::Es2015)),
+                expected,
+                "{source:?}"
+            );
+        }
     }
 
     #[test]
@@ -9986,13 +12986,17 @@ mod tests {
     }
 
     #[test]
-    fn class_expressions_lower_inside_call_arguments() {
+    fn class_expressions_lower_inside_call_arguments_like_class_expression_with_static_properties1()
+    {
         let output = emit_at(
             "consume(class { static x = 1; y = 2; });\n",
             ScriptTarget::Es2015,
         );
         let code = javascript(&output);
-        assert!(code.contains("consume((() =>"), "{code}");
+        assert!(code.contains("_a = class {"), "{code}");
+        assert!(code.contains("_a.x = 1,"), "{code}");
+        assert!(code.contains(",\n    _a))"), "{code}");
+        assert!(!code.contains(", _a))"), "{code}");
         assert!(code.contains("this.y = 2"), "{code}");
         assert!(code.contains(".x = 1"), "{code}");
         assert!(!code.contains("static x"), "{code}");
@@ -10367,6 +13371,1222 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         assert!(code.contains("exports.a = a;"), "{code}");
         assert!(code.contains("exports.c = b;"), "{code}");
         assert!(!code.contains("export {"), "{code}");
+    }
+
+    #[test]
+    fn a_namespace_fills_its_container_through_a_call() {
+        let output = emit_at(
+            "namespace A {\n\
+             \x20   // a comment\n\
+             \x20   export var x = 1, y;\n\
+             \x20   var hidden = x;\n\
+             \x20   export function f() { return x; }\n\
+             \x20   export class C {}\n\
+             \x20   export namespace B {\n\
+             \x20       export var z = x + 1;\n\
+             \x20   }\n\
+             }\n\
+             namespace A {\n\
+             \x20   x = 2;\n\
+             \x20   x++;\n\
+             \x20   const box = { x };\n\
+             \x20   f();\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var A;\n\
+             (function (A) {\n\
+             \x20   // a comment\n\
+             \x20   A.x = 1;\n\
+             \x20   var hidden = A.x;\n\
+             \x20   function f() { return A.x; }\n\
+             \x20   A.f = f;\n\
+             \x20   class C {\n\
+             \x20   }\n\
+             \x20   A.C = C;\n\
+             \x20   let B;\n\
+             \x20   (function (B) {\n\
+             \x20       B.z = A.x + 1;\n\
+             \x20   })(B = A.B || (A.B = {}));\n\
+             })(A || (A = {}));\n\
+             (function (A) {\n\
+             \x20   A.x = 2;\n\
+             \x20   A.x++;\n\
+             \x20   const box = { x: A.x };\n\
+             \x20   A.f();\n\
+             })(A || (A = {}));\n"
+        );
+    }
+
+    #[test]
+    fn an_enum_is_declared_once_and_published_like_a_namespace() {
+        let output = emit_at(
+            "enum E { A }\n\
+             enum E { B = 1 }\n\
+             namespace N {\n\
+             \x20   export enum F { C }\n\
+             \x20   enum G { D }\n\
+             }\n\
+             function f() {\n\
+             \x20   enum H { I }\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var E;\n\
+             (function (E) {\n\
+             \x20   E[E[\"A\"] = 0] = \"A\";\n\
+             })(E || (E = {}));\n\
+             (function (E) {\n\
+             \x20   E[E[\"B\"] = 1] = \"B\";\n\
+             })(E || (E = {}));\n\
+             var N;\n\
+             (function (N) {\n\
+             \x20   let F;\n\
+             \x20   (function (F) {\n\
+             \x20       F[F[\"C\"] = 0] = \"C\";\n\
+             \x20   })(F = N.F || (N.F = {}));\n\
+             \x20   let G;\n\
+             \x20   (function (G) {\n\
+             \x20       G[G[\"D\"] = 0] = \"D\";\n\
+             \x20   })(G || (G = {}));\n\
+             })(N || (N = {}));\n\
+             function f() {\n\
+             \x20   let H;\n\
+             \x20   (function (H) {\n\
+             \x20       H[H[\"I\"] = 0] = \"I\";\n\
+             \x20   })(H || (H = {}));\n\
+             }\n"
+        );
+    }
+
+    #[test]
+    fn dotted_segments_bind_with_var_like_class_and_module_with_same_name_and_common_root() {
+        let output = emit_at(
+            "namespace X.Y {\n\
+             \x20   export var origin = 1;\n\
+             }\n\
+             namespace Outer {\n\
+             \x20   export namespace Inner {\n\
+             \x20       export var center = 2;\n\
+             \x20   }\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var X;\n\
+             (function (X) {\n\
+             \x20   var Y;\n\
+             \x20   (function (Y) {\n\
+             \x20       Y.origin = 1;\n\
+             \x20   })(Y = X.Y || (X.Y = {}));\n\
+             })(X || (X = {}));\n\
+             var Outer;\n\
+             (function (Outer) {\n\
+             \x20   let Inner;\n\
+             \x20   (function (Inner) {\n\
+             \x20       Inner.center = 2;\n\
+             \x20   })(Inner = Outer.Inner || (Outer.Inner = {}));\n\
+             })(Outer || (Outer = {}));\n"
+        );
+    }
+
+    #[test]
+    fn class_expression_static_fields_use_a_hoisted_temp_like_class_expression_with_static_properties1()
+     {
+        let output = emit_at(
+            "var v = class C {\n\
+             \x20   static a = 1;\n\
+             \x20   static b = 2;\n\
+             \x20   static c = C.a + C.b;\n\
+             };\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var _a;\n\
+             var v = (_a = class C {\n\
+             \x20   },\n\
+             \x20   _a.a = 1,\n\
+             \x20   _a.b = 2,\n\
+             \x20   _a.c = _a.a + _a.b,\n\
+             \x20   _a);\n"
+        );
+    }
+    #[test]
+    fn anonymous_class_expression_with_static_fields_has_no_name_restore_like_es64() {
+        let output = emit_at("(class { static x = 0; });\n", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(!code.contains("defineProperty"), "{code}");
+        assert!(!code.contains("__setFunctionName"), "{code}");
+        assert!(code.contains("_a.x = 0"), "{code}");
+    }
+    #[test]
+    fn anonymous_class_expression_assigned_to_variable_restores_inferred_name() {
+        let output = emit_at("var v = class { static x = 1; };\n", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(code.contains("value: \"v\""), "{code}");
+        let assign = code.find("_a = class").expect("temp assignment: {code}");
+        let restore = code.find("value: \"v\"").expect("restore: {code}");
+        let field = code.find("_a.x = 1").expect("field: {code}");
+        assert!(assign < restore && restore < field, "{code}");
+    }
+    #[test]
+    fn class_expression_computed_keys_keep_class_name_like_computed_with_static() {
+        let output = emit_at(
+            "(class C2 {\n\
+             \x20   static staticProp = 10;\n\
+             \x20   get [C2.staticProp]() { return \"hello\"; }\n\
+             \x20   [C2.staticProp]() {}\n\
+             });\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("[C2.staticProp]"), "{code}");
+        assert!(!code.contains("[_a.staticProp]"), "{code}");
+        assert!(code.contains("_a.staticProp = 10"), "{code}");
+    }
+
+    #[test]
+    fn class_declaration_static_fields_assign_through_the_class_name() {
+        let output = emit_at(
+            "class C {\n\
+             \x20   static a = 1;\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(javascript(&output), "class C {\n}\nC.a = 1;\n");
+    }
+    #[test]
+    fn plain_sequence_with_multiline_function_keeps_inline_separators() {
+        let output = emit_at(
+            "var x = (function foo() {\n return 1;\n}, 2);\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("}, 2)"), "{code}");
+    }
+    #[test]
+    fn separated_hex_prints_as_decimal_at_es2015_like_overshifts() {
+        let output = emit_at("0xFF_FF_FF_FF;\n", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(code.contains("4294967295"), "{code}");
+        assert!(!code.contains("_"), "{code}");
+    }
+    #[test]
+    fn hex_and_octal_without_separators_keep_at_es2015_like_parse_big_int() {
+        let output = emit_at("0xC0B;\n0o567;\n", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(code.contains("0xC0B"), "{code}");
+        assert!(code.contains("0o567"), "{code}");
+    }
+    #[test]
+    fn legacy_octal_prints_decimal_like_literals() {
+        let output = emit_at("015;\n001;\n09;\n", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(code.contains("13;"), "{code}");
+        assert!(code.contains("1;"), "{code}");
+        assert!(code.contains("9;"), "{code}");
+        assert!(!code.contains("015"), "{code}");
+        assert!(!code.contains("001"), "{code}");
+    }
+    #[test]
+    fn decimal_separators_print_plain_below_es2021_like_numeric_underscored_separator() {
+        let output = emit_at("123_456;\n1e2;\n", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(code.contains("123456"), "{code}");
+        assert!(code.contains("1e2"), "{code}");
+        assert!(!code.contains("_"), "{code}");
+    }
+
+    #[test]
+    fn bigint_literals_normalize_to_decimal_except_lowercase_hex_like_parse_big_int() {
+        let output = emit_at(
+            "0b101n;\n0o567n;\n0xC0Bn;\n123n;\n0b010_10_1n;\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("5n"), "{code}");
+        assert!(code.contains("375n"), "{code}");
+        assert!(code.contains("0xc0bn"), "{code}");
+        assert!(code.contains("123n"), "{code}");
+        assert!(code.contains("21n"), "{code}");
+    }
+
+    #[test]
+    fn decimal_separators_keep_at_es2021_and_normalize_below_like_parser_numeric_separators_decimal()
+     {
+        let source = "1_000_000_000;\n1.1_00_01;\n1e1_0;\n1.1e10_0;\n0_.0;\n";
+        let es2021_output = emit_at(source, ScriptTarget::Es2021);
+        let es2021 = javascript(&es2021_output);
+        assert!(es2021.contains("1_000_000_000"), "{es2021}");
+        let es5_output = emit_at(source, ScriptTarget::Es5);
+        let es5 = javascript(&es5_output);
+        assert!(es5.contains("1000000000"), "{es5}");
+        assert!(es5.contains("1.10001"), "{es5}");
+        assert!(es5.contains("10000000000"), "{es5}");
+        assert!(es5.contains("1.1e+100"), "{es5}");
+        assert!(!es5.contains("_"), "{es5}");
+    }
+    #[test]
+    fn hex_separators_keep_at_esnext_and_decimalize_below_like_numeric_underscored_separator() {
+        let source = "0xA0_B0_C0;\n";
+        let esnext_output = emit_at(source, ScriptTarget::EsNext);
+        let esnext = javascript(&esnext_output);
+        assert!(esnext.contains("0xA0_B0_C0"), "{esnext}");
+        let es2015_output = emit_at(source, ScriptTarget::Es2015);
+        let es2015 = javascript(&es2015_output);
+        assert!(!es2015.contains("_"), "{es2015}");
+        assert!(!es2015.contains("0x"), "{es2015}");
+    }
+
+    #[test]
+    fn numeric_property_names_normalize_like_numeric_underscored_separator() {
+        let output = emit_at("var x = { 0xFF_FF: 1, 0b10_1: 2 };\n", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(code.contains("65535"), "{code}");
+        assert!(code.contains("5:"), "{code}");
+        assert!(!code.contains("0xFF_FF"), "{code}");
+        assert!(!code.contains("0b10_1"), "{code}");
+    }
+    #[test]
+    fn class_expression_temp_is_function_scoped_like_class_block_scoping() {
+        let output = emit_at(
+            "function f(b: boolean) {\n\
+             \x20   let Foo: any;\n\
+             \x20   if (b) {\n\
+             \x20       Foo = class Foo {\n\
+             \x20           static y = new Foo();\n\
+             \x20       };\n\
+             \x20   }\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        let fn_pos = code.find("function f").expect("function: {code}");
+        let var_pos = code.find("var _a").expect("temp declaration: {code}");
+        assert!(fn_pos < var_pos, "{code}");
+        assert!(
+            !code.lines().next().unwrap_or("").contains("var _a"),
+            "{code}"
+        );
+    }
+    #[test]
+    fn nested_class_expression_temp_is_inner_function_scoped_like_static_block18() {
+        let output = emit_at(
+            "function foo() {\n\
+             \x20   return class {\n\
+             \x20       static foo = 1;\n\
+             \x20       static {\n\
+             \x20           const c = class {\n\
+             \x20               static bar = 2;\n\
+             \x20           };\n\
+             \x20       }\n\
+             \x20   };\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        let foo_pos = code.find("function foo").expect("foo");
+        assert!(
+            foo_pos < code.find("var _a").unwrap_or(usize::MAX),
+            "{code}"
+        );
+        let b_pos = code.find("var _b").unwrap_or(usize::MAX);
+        assert!(b_pos != usize::MAX, "missing var _b in:\n{code}");
+        assert!(
+            code.find("var _a").unwrap() < b_pos,
+            "inner temp follows outer:\n{code}"
+        );
+        let iife_pos = code
+            .find("() =>")
+            .or_else(|| code.find("function ("))
+            .unwrap_or(usize::MAX);
+        assert!(
+            iife_pos != usize::MAX,
+            "missing static block function in:\n{code}"
+        );
+        assert!(
+            iife_pos < b_pos,
+            "inner temp inside static block function:\n{code}"
+        );
+    }
+
+    #[test]
+    fn unexported_nested_namespaces_stay_local_like_nested_module_private_access() {
+        let output = emit_at(
+            "namespace a {\n\
+             \x20   var x: number;\n\
+             \x20   namespace b {\n\
+             \x20       var y = x;\n\
+             \x20   }\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var a;\n\
+             (function (a) {\n\
+             \x20   var x;\n\
+             \x20   let b;\n\
+             \x20   (function (b) {\n\
+             \x20       var y = x;\n\
+             \x20   })(b || (b = {}));\n\
+             })(a || (a = {}));\n"
+        );
+    }
+
+    #[test]
+    fn nested_containers_bind_with_var_below_es2015_like_comments_external_modules() {
+        let output = emit_at(
+            "namespace M {\n\
+             \x20   export namespace N {\n\
+             \x20       export var c = 3;\n\
+             \x20   }\n\
+             }\n",
+            ScriptTarget::Es5,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var M;\n\
+             (function (M) {\n\
+             \x20   var N;\n\
+             \x20   (function (N) {\n\
+             \x20       N.c = 3;\n\
+             \x20   })(N = M.N || (M.N = {}));\n\
+             })(M || (M = {}));\n"
+        );
+    }
+
+    #[test]
+    fn an_exported_enum_publishes_its_container() {
+        let source = "export enum E { A }\nexport const enum F { B }\n";
+        let esm = emit_at(source, ScriptTarget::Es2015);
+        assert_eq!(
+            javascript(&esm),
+            "export var E;\n(function (E) {\n    E[E[\"A\"] = 0] = \"A\";\n})(E || (E = {}));\n"
+        );
+        let cjs = emit_with_options(
+            source,
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        assert_eq!(
+            javascript(&cjs),
+            "\"use strict\";\n\
+             Object.defineProperty(exports, \"__esModule\", { value: true });\n\
+             exports.E = void 0;\n\
+             var E;\n\
+             (function (E) {\n\
+             \x20   E[E[\"A\"] = 0] = \"A\";\n\
+             })(E || (exports.E = E = {}));\n"
+        );
+    }
+
+    #[test]
+    fn an_alias_is_declared_only_where_it_holds_a_value() {
+        // Upstream aliasBug, unusedImports10 and
+        // usingModuleWithExportImportInValuePosition.
+        let output = emit_at(
+            "namespace A { export var x = 1; export interface I {} }\n\
+             import top = A;\n\
+             namespace B { import unused = A; export var y = 1; }\n\
+             namespace C { import read = A; export var z = read.x; }\n\
+             namespace D { export import published = A; }\n\
+             namespace E { export import shape = A.I; export var w = 1; }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var A;\n\
+             (function (A) {\n\
+             \x20   A.x = 1;\n\
+             })(A || (A = {}));\n\
+             var top = A;\n\
+             var B;\n\
+             (function (B) {\n\
+             \x20   B.y = 1;\n\
+             })(B || (B = {}));\n\
+             var C;\n\
+             (function (C) {\n\
+             \x20   var read = A;\n\
+             \x20   C.z = read.x;\n\
+             })(C || (C = {}));\n\
+             var D;\n\
+             (function (D) {\n\
+             \x20   D.published = A;\n\
+             })(D || (D = {}));\n\
+             var E;\n\
+             (function (E) {\n\
+             \x20   E.w = 1;\n\
+             })(E || (E = {}));\n"
+        );
+    }
+
+    #[test]
+    fn a_namespace_member_is_rewritten_wherever_it_is_used() {
+        let output = emit_at(
+            "namespace N {\n\
+             \x20   export var x = 1;\n\
+             \x20   export class C {\n\
+             \x20       constructor(public p = x) {}\n\
+             \x20       m(q = x) { return () => x + q; }\n\
+             \x20   }\n\
+             \x20   for (x of [1]) {}\n\
+             \x20   for (x in {}) {}\n\
+             \x20   function shadowed(x: number) { return x; }\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        for expected in [
+            "constructor(p = N.x)",
+            "m(q = N.x)",
+            "return () => N.x + q;",
+            "for (N.x of [1])",
+            "for (N.x in {})",
+            "function shadowed(x) { return x; }",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+    }
+
+    #[test]
+    fn a_name_is_rewritten_in_loop_heads_and_binding_patterns() {
+        let output = emit_at(
+            "namespace N {\n\
+             \x20   export var n = 3;\n\
+             \x20   for (let i = n; i > 0; i--) {}\n\
+             \x20   for (const { a = n } of []) {}\n\
+             \x20   for (const k in { [n]: 1 }) {}\n\
+             \x20   function f({ a = n }, [b = n]) {}\n\
+             \x20   const { c = n, [n]: d } = {};\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        for expected in [
+            "for (let i = N.n; i > 0; i--)",
+            "for (const { a = N.n } of [])",
+            "[N.n]: 1",
+            "function f({ a = N.n }, [b = N.n])",
+            "const { c = N.n, [N.n]: d } = {};",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_name_in_a_binding_pattern_is_reported() {
+        let source = "const { a = missing } = {};\nconst [b = alsoMissing] = [];\n";
+        let checked = checker::check(&Recovered::clean(parse(source)));
+        let unknown = checked
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == crate::checker::CANNOT_FIND_NAME)
+            .count();
+        assert_eq!(unknown, 2, "{:?}", checked.diagnostics());
+    }
+
+    #[test]
+    fn a_const_enum_member_is_inlined() {
+        let output = emit_at(
+            "const enum K { A = 1 }\nconsole.log(K.A);\nconsole.log(K['A']);\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(!code.contains("K.A)"), "{code}");
+        assert!(!code.contains("K['A']"), "{code}");
+        assert!(code.contains("console.log(1"), "{code}");
+    }
+
+    #[test]
+    fn a_published_alias_is_read_from_its_container() {
+        let output = emit_at(
+            "namespace A { export var x = 1; }\n\
+             namespace C { export var v = b; export import b = A.x; export var w = b; }\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        for expected in ["C.v = C.b;", "C.b = A.x;", "C.w = C.b;"] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+    }
+
+    #[test]
+    fn a_namespace_without_a_value_emits_nothing() {
+        let output = emit_at(
+            "namespace T { export interface I {} }\n\
+             namespace U { import a = T; }\n\
+             namespace V { export const enum E { A } }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(javascript(&output), "");
+    }
+
+    #[test]
+    fn a_namespace_merged_into_a_class_uses_its_binding() {
+        let output = emit_at(
+            "class C {}\nnamespace C { export var x = 1; }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "class C {\n}\n(function (C) {\n    C.x = 1;\n})(C || (C = {}));\n"
+        );
+    }
+
+    #[test]
+    fn a_namespace_whose_body_shadows_its_name_renames_the_parameter() {
+        let output = emit_at(
+            "namespace M { export var M = 1; export var y = M; }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var M;\n(function (M_1) {\n    M_1.M = 1;\n    M_1.y = M_1.M;\n})(M || (M = {}));\n"
+        );
+    }
+
+    #[test]
+    fn an_exported_pattern_assigns_each_name_onto_the_container() {
+        // Upstream declarationEmitDestructuringArrayPattern3 and
+        // downlevelLetConst13: one read needs no temporary.
+        let output = emit_at(
+            "namespace M {\n\
+             \x20   export var [a, b] = [1, 2];\n\
+             \x20   export let [c] = [1];\n\
+             \x20   export const { d: e } = { d: 1 };\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "var M;\n\
+             (function (M) {\n\
+             \x20   var _a;\n\
+             \x20   _a = [1, 2], M.a = _a[0], M.b = _a[1];\n\
+             \x20   M.c = [1][0];\n\
+             \x20   M.e = { d: 1 }.d;\n\
+             })(M || (M = {}));\n"
+        );
+    }
+
+    #[test]
+    fn an_exported_pattern_collects_its_rest() {
+        let output = emit_at(
+            "namespace M {\n\
+             \x20   export var [a, ...b] = [1, 2, 3];\n\
+             \x20   export var { c, ...d } = { c: 1, e: 2 };\n\
+             }\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        for expected in [
+            "_a = [1, 2, 3], M.a = _a[0], M.b = _a.slice(1);",
+            "_b = { c: 1, e: 2 }, M.c = _b.c, M.d = __rest(_b, [\"c\"]);",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+    }
+
+    #[test]
+    fn an_exported_namespace_publishes_its_container() {
+        let source = "export namespace M { export var x = 1; }\n";
+        let esm = emit_at(source, ScriptTarget::Es2015);
+        assert_eq!(
+            javascript(&esm),
+            "export var M;\n(function (M) {\n    M.x = 1;\n})(M || (M = {}));\n"
+        );
+        let cjs = emit_with_options(
+            source,
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        assert_eq!(
+            javascript(&cjs),
+            "\"use strict\";\n\
+             Object.defineProperty(exports, \"__esModule\", { value: true });\n\
+             exports.M = void 0;\n\
+             var M;\n\
+             (function (M) {\n\
+             \x20   M.x = 1;\n\
+             })(M || (exports.M = M = {}));\n"
+        );
+    }
+
+    #[test]
+    fn commonjs_keeps_an_exported_variable_on_exports() {
+        // Upstream downlevelLetConst13 and internalAliasVarInsideTopLevelModuleWithExport.
+        let output = emit_with_options(
+            "export var a = 1, b;\n\
+             export let [c] = [1];\n\
+             a = 2;\n\
+             a++;\n\
+             const box = { a };\n\
+             a();\n\
+             function f(a: number) { return a; }\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        let body = code
+            .split_once("void 0;\n")
+            .map(|(_, body)| body)
+            .expect("the preamble declares the exports");
+        assert_eq!(
+            body,
+            "exports.a = 1;\n\
+             exports.c = [1][0];\n\
+             exports.a = 2;\n\
+             exports.a++;\n\
+             const box = { a: exports.a };\n\
+             (0, exports.a)();\n\
+             function f(a) { return a; }\n"
+        );
+        for name in ["exports.a", "exports.b", "exports.c"] {
+            let preamble = code.split("void 0;").next().expect("split yields a head");
+            assert!(preamble.contains(name), "{code}");
+        }
+    }
+
+    #[test]
+    fn commonjs_export_specifiers_read_what_the_name_became() {
+        let output = emit_with_options(
+            "import { x } from './m';\n\
+             import y from './n';\n\
+             export var a = 1;\n\
+             const local = 2;\n\
+             export { a as b, x, y, local };\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        for expected in [
+            "exports.b = exports.a;",
+            "Object.defineProperty(exports, \"x\", { enumerable: true, get: function () { return m_1.x; } });",
+            "exports.y = n_1.default;",
+            "exports.local = local;",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+    }
+
+    #[test]
+    fn commonjs_reads_a_published_alias_from_exports() {
+        let output = emit_with_options(
+            "export namespace a { export var x = 10; }\n\
+             export import b = a.x;\n\
+             export var c = b;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(code.contains("exports.b = a.x;"), "{code}");
+        assert!(code.contains("exports.c = exports.b;"), "{code}");
+    }
+
+    #[test]
+    fn commonjs_imports_stay_in_source_order_among_statements() {
+        let output = emit_with_options(
+            "// leading\n\
+             import './s';\n\
+             globalThis.a = 1;\n\
+             import { q } from './m';\n\
+             console.log(q);\n\
+             export * from './n';\n\
+             import './t';\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        let order = [
+            "// leading",
+            "require(\"./s\");",
+            "globalThis.a = 1;",
+            "const m_1 = require(\"./m\");",
+            "console.log(m_1.q);",
+            "__exportStar(require(\"./n\"), exports);",
+            "require(\"./t\");",
+        ];
+        let positions: Vec<usize> = order
+            .iter()
+            .map(|line| code.find(line).unwrap_or_else(|| panic!("{line}: {code}")))
+            .collect();
+        assert!(positions.is_sorted(), "{code}");
+    }
+
+    #[test]
+    fn commonjs_keeps_an_exported_local_in_step_with_exports() {
+        let output = emit_with_options(
+            "export { x };\n\
+             let x = 1, y = 2, z = 3;\n\
+             export { y as w, z };\n\
+             x = 5;\n\
+             y += 1;\n\
+             ++z;\n\
+             z++;\n\
+             const old = z--;\n\
+             [x] = [7];\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        let declared = code.find("let x = 1").expect("declaration");
+        for line in ["exports.x = x;", "exports.w = y;", "exports.z = z;"] {
+            let published = code.find(line).unwrap_or_else(|| panic!("{line}: {code}"));
+            assert!(published > declared, "{line}: {code}");
+        }
+        for line in [
+            "exports.x = x = 5;",
+            "exports.w = y += 1;",
+            "exports.z = ++z;",
+            "exports.z = (z++, z);",
+            ", exports.x = x, ",
+        ] {
+            assert!(code.contains(line), "{line}: {code}");
+        }
+        assert!(code.contains("exports.z = (_"), "{code}");
+    }
+
+    #[test]
+    fn export_assignment_closes_the_module_and_an_ambient_publishes_nothing() {
+        let commonjs = EmitOptions {
+            target: ScriptTarget::Es2022,
+            module: Some(crate::emitter::ModuleKind::CommonJs),
+            ..EmitOptions::default()
+        };
+        let output = emit_with_options("export = C;\nclass C {}\n", commonjs.clone());
+        let code = javascript(&output);
+        assert!(code.ends_with("module.exports = C;\n"), "{code}");
+        let ambient = emit_with_options(
+            "declare const q: number;\nexport { q };\n",
+            commonjs.clone(),
+        );
+        let code = javascript(&ambient);
+        assert!(code.contains("exports.q = void 0;"), "{code}");
+        assert!(!code.contains("exports.q = q"), "{code}");
+        let parameter = emit_with_options(
+            "import { x } from './m';\nclass C { constructor(public a = x) {} }\nnew C();\n",
+            commonjs,
+        );
+        let code = javascript(&parameter);
+        assert!(code.contains("a = m_1.x"), "{code}");
+    }
+
+    #[test]
+    fn export_assignment_replaces_commonjs_exports() {
+        let output = emit_with_options(
+            "const K = 1;\nexport = K;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        assert_eq!(
+            javascript(&output),
+            "\"use strict\";\nconst K = 1;\nmodule.exports = K;\n"
+        );
+    }
+
+    #[test]
+    fn string_export_names_quote_their_decoded_text() {
+        let output = emit_with_options(
+            "import { \"a b\" as ab } from './m';\n\
+             const v = ab;\n\
+             export { v as 'quo\"te', v as \"back\\\\slash\", v as \"x²\" };\n\
+             export { q as \"c d\" } from './n';\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        for line in [
+            "const v = m_1[\"a b\"];",
+            "exports[\"quo\\\"te\"] = v;",
+            "exports[\"back\\\\slash\"] = v;",
+            "exports[\"x²\"] = v;",
+            "Object.defineProperty(exports, \"c d\", {",
+        ] {
+            assert!(code.contains(line), "{line}: {code}");
+        }
+    }
+
+    #[test]
+    fn verbatim_module_syntax_keeps_type_only_imports_loading() {
+        let output = emit_with_options(
+            "import { type I } from './a';\n\
+             import {} from './b';\n\
+             export { type T } from './c';\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::EsNext),
+                verbatim_module_syntax: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        for line in [
+            "import {} from './a';",
+            "import {} from './b';",
+            "export {} from './c';",
+        ] {
+            assert!(code.contains(line), "{line}: {code}");
+        }
+    }
+
+    #[test]
+    fn a_require_local_is_always_an_identifier() {
+        let mut names = super::RequireNames::new(std::collections::BTreeSet::new());
+        for (module, expected) in [
+            ("./m.js", "m_js_1"),
+            ("./m.js", "m_js_2"),
+            ("@scope/my-lib", "my_lib_1"),
+            ("./10-lib", "_10_lib_1"),
+            ("enum", "enum_1"),
+        ] {
+            assert_eq!(names.allocate(module), expected);
+        }
+    }
+
+    #[test]
+    fn commonjs_function_exports_precede_every_require() {
+        let output = emit_with_options(
+            "import './setup';\n\
+             export * from './lib';\n\
+             export function f() {}\n\
+             function g() {}\n\
+             export { g as h };\n\
+             const c = 1;\n\
+             export { c };\n\
+             export default function d() {}\n\
+             export declare function ambient(): void;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        let order = [
+            "exports.c = void 0;",
+            "exports.f = f;",
+            "exports.h = g;",
+            "exports.default = d;",
+            "require(\"./setup\");",
+            "__exportStar(require(\"./lib\"), exports);",
+            "function f() { }",
+        ];
+        let positions: Vec<usize> = order
+            .iter()
+            .map(|line| code.find(line).unwrap_or_else(|| panic!("{line}: {code}")))
+            .collect();
+        assert!(positions.is_sorted(), "{code}");
+        assert!(!code.contains("ambient"), "{code}");
+    }
+
+    #[test]
+    fn an_es_module_with_nothing_left_stays_a_module() {
+        let esm = EmitOptions {
+            target: ScriptTarget::Es2015,
+            module: Some(crate::emitter::ModuleKind::EsNext),
+            ..EmitOptions::default()
+        };
+        for source in [
+            "export interface I {}\n",
+            "interface I {}\nexport { I };\n",
+            "export {};\n",
+            "import type { T } from './t';\nconst x = 1;\nexport type { T };\n",
+        ] {
+            let output = emit_with_options(source, esm.clone());
+            let code = javascript(&output);
+            assert!(code.ends_with("export {};\n"), "{source}: {code}");
+        }
+        for source in ["export const x = 1;\n", "import './a';\n", "const x = 1;\n"] {
+            let output = emit_with_options(source, esm.clone());
+            assert!(!javascript(&output).contains("export {}"), "{source}");
+        }
+        let commonjs = emit_with_options(
+            "export interface I {}\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        assert!(!javascript(&commonjs).contains("export {}"));
+    }
+
+    #[test]
+    fn an_import_survives_only_through_a_value_read() {
+        let esm = EmitOptions {
+            target: ScriptTarget::Es2022,
+            module: Some(crate::emitter::ModuleKind::EsNext),
+            ..EmitOptions::default()
+        };
+        for (source, expected) in [
+            (
+                "import { I, v } from './m';\nlet a: I;\nv;\n",
+                "import { v } from './m';",
+            ),
+            ("import { unused } from './m';\n", "export {};"),
+            ("import d from './m';\nlet a: d;\n", "export {};"),
+            ("import * as n from './m';\nlet a: n.T;\n", "export {};"),
+            ("import {} from './m';\n", "export {};"),
+            (
+                "import { x } from './m';\nexport { x };\n",
+                "import { x } from './m';",
+            ),
+            (
+                "import { d } from './m';\n@d class C {}\n",
+                "import { d } from './m';",
+            ),
+            (
+                "import { d } from './m';\nclass C { @d m() {} }\n",
+                "import { d } from './m';",
+            ),
+            (
+                "import { c } from './m';\ntry {} catch ({ a = c }) {}\n",
+                "import { c } from './m';",
+            ),
+            (
+                "import { x } from './m';\nfunction f(a = x) { var x = 2; return a; }\n",
+                "import { x } from './m';",
+            ),
+            (
+                "import { x } from './m';\n{ function x() {} }\nconsole.log(x);\n",
+                "import { x } from './m';",
+            ),
+            (
+                "import { x } from './m';\nnamespace N { import q = x.v; export const w = q; }\n",
+                "import { x } from './m';",
+            ),
+            (
+                "import { x } from './m';\nexport import w = x.v;\n",
+                "import { x } from './m';",
+            ),
+            ("import './m';\n", "import './m';"),
+        ] {
+            let output = emit_with_options(source, esm.clone());
+            let code = javascript(&output);
+            assert!(code.contains(expected), "{source}: {code}");
+            if expected == "export {};" {
+                assert!(!code.contains("import"), "{source}: {code}");
+            }
+        }
+        let verbatim = emit_with_options(
+            "import { unused } from './m';\n",
+            EmitOptions {
+                verbatim_module_syntax: true,
+                ..esm.clone()
+            },
+        );
+        assert!(javascript(&verbatim).contains("import { unused }"));
+        let commonjs = emit_with_options(
+            "import { I } from './m';\nlet a: I;\nexport { a };\n",
+            EmitOptions {
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..esm
+            },
+        );
+        assert!(!javascript(&commonjs).contains("require"));
+    }
+
+    #[test]
+    fn a_catch_pattern_reads_through_its_namespace() {
+        let output = emit_with_options(
+            "namespace N {\n\
+             export var n = 3;\n\
+             try { throw {}; } catch ({ a = n }) { a; }\n\
+             }\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(code.contains("catch ({ a = N.n })"), "{code}");
+    }
+
+    #[test]
+    fn a_value_read_keeps_an_import_whatever_another_file_seems_to_say() {
+        let output = emit_with_options(
+            "import { Foo, Bar } from './m';\nconsole.log(Foo);\nexport { Bar };\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::EsNext),
+                erased_imports: std::sync::Arc::new(
+                    [
+                        ("./m".to_owned(), "Foo".to_owned()),
+                        ("./m".to_owned(), "Bar".to_owned()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(code.contains("import { Foo } from './m';"), "{code}");
+        assert!(!code.contains("Bar"), "{code}");
+    }
+
+    #[test]
+    fn something_reading_imports_unseen_keeps_them_all() {
+        let options = EmitOptions {
+            target: ScriptTarget::Es2022,
+            module: Some(crate::emitter::ModuleKind::EsNext),
+            ..EmitOptions::default()
+        };
+        let pragma = emit_with_options(
+            "/** @jsx h */\nimport { h } from './m';\nexport {};\n",
+            options.clone(),
+        );
+        assert!(javascript(&pragma).contains("import { h }"));
+        let metadata = emit_with_options(
+            "import { T } from './m';\nlet a: T;\n",
+            EmitOptions {
+                keeps_imports: true,
+                ..options
+            },
+        );
+        assert!(javascript(&metadata).contains("import { T }"));
+    }
+
+    #[test]
+    fn commonjs_export_import_require_lives_on_exports() {
+        let output = emit_with_options(
+            "export import ns = require('./m');\nconsole.log(ns);\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(code.contains("exports.ns = require(\"./m\");"), "{code}");
+        assert!(code.contains("console.log(exports.ns);"), "{code}");
+    }
+
+    #[test]
+    fn a_type_has_no_runtime_export() {
+        const SOURCE: &str = "import type { Q } from './types';\n\
+             import { type R } from './types';\n\
+             interface I {}\n\
+             type T = 1;\n\
+             const v = 1;\n\
+             export { I, T, Q, R, v };\n";
+        let commonjs_output = emit_with_options(
+            SOURCE,
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let commonjs = javascript(&commonjs_output);
+        assert!(commonjs.contains("exports.v = void 0;"), "{commonjs}");
+        assert!(commonjs.contains("exports.v = v;"), "{commonjs}");
+        for name in ["I", "T", "Q", "R"] {
+            assert!(!commonjs.contains(&format!("exports.{name}")), "{commonjs}");
+        }
+        let module_output = emit_with_options(
+            SOURCE,
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::EsNext),
+                ..EmitOptions::default()
+            },
+        );
+        let module = javascript(&module_output);
+        assert!(module.contains("export { v };"), "{module}");
+    }
+
+    #[test]
+    fn commonjs_reexports_are_not_left_as_module_syntax() {
+        let output = emit_with_options(
+            "export * from './a';\n\
+             export * as ns from './b';\n\
+             export { x, y as z } from './c';\n\
+             export type { T } from './d';\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(!code.contains("export "), "{code}");
+        assert!(!code.contains("./d"), "{code}");
+        for expected in [
+            "__exportStar(require(\"./a\"), exports);",
+            "exports.ns = __importStar(require(\"./b\"));",
+            "var c_1 = require(\"./c\");",
+            "Object.defineProperty(exports, \"x\", { enumerable: true, get: function () { return c_1.x; } });",
+            "Object.defineProperty(exports, \"z\", { enumerable: true, get: function () { return c_1.y; } });",
+            "function __exportStar(",
+            "function __importStar(",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+    }
+
+    #[test]
+    fn commonjs_rewrites_an_import_wherever_it_is_read() {
+        let output = emit_with_options(
+            "import { a } from './m';\n\
+             const list = [a, ...a];\n\
+             const box = { a, b: a, [a]: 1, c() { return a; } };\n\
+             const text = `${a}`;\n\
+             a.b = 1;\n\
+             a.b++;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        for expected in [
+            "const list = [m_1.a, ...m_1.a];",
+            "a: m_1.a",
+            "b: m_1.a",
+            "[m_1.a]: 1",
+            "return m_1.a;",
+            "`${m_1.a}`",
+            "m_1.a.b = 1;",
+            "m_1.a.b++;",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
     }
 
     #[test]
@@ -11127,5 +15347,186 @@ console.log(JSON.stringify([bar, bar4, log]));
             javascript(&native).contains("names?.filter(f)"),
             "{native:?}"
         );
+    }
+
+    fn commonjs_at(source: &str, target: ScriptTarget) -> String {
+        let output = emit_with_options(
+            source,
+            EmitOptions {
+                target,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        javascript(&output).to_owned()
+    }
+
+    #[test]
+    fn a_lowered_write_to_an_exported_variable_goes_to_exports() {
+        // A variable exported where it is declared has no local: upstream's module
+        // transform runs after these lowerings and rewrites what they produce.
+        for (source, lowered) in [
+            ("a ||= 1;", "exports.a || (exports.a = 1);"),
+            ("a &&= 1;", "exports.a && (exports.a = 1);"),
+            (
+                "a ??= 1;",
+                "exports.a !== null && exports.a !== void 0 ? exports.a : (exports.a = 1);",
+            ),
+            ("a **= 2;", "exports.a = Math.pow(exports.a, 2);"),
+        ] {
+            let code = commonjs_at(
+                &format!("export var a: any = 0;\n{source}\n"),
+                ScriptTarget::Es5,
+            );
+            assert!(code.contains(lowered), "{code}");
+        }
+    }
+
+    #[test]
+    fn lowered_destructuring_writes_an_exported_variable_through_exports() {
+        let code = commonjs_at(
+            "export var a: any = 0;\nvar o: any = {};\nexport var s: any = [1];\n[a] = [2];\n({ a } = { a: 3 });\n[o.x] = [4];\n[o.y] = s;\n",
+            ScriptTarget::Es5,
+        );
+        assert!(!code.contains("\na = "), "{code}");
+        assert!(code.contains("exports.a = _"), "{code}");
+        assert!(!code.contains("= s;"), "{code}");
+    }
+
+    #[test]
+    fn lowered_destructuring_publishes_a_local_exported_by_a_specifier() {
+        let code = commonjs_at(
+            "var a: any = 0;\nexport { a, a as b };\n[a] = [2];\n",
+            ScriptTarget::Es5,
+        );
+        assert!(code.contains("exports.b = exports.a = a = _"), "{code}");
+    }
+
+    #[test]
+    fn a_lowered_write_to_a_namespace_member_goes_to_the_namespace() {
+        let code = commonjs_at(
+            "export namespace N {\n    export var a: any = 0;\n    a ||= 1;\n    a **= 2;\n}\n",
+            ScriptTarget::Es5,
+        );
+        assert!(code.contains("N.a || (N.a = 1);"), "{code}");
+        assert!(code.contains("N.a = Math.pow(N.a, 2);"), "{code}");
+    }
+
+    /// What Node prints for the CommonJS output of `source`, then `report`.
+    fn node_prints(source: &str, target: ScriptTarget, report: &str) -> String {
+        let code = commonjs_at(source, target);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("bamts-cjs-{nonce}.cjs"));
+        std::fs::write(&path, format!("{code}\n{report}\n")).expect("write lowered JavaScript");
+        let result = std::process::Command::new("node")
+            .arg(&path)
+            .output()
+            .expect("execute Node");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout)
+            .expect("Node stdout")
+            .trim()
+            .to_owned()
+    }
+
+    const EMIT_TARGETS: [ScriptTarget; 3] = [
+        ScriptTarget::Es5,
+        ScriptTarget::Es2015,
+        ScriptTarget::Es2020,
+    ];
+
+    #[test]
+    fn node_executes_lowered_writes_to_exported_variables() {
+        let source = r#"
+export var a: any = 0;
+export let b: any = 1;
+var c: any = 0;
+export { c };
+export var s: any = [20, 21];
+var o: any = {};
+export { o };
+a ||= 5;
+b &&= 6;
+c ??= 7;
+a **= 2;
+[b] = [8];
+({ c } = { c: 9 });
+var d: any;
+[d, o.e] = s;
+"#;
+        let report =
+            "console.log(JSON.stringify([exports.a, exports.b, exports.c, exports.o, d]));";
+        for target in EMIT_TARGETS {
+            assert_eq!(
+                node_prints(source, target, report),
+                r#"[25,8,9,{"e":21},20]"#
+            );
+        }
+    }
+
+    #[test]
+    fn node_executes_a_for_of_that_writes_exported_variables() {
+        let source = r#"
+export var a: any = 0;
+export var b: any = 0;
+for (a of [1, 2]) {}
+for ([b] of [[3], [4]]) {}
+"#;
+        let report = "console.log(JSON.stringify([exports.a, exports.b]));";
+        for target in EMIT_TARGETS {
+            assert_eq!(node_prints(source, target, report), "[2,4]");
+        }
+    }
+
+    /// tsc 7.0.2 prints a loop head that writes a local of `export { c }` as it stands,
+    /// so `exports.c` keeps its value. Parity keeps that gap.
+    #[test]
+    fn a_loop_head_does_not_publish_a_local_exported_by_a_specifier() {
+        let source = "var c: any = 0;\nexport { c };\nfor (c of [5, 6]) {}\n";
+        for target in [ScriptTarget::Es2015, ScriptTarget::Es2020] {
+            assert!(
+                commonjs_at(source, target).contains("for (c of [5, 6]) { }"),
+                "{target:?}"
+            );
+            let report = "console.log(JSON.stringify(exports.c));";
+            assert_eq!(node_prints(source, target, report), "0");
+        }
+    }
+
+    #[test]
+    fn node_executes_the_rest_of_an_array_assignment() {
+        let source = r#"
+export var a: any, b: any, c: any, d: any, e: any, f: any;
+[a, ...b] = [1, 2, 3];
+[, ...c] = [4, 5];
+[d, ...[e]] = [6, 7, 8];
+[...f] = [9];
+"#;
+        let report = "console.log(JSON.stringify([exports.a, exports.b, exports.c, exports.d, exports.e, exports.f]));";
+        for target in EMIT_TARGETS {
+            assert_eq!(node_prints(source, target, report), "[1,[2,3],[5],6,7,[9]]");
+        }
+    }
+
+    #[test]
+    fn a_string_named_constructor_is_the_constructor() {
+        // quotedConstructors.js: a string with the value `constructor` makes the
+        // constructor, whatever its escapes, and a computed name is a method.
+        let code = javascript(&emit_at(
+            "class C {\n    \"constructor\"() { }\n}\nclass D {\n    '\\x63onstructor'() { }\n}\nclass E {\n    ['constructor']() { }\n}\nclass F {\n    'constructors'() { }\n}\n",
+            ScriptTarget::Es2015,
+        ))
+        .to_owned();
+        assert_eq!(code.matches("    constructor() { }").count(), 2, "{code}");
+        assert!(code.contains("]() { }"), "{code}");
+        assert!(code.contains("'constructors'() { }"), "{code}");
     }
 }

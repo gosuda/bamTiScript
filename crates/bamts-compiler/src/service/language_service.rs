@@ -557,24 +557,13 @@ const fn symbol_index(symbol: SymbolId) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::fs;
 
     use super::*;
     use crate::service::{ServiceError, ServiceState, filesystem::OsFileSystem};
 
     fn state(source: &str) -> (PathBuf, ServiceState<OsFileSystem>) {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "bamts-language-service-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir(&root).expect("create root");
+        let root = crate::service::test_support::fresh_dir("bamts-language-service");
         let mut state = ServiceState::new(OsFileSystem::new(&root).expect("filesystem"));
         state.open("a.ts", source, 1).expect("open");
         (root, state)

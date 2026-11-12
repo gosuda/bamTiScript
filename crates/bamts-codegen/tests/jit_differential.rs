@@ -10,13 +10,14 @@ use bamts_codegen::compile_jit;
 use bamts_codegen::helpers::{
     HelperDemand, ISA_REPRESENTATIVES, STRUCTURAL_HELPERS, helper_demand, verify_helper_coverage,
 };
-use bamts_codegen::tiering::{
+use bamts_native::tiering::{
     DeoptReason, OsrEntry, Tier, TierTransition, TieringState, WarmupPolicy,
     verify_tiering_contract,
 };
-use bamts_native::NativeEntryTable;
+use bamts_native::{Completion, CompletionTag, NativeEntryTable, ShadowFrame, Value};
 use bamts_runtime::{
-    Host, Limits, NativeError, RuntimeError, run as run_interpreter, run_linked_program,
+    CancellationToken, Host, Limits, NativeError, RuntimeError, TieredRunReport,
+    UnitTieringSummary, run as run_interpreter, run_linked_program, run_linked_program_tiered,
 };
 
 #[derive(Default)]
@@ -433,4 +434,525 @@ fn executable_publication_is_repeatable_and_program_bound() {
             );
         }
     }
+}
+fn tiered(
+    program: &Program<Verified>,
+    limits: &Limits,
+    policy: WarmupPolicy,
+) -> (Observable, TieredRunReport) {
+    let compiled = compile_jit(program).expect("stress fixture must compile to native code");
+    assert_eq!(
+        compiled.program_bytes(),
+        program.encode(),
+        "a published JIT artifact must remain bound to the exact verified program",
+    );
+    let mut host = RecordingHost::default();
+    let (outcome, report) = run_linked_program_tiered(
+        program,
+        &compiled,
+        &mut host,
+        limits,
+        policy,
+        CancellationToken::new(),
+    )
+    .expect("tiered run links");
+    let observable = match outcome {
+        Ok(outcome) => Observable::Normal {
+            stdout: host.stdout,
+            exit_code: outcome.exit_code,
+        },
+        Err(NativeError::Runtime(error)) => Observable::Abrupt(error),
+        Err(error) => panic!("native-only failure without interpreter analogue: {error:?}"),
+    };
+    (observable, report)
+}
+
+fn osr_only_policy() -> WarmupPolicy {
+    WarmupPolicy {
+        baseline_invocations: u32::MAX,
+        optimized_invocations: u32::MAX,
+        osr_back_edges: 2,
+        deopt_budget: 8,
+    }
+}
+
+fn entry_summary(report: &TieredRunReport) -> &UnitTieringSummary {
+    report
+        .units
+        .iter()
+        .find(|unit| unit.module == ModuleId::new(0) && unit.function == FunctionId::new(0))
+        .expect("entry unit is reported")
+}
+
+fn loop_print_program(iterations: i32) -> Program<Verified> {
+    let code = vec![
+        Instruction::LoadGlobal {
+            dst: reg(7),
+            name: cid(1),
+        },
+        Instruction::LoadConst {
+            dst: reg(0),
+            constant: cid(3),
+        },
+        Instruction::LoadConst {
+            dst: reg(1),
+            constant: cid(4),
+        },
+        Instruction::LoadConst {
+            dst: reg(2),
+            constant: cid(5),
+        },
+        Instruction::Binary {
+            dst: reg(3),
+            op: BinaryOp::LessThan,
+            left: reg(0),
+            right: reg(1),
+        },
+        Instruction::JumpIfFalse {
+            condition: reg(3),
+            target: Pc::new(12),
+        },
+        Instruction::CreateArray { dst: reg(6) },
+        Instruction::ArrayPush {
+            array: reg(6),
+            value: reg(0),
+        },
+        Instruction::LoadConst {
+            dst: reg(9),
+            constant: cid(2),
+        },
+        Instruction::Call {
+            dst: reg(8),
+            callee: reg(7),
+            this_value: reg(9),
+            arguments: reg(6),
+        },
+        Instruction::Binary {
+            dst: reg(0),
+            op: BinaryOp::Add,
+            left: reg(0),
+            right: reg(2),
+        },
+        Instruction::Jump { target: Pc::new(4) },
+        Instruction::Halt,
+    ];
+    program(
+        vec![
+            Constant::String(EcmaString::encode("entry")),
+            Constant::String(EcmaString::encode("print")),
+            Constant::Undefined,
+            Constant::Int32(0),
+            Constant::Int32(iterations),
+            Constant::Int32(1),
+        ],
+        10,
+        code,
+    )
+}
+
+fn loop_throw_program() -> Program<Verified> {
+    let constants = vec![
+        Constant::String(EcmaString::encode("entry")),
+        Constant::String(EcmaString::encode("print")),
+        Constant::Undefined,
+        Constant::Int32(0),
+        Constant::Int32(5),
+        Constant::Int32(3),
+        Constant::Int32(1),
+        Constant::Int32(99),
+    ];
+    let entry = Function::new(
+        None,
+        0,
+        0,
+        10,
+        FunctionFlags::default(),
+        vec![
+            Instruction::LoadGlobal {
+                dst: reg(6),
+                name: cid(1),
+            },
+            Instruction::CreateArray { dst: reg(0) },
+            Instruction::CreateClosure {
+                dst: reg(1),
+                function: FunctionId::new(1),
+                captures: reg(0),
+            },
+            Instruction::LoadConst {
+                dst: reg(2),
+                constant: cid(2),
+            },
+            Instruction::CreateArray { dst: reg(3) },
+            Instruction::Call {
+                dst: reg(4),
+                callee: reg(1),
+                this_value: reg(2),
+                arguments: reg(3),
+            },
+            Instruction::Halt,
+            Instruction::CreateArray { dst: reg(7) },
+            Instruction::ArrayPush {
+                array: reg(7),
+                value: reg(5),
+            },
+            Instruction::LoadConst {
+                dst: reg(8),
+                constant: cid(2),
+            },
+            Instruction::Call {
+                dst: reg(9),
+                callee: reg(6),
+                this_value: reg(8),
+                arguments: reg(7),
+            },
+            Instruction::Halt,
+        ],
+        vec![bamts_bytecode::ExceptionHandler {
+            start: Pc::new(5),
+            end: Pc::new(6),
+            handler: Pc::new(7),
+            catch_register: reg(5),
+        }],
+    );
+    let callee = Function::new(
+        None,
+        0,
+        0,
+        11,
+        FunctionFlags::default(),
+        vec![
+            Instruction::LoadGlobal {
+                dst: reg(7),
+                name: cid(1),
+            },
+            Instruction::LoadConst {
+                dst: reg(0),
+                constant: cid(3),
+            },
+            Instruction::LoadConst {
+                dst: reg(1),
+                constant: cid(4),
+            },
+            Instruction::LoadConst {
+                dst: reg(2),
+                constant: cid(6),
+            },
+            Instruction::LoadConst {
+                dst: reg(4),
+                constant: cid(5),
+            },
+            Instruction::LoadConst {
+                dst: reg(9),
+                constant: cid(7),
+            },
+            Instruction::Binary {
+                dst: reg(3),
+                op: BinaryOp::LessThan,
+                left: reg(0),
+                right: reg(1),
+            },
+            Instruction::JumpIfFalse {
+                condition: reg(3),
+                target: Pc::new(17),
+            },
+            Instruction::Binary {
+                dst: reg(5),
+                op: BinaryOp::Equal,
+                left: reg(0),
+                right: reg(4),
+            },
+            Instruction::JumpIfTrue {
+                condition: reg(5),
+                target: Pc::new(16),
+            },
+            Instruction::CreateArray { dst: reg(6) },
+            Instruction::ArrayPush {
+                array: reg(6),
+                value: reg(0),
+            },
+            Instruction::LoadConst {
+                dst: reg(8),
+                constant: cid(2),
+            },
+            Instruction::Call {
+                dst: reg(10),
+                callee: reg(7),
+                this_value: reg(8),
+                arguments: reg(6),
+            },
+            Instruction::Binary {
+                dst: reg(0),
+                op: BinaryOp::Add,
+                left: reg(0),
+                right: reg(2),
+            },
+            Instruction::Jump { target: Pc::new(6) },
+            Instruction::Throw { value: reg(9) },
+            Instruction::Halt,
+        ],
+        Vec::new(),
+    );
+    let module = Module::new(constants, vec![entry, callee], FunctionId::new(0))
+        .verify()
+        .expect("stress fixture must verify");
+    let module = ProgramModule {
+        name: ConstantId::new(0),
+        code: module,
+        edges: Vec::new(),
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+    Program::link(vec![module], ModuleId::new(0)).expect("stress fixture must link")
+}
+
+fn generator_loop_program() -> Program<Verified> {
+    let code = vec![
+        Instruction::LoadConst {
+            dst: reg(3),
+            constant: cid(2),
+        },
+        Instruction::LoadConst {
+            dst: reg(4),
+            constant: cid(3),
+        },
+        Instruction::LoadConst {
+            dst: reg(5),
+            constant: cid(4),
+        },
+        Instruction::LoadConst {
+            dst: reg(0),
+            constant: cid(1),
+        },
+        Instruction::Suspend {
+            dst: reg(1),
+            src: reg(0),
+            resume: Pc::new(5),
+            mode: reg(2),
+        },
+        Instruction::Binary {
+            dst: reg(0),
+            op: BinaryOp::LessThan,
+            left: reg(3),
+            right: reg(4),
+        },
+        Instruction::JumpIfFalse {
+            condition: reg(0),
+            target: Pc::new(9),
+        },
+        Instruction::Binary {
+            dst: reg(3),
+            op: BinaryOp::Add,
+            left: reg(3),
+            right: reg(5),
+        },
+        Instruction::Jump { target: Pc::new(5) },
+        Instruction::Return { value: reg(3) },
+    ];
+    let module = Module::new(
+        vec![
+            Constant::String(EcmaString::encode("entry")),
+            Constant::Int32(1),
+            Constant::Int32(0),
+            Constant::Int32(3),
+            Constant::Int32(1),
+        ],
+        vec![Function::new(
+            None,
+            0,
+            0,
+            6,
+            FunctionFlags {
+                is_async: false,
+                is_generator: true,
+                is_constructable: false,
+                ..FunctionFlags::default()
+            },
+            code,
+            Vec::new(),
+        )],
+        FunctionId::new(0),
+    )
+    .verify()
+    .expect("stress fixture must verify");
+    let module = ProgramModule {
+        name: ConstantId::new(0),
+        code: module,
+        edges: Vec::new(),
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+    Program::link(vec![module], ModuleId::new(0)).expect("stress fixture must link")
+}
+
+#[test]
+fn tiered_first_call_promotes_to_baseline_and_matches_interpreter() {
+    let case = arithmetic_program(19, 23, BinaryOp::Add);
+    let expected = interpreter(&case, &Limits::default());
+    let (actual, report) = tiered(&case, &Limits::default(), WarmupPolicy::DEFAULT);
+    assert_eq!(
+        actual, expected,
+        "tiered baseline must match the interpreter"
+    );
+    let entry = entry_summary(&report);
+    assert_eq!(
+        entry.tier,
+        Tier::Baseline,
+        "one call promotes under the shipped policy"
+    );
+    assert_eq!(entry.deopts, 0);
+}
+
+#[test]
+fn tiered_loop_enters_at_header_with_identical_side_effects() {
+    let case = loop_print_program(5);
+    let expected = interpreter(&case, &Limits::default());
+    let (actual, report) = tiered(&case, &Limits::default(), osr_only_policy());
+    assert_eq!(
+        actual, expected,
+        "restarting at pc 0 would duplicate the prefix"
+    );
+    let entry = entry_summary(&report);
+    assert!(
+        entry.osr_entries > 0,
+        "the loop must transfer into compiled code"
+    );
+    assert_eq!(
+        entry.deopts, 0,
+        "a refused entry deoptimizes and must not pass"
+    );
+    assert_eq!(entry.tier, Tier::Interpreter);
+}
+
+#[test]
+fn tiered_loop_throw_reaches_handler_with_identical_output() {
+    let case = loop_throw_program();
+    let expected = interpreter(&case, &Limits::default());
+    let (actual, report) = tiered(&case, &Limits::default(), osr_only_policy());
+    assert_eq!(
+        actual, expected,
+        "compiled throw must reach the same handler"
+    );
+    let callee = report
+        .units
+        .iter()
+        .find(|unit| unit.module == ModuleId::new(0) && unit.function == FunctionId::new(1))
+        .expect("callee unit is reported");
+    assert!(
+        callee.osr_entries > 0,
+        "the loop must transfer before it throws"
+    );
+    assert_eq!(
+        callee.deopts, 0,
+        "the throw is ordinary completion, not a deopt"
+    );
+}
+
+#[test]
+fn tiered_corpus_matches_interpreter() {
+    let policy = osr_only_policy();
+    for seed in [0u64, 1, 0x5eed] {
+        let low = i32::try_from(seed).expect("seed fits in i32");
+        let high = i32::try_from(seed >> 32).expect("seed fits in i32");
+        let case = arithmetic_program(low, high, BinaryOp::Add);
+        let expected = interpreter(&case, &Limits::default());
+        let (actual, _) = tiered(&case, &Limits::default(), policy);
+        assert_eq!(actual, expected, "tiered corpus mismatch at seed {seed}");
+    }
+    let branch = program(
+        vec![
+            Constant::String(EcmaString::encode("entry")),
+            Constant::String(EcmaString::encode("print")),
+            Constant::Undefined,
+            Constant::Boolean(true),
+            Constant::Int32(11),
+            Constant::Int32(99),
+        ],
+        7,
+        vec![
+            Instruction::LoadConst {
+                dst: reg(0),
+                constant: cid(3),
+            },
+            Instruction::Move {
+                dst: reg(1),
+                src: reg(0),
+            },
+            Instruction::JumpIfFalse {
+                condition: reg(1),
+                target: Pc::new(5),
+            },
+            Instruction::LoadConst {
+                dst: reg(2),
+                constant: cid(4),
+            },
+            Instruction::Jump { target: Pc::new(6) },
+            Instruction::LoadConst {
+                dst: reg(2),
+                constant: cid(5),
+            },
+            Instruction::LoadGlobal {
+                dst: reg(3),
+                name: cid(1),
+            },
+            Instruction::CreateArray { dst: reg(4) },
+            Instruction::ArrayPush {
+                array: reg(4),
+                value: reg(2),
+            },
+            Instruction::LoadConst {
+                dst: reg(5),
+                constant: cid(2),
+            },
+            Instruction::Call {
+                dst: reg(6),
+                callee: reg(3),
+                this_value: reg(5),
+                arguments: reg(4),
+            },
+            Instruction::Halt,
+        ],
+    );
+    let expected = interpreter(&branch, &Limits::default());
+    let (actual, _) = tiered(&branch, &Limits::default(), policy);
+    assert_eq!(actual, expected, "tiered branch mismatch");
+    let thrown = program(
+        vec![
+            Constant::String(EcmaString::encode("entry")),
+            Constant::Int32(0x2a),
+        ],
+        1,
+        vec![
+            Instruction::LoadConst {
+                dst: reg(0),
+                constant: cid(1),
+            },
+            Instruction::Throw { value: reg(0) },
+        ],
+    );
+    let expected = interpreter(&thrown, &Limits::default());
+    let (actual, _) = tiered(&thrown, &Limits::default(), policy);
+    assert_eq!(actual, expected, "tiered throw mismatch");
+}
+
+#[test]
+fn generator_loop_dispatch_accepts_resume_and_osr_tokens() {
+    let program = generator_loop_program();
+    let compiled = compile_jit(&program).expect("generator loop must compile");
+    let mut registers = vec![Value::UNDEFINED; 6];
+    let mut run = |token: u32| {
+        let mut shadow =
+            ShadowFrame::new(std::ptr::null_mut(), token, 0, registers.as_mut_ptr(), 6);
+        let mut out = Completion::new(Value::UNDEFINED);
+        let tag = compiled.invoke(0, 0, &mut shadow, &mut out);
+        (tag, out.value.as_int32(), out.value.to_bits())
+    };
+    let (tag, id, _) = run(5);
+    assert_eq!(tag, Ok(CompletionTag::FatalTrap));
+    assert_eq!(id, Some(bamts_native::TRAP_MISSING_NATIVE_OPS));
+    let (tag, id, _) = run(0x8000_0000u32 | 5);
+    assert_eq!(tag, Ok(CompletionTag::FatalTrap));
+    assert_eq!(id, Some(bamts_native::TRAP_MISSING_NATIVE_OPS));
+    let (tag, _, bits) = run(0x1234);
+    assert_eq!(tag, Ok(CompletionTag::FatalTrap));
+    assert_eq!(bits, 1);
 }

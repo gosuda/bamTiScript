@@ -7,6 +7,8 @@ use crate::{CollectionIndex, CollectionKind, EvalFailure, HeapEntry, Host, Machi
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
     set_prototype: Value,
 ) {
@@ -19,8 +21,8 @@ pub(super) fn install<H: Host>(
         ("isSupersetOf", is_superset_of::<H>),
         ("isDisjointFrom", is_disjoint_from::<H>),
     ] {
-        let function = install_function(heap, builtins, name, 1, handler);
-        define_data(heap, set_prototype, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 1, handler: handler });
+        define_data(heap, atoms, shapes, set_prototype, name, function);
     }
 }
 
@@ -457,7 +459,6 @@ mod tests {
     use super::*;
     use crate::intrinsics::{BuiltinDef, native_function};
     use crate::{NativeCallable, Property, PropertyKey, ThrowOrigin};
-    use bamts_bytecode::EcmaString;
 
     fn with_machine(test: impl FnOnce(&mut Machine<'_, TestHost>)) {
         let program = blank_program("set-methods");
@@ -477,7 +478,7 @@ mod tests {
             length,
             handler,
         });
-        native_function(&mut machine.heap, id, name, length)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
     }
 
     fn make_set(machine: &mut Machine<'_, TestHost>, values: &[Value]) -> Value {
@@ -1269,11 +1270,13 @@ mod tests {
         getter: Value,
     ) {
         let slot = machine.runtime_slot(object).unwrap().unwrap();
+        let key = PropertyKey::Named(machine.intern_str(name));
         let HeapEntry::Object { properties, .. } = &mut machine.heap[slot] else {
             unreachable!()
         };
         properties.insert(
-            PropertyKey::Named(EcmaString::encode(name)),
+            &mut machine.shapes,
+            key,
             Property::Accessor {
                 getter: Some(getter),
                 setter: None,
@@ -1355,7 +1358,7 @@ mod tests {
                     writable,
                     enumerable,
                     configurable,
-                }) = properties.get(&PropertyKey::Named(EcmaString::encode(name)))
+                }) = properties.get_ascii(&machine.shapes, &machine.atoms, name)
                 else {
                     panic!("{name} is installed as data property")
                 };

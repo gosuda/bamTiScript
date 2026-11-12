@@ -939,7 +939,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
     }
 
     fn named_global(machine: &crate::Machine<'_, TestHost>, name: &str) -> Value {
@@ -1406,7 +1406,7 @@ mod tests {
             let sync_prototype = machine.intrinsics.builtins.disposable_stack_prototype();
             let dispose = method(machine, sync_prototype, "dispose");
             let dispose_symbol = machine.intrinsics.builtins.symbol_dispose();
-            let dispose_key = machine.to_property_key(dispose_symbol).unwrap();
+            let dispose_key = machine.property_key_from_value(dispose_symbol).unwrap();
             assert_eq!(
                 machine
                     .get_property_key(sync_prototype, &dispose_key)
@@ -1806,7 +1806,7 @@ mod tests {
                 machine.get_named_property(stack, "owned").unwrap(),
                 Value::int32(3)
             );
-            let owned = PropertyKey::Named(EcmaString::encode("owned"));
+            let owned = PropertyKey::Named(machine.intern_str("owned"));
             assert!(machine.has_own_property_key(stack, &owned).unwrap());
             assert!(machine.internal_delete(stack, &owned).unwrap());
             assert!(!machine.has_own_property_key(stack, &owned).unwrap());

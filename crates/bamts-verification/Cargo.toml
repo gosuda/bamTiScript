@@ -16,10 +16,9 @@ bamts-bytecode.workspace = true
 bamts-cli.workspace = true
 bamts-codegen.workspace = true
 bamts-compiler.workspace = true
-bamts-native.workspace = true
+bamts-platform.workspace = true
 bamts-node = { workspace = true, features = ["script-compiler"] }
 bamts-runtime.workspace = true
-libc = "=0.2.189"
 anyhow = "=1.0.104"
 quint-connect = "=0.1.2"
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -44,10 +43,6 @@ path = "src/bin/ts_conformance.rs"
 [[bin]]
 name = "perf_budget"
 path = "src/bin/perf_budget.rs"
-
-[[bin]]
-name = "bh1_jit"
-path = "src/bin/bh1_jit.rs"
 
 [[bin]]
 name = "ts_lane_worker"

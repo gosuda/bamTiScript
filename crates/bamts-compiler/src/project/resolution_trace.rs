@@ -34,6 +34,15 @@ pub struct ResolutionTraceLog {
     unsupported: BTreeSet<UnsupportedTraceKind>,
 }
 
+/// One module-resolution request: the importing file, the specifier it names,
+/// and the kind, mode, and flavor the specifier resolves under.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResolutionRequest<'a> {
+    pub(crate) importer: &'a Path,
+    pub(crate) specifier: &'a str,
+    pub(crate) strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
+}
+
 impl ResolutionTraceLog {
     #[must_use]
     pub fn lines(&self) -> &[String] {
@@ -44,22 +53,37 @@ impl ResolutionTraceLog {
     pub fn unsupported(&self) -> &BTreeSet<UnsupportedTraceKind> {
         &self.unsupported
     }
-
     pub(crate) fn record_module(
         &mut self,
         root: &ProjectRoot,
-        importer: &Path,
-        specifier: &str,
-        strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
+        request: ResolutionRequest<'_>,
+        explicit_kind: bool,
         cached: bool,
         result: &Result<ResolvedModule, ResolutionError>,
     ) {
+        let ResolutionRequest {
+            importer,
+            specifier,
+            strategy,
+        } = request;
         if !(specifier.starts_with("./") || specifier.starts_with("../")) {
-            self.unsupported.insert(if specifier.starts_with('#') {
-                UnsupportedTraceKind::PackageImport
-            } else {
-                UnsupportedTraceKind::PackageName
-            });
+            if specifier.starts_with('#') {
+                self.unsupported.insert(UnsupportedTraceKind::PackageImport);
+                return;
+            }
+            if strategy.0 == ModuleResolutionKind::Bundler
+                && !cached
+                && self.render_bundler_bare(
+                    importer,
+                    specifier,
+                    (strategy.0, strategy.1),
+                    explicit_kind,
+                    result,
+                )
+            {
+                return;
+            }
+            self.unsupported.insert(UnsupportedTraceKind::PackageName);
             return;
         }
 
@@ -85,10 +109,17 @@ impl ResolutionTraceLog {
                 display_path(directory)
             ));
         } else {
-            self.lines.push(format!(
-                "Explicitly specified module resolution kind: '{}'.",
-                strategy.0.trace_name()
-            ));
+            if explicit_kind {
+                self.lines.push(format!(
+                    "Explicitly specified module resolution kind: '{}'.",
+                    strategy.0.trace_name()
+                ));
+            } else {
+                self.lines.push(format!(
+                    "Module resolution kind is not specified, using '{}'.",
+                    strategy.0.trace_name()
+                ));
+            }
             self.lines.push(format!(
                 "Resolving in {} mode with conditions '{}', 'types'.",
                 match strategy.1 {
@@ -114,17 +145,220 @@ impl ResolutionTraceLog {
             )),
         }
         if resolved_parent.is_some_and(|parent| parent == candidate_location) {
-            // The specifier resolved to a directory package; only its file-level
-            // probes are rendered above and the package walk stays unrendered.
             self.unsupported
                 .insert(UnsupportedTraceKind::DirectoryPackage);
         }
         if extension.is_none() && !result.is_ok() {
-            // A failed extensionless lookup continues into directory probes that
-            // this tracer does not render; report the gap instead of truncating.
             self.unsupported
                 .insert(UnsupportedTraceKind::DirectoryPackage);
         }
+    }
+
+    fn render_bundler_bare(
+        &mut self,
+        importer: &Path,
+        specifier: &str,
+        strategy: (ModuleResolutionKind, ResolutionMode),
+        explicit_kind: bool,
+        result: &Result<ResolvedModule, ResolutionError>,
+    ) -> bool {
+        let trace = match result {
+            Ok(resolved) => Some(resolved.trace()),
+            Err(error) => error.trace(),
+        };
+        let Some(trace) = trace else { return false };
+        if Path::new(specifier).extension().is_some() || specifier.starts_with('@') {
+            return false;
+        }
+        let mut probes = Vec::new();
+        let mut preferred = Vec::new();
+        let mut fallback = Vec::new();
+        let mut realpath = None;
+        let mut in_fallback = false;
+        let mut scope: Vec<(&PathBuf, bool)> = Vec::new();
+        for step in trace.steps() {
+            match step {
+                ResolutionTraceStep::PackageJsonProbe { path, exists } => {
+                    if *exists {
+                        return false;
+                    }
+                    probes.push(path);
+                }
+                ResolutionTraceStep::NodeModulesWalk {
+                    directory,
+                    exists,
+                    fallback: is_fallback,
+                } => {
+                    if *is_fallback {
+                        in_fallback = true;
+                    }
+                    if !*exists {
+                        let items = if *is_fallback {
+                            &mut fallback
+                        } else {
+                            &mut preferred
+                        };
+                        items.push(format!(
+                            "Directory '{}/node_modules' does not exist, skipping all lookups in it.",
+                            display_path(directory)
+                        ));
+                    }
+                }
+                ResolutionTraceStep::ScopeProbe {
+                    path,
+                    exists,
+                    has_exports,
+                } => {
+                    if *has_exports {
+                        return false;
+                    }
+                    scope.push((path, *exists));
+                    let items = if in_fallback {
+                        &mut fallback
+                    } else {
+                        &mut preferred
+                    };
+                    items.push(if *exists {
+                        format!("Found 'package.json' at '{}'.", display_path(path))
+                    } else {
+                        format!("File '{}' does not exist.", display_path(path))
+                    });
+                }
+                ResolutionTraceStep::LegacyField { field, target } => {
+                    let items = if in_fallback {
+                        &mut fallback
+                    } else {
+                        &mut preferred
+                    };
+                    match target {
+                        None => {
+                            items.push(format!("'package.json' does not have a '{field}' field."))
+                        }
+                        Some((value, resolved)) => {
+                            if field.as_ref() == "typesVersions" {
+                                return false;
+                            }
+                            items.push(format!(
+                                "'package.json' has '{field}' field '{value}' that references '{}'.",
+                                display_path(resolved)
+                            ));
+                        }
+                    }
+                }
+                ResolutionTraceStep::StripExtension { path } => {
+                    let items = if in_fallback {
+                        &mut fallback
+                    } else {
+                        &mut preferred
+                    };
+                    let extension = path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .unwrap_or_default();
+                    items.push(format!(
+                        "File name '{}' has a '.{extension}' extension - stripping it.",
+                        display_path(path)
+                    ));
+                }
+                ResolutionTraceStep::Candidate { path, exists } => {
+                    let items = if in_fallback {
+                        &mut fallback
+                    } else {
+                        &mut preferred
+                    };
+                    items.push(if *exists {
+                        format!(
+                            "File '{}' exists - use it as a name resolution result.",
+                            display_path(path)
+                        )
+                    } else {
+                        format!("File '{}' does not exist.", display_path(path))
+                    });
+                }
+                ResolutionTraceStep::Resolved { path } => {
+                    realpath = Some(path);
+                }
+                ResolutionTraceStep::Condition { .. }
+                | ResolutionTraceStep::PathsMatch { .. }
+                | ResolutionTraceStep::TypesFallback { .. } => return false,
+                _ => {}
+            }
+        }
+        if scope.first().is_some_and(|(_, exists)| !exists)
+            && scope.iter().any(|(_, exists)| *exists)
+        {
+            return false;
+        }
+        self.lines.push(format!(
+            "======== Resolving module '{specifier}' from '{}'. ========",
+            display_path(importer)
+        ));
+        if explicit_kind {
+            self.lines.push(format!(
+                "Explicitly specified module resolution kind: '{}'.",
+                strategy.0.trace_name()
+            ));
+        } else {
+            self.lines.push(format!(
+                "Module resolution kind is not specified, using '{}'.",
+                strategy.0.trace_name()
+            ));
+        }
+        let condition = match strategy.1 {
+            ResolutionMode::Import => "import",
+            ResolutionMode::Require => "require",
+        };
+        self.lines.push(format!(
+            "Resolving in CJS mode with conditions '{condition}', 'types'."
+        ));
+        for path in &probes {
+            self.lines
+                .push(format!("File '{}' does not exist.", display_path(path)));
+        }
+        self.lines.push(format!(
+            "Loading module '{specifier}' from 'node_modules' folder, target file types: TypeScript, JavaScript, Declaration, JSON."
+        ));
+        self.lines.push(
+            "Searching all ancestor node_modules directories for preferred extensions: TypeScript, Declaration."
+                .to_string(),
+        );
+        for line in &preferred {
+            self.lines.push(line.clone());
+        }
+        if realpath.is_none() || !fallback.is_empty() {
+            self.lines.push(
+                "Searching all ancestor node_modules directories for fallback extensions: JavaScript, JSON."
+                    .to_string(),
+            );
+            for line in &fallback {
+                self.lines.push(line.clone());
+            }
+        }
+        if let Some(path) = realpath {
+            self.lines.push(format!(
+                "Resolving real path for '{}', result '{}'.",
+                display_path(path),
+                display_path(path)
+            ));
+            self.lines.push(format!(
+                "======== Module name '{specifier}' was successfully resolved to '{}'. ========",
+                display_path(path)
+            ));
+            if result.is_ok()
+                && scope.first().is_some_and(|(_, exists)| *exists)
+                && let Some((path, _)) = scope.first()
+            {
+                self.lines.push(format!(
+                    "File '{}' exists according to earlier cached lookups.",
+                    display_path(path)
+                ));
+            }
+        } else {
+            self.lines.push(format!(
+                "======== Module name '{specifier}' was not resolved. ========"
+            ));
+        }
+        true
     }
 
     fn render_candidates(
@@ -210,7 +444,11 @@ fn upstream_candidates(
 }
 
 /// Renders a path the way upstream traces do: forward slashes, lowercased drive.
-fn display_path(path: &Path) -> String {
+///
+/// Anything that looks for a path inside a rendered trace must build the text
+/// with this function.
+#[must_use]
+pub fn display_path(path: &Path) -> String {
     let mut value = path.to_string_lossy().replace('\\', "/");
     if value.as_bytes().get(1) == Some(&b':') {
         value.make_ascii_lowercase();

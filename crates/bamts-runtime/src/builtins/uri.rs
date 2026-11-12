@@ -14,6 +14,8 @@ const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -25,7 +27,7 @@ pub(super) fn install<H: Host>(
         ("escape", escape::<H>),
         ("unescape", unescape::<H>),
     ] {
-        let function = install_function(heap, builtins, name, 1, handler);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 1, handler: handler });
         globals.insert(EcmaString::encode(name), function);
     }
 }
@@ -504,7 +506,9 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, "coercion hook", 0)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id,
+        "coercion hook",
+        0,)
     }
 
     #[test]
@@ -552,13 +556,13 @@ mod tests {
                 .global(name)
                 .expect("URI global installs");
             assert!(machine.is_callable(function).unwrap());
-            let name_key = PropertyKey::Named(EcmaString::encode("name"));
+            let name_key = PropertyKey::Named(machine.intern_str("name"));
             assert!(matches!(
                 machine.own_descriptor(function, &name_key).unwrap(),
                 Some(Property::Data { value, writable: false, enumerable: false, configurable: true })
                     if machine.string_value(value).is_some_and(|text| text.eq_ascii(name))
             ));
-            let length_key = PropertyKey::Named(EcmaString::encode("length"));
+            let length_key = PropertyKey::Named(machine.intern_str("length"));
             assert!(matches!(
                 machine.own_descriptor(function, &length_key).unwrap(),
                 Some(Property::Data { value, writable: false, enumerable: false, configurable: true })

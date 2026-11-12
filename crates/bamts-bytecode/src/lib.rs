@@ -381,6 +381,12 @@ pub enum UnaryOp {
     Negate,
     BitwiseNot,
     LogicalNot,
+    /// ECMAScript `ToString`, which a template literal applies to a substitution.
+    ToString,
+    /// ECMAScript `ToPropertyKey`, applied once to a key that is both read and
+    /// written. A primitive stays as it is, since it converts the same way each
+    /// time; only an object runs user code.
+    ToPropertyKey,
 }
 
 impl UnaryOp {
@@ -392,6 +398,8 @@ impl UnaryOp {
             Self::Negate => 3,
             Self::BitwiseNot => 4,
             Self::LogicalNot => 5,
+            Self::ToString => 6,
+            Self::ToPropertyKey => 7,
         }
     }
 
@@ -403,6 +411,8 @@ impl UnaryOp {
             3 => Some(Self::Negate),
             4 => Some(Self::BitwiseNot),
             5 => Some(Self::LogicalNot),
+            6 => Some(Self::ToString),
+            7 => Some(Self::ToPropertyKey),
             _ => None,
         }
     }
@@ -581,6 +591,10 @@ impl DisposeHint {
 pub enum AccessorKind {
     Getter,
     Setter,
+    /// A [`Self::Getter`] on a class, whose accessors are not enumerable.
+    ClassGetter,
+    /// A [`Self::Setter`] on a class, whose accessors are not enumerable.
+    ClassSetter,
 }
 
 impl AccessorKind {
@@ -588,6 +602,8 @@ impl AccessorKind {
         match self {
             Self::Getter => 0,
             Self::Setter => 1,
+            Self::ClassGetter => 2,
+            Self::ClassSetter => 3,
         }
     }
 
@@ -595,8 +611,22 @@ impl AccessorKind {
         match tag {
             0 => Some(Self::Getter),
             1 => Some(Self::Setter),
+            2 => Some(Self::ClassGetter),
+            3 => Some(Self::ClassSetter),
             _ => None,
         }
+    }
+
+    /// Whether this installs the getter half of the descriptor.
+    #[must_use]
+    pub const fn is_getter(self) -> bool {
+        matches!(self, Self::Getter | Self::ClassGetter)
+    }
+
+    /// Whether a property this creates is enumerable.
+    #[must_use]
+    pub const fn is_enumerable(self) -> bool {
+        matches!(self, Self::Getter | Self::Setter)
     }
 }
 
@@ -604,13 +634,16 @@ impl AccessorKind {
 /// [`Instruction::LoadOwnDescriptorSlot`] /
 /// [`Instruction::DefineOwnDescriptorSlot`] addresses.
 ///
-/// Wire tags are `0` = value, `1` = getter, `2` = setter. These opcodes never
-/// invoke accessors and never walk the prototype chain.
+/// Wire tags are `0` = value, `1` = getter, `2` = setter, `3` = entire. These
+/// opcodes never invoke accessors and never walk the prototype chain.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DescriptorSlot {
     Value,
     Getter,
     Setter,
+    /// The whole property, replaced by a writable, enumerable, configurable
+    /// data property: ECMAScript `CreateDataProperty`. It reads as `undefined`.
+    Entire,
 }
 
 impl DescriptorSlot {
@@ -619,6 +652,7 @@ impl DescriptorSlot {
             Self::Value => 0,
             Self::Getter => 1,
             Self::Setter => 2,
+            Self::Entire => 3,
         }
     }
 
@@ -627,6 +661,7 @@ impl DescriptorSlot {
             0 => Some(Self::Value),
             1 => Some(Self::Getter),
             2 => Some(Self::Setter),
+            3 => Some(Self::Entire),
             _ => None,
         }
     }
@@ -1410,13 +1445,21 @@ pub struct FunctionFlags {
     pub is_async: bool,
     pub is_generator: bool,
     pub is_constructable: bool,
+    /// Non-strict ECMAScript code, which only a JavaScript script can contain.
+    pub is_sloppy: bool,
+    /// A generator whose parameters can run code. A call runs it to its first
+    /// `Suspend`, which ends the prologue, so a throw reaches the caller.
+    pub binds_at_call: bool,
 }
 
 impl FunctionFlags {
     const ASYNC: u8 = 0b001;
     const GENERATOR: u8 = 0b010;
     const CONSTRUCTABLE: u8 = 0b100;
-    const KNOWN: u8 = Self::ASYNC | Self::GENERATOR | Self::CONSTRUCTABLE;
+    const SLOPPY: u8 = 0b1000;
+    const BINDS_AT_CALL: u8 = 0b1_0000;
+    const KNOWN: u8 =
+        Self::ASYNC | Self::GENERATOR | Self::CONSTRUCTABLE | Self::SLOPPY | Self::BINDS_AT_CALL;
 
     const fn to_bits(self) -> u8 {
         let mut bits = 0;
@@ -1429,6 +1472,12 @@ impl FunctionFlags {
         if self.is_constructable {
             bits |= Self::CONSTRUCTABLE;
         }
+        if self.is_sloppy {
+            bits |= Self::SLOPPY;
+        }
+        if self.binds_at_call {
+            bits |= Self::BINDS_AT_CALL;
+        }
         bits
     }
 
@@ -1440,6 +1489,8 @@ impl FunctionFlags {
             is_async: bits & Self::ASYNC != 0,
             is_generator: bits & Self::GENERATOR != 0,
             is_constructable: bits & Self::CONSTRUCTABLE != 0,
+            is_sloppy: bits & Self::SLOPPY != 0,
+            binds_at_call: bits & Self::BINDS_AT_CALL != 0,
         })
     }
 }
@@ -4131,6 +4182,8 @@ mod tests {
                     is_async: true,
                     is_generator: false,
                     is_constructable: true,
+                    is_sloppy: true,
+                    binds_at_call: true,
                 },
                 code,
                 handlers,
@@ -4874,11 +4927,11 @@ mod tests {
         write_u32(0, &mut bad_flags); // capture count
         write_u32(0, &mut bad_flags); // params
         write_u32(1, &mut bad_flags); // registers
-        bad_flags.push(0b1000); // unknown flag bit
+        bad_flags.push(0b10_0000); // unknown flag bit
         assert!(matches!(
             decode(&bad_flags, &DecodeLimits::default()),
             Err(DecodeError {
-                kind: DecodeErrorKind::InvalidFunctionFlags { bits: 0b1000 },
+                kind: DecodeErrorKind::InvalidFunctionFlags { bits: 0b10_0000 },
                 ..
             })
         ));
@@ -6155,7 +6208,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<Register>(), 4);
         assert_eq!(std::mem::size_of::<Pc>(), 4);
         assert_eq!(std::mem::size_of::<NumberBits>(), 8);
-        assert_eq!(std::mem::size_of::<FunctionFlags>(), 3);
+        assert_eq!(std::mem::size_of::<FunctionFlags>(), 5);
     }
 
     #[test]

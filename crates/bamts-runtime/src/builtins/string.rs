@@ -3,31 +3,37 @@ use std::collections::BTreeMap;
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
+use super::intl::{TargetCase, compare_with_collator, transform_case};
 use super::{
     allocate_array, allocate_string, define_data, install_constructor_function, install_function,
-    range_error, to_integer_or_infinity, type_error, uri_error, value_number,
+    range_error, type_error, uri_error, value_number, with_roots,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, IterationKind, Machine, PropertyKey, PropertyMap};
+use crate::{EvalFailure, HeapEntry, Host, IterationKind, Machine, PropertyKey};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.string_prototype();
-    let constructor = install_constructor_function(heap, builtins, "String", 1, constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "String", length: 1, handler: constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode("String"), constructor);
     for (name, length, handler) in [
         ("fromCharCode", 1, from_char_code::<H> as BuiltinHandler<H>),
         ("raw", 1, raw::<H>),
     ] {
-        let f = install_function(heap, builtins, name, length, handler);
-        define_static(heap, constructor, name, f)
+        let f = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_static(heap, atoms, shapes, constructor, name, f)
     }
     for (name, length, handler) in [
-        ("charAt", 1, char_at::<H> as BuiltinHandler<H>),
+        ("toString", 0, this_string_value::<H> as BuiltinHandler<H>),
+        ("valueOf", 0, this_string_value::<H>),
+        ("charAt", 1, char_at::<H>),
         ("charCodeAt", 1, char_code_at::<H>),
         ("codePointAt", 1, code_point_at::<H>),
         ("at", 1, at::<H>),
@@ -40,12 +46,13 @@ pub(super) fn install<H: Host>(
         ("endsWith", 1, ends_with::<H>),
         ("split", 2, split::<H>),
         ("replace", 2, replace::<H>),
-        ("replaceAll", 2, replace_all::<H>),
         ("trim", 0, trim::<H>),
         ("trimStart", 0, trim_start::<H>),
         ("trimEnd", 0, trim_end::<H>),
         ("toUpperCase", 0, to_upper::<H>),
         ("toLowerCase", 0, to_lower::<H>),
+        ("toLocaleUpperCase", 0, to_locale_upper::<H>),
+        ("toLocaleLowerCase", 0, to_locale_lower::<H>),
         ("padStart", 1, pad_start::<H>),
         ("padEnd", 1, pad_end::<H>),
         ("repeat", 1, repeat::<H>),
@@ -56,25 +63,40 @@ pub(super) fn install<H: Host>(
         ("search", 1, search::<H>),
         ("localeCompare", 1, locale_compare::<H>),
     ] {
-        let f = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, f)
+        let f = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, prototype, name, f)
     }
-    let iterator = install_function(heap, builtins, "[Symbol.iterator]", 0, string_iterator::<H>);
+    let iterator = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef { name: "[Symbol.iterator]", length: 0, handler: string_iterator::<H> },
+    );
     let HeapEntry::Object { properties, .. } = &mut heap[super::heap_index(prototype)] else {
         unreachable!()
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(super::heap_index(builtins.symbol_iterator()) as u32),
         super::builtin_property(iterator),
     );
 }
-fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
+fn define_static(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+    constructor: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[super::heap_index(constructor)]
     else {
         panic!("String constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        shapes,
+        PropertyKey::Named(atoms.intern_str(name)),
         super::builtin_property(value),
     );
 }
@@ -86,21 +108,24 @@ fn constructor<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let text = if args.is_empty() {
         EcmaString::default()
+    } else if constructing {
+        machine.coerce_string_observable(args[0])?
     } else {
         machine.string_constructor_text(args[0])?
     };
     let value = allocate_string(machine, text)?;
     if constructing {
-        Ok(BuiltinOutcome::Value(machine.box_primitive(value)?))
+        let prototype = machine.intrinsics.string_prototype;
+        super::wrap_for_new_target(machine, value, prototype)
     } else {
         Ok(BuiltinOutcome::Value(value))
     }
 }
-fn text<H: Host>(machine: &Machine<'_, H>, this: Value) -> Result<EcmaString, EvalFailure> {
+fn text<H: Host>(machine: &mut Machine<'_, H>, this: Value) -> Result<EcmaString, EvalFailure> {
     if matches!(this.decode(), Some(Decoded::Undefined | Decoded::Null)) {
         return Err(type_error("String method called on null or undefined"));
     }
-    machine.to_string(machine.unbox_primitive_or_self(this)?)
+    machine.coerce_string_observable(this)
 }
 fn locale_compare<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -114,6 +139,11 @@ fn locale_compare<H: Host>(
     let this = machine.coerce_string_observable(this)?;
     let other =
         machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let locales = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let options = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+    if locales != Value::UNDEFINED || options != Value::UNDEFINED {
+        return compare_with_collator(machine, &this, &other, locales, options);
+    }
     let result: i32 = match this.as_units().cmp(other.as_units()) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -126,9 +156,38 @@ fn append(out: &mut EcmaStringBuilder, text: &EcmaString) {
         out.push_unit(unit);
     }
 }
-fn integer<H: Host>(machine: &Machine<'_, H>, value: Value) -> Result<isize, EvalFailure> {
-    Ok(to_integer_or_infinity(machine, value)? as isize)
+fn integer<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<isize, EvalFailure> {
+    Ok(super::array_es2023::integer_or_infinity(machine, value)? as isize)
 }
+/// Rejects a search string that is a RegExp, for the methods that take text only.
+fn require_not_regexp<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+    operation: &'static str,
+) -> Result<(), EvalFailure> {
+    if super::string_edge::is_regexp(machine, value)? {
+        return Err(type_error(operation));
+    }
+    Ok(())
+}
+/// `String.prototype.toString` and `valueOf`: the receiver's own string. Neither
+/// coerces, so a receiver that is not a String throws.
+fn this_string_value<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let value = machine.unbox_primitive(this, "String.prototype.toString")?;
+    if machine.string_value(value).is_some() {
+        Ok(BuiltinOutcome::Value(value))
+    } else {
+        Err(type_error(
+            "String.prototype.toString called on incompatible receiver",
+        ))
+    }
+}
+
 fn from_char_code<H: Host>(
     machine: &mut Machine<'_, H>,
     _: Value,
@@ -137,7 +196,9 @@ fn from_char_code<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let mut out = EcmaStringBuilder::with_capacity(args.len());
     for arg in args {
-        out.push_unit(value_number(machine.to_number(*arg)?) as u16);
+        out.push_unit(
+            crate::to_uint32(value_number(machine.coerce_number_observable(*arg)?)) as u16,
+        );
     }
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
@@ -157,11 +218,13 @@ fn raw<H: Host>(
         .ok_or_else(|| type_error("String.raw requires template.raw"))?;
     let mut out = EcmaStringBuilder::new();
     for (i, value) in values.iter().enumerate() {
-        append(&mut out, &machine.to_string(*value)?);
+        append(&mut out, &machine.coerce_string_observable(*value)?);
         if i + 1 < values.len() {
             append(
                 &mut out,
-                &machine.to_string(args.get(i + 1).copied().unwrap_or(Value::UNDEFINED))?,
+                &machine.coerce_string_observable(
+                    args.get(i + 1).copied().unwrap_or(Value::UNDEFINED),
+                )?,
             );
         }
     }
@@ -269,15 +332,10 @@ fn slice<H: Host>(
         integer(machine, args.first().copied().unwrap_or(Value::int32(0)))?,
         string.len_units(),
     );
-    let end = rel(
-        integer(
-            machine,
-            args.get(1)
-                .copied()
-                .unwrap_or(crate::number_value(string.len_units() as f64)),
-        )?,
-        string.len_units(),
-    );
+    let end = match args.get(1).copied() {
+        None | Some(Value::UNDEFINED) => string.len_units(),
+        Some(end) => rel(integer(machine, end)?, string.len_units()),
+    };
     let result = if end > start {
         string
             .slice_units(start..end)
@@ -329,7 +387,8 @@ fn index_of<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let haystack = text(machine, this)?;
-    let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let needle =
+        machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let start = integer(machine, args.get(1).copied().unwrap_or(Value::int32(0)))?.max(0) as usize;
     Ok(BuiltinOutcome::Value(crate::number_value(
         search_units(haystack.as_units(), needle.as_units(), start).map_or(-1.0, |i| i as f64),
@@ -342,13 +401,16 @@ fn last_index_of<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let haystack = text(machine, this)?;
-    let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    let end = if args.len() < 2 || args[1] == Value::UNDEFINED {
+    let needle =
+        machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let position = value_number(
+        machine.coerce_number_observable(args.get(1).copied().unwrap_or(Value::UNDEFINED))?,
+    );
+    let end = if position.is_nan() {
         haystack.len_units()
     } else {
-        integer(machine, args[1])?.max(0) as usize
-    }
-    .min(haystack.len_units());
+        (position.max(0.0) as usize).min(haystack.len_units())
+    };
     let found = (0..=end).rev().find(|index| {
         haystack
             .as_units()
@@ -365,11 +427,17 @@ fn includes<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let BuiltinOutcome::Value(v) = index_of(machine, this, args, false)? else {
-        unreachable!()
-    };
+    let haystack = text(machine, this)?;
+    let search = args.first().copied().unwrap_or(Value::UNDEFINED);
+    require_not_regexp(
+        machine,
+        search,
+        "String.prototype.includes cannot search for a RegExp",
+    )?;
+    let needle = machine.coerce_string_observable(search)?;
+    let start = integer(machine, args.get(1).copied().unwrap_or(Value::int32(0)))?.max(0) as usize;
     Ok(BuiltinOutcome::Value(Value::boolean(
-        value_number(v) >= 0.0,
+        search_units(haystack.as_units(), needle.as_units(), start).is_some(),
     )))
 }
 fn starts_with<H: Host>(
@@ -379,9 +447,16 @@ fn starts_with<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let haystack = text(machine, this)?;
-    let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    let position =
-        integer(machine, args.get(1).copied().unwrap_or(Value::int32(0)))?.max(0) as usize;
+    let search = args.first().copied().unwrap_or(Value::UNDEFINED);
+    require_not_regexp(
+        machine,
+        search,
+        "String.prototype.startsWith cannot search for a RegExp",
+    )?;
+    let needle = machine.coerce_string_observable(search)?;
+    let position = (integer(machine, args.get(1).copied().unwrap_or(Value::int32(0)))?.max(0)
+        as usize)
+        .min(haystack.len_units());
     Ok(BuiltinOutcome::Value(Value::boolean(
         haystack
             .as_units()
@@ -396,7 +471,13 @@ fn ends_with<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let haystack = text(machine, this)?;
-    let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let search = args.first().copied().unwrap_or(Value::UNDEFINED);
+    require_not_regexp(
+        machine,
+        search,
+        "String.prototype.endsWith cannot search for a RegExp",
+    )?;
+    let needle = machine.coerce_string_observable(search)?;
     let end = if args.len() < 2 || args[1] == Value::UNDEFINED {
         haystack.len_units()
     } else {
@@ -409,56 +490,104 @@ fn ends_with<H: Host>(
     )))
 }
 
+fn require_coercible(value: Value) -> Result<(), EvalFailure> {
+    if matches!(value.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+        return Err(type_error("String method called on null or undefined"));
+    }
+    Ok(())
+}
+
+/// `GetMethod(argument, symbol)` for the methods that delegate to a pattern. A
+/// primitive argument is never consulted, so a method added to
+/// `Number.prototype` cannot take over a plain string search.
+fn pattern_method<H: Host>(
+    machine: &mut Machine<'_, H>,
+    argument: Value,
+    symbol: Value,
+) -> Result<Option<Value>, EvalFailure> {
+    if !machine.is_object(argument) {
+        return Ok(None);
+    }
+    let key = machine.property_key_from_value(symbol)?;
+    let method = machine.get_property_key(argument, &key)?;
+    if matches!(method.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+        return Ok(None);
+    }
+    if machine.is_callable(method)? {
+        Ok(Some(method))
+    } else {
+        Err(type_error("pattern method is not callable"))
+    }
+}
+
+/// `Invoke(rx, symbol, «input»)` on a RegExp this method just created.
+fn invoke_on_new_regexp<H: Host>(
+    machine: &mut Machine<'_, H>,
+    regexp: Value,
+    symbol: Value,
+    input: Value,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    with_roots(machine, &[regexp, input], |machine, _| {
+        let key = machine.property_key_from_value(symbol)?;
+        let method = machine.get_property_key(regexp, &key)?;
+        machine.call_value(method, regexp, &[input])
+    })
+    .map(BuiltinOutcome::Value)
+}
+
 fn split<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    if let Some(separator) = args.first().copied()
-        && super::regexp::regexp_parts(machine, separator).is_some()
-    {
-        return split_regexp(machine, this, args);
+    require_coercible(this)?;
+    let separator = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let limit = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let symbol = machine.intrinsics.builtins.symbol_split();
+    if let Some(method) = pattern_method(machine, separator, symbol)? {
+        return Ok(BuiltinOutcome::Value(machine.call_value(
+            method,
+            separator,
+            &[this, limit],
+        )?));
     }
     let string = text(machine, this)?;
-    let limit = value_number(
-        machine.to_number(
-            args.get(1)
-                .copied()
-                .unwrap_or(crate::number_value(u32::MAX as f64)),
-        )?,
-    ) as u32 as usize;
+    let limit = if limit == Value::UNDEFINED {
+        u32::MAX
+    } else {
+        crate::to_uint32(value_number(machine.coerce_number_observable(limit)?))
+    } as usize;
+    let separator_text = machine.coerce_string_observable(separator)?;
     if limit == 0 {
         return Ok(BuiltinOutcome::Value(allocate_array(machine, Vec::new())?));
     }
-    let parts = if args.is_empty() || args[0] == Value::UNDEFINED {
+    let parts = if separator == Value::UNDEFINED {
         vec![string]
+    } else if separator_text.is_empty() {
+        string
+            .as_units()
+            .iter()
+            .map(|unit| EcmaString::from_units(&[*unit]))
+            .collect()
     } else {
-        let separator = machine.to_string(args[0])?;
-        if separator.is_empty() {
-            string
-                .as_units()
-                .iter()
-                .map(|unit| EcmaString::from_units(&[*unit]))
-                .collect()
-        } else {
-            let mut parts = Vec::new();
-            let mut cursor = 0;
-            while let Some(offset) = search_units(string.as_units(), separator.as_units(), cursor) {
-                parts.push(
-                    string
-                        .slice_units(cursor..offset)
-                        .expect("separator search returns string bounds"),
-                );
-                cursor = offset + separator.len_units();
-            }
+        let mut parts = Vec::new();
+        let mut cursor = 0;
+        while let Some(offset) = search_units(string.as_units(), separator_text.as_units(), cursor)
+        {
             parts.push(
                 string
-                    .slice_units(cursor..string.len_units())
-                    .expect("separator search preserves string bounds"),
+                    .slice_units(cursor..offset)
+                    .expect("separator search returns string bounds"),
             );
-            parts
+            cursor = offset + separator_text.len_units();
         }
+        parts.push(
+            string
+                .slice_units(cursor..string.len_units())
+                .expect("separator search preserves string bounds"),
+        );
+        parts
     };
     let mut values = Vec::new();
     for part in parts.into_iter().take(limit) {
@@ -466,134 +595,70 @@ fn split<H: Host>(
     }
     Ok(BuiltinOutcome::Value(allocate_array(machine, values)?))
 }
-fn replacement<H: Host>(
-    machine: &mut Machine<'_, H>,
-    replacer: Value,
-    matched: &EcmaString,
-    index: usize,
-    whole: &EcmaString,
-) -> Result<EcmaString, EvalFailure> {
-    if machine.is_callable(replacer)? {
-        let matched_value = allocate_string(machine, matched.clone())?;
-        let whole_value = allocate_string(machine, whole.clone())?;
-        return machine
-            .call_value(
-                replacer,
-                Value::UNDEFINED,
-                &[
-                    matched_value,
-                    crate::number_value(index as f64),
-                    whole_value,
-                ],
-            )
-            .and_then(|value| machine.to_string(value));
-    }
-    let template = machine.to_string(replacer)?;
-    let mut output = EcmaStringBuilder::new();
-    let units = template.as_units();
-    let mut offset = 0;
-    while offset < units.len() {
-        if units[offset] != u16::from(b'$') || offset + 1 == units.len() {
-            output.push_unit(units[offset]);
-            offset += 1;
-            continue;
-        }
-        match units[offset + 1] {
-            unit if unit == u16::from(b'$') => output.push_unit(u16::from(b'$')),
-            unit if unit == u16::from(b'&') => append(&mut output, matched),
-            unit if unit == u16::from(b'`') => {
-                append(
-                    &mut output,
-                    &whole
-                        .slice_units(0..index)
-                        .expect("match index is within the source string"),
-                );
-            }
-            unit if unit == u16::from(b'\'') => {
-                append(
-                    &mut output,
-                    &whole
-                        .slice_units(index + matched.len_units()..whole.len_units())
-                        .expect("match range is within the source string"),
-                );
-            }
-            _ => {
-                output.push_unit(units[offset]);
-                offset += 1;
-                continue;
-            }
-        }
-        offset += 2;
-    }
-    Ok(output.finish())
-}
-fn replace_impl<H: Host>(
-    machine: &mut Machine<'_, H>,
-    this: Value,
-    args: &[Value],
-    all: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    if let Some(search) = args.first().copied()
-        && super::regexp::regexp_parts(machine, search).is_some()
-    {
-        return replace_regexp(machine, this, args, all);
-    }
-    let string = text(machine, this)?;
-    let needle = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    let replacer = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-    let mut output = EcmaStringBuilder::new();
-    let mut cursor = 0;
-    while cursor <= string.len_units() {
-        let Some(index) = search_units(string.as_units(), needle.as_units(), cursor) else {
-            break;
-        };
-        append(
-            &mut output,
-            &string
-                .slice_units(cursor..index)
-                .expect("search result is within the source string"),
-        );
-        append(
-            &mut output,
-            &replacement(machine, replacer, &needle, index, &string)?,
-        );
-        cursor = index + needle.len_units();
-        if !all {
-            break;
-        }
-        if needle.is_empty() && cursor < string.len_units() {
-            output.push_unit(string.unit_at(cursor).expect("cursor is in bounds"));
-            cursor += 1;
-        } else if needle.is_empty() && cursor == string.len_units() {
-            break;
-        }
-    }
-    append(
-        &mut output,
-        &string
-            .slice_units(cursor.min(string.len_units())..string.len_units())
-            .expect("cursor was clamped to the source string"),
-    );
-    Ok(BuiltinOutcome::Value(allocate_string(
-        machine,
-        output.finish(),
-    )?))
-}
+
 fn replace<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    replace_impl(machine, this, args, false)
-}
-fn replace_all<H: Host>(
-    machine: &mut Machine<'_, H>,
-    this: Value,
-    args: &[Value],
-    _: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    replace_impl(machine, this, args, true)
+    require_coercible(this)?;
+    let search = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let replace_value = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let symbol = machine.intrinsics.builtins.symbol_replace();
+    if let Some(method) = pattern_method(machine, search, symbol)? {
+        return Ok(BuiltinOutcome::Value(machine.call_value(
+            method,
+            search,
+            &[this, replace_value],
+        )?));
+    }
+    let string = text(machine, this)?;
+    let needle = machine.coerce_string_observable(search)?;
+    let functional = machine.is_callable(replace_value)?;
+    let template = if functional {
+        None
+    } else {
+        Some(machine.coerce_string_observable(replace_value)?)
+    };
+    let Some(position) = search_units(string.as_units(), needle.as_units(), 0) else {
+        return Ok(BuiltinOutcome::Value(allocate_string(machine, string)?));
+    };
+    let replacement = match template {
+        Some(template) => super::regexp_protocol::get_substitution(
+            machine,
+            &needle,
+            &string,
+            position,
+            &[],
+            Value::UNDEFINED,
+            &template,
+        )?,
+        None => {
+            let matched = allocate_string(machine, needle.clone())?;
+            let whole = allocate_string(machine, string.clone())?;
+            let value = machine.call_value(
+                replace_value,
+                Value::UNDEFINED,
+                &[matched, crate::number_value(position as f64), whole],
+            )?;
+            machine.coerce_string_observable(value)?
+        }
+    };
+    let mut output = EcmaStringBuilder::new();
+    append(
+        &mut output,
+        &super::regexp::slice_units(&string, 0..position),
+    );
+    append(&mut output, &replacement);
+    append(
+        &mut output,
+        &super::regexp::slice_units(&string, position + needle.len_units()..string.len_units()),
+    );
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        output.finish(),
+    )?))
 }
 fn is_js_whitespace(unit: u16) -> bool {
     matches!(
@@ -677,6 +742,32 @@ fn to_upper<H: Host>(
         output.finish(),
     )?))
 }
+fn to_locale_upper<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if matches!(this.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+        return Err(type_error("String method called on null or undefined"));
+    }
+    let source = machine.coerce_string_observable(this)?;
+    let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
+    transform_case(machine, &source, locales, TargetCase::Upper)
+}
+fn to_locale_lower<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if matches!(this.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+        return Err(type_error("String method called on null or undefined"));
+    }
+    let source = machine.coerce_string_observable(this)?;
+    let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
+    transform_case(machine, &source, locales, TargetCase::Lower)
+}
 fn to_lower<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -685,17 +776,18 @@ fn to_lower<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let source = text(machine, this)?;
     let mut output = EcmaStringBuilder::new();
+    // Lowering whole runs lets str::to_lowercase see the context Final_Sigma needs.
+    let mut run = String::new();
     for (_, code_point) in source.code_points() {
         if let Some(character) = char::from_u32(code_point) {
-            for mapped in character.to_lowercase() {
-                output
-                    .push_code_point(mapped as u32)
-                    .expect("Rust char is valid");
-            }
+            run.push(character);
         } else {
+            output.push_utf8(&run.to_lowercase());
+            run.clear();
             output.push_unit(code_point as u16);
         }
     }
+    output.push_utf8(&run.to_lowercase());
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
         output.finish(),
@@ -708,16 +800,18 @@ fn pad<H: Host>(
     start: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let string = text(machine, this)?;
-    let target =
-        to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?
-            .max(0.0);
+    let target = super::array_es2023::integer_or_infinity(
+        machine,
+        args.first().copied().unwrap_or(Value::UNDEFINED),
+    )?
+    .max(0.0);
     if target <= string.len_units() as f64 {
         return Ok(BuiltinOutcome::Value(allocate_string(machine, string)?));
     }
     let filler = if args.len() < 2 || args[1] == Value::UNDEFINED {
         EcmaString::encode(" ")
     } else {
-        machine.to_string(args[1])?
+        machine.coerce_string_observable(args[1])?
     };
     if filler.is_empty() {
         return Ok(BuiltinOutcome::Value(allocate_string(machine, string)?));
@@ -787,7 +881,10 @@ fn repeat<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let string = text(machine, this)?;
-    let count = to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let count = super::array_es2023::integer_or_infinity(
+        machine,
+        args.first().copied().unwrap_or(Value::UNDEFINED),
+    )?;
     if count < 0.0 || count.is_infinite() {
         return Err(range_error("Invalid count value"));
     }
@@ -829,7 +926,7 @@ fn concat<H: Host>(
     let mut output = EcmaStringBuilder::new();
     append(&mut output, &text(machine, this)?);
     for argument in args {
-        append(&mut output, &machine.to_string(*argument)?);
+        append(&mut output, &machine.coerce_string_observable(*argument)?);
     }
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
@@ -843,7 +940,7 @@ fn normalize<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     if let Some(form) = args.first().filter(|value| **value != Value::UNDEFINED) {
-        let form = machine.to_string(*form)?;
+        let form = machine.coerce_string_observable(*form)?;
         if !form.eq_ascii("NFC")
             && !form.eq_ascii("NFD")
             && !form.eq_ascii("NFKC")
@@ -854,10 +951,8 @@ fn normalize<H: Host>(
             ));
         }
     }
-    Ok(BuiltinOutcome::Value(allocate_string(
-        machine,
-        text(machine, this)?,
-    )?))
+    let string = text(machine, this)?;
+    Ok(BuiltinOutcome::Value(allocate_string(machine, string)?))
 }
 fn uri_unescaped(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte)
@@ -960,7 +1055,8 @@ pub(super) fn decode_uri_component<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let source = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let source =
+        machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let units = source.as_units();
     let mut output = EcmaStringBuilder::with_capacity(units.len());
     let mut offset = 0;
@@ -1030,48 +1126,8 @@ fn string_iterator<H: Host>(
     Ok(BuiltinOutcome::Value(super::collections::iterator(
         machine,
         source,
-        IterationKind::Value,
+        IterationKind::StringCodePoint,
     )?))
-}
-
-fn regexp_for_argument<H: Host>(
-    machine: &mut Machine<'_, H>,
-    value: Value,
-) -> Result<(crate::intrinsics::regexp::Regex, Option<Value>), EvalFailure> {
-    if let Some((pattern, flags)) = super::regexp::regexp_parts(machine, value) {
-        Ok((
-            super::regexp::compile(machine, &pattern, &flags)?,
-            Some(value),
-        ))
-    } else {
-        let pattern = machine.to_string(value)?;
-        Ok((
-            super::regexp::compile(machine, &pattern, &EcmaString::default())?,
-            None,
-        ))
-    }
-}
-
-/// Run a compiled regex, mapping step-budget exhaustion to a runtime error
-/// instead of a silent non-match. Compile errors are impossible here (the
-/// regex was already compiled by `regexp_for_argument` or `compile`).
-fn exec_regex(
-    regex: &crate::intrinsics::regexp::Regex,
-    input: &EcmaString,
-    start: usize,
-) -> Result<Option<crate::intrinsics::regexp::Match>, EvalFailure> {
-    regex
-        .exec(input, start)
-        .map_err(|error| match error.kind() {
-            crate::intrinsics::regexp::RegexErrorKind::BudgetExhausted => {
-                EvalFailure::Runtime(crate::RuntimeErrorKind::RegexpStepBudgetExceeded {
-                    limit: crate::intrinsics::regexp::STEP_BUDGET,
-                })
-            }
-            crate::intrinsics::regexp::RegexErrorKind::Compile => {
-                unreachable!("regex already compiled successfully")
-            }
-        })
 }
 
 fn string_match<H: Host>(
@@ -1080,66 +1136,12 @@ fn string_match<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let input = text(machine, this)?;
-    let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let (regex, object) = regexp_for_argument(machine, argument)?;
-    if !regex.flags().global {
-        if let Some(regexp) = object {
-            return Ok(BuiltinOutcome::Value(super::regexp::regexp_exec(
-                machine, regexp, &input,
-            )?));
-        }
-        let matched = exec_regex(&regex, &input, 0)?;
-        return match matched {
-            Some(matched) => Ok(BuiltinOutcome::Value(super::regexp::match_array_for(
-                machine, None, &input, matched,
-            )?)),
-            None => Ok(BuiltinOutcome::Value(Value::NULL)),
-        };
-    }
-    if let Some(regexp) = object {
-        machine.set_data_property(regexp, "lastIndex", Value::int32(0))?;
-    }
-    let matches = collect_matches(&regex, &input)?;
-    if matches.is_empty() {
-        return Ok(BuiltinOutcome::Value(Value::NULL));
-    }
-    let mut values = Vec::with_capacity(matches.len());
-    for matched in matches {
-        values.push(allocate_string(
-            machine,
-            super::regexp::slice_units(&input, matched.range),
-        )?);
-    }
-    Ok(BuiltinOutcome::Value(allocate_array(machine, values)?))
-}
-
-fn match_all<H: Host>(
-    machine: &mut Machine<'_, H>,
-    this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let input = text(machine, this)?;
-    let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let (regex, object) = regexp_for_argument(machine, argument)?;
-    if object.is_some() && !regex.flags().global {
-        return Err(type_error(
-            "String.prototype.matchAll requires a global RegExp",
-        ));
-    }
-    let mut values = Vec::new();
-    for matched in collect_matches(&regex, &input)? {
-        values.push(super::regexp::match_array_for(
-            machine, object, &input, matched,
-        )?);
-    }
-    let source = allocate_array(machine, values)?;
-    Ok(BuiltinOutcome::Value(super::collections::iterator(
+    delegate_to_pattern(
         machine,
-        source,
-        IterationKind::Value,
-    )?))
+        this,
+        args,
+        machine.intrinsics.builtins.symbol_match(),
+    )
 }
 
 fn search<H: Host>(
@@ -1148,320 +1150,68 @@ fn search<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let input = text(machine, this)?;
-    let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let (regex, _) = regexp_for_argument(machine, argument)?;
-    Ok(BuiltinOutcome::Value(crate::number_value(
-        exec_regex(&regex, &input, 0)?.map_or(-1.0, |matched| matched.range.start as f64),
-    )))
-}
-
-fn collect_matches(
-    regex: &crate::intrinsics::regexp::Regex,
-    input: &EcmaString,
-) -> Result<Vec<crate::intrinsics::regexp::Match>, EvalFailure> {
-    let mut matches = Vec::new();
-    let mut start = 0;
-    let length = input.len_units();
-    while start <= length {
-        let Some(matched) = exec_regex(regex, input, start)? else {
-            break;
-        };
-        let next = if matched.range.end == matched.range.start && matched.range.end < length {
-            matched.range.end
-                + crate::intrinsics::regexp::next_code_point(
-                    input.as_units(),
-                    matched.range.end,
-                    regex.flags().unicode,
-                )
-                .1
-        } else {
-            matched.range.end + usize::from(matched.range.end == matched.range.start)
-        };
-        matches.push(matched);
-        if !regex.flags().global || next > length {
-            break;
-        }
-        start = next;
-    }
-    Ok(matches)
-}
-
-fn split_regexp<H: Host>(
-    machine: &mut Machine<'_, H>,
-    this: Value,
-    args: &[Value],
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let input = text(machine, this)?;
-    let separator = args[0];
-    let (pattern, flags) =
-        super::regexp::regexp_parts(machine, separator).expect("caller checked RegExp argument");
-    let stickyless_flags = EcmaString::from_units(
-        &flags
-            .as_units()
-            .iter()
-            .copied()
-            .filter(|unit| *unit != u16::from(b'y'))
-            .collect::<Vec<_>>(),
-    );
-    let regex = super::regexp::compile(machine, &pattern, &stickyless_flags)?;
-    let limit = value_number(
-        machine.to_number(
-            args.get(1)
-                .copied()
-                .unwrap_or(crate::number_value(u32::MAX as f64)),
-        )?,
-    ) as u32 as usize;
-    let mut pieces = Vec::new();
-    // ECMA-262 §22.2.6.14 keeps two cursors: `p` (start of the pending
-    // piece) and `q` (search position). An empty match advances `q` only —
-    // it never pushes and never touches `p` — so the skipped text is not
-    // dropped. Collapsing both into one `cursor` made an empty match
-    // indistinguishable from a consumed one and silently deleted characters.
-    let mut piece_start = 0;
-    let mut cursor = 0;
-    let length = input.len_units();
-    while cursor < length && pieces.len() < limit {
-        let Some(matched) = exec_regex(&regex, &input, cursor)? else {
-            break;
-        };
-        if matched.range.start == matched.range.end && matched.range.start == piece_start {
-            // Empty match at the pending piece start: advance the search
-            // cursor only, exactly as the spec moves `q` past `p`. Push
-            // nothing and leave `piece_start` untouched.
-            cursor = matched.range.end
-                + crate::intrinsics::regexp::next_code_point(
-                    input.as_units(),
-                    matched.range.end,
-                    regex.flags().unicode,
-                )
-                .1;
-            continue;
-        }
-        pieces.push(super::regexp::slice_units(
-            &input,
-            piece_start..matched.range.start,
-        ));
-        for capture in matched.captures.iter().skip(1) {
-            if pieces.len() == limit {
-                break;
-            }
-            pieces.push(capture.clone().map_or_else(EcmaString::default, |range| {
-                super::regexp::slice_units(&input, range)
-            }));
-        }
-        piece_start = matched.range.end;
-        cursor = if matched.range.end == matched.range.start && matched.range.end < length {
-            matched.range.end
-                + crate::intrinsics::regexp::next_code_point(
-                    input.as_units(),
-                    matched.range.end,
-                    regex.flags().unicode,
-                )
-                .1
-        } else {
-            matched.range.end + usize::from(matched.range.end == matched.range.start)
-        };
-    }
-    if pieces.len() < limit {
-        pieces.push(super::regexp::slice_units(
-            &input,
-            piece_start.min(length)..length,
-        ));
-    }
-    let mut values = Vec::new();
-    for piece in pieces.into_iter().take(limit) {
-        values.push(allocate_string(machine, piece)?);
-    }
-    Ok(BuiltinOutcome::Value(allocate_array(machine, values)?))
-}
-
-fn replace_regexp<H: Host>(
-    machine: &mut Machine<'_, H>,
-    this: Value,
-    args: &[Value],
-    replace_all_call: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let input = text(machine, this)?;
-    let regexp = args[0];
-    let (pattern, flags) =
-        super::regexp::regexp_parts(machine, regexp).expect("caller checked RegExp argument");
-    let regex = super::regexp::compile(machine, &pattern, &flags)?;
-    if replace_all_call && !regex.flags().global {
-        return Err(type_error(
-            "String.prototype.replaceAll requires a global RegExp",
-        ));
-    }
-    let replacer = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-    let matches = collect_matches(&regex, &input)?;
-    let mut output = EcmaStringBuilder::new();
-    let mut cursor = 0;
-    for matched in matches {
-        append(
-            &mut output,
-            &super::regexp::slice_units(&input, cursor..matched.range.start),
-        );
-        append(
-            &mut output,
-            &regexp_replacement(machine, replacer, &input, &matched)?,
-        );
-        cursor = matched.range.end;
-        if !regex.flags().global {
-            break;
-        }
-    }
-    append(
-        &mut output,
-        &super::regexp::slice_units(&input, cursor..input.len_units()),
-    );
-    Ok(BuiltinOutcome::Value(allocate_string(
+    delegate_to_pattern(
         machine,
-        output.finish(),
-    )?))
+        this,
+        args,
+        machine.intrinsics.builtins.symbol_search(),
+    )
 }
 
-fn regexp_replacement<H: Host>(
+/// The shared shape of `match` and `search`: use the argument's own method, or
+/// build a RegExp from the argument and use that one.
+fn delegate_to_pattern<H: Host>(
     machine: &mut Machine<'_, H>,
-    replacer: Value,
-    input: &EcmaString,
-    matched: &crate::intrinsics::regexp::Match,
-) -> Result<EcmaString, EvalFailure> {
-    let matched_text = super::regexp::slice_units(input, matched.range.clone());
-    if machine.is_callable(replacer)? {
-        let mut arguments = Vec::with_capacity(matched.captures.len() + 3);
-        for capture in &matched.captures {
-            arguments.push(match capture {
-                Some(range) => {
-                    allocate_string(machine, super::regexp::slice_units(input, range.clone()))?
-                }
-                None => Value::UNDEFINED,
-            });
-        }
-        arguments.push(crate::number_value(matched.range.start as f64));
-        arguments.push(allocate_string(machine, input.clone())?);
-        // ECMA-262 §22.1.3.2.1 appends `groups` only when the pattern
-        // defines named capture metadata. The map retains unmatched groups
-        // as `None`, so metadata presence does not depend on participation.
-        if !matched.named.is_empty() {
-            let groups = machine
-                .allocate(HeapEntry::Object {
-                    properties: PropertyMap::default(),
-                    prototype: None,
-                    extensible: true,
-                    boxed_primitive: None,
-                })
-                .map_err(EvalFailure::Runtime)?;
-            for (name, range) in &matched.named {
-                let value = match range {
-                    Some(range) => {
-                        allocate_string(machine, super::regexp::slice_units(input, range.clone()))?
-                    }
-                    None => Value::UNDEFINED,
-                };
-                machine.set_data_property(groups, name, value)?;
-            }
-            arguments.push(groups);
-        }
-        return machine
-            .call_value(replacer, Value::UNDEFINED, &arguments)
-            .and_then(|value| machine.to_string(value));
+    this: Value,
+    args: &[Value],
+    symbol: Value,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    require_coercible(this)?;
+    let pattern = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if let Some(method) = pattern_method(machine, pattern, symbol)? {
+        return Ok(BuiltinOutcome::Value(machine.call_value(
+            method,
+            pattern,
+            &[this],
+        )?));
     }
-    let replacement = machine.to_string(replacer)?;
-    let before = super::regexp::slice_units(input, 0..matched.range.start);
-    let after = super::regexp::slice_units(input, matched.range.end..input.len_units());
-    let mut output = EcmaStringBuilder::new();
-    let units = replacement.as_units();
-    let mut offset = 0;
-    while offset < units.len() {
-        if units[offset] != u16::from(b'$') || offset + 1 == units.len() {
-            output.push_unit(units[offset]);
-            offset += 1;
-            continue;
-        }
-        let next = units[offset + 1];
-        if next == u16::from(b'$') {
-            output.push_unit(u16::from(b'$'));
-            offset += 2;
-            continue;
-        } else if next == u16::from(b'&') {
-            append(&mut output, &matched_text);
-            offset += 2;
-            continue;
-        } else if next == u16::from(b'`') {
-            append(&mut output, &before);
-            offset += 2;
-            continue;
-        } else if next == u16::from(b'\'') {
-            append(&mut output, &after);
-            offset += 2;
-            continue;
-        } else if next == u16::from(b'<') {
-            // ECMA-262 §22.1.3.19.1 GetSubstitution: $<Name> resolves a
-            // named capture group. If the name is absent or the group did
-            // not participate, the substitution is the empty string.
-            if !matched.named.is_empty()
-                && let Some(close) = units[offset + 2..]
-                    .iter()
-                    .position(|&unit| unit == u16::from(b'>'))
-            {
-                let name_units = &units[offset + 2..offset + 2 + close];
-                let name = String::from_utf16_lossy(name_units);
-                if let Some(Some(range)) = matched.named.get(&name) {
-                    append(
-                        &mut output,
-                        &super::regexp::slice_units(input, range.clone()),
-                    );
-                }
-                offset += 2 + close + 1;
-                continue;
-            }
-            // Without named capture metadata, or without a closing `>`,
-            // `$<` starts a literal sequence.
-            output.push_unit(units[offset]);
-            offset += 1;
-            continue;
-        } else if (u16::from(b'1')..=u16::from(b'9')).contains(&next) {
-            // ECMA-262 §22.1.3.19.1: $nn (01–99). When two digits form a
-            // valid group number, prefer that reading. Otherwise use the
-            // single-digit group and leave the second digit as a literal.
-            let one_digit = usize::from(next - u16::from(b'0'));
-            if let Some(second) = units.get(offset + 2).copied()
-                && (u16::from(b'0')..=u16::from(b'9')).contains(&second)
-            {
-                let two_digit = one_digit * 10 + usize::from(second - u16::from(b'0'));
-                if two_digit < matched.captures.len() {
-                    if let Some(Some(range)) = matched.captures.get(two_digit) {
-                        append(
-                            &mut output,
-                            &super::regexp::slice_units(input, range.clone()),
-                        );
-                    }
-                    offset += 3;
-                    continue;
-                }
-            }
-            if one_digit < matched.captures.len() {
-                if let Some(Some(range)) = matched.captures.get(one_digit) {
-                    append(
-                        &mut output,
-                        &super::regexp::slice_units(input, range.clone()),
-                    );
-                }
-                offset += 2;
-                continue;
-            }
-            // No matching group — emit '$' literally and re-examine the
-            // digit on the next iteration.
-            output.push_unit(units[offset]);
-            offset += 1;
-            continue;
-        } else {
-            output.push_unit(units[offset]);
-            offset += 1;
-            continue;
+    let string = text(machine, this)?;
+    let regexp = super::regexp::regexp_create(machine, pattern, Value::UNDEFINED)?;
+    let input = allocate_string(machine, string)?;
+    invoke_on_new_regexp(machine, regexp, symbol, input)
+}
+
+fn match_all<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    require_coercible(this)?;
+    let pattern = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if machine.is_object(pattern) && super::string_edge::is_regexp(machine, pattern)? {
+        let flags = machine.get_named_property(pattern, "flags")?;
+        require_coercible(flags)?;
+        let flags = machine.coerce_string_observable(flags)?;
+        if !flags.as_units().contains(&u16::from(b'g')) {
+            return Err(type_error(
+                "String.prototype.matchAll requires a global RegExp",
+            ));
         }
     }
-    Ok(output.finish())
+    let symbol = machine.intrinsics.builtins.symbol_match_all();
+    if let Some(method) = pattern_method(machine, pattern, symbol)? {
+        return Ok(BuiltinOutcome::Value(machine.call_value(
+            method,
+            pattern,
+            &[this],
+        )?));
+    }
+    let string = text(machine, this)?;
+    let global = allocate_string(machine, EcmaString::encode("g"))?;
+    let regexp = super::regexp::regexp_create(machine, pattern, global)?;
+    let input = allocate_string(machine, string)?;
+    invoke_on_new_regexp(machine, regexp, symbol, input)
 }
 
 #[cfg(test)]
@@ -1505,7 +1255,7 @@ mod unescape_tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
     }
 
     #[test]
@@ -1764,7 +1514,7 @@ mod unescape_tests {
             .allocate(HeapEntry::String(EcmaString::encode("x")))
             .expect("source string allocation succeeds");
         let iterator_key = machine
-            .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+            .property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
             .expect("Symbol.iterator is a property key");
         let iterator = machine
             .get_property_key(
@@ -1826,7 +1576,14 @@ mod split_replace_tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, "replacementArgumentCount", 0)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            "replacementArgumentCount",
+            0,
+        )
     }
 
     /// Constructs a RegExp the same way the `RegExp` constructor does, so

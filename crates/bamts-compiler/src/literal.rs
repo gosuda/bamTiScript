@@ -20,6 +20,32 @@ pub(crate) fn number_value(lexeme: &str) -> Option<f64> {
     {
         return radix_value(rest, 2);
     }
+    if lexeme.len() > 1 && lexeme.as_bytes()[0] == b'0' {
+        let rest = &lexeme[1..];
+        let int_end = rest.find(['.', 'e', 'E']).unwrap_or(rest.len());
+        let int_part = &rest[..int_end];
+        let mut has_octal_digit = false;
+        let mut all_octal = true;
+        for ch in int_part.chars() {
+            if ch == '_' {
+                continue;
+            }
+            if ('0'..='7').contains(&ch) {
+                has_octal_digit = true;
+                continue;
+            }
+            all_octal = false;
+            break;
+        }
+        if has_octal_digit && all_octal {
+            if int_end != rest.len() {
+                return None;
+            }
+            if let Some(value) = radix_value(rest, 8) {
+                return Some(value);
+            }
+        }
+    }
     if !lexeme.contains('_') {
         return lexeme.parse().ok();
     }
@@ -177,11 +203,76 @@ pub(crate) fn string_value(lexeme: &str) -> Option<EcmaString> {
         return None;
     }
     let interior = lexeme.get(1..lexeme.len().checked_sub(1)?)?;
-    Some(cook_escapes(interior))
+    Some(cook(interior, true))
 }
 
-/// Cooks JavaScript escape sequences in a string or template interior.
+/// Cooks JavaScript escape sequences in a template interior.
 pub(crate) fn cook_escapes(input: &str) -> EcmaString {
+    cook(input, false)
+}
+
+/// Whether a template interior has a cooked value. Every escape must be valid, and a
+/// tag reads `undefined` for an interior that fails.
+pub(crate) fn has_cooked_value(input: &str) -> bool {
+    let mut chars = input.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            continue;
+        }
+        let valid = match chars.next() {
+            Some('1'..='9') => false,
+            Some('0') => !chars.peek().is_some_and(char::is_ascii_digit),
+            Some('x') => has_hex_digits(&mut chars, 2),
+            Some('u') if chars.peek() == Some(&'{') => has_braced_code_point(&mut chars),
+            Some('u') => has_hex_digits(&mut chars, 4),
+            _ => true,
+        };
+        if !valid {
+            return false;
+        }
+    }
+    true
+}
+
+fn has_hex_digits(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, count: usize) -> bool {
+    (0..count).all(|_| chars.next().is_some_and(|digit| digit.is_ascii_hexdigit()))
+}
+
+/// Reads the `{` that the cursor is on, then the code point and its `}`.
+fn has_braced_code_point(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    chars.next();
+    let mut value = 0_u32;
+    let mut any = false;
+    for character in chars.by_ref() {
+        if character == '}' {
+            return any && value <= 0x0010_FFFF;
+        }
+        let Some(digit) = character.to_digit(16) else {
+            return false;
+        };
+        value = value.saturating_mul(16).saturating_add(digit);
+        any = true;
+    }
+    false
+}
+
+/// Cooks the value of a legacy octal escape, whose first digit is `first`. It reads
+/// up to three digits, and stops at two when a third would pass 0o377.
+fn cook_legacy_octal(first: u32, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> u16 {
+    let most_digits = if first <= 3 { 3 } else { 2 };
+    let mut value = first;
+    for _ in 1..most_digits {
+        let Some(digit) = chars.peek().and_then(|next| next.to_digit(8)) else {
+            break;
+        };
+        chars.next();
+        value = value * 8 + digit;
+    }
+    u16::try_from(value).expect("three octal digits fit a code unit")
+}
+
+/// `legacy` reads the octal escapes of a string literal, which a template refuses.
+fn cook(input: &str, legacy: bool) -> EcmaString {
     if !input.contains('\\') {
         return EcmaString::encode(input);
     }
@@ -206,6 +297,10 @@ pub(crate) fn cook_escapes(input: &str) -> EcmaString {
             'f' => output.push_unit(0x000C),
             'v' => output.push_unit(0x000B),
             '0' if !chars.peek().is_some_and(|c| c.is_ascii_digit()) => output.push_unit(0),
+            '0'..='7' if legacy => {
+                let first = escape.to_digit(8).expect("an octal digit");
+                output.push_unit(cook_legacy_octal(first, &mut chars));
+            }
             '\n' => {}
             '\r' => {
                 if chars.peek() == Some(&'\n') {
@@ -351,7 +446,7 @@ fn cook_unicode_escape(
 
 #[cfg(test)]
 mod tests {
-    use super::{cook_escapes, number_value, string_value};
+    use super::{cook_escapes, has_cooked_value, number_value, string_value};
 
     #[test]
     fn cooks_numbers_and_utf16_strings() {
@@ -459,6 +554,103 @@ mod tests {
             number_value(&format!("0o1{}", "0".repeat(342))),
             Some(f64::INFINITY)
         );
+    }
+
+    #[test]
+    fn cooks_legacy_octal_escapes_in_strings_only() {
+        for (lexeme, units) in [
+            (r#""\101""#, &[65][..]),
+            (r#"'\101\102'"#, &[65, 66]),
+            (r#""\0""#, &[0]),
+            (r#""\08""#, &[0, 56]),
+            (r#""\00""#, &[0]),
+            (r#""\000""#, &[0]),
+            (r#""\0000""#, &[0, 48]),
+            (r#""\1""#, &[1]),
+            (r#""\18""#, &[1, 56]),
+            (r#""\78""#, &[7, 56]),
+            (r#""\8""#, &[56]),
+            (r#""\9""#, &[57]),
+            (r#""\377""#, &[255]),
+            (r#""\400""#, &[32, 48]),
+            (r#""\777""#, &[63, 55]),
+            (r#""\12a""#, &[10, 97]),
+        ] {
+            assert_eq!(string_value(lexeme).unwrap().as_units(), units, "{lexeme}");
+        }
+        assert_eq!(cook_escapes(r"\101"), string_value("'101'").unwrap());
+    }
+
+    #[test]
+    fn a_template_interior_has_a_cooked_value_only_with_valid_escapes() {
+        for interior in [
+            "plain",
+            r"\0",
+            r"\0a",
+            r"\n",
+            r"\x41",
+            r"A",
+            r"\u{41}",
+            r"\u{10FFFF}",
+            r"\$",
+            "a\\\nb",
+        ] {
+            assert!(has_cooked_value(interior), "{interior}");
+        }
+        for interior in [
+            r"\1",
+            r"\8",
+            r"\01",
+            r"\08",
+            r"\x",
+            r"\x4",
+            r"\xg",
+            r"\u",
+            r"\u004",
+            r"\u{",
+            r"\u{}",
+            r"\u{41",
+            r"\u{g}",
+            r"\u{110000}",
+            r"a\n\1",
+        ] {
+            assert!(!has_cooked_value(interior), "{interior}");
+        }
+    }
+
+    #[test]
+    fn legacy_octal_integer_value_is_base_eight() {
+        assert_eq!(
+            number_value("070"),
+            Some(56.0),
+            "test262/language/literals/numeric/legacy-octal-integer.js 070 must be 56"
+        );
+        assert_eq!(
+            number_value("077"),
+            Some(63.0),
+            "legacy-octal-integer.js 077 must be 63"
+        );
+        assert_eq!(
+            number_value("08"),
+            Some(8.0),
+            "test262/language/literals/numeric/non-octal-decimal-integer.js 08 stays decimal"
+        );
+        assert_eq!(
+            number_value("0708"),
+            Some(708.0),
+            "non-octal-decimal-integer.js 0708 stays decimal"
+        );
+    }
+    #[test]
+    fn legacy_octal_integer_literal_rejects_fraction_and_exponent() {
+        assert_eq!(number_value("010.5"), None);
+        assert_eq!(number_value("010e1"), None);
+    }
+
+    #[test]
+    fn non_octal_decimal_integer_literal_allows_fraction_and_exponent() {
+        assert_eq!(number_value("08.5"), Some(8.5));
+        assert_eq!(number_value("09e1"), Some(90.0));
     }
 
     #[test]

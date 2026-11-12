@@ -42,6 +42,16 @@ pub(crate) struct BuiltinDef<H: Host> {
     pub(crate) length: u32,
     pub(crate) handler: BuiltinHandler<H>,
 }
+/// The builtin iterators with a prototype of their own. Each `next` serves only
+/// its family, so the discriminant also indexes their prototypes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IteratorFamily {
+    Array,
+    Map,
+    Set,
+    String,
+}
+
 pub(crate) struct BuiltinTable<H: Host> {
     defs: Vec<BuiltinDef<H>>,
     /// Index-aligned constructability flags. `register` defaults to `false`
@@ -55,12 +65,21 @@ pub(crate) struct BuiltinTable<H: Host> {
     number_prototype: Value,
     boolean_prototype: Value,
     error_prototypes: Vec<(BuiltinId, Value)>,
+    error_brand: Option<Value>,
+    throw_type_error: Option<Value>,
+    function_reified_brand: Option<Value>,
     symbol_iterator: Option<Value>,
     symbol_async_iterator: Option<Value>,
     symbol_to_string_tag: Option<Value>,
     symbol_match: Option<Value>,
     symbol_replace: Option<Value>,
+    symbol_match_all: Option<Value>,
+    symbol_search: Option<Value>,
+    symbol_split: Option<Value>,
+    symbol_is_concat_spreadable: Option<Value>,
+    symbol_has_instance: Option<Value>,
     symbol_species: Option<Value>,
+    symbol_to_primitive: Option<Value>,
     symbol_dispose: Option<Value>,
     symbol_async_dispose: Option<Value>,
     symbol_unscopables: Option<Value>,
@@ -70,8 +89,15 @@ pub(crate) struct BuiltinTable<H: Host> {
     object_to_string: Option<Value>,
     regexp_prototype: Option<Value>,
     iterator_prototype: Option<Value>,
+    iterator_family_prototypes: Option<[Value; 4]>,
+    iterator_helper_prototype: Option<Value>,
+    wrap_for_valid_iterator_prototype: Option<Value>,
+    regexp_string_iterator_prototype: Option<Value>,
     async_iterator_prototype: Option<Value>,
     generator_prototype: Option<Value>,
+    generator_function_prototype: Option<Value>,
+    async_function_prototype: Option<Value>,
+    async_generator_function_prototype: Option<Value>,
     async_generator_prototype: Option<Value>,
     async_from_sync_iterator_prototype: Option<Value>,
     promise_resolver_targets: Option<(Value, Value)>,
@@ -84,10 +110,15 @@ pub(crate) struct BuiltinTable<H: Host> {
     arraybuffer_constructor: Option<Value>,
     arraybuffer_prototype: Option<Value>,
     dataview_prototype: Option<Value>,
+    sharedarraybuffer_constructor: Option<Value>,
     sharedarraybuffer_prototype: Option<Value>,
+    wait_async_timeout: Option<Value>,
     disposable_stack_prototype: Option<Value>,
     async_disposable_stack_prototype: Option<Value>,
     date_prototype: Option<Value>,
+    temporal_prototypes: [Option<Value>; crate::temporal::TemporalKind::COUNT],
+    intl_prototypes: [Option<Value>; crate::intl::IntlKind::COUNT],
+    intl_fallback_symbol: Option<Value>,
     weak_ref_prototype: Option<Value>,
     finalization_registry_prototype: Option<Value>,
     map_prototype: Option<Value>,
@@ -122,12 +153,21 @@ impl<H: Host> BuiltinTable<H> {
             number_prototype,
             boolean_prototype,
             error_prototypes: Vec::new(),
+            error_brand: None,
+            throw_type_error: None,
+            function_reified_brand: None,
             symbol_iterator: None,
             symbol_async_iterator: None,
             symbol_to_string_tag: None,
             symbol_match: None,
             symbol_replace: None,
+            symbol_match_all: None,
+            symbol_search: None,
+            symbol_split: None,
+            symbol_is_concat_spreadable: None,
+            symbol_has_instance: None,
             symbol_species: None,
+            symbol_to_primitive: None,
             symbol_dispose: None,
             symbol_async_dispose: None,
             symbol_unscopables: None,
@@ -137,8 +177,15 @@ impl<H: Host> BuiltinTable<H> {
             object_to_string: None,
             regexp_prototype: None,
             iterator_prototype: None,
+            iterator_family_prototypes: None,
+            iterator_helper_prototype: None,
+            wrap_for_valid_iterator_prototype: None,
+            regexp_string_iterator_prototype: None,
             async_iterator_prototype: None,
             generator_prototype: None,
+            generator_function_prototype: None,
+            async_function_prototype: None,
+            async_generator_function_prototype: None,
             async_generator_prototype: None,
             async_from_sync_iterator_prototype: None,
             promise_resolver_targets: None,
@@ -151,10 +198,15 @@ impl<H: Host> BuiltinTable<H> {
             arraybuffer_constructor: None,
             arraybuffer_prototype: None,
             dataview_prototype: None,
+            sharedarraybuffer_constructor: None,
             sharedarraybuffer_prototype: None,
+            wait_async_timeout: None,
             disposable_stack_prototype: None,
             async_disposable_stack_prototype: None,
             date_prototype: None,
+            temporal_prototypes: [None; crate::temporal::TemporalKind::COUNT],
+            intl_prototypes: [None; crate::intl::IntlKind::COUNT],
+            intl_fallback_symbol: None,
             weak_ref_prototype: None,
             finalization_registry_prototype: None,
             map_prototype: None,
@@ -244,6 +296,39 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn symbol_replace(&self) -> Value {
         self.symbol_replace.expect("Symbol builtins install first")
     }
+    pub(crate) fn set_symbol_match_all(&mut self, symbol: Value) {
+        self.symbol_match_all = Some(symbol);
+    }
+    pub(crate) fn set_symbol_search(&mut self, symbol: Value) {
+        self.symbol_search = Some(symbol);
+    }
+    pub(crate) fn set_symbol_split(&mut self, symbol: Value) {
+        self.symbol_split = Some(symbol);
+    }
+    pub(crate) fn set_symbol_is_concat_spreadable(&mut self, symbol: Value) {
+        self.symbol_is_concat_spreadable = Some(symbol);
+    }
+    pub(crate) fn set_symbol_has_instance(&mut self, symbol: Value) {
+        self.symbol_has_instance = Some(symbol);
+    }
+    pub(crate) fn symbol_has_instance(&self) -> Value {
+        self.symbol_has_instance
+            .expect("Symbol builtins install first")
+    }
+    pub(crate) fn symbol_is_concat_spreadable(&self) -> Value {
+        self.symbol_is_concat_spreadable
+            .expect("Symbol builtins install first")
+    }
+    pub(crate) fn symbol_match_all(&self) -> Value {
+        self.symbol_match_all
+            .expect("Symbol builtins install first")
+    }
+    pub(crate) fn symbol_search(&self) -> Value {
+        self.symbol_search.expect("Symbol builtins install first")
+    }
+    pub(crate) fn symbol_split(&self) -> Value {
+        self.symbol_split.expect("Symbol builtins install first")
+    }
     pub(crate) fn set_symbol_dispose(&mut self, symbol: Value) {
         self.symbol_dispose = Some(symbol);
     }
@@ -262,6 +347,13 @@ impl<H: Host> BuiltinTable<H> {
     }
     pub(crate) fn symbol_unscopables(&self) -> Value {
         self.symbol_unscopables
+            .expect("Symbol builtins install first")
+    }
+    pub(crate) fn set_symbol_to_primitive(&mut self, symbol: Value) {
+        self.symbol_to_primitive = Some(symbol);
+    }
+    pub(crate) fn symbol_to_primitive(&self) -> Value {
+        self.symbol_to_primitive
             .expect("Symbol builtins install first")
     }
     pub(crate) fn set_symbol_species(&mut self, symbol: Value) {
@@ -313,6 +405,32 @@ impl<H: Host> BuiltinTable<H> {
         self.regexp_prototype
             .expect("RegExp builtins install their prototype")
     }
+    pub(crate) fn set_iterator_family_prototypes(&mut self, prototypes: [Value; 4]) {
+        self.iterator_family_prototypes = Some(prototypes);
+    }
+    pub(crate) fn iterator_family_prototype(&self, family: IteratorFamily) -> Value {
+        self.iterator_family_prototypes
+            .expect("collection builtins install the iterator prototypes")[family as usize]
+    }
+    pub(crate) fn set_iterator_helper_prototypes(&mut self, helper: Value, wrap: Value) {
+        self.iterator_helper_prototype = Some(helper);
+        self.wrap_for_valid_iterator_prototype = Some(wrap);
+    }
+    pub(crate) fn iterator_helper_prototype(&self) -> Value {
+        self.iterator_helper_prototype
+            .expect("Iterator builtins install the helper prototype")
+    }
+    pub(crate) fn wrap_for_valid_iterator_prototype(&self) -> Value {
+        self.wrap_for_valid_iterator_prototype
+            .expect("Iterator builtins install the wrapper prototype")
+    }
+    pub(crate) fn set_regexp_string_iterator_prototype(&mut self, prototype: Value) {
+        self.regexp_string_iterator_prototype = Some(prototype);
+    }
+    pub(crate) fn regexp_string_iterator_prototype(&self) -> Value {
+        self.regexp_string_iterator_prototype
+            .expect("RegExp builtins install the string iterator prototype")
+    }
     pub(crate) fn set_iterator_prototype(&mut self, prototype: Value) {
         self.iterator_prototype = Some(prototype);
     }
@@ -326,6 +444,28 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn async_iterator_prototype(&self) -> Value {
         self.async_iterator_prototype
             .expect("async iterator builtins install their prototype")
+    }
+    pub(crate) fn set_function_kind_prototypes(
+        &mut self,
+        generator: Value,
+        asynchronous: Value,
+        async_generator: Value,
+    ) {
+        self.generator_function_prototype = Some(generator);
+        self.async_function_prototype = Some(asynchronous);
+        self.async_generator_function_prototype = Some(async_generator);
+    }
+    pub(crate) fn generator_function_prototype(&self) -> Value {
+        self.generator_function_prototype
+            .expect("Function builtins install the generator function prototype")
+    }
+    pub(crate) fn async_function_prototype(&self) -> Value {
+        self.async_function_prototype
+            .expect("Function builtins install the async function prototype")
+    }
+    pub(crate) fn async_generator_function_prototype(&self) -> Value {
+        self.async_generator_function_prototype
+            .expect("Function builtins install the async generator function prototype")
     }
     pub(crate) fn set_generator_prototype(&mut self, prototype: Value) {
         self.generator_prototype = Some(prototype);
@@ -408,6 +548,27 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn set_arraybuffer_prototype(&mut self, prototype: Value) {
         self.arraybuffer_prototype = Some(prototype);
     }
+    pub(crate) fn set_wait_async_timeout(&mut self, callback: Value) {
+        self.wait_async_timeout = Some(callback);
+    }
+    pub(crate) fn wait_async_timeout(&self) -> Value {
+        self.wait_async_timeout
+            .expect("Atomics installs before runtime execution")
+    }
+    pub(crate) fn set_sharedarraybuffer_constructor(&mut self, constructor: Value) {
+        self.sharedarraybuffer_constructor = Some(constructor);
+    }
+    pub(crate) fn sharedarraybuffer_constructor(&self) -> Value {
+        self.sharedarraybuffer_constructor
+            .expect("SharedArrayBuffer installs before runtime execution")
+    }
+    pub(crate) fn set_sharedarraybuffer_prototype(&mut self, prototype: Value) {
+        self.sharedarraybuffer_prototype = Some(prototype);
+    }
+    pub(crate) fn sharedarraybuffer_prototype(&self) -> Value {
+        self.sharedarraybuffer_prototype
+            .expect("SharedArrayBuffer installs before runtime execution")
+    }
     pub(crate) fn arraybuffer_prototype(&self) -> Value {
         self.arraybuffer_prototype
             .expect("ArrayBuffer builtins install their prototype")
@@ -432,6 +593,30 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn async_disposable_stack_prototype(&self) -> Value {
         self.async_disposable_stack_prototype
             .expect("AsyncDisposableStack builtins install their prototype")
+    }
+    pub(crate) fn set_temporal_prototype(
+        &mut self,
+        kind: crate::temporal::TemporalKind,
+        prototype: Value,
+    ) {
+        self.temporal_prototypes[kind.index()] = Some(prototype);
+    }
+    pub(crate) fn temporal_prototype(&self, kind: crate::temporal::TemporalKind) -> Value {
+        self.temporal_prototypes[kind.index()].expect("Temporal builtins install their prototypes")
+    }
+    /// `%Intl%.[[FallbackSymbol]]`.
+    pub(crate) fn set_intl_fallback_symbol(&mut self, symbol: Value) {
+        self.intl_fallback_symbol = Some(symbol);
+    }
+    pub(crate) fn intl_fallback_symbol(&self) -> Value {
+        self.intl_fallback_symbol
+            .expect("Intl builtins install the fallback symbol")
+    }
+    pub(crate) fn set_intl_prototype(&mut self, kind: crate::intl::IntlKind, prototype: Value) {
+        self.intl_prototypes[kind.index()] = Some(prototype);
+    }
+    pub(crate) fn intl_prototype(&self, kind: crate::intl::IntlKind) -> Value {
+        self.intl_prototypes[kind.index()].expect("Intl builtins install their prototypes")
     }
     pub(crate) fn set_date_prototype(&mut self, prototype: Value) {
         self.date_prototype = Some(prototype);
@@ -548,6 +733,8 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn set_constructor_prototype(
         &mut self,
         heap: &mut [HeapEntry],
+        atoms: &mut crate::AtomTable,
+        shapes: &mut crate::ShapeTable,
         constructor: Value,
         prototype: Value,
     ) {
@@ -556,7 +743,8 @@ impl<H: Host> BuiltinTable<H> {
             panic!("builtin constructor is a native function");
         };
         properties.insert(
-            crate::PropertyKey::Named(EcmaString::encode("prototype")),
+            shapes,
+            crate::PropertyKey::Named(atoms.intern_str("prototype")),
             crate::Property::Data {
                 value: prototype,
                 writable: false,
@@ -574,9 +762,12 @@ impl<H: Host> BuiltinTable<H> {
         match &mut heap[prototype_index] {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Array { properties, .. }
-            | HeapEntry::Date { properties, .. } => {
+            | HeapEntry::Date { properties, .. }
+            | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. } => {
                 properties.insert(
-                    crate::PropertyKey::Named(EcmaString::encode("constructor")),
+                    shapes,
+                    crate::PropertyKey::Named(atoms.intern_str("constructor")),
                     constructor_property,
                 );
             }
@@ -586,6 +777,8 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn set_function_prototype(
         &mut self,
         heap: &mut [HeapEntry],
+        atoms: &mut crate::AtomTable,
+        shapes: &mut crate::ShapeTable,
         function: Value,
         prototype: Value,
     ) {
@@ -594,7 +787,8 @@ impl<H: Host> BuiltinTable<H> {
             panic!("builtin function is a native function");
         };
         properties.insert(
-            crate::PropertyKey::Named(EcmaString::encode("prototype")),
+            shapes,
+            crate::PropertyKey::Named(atoms.intern_str("prototype")),
             crate::Property::Data {
                 value: prototype,
                 writable: true,
@@ -619,6 +813,36 @@ impl<H: Host> BuiltinTable<H> {
         };
         self.error_prototypes.push((id, prototype));
     }
+    pub(crate) fn set_function_reified_brand(&mut self, brand: Value) {
+        self.function_reified_brand = Some(brand);
+    }
+
+    /// Marks a function whose `length` and `name` are stored properties.
+    pub(crate) fn function_reified_key(&self) -> crate::PropertyKey {
+        crate::PropertyKey::Private(heap_index(
+            self.function_reified_brand
+                .expect("Object builtins install the brand"),
+        ) as u32)
+    }
+
+    pub(crate) fn set_throw_type_error(&mut self, thrower: Value) {
+        self.throw_type_error = Some(thrower);
+    }
+
+    pub(crate) fn throw_type_error(&self) -> Value {
+        self.throw_type_error
+            .expect("Object builtins install %ThrowTypeError%")
+    }
+
+    pub(crate) fn set_error_brand(&mut self, brand: Value) {
+        self.error_brand = Some(brand);
+    }
+    /// The hidden key standing in for the `[[ErrorData]]` internal slot.
+    pub(crate) fn error_brand_key(&self) -> crate::PropertyKey {
+        crate::PropertyKey::Private(heap_index(
+            self.error_brand.expect("Error builtins install the brand"),
+        ) as u32)
+    }
     pub(crate) fn id_named(&self, name: &str) -> Option<BuiltinId> {
         self.defs
             .iter()
@@ -636,12 +860,21 @@ impl<H: Host> BuiltinTable<H> {
             number_prototype,
             boolean_prototype,
             error_prototypes,
+            error_brand,
+            throw_type_error,
+            function_reified_brand,
             symbol_iterator,
             symbol_async_iterator,
             symbol_to_string_tag,
             symbol_match,
             symbol_replace,
+            symbol_match_all,
+            symbol_search,
+            symbol_split,
+            symbol_is_concat_spreadable,
+            symbol_has_instance,
             symbol_species,
+            symbol_to_primitive,
             symbol_dispose,
             symbol_async_dispose,
             symbol_unscopables,
@@ -651,8 +884,15 @@ impl<H: Host> BuiltinTable<H> {
             object_to_string,
             regexp_prototype,
             iterator_prototype,
+            iterator_family_prototypes,
+            iterator_helper_prototype,
+            wrap_for_valid_iterator_prototype,
+            regexp_string_iterator_prototype,
             async_iterator_prototype,
             generator_prototype,
+            generator_function_prototype,
+            async_function_prototype,
+            async_generator_function_prototype,
             async_generator_prototype,
             async_from_sync_iterator_prototype,
             promise_resolver_targets,
@@ -665,10 +905,15 @@ impl<H: Host> BuiltinTable<H> {
             arraybuffer_constructor,
             arraybuffer_prototype,
             dataview_prototype,
+            sharedarraybuffer_constructor,
             sharedarraybuffer_prototype,
+            wait_async_timeout,
             disposable_stack_prototype,
             async_disposable_stack_prototype,
             date_prototype,
+            temporal_prototypes,
+            intl_prototypes,
+            intl_fallback_symbol,
             weak_ref_prototype,
             finalization_registry_prototype,
             map_prototype,
@@ -697,13 +942,25 @@ impl<H: Host> BuiltinTable<H> {
         for (_, value) in error_prototypes {
             visit(*value);
         }
+        for value in iterator_family_prototypes.iter().flatten() {
+            visit(*value);
+        }
         for value in [
+            *error_brand,
+            *throw_type_error,
+            *function_reified_brand,
             *symbol_iterator,
             *symbol_async_iterator,
             *symbol_to_string_tag,
             *symbol_match,
             *symbol_replace,
+            *symbol_match_all,
+            *symbol_search,
+            *symbol_split,
+            *symbol_is_concat_spreadable,
+            *symbol_has_instance,
             *symbol_species,
+            *symbol_to_primitive,
             *symbol_dispose,
             *symbol_async_dispose,
             *symbol_unscopables,
@@ -713,8 +970,14 @@ impl<H: Host> BuiltinTable<H> {
             *object_to_string,
             *regexp_prototype,
             *iterator_prototype,
+            *iterator_helper_prototype,
+            *wrap_for_valid_iterator_prototype,
+            *regexp_string_iterator_prototype,
             *async_iterator_prototype,
             *generator_prototype,
+            *generator_function_prototype,
+            *async_function_prototype,
+            *async_generator_function_prototype,
             *async_generator_prototype,
             *async_from_sync_iterator_prototype,
             *promise_all_target,
@@ -724,7 +987,9 @@ impl<H: Host> BuiltinTable<H> {
             *arraybuffer_constructor,
             *arraybuffer_prototype,
             *dataview_prototype,
+            *sharedarraybuffer_constructor,
             *sharedarraybuffer_prototype,
+            *wait_async_timeout,
             *disposable_stack_prototype,
             *async_disposable_stack_prototype,
             *date_prototype,
@@ -750,6 +1015,9 @@ impl<H: Host> BuiltinTable<H> {
         for value in typedarray_constructors
             .iter()
             .chain(typedarray_prototypes.iter())
+            .chain(temporal_prototypes.iter())
+            .chain(intl_prototypes.iter())
+            .chain(std::iter::once(intl_fallback_symbol))
             .flatten()
         {
             visit(*value);
@@ -772,7 +1040,13 @@ pub(crate) struct Intrinsics<H: Host> {
     pub(crate) builtins: BuiltinTable<H>,
 }
 impl<H: Host> Intrinsics<H> {
-    pub(crate) fn initialize(heap: &mut Vec<HeapEntry>, timers_available: bool) -> Self {
+    pub(crate) fn initialize(
+        heap: &mut Vec<HeapEntry>,
+        atoms: &mut crate::AtomTable,
+        shapes: &mut crate::ShapeTable,
+        timers_available: bool,
+        script_compiler: bool,
+    ) -> Self {
         let object_prototype = push(
             heap,
             HeapEntry::Object {
@@ -793,9 +1067,10 @@ impl<H: Host> Intrinsics<H> {
                 length_writable: true,
             },
         );
-        let string_prototype = ordinary_prototype(heap, object_prototype);
-        let number_prototype = ordinary_prototype(heap, object_prototype);
-        let boolean_prototype = ordinary_prototype(heap, object_prototype);
+        let empty_string = push(heap, HeapEntry::String(EcmaString::encode("")));
+        let string_prototype = wrapper_prototype(heap, object_prototype, empty_string);
+        let number_prototype = wrapper_prototype(heap, object_prototype, Value::int32(0));
+        let boolean_prototype = wrapper_prototype(heap, object_prototype, Value::FALSE);
         let mut globals = BTreeMap::new();
         let mut builtins = BuiltinTable::new(
             object_prototype,
@@ -805,8 +1080,15 @@ impl<H: Host> Intrinsics<H> {
             number_prototype,
             boolean_prototype,
         );
-        builtins::install(heap, &mut globals, &mut builtins, timers_available);
-        crate::host_objects::install(heap, &mut globals, &mut builtins);
+        builtins::install(
+            heap,
+            atoms,
+            shapes,
+            &mut globals,
+            &mut builtins,
+            builtins::InstallOptions { timers_available, script_compiler },
+        );
+        crate::host_objects::install(heap, atoms, shapes, &mut globals, &mut builtins);
         Self {
             globals,
             symbol_registry: BTreeMap::new(),
@@ -867,6 +1149,22 @@ impl<H: Host> Intrinsics<H> {
         builtins.for_each_value(visit);
     }
 }
+/// A prototype that is itself a wrapper around `primitive`.
+fn wrapper_prototype(
+    heap: &mut Vec<HeapEntry>,
+    object_prototype: Value,
+    primitive: Value,
+) -> Value {
+    push(
+        heap,
+        HeapEntry::Object {
+            properties: PropertyMap::default(),
+            prototype: Some(object_prototype),
+            extensible: true,
+            boxed_primitive: Some(primitive),
+        },
+    )
+}
 fn ordinary_prototype(heap: &mut Vec<HeapEntry>, object_prototype: Value) -> Value {
     push(
         heap,
@@ -878,32 +1176,49 @@ fn ordinary_prototype(heap: &mut Vec<HeapEntry>, object_prototype: Value) -> Val
         },
     )
 }
+pub(crate) fn native_function_properties(
+    heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+    name: &'static str,
+    length: u32,
+) -> PropertyMap {
+    let name_value = push(heap, HeapEntry::String(EcmaString::encode(name)));
+    function_properties(atoms, shapes, length, name_value)
+}
+pub(crate) fn function_properties(
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+    length: u32,
+    name: Value,
+) -> PropertyMap {
+    let mut properties = PropertyMap::default();
+    for (key, value) in [
+        ("length", crate::number_value(f64::from(length))),
+        ("name", name),
+    ] {
+        properties.insert(
+            shapes,
+            crate::PropertyKey::Named(atoms.intern_str(key)),
+            crate::Property::Data {
+                value,
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+    properties
+}
 pub(crate) fn native_function(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     id: BuiltinId,
     name: &'static str,
     length: u32,
 ) -> Value {
-    let name_value = push(heap, HeapEntry::String(EcmaString::encode(name)));
-    let mut properties = PropertyMap::default();
-    properties.insert(
-        crate::PropertyKey::Named(EcmaString::encode("length")),
-        crate::Property::Data {
-            value: crate::number_value(f64::from(length)),
-            writable: false,
-            enumerable: false,
-            configurable: true,
-        },
-    );
-    properties.insert(
-        crate::PropertyKey::Named(EcmaString::encode("name")),
-        crate::Property::Data {
-            value: name_value,
-            writable: false,
-            enumerable: false,
-            configurable: true,
-        },
-    );
+    let properties = native_function_properties(heap, atoms, shapes, name, length);
     push(
         heap,
         HeapEntry::native_function(NativeCallable::Builtin(id), properties, None),
@@ -941,10 +1256,14 @@ impl<'a, H: Host> Machine<'a, H> {
         constructing: bool,
         new_target: Value,
     ) -> Result<BuiltinOutcome, EvalFailure> {
+        if self.native_stack_overflows() {
+            return Err(EvalFailure::Throw(crate::STACK_OVERFLOW));
+        }
         let handler = self.intrinsics.builtins.get(id).handler;
         let previous_id = self.current_builtin_id.replace(id);
         let previous_new_target = std::mem::replace(&mut self.current_new_target, new_target);
-        let outcome = handler(self, this_value, arguments, constructing);
+        let outcome =
+            self.with_temporaries(|machine| handler(machine, this_value, arguments, constructing));
         self.current_builtin_id = previous_id;
         self.current_new_target = previous_new_target;
         outcome
@@ -969,38 +1288,38 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::BigInt(_) => "BigInt",
                     HeapEntry::PrivateName { .. } => "Symbol",
                     HeapEntry::Date { .. } => "Date",
-                    HeapEntry::Object { .. } if self.is_error_object(index)? => "Error",
-                    HeapEntry::Proxy { .. } => "Object",
+                    HeapEntry::Object {
+                        boxed_primitive: Some(primitive),
+                        ..
+                    } => match self.object_to_string_tag(*primitive)? {
+                        tag @ ("Boolean" | "Number" | "String") => tag,
+                        _ => "Object",
+                    },
+                    HeapEntry::Object { properties, .. }
+                        if properties
+                            .get(&self.shapes, &self.intrinsics.builtins.error_brand_key())
+                            .is_some() =>
+                    {
+                        "Error"
+                    }
+                    HeapEntry::Proxy { .. } if builtins::is_array(self, value)? => "Array",
+                    HeapEntry::Proxy { .. } if self.is_callable(value)? => "Function",
                     HeapEntry::ProxyRevoker { .. } => "Function",
                     _ => "Object",
                 })
             }
         }
     }
-    fn is_error_object(&self, mut index: usize) -> Result<bool, EvalFailure> {
-        for _ in 0..=self.heap.len() {
-            let value = Value::heap_ref(
-                bamts_native::SlotId::from_parts(
-                    crate::RUNTIME_HEAP_SEGMENT,
-                    u32::try_from(index + 1).expect("heap index fits in u32"),
-                )
-                .expect("heap index is nonzero"),
-            );
-            if self
-                .intrinsics
-                .builtins
-                .error_prototypes
-                .iter()
-                .any(|(_, prototype)| *prototype == value)
-            {
-                return Ok(true);
-            }
-            match self.prototype_index(index)? {
-                Some(next) => index = next,
-                None => return Ok(false),
-            }
+    /// The own `message` data property of a thrown object. Like constructor
+    /// resolution, this runs no user code, so an accessor yields nothing.
+    pub(crate) fn resolve_thrown_message(&mut self, value: Value) -> Option<EcmaString> {
+        let index = self.runtime_slot(value).ok().flatten()?;
+        let message_atom = self.intern_str("message");
+        match self.own_get_atom(index, message_atom)? {
+            Found::Value(message) => self.string_value(message),
+            Found::Text(message) => Some(message),
+            _ => None,
         }
-        Ok(false)
     }
 
     /// Resolves the constructor name of a thrown value by walking its
@@ -1013,7 +1332,7 @@ impl<'a, H: Host> Machine<'a, H> {
     /// user code (no getters, no `toString`); it reads only own data
     /// properties and the static `error_prototypes` table.
     pub(crate) fn resolve_thrown_constructor_name(
-        &self,
+        &mut self,
         value: Value,
     ) -> Result<Option<EcmaString>, EvalFailure> {
         let Some(mut index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
@@ -1044,8 +1363,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.intrinsics.builtins.get(*id).name,
                 )));
             }
-            // Try to read `constructor` own data property on this prototype.
-            if let Some(Found::Value(constructor)) = self.own_get_ascii(index, "constructor")
+            let constructor_atom = self.intern_str("constructor");
+            if let Some(Found::Value(constructor)) = self.own_get_atom(index, constructor_atom)
                 && let Some(ctor_index) = self
                     .runtime_slot(constructor)
                     .map_err(EvalFailure::Runtime)?
@@ -1071,7 +1390,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties,
                 ..
             } => {
-                if let Some(Property::Data { value, .. }) = properties.get_ascii("name")
+                if let Some(Property::Data { value, .. }) =
+                    properties.get_ascii(&self.shapes, &self.atoms, "name")
                     && let Some(text) = self.string_from_value(*value)
                 {
                     return Some(text);
@@ -1082,7 +1402,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     .map(|id| self.constant_text(*module, id).clone())
             }
             HeapEntry::NativeFunction { properties, .. } => {
-                if let Some(Property::Data { value, .. }) = properties.get_ascii("name") {
+                if let Some(Property::Data { value, .. }) =
+                    properties.get_ascii(&self.shapes, &self.atoms, "name")
+                {
                     self.string_from_value(*value)
                 } else {
                     None
@@ -1173,6 +1495,58 @@ mod tests {
     #[derive(Default)]
     struct TestHost;
     impl Host for TestHost {}
+    #[test]
+    fn wrapper_prototypes_hold_their_default_primitive() {
+        let program = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let (number, boolean, string) = (
+            machine.intrinsics.number_prototype,
+            machine.intrinsics.boolean_prototype,
+            machine.intrinsics.string_prototype,
+        );
+        assert_eq!(
+            machine.unbox_primitive_or_self(number).unwrap(),
+            Value::int32(0)
+        );
+        assert_eq!(
+            machine.unbox_primitive_or_self(boolean).unwrap(),
+            Value::FALSE
+        );
+        assert_eq!(
+            machine.get_named_property(string, "length").unwrap(),
+            Value::int32(0)
+        );
+    }
+    #[test]
+    fn built_in_tags_follow_the_object_rather_than_its_prototype_chain() {
+        let program = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let wrapped = machine.value_to_object(Value::int32(1)).unwrap();
+        assert_eq!(machine.object_to_string_tag(wrapped).unwrap(), "Number");
+        let flag = machine.value_to_object(Value::TRUE).unwrap();
+        assert_eq!(machine.object_to_string_tag(flag).unwrap(), "Boolean");
+        let error_prototype = machine.intrinsics.global("Error").unwrap();
+        let error_prototype = machine
+            .get_named_property(error_prototype, "prototype")
+            .unwrap();
+        assert_eq!(
+            machine.object_to_string_tag(error_prototype).unwrap(),
+            "Object"
+        );
+        let array = machine
+            .construct_value(machine.intrinsics.global("Array").unwrap(), &[])
+            .unwrap();
+        let handler = machine
+            .construct_value(machine.intrinsics.global("Object").unwrap(), &[])
+            .unwrap();
+        let proxy_constructor = machine.intrinsics.global("Proxy").unwrap();
+        let proxy = machine
+            .construct_value(proxy_constructor, &[array, handler])
+            .unwrap();
+        assert_eq!(machine.object_to_string_tag(proxy).unwrap(), "Array");
+    }
     fn module() -> Program<Verified> {
         let code = Module::new(
             vec![Constant::String(EcmaString::encode("<test>"))],
@@ -1228,7 +1602,7 @@ mod tests {
             Value::int32(5),
             Value::int32(6),
         );
-        let roots: Vec<Value> = (101..=145).map(Value::int32).collect();
+        let roots: Vec<Value> = (101..=147).map(Value::int32).collect();
         table.typedarray_constructor = Some(roots[0]);
         table.promise_capability_executor = Some(roots[1]);
         table.promise_finally_value = Some(roots[2]);
@@ -1254,6 +1628,8 @@ mod tests {
             table.typedarray_constructors[offset] = Some(roots[21 + offset]);
             table.typedarray_prototypes[offset] = Some(roots[33 + offset]);
         }
+        table.sharedarraybuffer_constructor = Some(roots[45]);
+        table.wait_async_timeout = Some(roots[46]);
         let mut visited = Vec::new();
         table.for_each_value(|value| visited.push(value));
         for root in roots {
@@ -1301,12 +1677,14 @@ mod tests {
             })
             .unwrap();
         for (key, value) in [("b", 1), ("2", 2), ("a", 3), ("1", 4)] {
+            let atom = PropertyKey::Named(machine.intern_str(key));
             let index = machine.runtime_slot(ordered).unwrap().unwrap();
             let HeapEntry::Object { properties, .. } = &mut machine.heap[index] else {
                 unreachable!()
             };
             properties.insert(
-                PropertyKey::Named(EcmaString::encode(key)),
+                &mut machine.shapes,
+                atom,
                 Property::Data {
                     value: Value::int32(value),
                     writable: true,
@@ -1445,7 +1823,7 @@ mod tests {
     fn realm_handles_never_enter_public_globals() {
         let module = module();
         let mut host = TestHost;
-        let machine = Machine::new(&module, &mut host, Limits::default());
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
         assert!(
             machine
                 .intrinsics
@@ -1461,7 +1839,7 @@ mod tests {
             .own_property_keys(global_this)
             .expect("globalThis is an object");
         assert!(keys.into_iter().all(|key| {
-            key.as_string()
+            key.as_string(&machine.atoms)
                 .is_none_or(|name| name.as_units().first() != Some(&0))
         }));
     }
@@ -1743,8 +2121,6 @@ mod tests {
         let machine = Machine::new(&module, &mut host, Limits::default());
         let names = [
             "eval",
-            "Intl",
-            "Iterator",
             "AsyncIterator",
             "URL",
             "URLSearchParams",
@@ -1784,8 +2160,8 @@ mod tests {
             "ArrayBuffer is installed before globals"
         );
         assert!(
-            machine.intrinsics.global("SharedArrayBuffer").is_none(),
-            "SharedArrayBuffer waits for atomics install"
+            machine.intrinsics.global("SharedArrayBuffer").is_some(),
+            "SharedArrayBuffer is installed by the atomics surface"
         );
         let _ = machine.intrinsics.builtins.arraybuffer_constructor();
         let _ = machine.intrinsics.builtins.arraybuffer_prototype();

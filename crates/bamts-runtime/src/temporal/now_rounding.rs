@@ -1,6 +1,6 @@
 //! Deterministic Temporal.Now host boundary, exact rounding, and serialization.
 //!
-//! A host must inject civil and monotonic clock readings, time-zone data, and
+//! A host must inject civil clock readings, time-zone data, and
 //! calendar projection data. This module never reads ambient process or machine
 //! state. It implements the host-facing operations in Temporal sections 2 and
 //! 11 together with the serialization operations shared by Temporal and Intl.
@@ -14,79 +14,46 @@
 use std::fmt;
 
 use super::instant_duration::{
-    Duration, INSTANT_NS_MAX, INSTANT_NS_MIN, Instant, NS_PER_DAY, NS_PER_HOUR,
-    NS_PER_MICROSECOND, NS_PER_MILLISECOND, NS_PER_MINUTE, NS_PER_SECOND, Overflow, Precision,
-    RoundingMode, TemporalError, TemporalResult, Unit, format_iso_date, format_time_ns,
-    round_to_increment, validate_rounding_increment, ymd_from_epoch_days,
+    Duration, INSTANT_NS_MAX, INSTANT_NS_MIN, Instant, NS_PER_DAY, NS_PER_HOUR, NS_PER_MICROSECOND,
+    NS_PER_MILLISECOND, NS_PER_MINUTE, NS_PER_SECOND, Overflow, Precision, RoundingMode,
+    TemporalError, TemporalResult, Unit, format_iso_date, format_time_ns, round_to_increment,
+    round_to_increment_as_if_positive, validate_rounding_increment, ymd_from_epoch_days,
 };
 use super::plain_types::{PlainDate, PlainDateTime, PlainTime};
+pub use super::zoned_date_time::UtcOffsetNanoseconds;
+use super::zoned_date_time::format_utc_offset;
 
-/// A validated UTC offset. Temporal offsets are strictly between -24 and +24 hours.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct UtcOffsetNanoseconds(i64);
-
-impl UtcOffsetNanoseconds {
-    /// Validates the range required by `GetOffsetNanosecondsFor`.
-    pub fn new(nanoseconds: i64) -> TemporalResult<Self> {
-        let day = i64::try_from(NS_PER_DAY)
-            .map_err(|_| TemporalError::range("Temporal day does not fit an offset"))?;
-        if !(-day < nanoseconds && nanoseconds < day) {
-            return Err(TemporalError::range(format!(
-                "UTC offset {nanoseconds}ns must be strictly between -24h and +24h"
-            )));
-        }
-        Ok(Self(nanoseconds))
-    }
-
-    #[must_use]
-    pub const fn as_nanoseconds(self) -> i64 {
-        self.0
-    }
-}
-
-/// One atomic host clock observation.
-///
-/// The civil reading is visible to Temporal. The monotonic reading is retained
-/// so an embedding can order snapshots without substituting it for civil time.
+/// One host clock observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClockSnapshot {
     instant: Instant,
-    monotonic_nanoseconds: u128,
 }
 
 impl ClockSnapshot {
     /// Builds a snapshot from a host reading that already satisfies the
     /// `HostSystemUTCEpochNanoseconds` range contract.
-    pub fn new(epoch_nanoseconds: i128, monotonic_nanoseconds: u128) -> TemporalResult<Self> {
+    pub fn new(epoch_nanoseconds: i128) -> TemporalResult<Self> {
         Ok(Self {
             instant: Instant::from_epoch_nanoseconds(epoch_nanoseconds)?,
-            monotonic_nanoseconds,
         })
     }
 
     /// Implements the specification's default host clamping behavior.
     #[must_use]
-    pub fn clamped(epoch_nanoseconds: i128, monotonic_nanoseconds: u128) -> Self {
-        let epoch_nanoseconds = epoch_nanoseconds.clamp(INSTANT_NS_MIN, INSTANT_NS_MAX);
-        let instant = match Instant::from_epoch_nanoseconds(epoch_nanoseconds) {
-            Ok(instant) => instant,
+    pub fn clamped(epoch_nanoseconds: i128) -> Self {
+        match Self::new(epoch_nanoseconds.clamp(INSTANT_NS_MIN, INSTANT_NS_MAX)) {
+            Ok(snapshot) => snapshot,
             Err(_) => unreachable!("clamped epoch nanoseconds are always a valid Instant"),
-        };
-        Self { instant, monotonic_nanoseconds }
+        }
     }
 
     #[must_use]
     pub const fn instant(self) -> Instant {
         self.instant
     }
-
-    #[must_use]
-    pub const fn monotonic_nanoseconds(self) -> u128 {
-        self.monotonic_nanoseconds
-    }
 }
 
-/// Injected atomic civil/monotonic clock capability.
+/// Injected civil clock capability.
 pub trait HostClock {
     type Error;
 
@@ -166,6 +133,17 @@ where
 pub type NowResult<T, ClockError, TimeZoneError, CalendarError> =
     Result<T, NowError<ClockError, TimeZoneError, CalendarError>>;
 
+/// The outcome of projecting one clock snapshot into a zone.
+pub type ZonedNowResult<Clock, TimeZones, Calendars> = NowResult<
+    NowZonedProjection<
+        <TimeZones as NowTimeZoneProvider>::Identifier,
+        <Calendars as CalendarProjectionProvider>::Identifier,
+    >,
+    <Clock as HostClock>::Error,
+    <TimeZones as NowTimeZoneProvider>::Error,
+    <Calendars as CalendarProjectionProvider>::Error,
+>;
+
 /// One clock snapshot projected into a time zone and tagged with an ISO calendar.
 ///
 /// C11.4 can construct its `ZonedDateTime` directly from `instant`, `time_zone`,
@@ -175,16 +153,10 @@ pub struct NowZonedProjection<TimeZoneId, CalendarId> {
     snapshot: ClockSnapshot,
     time_zone: TimeZoneId,
     calendar: CalendarId,
-    offset: UtcOffsetNanoseconds,
     iso_date_time: PlainDateTime,
 }
 
 impl<TimeZoneId, CalendarId> NowZonedProjection<TimeZoneId, CalendarId> {
-    #[must_use]
-    pub const fn snapshot(&self) -> ClockSnapshot {
-        self.snapshot
-    }
-
     #[must_use]
     pub const fn instant(&self) -> Instant {
         self.snapshot.instant()
@@ -198,11 +170,6 @@ impl<TimeZoneId, CalendarId> NowZonedProjection<TimeZoneId, CalendarId> {
     #[must_use]
     pub fn calendar_id(&self) -> &CalendarId {
         &self.calendar
-    }
-
-    #[must_use]
-    pub const fn offset(&self) -> UtcOffsetNanoseconds {
-        self.offset
     }
 
     #[must_use]
@@ -226,10 +193,14 @@ where
 {
     #[must_use]
     pub const fn new(clock: Clock, time_zones: TimeZones, calendars: Calendars) -> Self {
-        Self { clock, time_zones, calendars }
+        Self {
+            clock,
+            time_zones,
+            calendars,
+        }
     }
 
-    /// Captures civil and monotonic readings atomically through the host.
+    /// Captures one civil reading through the host.
     pub fn capture(
         &mut self,
     ) -> NowResult<ClockSnapshot, Clock::Error, TimeZones::Error, Calendars::Error> {
@@ -247,23 +218,23 @@ where
     pub fn time_zone_id(
         &mut self,
     ) -> NowResult<TimeZones::Identifier, Clock::Error, TimeZones::Error, Calendars::Error> {
-        self.time_zones.system_time_zone_id().map_err(NowError::TimeZone)
+        self.time_zones
+            .system_time_zone_id()
+            .map_err(NowError::TimeZone)
     }
 
     /// Captures once and projects the instant into an explicit or system zone.
     pub fn zoned_date_time_iso(
         &mut self,
         time_zone: Option<TimeZones::Identifier>,
-    ) -> NowResult<
-        NowZonedProjection<TimeZones::Identifier, Calendars::Identifier>,
-        Clock::Error,
-        TimeZones::Error,
-        Calendars::Error,
-    > {
+    ) -> ZonedNowResult<Clock, TimeZones, Calendars> {
         // SystemDateTime resolves the zone before observing the civil clock.
         let time_zone = match time_zone {
             Some(time_zone) => time_zone,
-            None => self.time_zones.system_time_zone_id().map_err(NowError::TimeZone)?,
+            None => self
+                .time_zones
+                .system_time_zone_id()
+                .map_err(NowError::TimeZone)?,
         };
         let snapshot = self.capture()?;
         let offset = self
@@ -275,7 +246,6 @@ where
             snapshot,
             time_zone,
             calendar: self.calendars.iso8601_identifier(),
-            offset,
             iso_date_time,
         })
     }
@@ -286,14 +256,6 @@ where
         time_zone: Option<TimeZones::Identifier>,
     ) -> NowResult<PlainDateTime, Clock::Error, TimeZones::Error, Calendars::Error> {
         Ok(self.zoned_date_time_iso(time_zone)?.iso_date_time())
-    }
-
-    /// `Temporal.Now.plainDateISO()`.
-    pub fn plain_date_iso(
-        &mut self,
-        time_zone: Option<TimeZones::Identifier>,
-    ) -> NowResult<PlainDate, Clock::Error, TimeZones::Error, Calendars::Error> {
-        Ok(self.zoned_date_time_iso(time_zone)?.iso_date_time().date)
     }
 
     /// `Temporal.Now.plainTimeISO()`.
@@ -324,7 +286,7 @@ pub fn iso_date_time_for(
 ) -> TemporalResult<PlainDateTime> {
     let local_ns = instant
         .epoch_nanoseconds()
-        .checked_add(i128::from(offset.as_nanoseconds()))
+        .checked_add(i128::from(offset.get()))
         .ok_or_else(|| TemporalError::range("time-zone projection overflow"))?;
     let epoch_days = local_ns.div_euclid(NS_PER_DAY);
     let time_ns = local_ns.rem_euclid(NS_PER_DAY);
@@ -341,13 +303,14 @@ pub fn iso_date_time_for(
         year,
         i64::from(month),
         i64::from(day),
-        i64::try_from(hour).map_err(|_| TemporalError::range("hour overflow"))?,
-        i64::try_from(minute).map_err(|_| TemporalError::range("minute overflow"))?,
-        i64::try_from(second).map_err(|_| TemporalError::range("second overflow"))?,
-        i64::try_from(millisecond)
-            .map_err(|_| TemporalError::range("millisecond overflow"))?,
-        i64::try_from(microsecond).map_err(|_| TemporalError::range("microsecond overflow"))?,
-        i64::try_from(nanosecond).map_err(|_| TemporalError::range("nanosecond overflow"))?,
+        [
+            i64::try_from(hour).map_err(|_| TemporalError::range("hour overflow"))?,
+            i64::try_from(minute).map_err(|_| TemporalError::range("minute overflow"))?,
+            i64::try_from(second).map_err(|_| TemporalError::range("second overflow"))?,
+            i64::try_from(millisecond).map_err(|_| TemporalError::range("millisecond overflow"))?,
+            i64::try_from(microsecond).map_err(|_| TemporalError::range("microsecond overflow"))?,
+            i64::try_from(nanosecond).map_err(|_| TemporalError::range("nanosecond overflow"))?,
+        ],
         Overflow::Reject,
     )
 }
@@ -378,47 +341,13 @@ pub fn round_epoch_nanoseconds(
     mode: RoundingMode,
 ) -> TemporalResult<i128> {
     validate_rounding_increment(smallest_unit, increment, false)?;
-    let unit_ns = smallest_unit.ns_per().ok_or_else(|| {
-        TemporalError::range("epoch rounding requires day or a time unit")
-    })?;
+    let unit_ns = smallest_unit
+        .ns_per()
+        .ok_or_else(|| TemporalError::range("epoch rounding requires day or a time unit"))?;
     let step = unit_ns
         .checked_mul(increment)
         .ok_or_else(|| TemporalError::range("rounding increment overflow"))?;
     round_to_increment_as_if_positive(value, step, mode)
-}
-
-fn round_to_increment_as_if_positive(
-    value: i128,
-    increment: i128,
-    mode: RoundingMode,
-) -> TemporalResult<i128> {
-    let quotient = value.div_euclid(increment);
-    let remainder = value.rem_euclid(increment);
-    if remainder == 0 {
-        return Ok(value);
-    }
-    let half = increment / 2;
-    let tie = increment % 2 == 0 && remainder == half;
-    let above_half = remainder > half && !tie;
-    let round_up = match mode {
-        RoundingMode::Ceil | RoundingMode::Expand => true,
-        RoundingMode::Floor | RoundingMode::Trunc => false,
-        RoundingMode::HalfCeil | RoundingMode::HalfExpand => above_half || tie,
-        RoundingMode::HalfFloor | RoundingMode::HalfTrunc => above_half,
-        RoundingMode::HalfEven => {
-            above_half || (tie && quotient.rem_euclid(2) == 1)
-        }
-    };
-    let quotient = if round_up {
-        quotient
-            .checked_add(1)
-            .ok_or_else(|| TemporalError::range("epoch rounding overflow"))?
-    } else {
-        quotient
-    };
-    quotient
-        .checked_mul(increment)
-        .ok_or_else(|| TemporalError::range("epoch rounding overflow"))
 }
 
 /// Rounds exact time nanoseconds and balances them into a shared `Duration`.
@@ -583,28 +512,30 @@ pub enum ShowOffset {
 }
 
 /// Formats a canonical calendar annotation, including its own critical flag.
-pub fn format_calendar_annotation(
-    calendar: &str,
-    show: ShowCalendar,
-) -> TemporalResult<String> {
+pub fn format_calendar_annotation(calendar: &str, show: ShowCalendar) -> TemporalResult<String> {
     if show == ShowCalendar::Never || (show == ShowCalendar::Auto && calendar == "iso8601") {
         return Ok(String::new());
     }
     validate_calendar_identifier(calendar)?;
-    let critical = if show == ShowCalendar::Critical { "!" } else { "" };
+    let critical = if show == ShowCalendar::Critical {
+        "!"
+    } else {
+        ""
+    };
     Ok(format!("[{critical}u-ca={calendar}]"))
 }
 
 /// Formats a time-zone annotation, including its own critical flag.
-pub fn format_time_zone_annotation(
-    time_zone: &str,
-    show: ShowTimeZone,
-) -> TemporalResult<String> {
+pub fn format_time_zone_annotation(time_zone: &str, show: ShowTimeZone) -> TemporalResult<String> {
     if show == ShowTimeZone::Never {
         return Ok(String::new());
     }
     validate_time_zone_annotation(time_zone)?;
-    let critical = if show == ShowTimeZone::Critical { "!" } else { "" };
+    let critical = if show == ShowTimeZone::Critical {
+        "!"
+    } else {
+        ""
+    };
     Ok(format!("[{critical}{time_zone}]"))
 }
 
@@ -627,8 +558,7 @@ fn validate_calendar_identifier(calendar: &str) -> TemporalResult<()> {
 fn validate_time_zone_annotation(time_zone: &str) -> TemporalResult<()> {
     let valid = !time_zone.is_empty()
         && time_zone.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(byte, b'/' | b'_' | b'-' | b'+' | b':' | b'.')
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'+' | b':' | b'.')
         });
     if !valid {
         return Err(TemporalError::range(format!(
@@ -638,40 +568,15 @@ fn validate_time_zone_annotation(time_zone: &str) -> TemporalResult<()> {
     Ok(())
 }
 
-/// Formats an exact UTC offset as `±HH:MM[:SS[.fffffffff]]`.
-#[must_use]
-pub fn format_utc_offset(offset: UtcOffsetNanoseconds) -> String {
-    let value = offset.as_nanoseconds();
-    let sign = if value < 0 { '-' } else { '+' };
-    let absolute = i128::from(value).abs();
-    let hour = absolute / NS_PER_HOUR;
-    let minute = (absolute / NS_PER_MINUTE) % 60;
-    let second = (absolute / NS_PER_SECOND) % 60;
-    let fraction = absolute % NS_PER_SECOND;
-    let mut result = format!("{sign}{hour:02}:{minute:02}");
-    if second != 0 || fraction != 0 {
-        result.push_str(&format!(":{second:02}"));
-        if fraction != 0 {
-            let mut digits = format!("{fraction:09}");
-            while digits.ends_with('0') {
-                digits.pop();
-            }
-            result.push('.');
-            result.push_str(&digits);
-        }
-    }
-    result
-}
-
 /// Formats a named-zone date-time offset after half-expand minute rounding.
 pub fn format_utc_offset_rounded(offset: UtcOffsetNanoseconds) -> TemporalResult<String> {
     let rounded = round_to_increment(
-        i128::from(offset.as_nanoseconds()),
+        i128::from(offset.get()),
         NS_PER_MINUTE,
         RoundingMode::HalfExpand,
     )?;
-    let rounded = i64::try_from(rounded)
-        .map_err(|_| TemporalError::range("rounded UTC offset overflow"))?;
+    let rounded =
+        i64::try_from(rounded).map_err(|_| TemporalError::range("rounded UTC offset overflow"))?;
     Ok(format_utc_offset(UtcOffsetNanoseconds::new(rounded)?))
 }
 
@@ -680,7 +585,10 @@ pub fn format_utc_offset_rounded(offset: UtcOffsetNanoseconds) -> TemporalResult
 pub fn format_iso_date_time(value: &PlainDateTime, precision: Precision) -> String {
     let mut result = format_iso_date(value.date.year, value.date.month, value.date.day);
     result.push('T');
-    result.push_str(&format_time_ns(value.time.to_nanoseconds_of_day(), precision));
+    result.push_str(&format_time_ns(
+        value.time.to_nanoseconds_of_day(),
+        precision,
+    ));
     result
 }
 
@@ -782,7 +690,6 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ZoneFailure {
-        System,
         Offset,
     }
 
@@ -859,9 +766,7 @@ mod tests {
         }
     }
 
-    fn clock(
-        readings: Vec<Result<ClockSnapshot, ClockFailure>>,
-    ) -> (FakeClock, Rc<Cell<usize>>) {
+    fn clock(readings: Vec<Result<ClockSnapshot, ClockFailure>>) -> (FakeClock, Rc<Cell<usize>>) {
         let calls = Rc::new(Cell::new(0));
         (
             FakeClock {
@@ -915,8 +820,14 @@ mod tests {
             (RoundingMode::HalfEven, 4, -4),
         ];
         for (mode, positive, negative) in cases {
-            assert_eq!(round_nanoseconds(5, Unit::Nanosecond, 2, mode), Ok(positive));
-            assert_eq!(round_nanoseconds(-5, Unit::Nanosecond, 2, mode), Ok(negative));
+            assert_eq!(
+                round_nanoseconds(5, Unit::Nanosecond, 2, mode),
+                Ok(positive)
+            );
+            assert_eq!(
+                round_nanoseconds(-5, Unit::Nanosecond, 2, mode),
+                Ok(negative)
+            );
         }
         assert_eq!(
             round_nanoseconds(-7, Unit::Nanosecond, 2, RoundingMode::HalfEven),
@@ -949,10 +860,7 @@ mod tests {
     fn increment_validation_and_overflow_are_typed_errors() {
         assert!(round_nanoseconds(1, Unit::Second, 0, RoundingMode::Trunc).is_err());
         assert!(round_nanoseconds(1, Unit::Second, 7, RoundingMode::Trunc).is_err());
-        assert!(
-            round_nanoseconds(i128::MAX, Unit::Day, i128::MAX, RoundingMode::Ceil)
-                .is_err()
-        );
+        assert!(round_nanoseconds(i128::MAX, Unit::Day, i128::MAX, RoundingMode::Ceil).is_err());
         assert!(
             round_and_balance_duration(
                 i128::MIN,
@@ -1013,10 +921,7 @@ mod tests {
             })
         );
         assert_eq!(
-            SecondsStringPrecision::resolve(
-                Some(Unit::Minute),
-                FractionalSecondDigits::Digits(9),
-            ),
+            SecondsStringPrecision::resolve(Some(Unit::Minute), FractionalSecondDigits::Digits(9),),
             Ok(SecondsStringPrecision {
                 precision: Precision::Minute,
                 unit: Unit::Minute,
@@ -1025,18 +930,14 @@ mod tests {
         );
         assert!(FractionalSecondDigits::digits(10).is_err());
         assert!(
-            SecondsStringPrecision::resolve(
-                Some(Unit::Hour),
-                FractionalSecondDigits::Auto,
-            )
-            .is_err()
+            SecondsStringPrecision::resolve(Some(Unit::Hour), FractionalSecondDigits::Auto,)
+                .is_err()
         );
     }
 
     #[test]
     fn precision_serialization_trims_or_fixes_fraction_and_omits_seconds() {
-        let time = PlainTime::new(1, 2, 3, 123, 400, 0, Overflow::Reject)
-            .expect("valid time");
+        let time = PlainTime::new(1, 2, 3, 123, 400, 0, Overflow::Reject).expect("valid time");
         assert_eq!(
             serialize_plain_time(&time, ToStringRoundingOptions::default()),
             Ok("01:02:03.1234".to_owned())
@@ -1082,21 +983,9 @@ mod tests {
             Ok("[!Test/Zone]".to_owned())
         );
 
-        let date_time = PlainDateTime::new(
-            1970,
-            1,
-            1,
-            1,
-            2,
-            3,
-            123,
-            400,
-            0,
-            Overflow::Reject,
-        )
-        .expect("valid date-time");
-        let offset = UtcOffsetNanoseconds::new(90 * 60 * 1_000_000_000)
-            .expect("valid offset");
+        let date_time = PlainDateTime::new(1970, 1, 1, [1, 2, 3, 123, 400, 0], Overflow::Reject)
+            .expect("valid date-time");
+        let offset = UtcOffsetNanoseconds::new(90 * 60 * 1_000_000_000).expect("valid offset");
         assert_eq!(
             serialize_zoned_date_time(ZonedSerialization {
                 iso_date_time: &date_time,
@@ -1120,8 +1009,8 @@ mod tests {
         .expect("valid offset");
         assert_eq!(format_utc_offset(exact), "+01:02:03.4");
 
-        let negative_tie = UtcOffsetNanoseconds::new(-((62 * 60 + 30) * 1_000_000_000))
-            .expect("valid offset");
+        let negative_tie =
+            UtcOffsetNanoseconds::new(-((62 * 60 + 30) * 1_000_000_000)).expect("valid offset");
         assert_eq!(
             format_utc_offset_rounded(negative_tie),
             Ok("-01:03".to_owned())
@@ -1134,15 +1023,16 @@ mod tests {
         let calls = Rc::new(Cell::new(0));
         let clock = FakeClock {
             readings: vec![
-                Ok(ClockSnapshot::new(0, 41).expect("valid snapshot")),
-                Ok(ClockSnapshot::new(NS_PER_DAY, 42).expect("valid snapshot")),
+                Ok(ClockSnapshot::new(0).expect("valid snapshot")),
+                Ok(ClockSnapshot::new(NS_PER_DAY).expect("valid snapshot")),
             ],
             cursor: 0,
             calls: Rc::clone(&calls),
         };
-        let (zones, system_calls, offset_calls) = time_zones(Ok(
-            UtcOffsetNanoseconds::new(90 * 60 * 1_000_000_000).expect("valid offset"),
-        ));
+        let (zones, system_calls, offset_calls) = time_zones(Ok(UtcOffsetNanoseconds::new(
+            90 * 60 * 1_000_000_000,
+        )
+        .expect("valid offset")));
         let (calendars, calendar_calls) = calendars(false);
         let mut now = TemporalNow::new(clock, zones, calendars);
 
@@ -1150,10 +1040,10 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert_eq!(system_calls.get(), 1);
         assert_eq!(offset_calls.get(), 1);
-        assert_eq!(projected.snapshot().monotonic_nanoseconds(), 41);
+        assert_eq!(projected.instant().epoch_nanoseconds(), 0);
         assert_eq!(
             projected.iso_date_time(),
-            PlainDateTime::new(1970, 1, 1, 1, 30, 0, 0, 0, 0, Overflow::Reject)
+            PlainDateTime::new(1970, 1, 1, [1, 30, 0, 0, 0, 0], Overflow::Reject)
                 .expect("valid expected date-time")
         );
         assert_eq!(projected.calendar_id(), "iso8601");
@@ -1164,61 +1054,64 @@ mod tests {
             Ok("hebrew:1970-01-01".to_owned())
         );
         assert_eq!(calendar_calls.get(), 1);
-        assert_eq!(calls.get(), 1, "calendar projection must not recapture time");
+        assert_eq!(
+            calls.get(),
+            1,
+            "calendar projection must not recapture time"
+        );
     }
 
     #[test]
     fn injected_readings_prove_no_ambient_clock_dependency() {
-        let (clock_a, _) = clock(vec![Ok(
-            ClockSnapshot::new(-1, 10).expect("valid snapshot"),
-        )]);
-        let (zones_a, _, _) = time_zones(Ok(
-            UtcOffsetNanoseconds::new(0).expect("valid offset"),
-        ));
+        let (clock_a, _) = clock(vec![Ok(ClockSnapshot::new(-1).expect("valid snapshot"))]);
+        let (zones_a, _, _) = time_zones(Ok(UtcOffsetNanoseconds::new(0).expect("valid offset")));
         let (calendars_a, _) = calendars(false);
         let mut now_a = TemporalNow::new(clock_a, zones_a, calendars_a);
 
-        let (clock_b, _) = clock(vec![Ok(
-            ClockSnapshot::new(1, 20).expect("valid snapshot"),
-        )]);
-        let (zones_b, _, _) = time_zones(Ok(
-            UtcOffsetNanoseconds::new(0).expect("valid offset"),
-        ));
+        let (clock_b, _) = clock(vec![Ok(ClockSnapshot::new(1).expect("valid snapshot"))]);
+        let (zones_b, _, _) = time_zones(Ok(UtcOffsetNanoseconds::new(0).expect("valid offset")));
         let (calendars_b, _) = calendars(false);
         let mut now_b = TemporalNow::new(clock_b, zones_b, calendars_b);
 
-        assert_eq!(now_a.instant().expect("first injected clock").epoch_nanoseconds(), -1);
-        assert_eq!(now_b.instant().expect("second injected clock").epoch_nanoseconds(), 1);
+        assert_eq!(
+            now_a
+                .instant()
+                .expect("first injected clock")
+                .epoch_nanoseconds(),
+            -1
+        );
+        assert_eq!(
+            now_b
+                .instant()
+                .expect("second injected clock")
+                .epoch_nanoseconds(),
+            1
+        );
     }
 
     #[test]
     fn provider_failures_remain_typed_and_clock_is_not_retried() {
         let (failed_clock, clock_calls) = clock(vec![Err(ClockFailure::Unavailable)]);
-        let (zones, _, _) = time_zones(Ok(
-            UtcOffsetNanoseconds::new(0).expect("valid offset"),
-        ));
-        let (calendars, _) = calendars(false);
-        let mut now = TemporalNow::new(failed_clock, zones, calendars);
-        assert_eq!(now.instant(), Err(NowError::Clock(ClockFailure::Unavailable)));
+        let (zones, _, _) = time_zones(Ok(UtcOffsetNanoseconds::new(0).expect("valid offset")));
+        let (first_calendars, _) = calendars(false);
+        let mut now = TemporalNow::new(failed_clock, zones, first_calendars);
+        assert_eq!(
+            now.instant(),
+            Err(NowError::Clock(ClockFailure::Unavailable))
+        );
         assert_eq!(clock_calls.get(), 1);
 
-        let (good_clock, _) = clock(vec![Ok(
-            ClockSnapshot::new(0, 0).expect("valid snapshot"),
-        )]);
+        let (good_clock, _) = clock(vec![Ok(ClockSnapshot::new(0).expect("valid snapshot"))]);
         let (failed_zones, _, _) = time_zones(Err(ZoneFailure::Offset));
-        let (calendars, _) = calendars(false);
-        let mut now = TemporalNow::new(good_clock, failed_zones, calendars);
+        let (second_calendars, _) = calendars(false);
+        let mut now = TemporalNow::new(good_clock, failed_zones, second_calendars);
         assert_eq!(
             now.zoned_date_time_iso(Some("UTC".to_owned())),
             Err(NowError::TimeZone(ZoneFailure::Offset))
         );
 
-        let (good_clock, _) = clock(vec![Ok(
-            ClockSnapshot::new(0, 0).expect("valid snapshot"),
-        )]);
-        let (zones, _, _) = time_zones(Ok(
-            UtcOffsetNanoseconds::new(0).expect("valid offset"),
-        ));
+        let (good_clock, _) = clock(vec![Ok(ClockSnapshot::new(0).expect("valid snapshot"))]);
+        let (zones, _, _) = time_zones(Ok(UtcOffsetNanoseconds::new(0).expect("valid offset")));
         let (failed_calendars, _) = calendars(true);
         let mut now = TemporalNow::new(good_clock, zones, failed_calendars);
         let projected = now
@@ -1233,13 +1126,13 @@ mod tests {
     #[test]
     fn clock_clamping_and_boundary_zone_projection_are_exact() {
         assert_eq!(
-            ClockSnapshot::clamped(i128::MAX, 1)
+            ClockSnapshot::clamped(i128::MAX)
                 .instant()
                 .epoch_nanoseconds(),
             INSTANT_NS_MAX
         );
         assert_eq!(
-            ClockSnapshot::clamped(i128::MIN, 2)
+            ClockSnapshot::clamped(i128::MIN)
                 .instant()
                 .epoch_nanoseconds(),
             INSTANT_NS_MIN

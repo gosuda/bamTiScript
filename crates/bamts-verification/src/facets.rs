@@ -19,7 +19,7 @@
 //!   path. Empty stdout cannot pass on its own.
 //!
 //! The diagnostic code map at [`DIAGNOSTIC_CODE_MAP_PATH`] must enumerate every
-//! current `BAMTS-L001…L011`, parser, and checker diagnostic codes.
+//! current `BAMTS-L001…L015`, parser, and checker diagnostic codes.
 //! Unmapped entries are first-class evidence, not invented TypeScript codes.
 
 use std::{
@@ -51,7 +51,7 @@ pub const DIAGNOSTIC_CODE_MAP_PATH: &str = "verification/diagnostic-code-map.jso
 pub const DIAGNOSTIC_CODE_MAP_SCHEMA_VERSION: u32 = 1;
 
 /// Every current BAMTS diagnostic code the map must cover exactly once.
-pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 104] = [
+pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 132] = [
     "BAMTS-L001",
     "BAMTS-L002",
     "BAMTS-L003",
@@ -63,6 +63,11 @@ pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 104] = [
     "BAMTS-L009",
     "BAMTS-L010",
     "BAMTS-L011",
+    "BAMTS-L012",
+    "BAMTS-L013",
+    "BAMTS-L014",
+    "BAMTS-L015",
+    "BAMTS-L016",
     "BAMTS-P001",
     "BAMTS-P002",
     "BAMTS-P003",
@@ -74,6 +79,9 @@ pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 104] = [
     "BAMTS-P010",
     "BAMTS-P011",
     "BAMTS-P012",
+    "BAMTS-P017",
+    "BAMTS-P018",
+    "BAMTS-P019",
     "BAMTS-C001",
     "BAMTS-C002",
     "BAMTS-C003",
@@ -132,12 +140,29 @@ pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 104] = [
     "BAMTS-C057",
     "BAMTS-C058",
     "BAMTS-C059",
+    "BAMTS-C060",
+    "BAMTS-C061",
+    "BAMTS-C062",
+    "BAMTS-C063",
+    "BAMTS-C064",
+    "BAMTS-C065",
     "BAMTS-C066",
+    "BAMTS-C067",
+    "BAMTS-C068",
+    "BAMTS-C069",
     "BAMTS-C070",
     "BAMTS-C071",
     "BAMTS-C072",
+    "BAMTS-C073",
+    "BAMTS-C074",
+    "BAMTS-C075",
+    "BAMTS-C076",
+    "BAMTS-C077",
+    "BAMTS-C078",
+    "BAMTS-C079",
     "BAMTS-C080",
     "BAMTS-C081",
+    "BAMTS-C082",
     "BAMTS-C086",
     "BAMTS-C087",
     "BAMTS-C088",
@@ -156,6 +181,9 @@ pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 104] = [
     "BAMTS-C101",
     "BAMTS-C102",
     "BAMTS-C103",
+    "BAMTS-C104",
+    "BAMTS-C105",
+    "BAMTS-C106",
 ];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FacetVerdict {
@@ -637,6 +665,10 @@ pub fn compare_js_emit(expected: &str, actual: &str) -> FacetVerdict {
     compare_structural("javascript", expected, actual, canonicalize_js_emit)
 }
 
+pub fn compare_declaration_emit(expected: &str, actual: &str) -> FacetVerdict {
+    compare_structural("declaration", expected, actual, canonicalize_js_emit)
+}
+
 fn canonicalize_js_emit(text: &str) -> Result<Vec<String>, ()> {
     Ok(text
         .replace("\r\n", "\n")
@@ -672,9 +704,241 @@ fn compare_structural(
         FacetVerdict::Pass
     } else {
         FacetVerdict::Fail {
-            reason: format!("{facet} structural mismatch after formatting/order normalization"),
+            reason: format!(
+                "{facet} structural mismatch {}",
+                describe_difference(&expected_norm, &actual_norm, facet)
+            ),
         }
     }
+}
+
+/// Longest excerpt of a differing line kept in a reason.
+const EXCERPT_CHARS: usize = 100;
+
+/// `[category]: where`, naming the first difference between two normalized
+/// outputs. The category is a plain word, so rows that differ the same way group
+/// together. The lines themselves sit in backticks, so a family ignores them.
+fn describe_difference(expected: &[String], actual: &[String], facet: &str) -> String {
+    let common = expected
+        .iter()
+        .zip(actual)
+        .take_while(|(left, right)| left == right)
+        .count();
+    match (expected.get(common), actual.get(common)) {
+        (None, Some(extra)) => {
+            let kind = match facet {
+                "types" => "extra-record",
+                "symbols" => "extra-row",
+                _ => "extra-lines",
+            };
+            format!(
+                "[{kind}]: actual has {} extra line(s) from line {}: `{}`",
+                actual.len() - common,
+                common + 1,
+                excerpt(extra)
+            )
+        }
+        (Some(missing), None) => {
+            let kind = match facet {
+                "types" => "missing-record",
+                "symbols" => "missing-row",
+                _ => "missing-lines",
+            };
+            format!(
+                "[{kind}]: actual ends at line {common}; expected continues with `{}`",
+                excerpt(missing)
+            )
+        }
+        (Some(left), Some(right)) => {
+            let mut sorted_expected = expected.to_vec();
+            let mut sorted_actual = actual.to_vec();
+            sorted_expected.sort();
+            sorted_actual.sort();
+            let category = if sorted_expected == sorted_actual {
+                "order".to_owned()
+            } else {
+                line_difference(left, right, facet)
+            };
+            format!(
+                "[{category}]: line {} expected `{}` actual `{}`",
+                common + 1,
+                excerpt(left),
+                excerpt(right)
+            )
+        }
+        // The slices differ, so one of them has a line at `common`.
+        (None, None) => "[text]: outputs differ".to_owned(),
+    }
+}
+
+fn line_difference(expected: &str, actual: &str, facet: &str) -> String {
+    let unquoted = |text: &str| text.replace('\'', "\"");
+    let unpunctuated = |text: &str| text.trim_end_matches([';', ',']).to_owned();
+    if (facet == "types" || facet == "symbols")
+        && let (Some(left), Some(right)) = (canonical_tokens(expected), canonical_tokens(actual))
+    {
+        return canvas_difference(facet, &left, &right).to_owned();
+    }
+    if expected.split_whitespace().eq(actual.split_whitespace()) {
+        return "spacing".to_owned();
+    }
+    if expected.eq_ignore_ascii_case(actual) {
+        return "case".to_owned();
+    }
+    if unquoted(expected) == unquoted(actual) {
+        return "quote-style".to_owned();
+    }
+    if unpunctuated(expected) == unpunctuated(actual) {
+        return "punctuation".to_owned();
+    }
+    let (left, right) = (line_kind(expected), line_kind(actual));
+    if left == right {
+        "text".to_owned()
+    } else {
+        format!("{left}-vs-{right}")
+    }
+}
+
+fn canonical_tokens(line: &str) -> Option<Vec<(&str, &str)>> {
+    let mut tokens = Vec::new();
+    for part in line.split('|') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (length, token) = part.split_once(':')?;
+        if length.is_empty() || !length.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        tokens.push((length, token));
+    }
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(tokens)
+}
+
+fn canvas_difference(facet: &str, left: &[(&str, &str)], right: &[(&str, &str)]) -> &'static str {
+    if left.iter().any(|(_, token)| *token == "===")
+        || right.iter().any(|(_, token)| *token == "===")
+    {
+        return "section-header";
+    }
+    if strip_caret_tail(left) == strip_caret_tail(right) && left != right {
+        return "caret-line";
+    }
+    let (Some(sep_left), Some(sep_right)) = (separator_index(left), separator_index(right)) else {
+        return "type-text";
+    };
+    if name_range(left, sep_left) != name_range(right, sep_right) {
+        return if facet == "symbols" {
+            "symbol-name"
+        } else {
+            "record-name"
+        };
+    }
+    if facet == "symbols" && decl_skeleton(left) == decl_skeleton(right) && left != right {
+        return "decl-position";
+    }
+    if rendered_has_any(right, sep_right) && !rendered_has_any(left, sep_left) {
+        return "type-any";
+    }
+    "type-text"
+}
+
+fn strip_caret_tail<'t>(tokens: &'t [(&'t str, &'t str)]) -> &'t [(&'t str, &'t str)] {
+    let mut end = tokens.len();
+    while end > 0 && tokens[end - 1].1 == "^" {
+        end -= 1;
+    }
+    if end > 0 && tokens[end - 1].1 == ":" {
+        end -= 1;
+    }
+    &tokens[..end]
+}
+
+fn separator_index(tokens: &[(&str, &str)]) -> Option<usize> {
+    tokens.iter().position(|(_, token)| *token == ":")
+}
+
+fn name_range<'t>(tokens: &'t [(&'t str, &'t str)], sep: usize) -> &'t [(&'t str, &'t str)] {
+    let start = usize::from(!tokens.is_empty() && tokens[0].1 == ">");
+    &tokens[start..sep]
+}
+
+fn rendered_has_any(tokens: &[(&str, &str)], sep: usize) -> bool {
+    tokens[sep..].iter().any(|(_, token)| *token == "any")
+}
+
+fn decl_skeleton<'t>(tokens: &[(&'t str, &'t str)]) -> Vec<&'t str> {
+    let mut skeleton = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index].1 == "Decl" && tokens.get(index + 1).is_some_and(|next| next.1 == "(") {
+            skeleton.push("Decl(..)");
+            let mut depth = 0;
+            while index < tokens.len() {
+                if tokens[index].1 == "(" {
+                    depth += 1;
+                }
+                if tokens[index].1 == ")" {
+                    depth -= 1;
+                    if depth == 0 {
+                        index += 1;
+                        break;
+                    }
+                }
+                index += 1;
+            }
+            continue;
+        }
+        skeleton.push(tokens[index].1);
+        index += 1;
+    }
+    skeleton
+}
+
+/// The kind of JavaScript line, from its first token. A small closed set, so
+/// the pairs a mismatch can name stay few.
+fn line_kind(line: &str) -> &'static str {
+    const KINDS: [(&str, &[&str]); 10] = [
+        ("comment", &["//", "/*", "*"]),
+        ("import", &["import "]),
+        ("export", &["export "]),
+        ("declare", &["declare "]),
+        ("binding", &["var ", "let ", "const "]),
+        ("function", &["function ", "async function "]),
+        ("class", &["class ", "abstract class "]),
+        ("strict", &["\"use strict\"", "'use strict'"]),
+        ("brace", &["}", "{", ")", "]"]),
+        (
+            "cjs",
+            &[
+                "exports.",
+                "module.exports",
+                "Object.defineProperty(exports",
+            ],
+        ),
+    ];
+    let line = line.trim();
+    if line.is_empty() {
+        return "blank";
+    }
+    KINDS
+        .iter()
+        .find(|(_, prefixes)| prefixes.iter().any(|prefix| line.starts_with(prefix)))
+        .map_or("other", |(kind, _)| kind)
+}
+
+/// A line cut to a readable length, with backticks replaced so it can sit in one.
+fn excerpt(line: &str) -> String {
+    let line = line.trim().replace('`', "'");
+    if line.chars().count() <= EXCERPT_CHARS {
+        return line;
+    }
+    let mut cut: String = line.chars().take(EXCERPT_CHARS).collect();
+    cut.push('…');
+    cut
 }
 
 /// Declared identity of one element in a declaration-set container.
@@ -1230,7 +1494,8 @@ fn canonical_class_member(member: &ClassMemberNode, file: &SourceFile) -> (DeclI
         ClassMember::Constructor(_)
         | ClassMember::StaticBlock(_)
         | ClassMember::IndexSignature(_)
-        | ClassMember::Missing(_) => DeclIdentity::Anonymous,
+        | ClassMember::Missing(_)
+        | ClassMember::Semicolon => DeclIdentity::Anonymous,
         ClassMember::Method(method) => property_identity(&method.name, file),
         ClassMember::Property(property) => property_identity(&property.name, file),
         ClassMember::AutoAccessor(accessor) => property_identity(&accessor.name, file),
@@ -1263,9 +1528,10 @@ fn canonical_class_member(member: &ClassMemberNode, file: &SourceFile) -> (DeclI
             children.push(&*index.type_annotation.data().type_node);
             rebuild_children(file, member.range(), children)
         }
-        ClassMember::Constructor(_) | ClassMember::StaticBlock(_) | ClassMember::Missing(_) => {
-            slice_node(file, member.range())
-        }
+        ClassMember::Constructor(_)
+        | ClassMember::StaticBlock(_)
+        | ClassMember::Missing(_)
+        | ClassMember::Semicolon => slice_node(file, member.range()),
     };
     (identity, raw)
 }
@@ -1988,6 +2254,127 @@ mod tests {
     use super::*;
     use crate::corpus::{OracleOutcome, Provenance};
 
+    fn js_reason(expected: &str, actual: &str) -> String {
+        match compare_js_emit(expected, actual) {
+            FacetVerdict::Fail { reason } => reason,
+            other => panic!("a difference must fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_mismatch_names_its_category_and_the_first_differing_line() {
+        let cases: [(&str, &str, &str, &[&str]); 12] = [
+            (
+                "a\nb",
+                "a\nb\nc\nd",
+                "extra-lines",
+                &["2 extra line(s) from line 3", "`c`"],
+            ),
+            (
+                "a\nb\nc",
+                "a\nb",
+                "missing-lines",
+                &["ends at line 2", "`c`"],
+            ),
+            (
+                "a\nb\nc",
+                "a\nc\nb",
+                "order",
+                &["line 2", "expected `b`", "actual `c`"],
+            ),
+            (
+                "var x = 1;",
+                "var  x =  1;",
+                "spacing",
+                &["line 1", "expected `var x = 1;`"],
+            ),
+            ("let s = 'a';", "let s = \"a\";", "quote-style", &["line 1"]),
+            (
+                "f()",
+                "f();",
+                "punctuation",
+                &["expected `f()`", "actual `f();`"],
+            ),
+            ("Foo();", "foo();", "case", &["line 1"]),
+            (
+                "ok\na = 1;",
+                "ok\na = 2;",
+                "text",
+                &["line 2", "expected `a = 1;`", "actual `a = 2;`"],
+            ),
+            (
+                "// note\nok",
+                "var x = 1;\nok",
+                "comment-vs-binding",
+                &["line 1", "expected `// note`"],
+            ),
+            (
+                "class C {",
+                "var C = (function () {",
+                "class-vs-binding",
+                &["line 1"],
+            ),
+            (
+                "exports.a = 1;",
+                "var a = 1;",
+                "cjs-vs-binding",
+                &["actual `var a = 1;`"],
+            ),
+            (
+                "var x = 1;",
+                "export var x = 1;",
+                "binding-vs-export",
+                &["line 1"],
+            ),
+        ];
+        for (expected, actual, category, mentions) in cases {
+            let reason = js_reason(expected, actual);
+            assert!(
+                reason.starts_with(&format!("javascript structural mismatch [{category}]: ")),
+                "{category}: {reason}"
+            );
+            for mention in mentions {
+                assert!(reason.contains(mention), "{category}: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_mismatch_stays_a_failure_and_equal_output_still_passes() {
+        assert!(compare_js_emit("a = 1;", "a = 2;").is_fail());
+        assert!(compare_js_emit("a = 1;\r\n", "a = 1;  \n").is_pass());
+    }
+
+    #[test]
+    fn a_reason_excerpts_long_lines_and_never_nests_backticks() {
+        let long = "x".repeat(400);
+        let reason = js_reason("ok", &format!("ok\n{long}"));
+        assert!(reason.len() < 200, "{} bytes: {reason}", reason.len());
+        let tick = js_reason("a `b` c", "a `d` c");
+        assert_eq!(tick.matches('`').count() % 2, 0, "{tick}");
+        assert!(!tick.contains("`b`"), "{tick}");
+    }
+
+    #[test]
+    fn rows_that_differ_in_category_not_in_content_share_a_family() {
+        use crate::sweep_report::family_name;
+        let family =
+            |expected: &str, actual: &str| family_name("javascript", &js_reason(expected, actual));
+        assert_eq!(
+            family("a = 1;", "a = 2;"),
+            family("return f(x);", "return g(y);")
+        );
+        assert_eq!(family("f()", "f();"), family("g(1, 2)", "g(1, 2);"));
+        assert_ne!(family("a = 1;", "a = 2;"), family("f()", "f();"));
+        assert_eq!(
+            family("// a", "var x = 1;"),
+            family("// b c", "let y = f(z);")
+        );
+        assert_ne!(family("// a", "var x = 1;"), family("// a", "class X {"));
+        assert_ne!(family("// a", "var x = 1;"), family("var x = 1;", "// a"));
+        assert_ne!(family("a\nb", "a\nb\nc"), family("a\nb\nc", "a\nb"));
+    }
+
     fn empty_map_json(entries: &[(&str, DiagnosticMappingStatus, Option<u32>)]) -> String {
         let evidence = "fixture evidence";
         let mut items = Vec::new();
@@ -2261,17 +2648,122 @@ mod tests {
     }
 
     #[test]
-    fn structural_types_survive_formatting_and_order_normalization() {
-        let expected = "=== a.ts ===\n> var x: number\n> var y: string\n";
-        let actual = "=== a.ts ===\n\n>   var   y:   string\n> var x: number\n";
-        assert!(compare_types(expected, actual).is_pass());
+    fn types_labels_name_the_kind_but_keep_the_verdict() {
+        let passing = compare_types(
+            "=== anyPropertyAccess.ts ===\n>var x: any\n",
+            "=== anyPropertyAccess.ts ===\n>var x: any\n",
+        );
+        assert!(passing.is_pass());
+        let failing = compare_types(">a : any\n", ">b : any\n");
+        match &failing {
+            FacetVerdict::Fail { reason } => {
+                assert!(reason.contains("[record-name]"), "{reason}")
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        assert!(failing.is_fail());
+        let passing = compare_symbols(
+            "=== aliasUsedAsNameValue_2.ts ===\n>b : Symbol(b, Decl(aliasUsedAsNameValue_2.ts, 2, 49))\n",
+            "=== aliasUsedAsNameValue_2.ts ===\n>b : Symbol(b, Decl(aliasUsedAsNameValue_2.ts, 2, 49))\n",
+        );
+        assert!(passing.is_pass());
+        let failing = compare_symbols(
+            ">a : Symbol(a, Decl(aliasUsedAsNameValue_2.ts, 5, 10))\n",
+            ">a : Symbol(a, Decl(aliasUsedAsNameValue_1.ts, 0, 18))\n",
+        );
+        match &failing {
+            FacetVerdict::Fail { reason } => {
+                assert!(reason.contains("[decl-position]"), "{reason}")
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        assert!(failing.is_fail());
     }
 
     #[test]
-    fn structural_types_reject_semantic_differences() {
-        let expected = "> var x: number\n";
-        let actual = "> var x: string\n";
-        assert!(compare_types(expected, actual).is_fail());
+    fn types_differences_name_their_kind() {
+        let cases: [(&str, &str, &str); 7] = [
+            (
+                "section-header",
+                "=== anyPropertyAccess.ts ===\n",
+                "=== incrementOperatorWithAnyOtherType.ts ===\n",
+            ),
+            (
+                "caret-line",
+                ">x : any\n>  : ^^^\n",
+                ">x : any\n>  : ^^^^^^\n",
+            ),
+            ("record-name", ">a : any\n", ">b : any\n"),
+            ("type-any", ">y : null\n", ">y : any\n"),
+            ("type-text", ">x : number\n", ">x : string\n"),
+            (
+                "missing-record",
+                "=== anyPropertyAccess.ts ===\n>a : any\n",
+                "=== anyPropertyAccess.ts ===\n",
+            ),
+            (
+                "extra-record",
+                "=== anyPropertyAccess.ts ===\n",
+                "=== anyPropertyAccess.ts ===\n>a : any\n",
+            ),
+        ];
+        for (label, expected, actual) in cases {
+            let verdict = compare_types(expected, actual);
+            match &verdict {
+                FacetVerdict::Fail { reason } => {
+                    assert!(
+                        reason.contains(&format!("[{label}]")),
+                        "expected [{label}] in {reason}"
+                    );
+                }
+                other => panic!("{label}: expected Fail, got {other:?}"),
+            }
+            assert!(verdict.is_fail());
+        }
+    }
+
+    #[test]
+    fn symbols_differences_name_their_kind() {
+        let cases: [(&str, &str, &str); 5] = [
+            (
+                "section-header",
+                "=== anyPropertyAccess.ts ===\n",
+                "=== aliasUsedAsNameValue_2.ts ===\n",
+            ),
+            (
+                "symbol-name",
+                ">b : Symbol(b, Decl(aliasUsedAsNameValue_2.ts, 2, 49))\n",
+                ">mod : Symbol(mod, Decl(aliasUsedAsNameValue_2.ts, 0, 0))\n",
+            ),
+            (
+                "decl-position",
+                ">a : Symbol(a, Decl(aliasUsedAsNameValue_2.ts, 5, 10))\n",
+                ">a : Symbol(a, Decl(aliasUsedAsNameValue_1.ts, 0, 18))\n",
+            ),
+            (
+                "missing-row",
+                "=== anyPropertyAccess.ts ===\n>d : Symbol(d, Decl(anyPropertyAccess.ts, 4, 3))\n",
+                "=== anyPropertyAccess.ts ===\n",
+            ),
+            (
+                "extra-row",
+                "=== anyPropertyAccess.ts ===\n",
+                "=== anyPropertyAccess.ts ===\n>d : Symbol(d, Decl(anyPropertyAccess.ts, 4, 3))\n",
+            ),
+        ];
+        for (label, expected, actual) in cases {
+            let verdict = compare_symbols(expected, actual);
+            match &verdict {
+                FacetVerdict::Fail { reason } => {
+                    assert!(
+                        reason.contains(&format!("[{label}]")),
+                        "expected [{label}] in {reason}"
+                    );
+                }
+                other => panic!("{label}: expected Fail, got {other:?}"),
+            }
+            assert!(verdict.is_fail());
+        }
     }
 
     #[test]
@@ -2720,11 +3212,40 @@ interface A {
 
         // S1 mapped scanner (L) codes and U2.6 mapped checker (C) codes;
         // parser (P) codes are still unmapped and will be resolved by later
-        // slices.
+        // slices. Checker codes emitted without a tsc-verified counterpart
+        // stay unmapped: the registry rows name their compiler constants
+        // (verification/diagnostic-code-map.json).
+        const UNMAPPED_CHECKER_CODES: [&str; 20] = [
+            "BAMTS-C060",
+            "BAMTS-C061",
+            "BAMTS-C062",
+            "BAMTS-C063",
+            "BAMTS-C064",
+            "BAMTS-C065",
+            "BAMTS-C067",
+            "BAMTS-C068",
+            "BAMTS-C069",
+            "BAMTS-C073",
+            "BAMTS-C074",
+            "BAMTS-C075",
+            "BAMTS-C076",
+            "BAMTS-C077",
+            "BAMTS-C078",
+            "BAMTS-C079",
+            "BAMTS-C082",
+            "BAMTS-C104",
+            "BAMTS-C105",
+            "BAMTS-C106",
+        ];
         let mut mapped = 0;
         for code in REQUIRED_BAMTS_DIAGNOSTIC_CODES {
             let entry = map.get(code).expect(code);
             assert!(!entry.evidence.trim().is_empty());
+            if UNMAPPED_CHECKER_CODES.contains(&code) {
+                assert_eq!(entry.status, DiagnosticMappingStatus::Unmapped, "{code}");
+                assert!(entry.ts_code.is_none());
+                continue;
+            }
             if code.starts_with("BAMTS-L") || code.starts_with("BAMTS-C") {
                 assert_eq!(
                     entry.status,

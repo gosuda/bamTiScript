@@ -41,9 +41,17 @@ pub struct WarmupPolicy {
 impl WarmupPolicy {
     /// The shipped policy.
     pub const DEFAULT: WarmupPolicy = WarmupPolicy {
-        baseline_invocations: 10,
+        baseline_invocations: 1,
         optimized_invocations: 1_000,
         osr_back_edges: 100,
+        deopt_budget: 8,
+    };
+    /// The conformance policy: eager baseline with a short optimized fuse so
+    /// the test262 JIT sweep exercises optimized code and loop-header entry.
+    pub const STRESS: WarmupPolicy = WarmupPolicy {
+        baseline_invocations: 1,
+        optimized_invocations: 2,
+        osr_back_edges: 2,
         deopt_budget: 8,
     };
 

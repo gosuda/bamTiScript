@@ -222,24 +222,14 @@ impl<F: FileSystem> SyncService<F> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{fs, sync::Arc};
 
     use super::SyncService;
     use crate::service::{ServiceError, filesystem::OsFileSystem};
 
     #[test]
     fn sync_api_preserves_version_failures_across_clones() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("bamts-sync-service-{}-{nonce}", std::process::id()));
-        fs::create_dir(&root).expect("create root");
+        let root = crate::service::test_support::fresh_dir("bamts-sync-service");
         let service = SyncService::new(OsFileSystem::new(&root).expect("filesystem"));
         service
             .open("a.ts", Arc::<str>::from("const a = 1;"), 1)

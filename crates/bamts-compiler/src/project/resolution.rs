@@ -6,10 +6,10 @@
 //! resolution-mode conditions, deterministic trace, and cycle-safe package lookup.
 //! It does not introduce a second path, options, or diagnostics model.
 
-use super::resolution_trace::ResolutionTraceLog;
+use super::resolution_trace::{ResolutionRequest, ResolutionTraceLog};
 use crate::project::{
     CompilerOptions, ModuleResolutionError, PackageError, PackageJson, PackageMode, PackageTarget,
-    PathError, PathMapping, ProjectRoot, ResolutionConditions, ResolutionFlavor,
+    PathError, PathMapping, ProjectRoot, ResolutionConditions, ResolutionFlavor, parse_jsonc,
     plan_relative_module,
 };
 use std::{
@@ -138,9 +138,17 @@ pub enum ResolutionTraceStep {
         pattern: Arc<str>,
         target: PathBuf,
     },
-    PackageJson {
+    ScopeProbe {
         path: PathBuf,
-        subpath: Arc<str>,
+        exists: bool,
+        has_exports: bool,
+    },
+    LegacyField {
+        field: Arc<str>,
+        target: Option<(Arc<str>, PathBuf)>,
+    },
+    StripExtension {
+        path: PathBuf,
     },
     Condition {
         name: Arc<str>,
@@ -152,6 +160,12 @@ pub enum ResolutionTraceStep {
     },
     NodeModulesWalk {
         directory: PathBuf,
+        exists: bool,
+        fallback: bool,
+    },
+    PackageJsonProbe {
+        path: PathBuf,
+        exists: bool,
     },
     TypesFallback {
         package: Arc<str>,
@@ -490,9 +504,12 @@ fn resolve_module_name_inner(
         if let Some(log) = log {
             log.record_module(
                 root,
-                &importer,
-                specifier,
-                (kind, mode, flavor),
+                ResolutionRequest {
+                    importer: &importer,
+                    specifier,
+                    strategy: (kind, mode, flavor),
+                },
+                options.module_resolution().is_some(),
                 true,
                 &result,
             );
@@ -558,9 +575,12 @@ fn resolve_module_name_inner(
     if let Some(log) = log {
         log.record_module(
             root,
-            &importer,
-            specifier,
-            (kind, mode, flavor),
+            ResolutionRequest {
+                importer: &importer,
+                specifier,
+                strategy: (kind, mode, flavor),
+            },
+            options.module_resolution().is_some(),
             false,
             &stored,
         );
@@ -851,6 +871,162 @@ fn pathdiff_relative(from_dir: &Path, to: &Path) -> String {
         parts.join("/")
     }
 }
+fn package_has_exports(content: &Option<Arc<str>>) -> bool {
+    content.as_ref().is_some_and(|source| {
+        parse_jsonc(source)
+            .map(|value| {
+                value
+                    .as_object()
+                    .is_some_and(|object| object.get("exports").is_some())
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn legacy_field_value(content: &Arc<str>, field: &str) -> Option<Arc<str>> {
+    parse_jsonc(content)
+        .ok()?
+        .as_object()?
+        .get(field)?
+        .as_str()
+        .map(Arc::from)
+}
+
+fn probe_legacy_fields(
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+    chain: &[(PathBuf, Option<Arc<str>>)],
+) -> Option<PathBuf> {
+    let (driver_path, driver_source) = chain.first()?;
+    let driver_source = driver_source.as_ref()?;
+    let driver_dir = driver_path.parent()?;
+    for field in ["typesVersions", "typings", "types"] {
+        let value = legacy_field_value(driver_source, field);
+        match value {
+            None => {
+                trace.push(ResolutionTraceStep::LegacyField {
+                    field: Arc::from(field),
+                    target: None,
+                });
+            }
+            Some(value) => {
+                let resolved = driver_dir.join(value.strip_prefix("./").unwrap_or(value.as_ref()));
+                trace.push(ResolutionTraceStep::LegacyField {
+                    field: Arc::from(field),
+                    target: Some((Arc::clone(&value), resolved.clone())),
+                });
+                if field == "typesVersions" {
+                    return None;
+                }
+                let direct = resolved
+                    .extension()
+                    .is_some_and(|extension| extension == "ts" || extension == "tsx")
+                    || resolved
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(".d.ts"));
+                if direct {
+                    if let Some(found) = probe_candidate(host, trace, resolved) {
+                        return Some(found);
+                    }
+                } else {
+                    trace.push(ResolutionTraceStep::StripExtension {
+                        path: resolved.clone(),
+                    });
+                    let stem = resolved.with_extension("");
+                    for extension in ["ts", "tsx", "d.ts"] {
+                        let mut name = stem.clone().into_os_string();
+                        name.push(".");
+                        name.push(extension);
+                        if let Some(found) = probe_candidate(host, trace, PathBuf::from(name)) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn probe_candidate(
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+    candidate: PathBuf,
+) -> Option<PathBuf> {
+    let exists = host.file_exists(&candidate);
+    trace.push(ResolutionTraceStep::Candidate {
+        path: candidate.clone(),
+        exists,
+    });
+    exists.then_some(candidate)
+}
+
+fn confined_hit(
+    root: &ProjectRoot,
+    trace: &mut ResolutionTrace,
+    kind: ModuleResolutionKind,
+    mode: ResolutionMode,
+    found: &Path,
+) -> Result<Option<ResolvedModule>, ResolutionError> {
+    let path = root.confine(found).map_err(|error| match error {
+        PathError::PathEscapesRoot { path, root } => ResolutionError::EscapesRoot {
+            path,
+            root,
+            trace: trace.clone(),
+        },
+        other => ResolutionError::Path(other),
+    })?;
+    Ok(Some(ResolvedModule {
+        path,
+        kind,
+        mode,
+        package_json: None,
+        trace: ResolutionTrace::default(),
+    }))
+}
+
+fn probe_loose_stems(
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+    stems: &[PathBuf],
+    extensions: &[&str],
+) -> Option<PathBuf> {
+    for root in stems {
+        for extension in extensions {
+            let mut name = root.clone().into_os_string();
+            name.push(".");
+            name.push(extension);
+            if let Some(found) = probe_candidate(host, trace, PathBuf::from(name)) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+fn probe_loose_files(
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+    node_modules: &Path,
+    package_name: &str,
+    subpath: &str,
+    extensions: &[&str],
+) -> Option<PathBuf> {
+    if package_name.starts_with('@') {
+        return None;
+    }
+    if !host.directory_exists(node_modules) {
+        return None;
+    }
+    let mut stem = node_modules.join(package_name);
+    if !subpath.is_empty() {
+        stem.push(subpath);
+    }
+    if stem.extension().is_some() {
+        return None;
+    }
+    probe_loose_stems(host, trace, &[stem.clone(), stem.join("index")], extensions)
+}
 
 fn try_node_modules(
     context: (&ProjectRoot, &CompilerOptions),
@@ -870,8 +1046,29 @@ fn try_node_modules(
         if !directory.starts_with(root.path()) {
             break;
         }
+        let package_json = directory.join("package.json");
+        trace.push(ResolutionTraceStep::PackageJsonProbe {
+            path: package_json.clone(),
+            exists: host.file_exists(&package_json),
+        });
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        if parent == directory {
+            break;
+        }
+        directory = parent.to_path_buf();
+    }
+    let mut directory = containing.to_path_buf();
+    loop {
+        if !directory.starts_with(root.path()) {
+            break;
+        }
+        let node_modules = directory.join("node_modules");
         trace.push(ResolutionTraceStep::NodeModulesWalk {
             directory: directory.clone(),
+            exists: host.directory_exists(&node_modules),
+            fallback: false,
         });
         let package_root = directory.join("node_modules").join(&package_name);
         if (host.directory_exists(&package_root)
@@ -887,6 +1084,49 @@ fn try_node_modules(
             )?
         {
             return Ok(Some(resolved));
+        }
+        if kind == ModuleResolutionKind::Bundler
+            && let Some(found) = probe_loose_files(
+                host,
+                trace,
+                &node_modules,
+                &package_name,
+                &subpath,
+                &["ts", "tsx", "d.ts"],
+            )
+        {
+            return confined_hit(root, trace, kind, mode, &found);
+        }
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        if parent == directory {
+            break;
+        }
+        directory = parent.to_path_buf();
+    }
+    let mut directory = containing.to_path_buf();
+    loop {
+        if !directory.starts_with(root.path()) {
+            break;
+        }
+        let node_modules = directory.join("node_modules");
+        trace.push(ResolutionTraceStep::NodeModulesWalk {
+            directory: directory.clone(),
+            exists: host.directory_exists(&node_modules),
+            fallback: true,
+        });
+        if kind == ModuleResolutionKind::Bundler
+            && let Some(found) = probe_loose_files(
+                host,
+                trace,
+                &node_modules,
+                &package_name,
+                &subpath,
+                &["js", "jsx", "json"],
+            )
+        {
+            return confined_hit(root, trace, kind, mode, &found);
         }
         let Some(parent) = directory.parent() else {
             break;
@@ -911,46 +1151,77 @@ fn resolve_installed_package(
     let (root, options) = context;
     let (kind, mode, flavor) = strategy;
     let (host, _cache, _package_stack) = services;
-    let package_json_path = package_root.join("package.json");
-    let package_json_path = match root.confine(&package_json_path) {
-        Ok(path) => path,
-        Err(PathError::PathEscapesRoot { path, root }) => {
-            return Err(ResolutionError::EscapesRoot {
-                path,
-                root,
-                trace: trace.clone(),
-            });
-        }
-        Err(other) => return Err(other.into()),
-    };
-
     let export_subpath = if subpath.is_empty() {
         ".".to_string()
     } else {
         format!("./{subpath}")
     };
-    trace.push(ResolutionTraceStep::PackageJson {
-        path: package_json_path.clone(),
-        subpath: Arc::from(export_subpath.as_str()),
-    });
-
-    let conditions = conditions_for(kind, mode, flavor);
-    for name in conditions.values() {
-        trace.push(ResolutionTraceStep::Condition {
-            name: Arc::clone(name),
-            matched: true,
+    let walk_start = if subpath.is_empty() {
+        package_root.to_path_buf()
+    } else {
+        package_root.join(subpath)
+    };
+    let mut chain: Vec<(PathBuf, Option<Arc<str>>)> = Vec::new();
+    let mut cursor = walk_start.clone();
+    loop {
+        let confined = match root.confine(cursor.join("package.json")) {
+            Ok(path) => path,
+            Err(PathError::PathEscapesRoot { path, root }) => {
+                if cursor == package_root {
+                    return Err(ResolutionError::EscapesRoot {
+                        path,
+                        root,
+                        trace: trace.clone(),
+                    });
+                }
+                break;
+            }
+            Err(other) => return Err(other.into()),
+        };
+        let content = host.read_file(&confined);
+        chain.push((confined, content));
+        if cursor == package_root {
+            break;
+        }
+        match cursor.parent() {
+            Some(parent) => cursor = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    for (path, content) in &chain {
+        trace.push(ResolutionTraceStep::ScopeProbe {
+            path: path.clone(),
+            exists: content.is_some(),
+            has_exports: package_has_exports(content),
         });
     }
-
-    if let Some(source) = host.read_file(&package_json_path) {
+    let package_json_path = chain
+        .last()
+        .map(|(path, _)| path.clone())
+        .unwrap_or_else(|| package_root.join("package.json"));
+    if let Some(source) = chain.last().and_then(|(_, content)| content.clone()) {
         let package = PackageJson::parse(root, &package_json_path, &source)?;
         let has_exports = package.raw().get("exports").is_some();
+        if has_exports {
+            let conditions = conditions_for(kind, mode, flavor);
+            for name in conditions.values() {
+                trace.push(ResolutionTraceStep::Condition {
+                    name: Arc::clone(name),
+                    matched: true,
+                });
+            }
+        }
         let package_mode = if flavor == ResolutionFlavor::Types {
             PackageMode::Types
         } else {
             mode.package_mode()
         };
-        match package.resolve_export(root, &export_subpath, package_mode, &conditions) {
+        match package.resolve_export(
+            root,
+            &export_subpath,
+            package_mode,
+            &conditions_for(kind, mode, flavor),
+        ) {
             Ok(target) => {
                 return finalize_package_target(
                     (root, options),
@@ -973,6 +1244,35 @@ fn resolve_installed_package(
             | Err(PackageError::TargetBlocked) => {}
             Err(other) => return Err(other.into()),
         }
+    }
+    let chain_has_exports = chain
+        .iter()
+        .any(|(_, content)| package_has_exports(content));
+    if kind == ModuleResolutionKind::Bundler
+        && !chain_has_exports
+        && walk_start.extension().is_none()
+        && !walk_start.components().any(|component| {
+            component
+                .as_os_str()
+                .as_encoded_bytes()
+                .first()
+                .is_some_and(|byte| *byte == b'@')
+        })
+    {
+        let mut stems = vec![walk_start.clone()];
+        if chain.first().is_some_and(|(_, content)| content.is_none()) {
+            stems.push(walk_start.join("index"));
+        }
+        if let Some(found) = probe_loose_stems(host, trace, &stems, &["ts", "tsx", "d.ts"]) {
+            return confined_hit(root, trace, kind, mode, &found);
+        }
+    }
+    if kind == ModuleResolutionKind::Bundler
+        && !chain_has_exports
+        && chain.first().is_some_and(|(_, content)| content.is_some())
+        && let Some(found) = probe_legacy_fields(host, trace, &chain)
+    {
+        return confined_hit(root, trace, kind, mode, &found);
     }
 
     // No usable exports/legacy entry: try subpath as a relative file inside the package.
@@ -998,7 +1298,6 @@ fn resolve_installed_package(
         Err(other) => Err(other),
     }
 }
-
 fn finalize_package_target(
     context: (&ProjectRoot, &CompilerOptions),
     importer: &Path,
@@ -1264,6 +1563,8 @@ fn conditions_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::canonical::slash_text;
+    use crate::project::test_paths::abs;
     use crate::project::{JsonObject, JsonValue, PathMapping, ProjectConfig};
     use std::collections::BTreeMap;
 
@@ -1274,8 +1575,8 @@ mod tests {
     }
 
     impl MemoryHost {
-        fn file(&mut self, path: &str, source: &str) {
-            let path = PathBuf::from(path);
+        fn file(&mut self, path: impl AsRef<Path>, source: &str) {
+            let path = path.as_ref().to_path_buf();
             if let Some(parent) = path.parent() {
                 self.mark_dirs(parent);
             }
@@ -1297,7 +1598,7 @@ mod tests {
         }
 
         fn directory_exists(&self, path: &Path) -> bool {
-            self.directories.contains(path) || self.files.keys().any(|file| file.starts_with(path))
+            self.directories.contains(path)
         }
 
         fn read_file(&self, path: &Path) -> Option<Arc<str>> {
@@ -1306,13 +1607,21 @@ mod tests {
     }
 
     fn root() -> ProjectRoot {
-        ProjectRoot::new("/workspace").expect("absolute root")
+        ProjectRoot::new(abs("/workspace")).expect("absolute root")
+    }
+
+    /// How a trace line spells the root of the fixture file system: c: on Windows,
+    /// where upstream traces print a lowercase drive, and nothing elsewhere.
+    fn trace_drive() -> String {
+        slash_text(&abs("/"))
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
     }
 
     fn options_with_resolution(module_resolution: &str) -> CompilerOptions {
         let config = ProjectConfig::parse(
             &root(),
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             &format!(
                 r#"{{"compilerOptions":{{"moduleResolution":"{module_resolution}","resolveJsonModule":true}}}}"#
             ),
@@ -1324,7 +1633,7 @@ mod tests {
     fn options_with_paths(paths_json: &str) -> CompilerOptions {
         let config = ProjectConfig::parse(
             &root(),
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             &format!(
                 r#"{{"compilerOptions":{{"moduleResolution":"bundler","baseUrl":".","paths":{paths_json}}}}}"#
             ),
@@ -1364,22 +1673,22 @@ mod tests {
     #[test]
     fn relative_extension_substitution_and_index_fallback() {
         let mut host = MemoryHost::default();
-        host.file("/workspace/src/util.ts", "export const n = 1;\n");
-        host.file("/workspace/src/nested/index.ts", "export {};\n");
+        host.file(abs("/workspace/src/util.ts"), "export const n = 1;\n");
+        host.file(abs("/workspace/src/nested/index.ts"), "export {};\n");
         let options = options_with_resolution("node16");
         let mut cache = ResolutionCache::new();
 
         let resolved = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./util.js",
             (ModuleResolutionKind::Node16, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("util.js → util.ts");
-        assert_eq!(resolved.path(), Path::new("/workspace/src/util.ts"));
+        assert_eq!(resolved.path(), abs("/workspace/src/util.ts").as_path());
         assert!(
             resolved
                 .trace()
@@ -1391,25 +1700,28 @@ mod tests {
         let nested = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./nested",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("directory index");
-        assert_eq!(nested.path(), Path::new("/workspace/src/nested/index.ts"));
+        assert_eq!(
+            nested.path(),
+            abs("/workspace/src/nested/index.ts").as_path()
+        );
     }
     #[test]
     fn nodenext_import_requires_relative_extension_but_require_and_bundler_do_not() {
         let mut host = MemoryHost::default();
-        host.file("/workspace/src/util.ts", "export const n = 1;\n");
+        host.file(abs("/workspace/src/util.ts"), "export const n = 1;\n");
         let options = options_with_resolution("nodenext");
         let mut cache = ResolutionCache::new();
         let missing = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./util",
             (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
             &host,
@@ -1423,34 +1735,34 @@ mod tests {
             let resolved = resolve_module_name(
                 &root(),
                 &options,
-                "/workspace/src/main.ts",
+                abs("/workspace/src/main.ts"),
                 "./util",
                 strategy,
                 &host,
                 &mut cache,
             )
             .expect("extensionless resolution is permitted");
-            assert_eq!(resolved.path(), Path::new("/workspace/src/util.ts"));
+            assert_eq!(resolved.path(), abs("/workspace/src/util.ts").as_path());
         }
     }
 
     #[test]
     fn paths_longest_prefix_wins_with_star_substitution() {
         let mut host = MemoryHost::default();
-        host.file("/workspace/lib/foo/bar.ts", "export {};\n");
+        host.file(abs("/workspace/lib/foo/bar.ts"), "export {};\n");
         let options = options_with_paths(r#"{ "@app/*": ["lib/*"], "@app/foo/*": ["lib/foo/*"] }"#);
         let mut cache = ResolutionCache::new();
         let resolved = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "@app/foo/bar",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("paths");
-        assert_eq!(resolved.path(), Path::new("/workspace/lib/foo/bar.ts"));
+        assert_eq!(resolved.path(), abs("/workspace/lib/foo/bar.ts").as_path());
         assert!(resolved.trace().steps().iter().any(|step| matches!(
             step,
             ResolutionTraceStep::PathsMatch { pattern, .. } if pattern.as_ref() == "@app/foo/*"
@@ -1461,7 +1773,7 @@ mod tests {
     fn package_exports_honor_resolution_mode_conditions() {
         let mut host = MemoryHost::default();
         host.file(
-            "/workspace/node_modules/pkg/package.json",
+            abs("/workspace/node_modules/pkg/package.json"),
             r#"{
                 "name":"pkg",
                 "exports":{
@@ -1472,14 +1784,14 @@ mod tests {
                 }
             }"#,
         );
-        host.file("/workspace/node_modules/pkg/esm.js", "export {};\n");
+        host.file(abs("/workspace/node_modules/pkg/esm.js"), "export {};\n");
         host.file(
-            "/workspace/node_modules/pkg/cjs.js",
+            abs("/workspace/node_modules/pkg/cjs.js"),
             "module.exports = {};\n",
         );
         // Provide TS stand-ins so extension substitution can succeed for both modes.
-        host.file("/workspace/node_modules/pkg/esm.ts", "export {};\n");
-        host.file("/workspace/node_modules/pkg/cjs.ts", "export {};\n");
+        host.file(abs("/workspace/node_modules/pkg/esm.ts"), "export {};\n");
+        host.file(abs("/workspace/node_modules/pkg/cjs.ts"), "export {};\n");
 
         let options = options_with_resolution("nodenext");
         let mut cache = ResolutionCache::new();
@@ -1487,7 +1799,7 @@ mod tests {
         let import_hit = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "pkg",
             (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
             &host,
@@ -1496,13 +1808,13 @@ mod tests {
         .expect("import condition");
         assert_eq!(
             import_hit.path(),
-            Path::new("/workspace/node_modules/pkg/esm.ts")
+            abs("/workspace/node_modules/pkg/esm.ts").as_path()
         );
 
         let require_hit = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "pkg",
             (ModuleResolutionKind::NodeNext, ResolutionMode::Require),
             &host,
@@ -1511,25 +1823,31 @@ mod tests {
         .expect("require condition");
         assert_eq!(
             require_hit.path(),
-            Path::new("/workspace/node_modules/pkg/cjs.ts")
+            abs("/workspace/node_modules/pkg/cjs.ts").as_path()
         );
     }
     #[test]
     fn package_exports_block_private_and_null_subpaths() {
         let mut host = MemoryHost::default();
         host.file(
-            "/workspace/node_modules/pkg/package.json",
+            abs("/workspace/node_modules/pkg/package.json"),
             r#"{"exports":{".":"./index.js","./blocked":null}}"#,
         );
-        host.file("/workspace/node_modules/pkg/index.ts", "export {};\n");
-        host.file("/workspace/node_modules/pkg/private.ts", "export {};\n");
-        host.file("/workspace/node_modules/pkg/blocked.ts", "export {};\n");
+        host.file(abs("/workspace/node_modules/pkg/index.ts"), "export {};\n");
+        host.file(
+            abs("/workspace/node_modules/pkg/private.ts"),
+            "export {};\n",
+        );
+        host.file(
+            abs("/workspace/node_modules/pkg/blocked.ts"),
+            "export {};\n",
+        );
         let options = options_with_resolution("nodenext");
         for specifier in ["pkg/private", "pkg/blocked"] {
             let error = resolve_module_name(
                 &root(),
                 &options,
-                "/workspace/src/main.ts",
+                abs("/workspace/src/main.ts"),
                 specifier,
                 (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
                 &host,
@@ -1548,7 +1866,7 @@ mod tests {
     fn package_imports_resolve_and_detect_cycles() {
         let mut host = MemoryHost::default();
         host.file(
-            "/workspace/package.json",
+            abs("/workspace/package.json"),
             r##"{
                 "name":"app",
                 "imports":{
@@ -1557,27 +1875,27 @@ mod tests {
                 }
             }"##,
         );
-        host.file("/workspace/src/value.ts", "export const v = 1;\n");
-        host.file("/workspace/src/main.ts", "import '#internal/value';\n");
+        host.file(abs("/workspace/src/value.ts"), "export const v = 1;\n");
+        host.file(abs("/workspace/src/main.ts"), "import '#internal/value';\n");
 
         let options = options_with_resolution("bundler");
         let mut cache = ResolutionCache::new();
         let resolved = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "#internal/value",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("hash import");
-        assert_eq!(resolved.path(), Path::new("/workspace/src/value.ts"));
+        assert_eq!(resolved.path(), abs("/workspace/src/value.ts").as_path());
 
         let cycle = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "#loop",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
@@ -1591,12 +1909,15 @@ mod tests {
     fn node_modules_walk_stops_at_project_root_and_confinement_rejects_escape() {
         let mut host = MemoryHost::default();
         host.file(
-            "/workspace/node_modules/left-pad/package.json",
+            abs("/workspace/node_modules/left-pad/package.json"),
             r#"{"name":"left-pad","main":"./index.js"}"#,
         );
-        host.file("/workspace/node_modules/left-pad/index.ts", "export {};\n");
         host.file(
-            "/workspace/node_modules/left-pad/index.js",
+            abs("/workspace/node_modules/left-pad/index.ts"),
+            "export {};\n",
+        );
+        host.file(
+            abs("/workspace/node_modules/left-pad/index.js"),
             "module.exports = {};\n",
         );
 
@@ -1605,7 +1926,7 @@ mod tests {
         let resolved = resolve_module_name(
             &root(),
             &options,
-            "/workspace/packages/app/src/main.ts",
+            abs("/workspace/packages/app/src/main.ts"),
             "left-pad",
             (ModuleResolutionKind::Node16, ResolutionMode::Require),
             &host,
@@ -1614,7 +1935,7 @@ mod tests {
         .expect("upward walk");
         assert_eq!(
             resolved.path(),
-            Path::new("/workspace/node_modules/left-pad/index.ts")
+            abs("/workspace/node_modules/left-pad/index.ts").as_path()
         );
         assert!(
             resolved
@@ -1627,7 +1948,7 @@ mod tests {
         let escape = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "../../outside",
             (ModuleResolutionKind::Node16, ResolutionMode::Import),
             &host,
@@ -1640,7 +1961,7 @@ mod tests {
     fn types_fallback_mangles_scoped_package_names() {
         let mut host = MemoryHost::default();
         host.file(
-            "/workspace/node_modules/@types/scope__pkg/index.d.ts",
+            abs("/workspace/node_modules/@types/scope__pkg/index.d.ts"),
             "export {};\n",
         );
         let options = options_with_resolution("nodenext");
@@ -1648,7 +1969,7 @@ mod tests {
         let resolved = resolve_type_reference(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "@scope/pkg",
             (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
             &host,
@@ -1657,7 +1978,7 @@ mod tests {
         .expect("@types scope mangling");
         assert_eq!(
             resolved.path(),
-            Path::new("/workspace/node_modules/@types/scope__pkg/index.d.ts")
+            abs("/workspace/node_modules/@types/scope__pkg/index.d.ts").as_path()
         );
         assert!(resolved.trace().steps().iter().any(|step| matches!(
             step,
@@ -1669,13 +1990,13 @@ mod tests {
     #[test]
     fn cache_returns_identical_results_for_repeated_lookups() {
         let mut host = MemoryHost::default();
-        host.file("/workspace/src/a.ts", "export {};\n");
+        host.file(abs("/workspace/src/a.ts"), "export {};\n");
         let options = options_with_resolution("bundler");
         let mut cache = ResolutionCache::new();
         let first = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./a",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
@@ -1685,7 +2006,7 @@ mod tests {
         let second = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./a",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
@@ -1698,7 +2019,7 @@ mod tests {
         let missing = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./missing",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
@@ -1708,7 +2029,7 @@ mod tests {
         let missing_again = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./missing",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
@@ -1725,18 +2046,18 @@ mod tests {
     fn trace_is_deterministic_across_two_fresh_caches() {
         let mut host = MemoryHost::default();
         host.file(
-            "/workspace/node_modules/demo/package.json",
+            abs("/workspace/node_modules/demo/package.json"),
             r#"{"name":"demo","exports":{".":{"import":"./lib.js"}}}"#,
         );
-        host.file("/workspace/node_modules/demo/lib.ts", "export {};\n");
-        host.file("/workspace/node_modules/demo/lib.js", "export {};\n");
+        host.file(abs("/workspace/node_modules/demo/lib.ts"), "export {};\n");
+        host.file(abs("/workspace/node_modules/demo/lib.js"), "export {};\n");
         let options = options_with_resolution("node16");
 
         let mut cache_a = ResolutionCache::new();
         let a = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "demo",
             (ModuleResolutionKind::Node16, ResolutionMode::Import),
             &host,
@@ -1747,7 +2068,7 @@ mod tests {
         let b = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "demo",
             (ModuleResolutionKind::Node16, ResolutionMode::Import),
             &host,
@@ -1768,6 +2089,240 @@ mod tests {
         let _mappings: &[PathMapping] = options.paths();
         let _object_ty: Option<&JsonObject> = None;
         let _value_ty: Option<&JsonValue> = None;
+    }
+    #[test]
+    fn trace_kind_line_marks_unspecified_resolution_kind() {
+        let unspecified = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/tsconfig.json"),
+            r#"{"compilerOptions":{}}"#,
+        )
+        .expect("config")
+        .options()
+        .clone();
+        let specified = options_with_resolution("bundler");
+        let mut host = MemoryHost::default();
+        host.file(abs("/workspace/other.ts"), "export {};\n");
+        for (options, expected) in [
+            (
+                unspecified,
+                "Module resolution kind is not specified, using 'Bundler'.",
+            ),
+            (
+                specified,
+                "Explicitly specified module resolution kind: 'Bundler'.",
+            ),
+        ] {
+            let mut cache = ResolutionCache::new();
+            let mut log = ResolutionTraceLog::default();
+            resolve_module_name_with_trace(
+                &root(),
+                &options,
+                abs("/workspace/main.ts"),
+                "./other",
+                (
+                    ModuleResolutionKind::Bundler,
+                    ResolutionMode::Import,
+                    ResolutionFlavor::Runtime,
+                ),
+                TraceResolutionServices {
+                    host: &host,
+                    cache: &mut cache,
+                    log: &mut log,
+                },
+            )
+            .expect("relative resolution");
+            assert!(
+                log.lines().iter().any(|line| line == expected),
+                "missing `{expected}` in {:?}",
+                log.lines()
+            );
+        }
+    }
+    #[test]
+    fn trace_bundler_bare_miss_matches_upstream_walk() {
+        let options = options_with_resolution("bundler");
+        let host = MemoryHost::default();
+        let mut cache = ResolutionCache::new();
+        let mut log = ResolutionTraceLog::default();
+        let outcome = resolve_module_name_with_trace(
+            &root(),
+            &options,
+            abs("/workspace/a/b/c/lib.ts"),
+            "foo",
+            (
+                ModuleResolutionKind::Bundler,
+                ResolutionMode::Import,
+                ResolutionFlavor::Runtime,
+            ),
+            TraceResolutionServices {
+                host: &host,
+                cache: &mut cache,
+                log: &mut log,
+            },
+        );
+        assert!(outcome.is_err());
+        let expected: &[&str] = &[
+            "======== Resolving module 'foo' from '/workspace/a/b/c/lib.ts'. ========",
+            "Explicitly specified module resolution kind: 'Bundler'.",
+            "Resolving in CJS mode with conditions 'import', 'types'.",
+            "File '/workspace/a/b/c/package.json' does not exist.",
+            "File '/workspace/a/b/package.json' does not exist.",
+            "File '/workspace/a/package.json' does not exist.",
+            "File '/workspace/package.json' does not exist.",
+            "Loading module 'foo' from 'node_modules' folder, target file types: TypeScript, JavaScript, Declaration, JSON.",
+            "Searching all ancestor node_modules directories for preferred extensions: TypeScript, Declaration.",
+            "Directory '/workspace/a/b/c/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/a/b/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/a/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/node_modules' does not exist, skipping all lookups in it.",
+            "Searching all ancestor node_modules directories for fallback extensions: JavaScript, JSON.",
+            "Directory '/workspace/a/b/c/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/a/b/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/a/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/node_modules' does not exist, skipping all lookups in it.",
+            "======== Module name 'foo' was not resolved. ========",
+        ];
+        let drive = trace_drive();
+        let expected: Vec<String> = expected
+            .iter()
+            .map(|line| line.replace("'/workspace", &format!("'{drive}/workspace")))
+            .collect();
+        let produced: Vec<&str> = log.lines().iter().map(String::as_str).collect();
+        assert_eq!(produced, expected);
+        assert!(log.unsupported().is_empty());
+    }
+    #[test]
+    fn trace_bundler_subpath_package_scope_matches_upstream_found_lines() {
+        let config = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/tsconfig.json"),
+            r#"{"compilerOptions":{"module":"commonjs"}}"#,
+        )
+        .expect("config");
+        let options = config.options().clone();
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/foo/bar/package.json"),
+            "{ \"types\": \"types.d.ts\" }\n",
+        );
+        host.file(abs("/workspace/node_modules/foo/package.json"), "{}\n");
+        host.file(
+            abs("/workspace/node_modules/foo/bar/types.d.ts"),
+            "export const x: number;\n",
+        );
+        let mut cache = ResolutionCache::new();
+        let mut log = ResolutionTraceLog::default();
+        let resolved = resolve_module_name_with_trace(
+            &root(),
+            &options,
+            abs("/workspace/a.ts"),
+            "foo/bar",
+            (
+                ModuleResolutionKind::Bundler,
+                ResolutionMode::Require,
+                ResolutionFlavor::Runtime,
+            ),
+            TraceResolutionServices {
+                host: &host,
+                cache: &mut cache,
+                log: &mut log,
+            },
+        )
+        .expect("subpath types hit");
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/node_modules/foo/bar/types.d.ts").as_path()
+        );
+        let expected: &[&str] = &[
+            "======== Resolving module 'foo/bar' from '/workspace/a.ts'. ========",
+            "Module resolution kind is not specified, using 'Bundler'.",
+            "Resolving in CJS mode with conditions 'require', 'types'.",
+            "File '/workspace/package.json' does not exist.",
+            "Loading module 'foo/bar' from 'node_modules' folder, target file types: TypeScript, JavaScript, Declaration, JSON.",
+            "Searching all ancestor node_modules directories for preferred extensions: TypeScript, Declaration.",
+            "Found 'package.json' at '/workspace/node_modules/foo/bar/package.json'.",
+            "Found 'package.json' at '/workspace/node_modules/foo/package.json'.",
+            "File '/workspace/node_modules/foo/bar.ts' does not exist.",
+            "File '/workspace/node_modules/foo/bar.tsx' does not exist.",
+            "File '/workspace/node_modules/foo/bar.d.ts' does not exist.",
+            "'package.json' does not have a 'typesVersions' field.",
+            "'package.json' does not have a 'typings' field.",
+            "'package.json' has 'types' field 'types.d.ts' that references '/workspace/node_modules/foo/bar/types.d.ts'.",
+            "File '/workspace/node_modules/foo/bar/types.d.ts' exists - use it as a name resolution result.",
+            "Resolving real path for '/workspace/node_modules/foo/bar/types.d.ts', result '/workspace/node_modules/foo/bar/types.d.ts'.",
+            "======== Module name 'foo/bar' was successfully resolved to '/workspace/node_modules/foo/bar/types.d.ts'. ========",
+            "File '/workspace/node_modules/foo/bar/package.json' exists according to earlier cached lookups.",
+        ];
+        let drive = trace_drive();
+        let expected: Vec<String> = expected
+            .iter()
+            .map(|line| line.replace("'/workspace", &format!("'{drive}/workspace")))
+            .collect();
+        let produced: Vec<&str> = log.lines().iter().map(String::as_str).collect();
+        assert_eq!(produced, expected);
+        assert!(log.unsupported().is_empty());
+    }
+    #[test]
+    fn trace_bundler_loose_file_hit_matches_upstream_probes() {
+        let options = options_with_resolution("bundler");
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/a/b/node_modules/foo.d.ts"),
+            "export declare const x: number;\n",
+        );
+        let mut cache = ResolutionCache::new();
+        let mut log = ResolutionTraceLog::default();
+        let resolved = resolve_module_name_with_trace(
+            &root(),
+            &options,
+            abs("/workspace/a/b/c/d/e/app.ts"),
+            "foo",
+            (
+                ModuleResolutionKind::Bundler,
+                ResolutionMode::Import,
+                ResolutionFlavor::Runtime,
+            ),
+            TraceResolutionServices {
+                host: &host,
+                cache: &mut cache,
+                log: &mut log,
+            },
+        )
+        .expect("loose declaration hit");
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/a/b/node_modules/foo.d.ts").as_path()
+        );
+        let expected: &[&str] = &[
+            "======== Resolving module 'foo' from '/workspace/a/b/c/d/e/app.ts'. ========",
+            "Explicitly specified module resolution kind: 'Bundler'.",
+            "Resolving in CJS mode with conditions 'import', 'types'.",
+            "File '/workspace/a/b/c/d/e/package.json' does not exist.",
+            "File '/workspace/a/b/c/d/package.json' does not exist.",
+            "File '/workspace/a/b/c/package.json' does not exist.",
+            "File '/workspace/a/b/package.json' does not exist.",
+            "File '/workspace/a/package.json' does not exist.",
+            "File '/workspace/package.json' does not exist.",
+            "Loading module 'foo' from 'node_modules' folder, target file types: TypeScript, JavaScript, Declaration, JSON.",
+            "Searching all ancestor node_modules directories for preferred extensions: TypeScript, Declaration.",
+            "Directory '/workspace/a/b/c/d/e/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/a/b/c/d/node_modules' does not exist, skipping all lookups in it.",
+            "Directory '/workspace/a/b/c/node_modules' does not exist, skipping all lookups in it.",
+            "File '/workspace/a/b/node_modules/foo.ts' does not exist.",
+            "File '/workspace/a/b/node_modules/foo.tsx' does not exist.",
+            "File '/workspace/a/b/node_modules/foo.d.ts' exists - use it as a name resolution result.",
+            "Resolving real path for '/workspace/a/b/node_modules/foo.d.ts', result '/workspace/a/b/node_modules/foo.d.ts'.",
+            "======== Module name 'foo' was successfully resolved to '/workspace/a/b/node_modules/foo.d.ts'. ========",
+        ];
+        let drive = trace_drive();
+        let expected: Vec<String> = expected
+            .iter()
+            .map(|line| line.replace("'/workspace", &format!("'{drive}/workspace")))
+            .collect();
+        let produced: Vec<&str> = log.lines().iter().map(String::as_str).collect();
+        assert_eq!(produced, expected);
+        assert!(log.unsupported().is_empty());
     }
     #[test]
     fn trace_log_matches_upstream_bundler_relative_blob() {
@@ -1802,17 +2357,17 @@ mod tests {
             "======== Module name './dir/index' was successfully resolved to '/dir/index.ts'. ========",
         ];
 
-        let fs_root = ProjectRoot::new("/").expect("absolute root");
+        let fs_root = ProjectRoot::new(abs("/")).expect("absolute root");
         let config = ProjectConfig::parse(
             &fs_root,
-            "/tsconfig.json",
+            abs("/tsconfig.json"),
             r#"{"compilerOptions":{"moduleResolution":"bundler"}}"#,
         )
         .expect("config");
         let options = config.options().clone();
         let mut host = MemoryHost::default();
-        host.file("/main.ts", "import {} from './dir/index.js';\n");
-        host.file("/dir/index.ts", "export {};\n");
+        host.file(abs("/main.ts"), "import {} from './dir/index.js';\n");
+        host.file(abs("/dir/index.ts"), "export {};\n");
         let mut cache = ResolutionCache::new();
         let mut log = ResolutionTraceLog::default();
 
@@ -1820,7 +2375,7 @@ mod tests {
             resolve_module_name_with_trace(
                 &fs_root,
                 &options,
-                "/main.ts",
+                abs("/main.ts"),
                 specifier,
                 (
                     ModuleResolutionKind::Bundler,
@@ -1838,7 +2393,7 @@ mod tests {
         resolve_module_name_with_trace(
             &fs_root,
             &options,
-            "/main.ts",
+            abs("/main.ts"),
             "./dir/index",
             (
                 ModuleResolutionKind::Bundler,
@@ -1853,22 +2408,27 @@ mod tests {
         )
         .expect("cache hit");
 
+        let drive = trace_drive();
+        let expected: Vec<String> = expected
+            .iter()
+            .map(|line| line.replace("'/", &format!("'{drive}/")))
+            .collect();
         let produced: Vec<&str> = log.lines().iter().map(String::as_str).collect();
         assert_eq!(produced, expected);
         assert!(log.unsupported().is_empty());
     }
     #[test]
     fn trace_mode_word_follows_resolution_mode() {
-        let fs_root = ProjectRoot::new("/").expect("absolute root");
+        let fs_root = ProjectRoot::new(abs("/")).expect("absolute root");
         let config = ProjectConfig::parse(
             &fs_root,
-            "/tsconfig.json",
+            abs("/tsconfig.json"),
             r#"{"compilerOptions":{"moduleResolution":"bundler"}}"#,
         )
         .expect("config");
         let options = config.options().clone();
         let mut host = MemoryHost::default();
-        host.file("/dir/index.ts", "export {};\n");
+        host.file(abs("/dir/index.ts"), "export {};\n");
 
         for (mode, word) in [
             (ResolutionMode::Import, "ESM"),
@@ -1879,7 +2439,7 @@ mod tests {
             resolve_module_name_with_trace(
                 &fs_root,
                 &options,
-                "/main.ts",
+                abs("/main.ts"),
                 "./dir/index.ts",
                 (
                     ModuleResolutionKind::Bundler,
@@ -1907,17 +2467,17 @@ mod tests {
 
     #[test]
     fn trace_types_flavor_narrates_declaration_candidates_first() {
-        let fs_root = ProjectRoot::new("/").expect("absolute root");
+        let fs_root = ProjectRoot::new(abs("/")).expect("absolute root");
         let config = ProjectConfig::parse(
             &fs_root,
-            "/tsconfig.json",
+            abs("/tsconfig.json"),
             r#"{"compilerOptions":{"moduleResolution":"bundler"}}"#,
         )
         .expect("config");
         let options = config.options().clone();
         let mut host = MemoryHost::default();
-        host.file("/dir/index.d.ts", "export {};\n");
-        host.file("/dir/index.ts", "export {};\n");
+        host.file(abs("/dir/index.d.ts"), "export {};\n");
+        host.file(abs("/dir/index.ts"), "export {};\n");
 
         for (flavor, chosen, narrated) in [
             (ResolutionFlavor::Runtime, "index.ts", "dir/index.ts"),
@@ -1928,7 +2488,7 @@ mod tests {
             let resolved = resolve_module_name_with_trace(
                 &fs_root,
                 &options,
-                "/main.ts",
+                abs("/main.ts"),
                 "./dir/index",
                 (
                     ModuleResolutionKind::Bundler,
@@ -1942,7 +2502,7 @@ mod tests {
                 },
             )
             .expect("resolution");
-            assert_eq!(resolved.path(), Path::new(&format!("/dir/{chosen}")));
+            assert_eq!(resolved.path(), abs(&format!("/dir/{chosen}")).as_path());
             // Narration stops at the first probed candidate, so the single
             // narrated file must be the one the resolver actually chose.
             let narrated_files: Vec<String> = log
@@ -1951,24 +2511,26 @@ mod tests {
                 .filter(|line| line.starts_with("File '"))
                 .cloned()
                 .collect();
-            let expected =
-                format!("File '/{narrated}' exists - use it as a name resolution result.");
+            let expected = format!(
+                "File '{}/{narrated}' exists - use it as a name resolution result.",
+                trace_drive()
+            );
             assert_eq!(narrated_files, vec![expected]);
         }
     }
 
     #[test]
     fn cache_keys_distinguish_runtime_and_types_flavors() {
-        let fs_root = ProjectRoot::new("/").expect("absolute root");
+        let fs_root = ProjectRoot::new(abs("/")).expect("absolute root");
         let mut host = MemoryHost::default();
-        host.file("/dir/index.d.ts", "export {};\n");
-        host.file("/dir/index.ts", "export {};\n");
+        host.file(abs("/dir/index.d.ts"), "export {};\n");
+        host.file(abs("/dir/index.ts"), "export {};\n");
         let options = options_with_resolution("bundler");
         let mut cache = ResolutionCache::new();
         let runtime = resolve_module_name(
             &fs_root,
             &options,
-            "/main.ts",
+            abs("/main.ts"),
             "./dir/index",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
@@ -1978,29 +2540,29 @@ mod tests {
         let types = resolve_type_reference(
             &fs_root,
             &options,
-            "/main.ts",
+            abs("/main.ts"),
             "./dir/index",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("types flavor");
-        assert_eq!(runtime.path(), Path::new("/dir/index.ts"));
-        assert_eq!(types.path(), Path::new("/dir/index.d.ts"));
+        assert_eq!(runtime.path(), abs("/dir/index.ts").as_path());
+        assert_eq!(types.path(), abs("/dir/index.d.ts").as_path());
         assert_eq!(cache.len(), 2);
     }
 
     #[test]
     fn json_specifier_resolves_the_exact_file_when_resolve_json_module_is_on() {
         let mut host = MemoryHost::default();
-        host.file("/workspace/src/data.json", "{\n  \"a\": 1\n}\n");
+        host.file(abs("/workspace/src/data.json"), "{\n  \"a\": 1\n}\n");
         // A script module beside the JSON file must not win: a `.json`
         // specifier is planned as an exact file with no extension
         // substitution.
-        host.file("/workspace/src/data.ts", "export const a = 1;\n");
+        host.file(abs("/workspace/src/data.ts"), "export const a = 1;\n");
         let config = ProjectConfig::parse(
             &root(),
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions":{"moduleResolution":"bundler","resolveJsonModule":true}}"#,
         )
         .expect("config");
@@ -2009,14 +2571,14 @@ mod tests {
         let resolved = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./data.json",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("exact JSON module");
-        assert_eq!(resolved.path(), Path::new("/workspace/src/data.json"));
+        assert_eq!(resolved.path(), abs("/workspace/src/data.json").as_path());
         assert!(
             resolved.trace().steps().iter().all(|step| !matches!(
                 step,
@@ -2030,10 +2592,10 @@ mod tests {
     #[test]
     fn json_specifier_probes_the_exact_file_even_when_resolve_json_module_is_off() {
         let mut host = MemoryHost::default();
-        host.file("/workspace/src/data.json", "{\n  \"a\": 1\n}\n");
+        host.file(abs("/workspace/src/data.json"), "{\n  \"a\": 1\n}\n");
         let config = ProjectConfig::parse(
             &root(),
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions":{"moduleResolution":"bundler"}}"#,
         )
         .expect("config");
@@ -2046,14 +2608,14 @@ mod tests {
         let resolved = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./data.json",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("exact JSON module resolves without the flag");
-        assert_eq!(resolved.path(), Path::new("/workspace/src/data.json"));
+        assert_eq!(resolved.path(), abs("/workspace/src/data.json").as_path());
 
         // A `.json` specifier that names no file fails as a plain cannot-find
         // miss (upstream TS2732) — never as an unsupported-extension
@@ -2061,7 +2623,7 @@ mod tests {
         let error = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "./missing.json",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
@@ -2074,10 +2636,13 @@ mod tests {
     #[test]
     fn json_specifier_with_paths_mapping_resolves_through_the_mapping() {
         let mut host = MemoryHost::default();
-        host.file("/workspace/config/pkg.json", "{\n  \"name\": \"pkg\"\n}\n");
+        host.file(
+            abs("/workspace/config/pkg.json"),
+            "{\n  \"name\": \"pkg\"\n}\n",
+        );
         let config = ProjectConfig::parse(
             &root(),
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions":{"moduleResolution":"bundler","baseUrl":".","paths":{"@config/*":["config/*"]},"resolveJsonModule":true}}"#,
         )
         .expect("config");
@@ -2086,14 +2651,14 @@ mod tests {
         let resolved = resolve_module_name(
             &root(),
             &options,
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "@config/pkg.json",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,
             &mut cache,
         )
         .expect("paths-mapped JSON module");
-        assert_eq!(resolved.path(), Path::new("/workspace/config/pkg.json"));
+        assert_eq!(resolved.path(), abs("/workspace/config/pkg.json").as_path());
 
         // The searched routes stay flag-gated: with `resolveJsonModule`
         // disabled a paths-mapped `.json` cannot be found with the current
@@ -2102,7 +2667,7 @@ mod tests {
         // though the mapped target file exists.
         let without_flag = ProjectConfig::parse(
             &root(),
-            "/workspace/tsconfig.json",
+            abs("/workspace/tsconfig.json"),
             r#"{"compilerOptions":{"moduleResolution":"bundler","baseUrl":".","paths":{"@config/*":["config/*"]}}}"#,
         )
         .expect("config");
@@ -2112,7 +2677,7 @@ mod tests {
         let error = resolve_module_name(
             &root(),
             without_flag.options(),
-            "/workspace/src/main.ts",
+            abs("/workspace/src/main.ts"),
             "@config/pkg.json",
             (ModuleResolutionKind::Bundler, ResolutionMode::Import),
             &host,

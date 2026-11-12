@@ -1,1404 +1,769 @@
-schema = "bamti.completion-program/v1"
+schema = "bamti.completion-program/v2"
 release = "typescript-7.0.2"
 root = "product"
 
 [[leaf]]
 id = "A1.1"
 cluster = "A1"
-wave = "W0"
-ledger = ".outline/gates/A1.1.md"
 owns = ["vendor/sources.toml"]
-aspects = []
 catalogs = []
-mutation_required = false
 
 [[leaf]]
 id = "A1.2"
 cluster = "A1"
-wave = "W0"
-ledger = ".outline/gates/A1.2.md"
 owns = ["crates/bamts-verification/src/source_fetch.rs"]
-aspects = []
 catalogs = []
-mutation_required = false
 
 [[leaf]]
 id = "A1.3"
 cluster = "A1"
-wave = "W0"
-ledger = ".outline/gates/A1.3.md"
 owns = ["crates/bamts-verification/src/catalog.rs"]
-aspects = []
 catalogs = []
-mutation_required = false
 
 [[leaf]]
 id = "A1.4"
 cluster = "A1"
-wave = "W0"
-ledger = ".outline/gates/A1.4.md"
 owns = ["crates/bamts-verification/src/ledger.rs", "verification/manifest.lock.json"]
-aspects = []
 catalogs = []
-mutation_required = false
 
 [[leaf]]
 id = "A1.5"
 cluster = "A1"
-wave = "W0"
-ledger = ".outline/gates/A1.5.md"
 owns = ["crates/bamts-verification/src/classification.rs", "verification/classification/*.toml"]
-aspects = []
 catalogs = []
-mutation_required = false
 
 [[leaf]]
 id = "A2.1"
 cluster = "A2"
-wave = "W0"
-ledger = ".outline/gates/A2.1.md"
 owns = ["crates/bamts-verification/src/lane.rs", "crates/bamts-verification/src/shard.rs", "crates/bamts-verification/src/evidence.rs"]
-aspects = []
 catalogs = []
-mutation_required = false
 
 [[leaf]]
 id = "A2.2"
 cluster = "A2"
-wave = "W0"
-ledger = ".outline/gates/A2.2.md"
 owns = ["crates/bamts-verification/src/oracles/mod.rs", "crates/bamts-verification/src/oracles/tsc.rs"]
-aspects = []
 catalogs = []
-mutation_required = false
 
 [[leaf]]
 id = "A2.3"
 cluster = "A2"
-wave = "W0"
-ledger = ".outline/gates/A2.3.md"
 owns = ["crates/bamts-verification/src/oracles/test262.rs", "crates/bamts-verification/Cargo.toml"]
-aspects = []
 catalogs = []
-mutation_required = false
 
 [[leaf]]
 id = "A2.6"
 cluster = "A2"
-wave = "W0"
-ledger = ".outline/gates/A2.6.md"
 owns = ["crates/bamts-verification/src/rebuild.rs"]
-aspects = []
 catalogs = []
-mutation_required = false
 
 [[leaf]]
 id = "A2.7"
 cluster = "A2"
-wave = "W0"
-ledger = ".outline/gates/A2.7.md"
-owns = [".github/workflows/ci.yml", ".github/workflows/nightly.yml", ".github/workflows/weekly-audit.yml", ".github/workflows/release.yml"]
-aspects = []
+owns = [".github/workflows/ci.yml", ".github/workflows/nightly.yml", ".github/workflows/release.yml"]
 catalogs = []
-mutation_required = false
-
-[[leaf]]
-id = "A3.1"
-cluster = "A3"
-wave = "W1"
-ledger = ".outline/gates/A3.1.md"
-owns = ["verification/evidence/typescript-7.0.2/*.jsonl", "proof/completeness-ledger.json"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
-catalogs = []
-mutation_required = true
-
-[[leaf]]
-id = "B0.1"
-cluster = "B0"
-wave = "W2"
-ledger = ".outline/gates/B0.1.md"
-owns = ["docs/dev/ast_change_window_protocol.md"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
-catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B1.1"
 cluster = "B1"
-wave = "W2"
-ledger = ".outline/gates/B1.1.md"
 owns = ["crates/bamts-compiler/src/tsc_directives.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B1.2"
 cluster = "B1"
-wave = "W2"
-ledger = ".outline/gates/B1.2.md"
 owns = ["crates/bamts-compiler/src/parser.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B1.3"
 cluster = "B1"
-wave = "W2"
-ledger = ".outline/gates/B1.3.md"
 owns = ["crates/bamts-compiler/src/diagnostics_parser.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B1.4"
 cluster = "B1"
-wave = "W2"
-ledger = ".outline/gates/B1.4.md"
 owns = ["crates/bamts-compiler/src/scanner.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B2.1"
 cluster = "B2"
-wave = "W2"
-ledger = ".outline/gates/B2.1.md"
 owns = ["crates/bamts-compiler/src/binder/merging.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B2.2"
 cluster = "B2"
-wave = "W2"
-ledger = ".outline/gates/B2.2.md"
 owns = ["crates/bamts-compiler/src/binder/exports.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B3.1"
 cluster = "B3"
-wave = "W2"
-ledger = ".outline/gates/B3.1.md"
 owns = ["crates/bamts-compiler/src/generated/diagnostic_messages.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B3.2"
 cluster = "B3"
-wave = "W2"
-ledger = ".outline/gates/B3.2.md"
 owns = ["crates/bamts-compiler/src/checker/relations.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B3.3"
 cluster = "B3"
-wave = "W2"
-ledger = ".outline/gates/B3.3.md"
 owns = ["crates/bamts-compiler/src/checker/conditional_types.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B3.4"
 cluster = "B3"
-wave = "W2"
-ledger = ".outline/gates/B3.4.md"
 owns = ["crates/bamts-compiler/src/checker/inference.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B3.5"
 cluster = "B3"
-wave = "W3"
-ledger = ".outline/gates/B3.5.md"
 owns = ["crates/bamts-compiler/src/checker/narrowing.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B3.6"
 cluster = "B3"
-wave = "W3"
-ledger = ".outline/gates/B3.6.md"
 owns = ["crates/bamts-compiler/src/checker/jsx.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B3.7"
 cluster = "B3"
-wave = "W3"
-ledger = ".outline/gates/B3.7.md"
 owns = ["crates/bamts-compiler/src/checker/overloads.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B3.8"
 cluster = "B3"
-wave = "W3"
-ledger = ".outline/gates/B3.8.md"
 owns = ["crates/bamts-compiler/src/checker/enum_namespace.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B3.9"
 cluster = "B3"
-wave = "W3"
-ledger = ".outline/gates/B3.9.md"
 owns = ["crates/bamts-compiler/src/checker/decorators.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B4.1"
 cluster = "B4"
-wave = "W3"
-ledger = ".outline/gates/B4.1.md"
 owns = ["crates/bamts-compiler/src/emitter/transforms.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B4.2"
 cluster = "B4"
-wave = "W3"
-ledger = ".outline/gates/B4.2.md"
 owns = ["crates/bamts-compiler/src/emitter/declarations.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B4.3"
 cluster = "B4"
-wave = "W3"
-ledger = ".outline/gates/B4.3.md"
 owns = ["crates/bamts-compiler/src/emitter/sourcemap.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B4.4"
 cluster = "B4"
-wave = "W3"
-ledger = ".outline/gates/B4.4.md"
 owns = ["crates/bamts-compiler/src/emitter/helpers.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B4.5"
 cluster = "B4"
-wave = "W3"
-ledger = ".outline/gates/B4.5.md"
 owns = ["crates/bamts-compiler/src/emitter/transpile.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B5.1"
 cluster = "B5"
-wave = "W4"
-ledger = ".outline/gates/B5.1.md"
 owns = ["crates/bamts-compiler/src/project/resolution.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B5.2"
 cluster = "B5"
-wave = "W4"
-ledger = ".outline/gates/B5.2.md"
 owns = ["crates/bamts-compiler/src/project/tsconfig.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B5.3"
 cluster = "B5"
-wave = "W4"
-ledger = ".outline/gates/B5.3.md"
 owns = ["crates/bamts-compiler/src/project/references.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B5.4"
 cluster = "B5"
-wave = "W4"
-ledger = ".outline/gates/B5.4.md"
 owns = ["crates/bamts-compiler/src/project/build_mode.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B6.1"
 cluster = "B6"
-wave = "W4"
-ledger = ".outline/gates/B6.1.md"
 owns = ["crates/bamts-cli/src/cli/tsc_args.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B6.2"
 cluster = "B6"
-wave = "W4"
-ledger = ".outline/gates/B6.2.md"
 owns = ["crates/bamts-cli/src/cli/diagnostic_format.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "B7.1"
 cluster = "B7"
-wave = "W4"
-ledger = ".outline/gates/B7.1.md"
 owns = ["corpus/manifest.toml", "corpus/cases/*.ts"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
+
+[[leaf]]
+id = "B7.2"
+cluster = "B7"
+owns = ["crates/bamts-verification/src/historical.rs"]
+catalogs = ["typescript-6.0.2", "typescript-5.9.3"]
 
 [[leaf]]
 id = "C0.1"
 cluster = "C0"
-wave = "W2"
-ledger = ".outline/gates/C0.1.md"
 owns = ["crates/bamts-runtime/src/host_objects.rs", "crates/bamts-verification/src/oracles/test262_harness.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C1.1"
 cluster = "C1"
-wave = "W2"
-ledger = ".outline/gates/C1.1.md"
 owns = ["crates/bamts-runtime/src/builtins/bigint.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C1.2"
 cluster = "C1"
-wave = "W2"
-ledger = ".outline/gates/C1.2.md"
 owns = ["crates/bamts-runtime/src/builtins/number_format.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C1.3"
 cluster = "C1"
-wave = "W2"
-ledger = ".outline/gates/C1.3.md"
 owns = ["crates/bamts-runtime/src/builtins/math_edge.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C2.1"
 cluster = "C2"
-wave = "W2"
-ledger = ".outline/gates/C2.1.md"
 owns = ["crates/bamts-runtime/src/builtins/proxy.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C2.2"
 cluster = "C2"
-wave = "W2"
-ledger = ".outline/gates/C2.2.md"
 owns = ["crates/bamts-runtime/src/builtins/reflect.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C2.3"
 cluster = "C2"
-wave = "W2"
-ledger = ".outline/gates/C2.3.md"
 owns = ["crates/bamts-runtime/src/builtins/property_descriptor.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C2.4"
 cluster = "C2"
-wave = "W2"
-ledger = ".outline/gates/C2.4.md"
 owns = ["crates/bamts-runtime/src/builtins/object_statics.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C3.1"
 cluster = "C3"
-wave = "W3"
-ledger = ".outline/gates/C3.1.md"
 owns = ["crates/bamts-runtime/src/builtins/array_es2023.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C3.2"
 cluster = "C3"
-wave = "W3"
-ledger = ".outline/gates/C3.2.md"
 owns = ["crates/bamts-runtime/src/builtins/typedarray_all.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C3.3"
 cluster = "C3"
-wave = "W3"
-ledger = ".outline/gates/C3.3.md"
 owns = ["crates/bamts-runtime/src/builtins/dataview.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C3.4"
 cluster = "C3"
-wave = "W3"
-ledger = ".outline/gates/C3.4.md"
 owns = ["crates/bamts-runtime/src/builtins/arraybuffer.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C3.5"
 cluster = "C3"
-wave = "W3"
-ledger = ".outline/gates/C3.5.md"
 owns = ["crates/bamts-runtime/src/builtins/atomics.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C3.6"
 cluster = "C3"
-wave = "W3"
-ledger = ".outline/gates/C3.6.md"
 owns = ["crates/bamts-runtime/src/builtins/set_methods.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C3.7"
 cluster = "C3"
-wave = "W3"
-ledger = ".outline/gates/C3.7.md"
 owns = ["crates/bamts-runtime/src/builtins/map_set_edge.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C4.1"
 cluster = "C4"
-wave = "W3"
-ledger = ".outline/gates/C4.1.md"
 owns = ["crates/bamts-runtime/src/builtins/string_edge.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C4.2"
 cluster = "C4"
-wave = "W3"
-ledger = ".outline/gates/C4.2.md"
 owns = ["crates/bamts-runtime/src/builtins/regexp_v/"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C4.3"
 cluster = "C4"
-wave = "W3"
-ledger = ".outline/gates/C4.3.md"
 owns = ["crates/bamts-runtime/src/builtins/uri.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C5.1"
 cluster = "C5"
-wave = "W3"
-ledger = ".outline/gates/C5.1.md"
 owns = ["crates/bamts-runtime/src/vm/generator_async.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C5.2"
 cluster = "C5"
-wave = "W3"
-ledger = ".outline/gates/C5.2.md"
 owns = ["crates/bamts-runtime/src/vm/async_iterators.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C5.3"
 cluster = "C5"
-wave = "W3"
-ledger = ".outline/gates/C5.3.md"
 owns = ["crates/bamts-runtime/src/vm/explicit_resource.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C5.4"
 cluster = "C5"
-wave = "W3"
-ledger = ".outline/gates/C5.4.md"
 owns = ["crates/bamts-runtime/src/builtins/error_edge.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C6.1"
 cluster = "C6"
-wave = "W4"
-ledger = ".outline/gates/C6.1.md"
 owns = ["crates/bamts-runtime/src/vm/esm_eval.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C6.2"
 cluster = "C6"
-wave = "W4"
-ledger = ".outline/gates/C6.2.md"
 owns = ["crates/bamts-runtime/src/vm/import_attributes.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C6.3"
 cluster = "C6"
-wave = "W4"
-ledger = ".outline/gates/C6.3.md"
 owns = ["crates/bamts-runtime/src/vm/dynamic_import.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C7.1"
 cluster = "C7"
-wave = "W4"
-ledger = ".outline/gates/C7.1.md"
 owns = ["crates/bamts-runtime/src/builtins/weakref_finalization.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C7.2"
 cluster = "C7"
-wave = "W4"
-ledger = ".outline/gates/C7.2.md"
 owns = ["crates/bamts-runtime/src/gc/stress_hardening.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C8.1"
 cluster = "C8"
-wave = "W4"
-ledger = ".outline/gates/C8.1.md"
 owns = ["crates/bamts-runtime/src/builtins/json_edge.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C8.2"
 cluster = "C8"
-wave = "W4"
-ledger = ".outline/gates/C8.2.md"
 owns = ["crates/bamts-runtime/src/builtins/date_full.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C8.3"
 cluster = "C8"
-wave = "W4"
-ledger = ".outline/gates/C8.3.md"
 owns = ["crates/bamts-runtime/src/builtins/structured_clone.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C9"
 cluster = "C9"
-wave = "W4"
-ledger = ".outline/gates/C9.md"
 owns = ["crates/bamts-runtime/src/builtins/annex_b.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C10.1"
 cluster = "C10"
-wave = "W5"
-ledger = ".outline/gates/C10.1.md"
 owns = ["crates/bamts-runtime/src/intl/locale_negotiation.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C10.2"
 cluster = "C10"
-wave = "W5"
-ledger = ".outline/gates/C10.2.md"
 owns = ["crates/bamts-runtime/src/intl/collator.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C10.3"
 cluster = "C10"
-wave = "W5"
-ledger = ".outline/gates/C10.3.md"
 owns = ["crates/bamts-runtime/src/intl/number_format.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C10.4"
 cluster = "C10"
-wave = "W5"
-ledger = ".outline/gates/C10.4.md"
 owns = ["crates/bamts-runtime/src/intl/date_time_format.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C10.5"
 cluster = "C10"
-wave = "W5"
-ledger = ".outline/gates/C10.5.md"
 owns = ["crates/bamts-runtime/src/intl/plural_rules.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C10.6"
 cluster = "C10"
-wave = "W5"
-ledger = ".outline/gates/C10.6.md"
 owns = ["crates/bamts-runtime/src/intl/canonical_locales.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C11.1"
 cluster = "C11"
-wave = "W5"
-ledger = ".outline/gates/C11.1.md"
 owns = ["crates/bamts-runtime/src/temporal/instant_duration.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C11.2"
 cluster = "C11"
-wave = "W5"
-ledger = ".outline/gates/C11.2.md"
 owns = ["crates/bamts-runtime/src/temporal/plain_types.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C11.3"
 cluster = "C11"
-wave = "W5"
-ledger = ".outline/gates/C11.3.md"
 owns = ["crates/bamts-runtime/src/temporal/zoned_date_time.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "C11.4"
 cluster = "C11"
-wave = "W5"
-ledger = ".outline/gates/C11.4.md"
 owns = ["crates/bamts-runtime/src/temporal/now_rounding.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["test262"]
-mutation_required = true
 
 [[leaf]]
 id = "E1.1"
 cluster = "E1"
-wave = "W2"
-ledger = ".outline/gates/E1.1.md"
 owns = ["crates/bamts-bytecode/src/isa.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = []
-mutation_required = true
 
 [[leaf]]
 id = "E1.2"
 cluster = "E1"
-wave = "W2"
-ledger = ".outline/gates/E1.2.md"
 owns = ["crates/bamts-bytecode/src/verifier.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = []
-mutation_required = true
 
 [[leaf]]
 id = "E2.1"
 cluster = "E2"
-wave = "W3"
-ledger = ".outline/gates/E2.1.md"
 owns = ["crates/bamts-codegen/src/jit/helpers.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = []
-mutation_required = true
 
 [[leaf]]
 id = "E2.2"
 cluster = "E2"
-wave = "W3"
-ledger = ".outline/gates/E2.2.md"
-owns = ["crates/bamts-codegen/src/jit/tiering.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
+owns = ["crates/bamts-native/src/tiering.rs"]
 catalogs = []
-mutation_required = true
 
 [[leaf]]
 id = "E2.3"
 cluster = "E2"
-wave = "W3"
-ledger = ".outline/gates/E2.3.md"
 owns = ["crates/bamts-codegen/tests/jit_differential.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = []
-mutation_required = true
+
+[[leaf]]
+id = "E2.4"
+cluster = "E2"
+owns = ["crates/bamts-codegen/src/jit_memory.rs"]
+catalogs = []
 
 [[leaf]]
 id = "E3.1"
 cluster = "E3"
-wave = "W4"
-ledger = ".outline/gates/E3.1.md"
 owns = ["crates/bamts-codegen/src/aot/emission.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = []
-mutation_required = true
 
 [[leaf]]
 id = "E3.2"
 cluster = "E3"
-wave = "W4"
-ledger = ".outline/gates/E3.2.md"
 owns = ["crates/bamts-codegen/src/aot/linking.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = []
-mutation_required = true
 
 [[leaf]]
 id = "E3.3"
 cluster = "E3"
-wave = "W4"
-ledger = ".outline/gates/E3.3.md"
 owns = ["crates/bamts-codegen/src/aot/reproducible.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = []
-mutation_required = true
 
 [[leaf]]
-id = "E4.1"
-cluster = "E4"
-wave = "W5"
-ledger = ".outline/gates/E4.1.md"
-owns = ["crates/bamts-verification/src/toolchain_schema.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
-catalogs = ["target-cells"]
-mutation_required = true
+id = "E3.4"
+cluster = "E3"
+owns = ["crates/bamts-cli/src/driver.rs"]
+catalogs = []
 
 [[leaf]]
-id = "E4.2"
-cluster = "E4"
-wave = "W5"
-ledger = ".outline/gates/E4.2.md"
-owns = ["verification/toolchains/x86_64-unknown-linux-gnu.json"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
-catalogs = ["target-cells"]
-mutation_required = true
+id = "E3.5"
+cluster = "E3"
+owns = ["crates/bamts-cli/src/windows_link.rs"]
+catalogs = []
 
 [[leaf]]
-id = "E4.3"
-cluster = "E4"
-wave = "W5"
-ledger = ".outline/gates/E4.3.md"
-owns = ["verification/toolchains/aarch64-unknown-linux-gnu.json"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
-catalogs = ["target-cells"]
-mutation_required = true
+id = "E3.6"
+cluster = "E3"
+owns = ["crates/bamts-platform/"]
+catalogs = []
 
 [[leaf]]
-id = "E4.4"
-cluster = "E4"
-wave = "W5"
-ledger = ".outline/gates/E4.4.md"
-owns = ["verification/toolchains/s390x-unknown-linux-gnu.json"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
-catalogs = ["target-cells"]
-mutation_required = true
-
-[[leaf]]
-id = "E4.5"
-cluster = "E4"
-wave = "W5"
-ledger = ".outline/gates/E4.5.md"
-owns = ["verification/toolchains/riscv64gc-unknown-linux-gnu.json"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
-catalogs = ["target-cells"]
-mutation_required = true
-
-[[leaf]]
-id = "E5.1"
-cluster = "E5"
-wave = "W6"
-ledger = ".outline/gates/E5.1.md"
-owns = ["bench/compiler-rules.toml"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
-catalogs = ["benchmarks"]
-mutation_required = true
-
-[[leaf]]
-id = "E5.2"
-cluster = "E5"
-wave = "W6"
-ledger = ".outline/gates/E5.2.md"
-owns = ["bench/jit_benchmarks.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
-catalogs = ["benchmarks"]
-mutation_required = true
-
-[[leaf]]
-id = "E5.3"
-cluster = "E5"
-wave = "W6"
-ledger = ".outline/gates/E5.3.md"
-owns = ["bench/stage0_evidence.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
-catalogs = ["benchmarks"]
-mutation_required = true
-
-[[leaf]]
-id = "E5.4"
-cluster = "E5"
-wave = "W6"
-ledger = ".outline/gates/E5.4.md"
-owns = ["bench/stage1_regression_guard.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
-catalogs = ["benchmarks"]
-mutation_required = true
+id = "E3.7"
+cluster = "E3"
+owns = ["crates/bamts-codegen/src/aot/in_process_link.rs"]
+catalogs = []
 
 [[leaf]]
 id = "F1.1"
 cluster = "F1"
-wave = "W6"
-ledger = ".outline/gates/F1.1.md"
 owns = ["formal/ledger_wiring.rs"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["formal-lean", "formal-quint", "formal-redex"]
-mutation_required = true
 
 [[leaf]]
 id = "F1.2"
 cluster = "F1"
-wave = "W6"
-ledger = ".outline/gates/F1.2.md"
 owns = ["formal/extension_policy.md"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["formal-lean", "formal-quint", "formal-redex"]
-mutation_required = true
 
 [[leaf]]
 id = "F2.1"
 cluster = "F2"
-wave = "W7"
-ledger = ".outline/gates/F2.1.md"
 owns = ["npm/bamti/package.json", "npm/bamti/index.js", "crates/bamts-cli/src/api_server/"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "F2.2"
 cluster = "F2"
-wave = "W7"
-ledger = ".outline/gates/F2.2.md"
 owns = ["crates/bamts-compiler/src/service/", "npm/bamti/unstable/sync.js", "npm/bamti/unstable/async.js", "npm/bamti/unstable/fs.js", "npm/bamti/unstable/proto.js"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "F2.3"
 cluster = "F2"
-wave = "W7"
-ledger = ".outline/gates/F2.3.md"
 owns = ["crates/bamts-compiler/src/public_ast/", "npm/bamti/unstable/ast/"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = true
 
 [[leaf]]
 id = "F2.4"
 cluster = "F2"
-wave = "W7"
-ledger = ".outline/gates/F2.4.md"
 owns = ["npm/test/bamti-api.test.mjs", "npm/artifacts/"]
-aspects = ["evidence", "coverage", "regression"]
 catalogs = ["typescript-7.0.2"]
-mutation_required = false
 
 [[leaf]]
 id = "F3.1"
 cluster = "F3"
-wave = "W7"
-ledger = ".outline/gates/F3.1.md"
 owns = ["docs/release/runbook.md"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = []
-mutation_required = true
 
 [[leaf]]
 id = "F3.2"
 cluster = "F3"
-wave = "W7"
-ledger = ".outline/gates/F3.2.md"
 owns = ["verification/release/typescript-7.0.2.json"]
-aspects = ["contract", "evidence", "coverage", "regression", "mutation"]
 catalogs = []
-mutation_required = true
 
 [[node]]
 kind = "cluster"
 id = "A1"
 children = ["A1.1", "A1.2", "A1.3", "A1.4", "A1.5"]
-ledger = ".outline/gates/cluster-A1.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "A2"
 children = ["A2.1", "A2.2", "A2.3", "A2.6", "A2.7"]
-ledger = ".outline/gates/cluster-A2.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "cluster"
-id = "A3"
-children = ["A3.1"]
-ledger = ".outline/gates/cluster-A3.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "cluster"
-id = "B0"
-children = ["B0.1"]
-ledger = ".outline/gates/cluster-B0.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "B1"
 children = ["B1.1", "B1.2", "B1.3", "B1.4"]
-ledger = ".outline/gates/cluster-B1.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "B2"
 children = ["B2.1", "B2.2"]
-ledger = ".outline/gates/cluster-B2.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "B3"
 children = ["B3.1", "B3.2", "B3.3", "B3.4", "B3.5", "B3.6", "B3.7", "B3.8", "B3.9"]
-ledger = ".outline/gates/cluster-B3.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "B4"
 children = ["B4.1", "B4.2", "B4.3", "B4.4", "B4.5"]
-ledger = ".outline/gates/cluster-B4.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "B5"
 children = ["B5.1", "B5.2", "B5.3", "B5.4"]
-ledger = ".outline/gates/cluster-B5.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "B6"
 children = ["B6.1", "B6.2"]
-ledger = ".outline/gates/cluster-B6.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "B7"
-children = ["B7.1"]
-ledger = ".outline/gates/cluster-B7.md"
-aspects = ["contract", "evidence", "regression"]
+children = ["B7.1", "B7.2"]
 
 [[node]]
 kind = "cluster"
 id = "C0"
 children = ["C0.1"]
-ledger = ".outline/gates/cluster-C0.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "C1"
 children = ["C1.1", "C1.2", "C1.3"]
-ledger = ".outline/gates/cluster-C1.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "C2"
 children = ["C2.1", "C2.2", "C2.3", "C2.4"]
-ledger = ".outline/gates/cluster-C2.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "C3"
 children = ["C3.1", "C3.2", "C3.3", "C3.4", "C3.5", "C3.6", "C3.7"]
-ledger = ".outline/gates/cluster-C3.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "C4"
 children = ["C4.1", "C4.2", "C4.3"]
-ledger = ".outline/gates/cluster-C4.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "C5"
 children = ["C5.1", "C5.2", "C5.3", "C5.4"]
-ledger = ".outline/gates/cluster-C5.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "C6"
 children = ["C6.1", "C6.2", "C6.3"]
-ledger = ".outline/gates/cluster-C6.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "C7"
 children = ["C7.1", "C7.2"]
-ledger = ".outline/gates/cluster-C7.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "C8"
 children = ["C8.1", "C8.2", "C8.3"]
-ledger = ".outline/gates/cluster-C8.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "C9"
 children = ["C9"]
-ledger = ".outline/gates/cluster-C9.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "C10"
 children = ["C10.1", "C10.2", "C10.3", "C10.4", "C10.5", "C10.6"]
-ledger = ".outline/gates/cluster-C10.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "C11"
 children = ["C11.1", "C11.2", "C11.3", "C11.4"]
-ledger = ".outline/gates/cluster-C11.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "E1"
 children = ["E1.1", "E1.2"]
-ledger = ".outline/gates/cluster-E1.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "E2"
-children = ["E2.1", "E2.2", "E2.3"]
-ledger = ".outline/gates/cluster-E2.md"
-aspects = ["contract", "evidence", "regression"]
+children = ["E2.1", "E2.2", "E2.3", "E2.4"]
 
 [[node]]
 kind = "cluster"
 id = "E3"
-children = ["E3.1", "E3.2", "E3.3"]
-ledger = ".outline/gates/cluster-E3.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "cluster"
-id = "E4"
-children = ["E4.1", "E4.2", "E4.3", "E4.4", "E4.5"]
-ledger = ".outline/gates/cluster-E4.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "cluster"
-id = "E5"
-children = ["E5.1", "E5.2", "E5.3", "E5.4"]
-ledger = ".outline/gates/cluster-E5.md"
-aspects = ["contract", "evidence", "regression"]
+children = ["E3.1", "E3.2", "E3.3", "E3.4", "E3.5", "E3.6", "E3.7"]
 
 [[node]]
 kind = "cluster"
 id = "F1"
 children = ["F1.1", "F1.2"]
-ledger = ".outline/gates/cluster-F1.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "F2"
 children = ["F2.1", "F2.2", "F2.3", "F2.4"]
-ledger = ".outline/gates/cluster-F2.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "cluster"
 id = "F3"
 children = ["F3.1", "F3.2"]
-ledger = ".outline/gates/cluster-F3.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "track"
-id = "A"
-children = ["A1", "A2", "A3"]
-ledger = ".outline/gates/track-A.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "track"
-id = "B"
-children = ["B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7"]
-ledger = ".outline/gates/track-B.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "track"
-id = "C"
-children = ["C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11"]
-ledger = ".outline/gates/track-C.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "track"
-id = "E"
-children = ["E1", "E2", "E3", "E4", "E5"]
-ledger = ".outline/gates/track-E.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "track"
-id = "F"
-children = ["F1", "F2", "F3"]
-ledger = ".outline/gates/track-F.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "wave"
-id = "W0"
-children = ["A1.1", "A1.2", "A1.3", "A1.4", "A1.5", "A2.1", "A2.2", "A2.3", "A2.6", "A2.7"]
-ledger = ".outline/gates/wave-W0.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "wave"
-id = "W1"
-children = ["A3.1"]
-ledger = ".outline/gates/wave-W1.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "wave"
-id = "W2"
-children = ["B0.1", "B1.1", "B1.2", "B1.3", "B1.4", "B2.1", "B2.2", "B3.1", "B3.2", "B3.3", "B3.4", "C0.1", "C1.1", "C1.2", "C1.3", "C2.1", "C2.2", "C2.3", "C2.4", "E1.1", "E1.2"]
-ledger = ".outline/gates/wave-W2.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "wave"
-id = "W3"
-children = ["B3.5", "B3.6", "B3.7", "B3.8", "B3.9", "B4.1", "B4.2", "B4.3", "B4.4", "B4.5", "C3.1", "C3.2", "C3.3", "C3.4", "C3.5", "C3.6", "C3.7", "C4.1", "C4.2", "C4.3", "C5.1", "C5.2", "C5.3", "C5.4", "E2.1", "E2.2", "E2.3"]
-ledger = ".outline/gates/wave-W3.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "wave"
-id = "W4"
-children = ["B5.1", "B5.2", "B5.3", "B5.4", "B6.1", "B6.2", "B7.1", "C6.1", "C6.2", "C6.3", "C7.1", "C7.2", "C8.1", "C8.2", "C8.3", "C9", "E3.1", "E3.2", "E3.3"]
-ledger = ".outline/gates/wave-W4.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "wave"
-id = "W5"
-children = ["C10.1", "C10.2", "C10.3", "C10.4", "C10.5", "C10.6", "C11.1", "C11.2", "C11.3", "C11.4", "E4.1", "E4.2", "E4.3", "E4.4", "E4.5"]
-ledger = ".outline/gates/wave-W5.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "wave"
-id = "W6"
-children = ["E5.1", "E5.2", "E5.3", "E5.4", "F1.1", "F1.2"]
-ledger = ".outline/gates/wave-W6.md"
-aspects = ["contract", "evidence", "regression"]
-
-[[node]]
-kind = "wave"
-id = "W7"
-children = ["F2.1", "F2.2", "F2.3", "F2.4", "F3.1", "F3.2"]
-ledger = ".outline/gates/wave-W7.md"
-aspects = ["contract", "evidence", "regression"]
 
 [[node]]
 kind = "root"
 id = "authority"
-children = ["track:A"]
-ledger = ".outline/GATES.md"
-aspects = []
+children = ["cluster:A1", "cluster:A2"]
 
 [[node]]
 kind = "root"
 id = "compiler"
-children = ["track:B"]
-ledger = ".outline/gates/root-compiler.md"
-aspects = ["contract", "regression"]
+children = ["cluster:B1", "cluster:B2", "cluster:B3", "cluster:B4", "cluster:B5", "cluster:B6", "cluster:B7"]
 
 [[node]]
 kind = "root"
 id = "runtime"
-children = ["track:C"]
-ledger = ".outline/gates/root-runtime.md"
-aspects = ["contract", "regression"]
+children = ["cluster:C0", "cluster:C1", "cluster:C2", "cluster:C3", "cluster:C4", "cluster:C5", "cluster:C6", "cluster:C7", "cluster:C8", "cluster:C9", "cluster:C10", "cluster:C11"]
 
 [[node]]
 kind = "root"
 id = "native"
-children = ["track:E", "cluster:F1"]
-ledger = ".outline/gates/root-native.md"
-aspects = ["contract", "regression"]
+children = ["cluster:E1", "cluster:E2", "cluster:E3", "cluster:F1"]
 
 [[node]]
 kind = "root"
 id = "package"
 children = ["cluster:F2"]
-ledger = ".outline/gates/root-package.md"
-aspects = ["contract", "regression"]
 
 [[node]]
 kind = "root"
 id = "product"
-children = ["root:compiler", "root:runtime", "root:native", "root:package"]
-ledger = ".outline/gates/root-product.md"
-aspects = ["contract"]
+children = ["root:compiler", "root:runtime", "root:native", "root:package", "cluster:F3"]
 

@@ -39,10 +39,13 @@
 //! React source (`.tsx`/`.jsx`) is parsed into JSX element, fragment, and
 //! self-closing-element nodes with `Missing*` recovery for malformed tags.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
-use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
-use crate::scanner::ScannedSource;
+use crate::diagnostic::{Diagnostic, DiagnosticCode, DiagnosticSeverity, Recovered};
+use crate::scanner::{
+    ScannedSource, at_reported_position, is_escape_diagnostic, is_unterminated_diagnostic,
+};
 use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
 use crate::syntax::{
     Accessibility, ArrayBindingElement, ArrayBindingPattern, ArrayElement, ArrayLiteral,
@@ -121,6 +124,9 @@ const UNTERMINATED_REGEX: DiagnosticCode = DiagnosticCode::new("BAMTS-L004");
 const YIELD_OUTSIDE_GENERATOR: DiagnosticCode = DiagnosticCode::new("BAMTS-P017");
 /// An await expression parsed inside a non-async function-like.
 const AWAIT_OUTSIDE_ASYNC: DiagnosticCode = DiagnosticCode::new("BAMTS-P018");
+/// A module name that is not a string literal. TypeScript reports it as a grammar
+/// error, which a file with a parse error does not get.
+const MODULE_NAME_NOT_STRING: DiagnosticCode = DiagnosticCode::new("BAMTS-P020");
 
 /// A parser operation was interrupted before completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,11 +220,10 @@ pub fn parse_with_cancel(
     let mut parser = Parser::new_with_cancel(source_id, script_kind, source, tokens, eof, cancel);
     let statements = parser.parse_statements_until(&[]);
 
-    // The default scanner pass emits only `Slash`/`SlashEq`, never a
-    // `RegularExpressionLiteral`; every such token in the final stream is a
-    // committed parser regex rescan. The lexical diagnostics the default pass
-    // recorded inside those spans reflect the wrong (division) interpretation,
-    // so they are dropped and superseded by the rescan's own diagnostics.
+    // Every `RegularExpressionLiteral` in the final stream is either one the
+    // default pass was certain of or a committed parser regex rescan. Any lexical
+    // diagnostics recorded inside those spans reflect the wrong (division)
+    // interpretation, so they are dropped and superseded by the rescan's own.
     let regex_spans: Vec<TextRange> = parser
         .tokens
         .iter()
@@ -228,13 +233,112 @@ pub fn parse_with_cancel(
     // Spans reinterpreted as JSX likewise supersede the default pass's lexical
     // diagnostics: character data and attribute strings were mis-lexed there.
     let jsx_spans = &parser.jsx_spans;
+    // A tag accepts any escape and reads a value of `undefined` for a bad one, so the
+    // text of a tagged template keeps no escape diagnostic.
+    // This also holds for the escapes that a JSX rescan finds.
+    let tagged_spans = &parser.tagged_spans;
+    let tagged_escape = |diagnostic: &Diagnostic| {
+        let start = diagnostic.range().start().get();
+        is_escape_diagnostic(diagnostic.code())
+            && tagged_spans
+                .iter()
+                .any(|span| start >= span.start().get() && start < span.end().get())
+    };
     let mut diagnostics = lexical;
     diagnostics.retain(|diagnostic| {
         let start = diagnostic.range().start().get();
         let in_span = |span: &TextRange| start >= span.start().get() && start < span.end().get();
-        !regex_spans.iter().any(in_span) && !jsx_spans.iter().any(in_span)
+        !regex_spans.iter().any(in_span)
+            && !jsx_spans.iter().any(in_span)
+            && !tagged_escape(diagnostic)
     });
-    diagnostics.extend(parser.diagnostics.iter().cloned());
+    // TypeScript reports no parse error at the start of an earlier one. Its
+    // scanner runs as it parses, so at one position a lexical error comes first,
+    // a literal that is not closed comes after the errors in its text, and the
+    // parse errors come last, in the order that the parser found them. A template
+    // with no substitution is the exception: TypeScript finds the errors in its
+    // text when it reads that text again, after the template that is not closed.
+    let opens_template = |diagnostic: &Diagnostic| {
+        let start = diagnostic.range().start();
+        let at = parser
+            .tokens
+            .partition_point(|token| token.range().start() < start);
+        parser.tokens.get(at).is_some_and(|token| {
+            token.range().start() == start && token.kind() == TokenKind::NoSubstitutionTemplate
+        })
+    };
+    // TypeScript drops an error only at the start of the error that it reported
+    // last. In such a template that is the template itself for the first error in
+    // its text, and an error in the text for each later one. So an error at the end
+    // of the text is kept when an earlier error is in the text.
+    let unclosed_templates: Vec<(usize, usize)> = diagnostics
+        .iter()
+        .filter(|diagnostic| is_unterminated_diagnostic(diagnostic.code()))
+        .filter(|diagnostic| opens_template(diagnostic))
+        .map(|diagnostic| {
+            let range = diagnostic.range();
+            (range.start().get(), range.end().get())
+        })
+        .collect();
+    let lexical_starts: Vec<usize> = diagnostics
+        .iter()
+        .filter(|diagnostic| !is_unterminated_diagnostic(diagnostic.code()))
+        .map(|diagnostic| diagnostic.range().start().get())
+        .collect();
+    let follows_an_error_in_its_template = |at: usize| {
+        unclosed_templates.iter().any(|(start, end)| {
+            at == *end
+                && lexical_starts
+                    .iter()
+                    .any(|error| (*start..*end).contains(error))
+        })
+    };
+    let mut ordered: Vec<(usize, u8, bool, Diagnostic)> = diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            let unterminated = is_unterminated_diagnostic(diagnostic.code());
+            let rank = if !unterminated {
+                1
+            } else if opens_template(&diagnostic) {
+                0
+            } else {
+                2
+            };
+            let diagnostic = at_reported_position(diagnostic);
+            let start = diagnostic.range().start().get();
+            let kept = !unterminated && follows_an_error_in_its_template(start);
+            (start, rank, kept, diagnostic)
+        })
+        .chain(
+            parser
+                .diagnostics
+                .iter()
+                .filter(|d| !tagged_escape(d))
+                .map(|diagnostic| {
+                    // A literal that the parser scans again, such as a JSX attribute
+                    // string, is not closed at the same place as a scanned one.
+                    let rank = if is_unterminated_diagnostic(diagnostic.code()) {
+                        2
+                    } else {
+                        3
+                    };
+                    let diagnostic = at_reported_position(diagnostic.clone());
+                    (diagnostic.range().start().get(), rank, false, diagnostic)
+                }),
+        )
+        .collect();
+    ordered.sort_by_key(|(start, rank, _, _)| (*start, *rank));
+    let mut starts = std::collections::BTreeSet::new();
+    let mut diagnostics: Vec<Diagnostic> = ordered
+        .into_iter()
+        .filter_map(|(start, _, kept, diagnostic)| {
+            (kept || !is_parse_error(&diagnostic) || starts.insert(start)).then_some(diagnostic)
+        })
+        .collect();
+    // TypeScript reports a grammar error only in a file with no parse error.
+    if diagnostics.iter().any(is_parse_error) {
+        diagnostics.retain(|diagnostic| diagnostic.code() != MODULE_NAME_NOT_STRING);
+    }
     diagnostics.sort();
     diagnostics.dedup();
 
@@ -278,6 +382,7 @@ struct ParserCheckpoint {
     next_node_id: u32,
     journal: usize,
     jsx_spans: usize,
+    tagged_spans: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -327,6 +432,9 @@ struct Parser {
     /// recorded inside them reflect a non-JSX reading and are dropped, mirroring
     /// the regex-rescan span handling.
     jsx_spans: Vec<TextRange>,
+    /// The text of every tagged template, which takes any escape, and of every
+    /// template literal type with no substitution, where TypeScript reports none.
+    tagged_spans: Vec<TextRange>,
     /// Cooperative cancellation signal checked at statement and list boundaries.
     cancel: CancellationToken,
 }
@@ -342,8 +450,53 @@ fn is_trivia(kind: TokenKind) -> bool {
     )
 }
 
+/// Whether TypeScript reports `diagnostic` while it parses. Every lexical error
+/// is one. A grammar error, such as `yield` outside a generator, is reported by
+/// its checker instead.
+fn is_parse_error(diagnostic: &Diagnostic) -> bool {
+    let code = diagnostic.code();
+    diagnostic.severity() == DiagnosticSeverity::Error
+        && (code.as_str().starts_with("BAMTS-L")
+            || [
+                EXPECTED_TOKEN,
+                EXPECTED_EXPRESSION,
+                EXPECTED_IDENTIFIER,
+                EXPECTED_TYPE,
+                UNEXPECTED_TOKEN,
+                EXPECTED_PROPERTY_NAME,
+                NESTING_TOO_DEEP,
+            ]
+            .contains(&code))
+}
+
 fn empty_range(at: Utf16Pos) -> TextRange {
     TextRange::new(at, at).expect("an empty range is ordered")
+}
+
+/// The end of the last part of a JSX tag name.
+fn jsx_name_end(name: &JsxElementName) -> Utf16Pos {
+    match name {
+        JsxElementName::Identifier(identifier) => identifier.range().end(),
+        JsxElementName::Namespace(namespaced) => namespaced.name.range().end(),
+        JsxElementName::Member(member) => member.property.range().end(),
+    }
+}
+
+/// The operator of a unary expression that cannot be the left operand of `**`.
+fn exponent_operand_operator(expression: &Expression) -> Option<&'static str> {
+    Some(match expression {
+        Expression::Await(_) => "await",
+        Expression::Unary(unary) => match unary.operator {
+            UnaryOperator::Plus => "+",
+            UnaryOperator::Minus => "-",
+            UnaryOperator::Not => "!",
+            UnaryOperator::BitNot => "~",
+            UnaryOperator::Typeof => "typeof",
+            UnaryOperator::Void => "void",
+            UnaryOperator::Delete => "delete",
+        },
+        _ => return None,
+    })
 }
 
 fn is_line_terminator(c: char) -> bool {
@@ -495,6 +648,7 @@ impl Parser {
             keyword_context: KeywordContext::default(),
             ambient: AmbientContext::None,
             jsx_spans: Vec::new(),
+            tagged_spans: Vec::new(),
             cancel,
         };
         parser.cursor = parser.next_significant(0);
@@ -645,12 +799,30 @@ impl Parser {
     // Diagnostics and recovery products
     // ------------------------------------------------------------------
 
-    fn error_at(&mut self, code: DiagnosticCode, range: TextRange, message: &'static str) {
+    fn error_at(
+        &mut self,
+        code: DiagnosticCode,
+        range: TextRange,
+        message: impl Into<Cow<'static, str>>,
+    ) {
         self.diagnostics
             .push(Diagnostic::error(code, self.source_id, range, message));
     }
 
     fn error_here(&mut self, code: DiagnosticCode, message: &'static str) {
+        // At the end of the text, TypeScript reports a missing name, expression or
+        // type where the trivia before the end starts.
+        if self.at_eof()
+            && [EXPECTED_EXPRESSION, EXPECTED_IDENTIFIER, EXPECTED_TYPE].contains(&code)
+        {
+            self.error_at(code, empty_range(Utf16Pos::new(self.prev_end)), message);
+        } else {
+            self.error_at_token(code, message);
+        }
+    }
+
+    /// Records a diagnostic over the current token, or at the end of the text.
+    fn error_at_token(&mut self, code: DiagnosticCode, message: &'static str) {
         let range = if self.at_eof() {
             empty_range(self.eof.range().start())
         } else {
@@ -816,6 +988,7 @@ impl Parser {
             next_node_id: self.next_node_id,
             journal: self.journal.len(),
             jsx_spans: self.jsx_spans.len(),
+            tagged_spans: self.tagged_spans.len(),
         }
     }
 
@@ -830,6 +1003,7 @@ impl Parser {
         self.diagnostics.truncate(checkpoint.diagnostics);
         self.next_node_id = checkpoint.next_node_id;
         self.jsx_spans.truncate(checkpoint.jsx_spans);
+        self.tagged_spans.truncate(checkpoint.tagged_spans);
     }
 
     // ------------------------------------------------------------------
@@ -1949,7 +2123,12 @@ impl Parser {
             let token = self.bump();
             Some(self.ident_from(token))
         } else {
-            if require_name && !self.at(TokenKind::LBrace) && !self.at(TokenKind::KwExtends) {
+            // At the end of the text, TypeScript reports only the missing `{`.
+            if require_name
+                && !self.at(TokenKind::LBrace)
+                && !self.at(TokenKind::KwExtends)
+                && !self.at_eof()
+            {
                 self.error_here(EXPECTED_IDENTIFIER, "expected a class name");
             }
             None
@@ -1964,6 +2143,11 @@ impl Parser {
             }
             if self.at(TokenKind::KwExtends) && extends.is_none() {
                 self.bump();
+                // A heritage list ends at the end of the text, with no missing
+                // element.
+                if self.at_eof() {
+                    break;
+                }
                 let expression = self.parse_lhs_expression(LhsContext::Expression);
                 let type_arguments = self.try_parse_type_arguments_in_heritage();
                 extends = Some(ClassHeritage {
@@ -1975,7 +2159,7 @@ impl Parser {
                 self.note_typescript_syntax(range);
                 self.bump();
                 loop {
-                    if self.is_cancelled() {
+                    if self.is_cancelled() || self.at_eof() {
                         break;
                     }
                     implements.push(self.parse_type());
@@ -1995,7 +2179,13 @@ impl Parser {
                 break;
             }
             let before = self.cursor;
-            let member = self.parse_class_member();
+            let member = if self.at(TokenKind::Semicolon) {
+                let start = self.cur_start();
+                self.bump();
+                self.node(start, ClassMember::Semicolon)
+            } else {
+                self.parse_class_member()
+            };
             members.push(member);
             if self.cursor == before {
                 let skipped = self.bump();
@@ -2080,7 +2270,7 @@ impl Parser {
                     self.error_at(
                         EXPORT_MODIFIER_ON_CLASS_ELEMENT,
                         range,
-                        "'export' modifier cannot appear on class elements.",
+                        "`export` modifier cannot appear on class elements",
                     );
                 }
                 TokenKind::KwAsync if !self.has_newline_before_nth(1) => is_async = true,
@@ -2151,8 +2341,14 @@ impl Parser {
         };
 
         // Constructor.
+        // In JavaScript a static, async, or generator `constructor` is an ordinary
+        // method, which the early-error pass judges. TypeScript keeps one shape
+        // here because its checker reports these itself.
+        let plain_in_javascript =
+            self.is_typescript() || !(modifiers.is_static || is_async || is_generator);
         if !is_accessor
             && property_modifier == PropertyModifier::None
+            && plain_in_javascript
             && self.is_constructor_name(&name)
             && self.at(TokenKind::LParen)
         {
@@ -2309,13 +2505,18 @@ impl Parser {
             || (self.at(TokenKind::KwStatic) && next == TokenKind::LBrace)
     }
 
-    /// Returns whether `name` is exactly the `constructor` identifier, so a
-    /// method named `constructors` is not misread as a constructor.
+    /// Returns whether `name` is exactly the `constructor` identifier or a string
+    /// with that value, so a method named `constructors` is not misread as a
+    /// constructor. A computed name is never one.
     fn is_constructor_name(&self, name: &PropertyName) -> bool {
-        let PropertyName::Identifier(node) = name else {
-            return false;
-        };
-        self.lexeme(*node.data().token()) == "constructor"
+        match name {
+            PropertyName::Identifier(node) => self.lexeme(*node.data().token()) == "constructor",
+            PropertyName::String(node) => {
+                crate::literal::string_value(self.lexeme(*node.data().token()))
+                    .is_some_and(|value| value.eq_ascii("constructor"))
+            }
+            _ => false,
+        }
     }
 
     /// Distinguishes `[key: string]: T` from a computed member name.
@@ -2343,7 +2544,9 @@ impl Parser {
         let mut extends = Vec::new();
         if self.eat(TokenKind::KwExtends).is_some() {
             loop {
-                if self.is_cancelled() {
+                // A heritage list ends at the end of the text, with no missing
+                // element.
+                if self.is_cancelled() || self.at_eof() {
                     break;
                 }
                 let entity = self.parse_entity_name();
@@ -2633,7 +2836,7 @@ impl Parser {
 
         let clause = self.parse_import_clause();
         self.expect(TokenKind::KwFrom, "expected `from`");
-        let source = self.parse_string_literal();
+        let source = self.parse_module_name(false);
         let attributes = self.parse_optional_import_attributes();
         self.expect_semicolon();
         self.node(
@@ -2664,7 +2867,7 @@ impl Parser {
         {
             self.bump();
             self.bump();
-            let source = self.parse_string_literal();
+            let source = self.parse_module_name(false);
             self.expect(TokenKind::RParen, "expected `)`");
             return ExternalModuleReference::Require(source);
         }
@@ -2840,13 +3043,43 @@ impl Parser {
         Some(ImportAttributes { entries })
     }
 
+    /// A string literal. TypeScript reads an expression where the value of an import
+    /// attribute belongs, so a token that cannot start one is a missing expression,
+    /// and any other token a missing string literal.
     fn parse_string_literal(&mut self) -> StringLiteralNode {
         if self.at(TokenKind::StringLiteral) {
             let token = self.bump();
             let range = token.range();
             return self.node_at(range, StringLiteral::new(token));
         }
-        self.error_here(EXPECTED_TOKEN, "expected a string literal");
+        if self.can_start_expression() {
+            self.error_here(EXPECTED_TOKEN, "expected a string literal");
+        } else {
+            self.error_here(EXPECTED_EXPRESSION, "expected an expression");
+        }
+        let token = self.missing_token(TokenKind::StringLiteral);
+        let range = token.range();
+        self.node_at(range, StringLiteral::new(token))
+    }
+
+    /// The name of a module after `from` or in `require(`, where TypeScript reads an
+    /// expression, or in an `import()` type, where it reads a type. A malformed one
+    /// reports its own errors, and one that is not a string literal gets a grammar
+    /// error.
+    fn parse_module_name(&mut self, in_type: bool) -> StringLiteralNode {
+        if self.at(TokenKind::StringLiteral) {
+            return self.parse_string_literal();
+        }
+        let range = if in_type {
+            self.parse_type().range()
+        } else {
+            self.parse_expression(false).range()
+        };
+        self.error_at(
+            MODULE_NAME_NOT_STRING,
+            range,
+            "a module name must be a string literal",
+        );
         let token = self.missing_token(TokenKind::StringLiteral);
         let range = token.range();
         self.node_at(range, StringLiteral::new(token))
@@ -2864,7 +3097,7 @@ impl Parser {
                 None
             };
             self.expect(TokenKind::KwFrom, "expected `from`");
-            let source = self.parse_string_literal();
+            let source = self.parse_module_name(false);
             let attributes = self.parse_optional_import_attributes();
             self.expect_semicolon();
             return self.node(
@@ -2902,7 +3135,7 @@ impl Parser {
                         None
                     };
                     self.expect(TokenKind::KwFrom, "expected `from`");
-                    let source = self.parse_string_literal();
+                    let source = self.parse_module_name(false);
                     let attributes = self.parse_optional_import_attributes();
                     self.expect_semicolon();
                     return self.node(
@@ -3098,7 +3331,7 @@ impl Parser {
         }
         self.expect(TokenKind::RBrace, "expected `}`");
         let (source, attributes) = if self.eat(TokenKind::KwFrom).is_some() {
-            let source = self.parse_string_literal();
+            let source = self.parse_module_name(false);
             let attributes = self.parse_optional_import_attributes();
             (Some(source), attributes)
         } else {
@@ -3239,7 +3472,10 @@ impl Parser {
     fn parse_assignment_inner(&mut self, no_in: bool) -> Expr {
         let start = self.cur_start();
 
-        if self.at(TokenKind::KwYield) {
+        // Outside a generator, sloppy JavaScript reads `yield` as an identifier.
+        if self.at(TokenKind::KwYield)
+            && (self.is_typescript() || self.keyword_context.yield_reserved)
+        {
             return self.parse_yield_expression(start, no_in);
         }
 
@@ -3406,12 +3642,15 @@ impl Parser {
             // unparenthesized prefix-unary (or `await`) left operand. `self`
             // still points at the operator, so inspect it before consuming.
             let is_exponent = matches!(self.kind(), TokenKind::StarStar);
-            if is_exponent && matches!(left.data(), Expression::Unary(_) | Expression::Await(_)) {
-                let op_range = self.cur().range();
+            if is_exponent && let Some(operator) = exponent_operand_operator(left.data()) {
+                let operand = left.range();
+                // TypeScript reports the operand and names its operator first.
                 self.error_at(
                     UNEXPECTED_TOKEN,
-                    op_range,
-                    "an unparenthesized unary expression cannot be the left operand of `**`",
+                    operand,
+                    format!(
+                        "an unparenthesized unary expression with `{operator}` cannot be the left operand of `**`"
+                    ),
                 );
             }
             self.bump();
@@ -3495,7 +3734,7 @@ impl Parser {
             );
         }
 
-        if self.at(TokenKind::KwAwait) && self.can_start_expression_after(1) {
+        if self.at(TokenKind::KwAwait) && self.await_is_an_operator() {
             let keyword_range = self.cur().range();
             self.bump();
             let argument = self.parse_unary_expression();
@@ -3534,6 +3773,72 @@ impl Parser {
     }
 
     /// Whether the `n`-th token can begin the operand of a prefix operator.
+    /// Whether the `await` here starts an await expression. TypeScript always
+    /// reads one so it can report misuse. In JavaScript, `await` outside an async
+    /// function is an ordinary name, and `await instanceof f` uses that name.
+    fn await_is_an_operator(&self) -> bool {
+        if !self.can_start_expression_after(1) {
+            return false;
+        }
+        if self.is_typescript() || self.keyword_context.await_reserved {
+            return true;
+        }
+        if self.keyword_context.in_function {
+            return false;
+        }
+        let next = self.nth_kind(1);
+        if self.has_module_syntax() {
+            return !matches!(next, TokenKind::KwInstanceof | TokenKind::KwIn);
+        }
+        // Without module syntax nothing settles the goal yet. Like Node, read
+        // the name unless what follows could not continue an expression.
+        is_identifier_like(next)
+            || matches!(
+                next,
+                TokenKind::NumericLiteral
+                    | TokenKind::BigIntLiteral
+                    | TokenKind::StringLiteral
+                    | TokenKind::LBrace
+                    | TokenKind::Bang
+                    | TokenKind::Tilde
+                    | TokenKind::KwClass
+                    | TokenKind::KwDelete
+                    | TokenKind::KwFalse
+                    | TokenKind::KwFunction
+                    | TokenKind::KwImport
+                    | TokenKind::KwNew
+                    | TokenKind::KwNull
+                    | TokenKind::KwSuper
+                    | TokenKind::KwThis
+                    | TokenKind::KwTrue
+                    | TokenKind::KwTypeof
+                    | TokenKind::KwVoid
+            )
+    }
+
+    /// Whether any token in the file looks like module syntax. `import(` and
+    /// `import.` also work in a script. A keyword used as a property name
+    /// counts too, which only keeps `await` an operator.
+    fn has_module_syntax(&self) -> bool {
+        let mut index = self.next_significant(0);
+        while index < self.tokens.len() {
+            let next = self.next_significant(index + 1);
+            match self.tokens[index].kind() {
+                TokenKind::KwExport => return true,
+                TokenKind::KwImport
+                    if !self.tokens.get(next).is_some_and(|token| {
+                        matches!(token.kind(), TokenKind::LParen | TokenKind::Dot)
+                    }) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+            index = next;
+        }
+        false
+    }
+
     fn can_start_expression_after(&self, n: usize) -> bool {
         !matches!(
             self.nth_kind(n),
@@ -3760,14 +4065,7 @@ impl Parser {
                     );
                 }
                 TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead => {
-                    let template = self.parse_template_literal();
-                    expr = self.node(
-                        start,
-                        Expression::TaggedTemplate(TaggedTemplateExpression {
-                            tag: Box::new(expr),
-                            template,
-                        }),
-                    );
+                    expr = self.parse_tagged_template(start, expr);
                 }
                 _ if self.at_less_like() => {
                     // `f<T>(...)` / `f<T>\`...\``: only a call/tagged-template
@@ -3791,14 +4089,7 @@ impl Parser {
                         self.kind(),
                         TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead
                     ) {
-                        let template = self.parse_template_literal();
-                        expr = self.node(
-                            start,
-                            Expression::TaggedTemplate(TaggedTemplateExpression {
-                                tag: Box::new(expr),
-                                template,
-                            }),
-                        );
+                        expr = self.parse_tagged_template(start, expr);
                     } else {
                         break;
                     }
@@ -3807,6 +4098,19 @@ impl Parser {
             }
         }
         expr
+    }
+
+    fn parse_tagged_template(&mut self, start: Utf16Pos, tag: Expr) -> Expr {
+        let template = self.parse_template_literal();
+        self.tagged_spans
+            .extend(template.elements.iter().map(|element| element.range()));
+        self.node(
+            start,
+            Expression::TaggedTemplate(TaggedTemplateExpression {
+                tag: Box::new(tag),
+                template,
+            }),
+        )
     }
 
     fn parse_optional_chain_link(&mut self, start: Utf16Pos, expr: Expr, no_call: bool) -> Expr {
@@ -3849,7 +4153,7 @@ impl Parser {
                         }),
                     )
                 } else {
-                    let property = self.parse_member_property_name();
+                    let property = self.parse_optional_member_property_name();
                     self.node(
                         start,
                         Expression::Member(MemberExpression {
@@ -3861,7 +4165,7 @@ impl Parser {
                 }
             }
             _ => {
-                let property = self.parse_member_property_name();
+                let property = self.parse_optional_member_property_name();
                 self.node(
                     start,
                     Expression::Member(MemberExpression {
@@ -3872,6 +4176,16 @@ impl Parser {
                 )
             }
         }
+    }
+
+    /// The name after `?.`. TypeScript reports a missing one at the token, also at
+    /// the end of the text.
+    fn parse_optional_member_property_name(&mut self) -> MemberProperty {
+        if self.at(TokenKind::PrivateIdentifier) || is_any_word(self.kind()) {
+            return self.parse_member_property_name();
+        }
+        self.error_at_token(EXPECTED_IDENTIFIER, "expected a property name");
+        MemberProperty::Named(self.missing_ident())
     }
 
     fn parse_member_property_name(&mut self) -> MemberProperty {
@@ -3928,7 +4242,7 @@ impl Parser {
     fn parse_primary_expression(&mut self) -> Expr {
         let start = self.cur_start();
         match self.kind() {
-            TokenKind::Slash | TokenKind::SlashEq => {
+            TokenKind::Slash | TokenKind::SlashEq | TokenKind::RegularExpressionLiteral => {
                 self.rescan_regex_here();
                 let token = self.bump();
                 let range = token.range();
@@ -4167,25 +4481,27 @@ impl Parser {
         }
         let name = self.parse_jsx_element_name();
         let attributes = self.parse_jsx_attributes();
-        if self.at(TokenKind::Slash) {
-            self.bump();
+        // TypeScript reads a tag that does not end with `>` as one that closes
+        // itself, so it then expects `/>`.
+        if self.eat(TokenKind::GreaterThan).is_none() {
+            self.expect(TokenKind::Slash, "expected `/`");
             self.expect(TokenKind::GreaterThan, "expected `>`");
             return self.node(
                 start,
                 Expression::JsxSelfClosingElement(JsxSelfClosingElement { name, attributes }),
             );
         }
-        self.expect(TokenKind::GreaterThan, "expected `>`");
         let opening = self.node(start, JsxOpeningElement { name, attributes });
         let children = self.parse_jsx_children();
-        let closing = self.parse_jsx_closing_element();
+        let (closing, name_start) = self.parse_jsx_closing_element();
         let open_text = self.jsx_name_text(&opening.data().name);
         let close_text = self.jsx_name_text(&closing.data().name);
         if open_text != close_text {
+            let name_end = jsx_name_end(&closing.data().name);
             self.error_at(
                 EXPECTED_TOKEN,
-                closing.range(),
-                "JSX closing tag does not match the opening tag",
+                TextRange::new(name_start, name_end.max(name_start)).expect("ordered by max"),
+                format!("JSX closing tag does not match the opening tag `{open_text}`"),
             );
         }
         self.node(
@@ -4198,13 +4514,16 @@ impl Parser {
         )
     }
 
-    fn parse_jsx_closing_element(&mut self) -> JsxClosingElementNode {
+    /// Parses a closing tag, and returns it with the end of its `</`. TypeScript
+    /// names the text of the tag from there, with any trivia before the name.
+    fn parse_jsx_closing_element(&mut self) -> (JsxClosingElementNode, Utf16Pos) {
         let start = self.cur_start();
         self.expect(TokenKind::LessThan, "expected `</`");
         self.expect(TokenKind::Slash, "expected `/`");
+        let name_start = Utf16Pos::new(self.prev_end.max(start.get()));
         let name = self.parse_jsx_element_name();
         self.expect(TokenKind::GreaterThan, "expected `>`");
-        self.node(start, JsxClosingElement { name })
+        (self.node(start, JsxClosingElement { name }), name_start)
     }
 
     /// Parses a JSX name identifier. JSX names are always lexed as
@@ -4304,7 +4623,8 @@ impl Parser {
         if self.at(TokenKind::StringLiteral) {
             return JsxAttributeInitializer::String(self.parse_string_literal());
         }
-        self.error_here(EXPECTED_EXPRESSION, "expected a JSX attribute value");
+        // TypeScript reports this at the token, even at the end of the text.
+        self.error_at_token(EXPECTED_EXPRESSION, "expected a JSX attribute value");
         let start = self.cur_start();
         let container = self.node(start, JsxExpressionContainer { expression: None });
         JsxAttributeInitializer::Expression(container)
@@ -4547,7 +4867,7 @@ impl Parser {
                 // diagnostic instead of derailing the object literal.
                 None
             } else {
-                self.error_here(EXPECTED_TOKEN, "expected a method body");
+                self.error_here(EXPECTED_TOKEN, "expected `{` to begin the method body");
                 None
             };
             return self.node(
@@ -4726,7 +5046,7 @@ impl Parser {
                     break;
                 }
                 _ => {
-                    self.error_here(EXPECTED_TOKEN, "expected a template continuation");
+                    self.error_here(EXPECTED_TOKEN, "expected `}` to continue the template");
                     let tail = self.missing_token(TokenKind::TemplateTail);
                     let range = tail.range();
                     elements.push(self.node_at(range, TemplateElement::new(tail)));
@@ -5407,8 +5727,9 @@ impl Parser {
         if simple {
             self.expression_to_target(expr)
         } else {
-            // Compound assignment requires a simple (identifier/member) target.
-            match expr.data() {
+            // Compound assignment requires a simple (identifier/member) target,
+            // which parentheses may wrap, as they may for `=`.
+            match crate::early_errors::strip_parentheses(&expr).data() {
                 Expression::Identifier(_) | Expression::Member(_) => {
                     self.expression_to_target(expr)
                 }
@@ -5430,7 +5751,8 @@ impl Parser {
                 Node::new(id, range, AssignmentTarget::Identifier(name))
             }
             Expression::Member(member) => {
-                if member.optional {
+                // No link of an optional chain is a target, even past its `?.`.
+                if member.optional || crate::early_errors::in_optional_chain(&member.object) {
                     let original = Node::new(id, range, Expression::Member(member));
                     return Node::new(id, range, AssignmentTarget::Invalid(Box::new(original)));
                 }
@@ -5472,12 +5794,9 @@ impl Parser {
                     let target = self.expression_to_target(*expr);
                     elements.push(AssignmentArrayElement::Target(target));
                 }
-                ArrayElement::Spread(_) => {
-                    // A rest element has no array-target slot. Record a missing
-                    // element so the checker can report it; the parser stays silent.
-                    elements.push(AssignmentArrayElement::Missing(MissingNode::new(
-                        NodeKind::MissingAssignmentTarget,
-                    )));
+                ArrayElement::Spread(spread) => {
+                    let target = self.expression_to_target(*spread.argument);
+                    elements.push(AssignmentArrayElement::Rest(target));
                 }
                 ArrayElement::Missing(node) => {
                     elements.push(AssignmentArrayElement::Missing(node));
@@ -5502,9 +5821,19 @@ impl Parser {
                         name: property.name,
                         target,
                         initializer,
+                        rest: false,
                     });
                 }
-                ObjectMember::Spread(_) | ObjectMember::Method(_) | ObjectMember::Missing(_) => {
+                ObjectMember::Spread(spread) => {
+                    let target = self.expression_to_target(*spread.argument);
+                    properties.push(AssignmentObjectProperty {
+                        name: PropertyName::Missing(MissingNode::new(NodeKind::Identifier)),
+                        target,
+                        initializer: None,
+                        rest: true,
+                    });
+                }
+                ObjectMember::Method(_) | ObjectMember::Missing(_) => {
                     properties.push(AssignmentObjectProperty {
                         name: PropertyName::Missing(MissingNode::new(NodeKind::Identifier)),
                         target: self.node_at(
@@ -5514,6 +5843,7 @@ impl Parser {
                             )),
                         ),
                         initializer: None,
+                        rest: false,
                     });
                 }
             }
@@ -5664,7 +5994,10 @@ impl Parser {
             }
             if self.at(TokenKind::LBracket) && !self.has_newline_before() {
                 self.bump();
-                if self.eat(TokenKind::RBracket).is_some() {
+                // At the end of the text, TypeScript reads an array type, so only
+                // the `]` is missing.
+                if self.at(TokenKind::RBracket) || self.at_eof() {
+                    self.expect(TokenKind::RBracket, "expected `]`");
                     type_node = self.node(start, TypeNode::Array(Box::new(type_node)));
                 } else {
                     let index_type = self.parse_type();
@@ -6146,7 +6479,7 @@ impl Parser {
     fn parse_import_type(&mut self, start: Utf16Pos) -> Ty {
         self.bump();
         self.expect(TokenKind::LParen, "expected `(`");
-        let argument = self.parse_string_literal();
+        let argument = self.parse_module_name(true);
         let attributes = if self.eat(TokenKind::Comma).is_some() {
             // `import("x", { with: {...} })`: the AST stores attributes only.
             if self.at(TokenKind::LBrace) {
@@ -6156,10 +6489,11 @@ impl Parser {
                         && matches!(self.cur_lexeme(), "with" | "assert")
                 {
                     self.bump();
-                    self.expect(TokenKind::Colon, "expected colon");
+                    self.expect(TokenKind::Colon, "expected `:`");
                     self.parse_attribute_object()
                 } else {
-                    self.error_here(EXPECTED_TOKEN, "expected with or assert");
+                    // TypeScript names only `with`, which it also expects here.
+                    self.error_here(EXPECTED_TOKEN, "expected `with`");
                     ImportAttributes::default()
                 };
                 while !self.at_eof() && !self.at(TokenKind::RBrace) {
@@ -6223,6 +6557,8 @@ impl Parser {
         if self.at(TokenKind::NoSubstitutionTemplate) {
             let token = self.bump();
             let range = token.range();
+            // TypeScript reports no escape error in a type with no substitution.
+            self.tagged_spans.push(range);
             elements.push(self.node_at(range, TemplateElement::new(token)));
         } else {
             let head = self.bump();
@@ -6243,7 +6579,7 @@ impl Parser {
                     elements.push(self.node_at(range, TemplateElement::new(token)));
                     break;
                 } else {
-                    self.error_here(EXPECTED_TOKEN, "expected a template continuation");
+                    self.error_here(EXPECTED_TOKEN, "expected `}` to continue the template");
                     break;
                 }
             }
@@ -6448,9 +6784,11 @@ impl Parser {
             }
             let before = self.cursor;
             members.push(self.parse_type_member());
+            // The end of the text also ends a member, so only the `}` is missing.
             if self.eat(TokenKind::Semicolon).is_none()
                 && self.eat(TokenKind::Comma).is_none()
                 && !self.at(TokenKind::RBrace)
+                && !self.at_eof()
                 && !self.has_newline_before()
             {
                 self.error_here(EXPECTED_TOKEN, "expected `;` or `,`");
@@ -6593,7 +6931,7 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnostic::DiagnosticSeverity;
+
     use crate::scanner::scan;
 
     fn parse_text(text: &str, script_kind: ScriptKind) -> Recovered<SourceFile> {
@@ -6759,6 +7097,407 @@ mod tests {
                 "'await' expressions are only allowed within async functions and at the top levels of modules."
             )
         );
+    }
+
+    /// The text that `tsc` 7.0.2 prints for each source, from the message that
+    /// the parser writes.
+    #[test]
+    fn parser_messages_project_onto_the_text_of_tsc() {
+        for (source, code, message) in [
+            (
+                "class C { export x = 1; }",
+                "TS1031",
+                "'export' modifier cannot appear on class elements of this kind.",
+            ),
+            (
+                "const z = -2 ** 2;",
+                "TS17006",
+                "An unary expression with the '-' operator is not allowed in the left-hand side of an exponentiation expression. Consider enclosing the expression in parentheses.",
+            ),
+            ("const o = { a: 1;", "TS1005", "',' expected."),
+            ("try { }", "TS1472", "'catch' or 'finally' expected."),
+            (
+                r#"const a = "\101";"#,
+                "TS1487",
+                r"Octal escape sequences are not allowed. Use the syntax '\x41'.",
+            ),
+            (
+                r#"const b = "\8";"#,
+                "TS1488",
+                r"Escape sequence '\8' is not allowed.",
+            ),
+        ] {
+            let parsed = parse_ts(source);
+            let mapped = crate::diagnostics_parser::map_parse_diagnostic(errors(&parsed)[0]);
+            assert_eq!(
+                (mapped.code().as_str(), mapped.message()),
+                (code, message),
+                "{source}"
+            );
+        }
+    }
+
+    /// `tsc` 7.0.2 reports TS17006 over the unary operand and TS17002 from the
+    /// end of `</` to the end of the name of the closing tag.
+    #[test]
+    fn an_operand_or_a_tag_error_is_where_tsc_reports_it() {
+        for (source, script_kind, range) in [
+            ("const z = -2 ** 2;", ScriptKind::TypeScript, (10, 12)),
+            (
+                "async () => { await 1 ** 2; };",
+                ScriptKind::TypeScript,
+                (14, 21),
+            ),
+            (
+                "const e = <div></span>;",
+                ScriptKind::TypeScriptReact,
+                (17, 21),
+            ),
+            (
+                "const e = <a.b></a.c>;",
+                ScriptKind::TypeScriptReact,
+                (17, 20),
+            ),
+            (
+                "const f = <a></ /*c*/ b>;",
+                ScriptKind::TypeScriptReact,
+                (15, 23),
+            ),
+            (
+                "const f = <é𝑥></  é𝑥y >;",
+                ScriptKind::TypeScriptReact,
+                (17, 23),
+            ),
+        ] {
+            let parsed = parse_text(source, script_kind);
+            let found: Vec<(usize, usize)> = errors(&parsed)
+                .iter()
+                .map(|d| (d.range().start().get(), d.range().end().get()))
+                .collect();
+            assert_eq!(found, [range], "{source}");
+        }
+    }
+
+    /// `tsc` 7.0.2 reports no parse error at the start of an earlier one, and a
+    /// lexical error comes first.
+    #[test]
+    fn one_parse_error_is_reported_at_a_position() {
+        let found_in = |text: &str, script_kind: ScriptKind| -> Vec<(usize, String)> {
+            errors(&parse_text(text, script_kind))
+                .iter()
+                .map(|d| {
+                    let mapped = crate::diagnostics_parser::map_parse_diagnostic(d);
+                    (d.range().start().get(), mapped.message().to_owned())
+                })
+                .collect()
+        };
+        let found = |text: &str| found_in(text, ScriptKind::TypeScript);
+        assert_eq!(
+            found("const o = { a: 1;\n"),
+            [
+                (16, "',' expected.".to_owned()),
+                (18, "'}' expected.".to_owned())
+            ]
+        );
+        assert_eq!(
+            found(r#"let a = "\x"#),
+            [(11, "Hexadecimal digit expected.".to_owned())]
+        );
+        // At the end of the text, a missing name or expression is reported
+        // after the last token, so it does not meet an error at the end.
+        assert_eq!(
+            found("let x = /* nope"),
+            [
+                (7, "Expression expected.".to_owned()),
+                (15, "'*/' expected.".to_owned())
+            ]
+        );
+        assert_eq!(
+            found("let x = 1 +  /* c"),
+            [
+                (11, "Expression expected.".to_owned()),
+                (17, "'*/' expected.".to_owned())
+            ]
+        );
+        assert_eq!(
+            found("let x = \n\n"),
+            [(7, "Expression expected.".to_owned())]
+        );
+        assert_eq!(
+            found("/* 😀 */ a.  // c"),
+            [(11, "Identifier expected.".to_owned())]
+        );
+        // A missing type is reported there too, but `A[` is an array type that
+        // misses its `]`.
+        assert_eq!(found("let x:   // c"), [(6, "Type expected.".to_owned())]);
+        assert_eq!(
+            found("let x: A[   // c"),
+            [(16, "']' expected.".to_owned())]
+        );
+        assert_eq!(
+            found("interface I { a:   // c"),
+            [
+                (16, "Type expected.".to_owned()),
+                (23, "'}' expected.".to_owned())
+            ]
+        );
+        // After `?.`, a missing name is reported at the token.
+        assert_eq!(
+            found("declare let a: any; a?.   // c"),
+            [(30, "Identifier expected.".to_owned())]
+        );
+        // At the end of the text, a class has no missing name, and a heritage
+        // list has no missing element.
+        for (text, end) in [
+            ("class   // c", 12),
+            ("class C extends   // c", 22),
+            ("class C implements   // c", 25),
+            ("class C implements A,   // c", 28),
+            ("interface I extends   // c", 26),
+            ("interface I extends A,   // c", 29),
+        ] {
+            assert_eq!(found(text), [(end, "'{' expected.".to_owned())], "{text}");
+        }
+        // A JSX attribute value is expected at the token, and a tag that does not
+        // end with `>` closes itself.
+        let attribute: Vec<usize> =
+            errors(&parse_text("const e = <a b= ", ScriptKind::TypeScriptReact))
+                .iter()
+                .map(|d| d.range().start().get())
+                .collect();
+        assert_eq!(attribute, [16]);
+        assert_eq!(
+            found_in("const e = <a b   ", ScriptKind::TypeScriptReact),
+            [(17, "'/' expected.".to_owned())]
+        );
+    }
+
+    /// `tsc` 7.0.2 reads an expression, or in an `import()` type a type, where a
+    /// module name belongs.
+    #[test]
+    fn a_missing_module_name_is_a_missing_expression_or_type() {
+        let found = |text: &str| -> Vec<(usize, String)> {
+            errors(&parse_ts(text))
+                .iter()
+                .map(|d| {
+                    let mapped = crate::diagnostics_parser::map_parse_diagnostic(d);
+                    (d.range().start().get(), mapped.message().to_owned())
+                })
+                .collect()
+        };
+        for (text, at, message) in [
+            ("import x from ;", 14, "Expression expected."),
+            ("import x from   // c", 13, "Expression expected."),
+            ("import x = require();", 19, "Expression expected."),
+            ("export * as x from ;", 19, "Expression expected."),
+            ("export { a } from 1;", 18, "String literal expected."),
+            ("import x from y;", 14, "String literal expected."),
+            ("type T = import();", 16, "Type expected."),
+        ] {
+            assert_eq!(found(text), [(at, message.to_owned())], "{text}");
+        }
+        assert_eq!(
+            found(r#"type T = import("x", { 1 });"#)[0],
+            (23, "'with' expected.".to_owned())
+        );
+    }
+
+    /// A tag accepts any escape, also in JSX, where the parser scans the template
+    /// again.
+    #[test]
+    fn a_tagged_template_in_jsx_keeps_no_escape_error() {
+        for (text, script_kind) in [
+            (r"const e = <a b={tag`\1`} />;", ScriptKind::JavaScriptReact),
+            (
+                r"const e = <a>{tag`${1}\8`}</a>;",
+                ScriptKind::JavaScriptReact,
+            ),
+            (r"const e = <a b={tag`\1`} />;", ScriptKind::TypeScriptReact),
+        ] {
+            let parsed = parse_text(text, script_kind);
+            assert_eq!(errors(&parsed), Vec::<&Diagnostic>::new(), "{text}");
+        }
+        let plain = parse_text(r"const e = <a b={`\1`} />;", ScriptKind::JavaScriptReact);
+        let starts: Vec<usize> = errors(&plain)
+            .iter()
+            .map(|d| d.range().start().get())
+            .collect();
+        assert_eq!(starts, [17], "a template with no tag keeps its error");
+    }
+
+    /// `tsc` 7.0.2 reports no escape error in a template literal type with no
+    /// substitution, and the errors of one with a substitution.
+    #[test]
+    fn a_template_literal_type_with_no_substitution_keeps_no_escape_error() {
+        for source in [
+            r"type T = `\1`;",
+            r"type T = `a\01`;",
+            r"type T = `\8`;",
+            r"type T = `\x`;",
+            r"type T = `\u{110000}`;",
+        ] {
+            let parsed = parse_ts(source);
+            assert_eq!(errors(&parsed), Vec::<&Diagnostic>::new(), "{source}");
+        }
+        for (source, start) in [
+            (r"type T = `\1${string}`;", 10),
+            (r"type T = `${string}\1`;", 19),
+            (r"let a = `\1`;", 9),
+        ] {
+            let parsed = parse_ts(source);
+            let starts: Vec<usize> = errors(&parsed)
+                .iter()
+                .map(|d| d.range().start().get())
+                .collect();
+            assert_eq!(starts, [start], "{source}");
+        }
+    }
+
+    /// `tsc` 7.0.2 reports a string, a template or a comment that is not closed
+    /// at the end of its text. The parser still drops one that starts in text
+    /// that it scans again.
+    #[test]
+    fn an_unterminated_literal_is_reported_at_its_end() {
+        for (source, start) in [
+            ("let a = \"abc\nlet b = 1;", 12),
+            ("let a = `ab${1}cd\nlet b = 2;\n", 29),
+            ("let a = 1; /* nope\nlet b = 2;\n", 30),
+        ] {
+            let parsed = parse_ts(source);
+            let found: Vec<(usize, usize)> = errors(&parsed)
+                .iter()
+                .map(|d| (d.range().start().get(), d.range().end().get()))
+                .collect();
+            assert_eq!(found, [(start, start)], "{source}");
+        }
+        let jsx = parse_text(
+            "const a = <div>don't</div>; const b = 1;\n",
+            ScriptKind::TypeScriptReact,
+        );
+        assert!(errors(&jsx).is_empty(), "{:?}", errors(&jsx));
+        // The parser scans a JSX attribute again. A literal there that is not
+        // closed is reported at the end of the text too, and alone.
+        for (source, start) in [
+            ("const e = <a b=\"abc />;\nconst f = 1;\n", 37),
+            ("const e = <a b={`abc} />;\nconst f = 1;\n", 39),
+        ] {
+            let parsed = parse_text(source, ScriptKind::TypeScriptReact);
+            let found: Vec<(usize, usize)> = errors(&parsed)
+                .iter()
+                .map(|d| (d.range().start().get(), d.range().end().get()))
+                .collect();
+            assert_eq!(found, [(start, start)], "{source}");
+        }
+    }
+
+    /// `tsc` 7.0.2 reports a template with no substitution that is not closed
+    /// before an escape error at its end. A string and a template tail report the
+    /// escape error there, and a braced escape that reaches the end is TS1126.
+    #[test]
+    fn an_escape_at_the_end_of_an_unclosed_literal_is_reported_as_tsc_does() {
+        // The errors at one position are in the order of their TypeScript codes,
+        // which is the order that a report gives them.
+        let found = |text: &str| -> Vec<(usize, String)> {
+            let mut found: Vec<(usize, String)> = errors(&parse_ts(text))
+                .iter()
+                .map(|d| {
+                    let mapped = crate::diagnostics_parser::map_parse_diagnostic(d);
+                    (d.range().start().get(), mapped.code().as_str().to_owned())
+                })
+                .collect();
+            found.sort();
+            found
+        };
+        let at = |list: &[(usize, &str)]| -> Vec<(usize, String)> {
+            list.iter()
+                .map(|(start, code)| (*start, (*code).to_owned()))
+                .collect()
+        };
+        for (source, expected) in [
+            (r"let a = `\x", at(&[(11, "TS1160")])),
+            (r"let a = `a\x1", at(&[(13, "TS1160")])),
+            (r"let a = `\u", at(&[(11, "TS1160")])),
+            (r"let a = `\u{12", at(&[(14, "TS1160")])),
+            (r"type T = `\x", at(&[(12, "TS1160")])),
+            (r"let a = `\1", at(&[(9, "TS1487"), (11, "TS1160")])),
+            (r"let a = `${1}\x", at(&[(15, "TS1125")])),
+            (r#"let a = "\x"#, at(&[(11, "TS1125")])),
+            (r#"let a = "\u{12"#, at(&[(14, "TS1126")])),
+            (r"let a = `${1}\u{12", at(&[(18, "TS1126")])),
+            (r#"let a = "\u{12x""#, at(&[(14, "TS1199")])),
+            (
+                r#"let a = "\u{110000"#,
+                at(&[(12, "TS1198"), (18, "TS1126")]),
+            ),
+            // An error at the end of the template is lost only when it is the
+            // first error in the text.
+            (
+                r"let a = `\1\u{12",
+                at(&[(9, "TS1487"), (16, "TS1126"), (16, "TS1160")]),
+            ),
+            (
+                r"let a = `\u{110000",
+                at(&[(12, "TS1198"), (18, "TS1126"), (18, "TS1160")]),
+            ),
+            (
+                r"let a = `\xZ\u{",
+                at(&[(11, "TS1125"), (15, "TS1125"), (15, "TS1160")]),
+            ),
+            (
+                r"let a = `\u{110000}\x",
+                at(&[(12, "TS1198"), (21, "TS1125"), (21, "TS1160")]),
+            ),
+        ] {
+            assert_eq!(found(source), expected, "{source}");
+        }
+    }
+
+    /// `tsc` 7.0.2 reads an expression where a module name belongs. A malformed one
+    /// reports its own errors, and one that is not a string literal is TS1141,
+    /// which a file with a parse error does not get.
+    #[test]
+    fn a_module_name_is_read_as_an_expression() {
+        let found = |text: &str| -> Vec<(usize, String)> {
+            errors(&parse_ts(text))
+                .iter()
+                .map(|d| {
+                    let mapped = crate::diagnostics_parser::map_parse_diagnostic(d);
+                    (d.range().start().get(), mapped.code().as_str().to_owned())
+                })
+                .collect()
+        };
+        let at = |list: &[(usize, &str)]| -> Vec<(usize, String)> {
+            list.iter()
+                .map(|(start, code)| (*start, (*code).to_owned()))
+                .collect()
+        };
+        for (source, expected) in [
+            ("import x from y;", at(&[(14, "TS1141")])),
+            ("import x from 1;", at(&[(14, "TS1141")])),
+            ("import x from (a);", at(&[(14, "TS1141")])),
+            ("import x from a, b;", at(&[(14, "TS1141")])),
+            ("import x from +;", at(&[(15, "TS1109")])),
+            ("import x from *;", at(&[(14, "TS1109"), (15, "TS1109")])),
+            ("import x from =;", at(&[(14, "TS1109"), (15, "TS1109")])),
+            ("import x from <;", at(&[(15, "TS1110")])),
+            ("import x from /;", at(&[(14, "TS1161")])),
+            ("export * from +;", at(&[(15, "TS1109")])),
+            ("export { a } from +;", at(&[(19, "TS1109")])),
+            ("import x = require(y);", at(&[(19, "TS1141")])),
+            (
+                "import x = require(*);",
+                at(&[(19, "TS1109"), (20, "TS1109")]),
+            ),
+            ("import x from y; let a = ;", at(&[(25, "TS1109")])),
+            ("let a = ;\nimport x from y;", at(&[(8, "TS1109")])),
+            // An `import()` type reads a type there.
+            ("type T = import(y);", at(&[(16, "TS1141")])),
+            ("type T = import(1);", at(&[(16, "TS1141")])),
+            ("type T = import(`x`);", at(&[(16, "TS1141")])),
+            ("type T = import();", at(&[(16, "TS1110")])),
+        ] {
+            assert_eq!(found(source), expected, "{source}");
+        }
     }
 
     #[test]
@@ -6957,6 +7696,34 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_semicolon_is_a_class_member() {
+        for source in [
+            "class C { ; }",
+            "class C { ;;; }",
+            "class C { a() {}; b = 1;; static c() {} ; }",
+            "class C { #a() {}; get #b() { return 1; }; }",
+        ] {
+            assert_clean(source);
+        }
+        let recovered = assert_clean("class C { a() {}; }");
+        let Statement::Class(class) = recovered.product().statements()[0].data() else {
+            panic!("expected a class");
+        };
+        let members: Vec<_> = class.members.iter().map(|member| member.data()).collect();
+        assert!(matches!(
+            members[..],
+            [ClassMember::Method(_), ClassMember::Semicolon]
+        ));
+    }
+
+    #[test]
+    fn jsx_text_that_looks_like_a_regex_stays_text() {
+        let source = "const a = <p>, /x</p>;\nconst b = <p>= /'</p>;\n";
+        let parsed = parse_text(source, ScriptKind::TypeScriptReact);
+        assert!(errors(&parsed).is_empty(), "{:?}", errors(&parsed));
+    }
+
+    #[test]
     fn regex_rescan_produces_literal() {
         let recovered = assert_clean("const r = /a[/]b/gi;");
         let Statement::Variable(decl) = recovered.product().statements()[0].data() else {
@@ -7109,6 +7876,26 @@ mod tests {
         assert_eq!(parameter_names, ["B", "x", "public"]);
     }
 
+    /// Only a tag takes a bad escape, and a tag does not cover the substitutions.
+    #[test]
+    fn a_tag_takes_any_escape_in_its_own_text() {
+        let escapes = |text: &str| {
+            parse_ts(text)
+                .diagnostics()
+                .iter()
+                .filter(|d| is_escape_diagnostic(d.code()))
+                .count()
+        };
+        assert_eq!(escapes(r"tag`\xg \u12 \u{110000} \u{12`;"), 0);
+        assert_eq!(escapes(r"tag`\1 \08 \8`;"), 0);
+        assert_eq!(escapes(r"tag`${1}\xg${2}\u12`;"), 0);
+        assert_eq!(escapes(r"tag<T>`\xg`;"), 0);
+        assert_eq!(escapes(r"`\xg`;"), 1);
+        assert_eq!(escapes(r"`\1`;"), 1);
+        assert_eq!(escapes(r"`\u{110000}`;"), 1);
+        assert_eq!(escapes(r"tag`${`\xg`}`;"), 1);
+    }
+
     #[test]
     fn parses_template_and_tagged_template() {
         let recovered = assert_clean("const s = `a${1 + 2}b${x}c`;");
@@ -7133,7 +7920,7 @@ mod tests {
         // Upstream accepts `{ get foo() }` with zero diagnostics (its
         // parseFunctionBlockOrSemicolon tolerates a member-ending token), so
         // the parser must recover the accessor with a missing body instead
-        // of minting "expected a method body".
+        // of reporting that a method body is expected.
         let recovered = assert_clean("var v = { get foo() }");
         let Statement::Variable(decl) = recovered.product().statements()[0].data() else {
             panic!("expected a variable declaration");

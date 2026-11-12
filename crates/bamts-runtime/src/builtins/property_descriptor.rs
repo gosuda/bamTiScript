@@ -1,4 +1,3 @@
-use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::type_error;
@@ -106,7 +105,7 @@ fn descriptor_field<H: Host>(
     descriptor: Value,
     name: &str,
 ) -> Result<Option<Value>, EvalFailure> {
-    let key = PropertyKey::Named(EcmaString::encode(name));
+    let key = PropertyKey::Named(machine.intern_str(name));
     if !machine.internal_has_property(descriptor, &key)? {
         return Ok(None);
     }
@@ -170,9 +169,10 @@ fn define_reified_field<H: Host>(
     name: &str,
     value: Value,
 ) -> Result<(), EvalFailure> {
+    let key = PropertyKey::Named(machine.intern_str(name));
     machine.define_descriptor(
         object,
-        PropertyKey::Named(EcmaString::encode(name)),
+        key,
         Property::Data {
             value,
             writable: true,
@@ -412,6 +412,8 @@ pub(crate) fn is_extensible<H: Host>(
         | HeapEntry::Script { extensible, .. }
         | HeapEntry::RegExp { extensible, .. }
         | HeapEntry::Date { extensible, .. }
+        | HeapEntry::Temporal { extensible, .. }
+        | HeapEntry::Intl { extensible, .. }
         | HeapEntry::Collection { extensible, .. }
         | HeapEntry::BuiltinIterator { extensible, .. }
         | HeapEntry::Generator { extensible, .. }
@@ -762,7 +764,7 @@ mod tests {
     fn configurable_properties_transition_both_directions_with_defaults() {
         with_machine(|machine| {
             let object = ordinary_object(machine);
-            let key = PropertyKey::Named(EcmaString::encode("x"));
+            let key = PropertyKey::Named(machine.intern_str("x"));
             machine
                 .define_descriptor(object, key.clone(), data(Value::int32(3), true, true))
                 .unwrap();
@@ -808,7 +810,7 @@ mod tests {
     fn application_preserves_omitted_fields_and_rejects_non_extensible_creation() {
         with_machine(|machine| {
             let object = ordinary_object(machine);
-            let key = PropertyKey::Named(EcmaString::encode("x"));
+            let key = PropertyKey::Named(machine.intern_str("x"));
             machine
                 .define_descriptor(object, key.clone(), data(Value::int32(3), true, true))
                 .unwrap();
@@ -833,7 +835,7 @@ mod tests {
                 }) if value == Value::int32(3)
             ));
 
-            let created_empty = PropertyKey::Named(EcmaString::encode("created_empty"));
+            let created_empty = PropertyKey::Named(machine.intern_str("created_empty"));
             assert!(
                 validate_and_apply_property_descriptor(
                     machine,
@@ -874,7 +876,7 @@ mod tests {
                 machine.get_named_property(object, "x").unwrap(),
                 Value::int32(8)
             );
-            let empty = PropertyKey::Named(EcmaString::encode("empty"));
+            let empty = PropertyKey::Named(machine.intern_str("empty"));
             assert!(
                 !validate_and_apply_property_descriptor(
                     machine,
@@ -886,7 +888,7 @@ mod tests {
                 .unwrap()
             );
             assert!(machine.own_descriptor(object, &empty).unwrap().is_none());
-            let missing = PropertyKey::Named(EcmaString::encode("missing"));
+            let missing = PropertyKey::Named(machine.intern_str("missing"));
             assert!(
                 !validate_and_apply_property_descriptor(
                     machine,
@@ -948,7 +950,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
     }
 
     #[test]
@@ -981,10 +983,11 @@ mod tests {
                 configurable_abrupt::<TestHost>,
             );
             for (name, getter) in [("enumerable", enumerable), ("configurable", configurable)] {
+                let key = PropertyKey::Named(machine.intern_str(name));
                 machine
                     .define_descriptor(
                         object,
-                        PropertyKey::Named(EcmaString::encode(name)),
+                        key,
                         Property::Accessor {
                             getter: Some(getter),
                             setter: None,
@@ -1020,10 +1023,11 @@ mod tests {
                 "setter lookup probe",
                 setter_lookup_probe::<TestHost>,
             );
+            let set_key = PropertyKey::Named(machine.intern_str("set"));
             machine
                 .define_descriptor(
                     object,
-                    PropertyKey::Named(EcmaString::encode("set")),
+                    set_key,
                     Property::Accessor {
                         getter: Some(setter_probe),
                         setter: None,
@@ -1096,17 +1100,12 @@ mod tests {
                 machine.get_named_property(object, "enumerable").unwrap(),
                 Value::TRUE
             );
-            assert!(
-                machine
-                    .own_descriptor(object, &PropertyKey::Named(EcmaString::encode("get")))
-                    .unwrap()
-                    .is_none()
-            );
+            let get_key = PropertyKey::Named(machine.intern_str("get"));
+            assert!(machine.own_descriptor(object, &get_key).unwrap().is_none());
             for name in ["value", "writable", "enumerable"] {
+                let name_key = PropertyKey::Named(machine.intern_str(name));
                 assert!(matches!(
-                    machine
-                        .own_descriptor(object, &PropertyKey::Named(EcmaString::encode(name)))
-                        .unwrap(),
+                    machine.own_descriptor(object, &name_key).unwrap(),
                     Some(Property::Data {
                         writable: true,
                         enumerable: true,
@@ -1143,12 +1142,10 @@ mod tests {
                 machine.get_named_property(accessor_object, "set").unwrap(),
                 Value::UNDEFINED
             );
+            let value_key = PropertyKey::Named(machine.intern_str("value"));
             assert!(
                 machine
-                    .own_descriptor(
-                        accessor_object,
-                        &PropertyKey::Named(EcmaString::encode("value")),
-                    )
+                    .own_descriptor(accessor_object, &value_key,)
                     .unwrap()
                     .is_none()
             );
@@ -1169,10 +1166,10 @@ mod tests {
                     .unwrap();
             }
             let first_symbol = machine
-                .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+                .property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
                 .unwrap();
             let second_symbol = machine
-                .to_property_key(machine.intrinsics.builtins.symbol_to_string_tag())
+                .property_key_from_value(machine.intrinsics.builtins.symbol_to_string_tag())
                 .unwrap();
             machine
                 .set_data_property_key(descriptors, first_symbol.clone(), descriptor)
@@ -1189,10 +1186,10 @@ mod tests {
             assert_eq!(
                 keys,
                 vec![
-                    PropertyKey::Named(EcmaString::encode("2")),
-                    PropertyKey::Named(EcmaString::encode("10")),
-                    PropertyKey::Named(EcmaString::encode("b")),
-                    PropertyKey::Named(EcmaString::encode("a")),
+                    PropertyKey::Named(machine.intern_str("2")),
+                    PropertyKey::Named(machine.intern_str("10")),
+                    PropertyKey::Named(machine.intern_str("b")),
+                    PropertyKey::Named(machine.intern_str("a")),
                     first_symbol,
                     second_symbol,
                 ]

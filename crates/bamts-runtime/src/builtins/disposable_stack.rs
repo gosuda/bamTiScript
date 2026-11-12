@@ -96,6 +96,8 @@ fn async_disposable_stack_public_method<H: Host>(
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -124,46 +126,40 @@ pub(super) fn install<H: Host>(
                 )
             }
         };
-        let constructor = install_constructor_function(
-            heap,
-            builtins,
-            descriptor.name,
-            descriptor.length,
-            stack_constructor_handler::<H>,
-        );
-        builtins.set_constructor_prototype(heap, constructor, prototype);
+        let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: descriptor.name, length: descriptor.length, handler: stack_constructor_handler::<H> });
+        builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
 
         let mut disposal_method = None;
         for method in methods {
-            let function =
-                install_function(heap, builtins, method.name, method.length, method_handler);
+            let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: method.name, length: method.length, handler: method_handler });
             if matches!(
                 method.kind,
                 StackMethodKind::Dispose | StackMethodKind::DisposeAsync
             ) {
                 disposal_method = Some(function);
             }
-            define_data(heap, prototype, method.name, function);
+            define_data(heap, atoms, shapes, prototype, method.name, function);
         }
         let disposal_method = disposal_method.expect("stack method table includes disposal");
         for install in installs {
             match *install {
                 StackInstall::DisposedAccessor => {
                     let getter =
-                        install_function(heap, builtins, "get disposed", 0, disposed_getter);
-                    define_getter(heap, prototype, "disposed", getter);
+                        install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get disposed", length: 0, handler: disposed_getter });
+                    define_getter(heap, atoms, shapes, prototype, "disposed", getter);
                 }
                 StackInstall::DisposeAlias => {
-                    define_symbol(heap, prototype, builtins.symbol_dispose(), disposal_method)
+                    define_symbol(heap, shapes, prototype, builtins.symbol_dispose(), disposal_method)
                 }
                 StackInstall::AsyncDisposeAlias => define_symbol(
                     heap,
+                    shapes,
                     prototype,
                     builtins.symbol_async_dispose(),
                     disposal_method,
                 ),
                 StackInstall::ToStringTag(tag) => {
-                    define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), tag)
+                    define_to_string_tag(heap, shapes, prototype, builtins.symbol_to_string_tag(), tag)
                 }
             }
         }
@@ -183,12 +179,20 @@ fn ordinary(heap: &mut Vec<HeapEntry>, prototype: Option<Value>) -> Value {
     )
 }
 
-fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
+fn define_getter(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+    object: Value,
+    name: &str,
+    getter: Value,
+) {
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
         unreachable!("DisposableStack prototype is an ordinary object")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        shapes,
+        PropertyKey::Named(atoms.intern_str(name)),
         Property::Accessor {
             getter: Some(getter),
             setter: None,
@@ -198,11 +202,12 @@ fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Valu
     );
 }
 
-fn define_symbol(heap: &mut [HeapEntry], object: Value, symbol: Value, value: Value) {
+fn define_symbol(heap: &mut [HeapEntry], shapes: &mut crate::ShapeTable, object: Value, symbol: Value, value: Value) {
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
         unreachable!("DisposableStack prototype is an ordinary object")
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(heap_index(symbol) as u32),
         builtin_property(value),
     );

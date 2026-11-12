@@ -1258,7 +1258,7 @@ fn visit_class(
             ClassMember::StaticBlock(block) => {
                 visit_statement_list(&block.data().statements, script_kind, findings)
             }
-            ClassMember::IndexSignature(_) | ClassMember::Missing(_) => {}
+            ClassMember::IndexSignature(_) | ClassMember::Missing(_) | ClassMember::Semicolon => {}
         }
     }
 }

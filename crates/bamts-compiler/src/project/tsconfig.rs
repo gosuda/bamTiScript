@@ -609,9 +609,10 @@ fn utf16_offset(source: &str, byte: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::test_paths::abs;
 
     fn root() -> ProjectRoot {
-        ProjectRoot::new("/workspace").unwrap()
+        ProjectRoot::new(abs("/workspace")).unwrap()
     }
 
     #[test]
@@ -663,7 +664,7 @@ mod tests {
         assert_eq!(cfg.references()[0].original_path(), Some("packages/foo"));
         assert_eq!(
             cfg.references()[0].path(),
-            Path::new("/workspace/packages/foo")
+            abs("/workspace/packages/foo").as_path()
         );
         assert_eq!(cfg.references()[1].original_path(), Some("packages/bar"));
         assert_eq!(cfg.references()[1].prepend(), Some(true));
@@ -695,7 +696,7 @@ mod tests {
     fn relative_extends() {
         let source = r#"{"extends": "./base.json"}"#;
         let loader = |p: &Path| {
-            if p == Path::new("/workspace/base.json") {
+            if p == abs("/workspace/base.json").as_path() {
                 Some(Arc::from(r#"{"compilerOptions": {"strict": true}}"#))
             } else {
                 None
@@ -703,7 +704,7 @@ mod tests {
         };
         let chain = resolve_extends(&root(), "tsconfig.json", source, &loader, 8).unwrap();
         assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].path(), Path::new("/workspace/base.json"));
+        assert_eq!(chain[0].path(), abs("/workspace/base.json").as_path());
         assert_eq!(chain[0].specifier(), "./base.json");
     }
 
@@ -711,7 +712,7 @@ mod tests {
     fn package_extends() {
         let source = r#"{"extends": "@tsconfig/strict"}"#;
         let loader = |p: &Path| {
-            if p == Path::new("/workspace/node_modules/@tsconfig/strict/tsconfig.json") {
+            if p == abs("/workspace/node_modules/@tsconfig/strict/tsconfig.json").as_path() {
                 Some(Arc::from(r#"{}"#))
             } else {
                 None
@@ -721,7 +722,7 @@ mod tests {
         assert_eq!(chain.len(), 1);
         assert_eq!(
             chain[0].path(),
-            Path::new("/workspace/node_modules/@tsconfig/strict/tsconfig.json")
+            abs("/workspace/node_modules/@tsconfig/strict/tsconfig.json").as_path()
         );
     }
 
@@ -729,7 +730,7 @@ mod tests {
     fn package_extends_with_subpath() {
         let source = r#"{"extends": "@tsconfig/strict/tsconfig.json"}"#;
         let loader = |p: &Path| {
-            if p == Path::new("/workspace/node_modules/@tsconfig/strict/tsconfig.json") {
+            if p == abs("/workspace/node_modules/@tsconfig/strict/tsconfig.json").as_path() {
                 Some(Arc::from(r#"{}"#))
             } else {
                 None
@@ -739,23 +740,26 @@ mod tests {
         assert_eq!(chain.len(), 1);
         assert_eq!(
             chain[0].path(),
-            Path::new("/workspace/node_modules/@tsconfig/strict/tsconfig.json")
+            abs("/workspace/node_modules/@tsconfig/strict/tsconfig.json").as_path()
         );
     }
 
     #[test]
     fn extends_arrays_preserve_order_and_walk_ancestor_node_modules() {
         let source = r#"{"extends":["./base.json","@tsconfig/strict"]}"#;
-        let loader = |path: &Path| match path.to_str() {
-            Some("/workspace/packages/app/base.json") => Some(Arc::from(r#"{}"#)),
-            Some("/workspace/node_modules/@tsconfig/strict/tsconfig.json") => {
-                Some(Arc::from(r#"{}"#))
-            }
-            _ => None,
+        let loader = |path: &Path| {
+            let known = [
+                abs("/workspace/packages/app/base.json"),
+                abs("/workspace/node_modules/@tsconfig/strict/tsconfig.json"),
+            ];
+            known
+                .iter()
+                .any(|candidate| candidate == path)
+                .then(|| Arc::from(r#"{}"#))
         };
         let chain = resolve_extends(
             &root(),
-            "/workspace/packages/app/tsconfig.json",
+            abs("/workspace/packages/app/tsconfig.json"),
             source,
             &loader,
             8,
@@ -766,7 +770,7 @@ mod tests {
         assert_eq!(chain[1].specifier(), "@tsconfig/strict");
         assert_eq!(
             chain[1].path(),
-            Path::new("/workspace/node_modules/@tsconfig/strict/tsconfig.json")
+            abs("/workspace/node_modules/@tsconfig/strict/tsconfig.json").as_path()
         );
     }
 
@@ -790,9 +794,9 @@ mod tests {
     fn extends_cycle() {
         let source = r#"{"extends": "./a.json"}"#;
         let loader = |p: &Path| {
-            if p == Path::new("/workspace/a.json") {
+            if p == abs("/workspace/a.json").as_path() {
                 Some(Arc::from(r#"{"extends": "./b.json"}"#))
-            } else if p == Path::new("/workspace/b.json") {
+            } else if p == abs("/workspace/b.json").as_path() {
                 Some(Arc::from(r#"{"extends": "./a.json"}"#))
             } else {
                 None

@@ -350,10 +350,64 @@
       "tsCode": 2351
     },
     {
+      "bamtsCode": "BAMTS-C060",
+      "evidence": "Emitted by bamts-compiler as ASSIGNMENT_TO_CONST (checker.rs) and DUPLICATE_ENUM_MEMBER (checker/enum_namespace.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C061",
+      "evidence": "Emitted by bamts-compiler as ASSIGNMENT_TO_READONLY (checker.rs) and CONST_ENUM_INVALID_USE (checker/enum_namespace.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C062",
+      "evidence": "Emitted by bamts-compiler as STRICT_NULL_MEMBER_ACCESS (checker.rs) and CONST_ENUM_INVALID_ELEMENT_ACCESS (checker/enum_namespace.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C063",
+      "evidence": "Emitted by bamts-compiler as MEMBER_NOT_ACCESSIBLE (checker.rs) and AMBIENT_CONST_ENUM_ISOLATED_MODULES (checker/enum_namespace.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C064",
+      "evidence": "Emitted by bamts-compiler as INVALID_INDEXED_ACCESS_KEY (checker.rs) and ENUM_MERGE_INVALID_TARGET (checker/enum_namespace.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C065",
+      "evidence": "Emitted by bamts-compiler as FOR_OF_ITERABLE_REQUIRED (checker.rs) and COMPUTED_MEMBER_IN_STRING_ENUM (checker/enum_namespace.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
       "bamtsCode": "BAMTS-C066",
       "evidence": "Cannot create an instance of an abstract class (direct abstract class, abstract-union constructor selection, and mixed constructor unions) -> TS2511 via tsc --noEmit on the upstream abstractClassUnionInstantiation reference case (new cls1()/new cls2() rows).",
       "status": "mapped",
       "tsCode": 2511
+    },
+    {
+      "bamtsCode": "BAMTS-C067",
+      "evidence": "Emitted by bamts-compiler as EXCESS_PROPERTY (checker.rs) and NON_INSTANTIATED_NAMESPACE_VALUE_USE (checker/enum_namespace.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C068",
+      "evidence": "Emitted by bamts-compiler as DERIVED_CONSTRUCTOR_MISSING_SUPER (checker.rs) and NAMESPACE_MEMBER_NOT_EXPORTED (checker/enum_namespace.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C069",
+      "evidence": "Emitted by bamts-compiler as CANCELLATION_REQUESTED (checker.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
     },
     {
       "bamtsCode": "BAMTS-C070",
@@ -374,6 +428,48 @@
       "tsCode": 2456
     },
     {
+      "bamtsCode": "BAMTS-C073",
+      "evidence": "Emitted by bamts-compiler as DECORATOR_ON_AMBIENT_DECLARATION (checker/decorators.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C074",
+      "evidence": "Emitted by bamts-compiler as DECORATOR_ON_BOTH_ACCESSORS (checker/decorators.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C075",
+      "evidence": "Emitted by bamts-compiler as DECORATOR_ON_STATIC_BLOCK (checker/decorators.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C076",
+      "evidence": "Emitted by bamts-compiler as STAGE3_PARAMETER_DECORATOR (checker/decorators.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C077",
+      "evidence": "Emitted by bamts-compiler as DECORATOR_BOTH_SIDES_OF_EXPORT (checker/decorators.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C078",
+      "evidence": "Emitted by bamts-compiler as METADATA_REQUIRES_EXPERIMENTAL_DECORATORS (checker/decorators.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C079",
+      "evidence": "Emitted by bamts-compiler as LEGACY_DECORATORS_DISABLED (checker/decorators.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
       "bamtsCode": "BAMTS-C080",
       "evidence": "Parameter property outside a constructor implementation -> TS2369 via tsc --noEmit on \"var v = (public x: string) => { };\".",
       "status": "mapped",
@@ -384,6 +480,12 @@
       "evidence": "A function whose declared type is neither 'undefined', 'void', nor 'any' must return a value (empty or fall-through body) -> TS2355 via tsc --noEmit on the upstream ParameterList5 reference case (row 1,15).",
       "status": "mapped",
       "tsCode": 2355
+    },
+    {
+      "bamtsCode": "BAMTS-C082",
+      "evidence": "Emitted by bamts-compiler as TYPE_NESTING_TOO_DEEP (checker.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
     },
     {
       "bamtsCode": "BAMTS-C086",
@@ -435,9 +537,9 @@
     },
     {
       "bamtsCode": "BAMTS-L006",
-      "evidence": "Invalid escape sequence -> TS1488 via tsc --noEmit on \"\\8\".",
+      "evidence": "Hexadecimal escape without two digits -> TS1125 at the first character that is not a digit via tsc 7.0.2 --noEmit on const x = \"\\xg\"; (x.ts(1,14)).",
       "status": "mapped",
-      "tsCode": 1488
+      "tsCode": 1125
     },
     {
       "bamtsCode": "BAMTS-L007",
@@ -468,6 +570,36 @@
       "evidence": "Invalid private identifier / hash not followed by identifier -> TS1127 via tsc --noEmit on \"# \".",
       "status": "mapped",
       "tsCode": 1127
+    },
+    {
+      "bamtsCode": "BAMTS-L012",
+      "evidence": "Extended unicode escape above U+10FFFF -> TS1198 over its digits via tsc 7.0.2 --noEmit on const z = \"\\u{110000}\"; (x.ts(1,15)).",
+      "status": "mapped",
+      "tsCode": 1198
+    },
+    {
+      "bamtsCode": "BAMTS-L013",
+      "evidence": "Extended unicode escape without its closing brace -> TS1199 at the character after the digits via tsc 7.0.2 --noEmit on const u = \"\\u{12\"; (x.ts(1,17)).",
+      "status": "mapped",
+      "tsCode": 1199
+    },
+    {
+      "bamtsCode": "BAMTS-L014",
+      "evidence": "Legacy octal escape in a TypeScript file -> TS1487 from its backslash via tsc 7.0.2 --noEmit on const a = \"\\101\"; (x.ts(1,12), Use the syntax '\\x41'), also with --alwaysStrict false.",
+      "status": "mapped",
+      "tsCode": 1487
+    },
+    {
+      "bamtsCode": "BAMTS-L015",
+      "evidence": "\\8 or \\9 escape in a TypeScript file -> TS1488 from its backslash via tsc 7.0.2 --noEmit on const b = \"\\8\"; (x.ts(1,12)).",
+      "status": "mapped",
+      "tsCode": 1488
+    },
+    {
+      "bamtsCode": "BAMTS-L016",
+      "evidence": "Extended unicode escape whose digits reach the end of the text -> TS1126 at the end via tsc 7.0.2 --noEmit on let a = \"\\u{12 with no newline (x.ts(1,15)); a closed one, let a = \"\\u{12x\", stays TS1199.",
+      "status": "mapped",
+      "tsCode": 1126
     },
     {
       "bamtsCode": "BAMTS-P001",
@@ -532,6 +664,24 @@
     {
       "bamtsCode": "BAMTS-P012",
       "evidence": "Reserved for parser-side `using` declaration grammar recovery.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P017",
+      "evidence": "Emitted by bamts-compiler as YIELD_OUTSIDE_GENERATOR (parser.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P018",
+      "evidence": "Emitted by bamts-compiler as AWAIT_OUTSIDE_ASYNC (parser.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P019",
+      "evidence": "Emitted by bamts-compiler as EARLY_ERROR (early_errors.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
       "status": "unmapped",
       "tsCode": null
     },
@@ -624,6 +774,24 @@
       "evidence": "Labeled break whose target crosses a function boundary -> TS1107 in the TypeScript 7.0.2 authority baselines: breakTarget5 (line 5).",
       "status": "mapped",
       "tsCode": 1107
+    },
+    {
+      "bamtsCode": "BAMTS-C104",
+      "evidence": "Emitted by bamts-compiler as IMPLICIT_ANY_FROM_INITIALIZER_CYCLE (checker.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C105",
+      "evidence": "Emitted by bamts-compiler as IMPLICIT_ANY_RETURN_FROM_CYCLE (checker.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C106",
+      "evidence": "Emitted by bamts-compiler as IMPLICIT_ANY_ANONYMOUS_RETURN_FROM_CYCLE (checker.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
+      "status": "unmapped",
+      "tsCode": null
     }
   ]
 }

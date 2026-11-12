@@ -294,6 +294,12 @@ impl ExecutionBinding {
         Ok(binding)
     }
 
+    /// The commit the run was built from.
+    #[must_use]
+    pub fn source_sha(&self) -> &str {
+        &self.source_sha
+    }
+
     #[cfg(test)]
     pub(crate) fn local_for_tests() -> Self {
         Self {
@@ -520,6 +526,12 @@ impl EvidenceRow {
     #[must_use]
     pub fn artifacts(&self) -> &BTreeMap<String, String> {
         &self.artifacts
+    }
+
+    /// The diagnostic text recorded with the state; empty on a clean `PASS`.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
     }
 }
 

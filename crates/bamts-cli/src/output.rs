@@ -438,6 +438,13 @@ impl AtomicFs for StdAtomicFs {
     }
 
     fn sync_dir(&mut self, dir: &Path) -> Result<(), Self::Error> {
+        // Windows is skipped: `File::open` cannot open a directory there. A handle
+        // opened with `FILE_FLAG_BACKUP_SEMANTICS` for writing can be flushed on
+        // NTFS, but this code does not do that. NTFS journals the rename, which is
+        // not a promise that it is on disk after a power loss.
+        if cfg!(windows) {
+            return Ok(());
+        }
         File::open(dir)?.sync_all()
     }
 
@@ -680,6 +687,15 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    /// A fixture path written the Unix way, on the drive Windows needs to call it absolute.
+    fn abs(unix: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{}", unix.replace('/', "\\")))
+        } else {
+            PathBuf::from(unix)
+        }
+    }
+
     fn request<'a>(root: &'a Path, entrypoints: &'a [PathBuf]) -> PlanRequest<'a> {
         PlanRequest {
             root,
@@ -693,9 +709,9 @@ mod tests {
 
     #[test]
     fn plans_confined_source_relative_outputs_in_stable_order() {
-        let root = Path::new("/workspace");
+        let root = abs("/workspace");
         let entries = vec![PathBuf::from("src/main.mts"), PathBuf::from("lib/util.cts")];
-        let mut input = request(root, &entries);
+        let mut input = request(&root, &entries);
         input.output_dir = Some(Path::new("dist/./generated"));
         input.emit_declarations = true;
         input.source_maps = true;
@@ -711,27 +727,27 @@ mod tests {
             vec![
                 (
                     ArtifactKind::JavaScript,
-                    Path::new("/workspace/dist/generated/src/main.mjs")
+                    abs("/workspace/dist/generated/src/main.mjs").as_path()
                 ),
                 (
                     ArtifactKind::Declaration,
-                    Path::new("/workspace/dist/generated/src/main.d.mts")
+                    abs("/workspace/dist/generated/src/main.d.mts").as_path()
                 ),
                 (
                     ArtifactKind::SourceMap,
-                    Path::new("/workspace/dist/generated/src/main.mjs.map")
+                    abs("/workspace/dist/generated/src/main.mjs.map").as_path()
                 ),
                 (
                     ArtifactKind::JavaScript,
-                    Path::new("/workspace/dist/generated/lib/util.cjs")
+                    abs("/workspace/dist/generated/lib/util.cjs").as_path()
                 ),
                 (
                     ArtifactKind::Declaration,
-                    Path::new("/workspace/dist/generated/lib/util.d.cts")
+                    abs("/workspace/dist/generated/lib/util.d.cts").as_path()
                 ),
                 (
                     ArtifactKind::SourceMap,
-                    Path::new("/workspace/dist/generated/lib/util.cjs.map")
+                    abs("/workspace/dist/generated/lib/util.cjs.map").as_path()
                 ),
             ]
         );
@@ -740,7 +756,8 @@ mod tests {
     #[test]
     fn exact_output_derives_declaration_and_map_companions() {
         let entries = vec![PathBuf::from("src/main.ts")];
-        let mut input = request(Path::new("/workspace"), &entries);
+        let root = abs("/workspace");
+        let mut input = request(&root, &entries);
         input.output_file = Some(Path::new("build/bundle.js"));
         input.emit_declarations = true;
         input.source_maps = true;
@@ -754,9 +771,9 @@ mod tests {
         assert_eq!(
             paths,
             vec![
-                Path::new("/workspace/build/bundle.js"),
-                Path::new("/workspace/build/bundle.d.ts"),
-                Path::new("/workspace/build/bundle.js.map"),
+                abs("/workspace/build/bundle.js").as_path(),
+                abs("/workspace/build/bundle.d.ts").as_path(),
+                abs("/workspace/build/bundle.js.map").as_path(),
             ]
         );
     }
@@ -770,7 +787,8 @@ mod tests {
             PathBuf::from(OsStr::from_bytes(b"src/\xff.ts")),
             PathBuf::from(OsStr::from_bytes(b"src/\xfe.mts")),
         ];
-        let mut input = request(Path::new("/workspace"), &entries);
+        let root = abs("/workspace");
+        let mut input = request(&root, &entries);
         input.output_dir = Some(Path::new("dist"));
 
         let plan = plan_outputs(input).unwrap();
@@ -789,7 +807,8 @@ mod tests {
     #[test]
     fn rejects_lexical_path_traversal() {
         let entries = vec![PathBuf::from("src/main.ts")];
-        let mut input = request(Path::new("/workspace/project"), &entries);
+        let root = abs("/workspace/project");
+        let mut input = request(&root, &entries);
         input.output_dir = Some(Path::new("../../escape"));
 
         assert!(matches!(
@@ -800,8 +819,9 @@ mod tests {
 
     #[test]
     fn rejects_absolute_paths_outside_root() {
-        let entries = vec![PathBuf::from("/other/main.ts")];
-        let input = request(Path::new("/workspace"), &entries);
+        let entries = vec![abs("/other/main.ts")];
+        let root = abs("/workspace");
+        let input = request(&root, &entries);
 
         assert!(matches!(
             plan_outputs(input),
@@ -815,7 +835,8 @@ mod tests {
             PathBuf::from("src/value.ts"),
             PathBuf::from("src/value.tsx"),
         ];
-        let mut input = request(Path::new("/workspace"), &entries);
+        let root = abs("/workspace");
+        let mut input = request(&root, &entries);
         input.output_dir = Some(Path::new("dist/a/../"));
 
         assert!(matches!(
@@ -824,19 +845,20 @@ mod tests {
                 path,
                 second_kind: ArtifactKind::JavaScript,
                 ..
-            }) if path == Path::new("/workspace/dist/src/value.js")
+            }) if path == abs("/workspace/dist/src/value.js").as_path()
         ));
     }
 
     #[test]
     fn rejects_outputs_that_clobber_javascript_inputs() {
         let entries = vec![PathBuf::from("src/value.js")];
-        let input = request(Path::new("/workspace"), &entries);
+        let root = abs("/workspace");
+        let input = request(&root, &entries);
 
         assert!(matches!(
             plan_outputs(input),
             Err(PlanError::ClobbersInput { path, .. })
-                if path == Path::new("/workspace/src/value.js")
+                if path == abs("/workspace/src/value.js").as_path()
         ));
     }
 
@@ -1091,10 +1113,10 @@ mod tests {
 
     #[test]
     fn rejects_entrypoint_normalizing_to_root() {
-        let root = PathBuf::from("/workspace");
+        let root = abs("/workspace");
         for entrypoint in [
             PathBuf::from("."),
-            PathBuf::from("/workspace"),
+            abs("/workspace"),
             PathBuf::from("src/.."),
         ] {
             let entrypoints = [entrypoint.clone()];

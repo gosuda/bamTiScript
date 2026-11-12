@@ -1,16 +1,21 @@
 use super::{BuiltinDef, BuiltinOutcome, BuiltinTable, native_function, push};
 use crate::GetOutcome;
 use crate::{
-    EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap, ThrowOrigin,
+    EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap, ShapeTable,
+    ThrowOrigin,
 };
 use bamts_bytecode::{DescriptorSlot, EcmaString};
 use bamts_native::{Decoded, Value};
 use std::collections::BTreeMap;
 mod array;
+mod array_generic;
+pub(crate) use array_generic::is_array;
 pub(crate) mod bigint;
 mod collections;
 mod date_full;
 mod function_constructor;
+mod intl;
+pub(crate) mod iterator_helpers;
 mod json_edge;
 mod number;
 mod object;
@@ -20,22 +25,26 @@ pub(crate) mod property_descriptor;
 pub(crate) mod proxy;
 pub(crate) mod reflect;
 mod regexp;
-pub(crate) use regexp::{canonical_source, initial_regexp_properties};
+pub(crate) use regexp::initial_regexp_properties;
 mod annex_b;
 mod array_es2023;
 pub(crate) mod arraybuffer;
+pub(crate) mod atomics;
 pub(crate) mod dataview;
 mod disposable_stack;
 mod error_edge;
 mod map_set_edge;
 mod math_edge;
 mod number_format;
-mod regexp_v;
+pub(crate) use number_format::string_to_number;
+mod regexp_protocol;
+pub(crate) mod regexp_v;
 mod set_methods;
 mod string;
 mod string_edge;
 mod structured_clone;
 mod symbol;
+mod temporal;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod timers;
@@ -43,66 +52,105 @@ pub(crate) mod typedarray_all;
 mod uri;
 pub(crate) mod weakref_finalization;
 pub(crate) use collections::ordinary_runtime;
+pub(crate) struct InstallOptions {
+    pub(crate) timers_available: bool,
+    pub(crate) script_compiler: bool,
+}
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
-    timers_available: bool,
+    options: InstallOptions,
 ) {
-    symbol::install(heap, globals, builtins);
-    let bigint_prototype = bigint::install(heap, globals, builtins);
+    object::install_function_prototype(heap, atoms, shapes, builtins);
+    symbol::install(heap, atoms, shapes, globals, builtins);
+    let bigint_prototype = bigint::install(heap, atoms, shapes, globals, builtins);
     builtins.set_bigint_prototype(bigint_prototype);
-    promise::install(heap, globals, builtins);
-    if timers_available {
-        timers::install(heap, globals, builtins);
+    promise::install(heap, atoms, shapes, globals, builtins);
+    if options.timers_available {
+        timers::install(heap, atoms, shapes, globals, builtins);
     }
-    collections::install_iterator_prototype(heap, builtins);
-    collections::install_async_iterator_prototype(heap, builtins);
-    collections::install_generator_prototype(heap, builtins);
-    collections::install_async_generator_prototype(heap, builtins);
-    collections::install(heap, globals, builtins);
-    function_constructor::install(heap, globals, builtins);
-    map_set_edge::install(heap, globals, builtins);
-    date_full::install(heap, globals, builtins);
-    object::install(heap, globals, builtins);
-    array::install(heap, globals, builtins);
-    string::install(heap, globals, builtins);
-    number::install(heap, globals, builtins);
-    install_boolean(heap, globals, builtins);
-    install_math(heap, globals, builtins);
-    regexp::install(heap, globals, builtins);
-    string_edge::install(heap, globals, builtins);
-    annex_b::install(heap, globals, builtins);
-    weakref_finalization::install(heap, globals, builtins);
-    arraybuffer::install(heap, globals, builtins);
-    typedarray_all::install(heap, globals, builtins);
-    dataview::install(heap, globals, builtins);
-    install_globals(heap, globals, builtins);
-    json_edge::install(heap, globals, builtins);
-    install_errors(heap, globals, builtins);
-    error_edge::install(heap, globals, builtins);
-    proxy::install(heap, globals, builtins);
+    collections::install_iterator_prototype(heap, atoms, shapes, builtins);
+    iterator_helpers::install(heap, atoms, shapes, globals, builtins);
+    collections::install_async_iterator_prototype(heap, atoms, shapes, builtins);
+    collections::install_generator_prototype(heap, atoms, shapes, builtins);
+    collections::install_async_generator_prototype(heap, atoms, shapes, builtins);
+    collections::install(heap, atoms, shapes, globals, builtins);
+    function_constructor::install(
+        heap,
+        atoms,
+        shapes,
+        globals,
+        builtins,
+        options.script_compiler,
+    );
+    map_set_edge::install(heap, atoms, shapes, globals, builtins);
+    date_full::install(heap, atoms, shapes, globals, builtins);
+    object::install(heap, atoms, shapes, globals, builtins);
+    array::install(heap, atoms, shapes, globals, builtins);
+    string::install(heap, atoms, shapes, globals, builtins);
+    number::install(heap, atoms, shapes, globals, builtins);
+    install_boolean(heap, atoms, shapes, globals, builtins);
+    install_math(heap, atoms, shapes, globals, builtins);
+    regexp::install(heap, atoms, shapes, globals, builtins);
+    string_edge::install(heap, atoms, shapes, globals, builtins);
+    annex_b::install(heap, atoms, shapes, globals, builtins);
+    weakref_finalization::install(heap, atoms, shapes, globals, builtins);
+    arraybuffer::install(heap, atoms, shapes, globals, builtins);
+    atomics::install(heap, atoms, shapes, globals, builtins);
+    typedarray_all::install(heap, atoms, shapes, globals, builtins);
+    dataview::install(heap, atoms, shapes, globals, builtins);
+    install_globals(heap, atoms, shapes, globals, builtins);
+    json_edge::install(heap, atoms, shapes, globals, builtins);
+    install_errors(heap, atoms, shapes, globals, builtins);
+    error_edge::install(heap, atoms, shapes, globals, builtins);
+    proxy::install(heap, atoms, shapes, globals, builtins);
     if let Some(id) = builtins.id_named("Proxy") {
         builtins.set_constructable(id, true);
     }
-    reflect::install(heap, globals, builtins);
-    uri::install(heap, globals, builtins);
-    disposable_stack::install(heap, globals, builtins);
+    reflect::install(heap, atoms, shapes, globals, builtins);
+    uri::install(heap, atoms, shapes, globals, builtins);
+    disposable_stack::install(heap, atoms, shapes, globals, builtins);
+    temporal::install(heap, atoms, shapes, globals, builtins);
+    intl::install(heap, atoms, shapes, globals, builtins);
+}
+/// Runs `body` with `roots` kept alive across any user code it reaches. The
+/// frame's depth is passed in, so `keep_root` can add values found along the way.
+fn with_roots<H: Host, T>(
+    machine: &mut Machine<'_, H>,
+    roots: &[Value],
+    body: impl FnOnce(&mut Machine<'_, H>, usize) -> Result<T, EvalFailure>,
+) -> Result<T, EvalFailure> {
+    let depth = machine.native_roots.len();
+    machine.push_native_roots(depth, roots);
+    let result = body(machine, depth);
+    machine.pop_native_roots(depth);
+    result
+}
+fn keep_root<H: Host>(machine: &mut Machine<'_, H>, depth: usize, value: Value) {
+    machine.native_roots[depth].push(value);
+}
+/// How many roots the frame at `depth` holds, for `release_roots`.
+fn root_count<H: Host>(machine: &Machine<'_, H>, depth: usize) -> usize {
+    machine.native_roots[depth].len()
+}
+/// Drops the roots that `keep_root` added after the frame held `count`. A loop that
+/// is done with the values of a step calls this, so that it holds one step at a time.
+fn release_roots<H: Host>(machine: &mut Machine<'_, H>, depth: usize, count: usize) {
+    machine.native_roots[depth].truncate(count);
 }
 fn install_function<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
-    name: &'static str,
-    length: u32,
-    handler: super::BuiltinHandler<H>,
+    definition: BuiltinDef<H>,
 ) -> Value {
-    let id = builtins.register(BuiltinDef {
-        name,
-        length,
-        handler,
-    });
-    let definition = builtins.get(id);
-    native_function(heap, id, definition.name, definition.length)
+    let id = builtins.register(definition);
+    let installed = builtins.get(id);
+    native_function(heap, atoms, shapes, id, installed.name, installed.length)
 }
 
 /// Installs a builtin **constructor** (`[[Construct]]` present). Method,
@@ -110,20 +158,23 @@ fn install_function<H: Host>(
 /// registers non-constructable by default.
 pub(crate) fn install_constructor_function<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
-    name: &'static str,
-    length: u32,
-    handler: super::BuiltinHandler<H>,
+    definition: BuiltinDef<H>,
 ) -> Value {
-    let id = builtins.register_constructor(BuiltinDef {
-        name,
-        length,
-        handler,
-    });
-    let definition = builtins.get(id);
-    native_function(heap, id, definition.name, definition.length)
+    let id = builtins.register_constructor(definition);
+    let installed = builtins.get(id);
+    native_function(heap, atoms, shapes, id, installed.name, installed.length)
 }
-pub(crate) fn define_data(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
+pub(crate) fn define_data(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+    object: Value,
+    name: &str,
+    value: Value,
+) {
     let index = heap_index(object);
     match &mut heap[index] {
         HeapEntry::Object { properties, .. }
@@ -132,17 +183,43 @@ pub(crate) fn define_data(heap: &mut [HeapEntry], object: Value, name: &str, val
         | HeapEntry::Script { properties, .. }
         | HeapEntry::NativeFunction { properties, .. }
         | HeapEntry::RegExp { properties, .. }
-        | HeapEntry::Date { properties, .. } => {
+        | HeapEntry::Date { properties, .. }
+        | HeapEntry::Temporal { properties, .. }
+        | HeapEntry::Intl { properties, .. } => {
             properties.insert(
-                PropertyKey::Named(EcmaString::encode(name)),
+                shapes,
+                PropertyKey::Named(atoms.intern_str(name)),
                 builtin_property(value),
             );
         }
         _ => panic!("intrinsic property target must be an ordinary object"),
     }
 }
+/// Installs a symbol-keyed property on an intrinsic object of any shape.
+pub(crate) fn define_symbol_property(
+    heap: &mut [HeapEntry],
+    shapes: &mut crate::ShapeTable,
+    object: Value,
+    symbol: Value,
+    property: Property,
+) {
+    let key = PropertyKey::Symbol(heap_index(symbol) as u32);
+    let index = heap_index(object);
+    match &mut heap[index] {
+        HeapEntry::Object { properties, .. }
+        | HeapEntry::Array { properties, .. }
+        | HeapEntry::Function { properties, .. }
+        | HeapEntry::NativeFunction { properties, .. }
+        | HeapEntry::RegExp { properties, .. }
+        | HeapEntry::Date { properties, .. } => {
+            properties.insert(shapes, key, property);
+        }
+        _ => panic!("intrinsic property target must be an ordinary object"),
+    }
+}
 pub(super) fn define_to_string_tag(
     heap: &mut Vec<HeapEntry>,
+    shapes: &mut crate::ShapeTable,
     object: Value,
     symbol: Value,
     tag: &str,
@@ -153,6 +230,7 @@ pub(super) fn define_to_string_tag(
         panic!("namespace tag target must be an ordinary object");
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(heap_index(symbol) as u32),
         Property::Data {
             value,
@@ -164,7 +242,14 @@ pub(super) fn define_to_string_tag(
 }
 /// Installs a named data property that is non-writable, non-enumerable, and
 /// non-configurable onto an ordinary object, array, or native function.
-pub(crate) fn define_frozen_data(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
+pub(crate) fn define_frozen_data(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+    object: Value,
+    name: &str,
+    value: Value,
+) {
     let index = heap_index(object);
     let properties = match &mut heap[index] {
         HeapEntry::Object { properties, .. }
@@ -176,7 +261,8 @@ pub(crate) fn define_frozen_data(heap: &mut [HeapEntry], object: Value, name: &s
         _ => panic!("frozen property target must be an ordinary object"),
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        shapes,
+        PropertyKey::Named(atoms.intern_str(name)),
         Property::Data {
             value,
             writable: false,
@@ -257,11 +343,45 @@ fn to_uint8_from_f64(number: f64) -> u8 {
     }
 }
 
+/// `GetPrototypeFromConstructor` for the running built-in constructor.
+fn prototype_from_new_target<H: Host>(
+    machine: &mut Machine<'_, H>,
+    default_prototype: Value,
+) -> Result<Value, EvalFailure> {
+    let new_target = machine.current_new_target();
+    if new_target == Value::UNDEFINED {
+        return Ok(default_prototype);
+    }
+    let prototype = machine.get_named_property(new_target, "prototype")?;
+    Ok(if machine.is_object(prototype) {
+        prototype
+    } else {
+        default_prototype
+    })
+}
+/// The wrapper object a primitive-wrapping constructor returns.
+fn wrap_for_new_target<H: Host>(
+    machine: &mut Machine<'_, H>,
+    primitive: Value,
+    default_prototype: Value,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let prototype = with_roots(machine, &[primitive], |machine, _| {
+        prototype_from_new_target(machine, default_prototype)
+    })?;
+    let wrapper = machine.box_primitive(primitive)?;
+    if let HeapEntry::Object {
+        prototype: slot, ..
+    } = &mut machine.heap[heap_index(wrapper)]
+    {
+        *slot = Some(prototype);
+    }
+    Ok(BuiltinOutcome::Value(wrapper))
+}
 fn to_integer_or_infinity<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<f64, EvalFailure> {
-    let number = value_number(machine.to_number(value)?);
+    let number = value_number(machine.coerce_number_observable(value)?);
     Ok(if number.is_nan() || number == 0.0 {
         0.0
     } else {
@@ -280,26 +400,35 @@ fn uri_error(operation: &'static str) -> EvalFailure {
 fn define_array_length(
     elements: &mut Vec<Value>,
     properties: &mut PropertyMap,
+    atoms: &crate::AtomTable,
     length_writable: bool,
+    shapes: &crate::ShapeTable,
     length: usize,
 ) -> Result<(), EvalFailure> {
     if !length_writable && length != elements.len() {
         return Err(type_error("Cannot redefine non-writable array length"));
     }
-    crate::apply_array_length(elements, properties, length, "define array length")
+    if crate::apply_array_length(elements, properties, atoms, length, shapes) {
+        Ok(())
+    } else {
+        Err(type_error("define array length"))
+    }
 }
 fn install_boolean<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.boolean_prototype();
-    let constructor =
-        install_constructor_function(heap, builtins, "Boolean", 1, boolean_constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Boolean", length: 1, handler: boolean_constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode("Boolean"), constructor);
-    let value_of = install_function(heap, builtins, "valueOf", 0, boolean_value_of::<H>);
-    define_data(heap, prototype, "valueOf", value_of);
+    let value_of = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "valueOf", length: 0, handler: boolean_value_of::<H> });
+    define_data(heap, atoms, shapes, prototype, "valueOf", value_of);
+    let to_string = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "toString", length: 0, handler: boolean_to_string::<H> });
+    define_data(heap, atoms, shapes, prototype, "toString", to_string);
 }
 fn boolean_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -310,7 +439,8 @@ fn boolean_constructor<H: Host>(
     let value =
         Value::boolean(machine.to_boolean(args.first().copied().unwrap_or(Value::UNDEFINED)));
     if constructing {
-        return machine.box_primitive(value).map(BuiltinOutcome::Value);
+        let prototype = machine.intrinsics.boolean_prototype;
+        return wrap_for_new_target(machine, value, prototype);
     }
     Ok(BuiltinOutcome::Value(value))
 }
@@ -328,8 +458,25 @@ fn boolean_value_of<H: Host>(
         )),
     }
 }
+fn boolean_to_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let value = machine.unbox_primitive(this, "Boolean.prototype.toString")?;
+    let Some(bamts_native::Decoded::Boolean(value)) = value.decode() else {
+        return Err(type_error(
+            "Boolean.prototype.toString called on incompatible receiver",
+        ));
+    };
+    let text = EcmaString::encode(if value { "true" } else { "false" });
+    allocate_string(machine, text).map(BuiltinOutcome::Value)
+}
 fn install_math<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -358,19 +505,19 @@ fn install_math<H: Host>(
         ("log2", 1, math_log2::<H>),
         ("imul", 2, math_imul::<H>),
     ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, math, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, math, name, function);
     }
-    define_to_string_tag(heap, math, builtins.symbol_to_string_tag(), "Math");
+    define_to_string_tag(heap, shapes, math, builtins.symbol_to_string_tag(), "Math");
     globals.insert(EcmaString::encode("Math"), math);
-    math_edge::install(heap, builtins, math);
+    math_edge::install(heap, atoms, shapes, builtins, math);
 }
 fn numeric_args<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     args: &[Value],
 ) -> Result<Vec<f64>, EvalFailure> {
     args.iter()
-        .map(|value| machine.to_number(*value).map(value_number))
+        .map(|value| machine.coerce_number_observable(*value).map(value_number))
         .collect()
 }
 macro_rules! unary_math {
@@ -381,9 +528,10 @@ macro_rules! unary_math {
             args: &[Value],
             _constructing: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
-            let x =
-                value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?)
-                    as f64;
+            let x = value_number(
+                machine
+                    .coerce_number_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+            ) as f64;
             Ok(BuiltinOutcome::Value(crate::number_value(($body)(x))))
         }
     };
@@ -394,19 +542,31 @@ unary_math!(math_ceil, f64::ceil);
 unary_math!(math_trunc, f64::trunc);
 unary_math!(math_sqrt, f64::sqrt);
 unary_math!(math_log2, f64::log2);
+/// The integer nearest `x`, ties toward positive infinity. Comparing the
+/// distance from the floor avoids `x + 0.5`, which itself rounds: the largest
+/// double below 0.5 would come back as 1. A negative `x` that rounds to zero
+/// gives negative zero.
+fn round_half_up(x: f64) -> f64 {
+    if x.fract() == 0.0 || !x.is_finite() {
+        return x;
+    }
+    let floor = x.floor();
+    let rounded = if x - floor >= 0.5 { floor + 1.0 } else { floor };
+    if rounded == 0.0 && x < 0.0 {
+        -0.0
+    } else {
+        rounded
+    }
+}
 fn math_round<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let x = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
-    let rounded = if (-0.5..0.0).contains(&x) {
-        -0.0
-    } else {
-        (x + 0.5).floor()
-    };
-    Ok(BuiltinOutcome::Value(crate::number_value(rounded)))
+    let x = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let x = value_number(machine.coerce_number_observable(x)?);
+    Ok(BuiltinOutcome::Value(crate::number_value(round_half_up(x))))
 }
 fn math_sign<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -414,7 +574,9 @@ fn math_sign<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let x = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
+    let x = value_number(
+        machine.coerce_number_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+    );
     let sign = if x == 0.0 || x.is_nan() {
         x
     } else {
@@ -472,9 +634,15 @@ fn math_pow<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let x = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
-    let y = value_number(machine.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))?);
-    Ok(BuiltinOutcome::Value(crate::number_value(x.powf(y))))
+    let x = value_number(
+        machine.coerce_number_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+    );
+    let y = value_number(
+        machine.coerce_number_observable(args.get(1).copied().unwrap_or(Value::UNDEFINED))?,
+    );
+    Ok(BuiltinOutcome::Value(crate::number_value(
+        crate::number_exponentiate(x, y),
+    )))
 }
 fn math_random<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -511,14 +679,18 @@ fn math_imul<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let a =
-        value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?) as u32;
-    let b =
-        value_number(machine.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))?) as u32;
+    let a = value_number(
+        machine.coerce_number_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+    ) as u32;
+    let b = value_number(
+        machine.coerce_number_observable(args.get(1).copied().unwrap_or(Value::UNDEFINED))?,
+    ) as u32;
     Ok(BuiltinOutcome::Value(Value::int32(a.wrapping_mul(b))))
 }
 fn install_globals<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -540,7 +712,7 @@ fn install_globals<H: Host>(
             structured_clone::structured_clone::<H>,
         ),
     ] {
-        let value = install_function(heap, builtins, name, length, handler);
+        let value = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
         globals.insert(EcmaString::encode(name), value);
     }
     globals.insert(
@@ -548,25 +720,13 @@ fn install_globals<H: Host>(
         crate::number_value(f64::INFINITY),
     );
     globals.insert(EcmaString::encode("NaN"), crate::number_value(f64::NAN));
-    // Node exposes `Atomics` as a global, and the corpus differential compares
-    // our output against Node byte-for-byte. `corpus/cases/is-plain-obj.ts`
-    // reads the global, so omitting it throws a ReferenceError and fails Node
-    // parity. Populating the namespace requires SharedArrayBuffer / shared
-    // memory, which the runtime does not have yet, so it is deliberately empty.
-    let atomics = push(
-        heap,
-        HeapEntry::Object {
-            properties: PropertyMap::default(),
-            prototype: Some(builtins.object_prototype()),
-            extensible: true,
-            boxed_primitive: None,
-        },
-    );
-    define_to_string_tag(heap, atomics, builtins.symbol_to_string_tag(), "Atomics");
-    globals.insert(EcmaString::encode("Atomics"), atomics);
+    globals.insert(EcmaString::encode("undefined"), Value::UNDEFINED);
+    number::share_global_parsers(heap, atoms, shapes, globals);
 }
 fn install_errors<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -579,12 +739,17 @@ fn install_errors<H: Host>(
             boxed_primitive: None,
         },
     );
-    let error_to_string = install_function(heap, builtins, "toString", 0, error_to_string::<H>);
-    define_data(heap, error_prototype, "toString", error_to_string);
+    let error_to_string =
+        install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "toString", length: 0, handler: error_to_string::<H> });
+    define_data(heap, atoms, shapes, error_prototype, "toString", error_to_string);
     install_error_type(
-        heap,
-        globals,
-        builtins,
+        InstallContext {
+            heap: &mut *heap,
+            atoms: &mut *atoms,
+            globals: &mut *globals,
+            builtins: &mut *builtins,
+        },
+        &mut *shapes,
         "Error",
         1,
         error_prototype,
@@ -615,9 +780,13 @@ fn install_errors<H: Host>(
             _ => 1,
         };
         install_error_type(
-            heap,
-            globals,
-            builtins,
+            InstallContext {
+                heap: &mut *heap,
+                atoms: &mut *atoms,
+                globals: &mut *globals,
+                builtins: &mut *builtins,
+            },
+            &mut *shapes,
             name,
             length,
             prototype,
@@ -625,22 +794,35 @@ fn install_errors<H: Host>(
         );
     }
 }
+struct InstallContext<'a, H: Host> {
+    heap: &'a mut Vec<HeapEntry>,
+    atoms: &'a mut crate::AtomTable,
+    globals: &'a mut BTreeMap<EcmaString, Value>,
+    builtins: &'a mut BuiltinTable<H>,
+}
+
 fn install_error_type<H: Host>(
-    heap: &mut Vec<HeapEntry>,
-    globals: &mut BTreeMap<EcmaString, Value>,
-    builtins: &mut BuiltinTable<H>,
+    ctx: InstallContext<'_, H>,
+    shapes: &mut crate::ShapeTable,
     name: &'static str,
     length: u32,
     prototype: Value,
     _error_prototype: Value,
 ) {
+    let InstallContext {
+        heap,
+        atoms,
+        globals,
+        builtins,
+    } = ctx;
     let name_value = push(heap, HeapEntry::String(EcmaString::encode(name)));
     let empty = push(heap, HeapEntry::String(EcmaString::default()));
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode("name")),
+        shapes,
+        PropertyKey::Named(atoms.intern_str("name")),
         Property::Data {
             value: name_value,
             writable: true,
@@ -649,7 +831,8 @@ fn install_error_type<H: Host>(
         },
     );
     properties.insert(
-        PropertyKey::Named(EcmaString::encode("message")),
+        shapes,
+        PropertyKey::Named(atoms.intern_str("message")),
         Property::Data {
             value: empty,
             writable: true,
@@ -658,8 +841,8 @@ fn install_error_type<H: Host>(
         },
     );
     let constructor =
-        install_constructor_function(heap, builtins, name, length, error_constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: error_constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     builtins.set_error_prototype(heap, constructor, prototype);
     globals.insert(EcmaString::encode(name), constructor);
 }
@@ -669,9 +852,10 @@ fn define_error_field<H: Host>(
     name: &str,
     value: Value,
 ) -> Result<(), EvalFailure> {
+    let key = PropertyKey::Named(machine.intern_str(name));
     machine.define_descriptor(
         object,
-        PropertyKey::Named(EcmaString::encode(name)),
+        key,
         Property::Data {
             value,
             writable: true,
@@ -747,7 +931,7 @@ fn error_constructor<H: Host>(
         .copied()
         .filter(|value| *value != Value::UNDEFINED)
     {
-        let cause_key = PropertyKey::Named(EcmaString::encode("cause"));
+        let cause_key = PropertyKey::Named(machine.intern_str("cause"));
         if machine.internal_has_property(options, &cause_key)? {
             let cause = machine.get_named_property(options, "cause")?;
             define_error_field(machine, object, "cause", cause)?;
@@ -774,10 +958,19 @@ fn error_to_string<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_object(this) {
+        return Err(type_error("Error.prototype.toString requires an object"));
+    }
     let name_value = machine.get_named_property(this, "name")?;
-    let name = machine.to_string(name_value)?;
+    let name = match name_value {
+        Value::UNDEFINED => EcmaString::encode("Error"),
+        value => machine.coerce_string_observable(value)?,
+    };
     let message_value = machine.get_named_property(this, "message")?;
-    let message = machine.to_string(message_value)?;
+    let message = match message_value {
+        Value::UNDEFINED => EcmaString::encode(""),
+        value => machine.coerce_string_observable(value)?,
+    };
     let text = if name.is_empty() {
         message
     } else if message.is_empty() {
@@ -822,10 +1015,9 @@ impl<'a, H: Host> Machine<'a, H> {
             return self.with_proxy_dispatch(|machine| proxy::get(machine, object, key, receiver));
         }
         let outcome = if let PropertyKey::Named(name) = key
-            && let Ok(name) = name.to_utf8_strict()
-            && name.is_ascii()
+            && self.atoms.is_ascii(*name)
         {
-            self.resolve_get_ascii(object, &name, receiver)?
+            self.resolve_get_atom(object, *name, receiver)?
         } else {
             self.resolve_get(object, key, receiver)?
         };
@@ -884,6 +1076,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 proxy::define_own_property(machine, object, key, descriptor)
             });
         }
+        if let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)?
+            && self.is_array_length_key(index, &key)
+        {
+            return self.array_define_length(index, descriptor);
+        }
         let current = self.own_descriptor(object, &key)?;
         let extensible = property_descriptor::is_extensible(self, object)?;
         property_descriptor::validate_and_apply_property_descriptor(
@@ -938,11 +1135,16 @@ impl<'a, H: Host> Machine<'a, H> {
         if self.same_value(proposed, current) {
             return Ok(true);
         }
-        if !property_descriptor::is_extensible(self, object)? {
+        // %Object.prototype% is an immutable prototype exotic object.
+        if object == self.intrinsics.object_prototype
+            || !property_descriptor::is_extensible(self, object)?
+        {
             return Ok(false);
         }
+        // The cycle walk stops at a proxy, whose [[GetPrototypeOf]] is not ordinary.
         let mut node = proposed;
-        while !matches!(node.decode(), Some(Decoded::Null)) {
+        while !matches!(node.decode(), Some(Decoded::Null)) && !self.heap_entry_is_proxy_value(node)
+        {
             if node == object {
                 return Ok(false);
             }
@@ -985,6 +1187,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::NativeFunction { extensible, .. }
             | HeapEntry::RegExp { extensible, .. }
             | HeapEntry::Date { extensible, .. }
+            | HeapEntry::Temporal { extensible, .. }
+            | HeapEntry::Intl { extensible, .. }
             | HeapEntry::BuiltinIterator { extensible, .. }
             | HeapEntry::Collection { extensible, .. }
             | HeapEntry::TypedArray { extensible, .. }
@@ -1026,7 +1230,7 @@ impl<'a, H: Host> Machine<'a, H> {
         this_value: Value,
         arguments: &[Value],
     ) -> Result<bool, EvalFailure> {
-        let result = self.call_value(callee, this_value, arguments)?;
+        let result = self.call_callback(callee, this_value, arguments)?;
         Ok(self.to_boolean(result))
     }
     #[cfg(test)]
@@ -1066,6 +1270,16 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             }
             | HeapEntry::Date {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Temporal {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::Intl {
                 properties,
                 extensible,
                 ..
@@ -1132,19 +1346,17 @@ impl<'a, H: Host> Machine<'a, H> {
             _ => return Ok(()),
         };
         *extensible = false;
-        for (_, property) in &mut properties.0 {
-            match property {
-                Property::Data {
-                    writable,
-                    configurable,
-                    ..
-                } => {
-                    *writable = false;
-                    *configurable = false;
-                }
-                Property::Accessor { configurable, .. } => *configurable = false,
+        properties.for_each_property_mut(|property| match property {
+            Property::Data {
+                writable,
+                configurable,
+                ..
+            } => {
+                *writable = false;
+                *configurable = false;
             }
-        }
+            Property::Accessor { configurable, .. } => *configurable = false,
+        });
         Ok(())
     }
     pub(crate) fn own_descriptor(
@@ -1155,22 +1367,24 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Ok(None);
         };
+        if let Some(property) = self.string_exotic_property(index, key)? {
+            return Ok(Some(property));
+        }
+        self.reify_function_properties(index)?;
         let properties = match &self.heap[index] {
             HeapEntry::ModuleNamespace { module } => {
                 let PropertyKey::Named(name) = key else {
                     return Ok(None);
                 };
-                return self
-                    .namespace_export(*module, name)
-                    .map(|value| {
-                        value.map(|value| Property::Data {
-                            value,
-                            writable: true,
-                            enumerable: true,
-                            configurable: false,
-                        })
-                    })
-                    .map_err(EvalFailure::Runtime);
+                return match self.namespace_export(*module, self.atoms.resolve(*name)) {
+                    Ok(value) => Ok(value.map(|value| Property::Data {
+                        value,
+                        writable: true,
+                        enumerable: true,
+                        configurable: false,
+                    })),
+                    Err(kind) => Err(self.read_failure(kind)),
+                };
             }
             HeapEntry::Array {
                 elements,
@@ -1178,7 +1392,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 length_writable,
                 ..
             } => {
-                if matches!(key, PropertyKey::Named(name) if name.eq_ascii("length")) {
+                if matches!(key, PropertyKey::Named(name) if self.atoms.eq_ascii(*name, "length")) {
                     return Ok(Some(Property::Data {
                         value: crate::number_value(elements.len() as f64),
                         writable: *length_writable,
@@ -1186,11 +1400,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         configurable: false,
                     }));
                 }
-                if let Some(property) = properties.get(key) {
+                if let Some(property) = properties.get(&self.shapes, key) {
                     return Ok(Some(property.clone()));
                 }
                 if let PropertyKey::Named(name) = key
-                    && let Some(offset) = crate::array_index(name)
+                    && let Some(offset) = self.atoms.array_index(*name)
                     && let Some(value) = elements.get(offset as usize)
                     && *value != Value::HOLE
                 {
@@ -1205,7 +1419,8 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             HeapEntry::TypedArray { properties, .. } => {
                 if let PropertyKey::Named(name) = key
-                    && let Some(typed_index) = typedarray_all::typed_array_index(name)
+                    && let Some(typed_index) =
+                        typedarray_all::typed_array_index(self.atoms.resolve(*name))
                 {
                     let view = self.value_for_runtime_index(index)?;
                     let bounds = typedarray_all::typed_array_bounds(self, view)?;
@@ -1229,15 +1444,25 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
+            | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::WeakRef { properties, .. }
             | HeapEntry::FinalizationRegistry { properties, .. }
             | HeapEntry::DisposableStack { properties, .. }
-            | HeapEntry::Timeout { properties, .. } => properties,
+            | HeapEntry::Timeout { properties, .. }
+            | HeapEntry::ArrayBuffer { properties, .. }
+            | HeapEntry::SharedArrayBuffer { properties, .. }
+            | HeapEntry::DataView { properties, .. }
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::AsyncFromSync { properties, .. }
+            | HeapEntry::ProxyRevoker { properties, .. } => properties,
             _ => return Ok(None),
         };
-        Ok(properties.get(key).cloned())
+        Ok(properties.get(&self.shapes, key).cloned())
     }
     /// ECMA-262 §7.2.10 SameValue(x, y) — like `same_value_zero` except that
     /// `+0` and `-0` are distinct. Mirrors the helper in `object.rs`; kept here
@@ -1358,8 +1583,25 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Err(type_error("Object.defineProperty called on non-object"));
         };
+        self.reify_function_properties(index)?;
+        if let Some(Property::Data {
+            value: stored,
+            enumerable,
+            ..
+        }) = self.string_exotic_property(index, &key)?
+        {
+            return match descriptor {
+                Property::Data {
+                    value,
+                    writable: false,
+                    enumerable: requested,
+                    configurable: false,
+                } if requested == enumerable && self.same_value(value, stored) => Ok(()),
+                _ => Err(type_error("Cannot redefine property")),
+            };
+        }
         if let PropertyKey::Named(name) = &key
-            && let Some(typed_index) = typedarray_all::typed_array_index(name)
+            && let Some(typed_index) = typedarray_all::typed_array_index(self.atoms.resolve(*name))
             && matches!(self.heap[index], HeapEntry::TypedArray { .. })
         {
             let Some(offset) = typed_index else {
@@ -1381,7 +1623,7 @@ impl<'a, H: Host> Machine<'a, H> {
             };
             return self.set_data_property_key(object, key, value);
         }
-        if matches!(&key, PropertyKey::Named(name) if name.eq_ascii("length"))
+        if matches!(&key, PropertyKey::Named(name) if self.atoms.eq_ascii(*name, "length"))
             && matches!(self.heap[index], HeapEntry::Array { .. })
         {
             let Property::Data {
@@ -1401,7 +1643,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     properties,
                     length_writable,
                     ..
-                } => (elements.len(), properties.charge_bytes(), *length_writable),
+                } => (
+                    elements.len(),
+                    properties.charge_bytes(&self.shapes, &self.atoms),
+                    *length_writable,
+                ),
                 _ => unreachable!("array checked above"),
             };
             if writable && !length_writable {
@@ -1422,7 +1668,14 @@ impl<'a, H: Host> Machine<'a, H> {
                 else {
                     unreachable!("array checked above");
                 };
-                let result = define_array_length(elements, properties, *length_writable, length);
+                let result = define_array_length(
+                    elements,
+                    properties,
+                    &self.atoms,
+                    *length_writable,
+                    &self.shapes,
+                    length,
+                );
                 if !writable {
                     *length_writable = false;
                 }
@@ -1433,7 +1686,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     elements,
                     properties,
                     ..
-                } => (elements.len(), properties.charge_bytes()),
+                } => (elements.len(), properties.charge_bytes(&self.shapes, &self.atoms)),
                 _ => unreachable!("array checked above"),
             };
             let released = old_length
@@ -1476,6 +1729,16 @@ impl<'a, H: Host> Machine<'a, H> {
                     ..
                 }
                 | HeapEntry::Date {
+                    properties,
+                    extensible,
+                    ..
+                }
+                | HeapEntry::Temporal {
+                    properties,
+                    extensible,
+                    ..
+                }
+                | HeapEntry::Intl {
                     properties,
                     extensible,
                     ..
@@ -1529,10 +1792,25 @@ impl<'a, H: Host> Machine<'a, H> {
                     properties,
                     extensible,
                     ..
+                }
+                | HeapEntry::Promise {
+                    properties,
+                    extensible,
+                    ..
+                }
+                | HeapEntry::Generator {
+                    properties,
+                    extensible,
+                    ..
+                }
+                | HeapEntry::AsyncGenerator {
+                    properties,
+                    extensible,
+                    ..
                 } => {
-                    let exists = properties.contains_key(&key);
+                    let exists = properties.contains_key(&self.shapes, &key);
                     let (property_growth, property_refund) =
-                        property_definition_charges(properties, &key, &descriptor);
+                        property_definition_charges(properties, &self.shapes, &self.atoms, &key, &descriptor);
                     (
                         *extensible,
                         exists,
@@ -1550,10 +1828,10 @@ impl<'a, H: Host> Machine<'a, H> {
                     ..
                 } => {
                     let array_index = key
-                        .as_string()
+                        .as_string(&self.atoms)
                         .and_then(crate::array_index)
                         .map(|offset| offset as usize);
-                    let exists = properties.contains_key(&key)
+                    let exists = properties.contains_key(&self.shapes, &key)
                         || array_index.is_some_and(|offset| {
                             elements
                                 .get(offset)
@@ -1578,7 +1856,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             .saturating_mul(std::mem::size_of::<Value>())
                     });
                     let (property_growth, property_refund) =
-                        property_definition_charges(properties, &key, &descriptor);
+                        property_definition_charges(properties, &self.shapes, &self.atoms, &key, &descriptor);
                     (
                         *extensible,
                         exists,
@@ -1611,14 +1889,16 @@ impl<'a, H: Host> Machine<'a, H> {
                         crate::array_set_length(
                             elements,
                             properties,
+                            &self.atoms,
                             *length_writable,
                             crate::number_value((offset + 1) as f64),
                             "define array index",
+                    &self.shapes,
                         )?;
                     }
                     elements[offset] = Value::HOLE;
                 }
-                properties.insert(key, descriptor);
+                properties.insert(&mut self.shapes, key, descriptor);
             }
             HeapEntry::Object { properties, .. }
             | HeapEntry::Function { properties, .. }
@@ -1626,6 +1906,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
+            | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::TypedArray { properties, .. }
@@ -1635,8 +1917,11 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::WeakRef { properties, .. }
             | HeapEntry::FinalizationRegistry { properties, .. }
             | HeapEntry::DisposableStack { properties, .. }
-            | HeapEntry::Timeout { properties, .. } => {
-                properties.insert(key, descriptor);
+            | HeapEntry::Timeout { properties, .. }
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. } => {
+                properties.insert(&mut self.shapes, key, descriptor);
             }
             _ => unreachable!("validated object cannot change heap entry kind"),
         }
@@ -1658,6 +1943,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::NativeFunction { extensible, .. }
             | HeapEntry::RegExp { extensible, .. }
             | HeapEntry::Date { extensible, .. }
+            | HeapEntry::Temporal { extensible, .. }
+            | HeapEntry::Intl { extensible, .. }
             | HeapEntry::BuiltinIterator { extensible, .. }
             | HeapEntry::Collection { extensible, .. }
             | HeapEntry::TypedArray { extensible, .. }
@@ -1679,14 +1966,14 @@ impl<'a, H: Host> Machine<'a, H> {
                 return Err(type_error("duplicate property in atomic descriptor batch"));
             }
             if matches!(&self.heap[index], HeapEntry::Array { .. })
-                && matches!(key, PropertyKey::Named(name) if name.eq_ascii("length") || crate::array_index(name).is_some())
+                && matches!(key, PropertyKey::Named(name) if self.atoms.eq_ascii(*name, "length") || self.atoms.array_index(*name).is_some())
             {
                 return Err(type_error(
                     "atomic descriptor batch cannot contain array index properties",
                 ));
             }
             if matches!(&self.heap[index], HeapEntry::TypedArray { .. })
-                && matches!(key, PropertyKey::Named(name) if typedarray_all::typed_array_index(name).is_some())
+                && matches!(key, PropertyKey::Named(name) if typedarray_all::typed_array_index(self.atoms.resolve(*name)).is_some())
             {
                 return Err(type_error(
                     "atomic descriptor batch cannot contain typed array index properties",
@@ -1706,6 +1993,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::NativeFunction { properties, .. }
                 | HeapEntry::RegExp { properties, .. }
                 | HeapEntry::Date { properties, .. }
+                | HeapEntry::Temporal { properties, .. }
+                | HeapEntry::Intl { properties, .. }
                 | HeapEntry::BuiltinIterator { properties, .. }
                 | HeapEntry::Collection { properties, .. }
                 | HeapEntry::TypedArray { properties, .. }
@@ -1715,7 +2004,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::Timeout { properties, .. }
                 | HeapEntry::DisposableStack { properties, .. }
                 | HeapEntry::Array { properties, .. } => {
-                    property_definition_charges(properties, key, descriptor)
+                    property_definition_charges(properties, &self.shapes, &self.atoms, key, descriptor)
                 }
                 _ => unreachable!("validated object cannot change heap entry kind"),
             };
@@ -1731,6 +2020,8 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::RegExp { properties, .. }
             | HeapEntry::Date { properties, .. }
+            | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::TypedArray { properties, .. }
@@ -1743,12 +2034,15 @@ impl<'a, H: Host> Machine<'a, H> {
             _ => unreachable!("validated object cannot change heap entry kind"),
         };
         for (key, descriptor) in descriptors {
-            properties.insert(key, descriptor);
+            properties.insert(&mut self.shapes, key, descriptor);
         }
         self.refund_slot(index, refund);
         Ok(())
     }
-    fn observable_property_key(&mut self, key: Value) -> Result<PropertyKey, EvalFailure> {
+    pub(crate) fn observable_property_key(
+        &mut self,
+        key: Value,
+    ) -> Result<PropertyKey, EvalFailure> {
         let primitive = self.coerce_primitive_observable(key, true)?;
         Ok(
             match self.runtime_slot(primitive).map_err(EvalFailure::Runtime)? {
@@ -1758,7 +2052,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Some(index) if matches!(self.heap[index], HeapEntry::PrivateName { .. }) => {
                     PropertyKey::Private(index as u32)
                 }
-                _ => PropertyKey::Named(self.to_string(primitive)?),
+                _ => PropertyKey::Named(self.intern(self.to_string(primitive)?)),
             },
         )
     }
@@ -1794,6 +2088,15 @@ impl<'a, H: Host> Machine<'a, H> {
         slot: DescriptorSlot,
     ) -> Result<(), EvalFailure> {
         let key = self.observable_property_key(key)?;
+        if slot == DescriptorSlot::Entire {
+            let property = Property::Data {
+                value: src,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            };
+            return self.define_descriptor(object, key, property);
+        }
         let half = (src != Value::UNDEFINED).then_some(src);
         let updated = match (self.own_descriptor(object, &key)?, slot) {
             (None, DescriptorSlot::Value) => Property::Data {
@@ -1863,12 +2166,15 @@ impl<'a, H: Host> Machine<'a, H> {
 }
 fn property_definition_charges(
     properties: &PropertyMap,
+    shapes: &ShapeTable,
+    atoms: &crate::AtomTable,
     key: &PropertyKey,
     descriptor: &Property,
 ) -> (usize, usize) {
-    match properties.get(key) {
+    match properties.get(shapes, key) {
         None => (
-            key.charge_bytes().saturating_add(descriptor.charge_bytes()),
+            key.charge_bytes(atoms)
+                .saturating_add(descriptor.charge_bytes()),
             0,
         ),
         Some(existing) => {
@@ -1902,16 +2208,12 @@ mod tests {
         let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let getter = install_function(
-            &mut machine.heap,
-            &mut machine.intrinsics.builtins,
-            "inherited message getter",
-            0,
-            inherited_message_getter::<TestHost>,
-        );
+        let getter = install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "inherited message getter", length: 0, handler: inherited_message_getter::<TestHost> });
         let mut properties = PropertyMap::default();
+        let key = PropertyKey::Named(machine.intern_str("message"));
         properties.insert(
-            PropertyKey::Named(EcmaString::encode("message")),
+            &mut machine.shapes,
+            key,
             Property::Accessor {
                 getter: Some(getter),
                 setter: None,
@@ -2002,7 +2304,7 @@ mod tests {
             .intrinsics
             .global("globalThis")
             .expect("globalThis is installed");
-        let key = PropertyKey::Named(EcmaString::encode("Infinity"));
+        let key = PropertyKey::Named(machine.intern_str("Infinity"));
         let descriptor = machine
             .own_descriptor(global_this, &key)
             .expect("descriptor lookup succeeds")
@@ -2034,7 +2336,7 @@ mod tests {
             .intrinsics
             .global("globalThis")
             .expect("globalThis is installed");
-        let key = PropertyKey::Named(EcmaString::encode("NaN"));
+        let key = PropertyKey::Named(machine.intern_str("NaN"));
         let descriptor = machine
             .own_descriptor(global_this, &key)
             .expect("descriptor lookup succeeds")
@@ -2053,6 +2355,43 @@ mod tests {
             }
             Property::Accessor { .. } => panic!("NaN must be a data property"),
         }
+    }
+    #[test]
+    fn round_half_up_keeps_zero_signs_and_the_value_just_below_a_tie() {
+        assert!(round_half_up(-0.0).is_sign_negative());
+        assert!(round_half_up(-0.5).is_sign_negative());
+        assert_eq!(round_half_up(-0.5), 0.0);
+        assert!(round_half_up(0.2).is_sign_positive());
+        assert_eq!(round_half_up(0.49999999999999994), 0.0);
+        assert_eq!(round_half_up(2.5), 3.0);
+        assert_eq!(round_half_up(-2.5), -2.0);
+        assert_eq!(round_half_up(9007199254740991.0), 9007199254740991.0);
+        assert!(round_half_up(f64::NAN).is_nan());
+        assert_eq!(round_half_up(f64::NEG_INFINITY), f64::NEG_INFINITY);
+    }
+    #[test]
+    fn global_undefined_descriptor_is_frozen() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let global_this = machine
+            .intrinsics
+            .global("globalThis")
+            .expect("globalThis is installed");
+        let key = PropertyKey::Named(machine.intern_str("undefined"));
+        let descriptor = machine
+            .own_descriptor(global_this, &key)
+            .expect("descriptor lookup succeeds")
+            .expect("undefined is defined on globalThis");
+        assert!(matches!(
+            descriptor,
+            Property::Data {
+                value: Value::UNDEFINED,
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            }
+        ));
     }
     #[test]
     fn global_infinity_and_nan_are_stable_across_reads() {
@@ -2146,7 +2485,7 @@ mod tests {
             .intrinsics
             .global("globalThis")
             .expect("globalThis is installed");
-        let key = PropertyKey::Named(EcmaString::encode("Atomics"));
+        let key = PropertyKey::Named(machine.intern_str("Atomics"));
         let descriptor = machine
             .own_descriptor(global_this, &key)
             .expect("descriptor lookup succeeds")
@@ -2166,10 +2505,10 @@ mod tests {
         }
     }
     #[test]
-    fn atomics_claims_no_methods() {
+    fn atomics_claims_exactly_the_methods_it_implements() {
         let module = blank_program("<test>");
         let mut host = TestHost;
-        let machine = Machine::new(&module, &mut host, Limits::default());
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
         let atomics = machine
             .intrinsics
             .global("Atomics")
@@ -2177,13 +2516,32 @@ mod tests {
         let keys = machine
             .own_property_keys(atomics)
             .expect("Atomics is an object");
-        let method_keys: Vec<_> = keys
+        let mut method_names: Vec<_> = keys
             .into_iter()
-            .filter(|key| !matches!(key, PropertyKey::Symbol(_)))
+            .filter_map(|key| match key {
+                PropertyKey::Named(name) => Some(machine.atoms.resolve(name).to_utf8_lossy()),
+                _ => None,
+            })
             .collect();
-        assert!(
-            method_keys.is_empty(),
-            "Atomics must not claim any named methods"
+        method_names.sort();
+        assert_eq!(
+            method_names,
+            [
+                "add",
+                "and",
+                "compareExchange",
+                "exchange",
+                "isLockFree",
+                "load",
+                "notify",
+                "or",
+                "pause",
+                "store",
+                "sub",
+                "wait",
+                "waitAsync",
+                "xor",
+            ]
         );
     }
     #[test]
@@ -2244,8 +2602,9 @@ mod tests {
             .unwrap();
         assert!(machine.inherits_from_prototype(result, prototype).unwrap());
         for (name, expected) in [("error", error), ("suppressed", suppressed)] {
+            let key = PropertyKey::Named(machine.intern_str(name));
             let descriptor = machine
-                .own_descriptor(result, &PropertyKey::Named(EcmaString::encode(name)))
+                .own_descriptor(result, &key)
                 .unwrap()
                 .expect("SuppressedError has an own error field");
             assert!(matches!(
@@ -2275,8 +2634,9 @@ mod tests {
             machine.enumerable_keys(error).unwrap().is_empty(),
             "Error own fields must not appear in Object.keys / for...in"
         );
+        let key = PropertyKey::Named(machine.intern_str("message"));
         let descriptor = machine
-            .own_descriptor(error, &PropertyKey::Named(EcmaString::encode("message")))
+            .own_descriptor(error, &key)
             .expect("descriptor lookup succeeds")
             .expect("Error has an own message property");
         assert!(
@@ -2291,8 +2651,9 @@ mod tests {
             ),
             "message must be a non-enumerable writable configurable data property"
         );
+        let key = PropertyKey::Named(machine.intern_str("stack"));
         let stack = machine
-            .own_descriptor(error, &PropertyKey::Named(EcmaString::encode("stack")))
+            .own_descriptor(error, &key)
             .expect("descriptor lookup succeeds")
             .expect("Error has an own stack property");
         assert!(
@@ -2332,8 +2693,9 @@ mod tests {
         let with_cause = machine
             .construct_value(error_constructor, &[msg2, options])
             .expect("Error with cause construction succeeds");
+        let key = PropertyKey::Named(machine.intern_str("cause"));
         let cause_descriptor = machine
-            .own_descriptor(with_cause, &PropertyKey::Named(EcmaString::encode("cause")))
+            .own_descriptor(with_cause, &key)
             .expect("descriptor lookup succeeds")
             .expect("Error has an own cause property");
         assert!(
@@ -2376,8 +2738,9 @@ mod tests {
             "AggregateError own fields must not appear in Object.keys / for...in"
         );
         for field in ["errors", "message"] {
+            let key = PropertyKey::Named(machine.intern_str(field));
             let descriptor = machine
-                .own_descriptor(aggregate, &PropertyKey::Named(EcmaString::encode(field)))
+                .own_descriptor(aggregate, &key)
                 .expect("descriptor lookup succeeds")
                 .expect("AggregateError has an own {field} property");
             assert!(
@@ -2411,8 +2774,8 @@ mod tests {
             .runtime_slot(object)
             .expect("object slot lookup succeeds")
             .expect("object has a runtime slot");
-        let data_key = PropertyKey::Named(EcmaString::encode("data"));
-        let accessor_key = PropertyKey::Named(EcmaString::encode("accessor"));
+        let data_key = PropertyKey::Named(machine.intern_str("data"));
+        let accessor_key = PropertyKey::Named(machine.intern_str("accessor"));
         let baseline_slot = machine.slot_bytes[index];
         let baseline_heap = machine.heap_bytes;
         for _ in 0..3 {
@@ -2480,7 +2843,7 @@ mod tests {
             .expect("object has a runtime slot");
         let before_slot = machine.slot_bytes[index];
         let before_heap = machine.heap_bytes;
-        let key = PropertyKey::Named(EcmaString::encode("x"));
+        let key = PropertyKey::Named(machine.intern_str("x"));
         assert!(matches!(
             machine.define_descriptor(
                 object,
@@ -2518,7 +2881,7 @@ mod tests {
             .runtime_slot(array)
             .expect("array slot lookup succeeds")
             .expect("array has a runtime slot");
-        let length_key = PropertyKey::Named(EcmaString::encode("length"));
+        let length_key = PropertyKey::Named(machine.intern_str("length"));
         machine
             .define_descriptor(
                 array,
@@ -2568,8 +2931,8 @@ mod tests {
         let missing = allocate_string(&mut machine, EcmaString::encode("missing")).unwrap();
         let data_key = allocate_string(&mut machine, EcmaString::encode("data")).unwrap();
         let accessor_key = allocate_string(&mut machine, EcmaString::encode("accessor")).unwrap();
-        let data_pk = PropertyKey::Named(EcmaString::encode("data"));
-        let accessor_pk = PropertyKey::Named(EcmaString::encode("accessor"));
+        let data_pk = PropertyKey::Named(machine.intern_str("data"));
+        let accessor_pk = PropertyKey::Named(machine.intern_str("accessor"));
         let getter = Value::int32(1);
         let setter = Value::int32(2);
         assert_eq!(
@@ -2654,10 +3017,10 @@ mod tests {
         let missing = allocate_string(&mut machine, EcmaString::encode("missing")).unwrap();
         let missing_getter =
             allocate_string(&mut machine, EcmaString::encode("missingGetter")).unwrap();
-        let data_pk = PropertyKey::Named(EcmaString::encode("data"));
-        let accessor_pk = PropertyKey::Named(EcmaString::encode("accessor"));
-        let missing_pk = PropertyKey::Named(EcmaString::encode("missing"));
-        let missing_getter_pk = PropertyKey::Named(EcmaString::encode("missingGetter"));
+        let data_pk = PropertyKey::Named(machine.intern_str("data"));
+        let accessor_pk = PropertyKey::Named(machine.intern_str("accessor"));
+        let missing_pk = PropertyKey::Named(machine.intern_str("missing"));
+        let missing_getter_pk = PropertyKey::Named(machine.intern_str("missingGetter"));
         let getter = Value::int32(11);
         let setter = Value::int32(22);
         let next_getter = Value::int32(33);
@@ -2778,8 +3141,8 @@ mod tests {
             .unwrap();
         let inherited_key = allocate_string(&mut machine, EcmaString::encode("inherited")).unwrap();
         let accessor_key = allocate_string(&mut machine, EcmaString::encode("accessor")).unwrap();
-        let inherited_pk = PropertyKey::Named(EcmaString::encode("inherited"));
-        let accessor_pk = PropertyKey::Named(EcmaString::encode("accessor"));
+        let inherited_pk = PropertyKey::Named(machine.intern_str("inherited"));
+        let accessor_pk = PropertyKey::Named(machine.intern_str("accessor"));
         machine
             .define_descriptor(
                 proto,
@@ -2799,15 +3162,9 @@ mod tests {
             Value::UNDEFINED,
             "inherited prototype data must not be visible to own-slot load"
         );
-        let getter = install_function(
-            &mut machine.heap,
-            &mut machine.intrinsics.builtins,
-            "counting getter",
-            0,
-            |_machine, _this, _args, _constructing| {
-                panic!("LoadOwnDescriptorSlot must not invoke accessors");
-            },
-        );
+        let getter = install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "counting getter", length: 0, handler: |_machine, _this, _args, _constructing| {
+            panic!("LoadOwnDescriptorSlot must not invoke accessors");
+        } });
         machine
             .define_descriptor(
                 object,
@@ -2857,7 +3214,7 @@ mod tests {
             })
             .expect("object allocation succeeds");
         let produced = allocate_string(&mut machine, EcmaString::encode("produced-key")).unwrap();
-        let produced_pk = PropertyKey::Named(EcmaString::encode("produced-key"));
+        let produced_pk = PropertyKey::Named(machine.intern_str("produced-key"));
         machine
             .define_descriptor(
                 object,
@@ -2884,13 +3241,7 @@ mod tests {
         machine
             .set_data_property(key_object, "produced", produced)
             .unwrap();
-        let to_string = install_function(
-            &mut machine.heap,
-            &mut machine.intrinsics.builtins,
-            "descriptor key toString",
-            0,
-            key_to_string::<TestHost>,
-        );
+        let to_string = install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "descriptor key toString", length: 0, handler: key_to_string::<TestHost> });
         machine
             .set_data_property(key_object, "toString", to_string)
             .unwrap();
@@ -2961,7 +3312,7 @@ mod tests {
             .runtime_slot(object)
             .expect("object slot lookup succeeds")
             .expect("object has a runtime slot");
-        let key = PropertyKey::Named(EcmaString::encode("x"));
+        let key = PropertyKey::Named(machine.intern_str("x"));
         // Install a writable, configurable data property, then freeze so it
         // becomes non-writable and non-configurable.
         machine
@@ -3050,8 +3401,22 @@ mod tests {
                 boxed_primitive: None,
             })
             .expect("object allocation succeeds");
-        define_data(&mut machine.heap, object, "bootstrap", Value::int32(42));
-        define_frozen_data(&mut machine.heap, object, "sealed", Value::int32(99));
+        define_data(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            object,
+            "bootstrap",
+            Value::int32(42),
+        );
+        define_frozen_data(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            object,
+            "sealed",
+            Value::int32(99),
+        );
         assert_eq!(
             machine.get_named_property(object, "bootstrap").unwrap(),
             Value::int32(42)

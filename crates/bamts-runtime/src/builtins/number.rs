@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
+use super::intl::number_to_locale_string;
 use super::{
     allocate_string, define_data, install_constructor_function, install_function, number_format,
     range_error, to_integer_or_infinity, type_error, value_number,
@@ -12,23 +13,24 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.number_prototype();
-    let constructor = install_constructor_function(heap, builtins, "Number", 1, constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Number", length: 1, handler: constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode("Number"), constructor);
     for (name, length, handler) in [
         ("isInteger", 1, is_integer::<H> as BuiltinHandler<H>),
         ("isSafeInteger", 1, is_safe_integer::<H>),
         ("isFinite", 1, is_finite::<H>),
         ("isNaN", 1, is_nan::<H>),
-        ("parseFloat", 1, parse_float::<H>),
-        ("parseInt", 2, parse_int::<H>),
     ] {
-        let f = install_function(heap, builtins, name, length, handler);
-        define_static(heap, constructor, name, f)
+        let f = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_static(heap, atoms, shapes, constructor, name, f)
     }
     for (name, value) in [
         ("MAX_SAFE_INTEGER", 9007199254740991.0),
@@ -40,26 +42,68 @@ pub(super) fn install<H: Host>(
         ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
         ("NaN", f64::NAN),
     ] {
-        define_static(heap, constructor, name, crate::number_value(value))
+        let HeapEntry::NativeFunction { properties, .. } =
+            &mut heap[super::heap_index(constructor)]
+        else {
+            panic!("Number constructor must be native")
+        };
+        properties.insert(
+            shapes,
+            PropertyKey::Named(atoms.intern_str(name)),
+            crate::Property::Data {
+                value: crate::number_value(value),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
     }
     for (name, length, handler) in [
         ("toString", 1, to_string::<H> as BuiltinHandler<H>),
         ("toFixed", 1, to_fixed::<H>),
+        ("toLocaleString", 0, to_locale_string::<H>),
         ("toExponential", 1, to_exponential::<H>),
         ("toPrecision", 1, to_precision::<H>),
         ("valueOf", 0, value_of::<H>),
     ] {
-        let f = install_function(heap, builtins, name, length, handler);
-        define_data(heap, prototype, name, f)
+        let f = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, prototype, name, f)
     }
 }
-fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
+/// `Number.parseFloat` and `Number.parseInt` are the global functions themselves.
+pub(super) fn share_global_parsers(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+    globals: &BTreeMap<EcmaString, Value>,
+) {
+    let constructor = globals[&EcmaString::encode("Number")];
+    for name in ["parseFloat", "parseInt"] {
+        define_static(
+            heap,
+            atoms,
+            shapes,
+            constructor,
+            name,
+            globals[&EcmaString::encode(name)],
+        );
+    }
+}
+fn define_static(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+    constructor: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[super::heap_index(constructor)]
     else {
         panic!("Number constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        shapes,
+        PropertyKey::Named(atoms.intern_str(name)),
         super::builtin_property(value),
     );
 }
@@ -69,15 +113,18 @@ fn constructor<H: Host>(
     args: &[Value],
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let value = if args.is_empty() {
-        Value::int32(0)
-    } else if let Some(number) = super::bigint::bigint_to_number(machine, args[0])? {
-        number
+    let value = if let Some(value) = args.first() {
+        let primitive = machine.coerce_primitive_observable(*value, false)?;
+        match super::bigint::bigint_to_number(machine, primitive)? {
+            Some(number) => number,
+            None => machine.coerce_number_observable(primitive)?,
+        }
     } else {
-        machine.to_number(args[0])?
+        Value::int32(0)
     };
     if constructing {
-        Ok(BuiltinOutcome::Value(machine.box_primitive(value)?))
+        let prototype = machine.intrinsics.number_prototype;
+        super::wrap_for_new_target(machine, value, prototype)
     } else {
         Ok(BuiltinOutcome::Value(value))
     }
@@ -156,7 +203,7 @@ pub(super) fn parse_float<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let text = machine
-        .to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?
+        .coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?
         .to_utf8_lossy();
     Ok(BuiltinOutcome::Value(crate::number_value(
         number_format::parse_float(&text),
@@ -180,10 +227,10 @@ pub(super) fn parse_int<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let text = machine
-        .to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?
+        .coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?
         .to_utf8_lossy();
     let requested = to_int32_radix(value_number(
-        machine.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))?,
+        machine.coerce_number_observable(args.get(1).copied().unwrap_or(Value::UNDEFINED))?,
     ));
     Ok(BuiltinOutcome::Value(crate::number_value(
         number_format::parse_int(&text, requested),
@@ -195,7 +242,9 @@ pub(super) fn global_is_nan<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let n = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
+    let n = value_number(
+        machine.coerce_number_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+    );
     Ok(BuiltinOutcome::Value(Value::boolean(n.is_nan())))
 }
 pub(super) fn global_is_finite<H: Host>(
@@ -204,7 +253,9 @@ pub(super) fn global_is_finite<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let n = value_number(machine.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))?);
+    let n = value_number(
+        machine.coerce_number_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?,
+    );
     Ok(BuiltinOutcome::Value(Value::boolean(n.is_finite())))
 }
 fn to_string<H: Host>(
@@ -229,6 +280,21 @@ fn to_string<H: Host>(
         EcmaString::encode(&text),
     )?))
 }
+fn to_locale_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let n = primitive_number(
+        machine,
+        this,
+        "Number.prototype.toLocaleString requires that 'this' be a Number",
+    )?;
+    let argument = |index: usize| args.get(index).copied().unwrap_or(Value::UNDEFINED);
+    number_to_locale_string(machine, n, argument(0), argument(1))
+}
+
 fn to_fixed<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -313,6 +379,58 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program};
     use super::*;
     use crate::Limits;
+
+    #[test]
+    fn exponentiation_differs_from_powf_for_a_unit_base() {
+        assert!(crate::number_exponentiate(1.0, f64::INFINITY).is_nan());
+        assert!(crate::number_exponentiate(-1.0, f64::NEG_INFINITY).is_nan());
+        assert!(crate::number_exponentiate(1.0, f64::NAN).is_nan());
+        assert_eq!(crate::number_exponentiate(f64::NAN, 0.0), 1.0);
+        assert_eq!(crate::number_exponentiate(2.0, 10.0), 1024.0);
+    }
+
+    #[test]
+    fn number_parsers_are_the_global_functions() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Number").unwrap();
+        for name in ["parseFloat", "parseInt"] {
+            assert_eq!(
+                machine.get_named_property(constructor, name).unwrap(),
+                machine.intrinsics.global(name).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn number_constants_are_read_only() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Number").unwrap();
+        for name in [
+            "MAX_SAFE_INTEGER",
+            "MIN_SAFE_INTEGER",
+            "EPSILON",
+            "MAX_VALUE",
+            "MIN_VALUE",
+            "POSITIVE_INFINITY",
+            "NEGATIVE_INFINITY",
+            "NaN",
+        ] {
+            let key = PropertyKey::Named(machine.intern_str(name));
+            assert!(matches!(
+                machine.own_descriptor(constructor, &key).unwrap(),
+                Some(crate::Property::Data {
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                    ..
+                })
+            ));
+        }
+    }
 
     #[test]
     fn numeric_prefixes_stop_at_lone_surrogates() {

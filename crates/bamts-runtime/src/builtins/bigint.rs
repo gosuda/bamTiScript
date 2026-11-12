@@ -12,7 +12,7 @@
 //! - mixed BigInt/Number arithmetic is a `TypeError`;
 //! - non-integral `Number -> BigInt` conversion is a `RangeError`;
 //! - `StringToBigInt` failures are real `SyntaxError` objects built through
-//!   the installed `SyntaxError` constructor (mirrors `json.rs`); a zero-length
+//!   the installed `SyntaxError` constructor (mirrors `json_edge.rs`); a zero-length
 //!   or whitespace-only string is `0n`, never an error.
 
 use std::collections::BTreeMap;
@@ -20,7 +20,10 @@ use std::collections::BTreeMap;
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
-use super::{allocate_string, define_data, heap_index, install_function, range_error, type_error};
+use super::{
+    allocate_string, define_data, heap_index, install_constructor_function, install_function,
+    range_error, type_error,
+};
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{
     EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, ThrowOrigin, numeric_f64,
@@ -1271,7 +1274,7 @@ pub(crate) enum BigIntBinaryOp {
 
 /// Maps a core `BigIntError` to an abrupt completion. Type and range stays in
 /// the typed `ThrowOrigin` channel; syntax failures build a real `SyntaxError`
-/// instance through the installed error constructor, exactly as `json.rs` does.
+/// instance through the installed error constructor, exactly as `json_edge.rs` does.
 fn bigint_failure<H: Host>(machine: &mut Machine<'_, H>, error: BigIntError) -> EvalFailure {
     match error {
         BigIntError::Range(operation) => range_error(operation),
@@ -1659,26 +1662,28 @@ pub(crate) fn json_reject<H: Host>(
 /// boxing path find `[[Prototype]]` for BigInt values.
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) -> Value {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let constructor = install_function(heap, builtins, "BigInt", 1, constructor::<H>);
+    let constructor =
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "BigInt", length: 1, handler: constructor::<H> });
     builtins.set_bigint_constructor(constructor);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
 
-    let as_int_n = install_function(heap, builtins, "asIntN", 2, as_int_n::<H>);
-    let as_uint_n = install_function(heap, builtins, "asUintN", 2, as_uint_n::<H>);
-    define_native_property(heap, constructor, "asIntN", as_int_n);
-    define_native_property(heap, constructor, "asUintN", as_uint_n);
+    let as_int_n = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "asIntN", length: 2, handler: as_int_n::<H> });
+    let as_uint_n = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "asUintN", length: 2, handler: as_uint_n::<H> });
+    define_native_property(heap, atoms, shapes, constructor, "asIntN", as_int_n);
+    define_native_property(heap, atoms, shapes, constructor, "asUintN", as_uint_n);
 
-    let to_string = install_function(heap, builtins, "toString", 0, to_string::<H>);
-    let value_of = install_function(heap, builtins, "valueOf", 0, value_of::<H>);
-    let to_locale_string =
-        install_function(heap, builtins, "toLocaleString", 0, to_locale_string::<H>);
-    define_data(heap, prototype, "toString", to_string);
-    define_data(heap, prototype, "valueOf", value_of);
-    define_data(heap, prototype, "toLocaleString", to_locale_string);
+    let to_string = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "toString", length: 0, handler: to_string::<H> });
+    let value_of = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "valueOf", length: 0, handler: value_of::<H> });
+    let to_locale_string = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "toLocaleString", length: 0, handler: to_locale_string::<H> });
+    define_data(heap, atoms, shapes, prototype, "toString", to_string);
+    define_data(heap, atoms, shapes, prototype, "valueOf", value_of);
+    define_data(heap, atoms, shapes, prototype, "toLocaleString", to_locale_string);
 
     let tag = super::super::push(heap, HeapEntry::String(EcmaString::encode("BigInt")));
     let to_string_tag = builtins.symbol_to_string_tag();
@@ -1686,6 +1691,7 @@ pub(super) fn install<H: Host>(
         unreachable!("prototype is an ordinary object");
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(heap_index(to_string_tag) as u32),
         Property::Data {
             value: tag,
@@ -1699,12 +1705,20 @@ pub(super) fn install<H: Host>(
     prototype
 }
 
-fn define_native_property(heap: &mut [HeapEntry], object: Value, name: &str, value: Value) {
+fn define_native_property(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+    object: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(object)] else {
         unreachable!("constructor is a native function");
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        shapes,
+        PropertyKey::Named(atoms.intern_str(name)),
         Property::Data {
             value,
             writable: true,
@@ -1714,7 +1728,8 @@ fn define_native_property(heap: &mut [HeapEntry], object: Value, name: &str, val
     );
 }
 
-/// §21.2.1.1: `BigInt(value)` is callable but not constructible.
+/// §21.2.1.1: `BigInt(value)` is callable. It has `[[Construct]]` so it can name
+/// an `extends` clause, but reaching it through `new` or `super()` throws here.
 fn constructor<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
@@ -1772,14 +1787,11 @@ fn as_uint_n<H: Host>(
 
 /// `ToIndex`: integer truncating, must be in `[0, 2^53 - 1]`.
 fn to_index<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<usize, EvalFailure> {
-    if value == Value::UNDEFINED {
-        return Ok(0);
-    }
-    let number = numeric_f64(machine.to_number(value)?).expect("ToNumber returns numeric");
-    if !number.is_finite() || !(0.0..=9_007_199_254_740_991.0).contains(&number) {
+    let integer = super::to_integer_or_infinity(machine, value)?;
+    if !(0.0..=9_007_199_254_740_991.0).contains(&integer) {
         return Err(range_error("Invalid index range"));
     }
-    usize::try_from(number.trunc() as u64).map_err(|_| range_error("Invalid index range"))
+    usize::try_from(integer as u64).map_err(|_| range_error("Invalid index range"))
 }
 
 /// §21.2.3.1: `BigInt.prototype.toString([radix])`.
@@ -1817,20 +1829,18 @@ fn value_of<H: Host>(
     Ok(BuiltinOutcome::Value(allocate_bigint(machine, &bigint)?))
 }
 
-/// §21.2.3.3: `BigInt.prototype.toLocaleString()`. Without an ECMA-402 host
-/// the fallback the spec permits is the plain decimal `toString` text; locale
-/// formatting is an unsupported host capability, not silently faked beyond
-/// this spec-sanctioned equivalence.
+/// ECMA-402 `BigInt.prototype.toLocaleString(locales, options)`: formats
+/// through a new `Intl.NumberFormat`, exactly.
 fn to_locale_string<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
-    _args: &[Value],
+    args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let bigint = this_bigint_value(machine, this)?;
-    let text = bigint.to_string_radix(10);
-    let string = allocate_string(machine, EcmaString::encode(&text))?;
-    Ok(BuiltinOutcome::Value(string))
+    let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    super::intl::bigint_to_locale_string(machine, &bigint.to_string_radix(10), locales, options)
 }
 
 #[cfg(test)]
@@ -1862,13 +1872,7 @@ mod tests {
     }
 
     fn observable_object(machine: &mut Machine<'_, TestHost>, primitive: Value) -> Value {
-        let value_of = install_function(
-            &mut machine.heap,
-            &mut machine.intrinsics.builtins,
-            "valueOf",
-            0,
-            observable_value_of,
-        );
+        let value_of = install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "valueOf", length: 0, handler: observable_value_of });
         let object = machine
             .allocate(HeapEntry::Object {
                 properties: Default::default(),
@@ -2080,16 +2084,41 @@ mod tests {
     }
 
     #[test]
+    fn bigint_has_construct_but_new_throws_from_the_function_body() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        install_bigint(&mut machine);
+        let bigint = machine.intrinsics.global("BigInt").unwrap();
+        assert!(
+            machine.is_constructor(bigint).unwrap(),
+            "an extends clause needs BigInt to have [[Construct]]"
+        );
+        assert!(matches!(
+            machine.construct_value(bigint, &[Value::int32(1)]),
+            Err(EvalFailure::Throw(crate::ThrowOrigin::TypeError {
+                operation: "BigInt is not a constructor"
+            }))
+        ));
+        let result = machine
+            .call_value(bigint, Value::UNDEFINED, &[Value::int32(1)])
+            .unwrap();
+        assert!(
+            !machine.is_object(result),
+            "a plain call still returns a primitive bigint"
+        );
+    }
+
+    #[test]
     fn constructor_and_prototype_descriptors_are_exact() {
         let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         install_bigint(&mut machine);
         let bigint = bigint_global(&machine);
-
-        let named = |name: &str| PropertyKey::Named(EcmaString::encode(name));
+        let prototype_key = PropertyKey::Named(machine.intern_str("prototype"));
         let prototype_descriptor = machine
-            .own_descriptor(bigint, &named("prototype"))
+            .own_descriptor(bigint, &prototype_key)
             .expect("descriptor lookup succeeds")
             .expect("BigInt.prototype is defined");
         assert!(
@@ -2108,8 +2137,9 @@ mod tests {
             .get_named_property(bigint, "prototype")
             .expect("prototype readable");
 
+        let constructor_key = PropertyKey::Named(machine.intern_str("constructor"));
         let constructor_descriptor = machine
-            .own_descriptor(prototype, &named("constructor"))
+            .own_descriptor(prototype, &constructor_key)
             .expect("descriptor lookup succeeds")
             .expect("BigInt.prototype.constructor is defined");
         assert!(
@@ -2126,8 +2156,9 @@ mod tests {
         );
 
         for method in ["toString", "valueOf", "toLocaleString"] {
+            let method_key = PropertyKey::Named(machine.intern_str(method));
             let descriptor = machine
-                .own_descriptor(prototype, &named(method))
+                .own_descriptor(prototype, &method_key)
                 .expect("descriptor lookup succeeds")
                 .unwrap_or_else(|| panic!("{method} is defined"));
             assert!(
@@ -2177,10 +2208,10 @@ mod tests {
         };
         assert_eq!(*target, machine.intrinsics.object_prototype);
 
-        // Static converters share the same descriptor profile.
         for method in ["asIntN", "asUintN"] {
+            let method_key = PropertyKey::Named(machine.intern_str(method));
             let descriptor = machine
-                .own_descriptor(bigint, &named(method))
+                .own_descriptor(bigint, &method_key)
                 .expect("descriptor lookup succeeds")
                 .unwrap_or_else(|| panic!("{method} is defined"));
             assert!(
@@ -2388,8 +2419,8 @@ mod tests {
             .expect("toLocaleString succeeds");
         let text = machine.to_string(locale).expect("locale result is text");
         assert!(
-            text.eq_ascii("-9099"),
-            "toLocaleString matches decimal toString"
+            text.eq_ascii("-9,099"),
+            "toLocaleString groups like Intl.NumberFormat"
         );
     }
 

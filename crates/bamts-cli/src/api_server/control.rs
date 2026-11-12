@@ -102,15 +102,25 @@ impl Control {
 
     pub(crate) fn offer(&self, request: Request, bytes: usize) -> Admission {
         let mut inner = self.inner.lock().expect("transport control poisoned");
-        if inner.stop || inner.fatal.is_some() {
+        if inner.fatal.is_some() {
             return Admission::Halt;
         }
+        // A frame already read still earns its terminal response: the drain runs
+        // after the reader exits, so the request only has to reach the queue.
+        let stopping = inner.stop;
+        if stopping && request.id.is_none() {
+            return Admission::Halt;
+        }
+        let admission = self.admit_locked(&mut inner, request, bytes);
+        if stopping { Admission::Halt } else { admission }
+    }
 
+    fn admit_locked(&self, inner: &mut Inner, request: Request, bytes: usize) -> Admission {
         if request.id.is_none() {
             match request.method.as_str() {
                 "$/cancelRequest" => {
                     if let Some(id) = cancellation_id(&request) {
-                        cancel_locked(&mut inner, &id);
+                        cancel_locked(inner, &id);
                     }
                     self.ready.notify_one();
                     return Admission::Accepted;
@@ -150,7 +160,7 @@ impl Control {
             };
 
             if let Some((response_id, error)) = rejection {
-                return self.queue_reject_locked(&mut inner, ticket, response_id, error);
+                return self.queue_reject_locked(inner, ticket, response_id, error);
             }
         }
 
@@ -169,9 +179,7 @@ impl Control {
         }
 
         match id {
-            Some(id) => {
-                self.queue_reject_locked(&mut inner, ticket, Some(id), ApiError::IntakeFull)
-            }
+            Some(id) => self.queue_reject_locked(inner, ticket, Some(id), ApiError::IntakeFull),
             None => Admission::Accepted,
         }
     }

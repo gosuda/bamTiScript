@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use bamts_compiler::program::ProgramLoadError;
+use bamts_compiler::project::canonical::canonicalize;
 
 use crate::driver::DriverError;
 
@@ -68,7 +68,7 @@ impl ExecutionContext {
 }
 
 fn canonicalize_cwd(cwd: &Path) -> Result<PathBuf, DriverError> {
-    fs::canonicalize(cwd)
+    canonicalize(cwd)
         .map_err(|error| DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(error)))
 }
 
@@ -87,21 +87,35 @@ fn temp_dir_from_env(env: &BTreeMap<OsString, OsString>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
+/// The value of the variable `key`, found without regard to case: Windows spells
+/// the search path `Path`, and an environment map compares keys exactly.
+#[cfg(any(windows, test))]
+pub(crate) fn env_ignoring_case<'a>(
+    env: impl IntoIterator<Item = (&'a OsStr, &'a OsStr)>,
+    key: &str,
+) -> Option<&'a OsStr> {
+    env.into_iter()
+        .find(|(candidate, _)| candidate.to_string_lossy().eq_ignore_ascii_case(key))
+        .map(|(_, value)| value)
+}
+
 #[cfg(windows)]
 fn temp_dir_from_env(env: &BTreeMap<OsString, OsString>) -> PathBuf {
-    fn value<'a>(env: &'a BTreeMap<OsString, OsString>, key: &str) -> Option<&'a OsStr> {
-        env.iter()
-            .find(|(candidate, _)| candidate.to_string_lossy().eq_ignore_ascii_case(key))
-            .map(|(_, value)| value.as_os_str())
-    }
+    let value = |key: &str| {
+        env_ignoring_case(
+            env.iter()
+                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+            key,
+        )
+    };
 
     for key in ["TMP", "TEMP", "USERPROFILE"] {
-        if let Some(path) = value(env, key) {
+        if let Some(path) = value(key) {
             return PathBuf::from(path);
         }
     }
-    value(env, "SystemRoot")
-        .or_else(|| value(env, "WINDIR"))
+    value("SystemRoot")
+        .or_else(|| value("WINDIR"))
         .map(|root| PathBuf::from(root).join("Temp"))
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows\Temp"))
 }
@@ -109,6 +123,9 @@ fn temp_dir_from_env(env: &BTreeMap<OsString, OsString>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The variable that names the temporary directory on this platform.
+    const TEMP_VARIABLE: &str = if cfg!(windows) { "TMP" } else { "TMPDIR" };
 
     #[test]
     fn explicit_context_resolves_relative_and_empty_temp_paths_from_cwd() {
@@ -119,7 +136,7 @@ mod tests {
         ] {
             let context = ExecutionContext::new(
                 directory.path(),
-                BTreeMap::from([(OsString::from("TMPDIR"), value)]),
+                BTreeMap::from([(OsString::from(TEMP_VARIABLE), value)]),
             )
             .expect("execution context");
             assert_eq!(context.temp_dir(), expected);

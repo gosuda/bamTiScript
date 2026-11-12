@@ -23,6 +23,7 @@ aot-main = []
 bamts-cancel.workspace = true
 bamts-bytecode.workspace = true
 bamts-native = { workspace = true, features = ["gc"] }
+bamts-platform.workspace = true
 icu_properties = { version = "=2.3.0", features = ["compiled_data"] }
 unicode-normalization = "=0.1.24"
 

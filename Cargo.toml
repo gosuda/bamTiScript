@@ -1,36 +1,8 @@
-[package]
-name = "bamts-bench"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-description = "Benchmark and evidence entry points for the BamTS workspace"
-publish = false
-
-[[bin]]
-name = "jit_benchmarks"
-path = "bench/jit_benchmarks.rs"
-
-[[bin]]
-name = "stage0_evidence"
-path = "bench/stage0_evidence.rs"
-
-[[bin]]
-name = "stage1_regression_guard"
-path = "bench/stage1_regression_guard.rs"
-
-[dependencies]
-bamts-verification = { path = "crates/bamts-verification", version = "0.2.0" }
-serde_json = "=1.0.151"
-
-[lints]
-workspace = true
-
 [workspace]
 members = [
     "crates/bamts-compiler",
     "crates/bamts-cancel",
+    "crates/bamts-platform",
     "crates/bamts-bytecode",
     "crates/bamts-runtime",
     "crates/bamts-native",
@@ -58,6 +30,7 @@ bamts-cli = { path = "crates/bamts-cli", version = "0.2.0" }
 bamts-codegen = { path = "crates/bamts-codegen", version = "0.2.0" }
 bamts-compiler = { path = "crates/bamts-compiler", version = "0.2.0" }
 bamts-native = { path = "crates/bamts-native", version = "0.2.0" }
+bamts-platform = { path = "crates/bamts-platform", version = "0.2.0" }
 bamts-node = { path = "crates/bamts-node", version = "0.2.0" }
 bamts-runtime = { path = "crates/bamts-runtime", version = "0.2.0" }
 base64 = "=0.23.1"
@@ -73,3 +46,6 @@ unsafe_code = "forbid"
 # Optimize the checker so those budgets measure compiler work, not debug codegen.
 [profile.test.package.bamts-compiler]
 opt-level = 2
+
+[profile.release.build-override]
+opt-level = 3

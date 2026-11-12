@@ -604,6 +604,7 @@ pub struct ProgramCheckOptions {
     /// Whether `noEmitHelpers` is enabled: emit references downleveling
     /// helpers without emitting their definitions.
     no_emit_helpers: bool,
+    remove_comments: bool,
     /// ECMAScript target — drives lib derivation and downleveling decisions.
     target: crate::emitter::ScriptTarget,
     /// Active lib set — controls which intrinsic globals are installed.
@@ -623,6 +624,7 @@ impl ProgramCheckOptions {
             strict_property_initialization: false,
             always_strict: false,
             no_emit_helpers: false,
+            remove_comments: false,
             target: crate::emitter::ScriptTarget::EsNext,
             libs: LibSet::ALL,
             check_js: false,
@@ -638,6 +640,7 @@ impl ProgramCheckOptions {
             strict_property_initialization: false,
             always_strict: false,
             no_emit_helpers: false,
+            remove_comments: false,
             target: crate::emitter::ScriptTarget::EsNext,
             libs: LibSet::ALL,
             check_js: false,
@@ -691,6 +694,17 @@ impl ProgramCheckOptions {
     #[must_use]
     pub const fn no_emit_helpers(&self) -> bool {
         self.no_emit_helpers
+    }
+
+    #[must_use]
+    pub const fn with_remove_comments(mut self, value: bool) -> Self {
+        self.remove_comments = value;
+        self
+    }
+
+    #[must_use]
+    pub const fn remove_comments(&self) -> bool {
+        self.remove_comments
     }
 
     /// Sets the target from a string (e.g. `"es5"`, `"es2020"`) and derives
@@ -13763,9 +13777,7 @@ class B extends A {
         // function type into a bodyless declaration, so C039 and the
         // value-level C002 for `C` stay absent. The zero-return fall-through
         // pairs TS2355 (BAMTS-C081) with the unresolved return-type name C
-        // (C003, TS2304) at (1,29) => offset 28. TS2369/TS7006 in the type
-        // position additionally need modifier modeling on function-type
-        // parameters and are tracked as a syntax.rs change-window item.
+        // (C003, TS2304) at (1,29) => offset 28.
         let result = check_text("function A(): (public B) => C {\n}");
         let diagnostics = result
             .diagnostics()
@@ -14318,6 +14330,35 @@ class B extends A {
             "x = 1 must not report C086, got {codes:?}"
         );
     }
+
+    #[test]
+    fn a_parenthesized_name_or_member_takes_a_compound_assignment() {
+        // Authority: compoundAssignmentLHSIsReference.ts reports nothing for
+        // `(x1) *= value` or `(x3.a) *= value`; a call stays an invalid target.
+        for text in [
+            "var x = 1; (x) += 1;",
+            "var x = 1; ((x)) **= 2;",
+            "var o = { a: 1 }; (o.a) *= 2;",
+            "var o = { a: 1 }; (o['a']) -= 1;",
+            "var x: number | undefined; (x) ??= 1;",
+        ] {
+            let codes = checker_codes_strict_null(text);
+            assert!(
+                !codes
+                    .iter()
+                    .any(|c| c == INVALID_ASSIGNMENT_TARGET.as_str()),
+                "{text} must not report C036, got {codes:?}"
+            );
+        }
+        let codes = checker_codes_strict_null("declare function f(): any; (f()) += 1;");
+        assert!(
+            codes
+                .iter()
+                .any(|c| c == INVALID_ASSIGNMENT_TARGET.as_str()),
+            "(f()) += 1 must report C036, got {codes:?}"
+        );
+    }
+
     #[test]
     fn grounded_cell_increment_null_matches_authority_multiset() {
         // Authority: incrementOperatorWithAnyOtherTypeInvalidOperations.ts

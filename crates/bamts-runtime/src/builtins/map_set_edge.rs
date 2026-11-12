@@ -10,19 +10,24 @@ use super::{
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
     CollectionKind, EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap,
+    ShapeTable,
 };
 
 /// Installs the collection algorithms whose observable ordering and iterator-close
 /// requirements cannot be expressed by the baseline eager constructors.
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let map = replace_constructor(heap, globals, builtins, "Map", map_constructor::<H>);
-    let set = replace_constructor(heap, globals, builtins, "Set", set_constructor::<H>);
+    let map = replace_constructor(heap, atoms, shapes, globals, builtins, "Map", map_constructor::<H>);
+    let set = replace_constructor(heap, atoms, shapes, globals, builtins, "Set", set_constructor::<H>);
     let weak_map = replace_constructor(
         heap,
+        atoms,
+        shapes,
         globals,
         builtins,
         "WeakMap",
@@ -30,32 +35,73 @@ pub(super) fn install<H: Host>(
     );
     let weak_set = replace_constructor(
         heap,
+        atoms,
+        shapes,
         globals,
         builtins,
         "WeakSet",
         weak_set_constructor::<H>,
     );
 
-    let group_by = install_function(heap, builtins, "groupBy", 2, map_group_by::<H>);
-    define_constructor_data(heap, map.constructor, "groupBy", group_by);
-    let map_set = install_function(heap, builtins, "set", 2, strong_map_set::<H>);
-    define_data(heap, map.prototype, "set", map_set);
-    let set_add = install_function(heap, builtins, "add", 1, strong_set_add::<H>);
-    define_data(heap, set.prototype, "add", set_add);
+    for constructor in [map.constructor, set.constructor] {
+        let species = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get [Symbol.species]", length: 0, handler: super::regexp_protocol::species_getter::<H> });
+        super::define_symbol_property(heap, shapes, constructor,
+        builtins.symbol_species(),
+        crate::Property::Accessor {
+            getter: Some(species),
+            setter: None,
+            enumerable: false,
+            configurable: true,
+        },);
+    }
+
+    let group_by = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "groupBy", length: 2, handler: map_group_by::<H> });
+    define_constructor_data(heap, atoms, shapes, map.constructor, "groupBy", group_by);
+    let map_set = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "set", length: 2, handler: strong_map_set::<H> });
+    define_data(heap, atoms, shapes, map.prototype, "set", map_set);
+    for (target, name, handler) in [
+        (
+            map.prototype,
+            "getOrInsert",
+            map_get_or_insert::<H> as BuiltinHandler<H>,
+        ),
+        (
+            map.prototype,
+            "getOrInsertComputed",
+            map_get_or_insert_computed::<H>,
+        ),
+        (
+            weak_map.prototype,
+            "getOrInsert",
+            weak_map_get_or_insert::<H>,
+        ),
+        (
+            weak_map.prototype,
+            "getOrInsertComputed",
+            weak_map_get_or_insert_computed::<H>,
+        ),
+    ] {
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 2, handler: handler });
+        define_data(heap, atoms, shapes, target, name, function);
+    }
+    let set_add = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "add", length: 1, handler: strong_set_add::<H> });
+    define_data(heap, atoms, shapes, set.prototype, "add", set_add);
 
     // Set.prototype.keys and Set.prototype.values are the same function object.
-    let set_prototype = prototype_of(heap, "Set", globals);
-    let values = own_data_property(heap, set_prototype, "values");
-    define_data(heap, set_prototype, "keys", values);
+    let set_prototype = prototype_of(heap, atoms, shapes, "Set", globals);
+    let values = own_data_property(heap, atoms, shapes, set_prototype, "values");
+    define_data(heap, atoms, shapes, set_prototype, "keys", values);
 
     define_collection_tag(
         heap,
+        shapes,
         weak_map.prototype,
         builtins.symbol_to_string_tag(),
         "WeakMap",
     );
     define_collection_tag(
         heap,
+        shapes,
         weak_set.prototype,
         builtins.symbol_to_string_tag(),
         "WeakSet",
@@ -70,48 +116,69 @@ struct InstalledConstructor {
 
 fn replace_constructor<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
     name: &'static str,
     handler: BuiltinHandler<H>,
 ) -> InstalledConstructor {
-    let prototype = prototype_of(heap, name, globals);
-    let constructor = install_constructor_function(heap, builtins, name, 0, handler);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let prototype = prototype_of(heap, atoms, shapes, name, globals);
+    let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 0, handler: handler });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode(name), constructor);
     InstalledConstructor {
         constructor,
         prototype,
     }
 }
-
-fn prototype_of(heap: &[HeapEntry], name: &str, globals: &BTreeMap<EcmaString, Value>) -> Value {
+fn prototype_of(
+    heap: &[HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &ShapeTable,
+    name: &str,
+    globals: &BTreeMap<EcmaString, Value>,
+) -> Value {
     let constructor = globals
         .get(&EcmaString::encode(name))
         .copied()
         .expect("baseline collection constructor is installed first");
-    own_data_property(heap, constructor, "prototype")
+    own_data_property(heap, atoms, shapes, constructor, "prototype")
 }
 
-fn own_data_property(heap: &[HeapEntry], object: Value, name: &str) -> Value {
+fn own_data_property(
+    heap: &[HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &ShapeTable,
+    object: Value,
+    name: &str,
+) -> Value {
     let properties = match &heap[heap_index(object)] {
         HeapEntry::Object { properties, .. }
         | HeapEntry::Array { properties, .. }
         | HeapEntry::NativeFunction { properties, .. } => properties,
         _ => panic!("collection intrinsic property owner must be an object"),
     };
-    match properties.get(&PropertyKey::Named(EcmaString::encode(name))) {
+    match properties.get(shapes, &PropertyKey::Named(atoms.intern(EcmaString::encode(name)))) {
         Some(Property::Data { value, .. }) => *value,
         _ => panic!("collection intrinsic data property must exist"),
     }
 }
 
-fn define_constructor_data(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
+fn define_constructor_data(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+    constructor: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)] else {
         panic!("collection constructor must be a native function")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        shapes,
+        PropertyKey::Named(atoms.intern(EcmaString::encode(name))),
         Property::Data {
             value,
             writable: true,
@@ -123,6 +190,7 @@ fn define_constructor_data(heap: &mut [HeapEntry], constructor: Value, name: &st
 
 fn define_collection_tag(
     heap: &mut Vec<HeapEntry>,
+    shapes: &mut crate::ShapeTable,
     prototype: Value,
     tag_symbol: Value,
     name: &str,
@@ -132,6 +200,7 @@ fn define_collection_tag(
         panic!("collection prototype must be an ordinary object")
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(heap_index(tag_symbol) as u32),
         Property::Data {
             value,
@@ -199,6 +268,112 @@ fn strong_set_add<H: Host>(
     let value = canonical_collection_key(args.first().copied().unwrap_or(Value::UNDEFINED));
     put_strong_entry(machine, this, value, value, CollectionKind::Set)?;
     Ok(BuiltinOutcome::Value(this))
+}
+
+/// The key `getOrInsert*` stores: `Map` canonicalizes `-0`, and `WeakMap`
+/// refuses anything that cannot be held weakly.
+fn upsert_key<H: Host>(
+    machine: &Machine<'_, H>,
+    key: Value,
+    kind: CollectionKind,
+) -> Result<Value, EvalFailure> {
+    if kind == CollectionKind::WeakMap {
+        super::collections::require_weak_key(machine, key)?;
+        return Ok(key);
+    }
+    Ok(canonical_collection_key(key))
+}
+
+fn existing_value<H: Host>(machine: &Machine<'_, H>, slot: usize, key: Value) -> Option<Value> {
+    let HeapEntry::Collection { entries, index, .. } = &machine.heap[slot] else {
+        unreachable!("collection brand was checked")
+    };
+    index
+        .get(machine, entries, key)
+        .map(|entry_index| entries[entry_index].value)
+}
+
+fn get_or_insert<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    kind: CollectionKind,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let slot = super::collections::collection_slot(machine, this, kind)?;
+    let key = upsert_key(
+        machine,
+        args.first().copied().unwrap_or(Value::UNDEFINED),
+        kind,
+    )?;
+    if let Some(existing) = existing_value(machine, slot, key) {
+        return Ok(BuiltinOutcome::Value(existing));
+    }
+    let value = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    super::collections::append_collection_entry(machine, slot, key, value)?;
+    Ok(BuiltinOutcome::Value(value))
+}
+
+/// The callback may change the collection, so its result is stored by a fresh
+/// lookup rather than at a position found before the call.
+fn get_or_insert_computed<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    kind: CollectionKind,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let slot = super::collections::collection_slot(machine, this, kind)?;
+    let key = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let key = upsert_key(machine, key, kind)?;
+    let callback = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    if !machine.is_callable(callback)? {
+        return Err(type_error("getOrInsertComputed callback is not callable"));
+    }
+    if let Some(existing) = existing_value(machine, slot, key) {
+        return Ok(BuiltinOutcome::Value(existing));
+    }
+    let depth = machine.native_roots.len();
+    machine.push_native_roots(depth, &[this, key, callback]);
+    let value = machine.call_value(callback, Value::UNDEFINED, &[key]);
+    machine.pop_native_roots(depth);
+    let value = value?;
+    super::collections::map_put(machine, this, key, value, kind)?;
+    Ok(BuiltinOutcome::Value(value))
+}
+
+fn map_get_or_insert<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    get_or_insert(machine, this, args, CollectionKind::Map)
+}
+
+fn map_get_or_insert_computed<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    get_or_insert_computed(machine, this, args, CollectionKind::Map)
+}
+
+fn weak_map_get_or_insert<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    get_or_insert(machine, this, args, CollectionKind::WeakMap)
+}
+
+fn weak_map_get_or_insert_computed<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    get_or_insert_computed(machine, this, args, CollectionKind::WeakMap)
 }
 
 fn canonical_collection_key(value: Value) -> Value {
@@ -392,7 +567,7 @@ fn get_sync_iterator<H: Host>(
     machine: &mut Machine<'_, H>,
     iterable: Value,
 ) -> Result<Value, EvalFailure> {
-    let key = machine.to_property_key(machine.intrinsics.builtins.symbol_iterator())?;
+    let key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_iterator())?;
     let method = machine.get_property_key(iterable, &key)?;
     if !machine.is_callable(method)? {
         return Err(type_error("value is not iterable"));
@@ -525,6 +700,178 @@ mod tests {
         test(&mut machine);
     }
 
+    fn invoke(
+        machine: &mut Machine<'_, TestHost>,
+        receiver: Value,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        let method = machine.get_named_property(receiver, name).unwrap();
+        machine.call_value(method, receiver, args)
+    }
+
+    fn compute_seven(
+        _machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(Value::int32(7)))
+    }
+
+    /// Stores into the map before returning, as a user callback may.
+    fn insert_during_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let global = machine.intrinsics.global("globalThis").unwrap();
+        let map = machine.get_named_property(global, "upsertTarget").unwrap();
+        invoke(machine, map, "set", &[args[0], Value::int32(1)])?;
+        Ok(BuiltinOutcome::Value(Value::int32(2)))
+    }
+
+    fn native_callback(
+        machine: &mut Machine<'_, TestHost>,
+        name: &'static str,
+        handler: crate::intrinsics::BuiltinHandler<TestHost>,
+    ) -> Value {
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name,
+            length: 1,
+            handler,
+        });
+        crate::intrinsics::native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 1)
+    }
+
+    fn new_collection(machine: &mut Machine<'_, TestHost>, name: &str) -> Value {
+        let constructor = machine.intrinsics.global(name).unwrap();
+        machine.construct_value(constructor, &[]).unwrap()
+    }
+
+    #[test]
+    fn get_or_insert_keeps_an_existing_value_and_canonicalizes_negative_zero() {
+        with_machine(|machine| {
+            let map = new_collection(machine, "Map");
+            let negative_zero = Value::number(-0.0);
+            assert_eq!(
+                invoke(
+                    machine,
+                    map,
+                    "getOrInsert",
+                    &[negative_zero, Value::int32(1)]
+                )
+                .unwrap(),
+                Value::int32(1)
+            );
+            assert_eq!(
+                invoke(
+                    machine,
+                    map,
+                    "getOrInsert",
+                    &[Value::int32(0), Value::int32(2)]
+                )
+                .unwrap(),
+                Value::int32(1),
+                "-0 and +0 are one key"
+            );
+            let keys = invoke(machine, map, "keys", &[]).unwrap();
+            let first = invoke(machine, keys, "next", &[]).unwrap();
+            let key = machine.get_named_property(first, "value").unwrap();
+            assert!(
+                matches!(key.decode(), Some(Decoded::Number(zero)) if zero.is_sign_positive())
+                    || key == Value::int32(0),
+                "the stored key is +0"
+            );
+        });
+    }
+
+    #[test]
+    fn get_or_insert_computed_calls_back_only_for_a_missing_key() {
+        with_machine(|machine| {
+            let map = new_collection(machine, "Map");
+            let compute = native_callback(machine, "compute seven", compute_seven);
+            assert_eq!(
+                invoke(
+                    machine,
+                    map,
+                    "getOrInsertComputed",
+                    &[Value::int32(1), compute]
+                )
+                .unwrap(),
+                Value::int32(7)
+            );
+            let non_callable = Value::int32(0);
+            assert!(matches!(
+                invoke(
+                    machine,
+                    map,
+                    "getOrInsertComputed",
+                    &[Value::int32(1), non_callable]
+                ),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        });
+    }
+
+    #[test]
+    fn a_key_stored_by_the_callback_is_overwritten_not_duplicated() {
+        with_machine(|machine| {
+            let map = new_collection(machine, "Map");
+            let global = machine.intrinsics.global("globalThis").unwrap();
+            machine
+                .set_data_property(global, "upsertTarget", map)
+                .unwrap();
+            let callback =
+                native_callback(machine, "insert during callback", insert_during_callback);
+            assert_eq!(
+                invoke(
+                    machine,
+                    map,
+                    "getOrInsertComputed",
+                    &[Value::int32(5), callback]
+                )
+                .unwrap(),
+                Value::int32(2)
+            );
+            assert_eq!(
+                invoke(machine, map, "get", &[Value::int32(5)]).unwrap(),
+                Value::int32(2)
+            );
+            assert_eq!(
+                machine.get_named_property(map, "size").unwrap(),
+                Value::int32(1)
+            );
+        });
+    }
+
+    #[test]
+    fn weak_map_get_or_insert_rejects_keys_that_cannot_be_held_weakly() {
+        with_machine(|machine| {
+            let weak_map = new_collection(machine, "WeakMap");
+            let key = ordinary_object(machine);
+            assert_eq!(
+                invoke(machine, weak_map, "getOrInsert", &[key, Value::int32(1)]).unwrap(),
+                Value::int32(1)
+            );
+            assert!(matches!(
+                invoke(machine, weak_map, "getOrInsert", &[Value::int32(1), key]),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+            let compute = native_callback(machine, "compute seven", compute_seven);
+            assert!(matches!(
+                invoke(
+                    machine,
+                    weak_map,
+                    "getOrInsertComputed",
+                    &[Value::int32(1), compute]
+                ),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        });
+    }
+
     fn builtin_id(machine: &Machine<'_, TestHost>, value: Value) -> crate::intrinsics::BuiltinId {
         let slot = machine.runtime_slot(value).unwrap().unwrap();
         match machine.heap[slot] {
@@ -544,12 +891,13 @@ mod tests {
                 .get_named_property(map, "groupBy")
                 .expect("Map.groupBy is readable");
             assert!(machine.is_callable(group_by).unwrap());
+            let length_key = PropertyKey::Named(machine.intern_str("length"));
             let slot = machine.runtime_slot(group_by).unwrap().unwrap();
             let HeapEntry::NativeFunction { properties, .. } = &machine.heap[slot] else {
                 panic!("Map.groupBy is a native function")
             };
             assert!(matches!(
-                properties.get(&PropertyKey::Named(EcmaString::encode("length"))),
+                properties.get(&machine.shapes, &length_key),
                 Some(Property::Data {
                     value,
                     writable: false,
@@ -660,11 +1008,30 @@ mod tests {
             length: 0,
             handler: iterator::<TestHost>,
         });
-        let next = crate::intrinsics::native_function(&mut machine.heap, next_id, "edge next", 0);
-        let close =
-            crate::intrinsics::native_function(&mut machine.heap, close_id, "edge return", 0);
-        let iterator_fn =
-            crate::intrinsics::native_function(&mut machine.heap, iterator_id, "edge iterator", 0);
+        let next = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            next_id,
+            "edge next",
+            0,
+        );
+        let close = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            close_id,
+            "edge return",
+            0,
+        );
+        let iterator_fn = crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            iterator_id,
+            "edge iterator",
+            0,
+        );
         let source = ordinary_object(machine);
         machine
             .set_data_property(source, "used", Value::FALSE)
@@ -678,7 +1045,7 @@ mod tests {
         machine.set_data_property(source, "next", next).unwrap();
         machine.set_data_property(source, "return", close).unwrap();
         let key = machine
-            .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+            .property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
             .unwrap();
         machine
             .set_data_property_key(source, key, iterator_fn)
@@ -718,7 +1085,14 @@ mod tests {
                 length: 2,
                 handler: reject::<TestHost>,
             });
-            let reject = crate::intrinsics::native_function(&mut machine.heap, id, "reject set", 2);
+            let reject = crate::intrinsics::native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                &mut machine.shapes,
+                id,
+                "reject set",
+                2,
+            );
             let constructor = machine.intrinsics.global("Map").unwrap();
             let prototype = machine
                 .get_named_property(constructor, "prototype")
@@ -778,8 +1152,14 @@ mod tests {
                 length: 3,
                 handler: mutate::<TestHost>,
             });
-            let callback =
-                crate::intrinsics::native_function(&mut machine.heap, id, "mutate map", 3);
+            let callback = crate::intrinsics::native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                &mut machine.shapes,
+                id,
+                "mutate map",
+                3,
+            );
             call_method(machine, "Map", "forEach", map, &[callback]).unwrap();
             assert_eq!(
                 machine.get_named_property(map, "visits").unwrap(),
@@ -902,7 +1282,14 @@ mod tests {
                 length: 2,
                 handler: parity::<TestHost>,
             });
-            let callback = crate::intrinsics::native_function(&mut machine.heap, id, "parity", 2);
+            let callback = crate::intrinsics::native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                &mut machine.shapes,
+                id,
+                "parity",
+                2,
+            );
             let items = custom_iterable(
                 machine,
                 vec![Value::int32(1), Value::int32(2), Value::int32(3)],
@@ -938,7 +1325,7 @@ mod tests {
                     .get_named_property(constructor, "prototype")
                     .unwrap();
                 let key = machine
-                    .to_property_key(machine.intrinsics.builtins.symbol_to_string_tag())
+                    .property_key_from_value(machine.intrinsics.builtins.symbol_to_string_tag())
                     .unwrap();
                 let tag = machine.get_property_key(prototype, &key).unwrap();
                 let slot = machine.runtime_slot(tag).unwrap().unwrap();

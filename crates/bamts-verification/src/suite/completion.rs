@@ -17,8 +17,8 @@
 //! Runner bindings between the parsed key mode and the workflow-declared
 //! runner follow the matrix the four workflows declare:
 //! TypeScript→compiler, test262→interpreter|jit|aot, formal-quint→quint,
-//! formal-lean→lean, formal-redex→redex, target-cells→aot, and
-//! benchmarks→perf.  Runners that do not name a runtime mode bind
+//! formal-lean→lean, formal-redex→redex.
+//! Runners that do not name a runtime mode bind
 //! [`ExecutionMode::Aot`]: their obligations execute the AOT candidate
 //! substrate, so every (catalog, mode) pair recovers exactly one runner.
 
@@ -40,16 +40,17 @@ use crate::{
     classification::{self, ClassificationState, NonPassState},
     evidence::{
         EvidenceHeader, EvidenceReader, EvidenceRow, EvidenceWriter, ExecutionBinding, PublishMode,
-        RunBinding, TerminalState, ToolchainPin, WorkingDirectoryPolicy, merge_shards,
+        RunBinding, ToolchainPin, WorkingDirectoryPolicy, merge_shards,
     },
+    fsync,
     lane::{
         LaneBinding, LaneExecutor, LaneOutcome, LaneProcessResult, LaneRequest, LaneResponse,
-        ProcessExecutor, ProcessObservation, derive_row,
+        ProcessExecutor, ProcessObservation, ServingExecutor, derive_row,
     },
     schema,
     shard::{ObligationKey, ShardIdentity, ShardSpec, validate_catalog},
     suite::{DEFAULT_SNAPSHOT_REL, verify_snapshot},
-    toolchain_schema::load_target_cells,
+    sweep_report::{ReportRow, read_receipt},
 };
 
 /// Per-obligation wall-clock bound handed to the lane.
@@ -105,7 +106,6 @@ pub enum SuiteRunner {
     Quint,
     Lean,
     Redex,
-    Perf,
 }
 
 impl SuiteRunner {
@@ -119,7 +119,6 @@ impl SuiteRunner {
             Self::Quint => "quint",
             Self::Lean => "lean",
             Self::Redex => "redex",
-            Self::Perf => "perf",
         }
     }
 
@@ -130,7 +129,7 @@ impl SuiteRunner {
         match self {
             Self::Interpreter => crate::shard::ExecutionMode::Interpreter,
             Self::Jit => crate::shard::ExecutionMode::Jit,
-            Self::Compiler | Self::Aot | Self::Quint | Self::Lean | Self::Redex | Self::Perf => {
+            Self::Compiler | Self::Aot | Self::Quint | Self::Lean | Self::Redex => {
                 crate::shard::ExecutionMode::Aot
             }
         }
@@ -147,8 +146,6 @@ fn allowed_runners(catalog: &str) -> Result<&'static [SuiteRunner]> {
         "formal-quint" => Ok(&[SuiteRunner::Quint]),
         "formal-lean" => Ok(&[SuiteRunner::Lean]),
         "formal-redex" => Ok(&[SuiteRunner::Redex]),
-        "target-cells" => Ok(&[SuiteRunner::Aot]),
-        "benchmarks" => Ok(&[SuiteRunner::Perf]),
         _ => Err(VerificationError::new(
             ErrorCode::Usage,
             format!("unknown catalog `{catalog}` for suite selection"),
@@ -222,27 +219,12 @@ fn runner_for_mode(catalog: &str, mode: crate::shard::ExecutionMode) -> Option<S
                     "formal-quint" => SuiteRunner::Quint,
                     "formal-lean" => SuiteRunner::Lean,
                     "formal-redex" => SuiteRunner::Redex,
-                    "target-cells" => SuiteRunner::Aot,
-                    "benchmarks" => SuiteRunner::Perf,
                     _ => return None,
                 }
             }
         }
     };
     allowed.contains(&runner).then_some(runner)
-}
-
-/// Platform token used when `BAMTS_PLATFORM` is unset: the host triple in
-/// the form the receipts already record.
-#[must_use]
-pub fn default_platform() -> String {
-    let arch = std::env::consts::ARCH;
-    match std::env::consts::OS {
-        "linux" => format!("{arch}-unknown-linux-gnu"),
-        "macos" => format!("{arch}-apple-darwin"),
-        "windows" => format!("{arch}-pc-windows-msvc"),
-        os => format!("{arch}-unknown-{os}"),
-    }
 }
 
 /// Selected catalog plus the digests that name the current manifest image.
@@ -343,10 +325,10 @@ pub struct LogicalObligation {
 /// obligation key and declared observable set, in canonical sorted order.
 ///
 /// TypeScript/test262 identifiers are `authority/runner/case#config#observable`;
-/// formal and target identifiers are `locator::name`; benchmark identifiers
-/// are the plain rule name.  Keys are built injectively: the observable is
-/// folded into the configuration token so one case can carry several
-/// observables without colliding.
+/// formal and target identifiers are `locator::name`, with a plain name
+/// falling back to the `default` configuration.  Keys are built injectively:
+/// the observable is folded into the configuration token so one case can
+/// carry several observables without colliding.
 pub fn materialize_obligations(
     catalog: &str,
     identifiers: &[String],
@@ -360,24 +342,10 @@ pub fn materialize_obligations(
         ));
     }
     let mode = runner.execution_mode();
-    let mut obligations = Vec::with_capacity(identifiers.len());
-    let authority_prefix = format!("{catalog}/");
-    for identifier in identifiers {
-        let (case, configuration, observables) = parse_logical_identifier(catalog, identifier)?;
-        // TS/test262 cases are `runner/path` tokens after the authority
-        // prefix; every other family keeps its own identity segments.
-        let key = ObligationKey::new(
-            catalog,
-            case.strip_prefix(authority_prefix.as_str())
-                .map(str::to_owned)
-                .unwrap_or(case.clone()),
-            configuration,
-            mode,
-            platform,
-        )?;
-        let _ = authority_prefix;
-        obligations.push(LogicalObligation { key, observables });
-    }
+    let mut obligations = identifiers
+        .iter()
+        .map(|identifier| logical_obligation(catalog, identifier, mode, platform))
+        .collect::<Result<Vec<_>>>()?;
     obligations.sort_by(|left, right| left.key.cmp(&right.key));
     validate_catalog(
         &obligations
@@ -386,6 +354,34 @@ pub fn materialize_obligations(
             .collect::<Vec<_>>(),
     )?;
     Ok(obligations)
+}
+
+/// The lane key that proves one manifest identifier in `mode` on `platform`,
+/// with its declared observables. This is the one mapping between the two
+/// names of an obligation: receipts carry the key, the manifest the identifier.
+pub(crate) fn logical_obligation(
+    catalog: &str,
+    identifier: &str,
+    mode: crate::shard::ExecutionMode,
+    platform: &str,
+) -> Result<LogicalObligation> {
+    let (case, configuration, observables) = parse_logical_identifier(catalog, identifier)?;
+    // TS/test262 cases are `runner/path` tokens after the authority
+    // prefix; every other family keeps its own identity segments.
+    let case = case
+        .strip_prefix(&format!("{catalog}/"))
+        .map_or_else(|| case.clone(), str::to_owned);
+    let key = ObligationKey::new(catalog, case, configuration, mode, platform)?;
+    Ok(LogicalObligation { key, observables })
+}
+
+/// The modes every identifier of `catalog` must be proven in: one per runner
+/// the catalog declares.
+pub(crate) fn required_modes(catalog: &str) -> Result<Vec<crate::shard::ExecutionMode>> {
+    Ok(allowed_runners(catalog)?
+        .iter()
+        .map(|runner| runner.execution_mode())
+        .collect())
 }
 
 /// Splits one logical identifier into〈case, configuration, observables〉.
@@ -425,18 +421,14 @@ fn parse_logical_identifier(
             BTreeSet::from([(*observable).to_owned()]),
         ));
     }
-    if identifier.contains("::") {
-        let segments: Vec<&str> = identifier.split("::").collect();
-        let [locator, name] = segments.as_slice() else {
-            return Err(reject());
-        };
+    if let Some((locator, name)) = identifier.split_once("::") {
         if locator.is_empty() || name.is_empty() {
             return Err(reject());
         }
         return Ok((
-            (*locator).to_owned(),
-            (*name).to_owned(),
-            BTreeSet::from([(*name).to_owned()]),
+            locator.to_owned(),
+            name.to_owned(),
+            BTreeSet::from([name.to_owned()]),
         ));
     }
     if identifier.is_empty() {
@@ -515,8 +507,7 @@ fn load_obligation_classifications(
 /// Executor backing: an internal adapter, an injected lane worker, or a typed
 /// unavailable adapter. An unavailable adapter is evidence, not a suite abort.
 enum SuiteAdapter {
-    TargetCells(BTreeMap<String, crate::toolchain_schema::TargetCellRecord>),
-    External(ProcessExecutor),
+    External(Box<dyn LaneExecutor>),
     Missing(String),
 }
 
@@ -545,11 +536,7 @@ fn lane_program(root: &Path, runner: SuiteRunner) -> Option<PathBuf> {
 }
 
 impl SuiteAdapter {
-    fn build(root: &Path, catalog: &str, runner: SuiteRunner) -> Result<Self> {
-        if runner == SuiteRunner::Aot && catalog == "target-cells" {
-            return Ok(Self::TargetCells(load_target_cells(root)?));
-        }
-
+    fn build(root: &Path, _catalog: &str, runner: SuiteRunner) -> Result<Self> {
         let variable = lane_adapter_variable(runner);
         let Some(configured) = std::env::var_os(&variable).filter(|value| !value.is_empty()) else {
             return Ok(Self::Missing(format!(
@@ -570,81 +557,28 @@ impl SuiteAdapter {
                 attempted.display()
             )));
         };
-        Ok(Self::External(
-            ProcessExecutor::new(program, Vec::new(), root, root.join("target/suite-lanes"))
-                .with_max_output_bytes(PROBE_OUTPUT_BYTES),
-        ))
+        let work_dir = root.join("target/suite-lanes");
+        // The compiler worker serves many requests from one process, so it
+        // authenticates and parses the snapshot once instead of once per case.
+        // The other lane workers answer one request per process.
+        let executor: Box<dyn LaneExecutor> = if runner == SuiteRunner::Compiler {
+            Box::new(
+                ServingExecutor::new(program, Vec::new(), root, work_dir)
+                    .with_max_output_bytes(PROBE_OUTPUT_BYTES),
+            )
+        } else {
+            Box::new(
+                ProcessExecutor::new(program, Vec::new(), root, work_dir)
+                    .with_max_output_bytes(PROBE_OUTPUT_BYTES),
+            )
+        };
+        Ok(Self::External(executor))
     }
 
     /// Executes one obligation through an internal path. Result is a worker
     /// outcome; the parent — never this function — derives PASS from it.
-    fn evaluate(&self, request: &LaneRequest) -> Result<LaneOutcome> {
+    fn evaluate(&self, _request: &LaneRequest) -> Result<LaneOutcome> {
         match self {
-            Self::TargetCells(cells) => {
-                let record = cells.get(request.key().case()).ok_or_else(|| {
-                    VerificationError::new(
-                        ErrorCode::Schema,
-                        format!(
-                            "no target-cell record for `{}` obligation `{}`",
-                            request.key().case(),
-                            request.key()
-                        ),
-                    )
-                })?;
-                let obligation = record
-                    .obligations()
-                    .get(request.key().configuration())
-                    .ok_or_else(|| {
-                        VerificationError::new(
-                            ErrorCode::Schema,
-                            format!(
-                                "target cell `{}` has no `{}` obligation evidence",
-                                request.key().case(),
-                                request.key().configuration()
-                            ),
-                        )
-                    })?;
-                Ok(match obligation.status() {
-                    TerminalState::Pass => LaneOutcome::Completed {
-                        artifacts: request
-                            .observables()
-                            .iter()
-                            .map(|observable| {
-                                (
-                                    observable.clone(),
-                                    schema::sha256_hex(obligation.evidence().as_bytes()),
-                                )
-                            })
-                            .collect(),
-                    },
-                    TerminalState::BlockingFail => LaneOutcome::BlockingFail {
-                        detail: format!(
-                            "{}; missing artifact `{}`",
-                            obligation.reason(),
-                            obligation.missing_artifact()
-                        ),
-                    },
-                    TerminalState::ExternalBlocked => LaneOutcome::ExternalBlocked {
-                        detail: format!(
-                            "{}; host must supply `{}`",
-                            obligation.reason(),
-                            obligation.missing_artifact()
-                        ),
-                    },
-                    TerminalState::InapplicableOutOfScopeHostFeature => {
-                        LaneOutcome::InapplicableOutOfScopeHostFeature {
-                            detail: obligation.reason().to_owned(),
-                        }
-                    }
-                    other => LaneOutcome::BlockingFail {
-                        detail: format!(
-                            "target-cell obligation `{}` records non-lane terminal state `{}`",
-                            request.key().configuration(),
-                            other.as_str()
-                        ),
-                    },
-                })
-            }
             Self::Missing(detail) => Ok(LaneOutcome::BlockingFail {
                 detail: detail.clone(),
             }),
@@ -749,12 +683,12 @@ fn classified_outcome(state: NonPassState, key: &ObligationKey) -> LaneOutcome {
 ///
 /// Abort error (manifest, adapter, digests, writer) leaves no receipt
 /// behind; per-obligation blocking outcomes never abort the loop.
-pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> {
-    let runner = resolve_runner(&request.catalog, &request.runner)?;
-    let platform = if request.platform.is_empty() {
-        default_platform()
+/// The requested platform, or the host's when none is given.
+fn canonical_platform(requested: &str) -> Result<String> {
+    let platform = if requested.is_empty() {
+        bamts_platform::host_triple()
     } else {
-        request.platform.clone()
+        requested.to_owned()
     };
     if platform.trim() != platform || platform.is_empty() {
         return Err(VerificationError::new(
@@ -762,6 +696,23 @@ pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> 
             "suite platform must be a nonempty canonical token",
         ));
     }
+    Ok(platform)
+}
+
+/// A fresh run identity; the compiler lane also binds the verified snapshot.
+fn fresh_lane_binding(root: &Path, runner: SuiteRunner) -> Result<LaneBinding> {
+    let run = LaneBinding::fresh()?;
+    if runner == SuiteRunner::Compiler {
+        let verified = verify_snapshot(&root.join(DEFAULT_SNAPSHOT_REL))?;
+        verified.bind_compiler_lane(run)
+    } else {
+        Ok(run)
+    }
+}
+
+pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> {
+    let runner = resolve_runner(&request.catalog, &request.runner)?;
+    let platform = canonical_platform(&request.platform)?;
     let catalog = load_catalog_manifest(root, &request.catalog)?;
     let obligations =
         materialize_obligations(&request.catalog, &catalog.identifiers, runner, &platform)?;
@@ -777,15 +728,7 @@ pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> 
     let binding = current_run_binding(root, &request.catalog)?;
     let header = EvidenceHeader::new(shard.clone(), binding, request.execution.clone())?;
     let members: Vec<usize> = request.shard.member_indices(keys.len()).collect();
-    let lane_binding = {
-        let run = LaneBinding::fresh()?;
-        if runner == SuiteRunner::Compiler {
-            let verified = verify_snapshot(&root.join(DEFAULT_SNAPSHOT_REL))?;
-            verified.bind_compiler_lane(run)?
-        } else {
-            run
-        }
-    };
+    let lane_binding = fresh_lane_binding(root, runner)?;
 
     let executor = SuiteExecutor {
         adapter,
@@ -833,10 +776,7 @@ pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> 
             writer.write_row(&row)?;
         }
         writer.finish()?;
-        File::open(&temp)
-            .map_err(|error| io_path(&temp, error))?
-            .sync_all()
-            .map_err(|error| io_path(&temp, error))
+        fsync::sync_file(&temp).map_err(|error| io_path(&temp, error))
     })();
     match outcome {
         Ok(()) => {
@@ -860,6 +800,133 @@ pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> 
             Err(error)
         }
     }
+}
+
+/// Reruns the obligations of one failure family named by an earlier receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuiteRecountRequest {
+    pub catalog: String,
+    pub runner: String,
+    pub baseline: PathBuf,
+    pub family: String,
+    /// How many passing rows to rerun beside the family. A family holds only
+    /// failing rows, so these are the rows a fix can regress.
+    pub guard: usize,
+}
+
+/// The rerun rows before and after, in the same order: the family, then the
+/// passing rows that guard against a regression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuiteRecount {
+    pub before: Vec<ReportRow>,
+    pub after: Vec<ReportRow>,
+}
+
+/// `count` of `rows`, spread evenly so a sample reaches every part of a catalog
+/// and the same receipt always gives the same sample.
+fn evenly_spaced(rows: Vec<ReportRow>, count: usize) -> Vec<ReportRow> {
+    let total = rows.len();
+    if count >= total {
+        return rows;
+    }
+    rows.into_iter()
+        .enumerate()
+        .filter(|(index, _)| (index + 1) * count / total != index * count / total)
+        .map(|(_, row)| row)
+        .collect()
+}
+
+/// Reruns the rows of `family` and a sample of the passing rows, on the
+/// platform the baseline recorded.
+///
+/// This answers one question for a repair loop: did the fix convert rows and
+/// regress none. Only a full sweep proves none regressed; the sample catches a
+/// broad regression between sweeps. It writes no receipt. Every state comes from
+/// the same lane executor and `derive_row` as a sweep, so a rerun cannot mint a
+/// `PASS` that a sweep could not.
+pub fn recount_suite(root: &Path, request: &SuiteRecountRequest) -> Result<SuiteRecount> {
+    let (mut before, others): (Vec<ReportRow>, Vec<ReportRow>) = read_receipt(&request.baseline)?
+        .into_iter()
+        .partition(|row| row.family().as_deref() == Some(request.family.as_str()));
+    let Some(first) = before.first() else {
+        return Err(VerificationError::new(
+            ErrorCode::Usage,
+            format!(
+                "{}: no row belongs to family `{}`",
+                request.baseline.display(),
+                request.family
+            ),
+        ));
+    };
+    let platform = canonical_platform(first.key().platform())?;
+    if before.iter().any(|row| row.key().platform() != platform) {
+        return Err(VerificationError::new(
+            ErrorCode::Usage,
+            format!("family `{}` spans more than one platform", request.family),
+        ));
+    }
+    let passing = others
+        .into_iter()
+        .filter(|row| row.state().is_pass() && row.key().platform() == platform)
+        .collect();
+    before.extend(evenly_spaced(passing, request.guard));
+    let runner = resolve_runner(&request.catalog, &request.runner)?;
+    let catalog = load_catalog_manifest(root, &request.catalog)?;
+    let obligations =
+        materialize_obligations(&request.catalog, &catalog.identifiers, runner, &platform)?;
+    let classifications = load_obligation_classifications(
+        root,
+        &request.catalog,
+        &catalog.identifiers,
+        &obligations,
+    )?;
+    let adapter = SuiteAdapter::build(root, &request.catalog, runner)?;
+    let lane_binding = fresh_lane_binding(root, runner)?;
+    let mut executor = SuiteExecutor {
+        adapter,
+        classifications,
+    };
+    let mut after = Vec::with_capacity(before.len());
+    for (ordinal, row) in before.iter().enumerate() {
+        // The catalog is strictly increasing by key, so a search finds the row.
+        let Ok(index) = obligations.binary_search_by(|entry| entry.key.cmp(row.key())) else {
+            return Err(VerificationError::new(
+                ErrorCode::SetMismatch,
+                format!(
+                    "the baseline names `{}`, which the `{}` catalog does not contain",
+                    row.key(),
+                    request.catalog
+                ),
+            ));
+        };
+        let obligation = &obligations[index];
+        let lane_request = LaneRequest::new(
+            lane_binding.clone(),
+            (ordinal + 1) as u64,
+            obligation.key.clone(),
+            obligation.observables.clone(),
+            vec![
+                "bamts-verification::suite::worker".to_owned(),
+                obligation.key.to_string(),
+            ],
+            WorkingDirectoryPolicy::RepositoryRoot,
+            CASE_TIMEOUT_MS,
+        )?;
+        let process = match executor.run(&lane_request) {
+            Ok(process) => process,
+            Err(error) => LaneProcessResult {
+                observation: ProcessObservation::Exited { code: 1 },
+                response_body: None,
+                duration_ms: 0,
+                detail: error.to_string(),
+            },
+        };
+        after.push(ReportRow::from_evidence(&derive_row(
+            &lane_request,
+            process,
+        )?));
+    }
+    Ok(SuiteRecount { before, after })
 }
 
 /// Merges every shard document below `receipts_root` for the catalog.
@@ -1841,7 +1908,7 @@ fn discover_jsonl(root: &Path, found: &mut Vec<PathBuf>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shard::ExecutionMode;
+    use crate::{evidence::TerminalState, shard::ExecutionMode};
 
     struct Scratch {
         root: PathBuf,
@@ -1896,7 +1963,7 @@ mod tests {
             .join(", ");
         format!(
             "{{\"schema\": \"{MANIFEST_SCHEMA}\", \"source_ledger_sha256\": \"{source_ledger}\", \
-             \"catalogs\": [{{\"extractor\": {{}}, \"id\": \"benchmarks\", \
+             \"catalogs\": [{{\"extractor\": {{}}, \"id\": \"formal-redex\", \
              \"identifier_count\": {}, \"identifiers\": [{}], \
              \"identifiers_sha256\": \"{}\", \
              \"source\": {{\"pin\": \"p\", \"url\": \"u\", \"digest_algorithm\": \"sha256\", \
@@ -2008,7 +2075,7 @@ mod tests {
             .expect("one worker selects");
         assert_eq!(chosen, worker);
 
-        let harness = select_candidate_binary("benchmarks", BTreeSet::new())
+        let harness = select_candidate_binary("formal-quint", BTreeSet::new())
             .expect("no worker falls back to the harness");
         assert_eq!(
             harness,
@@ -2127,8 +2194,8 @@ mod tests {
     #[test]
     fn manifest_identity_parsing_is_strict() {
         let (scratch, sorted) = manifest_root("identity", &["jit.c", "jit.a", "jit.b"]);
-        let loaded = load_catalog_manifest(&scratch.root, "benchmarks").expect("loads");
-        assert_eq!(loaded.catalog, "benchmarks");
+        let loaded = load_catalog_manifest(&scratch.root, "formal-redex").expect("loads");
+        assert_eq!(loaded.catalog, "formal-redex");
         assert_eq!(loaded.identifiers, sorted);
         assert_eq!(
             loaded.identifiers_sha256,
@@ -2138,7 +2205,7 @@ mod tests {
 
         // Sources-ledger drift is rejected as stale, not parsed over.
         scratch.write("vendor/sources.toml", b"[[source]]\n# drift\n");
-        let error = load_catalog_manifest(&scratch.root, "benchmarks")
+        let error = load_catalog_manifest(&scratch.root, "formal-redex")
             .expect_err("stale sources ledger must fail");
         assert_eq!(error.code(), ErrorCode::Schema);
 
@@ -2151,7 +2218,7 @@ mod tests {
         // duplicate identifier itself is caught by the digest.
         assert!(text.contains("\"jit.a\", \"jit.a\""));
         fs::write(mutated.root.join(schema::MANIFEST_PATH), text).expect("write");
-        assert!(load_catalog_manifest(&mutated.root, "benchmarks").is_err());
+        assert!(load_catalog_manifest(&mutated.root, "formal-redex").is_err());
 
         let (bad_tag, _) = manifest_root("identity-tag", &["jit.a"]);
         let bytes = fs::read(bad_tag.root.join(schema::MANIFEST_PATH)).expect("read");
@@ -2159,7 +2226,7 @@ mod tests {
             .expect("utf8")
             .replace(MANIFEST_SCHEMA, "bamti.other/v9");
         fs::write(bad_tag.root.join(schema::MANIFEST_PATH), text).expect("write");
-        assert!(load_catalog_manifest(&bad_tag.root, "benchmarks").is_err());
+        assert!(load_catalog_manifest(&bad_tag.root, "formal-redex").is_err());
     }
 
     #[test]
@@ -2173,8 +2240,6 @@ mod tests {
             ("formal-quint", "quint", SuiteRunner::Quint),
             ("formal-lean", "lean", SuiteRunner::Lean),
             ("formal-redex", "redex", SuiteRunner::Redex),
-            ("target-cells", "aot", SuiteRunner::Aot),
-            ("benchmarks", "perf", SuiteRunner::Perf),
         ];
         for (catalog, runner, expected) in declared {
             assert_eq!(
@@ -2187,12 +2252,10 @@ mod tests {
             ("typescript-7.0.2", "aot"),
             ("typescript-7.0.2", "interpreter"),
             ("test262", "compiler"),
-            ("test262", "perf"),
+            ("test262", "quint"),
             ("formal-quint", "lean"),
             ("formal-lean", "quint"),
             ("formal-redex", "compiler"),
-            ("target-cells", "perf"),
-            ("benchmarks", "aot"),
         ] {
             let error = resolve_runner(catalog, runner).expect_err("undeclared runner must fail");
             assert_eq!(error.code(), ErrorCode::Schema, "{catalog}/{runner}");
@@ -2200,8 +2263,8 @@ mod tests {
             assert!(text.contains(catalog) && text.contains(runner), "{text}");
         }
         assert_eq!(
-            resolve_runner("benchmarks", "").expect("sole runner"),
-            SuiteRunner::Perf
+            resolve_runner("formal-redex", "").expect("sole runner"),
+            SuiteRunner::Redex
         );
         assert!(resolve_runner("test262", "").is_err());
         assert_eq!(
@@ -2211,7 +2274,7 @@ mod tests {
             ErrorCode::Usage
         );
         assert_eq!(
-            resolve_runner("benchmarks", "Perf")
+            resolve_runner("formal-redex", "Redex")
                 .expect_err("case mismatch")
                 .code(),
             ErrorCode::Schema
@@ -2224,12 +2287,12 @@ mod tests {
             "jit.a", "jit.b", "jit.c", "jit.d", "jit.e", "jit.f", "jit.g",
         ];
         let obligations = materialize_obligations(
-            "benchmarks",
+            "formal-redex",
             &identifiers
                 .iter()
                 .map(|entry| (*entry).to_owned())
                 .collect::<Vec<_>>(),
-            SuiteRunner::Perf,
+            SuiteRunner::Redex,
             "ubuntu-latest",
         )
         .expect("obligations");
@@ -2257,10 +2320,37 @@ mod tests {
     }
 
     #[test]
+    fn a_formal_name_may_itself_contain_the_separator() {
+        let (case, configuration, observables) = parse_logical_identifier(
+            "formal-redex",
+            "ecmascript/semantics.rkt::rule::property_get",
+        )
+        .expect("the manifest declares identifiers of this shape");
+        assert_eq!(case, "ecmascript/semantics.rkt");
+        assert_eq!(configuration, "rule::property_get");
+        assert_eq!(
+            observables,
+            BTreeSet::from(["rule::property_get".to_owned()])
+        );
+    }
+
+    #[test]
+    fn test262_is_proven_in_all_three_modes_and_other_catalogs_in_one() {
+        use crate::shard::ExecutionMode as Mode;
+        assert_eq!(
+            required_modes("test262").expect("modes"),
+            [Mode::Interpreter, Mode::Jit, Mode::Aot]
+        );
+        for catalog in ["typescript-7.0.2", "formal-redex"] {
+            assert_eq!(required_modes(catalog).expect("modes"), [Mode::Aot]);
+        }
+    }
+
+    #[test]
     fn suite_never_mints_pass_without_exact_observables() {
         fn key(case: &str) -> ObligationKey {
             ObligationKey::new(
-                "benchmarks",
+                "formal-redex",
                 case,
                 "default",
                 ExecutionMode::Aot,
@@ -2338,7 +2428,7 @@ mod tests {
             .ancestors()
             .find(|candidate| candidate.join(".git").is_dir())
             .expect("fixture git repository");
-        current_run_binding(repository, "benchmarks").expect("current binding")
+        current_run_binding(repository, "formal-redex").expect("current binding")
     }
 
     fn write_shard(root: &Path, name: &str, keys: &[ObligationKey], spec: ShardSpec) -> PathBuf {
@@ -2404,7 +2494,7 @@ mod tests {
         );
         let root = scratch.root.clone();
         let obligations =
-            materialize_obligations("benchmarks", &sorted, SuiteRunner::Perf, "ubuntu-latest")
+            materialize_obligations("formal-redex", &sorted, SuiteRunner::Redex, "ubuntu-latest")
                 .expect("obligations");
         let keys: Vec<ObligationKey> = obligations.into_iter().map(|entry| entry.key).collect();
         let receipts = root.join("receipts");
@@ -2417,12 +2507,12 @@ mod tests {
             );
         }
         let out = root.join("merged.jsonl");
-        let report = merge_for_tests(&root, "benchmarks", &receipts, &out, PublishMode::Replace)
+        let report = merge_for_tests(&root, "formal-redex", &receipts, &out, PublishMode::Replace)
             .expect("complete merge");
         assert_eq!(report.rows, keys.len());
         assert_eq!(report.documents, 3);
         assert_eq!(report.platform, "ubuntu-latest");
-        assert_eq!(report.runner, "perf");
+        assert_eq!(report.runner, "redex");
         assert_eq!(report.states.get("BLOCKING_FAIL"), Some(&keys.len()));
         assert_eq!(
             report.obligation_set_digest,
@@ -2443,7 +2533,7 @@ mod tests {
         assert!(
             merge_for_tests(
                 &root,
-                "benchmarks",
+                "formal-redex",
                 &partial,
                 &root.join("out.jsonl"),
                 PublishMode::Replace
@@ -2505,7 +2595,7 @@ mod tests {
         }
         let error = merge_for_tests(
             &root,
-            "benchmarks",
+            "formal-redex",
             &stale,
             &root.join("out2.jsonl"),
             PublishMode::Replace,
@@ -2525,7 +2615,7 @@ mod tests {
             );
         }
         let foreign = ObligationKey::new(
-            "benchmarks",
+            "formal-redex",
             "aaa.foreign",
             "default",
             ExecutionMode::Aot,
@@ -2543,7 +2633,7 @@ mod tests {
         assert!(
             merge_for_tests(
                 &root,
-                "benchmarks",
+                "formal-redex",
                 &extra,
                 &root.join("out3.jsonl"),
                 PublishMode::Replace
@@ -2559,7 +2649,7 @@ mod tests {
             .iter()
             .map(|identifier| {
                 ObligationKey::new(
-                    "benchmarks",
+                    "formal-redex",
                     identifier,
                     "default",
                     ExecutionMode::Jit,
@@ -2597,7 +2687,7 @@ mod tests {
         assert_eq!(
             merge_for_tests(
                 &root,
-                "benchmarks",
+                "formal-redex",
                 &wrong_mode,
                 &root.join("out4.jsonl"),
                 PublishMode::Replace
@@ -2613,7 +2703,7 @@ mod tests {
         let (scratch, sorted) = manifest_root("two-half", &["jit.a", "jit.b", "jit.c", "jit.d"]);
         let root = scratch.root.clone();
         let obligations =
-            materialize_obligations("benchmarks", &sorted, SuiteRunner::Perf, "ubuntu-latest")
+            materialize_obligations("formal-redex", &sorted, SuiteRunner::Redex, "ubuntu-latest")
                 .expect("obligations");
         let keys: Vec<ObligationKey> = obligations.into_iter().map(|entry| entry.key).collect();
         let receipts = root.join("two");
@@ -2626,12 +2716,12 @@ mod tests {
             );
         }
         let out = root.join("two-halves.jsonl");
-        let report = merge_for_tests(&root, "benchmarks", &receipts, &out, PublishMode::Replace)
+        let report = merge_for_tests(&root, "formal-redex", &receipts, &out, PublishMode::Replace)
             .expect("two-half closure");
         assert_eq!(report.documents, 2);
         assert_eq!(report.rows, keys.len());
         let canonical = fs::read(&out).expect("canonical output");
-        merge_for_tests(&root, "benchmarks", &receipts, &out, PublishMode::Replace)
+        merge_for_tests(&root, "formal-redex", &receipts, &out, PublishMode::Replace)
             .expect("deterministic replacement");
         assert_eq!(fs::read(&out).expect("replacement"), canonical);
 
@@ -2651,7 +2741,14 @@ mod tests {
         )
         .expect("shard 1");
         assert!(
-            merge_for_tests(&root, "benchmarks", &duplicate, &out, PublishMode::Replace).is_err(),
+            merge_for_tests(
+                &root,
+                "formal-redex",
+                &duplicate,
+                &out,
+                PublishMode::Replace
+            )
+            .is_err(),
             "duplicate row must be rejected"
         );
         assert_eq!(
@@ -2664,18 +2761,18 @@ mod tests {
     #[test]
     fn missing_adapter_records_typed_blocking_rows_and_continues() {
         assert!(
-            std::env::var_os("BAMTS_SUITE_PERF_ADAPTER").is_none(),
-            "test requires no injected perf adapter"
+            std::env::var_os("BAMTS_SUITE_REDEX_ADAPTER").is_none(),
+            "test requires no injected redex adapter"
         );
         let (scratch, _) = manifest_root("closed", &["jit.a", "jit.b"]);
         let receipt = scratch.root.join("receipt.jsonl");
         let report = run_suite(
             &scratch.root,
             &SuiteRunRequest {
-                catalog: "benchmarks".to_owned(),
+                catalog: "formal-redex".to_owned(),
                 shard: ShardSpec::unsharded(),
                 receipt: receipt.clone(),
-                runner: "perf".to_owned(),
+                runner: "redex".to_owned(),
                 platform: "ubuntu-latest".to_owned(),
                 execution: ExecutionBinding::local_for_tests(),
             },
@@ -2692,6 +2789,176 @@ mod tests {
         }
         assert_eq!(reader.finish().expect("footer").row_count(), rows);
         assert_eq!(rows, 2);
+    }
+
+    /// A baseline from a run with no adapter, with the detail of the middle row
+    /// changed so the rows fall into two failure families.
+    fn two_family_baseline(identifiers: &[&str]) -> (Scratch, PathBuf, String, String) {
+        let (scratch, _) = manifest_root("recount", identifiers);
+        let baseline = scratch.root.join("baseline.jsonl");
+        run_suite(
+            &scratch.root,
+            &SuiteRunRequest {
+                catalog: "formal-redex".to_owned(),
+                shard: ShardSpec::unsharded(),
+                receipt: baseline.clone(),
+                runner: "redex".to_owned(),
+                platform: "ubuntu-latest".to_owned(),
+                execution: ExecutionBinding::local_for_tests(),
+            },
+        )
+        .expect("baseline run");
+        // Every case names its own observable, which would give each row a
+        // facet, and so a family, of its own. Share one so rows can group.
+        let mut text = fs::read_to_string(&baseline).expect("baseline text");
+        for identifier in identifiers {
+            text = text.replace(
+                &format!("\"observables\":[\"{identifier}\"]"),
+                "\"observables\":[\"redex\"]",
+            );
+        }
+        let detail = text
+            .lines()
+            .find_map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).ok()?;
+                value["body"]["detail"].as_str().map(str::to_owned)
+            })
+            .expect("a row detail");
+        let first = text.find(&detail).expect("first detail");
+        let second = first
+            + text[first + detail.len()..]
+                .find(&detail)
+                .expect("second detail")
+            + detail.len();
+        let edited = format!(
+            "{}beta failure{}",
+            &text[..second],
+            &text[second + detail.len()..]
+        );
+        fs::write(&baseline, edited).expect("edited baseline");
+        let rows = crate::sweep_report::read_receipt(&baseline).expect("readable baseline");
+        let family_of = |index: usize| rows[index].family().expect("failing row");
+        let (alpha, beta) = (family_of(0), family_of(1));
+        assert_ne!(alpha, beta);
+        assert_eq!(family_of(2), alpha);
+        (scratch, baseline, alpha, beta)
+    }
+
+    fn recount_request(baseline: &Path, family: &str) -> SuiteRecountRequest {
+        SuiteRecountRequest {
+            catalog: "formal-redex".to_owned(),
+            runner: "redex".to_owned(),
+            baseline: baseline.to_owned(),
+            family: family.to_owned(),
+            guard: 0,
+        }
+    }
+
+    #[test]
+    fn recount_reruns_only_the_rows_of_the_named_family() {
+        let (scratch, baseline, alpha, beta) = two_family_baseline(&["jit.a", "jit.b", "jit.c"]);
+
+        let one = recount_suite(&scratch.root, &recount_request(&baseline, &beta))
+            .expect("recount of the one-row family");
+        assert_eq!(one.before.len(), 1);
+        assert_eq!(one.after.len(), 1);
+        assert_eq!(one.before[0].key(), one.after[0].key());
+        assert!(
+            one.before[0].key().case().ends_with("jit.b"),
+            "{:?}",
+            one.before[0].key()
+        );
+        assert_eq!(one.after[0].key().platform(), "ubuntu-latest");
+
+        let two = recount_suite(&scratch.root, &recount_request(&baseline, &alpha))
+            .expect("recount of the two-row family");
+        let cases: Vec<&str> = two.after.iter().map(|row| row.key().case()).collect();
+        assert_eq!(cases.len(), 2, "{cases:?}");
+        assert!(
+            cases[0].ends_with("jit.a") && cases[1].ends_with("jit.c"),
+            "{cases:?}"
+        );
+        assert!(two.after.iter().all(|row| !row.state().is_pass()));
+    }
+
+    #[test]
+    fn recount_reruns_passing_rows_so_a_regression_can_be_seen() {
+        let (scratch, baseline, _, beta) = two_family_baseline(&["jit.a", "jit.b", "jit.c"]);
+        // These lanes fail every row, so a row recorded as passing regresses.
+        let edited: Vec<String> = fs::read_to_string(&baseline)
+            .expect("baseline text")
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).expect("json line");
+                let is_row = value["body"]["key"].to_string().contains("jit.c");
+                if is_row {
+                    value["body"]["state"] = serde_json::Value::from("PASS");
+                    value["body"]["artifacts"] = serde_json::json!({"redex": "0".repeat(64)});
+                }
+                value.to_string()
+            })
+            .collect();
+        fs::write(&baseline, edited.join("\n") + "\n").expect("edited baseline");
+
+        let mut request = recount_request(&baseline, &beta);
+        let unguarded = recount_suite(&scratch.root, &request).expect("recount without a guard");
+        let (_, regressions) =
+            crate::sweep_report::render_recount(&beta, &unguarded.before, &unguarded.after, 5);
+        assert_eq!(unguarded.after.len(), 1);
+        assert_eq!(regressions, 0);
+
+        request.guard = 5;
+        let guarded = recount_suite(&scratch.root, &request).expect("recount with a guard");
+        let (report, regressions) =
+            crate::sweep_report::render_recount(&beta, &guarded.before, &guarded.after, 5);
+        assert_eq!(guarded.after.len(), 2, "{report}");
+        assert_eq!(regressions, 1, "{report}");
+    }
+
+    #[test]
+    fn an_even_sample_has_the_exact_size_and_reaches_both_halves() {
+        let rows: Vec<ReportRow> = (0..10)
+            .map(|index| {
+                let key = ObligationKey::new(
+                    "formal-redex",
+                    format!("case-{index}"),
+                    "default",
+                    ExecutionMode::Interpreter,
+                    "ubuntu-latest",
+                )
+                .expect("key");
+                ReportRow::new(key, "redex", TerminalState::Pass, "")
+            })
+            .collect();
+        for count in 0..=12 {
+            let sample = evenly_spaced(rows.clone(), count);
+            assert_eq!(sample.len(), count.min(10));
+        }
+        let cases: Vec<String> = evenly_spaced(rows, 2)
+            .iter()
+            .map(|row| row.key().case().to_owned())
+            .collect();
+        assert_eq!(cases, ["case-4", "case-9"]);
+    }
+
+    #[test]
+    fn recount_of_an_unknown_family_is_a_usage_error() {
+        let (scratch, baseline, ..) = two_family_baseline(&["jit.a", "jit.b", "jit.c"]);
+        let error = recount_suite(
+            &scratch.root,
+            &recount_request(&baseline, "perf/no-such-family"),
+        )
+        .expect_err("unknown family");
+        assert_eq!(error.code(), ErrorCode::Usage);
+    }
+
+    #[test]
+    fn recount_refuses_a_baseline_the_catalog_no_longer_contains() {
+        let (_scratch, baseline, _, beta) = two_family_baseline(&["jit.a", "jit.b", "jit.c"]);
+        let (smaller, _) = manifest_root("recount-smaller", &["jit.a", "jit.c"]);
+        let error = recount_suite(&smaller.root, &recount_request(&baseline, &beta))
+            .expect_err("jit.b is gone from the catalog");
+        assert_eq!(error.code(), ErrorCode::SetMismatch);
     }
 
     /// `fourslash/…` obligations are language-service authority cases: the

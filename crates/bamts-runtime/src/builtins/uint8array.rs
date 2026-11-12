@@ -14,25 +14,20 @@ use crate::{
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
     builtins.set_uint8array_prototype(prototype);
-    let constructor = install_function(heap, builtins, "Uint8Array", 1, constructor::<H>);
+    let constructor = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Uint8Array", length: 1, handler: constructor::<H> });
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    define_data(heap, prototype, "constructor", constructor);
-    let length = install_function(heap, builtins, "get length", 0, length_getter::<H>);
-    define_getter(heap, prototype, "length", length);
-    let join = install_function(heap, builtins, "join", 1, join::<H> as BuiltinHandler<H>);
-    define_data(heap, prototype, "join", join);
-    let iterator = install_function(
-        heap,
-        builtins,
-        "[Symbol.iterator]",
-        0,
-        values::<H> as BuiltinHandler<H>,
-    );
+    define_data(heap, atoms, shapes, prototype, "constructor", constructor);
+    let length = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get length", length: 0, handler: length_getter::<H> });
+    define_getter(heap, atoms, prototype, "length", length);
+    let join = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "join", length: 1, handler: join::<H> as BuiltinHandler<H> });
+    define_data(heap, atoms, shapes, prototype, "join", join);
+    let iterator = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "[Symbol.iterator]", length: 0, handler: values::<H> as BuiltinHandler<H> });
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
         unreachable!("Uint8Array prototype is ordinary")
     };
@@ -77,7 +72,7 @@ fn constructor<H: Host>(
                 (bytes.len(), None, Some(bytes))
             } else {
                 let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-                let iterator_key = machine.to_property_key(iterator_symbol)?;
+                let iterator_key = machine.property_key_from_value(iterator_symbol)?;
                 let iterator_method = machine.get_property_key(source, &iterator_key)?;
                 match iterator_method.decode() {
                     Some(Decoded::Undefined | Decoded::Null) => {
@@ -94,13 +89,9 @@ fn constructor<H: Host>(
         }
     };
     let properties = PropertyMap::default();
+    let charge = properties.charge_bytes(&machine.atoms);
     machine
-        .ensure_allocation_capacity(
-            1,
-            length
-                .saturating_add(properties.charge_bytes())
-                .saturating_add(1),
-        )
+        .ensure_allocation_capacity(1, length.saturating_add(charge).saturating_add(1))
         .map_err(EvalFailure::Runtime)?;
     let bytes = if let Some(copied) = copied_bytes {
         copied
@@ -166,12 +157,18 @@ fn length_getter<H: Host>(
     )))
 }
 
-fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
+fn define_getter(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    object: Value,
+    name: &str,
+    getter: Value,
+) {
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
         panic!("accessor target must be an ordinary object");
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        PropertyKey::Named(atoms.intern_str(name)),
         Property::Accessor {
             getter: Some(getter),
             setter: None,
@@ -349,7 +346,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, name, 0)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
     }
 
     fn iterator_method(
@@ -511,7 +508,7 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let typed = construct(&mut machine, Value::int32(3));
-        let key = PropertyKey::Named(EcmaString::encode("length"));
+        let key = PropertyKey::Named(machine.intern_str("length"));
 
         assert!(machine.own_descriptor(typed, &key).unwrap().is_none());
         assert_eq!(
@@ -552,8 +549,7 @@ mod tests {
         let next = native(&mut machine, "next", iterator_next);
         let value_of = native(&mut machine, "valueOf", value_of);
         let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-        let iterator_key = machine
-            .to_property_key(iterator_symbol)
+        let iterator_key = machine.property_key_from_value(iterator_symbol)
             .expect("symbol key");
         machine
             .set_data_property_key(source, iterator_key, iterator)
@@ -712,8 +708,7 @@ mod tests {
             machine
                 .set_data_property(nullish, "length", Value::int32(1))
                 .unwrap();
-            let iterator_key = machine
-                .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+            let iterator_key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
                 .unwrap();
             machine
                 .set_data_property_key(nullish, iterator_key, Value::NULL)
@@ -740,8 +735,7 @@ mod tests {
                 .unwrap();
             let iterator = native(machine, "[Symbol.iterator]", iterator_method);
             let next = native(machine, "next", iterator_next_value);
-            let iterator_key = machine
-                .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+            let iterator_key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
                 .unwrap();
             machine
                 .set_data_property_key(source, iterator_key, iterator)
@@ -750,8 +744,7 @@ mod tests {
             let typed = construct(machine, source);
             assert_eq!(int(machine, typed, "0"), 9);
             let noncallable = ordinary_object(machine);
-            let iterator_key = machine
-                .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+            let iterator_key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
                 .unwrap();
             machine
                 .set_data_property_key(noncallable, iterator_key, Value::int32(0))
@@ -772,8 +765,7 @@ mod tests {
             );
             let source = construct(machine, source_values);
             let iterator = native(machine, "throwing [Symbol.iterator]", throwing_iterator);
-            let iterator_key = machine
-                .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+            let iterator_key = machine.property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
                 .unwrap();
             machine
                 .set_data_property_key(source, iterator_key, iterator)
@@ -995,7 +987,7 @@ mod tests {
             machine
                 .define_accessor(
                     source,
-                    PropertyKey::Named(EcmaString::encode("0")),
+                    PropertyKey::Named(machine.intern_str("0")),
                     getter0,
                     bamts_bytecode::AccessorKind::Getter,
                 )
@@ -1003,7 +995,7 @@ mod tests {
             machine
                 .define_accessor(
                     source,
-                    PropertyKey::Named(EcmaString::encode("1")),
+                    PropertyKey::Named(machine.intern_str("1")),
                     getter1,
                     bamts_bytecode::AccessorKind::Getter,
                 )
@@ -1074,8 +1066,7 @@ mod tests {
             let iterator_fn = machine
                 .get_property_key(
                     prototype,
-                    &machine
-                        .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+                    &machine.property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
                         .unwrap(),
                 )
                 .unwrap();
@@ -1093,8 +1084,7 @@ mod tests {
             let iterator_fn = machine
                 .get_property_key(
                     prototype,
-                    &machine
-                        .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+                    &machine.property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
                         .unwrap(),
                 )
                 .unwrap();

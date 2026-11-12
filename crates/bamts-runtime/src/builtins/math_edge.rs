@@ -1,8 +1,9 @@
 #[cfg(test)]
 use bamts_bytecode::EcmaString;
-use bamts_native::Value;
+use bamts_bytecode::IteratorKind;
+use bamts_native::{Decoded, Value};
 
-use super::{define_data, define_frozen_data, install_function, value_number};
+use super::{define_data, define_frozen_data, install_function, type_error, value_number};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine};
 
@@ -16,17 +17,19 @@ use crate::{EvalFailure, HeapEntry, Host, Machine};
 /// https://tc39.es/ecma262/2025/multipage/numbers-and-dates.html#sec-math-object
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
     math: Value,
 ) {
     // 21.3.1: every value property is non-writable, non-enumerable, and
     // non-configurable.
     for (name, value) in CONSTANTS {
-        define_frozen_data(heap, math, name, crate::number_value(value));
+        define_frozen_data(heap, atoms, shapes, math, name, crate::number_value(value));
     }
     for (name, length, handler) in functions::<H>() {
-        let function = install_function(heap, builtins, name, length, handler);
-        define_data(heap, math, name, function);
+        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        define_data(heap, atoms, shapes, math, name, function);
     }
 }
 
@@ -41,7 +44,7 @@ const CONSTANTS: [(&str, f64); 8] = [
     ("SQRT2", std::f64::consts::SQRT_2),
 ];
 
-fn functions<H: Host>() -> [(&'static str, u32, BuiltinHandler<H>); 29] {
+fn functions<H: Host>() -> [(&'static str, u32, BuiltinHandler<H>); 30] {
     [
         ("acos", 1, acos::<H> as BuiltinHandler<H>),
         ("acosh", 1, acosh::<H>),
@@ -69,6 +72,7 @@ fn functions<H: Host>() -> [(&'static str, u32, BuiltinHandler<H>); 29] {
         ("sign", 1, sign::<H>),
         ("sin", 1, sin::<H>),
         ("sinh", 1, sinh::<H>),
+        ("sumPrecise", 1, sum_precise::<H>),
         ("tan", 1, tan::<H>),
         ("tanh", 1, tanh::<H>),
         ("trunc", 1, trunc::<H>),
@@ -77,6 +81,182 @@ fn functions<H: Host>() -> [(&'static str, u32, BuiltinHandler<H>); 29] {
 
 fn argument(args: &[Value], index: usize) -> Value {
     args.get(index).copied().unwrap_or(Value::UNDEFINED)
+}
+
+/// Enough limbs for any sum the iterator protocol can produce: a finite Number
+/// is below 2^2098 of these units, and a list holds fewer than 2^53 of them.
+const EXACT_SUM_LIMBS: usize = 36;
+
+/// A two's-complement fixed-point total in units of 2^-1074, the spacing of
+/// every Number. Each finite Number is a whole count of those units, so the
+/// total is exact and `Math.sumPrecise` rounds exactly once, at the end.
+struct ExactSum {
+    limbs: [u64; EXACT_SUM_LIMBS],
+}
+
+impl ExactSum {
+    fn new() -> Self {
+        Self {
+            limbs: [0; EXACT_SUM_LIMBS],
+        }
+    }
+
+    fn add(&mut self, value: f64) {
+        let bits = value.to_bits();
+        let biased_exponent = (bits >> 52) & 0x7ff;
+        let fraction = bits & ((1 << 52) - 1);
+        let (mantissa, shift) = if biased_exponent == 0 {
+            (fraction, 0)
+        } else {
+            (fraction | (1 << 52), biased_exponent - 1)
+        };
+        let first = (shift / 64) as usize;
+        let wide = u128::from(mantissa) << (shift % 64);
+        let parts = [wide as u64, (wide >> 64) as u64];
+        let mut carry = false;
+        for (offset, limb) in self.limbs[first..].iter_mut().enumerate() {
+            let part = parts.get(offset).copied().unwrap_or(0);
+            if offset >= parts.len() && !carry {
+                break;
+            }
+            let (partial, first_carry, second_carry) = if value.is_sign_negative() {
+                let (partial, borrowed) = limb.overflowing_sub(part);
+                let (partial, again) = partial.overflowing_sub(u64::from(carry));
+                (partial, borrowed, again)
+            } else {
+                let (partial, carried) = limb.overflowing_add(part);
+                let (partial, again) = partial.overflowing_add(u64::from(carry));
+                (partial, carried, again)
+            };
+            *limb = partial;
+            carry = first_carry || second_carry;
+        }
+    }
+
+    /// The total rounded to the nearest Number, ties to even. An exact zero is
+    /// `+0`; the all-`-0` case never reaches here.
+    fn round(&self) -> f64 {
+        let negative = self.limbs[EXACT_SUM_LIMBS - 1] >> 63 == 1;
+        let mut magnitude = self.limbs;
+        if negative {
+            let mut carry = true;
+            for limb in &mut magnitude {
+                let (negated, carried) = (!*limb).overflowing_add(u64::from(carry));
+                *limb = negated;
+                carry = carried;
+            }
+        }
+        let Some(top) = magnitude.iter().rposition(|limb| *limb != 0) else {
+            return 0.0;
+        };
+        let bit_length = top * 64 + (64 - magnitude[top].leading_zeros() as usize);
+        let result = if bit_length <= 53 {
+            // The encoding of Numbers below 2^-1021 is continuous, so a count
+            // of units that fits in 53 bits is its own bit pattern.
+            f64::from_bits(magnitude[0])
+        } else {
+            round_magnitude(&magnitude, bit_length)
+        };
+        if negative { -result } else { result }
+    }
+}
+
+fn round_magnitude(magnitude: &[u64; EXACT_SUM_LIMBS], bit_length: usize) -> f64 {
+    let bit = |position: usize| magnitude[position / 64] >> (position % 64) & 1 == 1;
+    let mut shift = bit_length - 53;
+    let (limb, offset) = (shift / 64, shift % 64);
+    let low = magnitude[limb] >> offset;
+    let high = match offset {
+        0 => 0,
+        _ => magnitude
+            .get(limb + 1)
+            .map_or(0, |next| next << (64 - offset)),
+    };
+    let mut mantissa = (low | high) & ((1 << 53) - 1);
+    let round_position = shift - 1;
+    let sticky = magnitude[..round_position / 64]
+        .iter()
+        .any(|limb| *limb != 0)
+        || magnitude[round_position / 64] & ((1u64 << (round_position % 64)) - 1) != 0;
+    if bit(round_position) && (sticky || mantissa & 1 == 1) {
+        mantissa += 1;
+        if mantissa == 1 << 53 {
+            mantissa >>= 1;
+            shift += 1;
+        }
+    }
+    let biased_exponent = shift as u64 + 1;
+    if biased_exponent >= 0x7ff {
+        return f64::INFINITY;
+    }
+    f64::from_bits((biased_exponent << 52) | (mantissa & ((1 << 52) - 1)))
+}
+
+/// `Math.sumPrecise(items)`: the exact sum of an iterable of Numbers. A
+/// non-Number closes the iterator; infinities and NaN are only recorded, since
+/// later items must still be checked.
+fn sum_precise<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let items = argument(args, 0);
+    if matches!(items.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+        return Err(type_error("Math.sumPrecise requires an iterable"));
+    }
+    let iterator = machine.create_iterator(items, IteratorKind::Sync)?;
+    let depth = machine.native_roots.len();
+    machine.push_native_roots(depth, &[iterator]);
+    let total = sum_iterator(machine, iterator);
+    machine.pop_native_roots(depth);
+    Ok(BuiltinOutcome::Value(
+        number_value_preserving_negative_zero(total?),
+    ))
+}
+
+fn sum_iterator<H: Host>(
+    machine: &mut Machine<'_, H>,
+    iterator: Value,
+) -> Result<f64, EvalFailure> {
+    let mut sum = ExactSum::new();
+    let (mut saw_nan, mut saw_positive, mut saw_negative) = (false, false, false);
+    let mut only_negative_zero = true;
+    loop {
+        let (done, next) = machine.iterator_next(iterator)?;
+        if done {
+            break;
+        }
+        if !matches!(next.decode(), Some(Decoded::Int32(_) | Decoded::Number(_))) {
+            let (closed, _) = machine.close_iterator_raw(iterator);
+            if let Err(EvalFailure::Runtime(kind)) = closed {
+                return Err(EvalFailure::Runtime(kind));
+            }
+            return Err(type_error("Math.sumPrecise requires Number items"));
+        }
+        let number = value_number(next);
+        if number.is_nan() {
+            saw_nan = true;
+        } else if number == f64::INFINITY {
+            saw_positive = true;
+        } else if number == f64::NEG_INFINITY {
+            saw_negative = true;
+        } else {
+            only_negative_zero &= number == 0.0 && number.is_sign_negative();
+            sum.add(number);
+        }
+    }
+    Ok(if saw_nan || (saw_positive && saw_negative) {
+        f64::NAN
+    } else if saw_positive {
+        f64::INFINITY
+    } else if saw_negative {
+        f64::NEG_INFINITY
+    } else if only_negative_zero {
+        -0.0
+    } else {
+        sum.round()
+    })
 }
 
 /// `? ToNumber(arg)` on the observable path: an object argument runs its
@@ -386,6 +566,62 @@ fn round_to_binary16(value: f64) -> f64 {
 }
 
 #[cfg(test)]
+mod exact_sum_tests {
+    use super::ExactSum;
+
+    fn total(values: &[f64]) -> f64 {
+        let mut sum = ExactSum::new();
+        for value in values {
+            sum.add(*value);
+        }
+        sum.round()
+    }
+
+    #[test]
+    fn intermediate_overflow_and_cancellation_stay_exact() {
+        assert_eq!(total(&[f64::MAX, f64::MAX, -f64::MAX]), f64::MAX);
+        assert_eq!(total(&[1e308, 1e308, -1e308, -1e308]), 0.0);
+        assert_eq!(total(&[1e30, 0.1, -1e30]), 0.1);
+        assert_eq!(total(&[f64::MAX, f64::MAX]), f64::INFINITY);
+        assert_eq!(total(&[-f64::MAX, -f64::MAX]), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn rounding_is_to_nearest_with_ties_to_even() {
+        let tiny = 2f64.powi(-53);
+        assert_eq!(total(&[1.0, tiny]), 1.0, "a tie rounds down to even");
+        let odd = 1.0 + 2f64.powi(-52);
+        assert_eq!(
+            total(&[odd, tiny]),
+            1.0 + 2f64.powi(-51),
+            "a tie rounds up to even"
+        );
+        assert_eq!(
+            total(&[1.0, tiny, 2f64.powi(-1000)]),
+            1.0 + 2f64.powi(-52),
+            "anything past the tie breaks it upward"
+        );
+    }
+
+    #[test]
+    fn subnormal_totals_are_exact() {
+        let smallest = f64::from_bits(1);
+        assert_eq!(total(&[smallest, smallest]), f64::from_bits(2));
+        assert_eq!(
+            total(&[f64::MIN_POSITIVE, -smallest]).to_bits(),
+            (1 << 52) - 1
+        );
+        assert_eq!(total(&[-smallest]), -smallest);
+    }
+
+    #[test]
+    fn an_exact_zero_is_positive() {
+        assert!(total(&[1.5, -1.5]).is_sign_positive());
+        assert!(total(&[]).is_sign_positive());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
@@ -547,7 +783,7 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, id, "math valueOf", 0)
+        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "math valueOf", 0)
     }
 
     fn coercible(
@@ -933,10 +1169,16 @@ mod tests {
             .intrinsics
             .global("Math")
             .expect("Math is installed");
-        install(&mut machine.heap, &mut machine.intrinsics.builtins, math);
+        install(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            &mut machine.intrinsics.builtins,
+            math,
+        );
 
         for (name, expected) in CONSTANTS {
-            let key = PropertyKey::Named(EcmaString::encode(name));
+            let key = PropertyKey::Named(machine.intern_str(name));
             assert!(
                 matches!(
                     machine.own_descriptor(math, &key).unwrap(),
@@ -958,9 +1200,8 @@ mod tests {
                 "Math.{name} is callable"
             );
             for (property, expected_length) in [("name", None), ("length", Some(length))] {
-                let descriptor = machine
-                    .own_descriptor(function, &PropertyKey::Named(EcmaString::encode(property)))
-                    .unwrap();
+                let descriptor_key = PropertyKey::Named(machine.intern_str(property));
+                let descriptor = machine.own_descriptor(function, &descriptor_key).unwrap();
                 assert!(
                     matches!(
                         descriptor,
@@ -977,10 +1218,11 @@ mod tests {
                     "Math.{name} has the standard {property} descriptor",
                 );
             }
+            let math_key = PropertyKey::Named(machine.intern_str(name));
             assert!(
                 matches!(
                     machine
-                        .own_descriptor(math, &PropertyKey::Named(EcmaString::encode(name)))
+                        .own_descriptor(math, &math_key)
                         .unwrap(),
                     Some(Property::Data {
                         value,

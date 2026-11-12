@@ -3,7 +3,7 @@ use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar, EnumValue};
 use crate::jsx_desugar::JsxSourceDesugarPlan;
 use crate::literal::{
     BigIntTextError, MAX_BIGINT_CONVERSION_LIMB_OPS, canonical_bigint_text, cook_escapes,
-    number_value, string_value,
+    has_cooked_value, number_value, string_value,
 };
 use crate::namespace_plan::{ContainerAcquisition, NamespaceFacts};
 pub use crate::program::{
@@ -20,10 +20,11 @@ use crate::syntax::{
     ExportDefaultValue, ExportNamedDeclaration, ExportSpecifierMode, Expr, Expression, ForBinding,
     ForInStatement, ForInitializer, ForOfMode, ForOfStatement, ForStatement, FunctionBody,
     FunctionLike, IdentifierNode, IfStatement, ImportBinding, ImportDeclaration,
-    ImportSpecifierMode, LabeledStatement, Literal, LogicalExpression, LogicalOperator,
-    MemberExpression, MemberProperty, MetaProperty, ModuleExportName, NamespaceDeclaration,
-    NamespaceName, NewExpression, NodeId, NodeKind, NumericLiteralNode, ObjectLiteral,
-    ObjectMember, ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier, PropertyName,
+    ImportSpecifierMode, JsxAttributeInitializer, JsxAttributeItem, JsxChild, JsxElementName,
+    LabeledStatement, Literal, LogicalExpression, LogicalOperator, MemberExpression,
+    MemberProperty, MetaProperty, ModuleExportName, NamespaceDeclaration, NamespaceName,
+    NewExpression, NodeId, NodeKind, NumericLiteralNode, ObjectLiteral, ObjectMember,
+    ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier, PropertyName,
     RegexLiteralNode, SourceFile, Statement, Stmt, StringLiteralNode, SwitchStatement,
     TemplateElementNode, TemplateLiteral, TokenKind, UnaryOperator, UpdateExpression,
     UpdateOperator, VariableDeclaration, VariableKind, WhileStatement, WithStatement,
@@ -37,7 +38,7 @@ use bamts_bytecode::{
     UnaryOp, Verified, VerifyError,
 };
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 fn zero_range() -> TextRange {
@@ -49,6 +50,10 @@ fn zero_range() -> TextRange {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LowerOptions {
     pub javascript_compatibility: bool,
+    /// The host runs the entry file as an ECMAScript Script, so its top-level
+    /// `var` and function names live on the global object. Nothing in a file
+    /// can say this: Node runs the same bytes as a CommonJS module.
+    pub script_entry: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LoweringGoal {
@@ -356,6 +361,9 @@ fn assemble_with_linkage_strings(
     } else {
         None
     };
+    if options.script_entry {
+        context.instantiate_script(&mut builder, file.statements())?;
+    }
     context.lower_top_level(&mut builder, file.statements())?;
     match completion {
         Some(value) => context.emit(file.range(), Instruction::Return { value })?,
@@ -369,6 +377,30 @@ fn assemble_with_linkage_strings(
         .map(|slot| slot.expect("every reserved function slot is filled before assembly"))
         .collect();
     Ok(Module::new(builder.constants, functions, entry))
+}
+/// Whether binding `parameters` can neither run code nor throw.
+fn has_simple_parameters(parameters: &[ParameterNode]) -> bool {
+    parameters.iter().all(|parameter| {
+        parameter.data().initializer.is_none()
+            && matches!(
+                parameter.data().binding.data(),
+                BindingPattern::Identifier(_)
+            )
+    })
+}
+fn strip_parentheses(expression: &Expr) -> &Expr {
+    match expression.data() {
+        Expression::Parenthesized(inner) => strip_parentheses(inner),
+        _ => expression,
+    }
+}
+/// Whether code at the top of `file` is strict.
+fn source_is_strict(file: &SourceFile) -> bool {
+    !matches!(
+        file.script_kind(),
+        ScriptKind::JavaScript | ScriptKind::JavaScriptReact
+    ) || crate::early_errors::is_module(file)
+        || crate::early_errors::has_use_strict(file, file.statements())
 }
 fn validate_script_kind(file: &SourceFile, options: LowerOptions) -> Result<(), LowerError> {
     let kind = match file.script_kind() {
@@ -455,6 +487,67 @@ enum BindingIdentity {
 struct CapturePlan {
     captured: HashSet<BindingIdentity>,
     runtime_cells: HashSet<BindingIdentity>,
+}
+/// The names a file reads as values at any depth, which is what keeps an import.
+/// `export default x` and `export = x` are left to the caller: unlike a read, they
+/// are legal for a type, so the name alone does not make it a value.
+pub(crate) fn value_read_names(
+    file: &SourceFile,
+    enum_facts: Option<&'_ crate::enum_plan::EnumFacts>,
+) -> BTreeSet<String> {
+    let mut scanner = FreeVarScanner::new(file, None);
+    scanner.scans_jsx = true;
+    scanner.inlined_enums = enum_facts;
+    for statement in file.statements() {
+        let exports_a_name = match statement.data() {
+            Statement::Export(ExportDeclaration::Default(default)) => matches!(
+                &default.value,
+                ExportDefaultValue::Expression(value)
+                    if matches!(value.data(), Expression::Identifier(_))
+            ),
+            Statement::Export(ExportDeclaration::Assignment(value)) => {
+                matches!(value.data(), Expression::Identifier(_))
+            }
+            _ => false,
+        };
+        if !exports_a_name {
+            scanner.scan_statement(statement);
+        }
+    }
+    scanner.reads
+}
+/// A `this` parameter types the receiver and takes no argument.
+fn runtime_parameters<'p>(
+    file: &SourceFile,
+    parameters: &'p [ParameterNode],
+) -> &'p [ParameterNode] {
+    match parameters
+        .first()
+        .map(|parameter| parameter.data().binding.data())
+    {
+        Some(BindingPattern::Identifier(identifier))
+            if identifier_name(file, identifier).as_deref() == Some("this") =>
+        {
+            &parameters[1..]
+        }
+        _ => parameters,
+    }
+}
+fn scan_constructor(
+    scanner: &mut FreeVarScanner<'_>,
+    parameters: &[ParameterNode],
+    body: Option<&Block>,
+) {
+    scanner.preseed_parameters(parameters);
+    if let Some(block) = body {
+        scanner.preseed_vars(&block.statements);
+    }
+    scanner.scan_parameter_initializers(parameters);
+    if let Some(block) = body {
+        for statement in &block.statements {
+            scanner.scan_statement(statement);
+        }
+    }
 }
 fn scan_instance_init_free_vars(scanner: &mut FreeVarScanner<'_>, instance_steps: &[InstanceInit]) {
     for step in instance_steps {
@@ -551,6 +644,23 @@ struct WithBase {
     found: Register,
     key: Register,
 }
+/// What a member reference reads and writes through.
+#[derive(Clone, Copy)]
+enum MemberBase {
+    Object(Register),
+    Super { home: Register, receiver: Register },
+}
+
+impl MemberBase {
+    /// The `this` of a call through this reference.
+    const fn this_value(self) -> Register {
+        match self {
+            Self::Object(object) => object,
+            Self::Super { receiver, .. } => receiver,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum CaptureKey {
     /// Free outer binding plus the live `with` sites that still precede it at
@@ -565,9 +675,32 @@ enum CaptureKey {
     NewTarget,
     Parent(Register),
     ClassElements(Register),
+    /// The object a method was defined on, which `super` starts above.
+    Home(Register),
+    /// The cell recording that a derived constructor's `super(...)` has run.
+    SuperGuard(Register),
+    /// A name only field initializers read. They see the class's scope, so it
+    /// stays out of the constructor's own.
+    FieldName {
+        name: String,
+        sites: Vec<BindingSite>,
+        cell: Register,
+    },
     Cell(Register),
     Container(crate::checker::SymbolId, ContainerKind, Register),
     WithObject(BindingSite, Register),
+}
+/// The names a function resolves through, set aside while initializers lower.
+struct NameView {
+    scopes: Vec<HashMap<String, Binding>>,
+    captured_names: HashMap<String, Vec<BindingSite>>,
+}
+/// Whether `super(...)` has run. An arrow can reach `super` from outside the
+/// constructor's registers, so a constructor with such an arrow keeps a cell.
+#[derive(Clone, Copy)]
+enum SuperGuard {
+    Register(Register),
+    Cell(Register),
 }
 #[derive(Clone, Copy)]
 enum ArgumentsSource {
@@ -723,6 +856,8 @@ enum StaticInit {
         key: Register,
         init_chain: Register,
         extra_inits: Register,
+        /// Fields of an undecorated class define; decorated ones still assign.
+        defines: bool,
     },
     AutoAccessor {
         initializer: Option<Box<Expr>>,
@@ -780,12 +915,26 @@ struct FunctionContext<'a> {
     completion_depth: usize,
     this_capture: Option<Register>,
     this_cell: Option<Register>,
-    derived_super_guard: Option<Register>,
+    derived_super_guard: Option<SuperGuard>,
+    /// A derived constructor's `return` checks its value. An arrow that captured
+    /// the same state returns normally.
+    derived_constructor: bool,
+    /// The outer names field initializers read, by captured cell and the
+    /// `with` sites that precede each one.
+    field_scope: BTreeMap<String, (Register, Vec<BindingSite>)>,
     instance_steps: Vec<InstanceInit>,
     new_target_capture: Option<Register>,
     parent_constructor_capture: Option<Register>,
     class_elements: Option<Register>,
+    /// The home object in this function, for `super` member references.
+    home_object: Option<Register>,
+    /// The home object of the method about to be built from this context.
+    method_home: Option<Register>,
     arguments_source: ArgumentsSource,
+    /// Whether this code is strict. Everything but a JavaScript script is.
+    strict: bool,
+    /// The name an anonymous class about to be lowered takes from its context.
+    inferred_class_name: Option<String>,
 }
 impl<'a> FunctionContext<'a> {
     fn new_top_level(
@@ -827,11 +976,17 @@ impl<'a> FunctionContext<'a> {
             this_capture: None,
             this_cell: None,
             derived_super_guard: None,
+            derived_constructor: false,
+            field_scope: BTreeMap::new(),
             instance_steps: Vec::new(),
             new_target_capture: None,
             parent_constructor_capture: None,
             class_elements: None,
+            home_object: None,
+            method_home: None,
             arguments_source: ArgumentsSource::None,
+            strict: source_is_strict(file),
+            inferred_class_name: None,
         }
     }
     /// Whether `await`, `await using`, or async disposal awaits are legal here.
@@ -840,12 +995,13 @@ impl<'a> FunctionContext<'a> {
         self.is_async || (self.top_level && self.goal != LoweringGoal::ClassicScript)
     }
     fn into_function(self, name: Option<ConstantId>, flags: FunctionFlags) -> Function {
+        let is_sloppy = !self.strict;
         Function::new(
             name,
             self.capture_count,
             self.parameter_count,
             self.registers,
-            flags,
+            FunctionFlags { is_sloppy, ..flags },
             self.code,
             self.handlers,
         )
@@ -1522,6 +1678,12 @@ impl<'a> FunctionContext<'a> {
             };
         }
         let id = builder.intern(Constant::String(EcmaString::encode(name)), range)?;
+        if self.strict {
+            // Strict code cannot create a global by assigning to it. The value
+            // is already computed here, which is when the specification checks.
+            let dst = self.alloc_register(range)?;
+            self.emit(range, Instruction::LoadGlobal { dst, name: id })?;
+        }
         self.emit(range, Instruction::StoreGlobal { name: id, value })?;
         Ok(())
     }
@@ -1585,6 +1747,65 @@ impl<'a> FunctionContext<'a> {
             ArgumentsSource::Captured(register) => Ok(Some(register)),
             ArgumentsSource::None => Ok(None),
         }
+    }
+    /// The part of `GlobalDeclarationInstantiation` lowering must spell out:
+    /// each `var` name exists before the Script runs, and declaring one never
+    /// disturbs a global that already has it.
+    fn instantiate_script(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        statements: &[Stmt],
+    ) -> Result<(), LowerError> {
+        let range = self.file.range();
+        if self.strict {
+            // `this` is the global object at the top of a Script, even a strict
+            // one. No code has run yet that could have replaced `globalThis`.
+            let name = builder.intern(Constant::String(EcmaString::encode("globalThis")), range)?;
+            let dst = self.alloc_register(range)?;
+            self.emit(range, Instruction::LoadGlobal { dst, name })?;
+            self.this_capture = Some(dst);
+        }
+        let mut names = Vec::new();
+        collect_var_names(self.file, statements, &mut names);
+        names.sort_unstable();
+        names.dedup();
+        names.retain(|name| name != "undefined");
+        if names.is_empty() {
+            return Ok(());
+        }
+        let undefined_type = self.string_reg(builder, EcmaString::encode("undefined"), range)?;
+        let value = self.undefined(builder, range)?;
+        for name in names {
+            let id = builder.intern(Constant::String(EcmaString::encode(&name)), range)?;
+            let declared = self.alloc_register(range)?;
+            self.emit(
+                range,
+                Instruction::TypeOfGlobal {
+                    dst: declared,
+                    name: id,
+                },
+            )?;
+            let absent = self.alloc_register(range)?;
+            self.emit(
+                range,
+                Instruction::Binary {
+                    dst: absent,
+                    op: BinaryOp::StrictEqual,
+                    left: declared,
+                    right: undefined_type,
+                },
+            )?;
+            let skip = self.emit(
+                range,
+                Instruction::JumpIfFalse {
+                    condition: absent,
+                    target: Pc::new(0),
+                },
+            )?;
+            self.emit(range, Instruction::StoreGlobal { name: id, value })?;
+            self.patch_jump(skip, self.next_pc());
+        }
+        Ok(())
     }
     fn lower_top_level(
         &mut self,
@@ -2463,7 +2684,20 @@ impl<'a> FunctionContext<'a> {
                     declaration_scope,
                 )
             }
-            ForBinding::Target(target) => self.assign_target(builder, target, value),
+            ForBinding::Target(target) => {
+                if let AssignmentTarget::Invalid(operand) = target.data()
+                    && let Some(call) = call_target(operand)
+                {
+                    self.lower_call_target(
+                        builder,
+                        target.range(),
+                        call,
+                        "Invalid left-hand side in for-loop",
+                    )?;
+                    return Ok(());
+                }
+                self.assign_target(builder, target, value)
+            }
         }
     }
     fn lower_break(
@@ -2969,8 +3203,16 @@ impl<'a> FunctionContext<'a> {
             let range = declarator.range();
             let data = declarator.data();
             self.predeclare_captured_pattern(&data.binding, declaration_scope)?;
+            // `var x;` only declares, and hoisting has done that. The name keeps
+            // whatever it holds, which may be a global of the same name.
+            if declaration.kind == VariableKind::Var && data.initializer.is_none() {
+                continue;
+            }
             let value = match &data.initializer {
-                Some(initializer) => self.lower_expression(builder, initializer)?,
+                Some(initializer) => {
+                    let name = self.binding_name(&data.binding)?;
+                    self.lower_maybe_named(builder, initializer, name.as_deref())?
+                }
                 None => {
                     // A bare declaration (`let x;`) binds undefined.
                     self.undefined(builder, range)?
@@ -3610,6 +3852,77 @@ impl<'a> FunctionContext<'a> {
     // ------------------------------------------------------------------
     // Expressions
     // ------------------------------------------------------------------
+    /// `NamedEvaluation`: an anonymous function or class directly initializing
+    /// a name takes that name. Parentheses do not matter; a comma does, because
+    /// then the value is no longer a function definition.
+    fn lower_named_expression(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        expression: &Expr,
+        name: &str,
+    ) -> Result<Register, LowerError> {
+        let range = expression.range();
+        match strip_parentheses(expression).data() {
+            Expression::Function(function) if function.function.name.is_none() => self
+                .build_constructible_function_value(
+                    builder,
+                    range,
+                    Some(name.to_owned()),
+                    &function.function,
+                ),
+            Expression::Arrow(arrow) => {
+                self.lower_arrow_named(builder, range, arrow, Some(name.to_owned()))
+            }
+            Expression::Class(class) if class.class.name.is_none() => {
+                self.inferred_class_name = Some(name.to_owned());
+                self.lower_class_value(builder, range, &class.class, None, None)
+            }
+            _ => self.lower_expression(builder, expression),
+        }
+    }
+    /// Lowers `value`, naming it after `name` when one applies.
+    fn lower_maybe_named(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        value: &Expr,
+        name: Option<&str>,
+    ) -> Result<Register, LowerError> {
+        match name {
+            Some(name) => self.lower_named_expression(builder, value, name),
+            None => self.lower_expression(builder, value),
+        }
+    }
+    /// The name a binding gives its initializer, when it is a plain identifier.
+    fn binding_name(&self, pattern: &Pattern) -> Result<Option<String>, LowerError> {
+        match pattern.data() {
+            BindingPattern::Identifier(identifier) => self.identifier_text(identifier).map(Some),
+            _ => Ok(None),
+        }
+    }
+    /// The name an assignment target gives its value. `(x) = f` names nothing:
+    /// the target must be the bare identifier.
+    fn target_name(&self, target: &AssignmentTargetNode) -> Result<Option<String>, LowerError> {
+        match target.data() {
+            AssignmentTarget::Identifier(identifier)
+                if !crate::early_errors::is_parenthesized(self.file, target.range()) =>
+            {
+                self.identifier_text(identifier).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+    /// The name a property key gives a value, when it is known here.
+    fn property_name_text(&self, name: &PropertyName) -> Result<Option<String>, LowerError> {
+        match name {
+            PropertyName::Identifier(identifier) => self.identifier_text(identifier).map(Some),
+            PropertyName::String(literal) => Ok(self
+                .file
+                .token_text(literal.data().token())
+                .map(|text| text.trim_matches(['\'', '"']).to_owned())),
+            PropertyName::Private(private) => self.private_text(private).map(Some),
+            _ => Ok(None),
+        }
+    }
     fn lower_expression(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -3680,7 +3993,13 @@ impl<'a> FunctionContext<'a> {
             Expression::Array(array) => self.lower_array(builder, range, array),
             Expression::Object(object) => self.lower_object(builder, range, object),
             Expression::Function(function) => {
-                self.build_constructible_function_value(builder, range, None, &function.function)
+                let name = function
+                    .function
+                    .name
+                    .as_ref()
+                    .map(|identifier| self.identifier_text(identifier))
+                    .transpose()?;
+                self.build_constructible_function_value(builder, range, name, &function.function)
             }
             Expression::Class(class) => {
                 let name = class
@@ -3886,6 +4205,11 @@ impl<'a> FunctionContext<'a> {
             Expression::Member(member) => {
                 if Self::has_optional_chain(argument) {
                     return self.lower_optional_delete(builder, range, member);
+                }
+                if matches!(member.object.data(), Expression::Super) {
+                    self.this_value(builder, range)?;
+                    self.member_key(builder, &member.property)?;
+                    return self.throw_reference_error(builder, range);
                 }
                 let object = self.lower_expression(builder, &member.object)?;
                 let key = self.member_key(builder, &member.property)?;
@@ -4113,10 +4437,37 @@ impl<'a> FunctionContext<'a> {
             AssignmentTarget::Missing(missing) => {
                 Err(self.missing(assignment.left.range(), missing.expected()))
             }
-            AssignmentTarget::Invalid(_) => {
-                Err(self.missing(assignment.left.range(), NodeKind::AssignmentExpression))
+            AssignmentTarget::Invalid(operand) => {
+                let logical = matches!(
+                    compound_operator(assignment.operator),
+                    Some(CompoundOp::Logical(_))
+                );
+                match call_target(operand).filter(|_| !logical) {
+                    Some(call) => self.lower_call_target(
+                        builder,
+                        assignment.left.range(),
+                        call,
+                        "Invalid left-hand side in assignment",
+                    ),
+                    None => {
+                        Err(self.missing(assignment.left.range(), NodeKind::AssignmentExpression))
+                    }
+                }
             }
         }
+    }
+    /// A call parses as a target, for the sake of old code, and fails only when it runs:
+    /// V8 evaluates the call, then throws, and never evaluates the other side.
+    fn lower_call_target(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        call: &Expr,
+        message: &str,
+    ) -> Result<Register, LowerError> {
+        self.lower_expression(builder, call)?;
+        self.throw_error_message(builder, range, "ReferenceError", Some(message))?;
+        self.undefined(builder, range)
     }
     fn lower_identifier_assignment(
         &mut self,
@@ -4130,7 +4481,9 @@ impl<'a> FunctionContext<'a> {
         // assign_name so each performs a fresh membership walk.
         match compound_operator(assignment.operator) {
             None => {
-                let value = self.lower_expression(builder, &assignment.right)?;
+                let inferred = self.target_name(&assignment.left)?;
+                let value =
+                    self.lower_maybe_named(builder, &assignment.right, inferred.as_deref())?;
                 self.assign_name(builder, name, value, range)?;
                 Ok(value)
             }
@@ -4155,7 +4508,9 @@ impl<'a> FunctionContext<'a> {
                 let current = self.read_name(builder, name, range)?;
                 self.move_to(range, result, current)?;
                 let skip = self.branch_on_short_circuit(builder, range, op, current)?;
-                let value = self.lower_expression(builder, &assignment.right)?;
+                let inferred = self.target_name(&assignment.left)?;
+                let value =
+                    self.lower_maybe_named(builder, &assignment.right, inferred.as_deref())?;
                 self.assign_name(builder, name, value, range)?;
                 self.move_to(range, result, value)?;
                 let end = self.next_pc();
@@ -4171,24 +4526,21 @@ impl<'a> FunctionContext<'a> {
         member: &AssignmentMemberTarget,
         assignment: &AssignmentExpression,
     ) -> Result<Register, LowerError> {
-        let object = self.lower_expression(builder, &member.object)?;
-        let key = self.member_key(builder, &member.property)?;
-        match compound_operator(assignment.operator) {
+        let base = self.member_base(builder, range, &member.object)?;
+        let compound = compound_operator(assignment.operator);
+        let key = if compound.is_some() {
+            self.read_write_key(builder, range, base, &member.property)?
+        } else {
+            self.member_key(builder, &member.property)?
+        };
+        match compound {
             None => {
                 let value = self.lower_expression(builder, &assignment.right)?;
-                self.emit(range, Instruction::SetProperty { object, key, value })?;
+                self.set_member(range, base, key, value)?;
                 Ok(value)
             }
             Some(CompoundOp::Arithmetic(op)) => {
-                let current = self.alloc_register(range)?;
-                self.emit(
-                    range,
-                    Instruction::GetProperty {
-                        dst: current,
-                        object,
-                        key,
-                    },
-                )?;
+                let current = self.get_member(range, base, key)?;
                 let right = self.lower_expression(builder, &assignment.right)?;
                 let result = self.alloc_register(range)?;
                 self.emit(
@@ -4200,31 +4552,16 @@ impl<'a> FunctionContext<'a> {
                         right,
                     },
                 )?;
-                self.emit(
-                    range,
-                    Instruction::SetProperty {
-                        object,
-                        key,
-                        value: result,
-                    },
-                )?;
+                self.set_member(range, base, key, result)?;
                 Ok(result)
             }
             Some(CompoundOp::Logical(op)) => {
                 let result = self.alloc_register(range)?;
-                let current = self.alloc_register(range)?;
-                self.emit(
-                    range,
-                    Instruction::GetProperty {
-                        dst: current,
-                        object,
-                        key,
-                    },
-                )?;
+                let current = self.get_member(range, base, key)?;
                 self.move_to(range, result, current)?;
                 let skip = self.branch_on_short_circuit(builder, range, op, current)?;
                 let value = self.lower_expression(builder, &assignment.right)?;
-                self.emit(range, Instruction::SetProperty { object, key, value })?;
+                self.set_member(range, base, key, value)?;
                 self.move_to(range, result, value)?;
                 let end = self.next_pc();
                 self.patch_jump(skip, end);
@@ -4268,17 +4605,9 @@ impl<'a> FunctionContext<'a> {
                 if self.is_const_enum_member_target(&update.argument, &member.object)? {
                     return Err(self.const_enum_operation(range, ConstEnumOperation::Write));
                 }
-                let object = self.lower_expression(builder, &member.object)?;
-                let key = self.member_key(builder, &member.property)?;
-                let old = self.alloc_register(range)?;
-                self.emit(
-                    range,
-                    Instruction::GetProperty {
-                        dst: old,
-                        object,
-                        key,
-                    },
-                )?;
+                let base = self.member_base(builder, range, &member.object)?;
+                let key = self.read_write_key(builder, range, base, &member.property)?;
+                let old = self.get_member(range, base, key)?;
                 let one = self.load_constant(builder, Constant::Int32(1), range)?;
                 let updated = self.alloc_register(range)?;
                 self.emit(
@@ -4290,14 +4619,7 @@ impl<'a> FunctionContext<'a> {
                         right: one,
                     },
                 )?;
-                self.emit(
-                    range,
-                    Instruction::SetProperty {
-                        object,
-                        key,
-                        value: updated,
-                    },
-                )?;
+                self.set_member(range, base, key, updated)?;
                 Ok(if update.prefix { updated } else { old })
             }
             AssignmentTarget::Object(_) | AssignmentTarget::Array(_) => {
@@ -4306,9 +4628,19 @@ impl<'a> FunctionContext<'a> {
             AssignmentTarget::Missing(missing) => {
                 Err(self.missing(update.argument.range(), missing.expected()))
             }
-            AssignmentTarget::Invalid(_) => {
-                Err(self.missing(update.argument.range(), NodeKind::UpdateExpression))
-            }
+            AssignmentTarget::Invalid(operand) => match call_target(operand) {
+                Some(call) => self.lower_call_target(
+                    builder,
+                    update.argument.range(),
+                    call,
+                    if update.prefix {
+                        "Invalid left-hand side expression in prefix operation"
+                    } else {
+                        "Invalid left-hand side expression in postfix operation"
+                    },
+                ),
+                None => Err(self.missing(update.argument.range(), NodeKind::UpdateExpression)),
+            },
         }
     }
     /// `await x` suspends on `x` ([`Instruction::Await`], distinct from the
@@ -4788,11 +5120,169 @@ impl<'a> FunctionContext<'a> {
             };
             return Err(self.const_enum_operation(range, operation));
         }
-        let object = self.lower_expression(builder, &member.object)?;
+        let base = self.member_base(builder, range, &member.object)?;
         let key = self.member_key(builder, &member.property)?;
+        let dst = self.get_member(range, base, key)?;
+        Ok((base.this_value(), dst))
+    }
+    /// The base of a member reference. `super` reads from above the home
+    /// object, with the current `this` as the receiver.
+    fn member_base(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        object: &Expr,
+    ) -> Result<MemberBase, LowerError> {
+        if let (Expression::Super, Some(home)) = (object.data(), self.home_object) {
+            let receiver = self.this_value(builder, range)?;
+            return Ok(MemberBase::Super { home, receiver });
+        }
+        Ok(MemberBase::Object(self.lower_expression(builder, object)?))
+    }
+    /// A class constructor runs only through `new`.
+    fn reject_plain_call(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+    ) -> Result<(), LowerError> {
+        let new_target = self.new_target_value(range)?;
+        let undefined = self.undefined(builder, range)?;
+        let called = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::Binary {
+                dst: called,
+                op: BinaryOp::StrictEqual,
+                left: new_target,
+                right: undefined,
+            },
+        )?;
+        let constructed = self.emit(
+            range,
+            Instruction::JumpIfFalse {
+                condition: called,
+                target: Pc::new(0),
+            },
+        )?;
+        self.throw_error(builder, range, "TypeError")?;
+        self.patch_jump(constructed, self.next_pc());
+        Ok(())
+    }
+    /// Throws a `ReferenceError`, which is what deleting through `super` does.
+    fn throw_reference_error(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+    ) -> Result<Register, LowerError> {
+        self.throw_error(builder, range, "ReferenceError")?;
+        self.undefined(builder, range)
+    }
+    fn throw_error(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        kind: &str,
+    ) -> Result<(), LowerError> {
+        self.throw_error_message(builder, range, kind, None)
+    }
+    fn throw_error_message(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        kind: &str,
+        message: Option<&str>,
+    ) -> Result<(), LowerError> {
+        let name = builder.intern(Constant::String(EcmaString::encode(kind)), range)?;
+        let callee = self.alloc_register(range)?;
+        self.emit(range, Instruction::LoadGlobal { dst: callee, name })?;
+        let arguments = self.alloc_register(range)?;
+        self.emit(range, Instruction::CreateArray { dst: arguments })?;
+        if let Some(message) = message {
+            let value = self.string_reg(builder, EcmaString::encode(message), range)?;
+            self.emit(
+                range,
+                Instruction::ArrayPush {
+                    array: arguments,
+                    value,
+                },
+            )?;
+        }
+        let value = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::Construct {
+                dst: value,
+                callee,
+                arguments,
+            },
+        )?;
+        self.emit(range, Instruction::Throw { value })?;
+        Ok(())
+    }
+    /// The key of a reference that is read and then written, converted now so
+    /// user conversion runs once. A reference through nothing still fails first.
+    fn read_write_key(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        base: MemberBase,
+        property: &MemberProperty,
+    ) -> Result<Register, LowerError> {
+        let operand = self.member_key(builder, property)?;
+        if !matches!(property, MemberProperty::Computed(_)) {
+            return Ok(operand);
+        }
+        if let MemberBase::Object(object) = base {
+            self.require_object_coercible(range, object)?;
+        }
         let dst = self.alloc_register(range)?;
-        self.emit(range, Instruction::GetProperty { dst, object, key })?;
-        Ok((object, dst))
+        self.emit(
+            range,
+            Instruction::Unary {
+                dst,
+                op: UnaryOp::ToPropertyKey,
+                operand,
+            },
+        )?;
+        Ok(dst)
+    }
+    fn get_member(
+        &mut self,
+        range: TextRange,
+        base: MemberBase,
+        key: Register,
+    ) -> Result<Register, LowerError> {
+        let dst = self.alloc_register(range)?;
+        let instruction = match base {
+            MemberBase::Object(object) => Instruction::GetProperty { dst, object, key },
+            MemberBase::Super { home, receiver } => Instruction::GetSuper {
+                dst,
+                home,
+                receiver,
+                key,
+            },
+        };
+        self.emit(range, instruction)?;
+        Ok(dst)
+    }
+    fn set_member(
+        &mut self,
+        range: TextRange,
+        base: MemberBase,
+        key: Register,
+        value: Register,
+    ) -> Result<(), LowerError> {
+        let instruction = match base {
+            MemberBase::Object(object) => Instruction::SetProperty { object, key, value },
+            MemberBase::Super { home, receiver } => Instruction::SetSuper {
+                home,
+                receiver,
+                key,
+                value,
+            },
+        };
+        self.emit(range, instruction)?;
+        Ok(())
     }
     fn has_optional_chain(mut expression: &Expr) -> bool {
         loop {
@@ -4952,17 +5442,15 @@ impl<'a> FunctionContext<'a> {
             Expression::Member(member) if !member.optional => {
                 if matches!(member.object.data(), Expression::Super) {
                     let this_value = self.this_value(builder, range)?;
-                    let object = this_value;
-                    let key = self.member_key(builder, &member.property)?;
-                    let value = self.alloc_register(range)?;
-                    self.emit(
-                        range,
-                        Instruction::GetProperty {
-                            dst: value,
-                            object,
-                            key,
+                    let base = match self.home_object {
+                        Some(home) => MemberBase::Super {
+                            home,
+                            receiver: this_value,
                         },
-                    )?;
+                        None => MemberBase::Object(this_value),
+                    };
+                    let key = self.member_key(builder, &member.property)?;
+                    let value = self.get_member(range, base, key)?;
                     return Ok((value, this_value));
                 }
                 let (object, value) = self.lower_member(builder, callee.range(), callee)?;
@@ -5173,22 +5661,52 @@ impl<'a> FunctionContext<'a> {
                         },
                     )?;
                 }
-                ArrayElement::Elision => {
-                    let hole = self.undefined(builder, range)?;
-                    self.emit(
-                        range,
-                        Instruction::ArrayPush {
-                            array: dst,
-                            value: hole,
-                        },
-                    )?;
-                }
+                ArrayElement::Elision => self.extend_array_length(builder, range, dst)?,
                 ArrayElement::Missing(missing) => {
                     return Err(self.missing(range, missing.expected()));
                 }
             }
         }
         Ok(dst)
+    }
+    /// An elision has no element, so it only makes the array one longer. That
+    /// leaves a hole, which an element holding `undefined` would not be.
+    fn extend_array_length(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        array: Register,
+    ) -> Result<(), LowerError> {
+        let key = self.string_reg(builder, EcmaString::from("length"), range)?;
+        let length = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::GetProperty {
+                dst: length,
+                object: array,
+                key,
+            },
+        )?;
+        let one = self.load_constant(builder, Constant::Int32(1), range)?;
+        let value = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::Binary {
+                dst: value,
+                op: BinaryOp::Add,
+                left: length,
+                right: one,
+            },
+        )?;
+        self.emit(
+            range,
+            Instruction::SetProperty {
+                object: array,
+                key,
+                value,
+            },
+        )?;
+        Ok(())
     }
     fn lower_object(
         &mut self,
@@ -5201,8 +5719,21 @@ impl<'a> FunctionContext<'a> {
         for member in &object.members {
             match member.data() {
                 ObjectMember::Property(property) => {
-                    let key = self.property_key(builder, &property.name)?;
-                    let value = self.lower_expression(builder, &property.value)?;
+                    let key = self.converted_property_key(builder, range, &property.name)?;
+                    let name = self.property_name_text(&property.name)?;
+                    let value =
+                        self.lower_maybe_named(builder, &property.value, name.as_deref())?;
+                    if sets_prototype(property, name.as_deref()) {
+                        self.emit(
+                            member.range(),
+                            Instruction::SetProperty {
+                                object: dst,
+                                key,
+                                value,
+                            },
+                        )?;
+                        continue;
+                    }
                     self.install_property(
                         builder,
                         member.range(),
@@ -5213,9 +5744,12 @@ impl<'a> FunctionContext<'a> {
                     )?;
                 }
                 ObjectMember::Method(method) => {
-                    let key = self.property_key(builder, &method.name)?;
+                    let key = self.converted_property_key(builder, range, &method.name)?;
+                    self.method_home = Some(dst);
                     let value =
-                        self.build_function_value(builder, member.range(), None, &method.function)?;
+                        self.build_function_value(builder, member.range(), None, &method.function);
+                    self.method_home = None;
+                    let value = value?;
                     self.install_property(
                         builder,
                         member.range(),
@@ -5242,6 +5776,28 @@ impl<'a> FunctionContext<'a> {
         }
         Ok(dst)
     }
+    /// A literal's key, converted before its value runs.
+    fn converted_property_key(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        name: &PropertyName,
+    ) -> Result<Register, LowerError> {
+        let operand = self.property_key(builder, name)?;
+        if !matches!(name, PropertyName::Computed(_)) {
+            return Ok(operand);
+        }
+        let dst = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::Unary {
+                dst,
+                op: UnaryOp::ToPropertyKey,
+                operand,
+            },
+        )?;
+        Ok(dst)
+    }
     fn install_property(
         &mut self,
         _builder: &mut ModuleBuilder,
@@ -5253,7 +5809,15 @@ impl<'a> FunctionContext<'a> {
     ) -> Result<(), LowerError> {
         match modifier {
             PropertyModifier::None => {
-                self.emit(range, Instruction::SetProperty { object, key, value })?;
+                self.emit(
+                    range,
+                    Instruction::DefineOwnDescriptorSlot {
+                        object,
+                        key,
+                        src: value,
+                        slot: DescriptorSlot::Entire,
+                    },
+                )?;
             }
             PropertyModifier::Get => {
                 self.emit(
@@ -5278,6 +5842,37 @@ impl<'a> FunctionContext<'a> {
                 )?;
             }
         }
+        Ok(())
+    }
+    /// Installs a method or accessor on a class, where neither is enumerable.
+    fn install_class_method(
+        &mut self,
+        range: TextRange,
+        object: Register,
+        key: Register,
+        value: Register,
+        modifier: PropertyModifier,
+    ) -> Result<(), LowerError> {
+        let kind = match modifier {
+            PropertyModifier::None => {
+                self.emit(
+                    range,
+                    Instruction::DefineDataProperty { object, key, value },
+                )?;
+                return Ok(());
+            }
+            PropertyModifier::Get => AccessorKind::ClassGetter,
+            PropertyModifier::Set => AccessorKind::ClassSetter,
+        };
+        self.emit(
+            range,
+            Instruction::DefineAccessor {
+                object,
+                key,
+                accessor: value,
+                kind,
+            },
+        )?;
         Ok(())
     }
     fn set_named_entry(
@@ -5694,6 +6289,17 @@ impl<'a> FunctionContext<'a> {
         let mut acc = self.string_reg(builder, first, range)?;
         for (index, expression) in template.expressions.iter().enumerate() {
             let value = self.lower_expression(builder, expression)?;
+            // `ToString`, not the `+` operator's `ToPrimitive`: `valueOf` has no
+            // say here, and a Symbol must throw.
+            let text = self.alloc_register(range)?;
+            self.emit(
+                range,
+                Instruction::Unary {
+                    dst: text,
+                    op: UnaryOp::ToString,
+                    operand: value,
+                },
+            )?;
             let joined = self.alloc_register(range)?;
             self.emit(
                 range,
@@ -5701,7 +6307,7 @@ impl<'a> FunctionContext<'a> {
                     dst: joined,
                     op: BinaryOp::Add,
                     left: acc,
-                    right: value,
+                    right: text,
                 },
             )?;
             acc = joined;
@@ -5732,8 +6338,12 @@ impl<'a> FunctionContext<'a> {
         let raw = self.raw_template_parts(&tagged.template)?;
         let strings = self.alloc_register(range)?;
         self.emit(range, Instruction::CreateArray { dst: strings })?;
-        for part in &cooked {
-            let value = self.string_reg(builder, part.clone(), range)?;
+        for (part, element) in cooked.iter().zip(&tagged.template.elements) {
+            let value = if self.template_element_is_cooked(element) {
+                self.string_reg(builder, part.clone(), range)?
+            } else {
+                self.undefined(builder, range)?
+            };
             self.emit(
                 range,
                 Instruction::ArrayPush {
@@ -5813,6 +6423,12 @@ impl<'a> FunctionContext<'a> {
             .iter()
             .map(|element| self.template_element_text(element, false))
             .collect()
+    }
+    fn template_element_is_cooked(&self, element: &TemplateElementNode) -> bool {
+        let token = element.data().token();
+        self.file
+            .token_text(token)
+            .is_none_or(|text| has_cooked_value(trim_template_delimiters(text, token.kind())))
     }
     fn template_element_text(
         &self,
@@ -6381,6 +6997,7 @@ impl<'a> FunctionContext<'a> {
                 )
             }
             BindingPattern::Object(object) => {
+                self.require_object_coercible(range, value)?;
                 let mut taken: Vec<Register> = Vec::new();
                 for property in &object.properties {
                     if let BindingPattern::Rest(rest) = property.binding.data() {
@@ -6388,7 +7005,7 @@ impl<'a> FunctionContext<'a> {
                         self.bind_pattern(builder, &rest.argument, rest_value, declaration_scope)?;
                         continue;
                     }
-                    let key = self.property_key(builder, &property.name)?;
+                    let key = self.converted_property_key(builder, range, &property.name)?;
                     taken.push(key);
                     let element = self.alloc_register(range)?;
                     self.emit(
@@ -6400,7 +7017,10 @@ impl<'a> FunctionContext<'a> {
                         },
                     )?;
                     let element = match &property.initializer {
-                        Some(default) => self.apply_default(builder, range, element, default)?,
+                        Some(default) => {
+                            let name = self.binding_name(&property.binding)?;
+                            self.apply_default(builder, range, element, default, name.as_deref())?
+                        }
                         None => element,
                     };
                     self.bind_pattern(builder, &property.binding, element, declaration_scope)?;
@@ -6436,12 +7056,23 @@ impl<'a> FunctionContext<'a> {
                                 let value = self.iterator_step_value(builder, range, iterator)?;
                                 let value = match default {
                                     Some(default) => {
-                                        self.apply_default(builder, range, value, default)?
+                                        let name = self.binding_name(element_value)?;
+                                        self.apply_default(
+                                            builder,
+                                            range,
+                                            value,
+                                            default,
+                                            name.as_deref(),
+                                        )?
                                     }
                                     None => value,
                                 };
-                                let _ = element_value;
-                                self.bind_pattern(builder, inner, value, declaration_scope)?;
+                                self.bind_pattern(
+                                    builder,
+                                    element_value,
+                                    value,
+                                    declaration_scope,
+                                )?;
                             }
                         }
                         ArrayBindingElement::Missing(missing) => {
@@ -6452,7 +7083,9 @@ impl<'a> FunctionContext<'a> {
                 Ok(())
             }
             BindingPattern::Assignment(assignment) => {
-                let value = self.apply_default(builder, range, value, &assignment.right)?;
+                let name = self.binding_name(&assignment.left)?;
+                let value =
+                    self.apply_default(builder, range, value, &assignment.right, name.as_deref())?;
                 self.bind_pattern(builder, &assignment.left, value, declaration_scope)
             }
             BindingPattern::Rest(rest) => {
@@ -6474,6 +7107,7 @@ impl<'a> FunctionContext<'a> {
         range: TextRange,
         value: Register,
         default: &Expr,
+        name: Option<&str>,
     ) -> Result<Register, LowerError> {
         let result = self.alloc_register(range)?;
         self.move_to(range, result, value)?;
@@ -6495,7 +7129,7 @@ impl<'a> FunctionContext<'a> {
                 target: Pc::new(0),
             },
         )?;
-        let default_value = self.lower_expression(builder, default)?;
+        let default_value = self.lower_maybe_named(builder, default, name)?;
         self.move_to(range, result, default_value)?;
         let end = self.next_pc();
         self.patch_jump(skip, end);
@@ -6610,6 +7244,17 @@ impl<'a> FunctionContext<'a> {
         }
         Ok(rest)
     }
+    /// An object pattern refuses null and undefined before anything else, which
+    /// reading its first property could not do for `{}` or a computed key.
+    fn require_object_coercible(
+        &mut self,
+        range: TextRange,
+        value: Register,
+    ) -> Result<(), LowerError> {
+        let dst = self.alloc_register(range)?;
+        self.emit(range, Instruction::ToObject { dst, src: value })?;
+        Ok(())
+    }
     fn assign_target(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -6623,15 +7268,11 @@ impl<'a> FunctionContext<'a> {
                 self.assign_name(builder, &name, value, range)
             }
             AssignmentTarget::Member(member) => {
-                if self.is_const_enum_member_target(target, &member.object)? {
-                    return Err(self.const_enum_operation(range, ConstEnumOperation::Write));
-                }
-                let object = self.lower_expression(builder, &member.object)?;
-                let key = self.member_key(builder, &member.property)?;
-                self.emit(range, Instruction::SetProperty { object, key, value })?;
-                Ok(())
+                let (base, key) = self.member_reference(builder, target, member)?;
+                self.set_member(range, base, key, value)
             }
             AssignmentTarget::Object(object) => {
+                self.require_object_coercible(range, value)?;
                 let mut taken: Vec<Register> = Vec::new();
                 for property in &object.properties {
                     self.assign_object_property(builder, range, value, property, &mut taken)?;
@@ -6654,8 +7295,12 @@ impl<'a> FunctionContext<'a> {
                             self.iterator_step_discard(range, iterator)?;
                         }
                         AssignmentArrayElement::Target(inner) => {
-                            let element = self.iterator_step_value(builder, range, iterator)?;
-                            self.assign_target(builder, inner, element)?;
+                            self.assign_array_element(builder, range, inner, iterator)?;
+                        }
+                        AssignmentArrayElement::Rest(inner) => {
+                            let reference = self.target_reference(builder, inner)?;
+                            let rest = self.rest_array(builder, range, iterator)?;
+                            self.assign_reference(builder, inner, reference, rest)?;
                         }
                         AssignmentArrayElement::Missing(missing) => {
                             return Err(self.missing(range, missing.expected()));
@@ -6670,6 +7315,75 @@ impl<'a> FunctionContext<'a> {
             }
         }
     }
+    fn member_reference(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        target: &AssignmentTargetNode,
+        member: &AssignmentMemberTarget,
+    ) -> Result<(MemberBase, Register), LowerError> {
+        let range = target.range();
+        if self.is_const_enum_member_target(target, &member.object)? {
+            return Err(self.const_enum_operation(range, ConstEnumOperation::Write));
+        }
+        let base = self.member_base(builder, range, &member.object)?;
+        let key = self.member_key(builder, &member.property)?;
+        Ok((base, key))
+    }
+    /// A destructuring target's reference comes before the value it receives,
+    /// so reading that value can observe the target's side effects.
+    fn target_reference(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        target: &AssignmentTargetNode,
+    ) -> Result<Option<(MemberBase, Register)>, LowerError> {
+        match target.data() {
+            AssignmentTarget::Member(member) => {
+                self.member_reference(builder, target, member).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+    fn assign_reference(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        target: &AssignmentTargetNode,
+        reference: Option<(MemberBase, Register)>,
+        value: Register,
+    ) -> Result<(), LowerError> {
+        match reference {
+            Some((base, key)) => self.set_member(target.range(), base, key, value),
+            None => self.assign_target(builder, target, value),
+        }
+    }
+    /// Assigns one array element. The parser keeps `[a = 1]`'s element as the
+    /// assignment it read, so a default arrives as that expression.
+    fn assign_array_element(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        target: &AssignmentTargetNode,
+        iterator: Register,
+    ) -> Result<(), LowerError> {
+        if let AssignmentTarget::Invalid(operand) = target.data()
+            && let Expression::Assignment(assignment) = operand.data()
+            && assignment.operator == AssignmentOperator::Assign
+        {
+            let reference = self.target_reference(builder, &assignment.left)?;
+            let value = self.iterator_step_value(builder, range, iterator)?;
+            let name = self.target_name(&assignment.left)?;
+            let value = self.apply_default(
+                builder,
+                target.range(),
+                value,
+                &assignment.right,
+                name.as_deref(),
+            )?;
+            return self.assign_reference(builder, &assignment.left, reference, value);
+        }
+        let reference = self.target_reference(builder, target)?;
+        let value = self.iterator_step_value(builder, range, iterator)?;
+        self.assign_reference(builder, target, reference, value)
+    }
     fn assign_object_property(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -6678,8 +7392,15 @@ impl<'a> FunctionContext<'a> {
         property: &AssignmentObjectProperty,
         taken: &mut Vec<Register>,
     ) -> Result<(), LowerError> {
-        let key = self.property_key(builder, &property.name)?;
+        if property.rest {
+            let reference = self.target_reference(builder, &property.target)?;
+            let rest = self.rest_object(builder, range, source, taken)?;
+            return self.assign_reference(builder, &property.target, reference, rest);
+        }
+        // Converted now: the key must not convert again for the target or `rest`.
+        let key = self.converted_property_key(builder, range, &property.name)?;
         taken.push(key);
+        let reference = self.target_reference(builder, &property.target)?;
         let element = self.alloc_register(range)?;
         self.emit(
             range,
@@ -6690,10 +7411,13 @@ impl<'a> FunctionContext<'a> {
             },
         )?;
         let element = match &property.initializer {
-            Some(default) => self.apply_default(builder, range, element, default)?,
+            Some(default) => {
+                let name = self.target_name(&property.target)?;
+                self.apply_default(builder, range, element, default, name.as_deref())?
+            }
             None => element,
         };
-        self.assign_target(builder, &property.target, element)
+        self.assign_reference(builder, &property.target, reference, element)
     }
     fn lower_arrow(
         &mut self,
@@ -6701,10 +7425,19 @@ impl<'a> FunctionContext<'a> {
         range: TextRange,
         arrow: &ArrowFunction,
     ) -> Result<Register, LowerError> {
+        self.lower_arrow_named(builder, range, arrow, None)
+    }
+    fn lower_arrow_named(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        arrow: &ArrowFunction,
+        name: Option<String>,
+    ) -> Result<Register, LowerError> {
         let flags = FunctionFlags {
             is_async: arrow.is_async,
             is_generator: false,
-            is_constructable: false,
+            ..FunctionFlags::default()
         };
         let captures =
             self.compute_captures(&arrow.parameters, LoweredBody::Arrow(&arrow.body), true);
@@ -6713,7 +7446,7 @@ impl<'a> FunctionContext<'a> {
             builder,
             id,
             range,
-            None,
+            name,
             &arrow.parameters,
             LoweredBody::Arrow(&arrow.body),
             flags,
@@ -6733,6 +7466,7 @@ impl<'a> FunctionContext<'a> {
             is_async: function.is_async,
             is_generator: function.is_generator,
             is_constructable: !function.is_async && !function.is_generator,
+            ..FunctionFlags::default()
         };
         let closure =
             self.build_function_value_with_flags(builder, range, name, function, flags)?;
@@ -6771,7 +7505,7 @@ impl<'a> FunctionContext<'a> {
         let flags = FunctionFlags {
             is_async: function.is_async,
             is_generator: function.is_generator,
-            is_constructable: false,
+            ..FunctionFlags::default()
         };
         self.build_function_value_with_flags(builder, range, name, function, flags)
     }
@@ -6849,15 +7583,26 @@ impl<'a> FunctionContext<'a> {
             this_capture: None,
             this_cell: None,
             derived_super_guard: None,
-            instance_steps: Vec::new(),
+            derived_constructor: false,
+            field_scope: BTreeMap::new(),
+            // A `super(...)` in an arrow initializes the fields.
+            instance_steps: if is_arrow {
+                self.instance_steps.clone()
+            } else {
+                Vec::new()
+            },
             new_target_capture: None,
             parent_constructor_capture: None,
             class_elements: None,
+            home_object: None,
+            method_home: None,
             arguments_source: if is_arrow {
                 ArgumentsSource::None
             } else {
                 ArgumentsSource::Own
             },
+            strict: self.strict || body.has_use_strict(self.file),
+            inferred_class_name: None,
         };
         // Leading capture registers.
         for capture in captures {
@@ -6880,6 +7625,15 @@ impl<'a> FunctionContext<'a> {
                 CaptureKey::NewTarget => inner.new_target_capture = Some(register),
                 CaptureKey::Parent(_) => inner.parent_constructor_capture = Some(register),
                 CaptureKey::ClassElements(_) => inner.class_elements = Some(register),
+                CaptureKey::Home(_) => inner.home_object = Some(register),
+                CaptureKey::SuperGuard(_) => {
+                    inner.derived_super_guard = Some(SuperGuard::Cell(register));
+                }
+                CaptureKey::FieldName { name, sites, .. } => {
+                    inner
+                        .field_scope
+                        .insert(name.clone(), (register, sites.clone()));
+                }
                 CaptureKey::Cell(_) => {}
                 CaptureKey::Container(symbol, kind, _) => inner.containers.push(Container {
                     symbol: *symbol,
@@ -6905,6 +7659,13 @@ impl<'a> FunctionContext<'a> {
         } else if let LoweredBody::Block(block) = body {
             inner.hoist_vars(builder, &block.data().statements, range)?;
         }
+        // A generator binds its parameters when called, before the body's
+        // first `next`. Parameters that can run code stop here for that call.
+        let binds_at_call = flags.is_generator && !has_simple_parameters(parameters);
+        if binds_at_call {
+            let value = inner.undefined(builder, range)?;
+            inner.emit_suspend(builder, range, value)?;
+        }
         match body {
             LoweredBody::Function(FunctionBody::Block(block))
             | LoweredBody::Arrow(FunctionBody::Block(block))
@@ -6927,6 +7688,10 @@ impl<'a> FunctionContext<'a> {
         let name_constant = match name {
             Some(name) => Some(builder.intern(Constant::String(EcmaString::encode(&name)), range)?),
             None => None,
+        };
+        let flags = FunctionFlags {
+            binds_at_call,
+            ..flags
         };
         let assembled = inner.into_function(name_constant, flags);
         builder.fill_function(id, assembled);
@@ -6984,11 +7749,17 @@ impl<'a> FunctionContext<'a> {
             this_capture: None,
             this_cell: None,
             derived_super_guard: None,
+            derived_constructor: false,
+            field_scope: BTreeMap::new(),
             instance_steps: Vec::new(),
             new_target_capture: None,
             parent_constructor_capture: None,
             class_elements: None,
+            home_object: None,
+            method_home: None,
             arguments_source: ArgumentsSource::Own,
+            strict: self.strict,
+            inferred_class_name: None,
         };
         // Leading capture registers, in the same order the materialized
         // captures array pushes them.
@@ -7012,6 +7783,15 @@ impl<'a> FunctionContext<'a> {
                 CaptureKey::NewTarget => inner.new_target_capture = Some(register),
                 CaptureKey::Parent(_) => inner.parent_constructor_capture = Some(register),
                 CaptureKey::ClassElements(_) => inner.class_elements = Some(register),
+                CaptureKey::Home(_) => inner.home_object = Some(register),
+                CaptureKey::SuperGuard(_) => {
+                    inner.derived_super_guard = Some(SuperGuard::Cell(register));
+                }
+                CaptureKey::FieldName { name, sites, .. } => {
+                    inner
+                        .field_scope
+                        .insert(name.clone(), (register, sites.clone()));
+                }
                 CaptureKey::Cell(_) => {}
                 CaptureKey::Container(symbol, kind, _) => inner.containers.push(Container {
                     symbol: *symbol,
@@ -7047,6 +7827,7 @@ impl<'a> FunctionContext<'a> {
         parameters: &[ParameterNode],
         range: TextRange,
     ) -> Result<(Vec<Register>, Option<usize>), LowerError> {
+        let parameters = runtime_parameters(self.file, parameters);
         let rest_index = parameters.iter().position(|parameter| {
             matches!(parameter.data().binding.data(), BindingPattern::Rest(_))
         });
@@ -7066,6 +7847,7 @@ impl<'a> FunctionContext<'a> {
         slots: &[Register],
         rest_index: Option<usize>,
     ) -> Result<(), LowerError> {
+        let parameters = runtime_parameters(self.file, parameters);
         let fixed = slots.len();
         let mut undefined_seed = None;
         for (index, parameter) in parameters.iter().enumerate() {
@@ -7113,7 +7895,10 @@ impl<'a> FunctionContext<'a> {
             let data = parameter.data();
             let slot = slots[index];
             let value = match &data.initializer {
-                Some(default) => self.apply_default(builder, parameter.range(), slot, default)?,
+                Some(default) => {
+                    let name = self.binding_name(&data.binding)?;
+                    self.apply_default(builder, parameter.range(), slot, default, name.as_deref())?
+                }
                 None => slot,
             };
             self.bind_pattern(builder, &data.binding, value, DeclarationScope::Function)?;
@@ -7166,7 +7951,7 @@ impl<'a> FunctionContext<'a> {
         range: TextRange,
         value: Register,
     ) -> Result<(), LowerError> {
-        if self.this_cell.is_none() || self.parent_constructor_capture.is_none() {
+        if !self.derived_constructor {
             self.emit(range, Instruction::Return { value })?;
             return Ok(());
         }
@@ -7354,6 +8139,9 @@ impl<'a> FunctionContext<'a> {
             CaptureKey::NewTarget => self.new_target_value(range),
             CaptureKey::Parent(parent) => Ok(*parent),
             CaptureKey::ClassElements(table) => Ok(*table),
+            CaptureKey::Home(home) => Ok(*home),
+            CaptureKey::SuperGuard(guard) => Ok(*guard),
+            CaptureKey::FieldName { cell, .. } => Ok(*cell),
             CaptureKey::Cell(cell) => Ok(*cell),
             CaptureKey::Container(_, _, object) | CaptureKey::WithObject(_, object) => Ok(*object),
         }
@@ -7366,6 +8154,9 @@ impl<'a> FunctionContext<'a> {
     ) -> Vec<CaptureKey> {
         let mut scanner = FreeVarScanner::new(self.file, self.jsx_plan);
         scanner.scan_function(parameters, body, is_arrow);
+        // `super(...)` in an arrow finishes the enclosing constructor's work.
+        let calls_parent =
+            is_arrow && scanner.calls_super && self.parent_constructor_capture.is_some();
         let mut captures = Vec::new();
         for name in &scanner.free {
             if matches!(self.resolve(name), Some(Binding::ConstEnum(_))) {
@@ -7389,9 +8180,33 @@ impl<'a> FunctionContext<'a> {
             if scanner.uses_arguments {
                 captures.push(CaptureKey::Arguments);
             }
-            if scanner.uses_new_target {
+            if scanner.uses_new_target || calls_parent {
                 captures.push(CaptureKey::NewTarget);
             }
+            if calls_parent {
+                captures.extend(self.parent_constructor_capture.map(CaptureKey::Parent));
+                captures.extend(self.class_elements.map(CaptureKey::ClassElements));
+                if let Some(SuperGuard::Cell(guard)) = self.derived_super_guard {
+                    captures.push(CaptureKey::SuperGuard(guard));
+                }
+                // The arrow runs the field initializers there.
+                captures.extend(self.field_scope.iter().map(|(name, (cell, sites))| {
+                    CaptureKey::FieldName {
+                        name: name.clone(),
+                        sites: sites.clone(),
+                        cell: *cell,
+                    }
+                }));
+            }
+        }
+        // An arrow's `super` is the enclosing method's.
+        let home = if is_arrow {
+            self.home_object
+        } else {
+            self.method_home
+        };
+        if let (true, Some(home)) = (scanner.uses_super, home) {
+            captures.push(CaptureKey::Home(home));
         }
         for container in &self.containers {
             captures.push(CaptureKey::Container(
@@ -7678,21 +8493,35 @@ impl<'a> FunctionContext<'a> {
                 key,
                 init_chain,
                 extra_inits,
+                defines,
             } => {
                 let raw = match &property.initializer {
-                    Some(initializer) => self.lower_expression(builder, initializer)?,
+                    Some(initializer) => {
+                        let name = self.property_name_text(&property.name)?;
+                        self.lower_maybe_named(builder, initializer, name.as_deref())?
+                    }
                     None => self.undefined(builder, range)?,
                 };
                 let value =
                     self.run_initializer_chain(builder, range, final_class, *init_chain, raw)?;
-                self.emit(
-                    range,
+                // A field defines its property, so `static name` replaces the
+                // function's own read-only one. A private name has none to define.
+                let instruction = if *defines && !matches!(property.name, PropertyName::Private(_))
+                {
+                    Instruction::DefineOwnDescriptorSlot {
+                        object: raw_ctor,
+                        key: *key,
+                        src: value,
+                        slot: DescriptorSlot::Entire,
+                    }
+                } else {
                     Instruction::SetProperty {
                         object: raw_ctor,
                         key: *key,
                         value,
-                    },
-                )?;
+                    }
+                };
+                self.emit(range, instruction)?;
                 self.run_extra_initializers(builder, range, final_class, *extra_inits)?;
                 Ok(())
             }
@@ -7730,6 +8559,7 @@ impl<'a> FunctionContext<'a> {
             }
         }
     }
+    /// Lowers a class, every part of which is strict code.
     fn lower_class_value(
         &mut self,
         builder: &mut ModuleBuilder,
@@ -7738,6 +8568,21 @@ impl<'a> FunctionContext<'a> {
         declaration_name: Option<&str>,
         expression_name: Option<(&str, BindingSite)>,
     ) -> Result<Register, LowerError> {
+        let strict = std::mem::replace(&mut self.strict, true);
+        let value =
+            self.lower_strict_class_value(builder, range, class, declaration_name, expression_name);
+        self.strict = strict;
+        value
+    }
+    fn lower_strict_class_value(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        class: &ClassDeclaration,
+        declaration_name: Option<&str>,
+        expression_name: Option<(&str, BindingSite)>,
+    ) -> Result<Register, LowerError> {
+        let inferred_name = self.inferred_class_name.take();
         let class_decorators = class
             .decorators
             .iter()
@@ -7818,7 +8663,13 @@ impl<'a> FunctionContext<'a> {
             Some(identifier) => Some(self.identifier_text(identifier)?),
             None => None,
         };
-        let source_name = owned_class_name.as_deref().or(declaration_name);
+        let source_name = owned_class_name
+            .as_deref()
+            .or(declaration_name)
+            .or(inferred_name.as_deref());
+        // The constructor's `super` starts from this object, so it comes first.
+        let prototype = self.alloc_register(range)?;
+        self.emit(range, Instruction::CreateObject { dst: prototype })?;
         let ctor = self.build_constructor(
             builder,
             range,
@@ -7830,10 +8681,9 @@ impl<'a> FunctionContext<'a> {
             } else {
                 Some(class_elements)
             },
+            prototype,
             source_name,
         )?;
-        let prototype = self.alloc_register(range)?;
-        self.emit(range, Instruction::CreateObject { dst: prototype })?;
         if let Some(parent) = parent {
             let parent_prototype = self.get_named(builder, range, parent, "prototype")?;
             self.emit(
@@ -7888,6 +8738,13 @@ impl<'a> FunctionContext<'a> {
                 &mut static_inits,
             )?;
         }
+        if !class.decorators.is_empty() {
+            for init in &mut static_inits {
+                if let StaticInit::Field { defines, .. } = init {
+                    *defines = false;
+                }
+            }
+        }
         self.apply_member_decoration_stages(builder, stages)?;
         let class_extra_inits = self.alloc_register(range)?;
         self.emit(
@@ -7924,6 +8781,7 @@ impl<'a> FunctionContext<'a> {
         // on `final_class`, then the remaining static timeline.
         let previous_this = self.this_capture;
         self.this_capture = Some(final_class);
+        let previous_home = self.home_object.replace(ctor);
         let mut static_result = Ok(());
         let static_order = static_inits
             .iter()
@@ -7940,6 +8798,7 @@ impl<'a> FunctionContext<'a> {
             }
         }
         self.this_capture = previous_this;
+        self.home_object = previous_home;
         static_result?;
         self.run_extra_initializers(builder, range, final_class, class_extra_inits)?;
         if let Some(name) = declaration_name {
@@ -8098,6 +8957,7 @@ impl<'a> FunctionContext<'a> {
         parent: Option<Register>,
         instance_steps: &[InstanceInit],
         class_elements: Option<Register>,
+        home: Register,
         source_name: Option<&str>,
     ) -> Result<Register, LowerError> {
         let (parameters, body_block): (&[ParameterNode], Option<&Block>) = match constructor {
@@ -8117,6 +8977,7 @@ impl<'a> FunctionContext<'a> {
             instance_steps,
             parent,
             class_elements,
+            home,
         );
         let id = builder.reserve_function(range)?;
         self.build_constructor_into(
@@ -8139,29 +9000,29 @@ impl<'a> FunctionContext<'a> {
         instance_steps: &[InstanceInit],
         parent: Option<Register>,
         class_elements: Option<Register>,
+        home: Register,
     ) -> Vec<CaptureKey> {
         let mut scanner = FreeVarScanner::new(self.file, self.jsx_plan);
-        scanner.preseed_parameters(parameters);
-        if let Some(block) = body {
-            scanner.preseed_vars(&block.statements);
-        }
-        scanner.scan_parameter_initializers(parameters);
-        if let Some(block) = body {
-            for statement in &block.statements {
-                scanner.scan_statement(statement);
-            }
-        }
-        scan_instance_init_free_vars(&mut scanner, instance_steps);
+        scan_constructor(&mut scanner, parameters, body);
+        // Initializers scan alone: a constructor binding does not shadow them.
+        let mut fields = FreeVarScanner::new(self.file, self.jsx_plan);
+        scan_instance_init_free_vars(&mut fields, instance_steps);
         let mut captures = Vec::new();
-        for name in &scanner.free {
-            if matches!(self.resolve(name), Some(Binding::ConstEnum(_))) {
-                continue;
-            }
-            if self.resolve(name).is_some() {
-                captures.push(CaptureKey::Name(
+        for name in scanner.free.union(&fields.free) {
+            match self.resolve(name) {
+                Some(Binding::ConstEnum(_)) | None => {}
+                Some(_) if scanner.free.contains(name) => captures.push(CaptureKey::Name(
                     name.clone(),
                     self.preceding_with_sites(name),
-                ));
+                )),
+                Some(Binding::Cell(cell)) => captures.push(CaptureKey::FieldName {
+                    name: name.clone(),
+                    sites: self.preceding_with_sites(name),
+                    cell,
+                }),
+                Some(Binding::Local(_)) => {
+                    panic!("capture plan resolved field capture `{name}` to Local")
+                }
             }
         }
         if let Some(parent) = parent {
@@ -8170,6 +9031,9 @@ impl<'a> FunctionContext<'a> {
         if let Some(table) = class_elements {
             captures.push(CaptureKey::ClassElements(table));
         }
+        if scanner.uses_super || fields.uses_super {
+            captures.push(CaptureKey::Home(home));
+        }
         for container in &self.containers {
             captures.push(CaptureKey::Container(
                 container.symbol,
@@ -8177,22 +9041,42 @@ impl<'a> FunctionContext<'a> {
                 container.object,
             ));
         }
-        if !scanner.free.is_empty() {
+        if !scanner.free.is_empty() || !fields.free.is_empty() {
             for region in &self.with_regions {
                 captures.push(CaptureKey::WithObject(region.site, region.object));
             }
         }
         captures
     }
+    /// Swaps in what field initializers see, returning what to restore.
+    fn enter_field_scope(&mut self) -> NameView {
+        let bindings = self
+            .field_scope
+            .iter()
+            .map(|(name, (cell, _))| (name.clone(), Binding::Cell(*cell)))
+            .collect();
+        let sites = self
+            .field_scope
+            .iter()
+            .map(|(name, (_, sites))| (name.clone(), sites.clone()))
+            .collect();
+        NameView {
+            scopes: std::mem::replace(&mut self.scopes, vec![bindings]),
+            captured_names: std::mem::replace(&mut self.captured_names, sites),
+        }
+    }
     fn initialize_instance_fields(
         &mut self,
         builder: &mut ModuleBuilder,
         range: TextRange,
     ) -> Result<(), LowerError> {
-        let steps = self.instance_steps.clone();
+        // Taken so an initializer's own arrows carry no steps: only a
+        // diagnosed source has `super(...)` there, and it must still lower.
+        let steps = std::mem::take(&mut self.instance_steps);
         if steps.is_empty() {
             return Ok(());
         }
+        let outer = self.enter_field_scope();
         let table = self.class_elements;
         // Method/getter/setter extras are Decorated { initializer: None }.
         // Drain them as a prefix; field/auto-accessor steps keep source order.
@@ -8263,6 +9147,9 @@ impl<'a> FunctionContext<'a> {
                 }
             }
         }
+        self.scopes = outer.scopes;
+        self.captured_names = outer.captured_names;
+        self.instance_steps = steps;
         Ok(())
     }
     fn read_table_slot(
@@ -8308,13 +9195,15 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         range: TextRange,
     ) -> Result<(), LowerError> {
-        let Some(guard) = self.derived_super_guard else {
-            return Ok(());
+        let initialized = match self.derived_super_guard {
+            Some(SuperGuard::Register(guard)) => guard,
+            Some(SuperGuard::Cell(guard)) => self.cell_value(builder, guard, range)?,
+            None => return Ok(()),
         };
         let first_call = self.emit(
             range,
             Instruction::JumpIfFalse {
-                condition: guard,
+                condition: initialized,
                 target: Pc::new(0),
             },
         )?;
@@ -8329,9 +9218,13 @@ impl<'a> FunctionContext<'a> {
         builder: &mut ModuleBuilder,
         range: TextRange,
     ) -> Result<(), LowerError> {
-        if let Some(guard) = self.derived_super_guard {
-            let initialized = self.load_constant(builder, Constant::Boolean(true), range)?;
-            self.move_to(range, guard, initialized)?;
+        let Some(guard) = self.derived_super_guard else {
+            return Ok(());
+        };
+        let initialized = self.load_constant(builder, Constant::Boolean(true), range)?;
+        match guard {
+            SuperGuard::Register(guard) => self.move_to(range, guard, initialized)?,
+            SuperGuard::Cell(guard) => self.store_cell(builder, guard, initialized, range)?,
         }
         Ok(())
     }
@@ -8467,11 +9360,17 @@ impl<'a> FunctionContext<'a> {
             this_capture: None,
             this_cell: None,
             derived_super_guard: None,
+            derived_constructor: false,
+            field_scope: BTreeMap::new(),
             instance_steps: instance_steps.to_vec(),
             new_target_capture: None,
             parent_constructor_capture: None,
             class_elements: None,
+            home_object: None,
+            method_home: None,
             arguments_source: ArgumentsSource::Own,
+            strict: true,
+            inferred_class_name: None,
         };
         for capture in captures {
             let register = inner.alloc_register(range)?;
@@ -8484,9 +9383,18 @@ impl<'a> FunctionContext<'a> {
                         DeclarationScope::Function,
                     );
                     inner.captured_names.insert(name.clone(), sites.clone());
+                    inner
+                        .field_scope
+                        .insert(name.clone(), (register, sites.clone()));
+                }
+                CaptureKey::FieldName { name, sites, .. } => {
+                    inner
+                        .field_scope
+                        .insert(name.clone(), (register, sites.clone()));
                 }
                 CaptureKey::Parent(_) => inner.parent_constructor_capture = Some(register),
                 CaptureKey::ClassElements(_) => inner.class_elements = Some(register),
+                CaptureKey::Home(_) => inner.home_object = Some(register),
                 CaptureKey::Cell(_) => {}
                 CaptureKey::Container(symbol, kind, _) => inner.containers.push(Container {
                     symbol: *symbol,
@@ -8501,7 +9409,8 @@ impl<'a> FunctionContext<'a> {
                 CaptureKey::This
                 | CaptureKey::ThisCell
                 | CaptureKey::Arguments
-                | CaptureKey::NewTarget => {
+                | CaptureKey::NewTarget
+                | CaptureKey::SuperGuard(_) => {
                     unreachable!("constructors do not capture arrow-only bindings")
                 }
             }
@@ -8511,13 +9420,23 @@ impl<'a> FunctionContext<'a> {
             let cell = inner.alloc_register(range)?;
             inner.emit(range, Instruction::CreateCell { dst: cell })?;
             inner.this_cell = Some(cell);
+            inner.derived_constructor = true;
             if body.is_some() {
+                let mut scanner = FreeVarScanner::new(inner.file, inner.jsx_plan);
+                scan_constructor(&mut scanner, parameters, body);
                 let guard = inner.alloc_register(range)?;
                 let pending = inner.load_constant(builder, Constant::Boolean(false), range)?;
-                inner.move_to(range, guard, pending)?;
-                inner.derived_super_guard = Some(guard);
+                inner.derived_super_guard = Some(if scanner.arrow_calls_super {
+                    inner.emit(range, Instruction::CreateCell { dst: guard })?;
+                    inner.store_cell(builder, guard, pending, range)?;
+                    SuperGuard::Cell(guard)
+                } else {
+                    inner.move_to(range, guard, pending)?;
+                    SuperGuard::Register(guard)
+                });
             }
         }
+        inner.reject_plain_call(builder, range)?;
         inner.bind_parameters(builder, parameters, range, &parameter_slots, rest_index)?;
         if let Some(block) = body {
             inner.hoist_vars(builder, &block.statements, range)?;
@@ -8982,8 +9901,11 @@ impl<'a> FunctionContext<'a> {
                     Some(lowered) => lowered.key,
                     None => self.property_key(builder, &method.name)?,
                 };
-                let value = self.build_function_value(builder, range, None, &method.function)?;
-                self.install_property(builder, range, target, key, value, method.modifier)?;
+                self.method_home = Some(target);
+                let value = self.build_function_value(builder, range, None, &method.function);
+                self.method_home = None;
+                let value = value?;
+                self.install_class_method(range, target, key, value, method.modifier)?;
                 let Some(lowered) = decorators.filter(|d| !d.decorators.is_empty()) else {
                     return Ok(());
                 };
@@ -9049,6 +9971,7 @@ impl<'a> FunctionContext<'a> {
                             key: lowered.key,
                             init_chain,
                             extra_inits,
+                            defines: true,
                         });
                     } else {
                         let slot = *next_instance_slot;
@@ -9090,6 +10013,7 @@ impl<'a> FunctionContext<'a> {
                         key: lowered.key,
                         init_chain,
                         extra_inits,
+                        defines: false,
                     });
                 } else {
                     stages.instance_fields.push(decoration);
@@ -9126,7 +10050,7 @@ impl<'a> FunctionContext<'a> {
                         object: target,
                         key: public_key,
                         accessor: generated_get,
-                        kind: AccessorKind::Getter,
+                        kind: AccessorKind::ClassGetter,
                     },
                 )?;
                 self.emit(
@@ -9135,7 +10059,7 @@ impl<'a> FunctionContext<'a> {
                         object: target,
                         key: public_key,
                         accessor: generated_set,
-                        kind: AccessorKind::Setter,
+                        kind: AccessorKind::ClassSetter,
                     },
                 )?;
                 let Some(lowered) = decorators.filter(|d| !d.decorators.is_empty()) else {
@@ -9212,7 +10136,7 @@ impl<'a> FunctionContext<'a> {
                 static_inits.push(StaticInit::Block(block.clone()));
                 Ok(())
             }
-            ClassMember::IndexSignature(_) => Ok(()),
+            ClassMember::IndexSignature(_) | ClassMember::Semicolon => Ok(()),
             ClassMember::Missing(missing) => Err(self.missing(range, missing.expected())),
         }
     }
@@ -9222,6 +10146,18 @@ enum LoweredBody<'a> {
     Function(&'a FunctionBody),
     Arrow(&'a FunctionBody),
     Block(&'a BlockNode),
+}
+impl LoweredBody<'_> {
+    /// Whether this body's own directive prologue asks for strict code.
+    fn has_use_strict(self, file: &SourceFile) -> bool {
+        let block = match self {
+            Self::Function(FunctionBody::Block(block))
+            | Self::Arrow(FunctionBody::Block(block))
+            | Self::Block(block) => block,
+            _ => return false,
+        };
+        crate::early_errors::has_use_strict(file, &block.data().statements)
+    }
 }
 #[derive(Clone)]
 struct ScannedBinding {
@@ -9240,6 +10176,17 @@ struct FreeVarScanner<'a> {
     uses_this: bool,
     uses_arguments: bool,
     uses_new_target: bool,
+    uses_super: bool,
+    /// Walks source the way it is written, including JSX and decorators, which
+    /// lowering reaches some other way.
+    scans_jsx: bool,
+    /// Every name read as a value, shadowed or not. Keeping an import a shadowed
+    /// read did not need costs nothing; dropping one that was read would throw.
+    reads: BTreeSet<String>,
+    /// Const enum uses the source scan skips, because emit inlines them.
+    inlined_enums: Option<&'a crate::enum_plan::EnumFacts>,
+    calls_super: bool,
+    arrow_calls_super: bool,
     fn_boundary: u32,
     function_depth: u32,
 }
@@ -9313,6 +10260,12 @@ impl<'a> FreeVarScanner<'a> {
             uses_this: false,
             uses_arguments: false,
             uses_new_target: false,
+            uses_super: false,
+            scans_jsx: false,
+            reads: BTreeSet::new(),
+            inlined_enums: None,
+            calls_super: false,
+            arrow_calls_super: false,
             fn_boundary: 0,
             function_depth: 0,
         }
@@ -9396,6 +10349,9 @@ impl<'a> FreeVarScanner<'a> {
                 self.uses_arguments = true;
             }
             return;
+        }
+        if self.scans_jsx {
+            self.reads.insert(name.to_owned());
         }
         if let Some(binding) = self.resolve_binding(name).cloned() {
             if binding.owner_depth == 0 && !self.initialized.contains(&binding.identity) {
@@ -9656,6 +10612,7 @@ impl<'a> FreeVarScanner<'a> {
                     self.push();
                     if let Some(binding) = &handler.data().binding {
                         self.bind_pattern(binding, DeclarationScope::Lexical);
+                        self.scan_pattern_effects(binding);
                         self.initialize_pattern(binding, DeclarationScope::Lexical);
                     }
                     self.predeclare_immediate(&handler.data().body.data().statements, false);
@@ -9713,6 +10670,19 @@ impl<'a> FreeVarScanner<'a> {
                 for member in &declaration.members {
                     if let Some(initializer) = &member.data().initializer {
                         self.scan_expression(initializer);
+                    }
+                }
+            }
+            Statement::ImportEquals(import) if self.scans_jsx => {
+                if let crate::syntax::ExternalModuleReference::Qualified(name) = &import.reference {
+                    let mut root = name;
+                    while let crate::syntax::EntityName::Qualified { left, .. } = root {
+                        root = left;
+                    }
+                    if let crate::syntax::EntityName::Identifier(identifier) = root
+                        && let Some(text) = identifier_name(self.file, identifier)
+                    {
+                        self.use_name(&text);
                     }
                 }
             }
@@ -9809,12 +10779,85 @@ impl<'a> FreeVarScanner<'a> {
         self.pop();
         self.function_depth -= 1;
     }
+    /// A lowercase tag names an intrinsic, not a value in scope.
+    fn scan_jsx_name(&mut self, name: &JsxElementName) {
+        match name {
+            JsxElementName::Identifier(identifier) => {
+                if let Some(text) = identifier_name(self.file, identifier)
+                    && !text.starts_with(|c: char| c.is_ascii_lowercase())
+                {
+                    self.use_name(&text);
+                }
+            }
+            JsxElementName::Member(member) => {
+                let mut root = &*member.object;
+                while let JsxElementName::Member(inner) = root {
+                    root = &inner.object;
+                }
+                if let JsxElementName::Identifier(identifier) = root
+                    && let Some(text) = identifier_name(self.file, identifier)
+                {
+                    self.use_name(&text);
+                }
+            }
+            JsxElementName::Namespace(_) => {}
+        }
+    }
+    fn scan_jsx_attributes(&mut self, attributes: &[JsxAttributeItem]) {
+        for item in attributes {
+            match item {
+                JsxAttributeItem::Attribute(attribute) => {
+                    if let Some(JsxAttributeInitializer::Expression(container)) =
+                        &attribute.data().initializer
+                        && let Some(expression) = &container.data().expression
+                    {
+                        self.scan_expression(expression);
+                    }
+                }
+                JsxAttributeItem::Spread(spread) => {
+                    self.scan_expression(&spread.data().expression);
+                }
+            }
+        }
+    }
+    fn scan_jsx_children(&mut self, children: &[JsxChild]) {
+        for child in children {
+            match child {
+                JsxChild::Text(_) => {}
+                JsxChild::ExpressionContainer(container) => {
+                    if let Some(expression) = &container.data().expression {
+                        self.scan_expression(expression);
+                    }
+                }
+                JsxChild::Spread(spread) => self.scan_expression(&spread.data().expression),
+                JsxChild::Element(element) => self.scan_expression(element),
+            }
+        }
+    }
     fn scan_class_heritage(&mut self, class: &ClassDeclaration) {
         if let Some(heritage) = &class.extends {
             self.scan_expression(&heritage.expression);
         }
     }
+    /// Decorators run where the class is defined. Lowering reaches them there,
+    /// so only the source scan walks them here.
+    fn scan_decorators(&mut self, decorators: &[DecoratorNode]) {
+        if self.scans_jsx {
+            for decorator in decorators {
+                self.scan_expression(&decorator.data().expression);
+            }
+        }
+    }
     fn scan_class(&mut self, class: &ClassDeclaration) {
+        self.scan_decorators(&class.decorators);
+        for member in &class.members {
+            match member.data() {
+                ClassMember::Method(method) => self.scan_decorators(&method.function.decorators),
+                ClassMember::Property(property) => self.scan_decorators(&property.decorators),
+                ClassMember::AutoAccessor(accessor) => self.scan_decorators(&accessor.decorators),
+                _ => {}
+            }
+        }
         self.push();
         let mut seen_private = HashSet::new();
         for member in &class.members {
@@ -9853,6 +10896,11 @@ impl<'a> FreeVarScanner<'a> {
                 self.scan_statement(statement);
             }
         }
+        // Field initializers run in the constructor but see the class's scope.
+        self.function_roots.pop();
+        self.pop();
+        self.push();
+        self.function_roots.push(self.bound.len() - 1);
         for member in &class.members {
             match member.data() {
                 ClassMember::Property(property)
@@ -9925,6 +10973,12 @@ impl<'a> FreeVarScanner<'a> {
         self.pop();
     }
     fn scan_expression(&mut self, expression: &Expr) {
+        if self
+            .inlined_enums
+            .is_some_and(|facts| facts.const_use(expression.id()).is_some())
+        {
+            return;
+        }
         if let Some(replacement) = self
             .jsx_plan
             .and_then(|plan| plan.expression_desugars.get(&expression.id()))
@@ -9934,6 +10988,18 @@ impl<'a> FreeVarScanner<'a> {
             return;
         }
         match expression.data() {
+            Expression::JsxElement(element) if self.scans_jsx => {
+                self.scan_jsx_name(&element.opening.data().name);
+                self.scan_jsx_attributes(&element.opening.data().attributes);
+                self.scan_jsx_children(&element.children);
+            }
+            Expression::JsxSelfClosingElement(element) if self.scans_jsx => {
+                self.scan_jsx_name(&element.name);
+                self.scan_jsx_attributes(&element.attributes);
+            }
+            Expression::JsxFragment(fragment) if self.scans_jsx => {
+                self.scan_jsx_children(&fragment.children);
+            }
             Expression::JsxElement(_)
             | Expression::JsxFragment(_)
             | Expression::JsxSelfClosingElement(_) => {}
@@ -9952,7 +11018,12 @@ impl<'a> FreeVarScanner<'a> {
                     self.uses_this = true;
                 }
             }
-            Expression::Super => {}
+            Expression::Super => {
+                if self.fn_boundary == 0 {
+                    self.uses_super = true;
+                    self.uses_this = true;
+                }
+            }
             Expression::Meta(MetaProperty::NewTarget) => {
                 if self.fn_boundary == 0 {
                     self.uses_new_target = true;
@@ -10007,6 +11078,10 @@ impl<'a> FreeVarScanner<'a> {
             }
             Expression::Arrow(arrow) => self.scan_arrow(arrow),
             Expression::Call(call) => {
+                if self.fn_boundary == 0 && matches!(call.callee.data(), Expression::Super) {
+                    self.calls_super = true;
+                    self.arrow_calls_super |= self.function_depth > 0;
+                }
                 self.scan_expression(&call.callee);
                 for argument in &call.arguments {
                     match argument {
@@ -10114,7 +11189,9 @@ impl<'a> FreeVarScanner<'a> {
             }
             AssignmentTarget::Array(array) => {
                 for element in &array.elements {
-                    if let AssignmentArrayElement::Target(inner) = element {
+                    if let AssignmentArrayElement::Target(inner)
+                    | AssignmentArrayElement::Rest(inner) = element
+                    {
                         self.scan_assignment_target(inner);
                     }
                 }
@@ -10124,6 +11201,15 @@ impl<'a> FreeVarScanner<'a> {
                 self.scan_expression(operand);
             }
         }
+    }
+}
+/// The plain call that an invalid target holds. A call in an optional chain stays
+/// an early error.
+fn call_target(operand: &Expr) -> Option<&Expr> {
+    match operand.data() {
+        Expression::Parenthesized(inner) => call_target(inner),
+        Expression::Call(_) if !crate::early_errors::in_optional_chain(operand) => Some(operand),
+        _ => None,
     }
 }
 /// The `for` head range used for the back-edge jump's diagnostic anchor.
@@ -10556,6 +11642,14 @@ fn split_regex(lexeme: &str) -> Option<(String, String)> {
     let flags = &lexeme[last_slash + 1..];
     Some((pattern.to_owned(), flags.to_owned()))
 }
+/// Whether a property initializes the literal's prototype instead of naming a
+/// property of it. Only `__proto__: value` does, not a computed or shorthand key.
+fn sets_prototype(property: &crate::syntax::ObjectProperty, name: Option<&str>) -> bool {
+    name == Some("__proto__")
+        && !property.shorthand
+        && !matches!(property.name, PropertyName::Computed(_))
+}
+
 fn number_constant(value: f64) -> Constant {
     if value.fract() == 0.0
         && value.is_finite()
@@ -10705,6 +11799,7 @@ mod tests {
                 parsed.product(),
                 LowerOptions {
                     javascript_compatibility: true,
+                    ..LowerOptions::default()
                 },
             ) {
                 Ok(module) => {
@@ -10738,11 +11833,64 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
         )
     }
     fn lower_js(src: &str) -> Module<Verified> {
         lower_js_result(src).expect("snippet lowers to a verified module")
+    }
+    #[test]
+    fn a_parenthesized_name_or_member_lowers_for_every_assignment_operator() {
+        lower_js(
+            "var x = 1, o = { a: 1 }; (x) += 1; ((x)) **= 2; (o.a) *= 2; (o['a']) ??= 1; (x) &&= 3;",
+        );
+    }
+    #[test]
+    fn a_call_target_lowers_to_the_call_and_a_reference_error() {
+        for (statement, message) in [
+            ("f() = 1;", "Invalid left-hand side in assignment"),
+            ("f() += 1;", "Invalid left-hand side in assignment"),
+            ("(f()) = 1;", "Invalid left-hand side in assignment"),
+            ("(f()) += 1;", "Invalid left-hand side in assignment"),
+            (
+                "++f();",
+                "Invalid left-hand side expression in prefix operation",
+            ),
+            (
+                "f()--;",
+                "Invalid left-hand side expression in postfix operation",
+            ),
+            ("for (f() in {}) {}", "Invalid left-hand side in for-loop"),
+            ("for (f() of []) {}", "Invalid left-hand side in for-loop"),
+            ("(a?.b)() = 1;", "Invalid left-hand side in assignment"),
+        ] {
+            let module = lower_js(&format!("function f() {{}} {statement}"));
+            assert!(
+                module.constants().iter().any(
+                    |constant| matches!(constant, Constant::String(text) if text.eq_ascii(message))
+                ),
+                "{statement}"
+            );
+        }
+        for statement in [
+            "f() &&= 1;",
+            "f() ??= 1;",
+            "f?.() = 1;",
+            "1 = 2;",
+            "a?.b() = 1;",
+            "a?.b() += 1;",
+            "a?.b()++;",
+            "++a?.b();",
+            "for (a?.b() of []) {}",
+            "a?.b.c() = 1;",
+            "a?.b()() = 1;",
+        ] {
+            assert!(
+                lower_js_result(&format!("function f() {{}} {statement}")).is_err(),
+                "{statement}"
+            );
+        }
     }
     #[test]
     fn class_decorators_lower_in_reverse_and_bind_the_final_class_once() {
@@ -10797,6 +11945,16 @@ mod tests {
         );
     }
     #[test]
+    fn a_this_parameter_takes_no_argument() {
+        let module = lower_js("function f(this: any, a: number) { return a; }");
+        let function = module
+            .functions()
+            .iter()
+            .find(|function| function.parameter_count() > 0)
+            .expect("the function has a parameter");
+        assert_eq!(function.parameter_count(), 1);
+    }
+    #[test]
     fn checker_diagnosed_super_misuse_lowers_to_inert_values() {
         // The checker rejects every one of these (BAMTS-C024..C027); lowering
         // must still produce a verified module for diagnosed sources instead
@@ -10808,6 +11966,7 @@ mod tests {
             "class A { constructor() { super(); } }",
             "class A extends Object { constructor() { super(); const g = () => super(); } }",
             "class A extends Object { m() { super(); } }",
+            "class A extends Object { f = () => super(); constructor() { super(); } }",
         ] {
             lower_js(src);
         }
@@ -11506,13 +12665,21 @@ mod tests {
                 .any(|function| function_has_name(&module, function, "C")),
             "named class constructor metadata uses the source class name"
         );
-        let anonymous = lower_js("const C = class {};");
+        let anonymous = lower_js("(0, class {});");
         assert!(
             anonymous
                 .functions()
                 .iter()
                 .all(|function| function.name().is_none()),
-            "anonymous class constructors keep empty function metadata"
+            "a class with nothing to name it keeps empty function metadata"
+        );
+        let inferred = lower_js("const C = class {};");
+        assert!(
+            inferred
+                .functions()
+                .iter()
+                .any(|function| function_has_name(&inferred, function, "C")),
+            "a class initializing a binding takes the binding's name"
         );
         let expression = lower_js("const C = class Named {};");
         assert!(
@@ -12615,6 +13782,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
         )
         .expect_err("a trailing BigInt separator is invalid");
@@ -12681,6 +13849,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             checked.product().enum_facts(),
             checked.product().namespace_facts(),
@@ -12713,6 +13882,7 @@ mod tests {
                 parsed.product(),
                 LowerOptions {
                     javascript_compatibility: true,
+                    ..LowerOptions::default()
                 },
                 checked.product().enum_facts(),
                 checked.product().namespace_facts(),
@@ -12740,6 +13910,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             checked.product().enum_facts(),
             checked.product().namespace_facts(),
@@ -12772,6 +13943,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             checked.product().enum_facts(),
             checked.product().namespace_facts(),
@@ -12825,6 +13997,7 @@ mod tests {
                 parsed.product(),
                 LowerOptions {
                     javascript_compatibility: true,
+                    ..LowerOptions::default()
                 },
                 checked.product().enum_facts(),
                 checked.product().namespace_facts(),
@@ -12859,6 +14032,7 @@ mod tests {
                 parsed.product(),
                 LowerOptions {
                     javascript_compatibility: true,
+                    ..LowerOptions::default()
                 },
                 checked.product().enum_facts(),
                 checked.product().namespace_facts(),
@@ -12881,6 +14055,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             checked.product().enum_facts(),
             checked.product().namespace_facts(),
@@ -12940,6 +14115,7 @@ mod tests {
             files[1].product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             facts.enum_facts(),
             facts.namespace_facts(),
@@ -13037,6 +14213,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             checked.product().enum_facts(),
             checked.product().namespace_facts(),
@@ -13122,6 +14299,7 @@ mod tests {
             files[1].product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             facts.enum_facts(),
             facts.namespace_facts(),
@@ -14163,6 +15341,42 @@ mod tests {
             Instruction::CreateRegExp { .. }
         )));
     }
+    #[test]
+    fn array_assignment_patterns_take_defaults_and_rest() {
+        let module = lower_js("var a, b, c, d = {}; [a = 1, [b = 2], ...d.rest] = c;");
+        assert!(any_instruction(&module, |i| matches!(
+            i,
+            Instruction::GetIterator { .. }
+        )));
+    }
+
+    #[test]
+    fn class_methods_are_defined_as_hidden_and_object_methods_are_not() {
+        let class = lower_js("class C { m() {} get v() { return 1; } set v(x) {} }");
+        assert!(any_instruction(&class, |i| matches!(
+            i,
+            Instruction::DefineDataProperty { .. }
+        )));
+        for expected in [
+            bamts_bytecode::AccessorKind::ClassGetter,
+            bamts_bytecode::AccessorKind::ClassSetter,
+        ] {
+            assert!(any_instruction(&class, |i| matches!(
+                i,
+                Instruction::DefineAccessor { kind, .. } if *kind == expected
+            )));
+        }
+        let object = lower_js("var o = { m() {}, get v() { return 1; } };");
+        assert!(!any_instruction(&object, |i| matches!(
+            i,
+            Instruction::DefineDataProperty { .. }
+        )));
+        assert!(any_instruction(&object, |i| matches!(
+            i,
+            Instruction::DefineAccessor { kind, .. } if *kind == bamts_bytecode::AccessorKind::Getter
+        )));
+    }
+
     #[test]
     fn class_with_extends_builds_prototype_chain() {
         let module = lower_js("class B {} class C extends B { m() { return 1; } }");
@@ -15843,6 +17057,7 @@ mod tests {
             parsed.product(),
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
             checked.product().enum_facts(),
             checked.product().namespace_facts(),

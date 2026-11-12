@@ -190,9 +190,6 @@ mod jit;
 #[allow(unsafe_code)]
 mod jit_memory;
 #[cfg(feature = "host-jit")]
-#[path = "jit/tiering.rs"]
-pub mod tiering;
-#[cfg(feature = "host-jit")]
 pub use jit::{
     JitError, JitProgram, JitTelemetry, compile_jit, compile_jit_with_cancel,
     compile_jit_with_telemetry, compile_jit_with_telemetry_cancel,
@@ -749,13 +746,30 @@ impl Helper {
             // (frame, function_id, captures, out)
             Helper::CreateClosure => &[types::I64, types::I32, types::I64, types::I64],
             // (frame, object, key, out)
-            Helper::GetProperty | Helper::DeleteProperty | Helper::WithHasBinding => {
+            Helper::DeleteProperty | Helper::WithHasBinding => {
                 &[types::I64, types::I64, types::I64, types::I64]
             }
+            // (frame, object, key, site, out)
+            Helper::GetProperty => &[
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I32,
+                types::I64,
+            ],
             // (frame, object, key, value, out)
-            Helper::SetProperty | Helper::DefineDataProperty => {
+            Helper::DefineDataProperty => {
                 &[types::I64, types::I64, types::I64, types::I64, types::I64]
             }
+            // (frame, object, key, value, site, out)
+            Helper::SetProperty => &[
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I32,
+                types::I64,
+            ],
             // (frame, object, key, accessor, kind, out) or
             // (frame, object, key, src, slot, out)
             Helper::DefineAccessor | Helper::DefineOwnDescriptorSlot => &[
@@ -853,6 +867,8 @@ const fn unary_op_selector(op: UnaryOp) -> i64 {
         UnaryOp::Negate => 3,
         UnaryOp::BitwiseNot => 4,
         UnaryOp::LogicalNot => 5,
+        UnaryOp::ToString => 6,
+        UnaryOp::ToPropertyKey => 7,
     }
 }
 
@@ -919,6 +935,8 @@ const fn accessor_kind_selector(kind: AccessorKind) -> i64 {
     match kind {
         AccessorKind::Getter => 0,
         AccessorKind::Setter => 1,
+        AccessorKind::ClassGetter => 2,
+        AccessorKind::ClassSetter => 3,
     }
 }
 
@@ -929,6 +947,7 @@ const fn descriptor_slot_selector(slot: DescriptorSlot) -> i64 {
         DescriptorSlot::Value => 0,
         DescriptorSlot::Getter => 1,
         DescriptorSlot::Setter => 2,
+        DescriptorSlot::Entire => 4,
     }
 }
 
@@ -1454,7 +1473,7 @@ impl<'a> Lowering<'a> {
                 self.resume_blocks.insert(pc, block);
             }
         }
-        self.emit_dispatch();
+        self.emit_dispatch(code, reachable);
         for &pc in reachable {
             self.emit_instruction(pc, code[pc]);
         }
@@ -1481,25 +1500,19 @@ impl<'a> Lowering<'a> {
         helpers
     }
 
-    /// Emits the entry block: select the starting block from the resume token in
-    /// `frame.bytecode_pc`. Token `0` is a fresh call (pc-0 block); token `P + 1`
-    /// enters the resume prologue for the suspend at pc `P`.
-    fn emit_dispatch(&mut self) {
-        // A function with no suspends has a single entry (token 0): fresh calls
-        // always begin at pc 0, so no token comparison is emitted.
-        if self.resume_blocks.is_empty() {
+    fn emit_dispatch(&mut self, code: &[Instruction], reachable: &BTreeSet<usize>) {
+        let loop_headers = self.loop_headers(code, reachable);
+        if self.resume_blocks.is_empty() && loop_headers.is_empty() {
             let target = self.pc_blocks[0].expect("entry pc is reachable");
             self.builder.ins().jump(target, &[]);
             return;
         }
-
         let token = self.builder.ins().load(
             types::I32,
             MemFlagsData::trusted(),
             self.frame,
             SHADOW_FRAME_PC_OFFSET,
         );
-        // Fresh entry (token 0).
         let fresh = self.pc_blocks[0].expect("entry pc is reachable");
         let after_fresh = self.builder.create_block();
         let is_fresh = self.builder.ins().icmp_imm_u(IntCC::Equal, token, 0);
@@ -1507,14 +1520,13 @@ impl<'a> Lowering<'a> {
             .ins()
             .brif(is_fresh, fresh, &[], after_fresh, &[]);
         self.builder.switch_to_block(after_fresh);
-        // Resume tokens (P + 1), in ascending pc order for deterministic IR.
         let resume: Vec<(usize, Block)> = self
             .resume_blocks
             .iter()
             .map(|(&pc, &block)| (pc, block))
             .collect();
         for (pc, block) in resume {
-            let token_value = i64::from(pc as u32 + 1);
+            let token_value = i64::from(u32::try_from(pc).expect("reachable pc fits in u32") + 1);
             let matches = self
                 .builder
                 .ins()
@@ -1523,8 +1535,38 @@ impl<'a> Lowering<'a> {
             self.builder.ins().brif(matches, block, &[], next, &[]);
             self.builder.switch_to_block(next);
         }
-        // Resumed at an unrecognized token: fatal trap back to the runtime.
+        for header in loop_headers {
+            let target = self.pc_blocks[header].expect("loop header is reachable");
+            let header_u32 = u32::try_from(header).expect("reachable pc fits in u32");
+            let token_value = i64::from(0x8000_0000u32 | header_u32);
+            let matches = self
+                .builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, token, token_value);
+            let next = self.builder.create_block();
+            self.builder.ins().brif(matches, target, &[], next, &[]);
+            self.builder.switch_to_block(next);
+        }
         self.emit_trap(TRAP_INVALID_RESUME);
+    }
+
+    fn loop_headers(&self, code: &[Instruction], reachable: &BTreeSet<usize>) -> Vec<usize> {
+        let mut headers = BTreeSet::new();
+        for &pc in reachable {
+            let target = match code[pc] {
+                Instruction::Jump { target } => Some(target.get() as usize),
+                Instruction::JumpIfTrue { target, .. }
+                | Instruction::JumpIfFalse { target, .. } => Some(target.get() as usize),
+                _ => None,
+            };
+            if let Some(target) = target
+                && target <= pc
+                && reachable.contains(&target)
+            {
+                headers.insert(target);
+            }
+        }
+        headers.into_iter().collect()
     }
 
     fn emit_instruction(&mut self, pc: usize, instruction: Instruction) {
@@ -1614,9 +1656,11 @@ impl<'a> Lowering<'a> {
                 let handles = self.load_handles();
                 let object_value = self.load_register(handles, object);
                 let key_value = self.load_register(handles, key);
+                let site = i64::from(u32::try_from(pc).unwrap_or(u32::MAX));
+                let site_word = self.iconst32(site);
                 let tag = self.call_helper(
                     Helper::GetProperty,
-                    &[self.frame, object_value, key_value, self.out],
+                    &[self.frame, object_value, key_value, site_word, self.out],
                 );
                 self.route_completion(pc, tag, Some(dst));
             }
@@ -1625,9 +1669,18 @@ impl<'a> Lowering<'a> {
                 let object_value = self.load_register(handles, object);
                 let key_value = self.load_register(handles, key);
                 let value_value = self.load_register(handles, value);
+                let site = i64::from(u32::try_from(pc).unwrap_or(u32::MAX));
+                let site_word = self.iconst32(site);
                 let tag = self.call_helper(
                     Helper::SetProperty,
-                    &[self.frame, object_value, key_value, value_value, self.out],
+                    &[
+                        self.frame,
+                        object_value,
+                        key_value,
+                        value_value,
+                        site_word,
+                        self.out,
+                    ],
                 );
                 self.route_completion(pc, tag, None);
             }
@@ -3495,14 +3548,16 @@ mod tests {
             clif.contains("u1:8"),
             "delete-property import missing:\n{clif}"
         );
-        // Register key: get/delete take (frame, object, key, out) all i64 ops.
+        assert!(
+            clif.contains("(i64, i64, i64, i32, i64) -> i32"),
+            "get property sig wrong (register key):\n{clif}"
+        );
         assert!(
             clif.contains("(i64, i64, i64, i64) -> i32"),
-            "get/delete property sig wrong (register key):\n{clif}"
+            "delete property sig wrong (register key):\n{clif}"
         );
-        // Set takes (frame, object, key, value, out).
         assert!(
-            clif.contains("(i64, i64, i64, i64, i64) -> i32"),
+            clif.contains("(i64, i64, i64, i64, i32, i64) -> i32"),
             "set property sig wrong (register key):\n{clif}"
         );
     }

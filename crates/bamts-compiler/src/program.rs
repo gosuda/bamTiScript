@@ -29,7 +29,10 @@ use crate::{
     project::{
         CompilerOptions, ModuleResolutionError, PackageError, PackageJson, PackageMode,
         PackageTarget, ProjectRoot, ResolutionConditions, ResolutionFlavor, plan_relative_module,
-        resolution::ResolutionMode,
+        resolution::{
+            ModuleResolutionKind, ResolutionCache, ResolutionHost, ResolutionMode,
+            resolve_module_name, resolve_type_reference,
+        },
     },
     scanner,
     service::filesystem::{FileSystem, FileSystemError, OsFileSystem},
@@ -60,6 +63,18 @@ pub enum ModuleEdgeKind {
     StaticRuntime,
     TypeOnly,
     DynamicRuntime,
+}
+
+/// Which triple-slash reference directive introduced an edge, if any.
+///
+/// A `Some` value marks an edge collected from a leading
+/// `/// <reference ... />` comment rather than from an import or export
+/// statement.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ReferenceDirectiveKind {
+    Path,
+    Types,
+    Lib,
 }
 
 /// The canonical identity of a resolved module dependency.
@@ -99,11 +114,25 @@ pub struct ModuleEdge {
     target: ModuleTarget,
     type_target: Option<ModuleTarget>,
     range: TextRange,
+    unresolved: bool,
+    directive: Option<ReferenceDirectiveKind>,
 }
 impl ModuleEdge {
     #[must_use]
     pub const fn kind(&self) -> ModuleEdgeKind {
         self.kind
+    }
+
+    /// Which triple-slash reference directive introduced this edge, if any.
+    #[must_use]
+    pub const fn reference_directive(&self) -> Option<ReferenceDirectiveKind> {
+        self.directive
+    }
+
+    /// Whether a tolerant load found nothing for this specifier.
+    #[must_use]
+    pub const fn is_unresolved(&self) -> bool {
+        self.unresolved
     }
     /// Returns the resolution flavor used for `target`.
     ///
@@ -221,8 +250,10 @@ pub struct ResolvedProgram {
     strict_property_initialization: bool,
     always_strict: bool,
     no_emit_helpers: bool,
+    remove_comments: bool,
     use_define_for_class_fields: Option<bool>,
     import_helpers: Option<bool>,
+    verbatim_module_syntax: bool,
     target: crate::emitter::ScriptTarget,
     libs: crate::checker::intrinsic_environment::LibSet,
     check_js: bool,
@@ -246,6 +277,11 @@ impl ResolvedProgram {
     #[must_use]
     pub const fn import_helpers(&self) -> Option<bool> {
         self.import_helpers
+    }
+
+    #[must_use]
+    pub const fn verbatim_module_syntax(&self) -> bool {
+        self.verbatim_module_syntax
     }
 
     #[must_use]
@@ -343,6 +379,7 @@ impl ResolvedProgram {
         .with_strict_property_initialization(self.strict_property_initialization)
         .with_always_strict(self.always_strict)
         .with_no_emit_helpers(self.no_emit_helpers)
+        .with_remove_comments(self.remove_comments)
         .with_script_target(self.target)
         .with_libs(self.libs)
         .with_check_js(self.check_js)
@@ -583,6 +620,7 @@ pub struct ProgramLoader {
     root: ProjectRoot,
     options: CompilerOptions,
     fs: Arc<dyn FileSystem>,
+    tolerate_unresolved: bool,
 }
 
 impl fmt::Debug for ProgramLoader {
@@ -621,7 +659,18 @@ impl ProgramLoader {
             root,
             options: options.clone(),
             fs,
+            tolerate_unresolved: false,
         })
+    }
+
+    /// Keeps loading past an import nothing can satisfy, for a run that only
+    /// checks, as `tsc` does. The frontend reports each one, so a project sees
+    /// all of them at once. A run that will execute must not use this: the
+    /// program has to fail before it starts.
+    #[must_use]
+    pub const fn tolerating_unresolved_imports(mut self) -> Self {
+        self.tolerate_unresolved = true;
+        self
     }
 
     /// Resolves and loads an entrypoint. The entrypoint may be root-relative or absolute.
@@ -721,8 +770,10 @@ impl ProgramLoader {
             strict_property_initialization: self.options.strict_property_initialization(),
             always_strict: self.options.always_strict(),
             no_emit_helpers: self.options.no_emit_helpers(),
+            remove_comments: self.options.remove_comments(),
             use_define_for_class_fields: self.options.use_define_for_class_fields(),
             import_helpers: self.options.import_helpers(),
+            verbatim_module_syntax: self.options.verbatim_module_syntax(),
             target,
             libs,
             check_js: self.options.check_js(),
@@ -872,6 +923,12 @@ impl ProgramLoader {
                 flavor,
             });
         }
+        if let Some(directive) = edge.directive {
+            return self.resolve_directive(importer, edge, directive, cancel);
+        }
+        if self.tolerate_unresolved {
+            return self.resolve_edge_for_check(importer, edge, flavor, cancel);
+        }
         if let Some(target) = self.resolve_local(importer, edge, flavor, cancel)? {
             let type_overlay = self.type_overlay(importer, edge, &target, cancel)?;
             return Ok(ResolvedEdge {
@@ -893,6 +950,150 @@ impl ProgramLoader {
             edge.kind,
             edge.range,
         )))
+    }
+
+    /// Resolves an edge for a run that only checks. A package the runtime
+    /// could not use can still type-check, so `tsc`'s own algorithm gets the
+    /// last word, and what that cannot find becomes a reported edge.
+    fn resolve_edge_for_check(
+        &self,
+        importer: &Path,
+        edge: &UnresolvedEdge,
+        flavor: ResolutionFlavor,
+        cancel: &CancellationToken,
+    ) -> Result<ResolvedEdge, ProgramLoadError> {
+        let local = Self::missing_when_invalid(self.resolve_local(importer, edge, flavor, cancel))?;
+        if let Some(target) = local {
+            let type_overlay =
+                Self::missing_when_invalid(self.type_overlay(importer, edge, &target, cancel))?;
+            return Ok(ResolvedEdge {
+                target,
+                type_overlay,
+                flavor,
+            });
+        }
+        let target = match self.resolve_as_tsc(importer, edge) {
+            Some(path) => ResolvedEdgeTarget::Local(path),
+            None => ResolvedEdgeTarget::Unresolved(Arc::clone(&edge.specifier)),
+        };
+        Ok(ResolvedEdge {
+            target,
+            type_overlay: None,
+            flavor,
+        })
+    }
+    fn resolve_directive(
+        &self,
+        importer: &Path,
+        edge: &UnresolvedEdge,
+        directive: ReferenceDirectiveKind,
+        cancel: &CancellationToken,
+    ) -> Result<ResolvedEdge, ProgramLoadError> {
+        let flavor = ResolutionFlavor::Types;
+        match directive {
+            ReferenceDirectiveKind::Lib => Ok(ResolvedEdge {
+                target: ResolvedEdgeTarget::External(Arc::from(format!("lib:{}", edge.specifier))),
+                type_overlay: None,
+                flavor,
+            }),
+            ReferenceDirectiveKind::Types => {
+                if let Some(path) =
+                    self.resolve_type_directive(importer, &edge.specifier, edge.mode)?
+                {
+                    return Ok(ResolvedEdge {
+                        target: ResolvedEdgeTarget::Local(path),
+                        type_overlay: None,
+                        flavor,
+                    });
+                }
+                Err(ProgramLoadError::UnresolvedModule(diagnostic(
+                    importer,
+                    &edge.specifier,
+                    edge.kind,
+                    edge.range,
+                )))
+            }
+            ReferenceDirectiveKind::Path => {
+                if let Some(target) = self.resolve_local(importer, edge, flavor, cancel)? {
+                    let type_overlay = self.type_overlay(importer, edge, &target, cancel)?;
+                    return Ok(ResolvedEdge {
+                        target,
+                        type_overlay,
+                        flavor,
+                    });
+                }
+                Err(ProgramLoadError::UnresolvedModule(diagnostic(
+                    importer,
+                    &edge.specifier,
+                    edge.kind,
+                    edge.range,
+                )))
+            }
+        }
+    }
+
+    fn resolve_type_directive(
+        &self,
+        importer: &Path,
+        specifier: &str,
+        mode: ResolutionMode,
+    ) -> Result<Option<PathBuf>, ProgramLoadError> {
+        let kind = ModuleResolutionKind::from_options(&self.options)
+            .unwrap_or(ModuleResolutionKind::Bundler);
+        let host = LoaderResolutionHost(self.fs.as_ref());
+        let mut cache = ResolutionCache::new();
+        match resolve_type_reference(
+            &self.root,
+            &self.options,
+            importer,
+            specifier,
+            (kind, mode),
+            &host,
+            &mut cache,
+        ) {
+            Ok(resolved) => self
+                .fs
+                .normalize(resolved.path())
+                .map(Some)
+                .map_err(|error| ProgramLoadError::Read {
+                    path: resolved.path().to_path_buf(),
+                    source: file_system_io(error),
+                }),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Reads a package or specifier the runtime rules refused as not found.
+    fn missing_when_invalid<T>(
+        resolved: Result<Option<T>, ProgramLoadError>,
+    ) -> Result<Option<T>, ProgramLoadError> {
+        match resolved {
+            Err(
+                ProgramLoadError::InvalidPackage { .. } | ProgramLoadError::InvalidSpecifier { .. },
+            ) => Ok(None),
+            resolved => resolved,
+        }
+    }
+
+    fn resolve_as_tsc(&self, importer: &Path, edge: &UnresolvedEdge) -> Option<PathBuf> {
+        let kind = ModuleResolutionKind::from_options(&self.options)
+            .unwrap_or(ModuleResolutionKind::Bundler);
+        let strategy = (kind, edge.mode);
+        let host = LoaderResolutionHost(self.fs.as_ref());
+        let mut cache = ResolutionCache::new();
+        let specifier = &*edge.specifier;
+        let root = &self.root;
+        let options = &self.options;
+        resolve_type_reference(
+            root, options, importer, specifier, strategy, &host, &mut cache,
+        )
+        .or_else(|_| {
+            resolve_module_name(
+                root, options, importer, specifier, strategy, &host, &mut cache,
+            )
+        })
+        .ok()
+        .and_then(|resolved| self.fs.normalize(resolved.path()).ok())
     }
 
     fn resolve_local(
@@ -1074,6 +1275,7 @@ impl ProgramLoader {
                             mode: edge.mode,
                             specifier,
                             range: edge.range,
+                            directive: edge.directive,
                         };
                         match self.resolve_mapped(&external.specifier, flavor)? {
                             Some(mapped) => Ok(Some(ResolvedEdgeTarget::Local(mapped))),
@@ -1100,6 +1302,25 @@ impl ProgramLoader {
 enum ResolvedEdgeTarget {
     Local(PathBuf),
     External(Arc<str>),
+    /// Nothing satisfies the specifier, and the load was told to continue.
+    Unresolved(Arc<str>),
+}
+
+/// The loader's filesystem, as `tsc`'s resolution algorithm reads it.
+struct LoaderResolutionHost<'a>(&'a dyn FileSystem);
+
+impl ResolutionHost for LoaderResolutionHost<'_> {
+    fn file_exists(&self, path: &Path) -> bool {
+        self.0.metadata(path).is_ok() && !self.directory_exists(path)
+    }
+
+    fn directory_exists(&self, path: &Path) -> bool {
+        self.0.read_dir(path).is_ok()
+    }
+
+    fn read_file(&self, path: &Path) -> Option<Arc<str>> {
+        self.0.read(path).ok().map(Arc::from)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1221,6 +1442,8 @@ impl LoadState<'_> {
                             target: ModuleTarget::Local(source_id),
                             type_target: None,
                             range: pending.edge.range,
+                            unresolved: false,
+                            directive: pending.edge.directive,
                         });
                         if let Some(path) = pending.type_overlay {
                             self.type_overlays.push((
@@ -1309,6 +1532,7 @@ impl LoadState<'_> {
                             mode: self.ambient,
                             specifier: Arc::clone(specifier),
                             range: parsed.product().range(),
+                            directive: None,
                         });
                     }
                     let dependencies = Vec::with_capacity(unresolved.len());
@@ -1334,8 +1558,71 @@ impl LoadState<'_> {
                             let Some(edge) = frame.remaining.next() else {
                                 break None;
                             };
-                            let resolved =
-                                self.loader.resolve_edge(&frame.path, &edge, self.cancel)?;
+                            let resolved = match self.loader.resolve_edge(
+                                &frame.path,
+                                &edge,
+                                self.cancel,
+                            ) {
+                                Ok(resolved) => resolved,
+                                Err(error)
+                                    if edge.kind == ModuleEdgeKind::DynamicRuntime
+                                        && matches!(
+                                            error,
+                                            ProgramLoadError::UnresolvedModule(_)
+                                                | ProgramLoadError::InvalidSpecifier { .. }
+                                                | ProgramLoadError::InvalidPackage { .. }
+                                                | ProgramLoadError::UnsupportedSource(_)
+                                                | ProgramLoadError::Read { .. }
+                                                | ProgramLoadError::Source { .. }
+                                                | ProgramLoadError::IllFormedModuleSpecifier { .. }
+                                                | ProgramLoadError::TraversalRejected { .. }
+                                                | ProgramLoadError::JsxPlan { .. }
+                                        ) =>
+                                {
+                                    frame.dependencies.push(ModuleEdge {
+                                        kind: edge.kind,
+                                        flavor: crate::project::ResolutionFlavor::Runtime,
+                                        mode: edge.mode,
+                                        specifier: Arc::clone(&edge.specifier),
+                                        target: ModuleTarget::External(Arc::clone(&edge.specifier)),
+                                        type_target: None,
+                                        range: edge.range,
+                                        unresolved: true,
+                                        directive: edge.directive,
+                                    });
+                                    continue;
+                                }
+                                Err(error)
+                                    if edge.kind == ModuleEdgeKind::TypeOnly
+                                        && edge.directive.is_some()
+                                        && matches!(
+                                            error,
+                                            ProgramLoadError::UnresolvedModule(_)
+                                                | ProgramLoadError::InvalidSpecifier { .. }
+                                                | ProgramLoadError::InvalidPackage { .. }
+                                                | ProgramLoadError::UnsupportedSource(_)
+                                                | ProgramLoadError::Read { .. }
+                                                | ProgramLoadError::Source { .. }
+                                                | ProgramLoadError::IllFormedModuleSpecifier { .. }
+                                                | ProgramLoadError::TraversalRejected { .. }
+                                                | ProgramLoadError::JsxPlan { .. }
+                                        ) =>
+                                {
+                                    frame.dependencies.push(ModuleEdge {
+                                        kind: edge.kind,
+                                        flavor: crate::project::ResolutionFlavor::Types,
+                                        mode: edge.mode,
+                                        specifier: Arc::clone(&edge.specifier),
+                                        target: ModuleTarget::External(Arc::clone(&edge.specifier)),
+                                        type_target: None,
+                                        range: edge.range,
+                                        unresolved: true,
+                                        directive: edge.directive,
+                                    });
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
                             match resolved.target {
                                 ResolvedEdgeTarget::Local(target_path) => {
                                     frame.pending_edge = Some(PendingEdge {
@@ -1354,6 +1641,21 @@ impl LoadState<'_> {
                                         target: ModuleTarget::External(specifier),
                                         type_target: None,
                                         range: edge.range,
+                                        unresolved: false,
+                                        directive: edge.directive,
+                                    });
+                                }
+                                ResolvedEdgeTarget::Unresolved(specifier) => {
+                                    frame.dependencies.push(ModuleEdge {
+                                        kind: edge.kind,
+                                        flavor: resolved.flavor,
+                                        mode: edge.mode,
+                                        specifier: edge.specifier,
+                                        target: ModuleTarget::External(specifier),
+                                        type_target: None,
+                                        range: edge.range,
+                                        unresolved: true,
+                                        directive: edge.directive,
                                     });
                                 }
                             }
@@ -1393,6 +1695,8 @@ impl LoadState<'_> {
                         target: ModuleTarget::Local(source_id),
                         type_target: None,
                         range: pending.edge.range,
+                        unresolved: false,
+                        directive: pending.edge.directive,
                     });
                     if let Some(path) = pending.type_overlay {
                         self.type_overlays
@@ -1422,6 +1726,7 @@ struct UnresolvedEdge {
     mode: ResolutionMode,
     specifier: Arc<str>,
     range: TextRange,
+    directive: Option<ReferenceDirectiveKind>,
 }
 
 fn collect_edges(
@@ -1429,6 +1734,7 @@ fn collect_edges(
     ambient: ResolutionMode,
 ) -> Result<Vec<UnresolvedEdge>, TextRange> {
     let mut edges = Vec::new();
+    collect_reference_directives(source, ambient, &mut edges);
     for statement in source.statements() {
         match statement.data() {
             Statement::Import(import) => {
@@ -1534,9 +1840,172 @@ fn collect_edges(
             mode: ambient,
             specifier: Arc::from(specifier),
             range: window[2].range(),
+            directive: None,
         });
     }
     Ok(edges)
+}
+
+fn collect_reference_directives(
+    source: &SourceFile,
+    ambient: ResolutionMode,
+    edges: &mut Vec<UnresolvedEdge>,
+) {
+    let boundary = source
+        .statements()
+        .first()
+        .map(|statement| statement.range().start());
+    for token in source.tokens() {
+        if boundary.is_some_and(|end| token.range().start() >= end) {
+            break;
+        }
+        if token.kind() != TokenKind::LineComment {
+            continue;
+        }
+        let Some(text) = source.token_text(token) else {
+            continue;
+        };
+        parse_reference_directive(source, text, token, ambient, edges);
+    }
+}
+
+fn parse_reference_directive(
+    source: &SourceFile,
+    text: &str,
+    token: &crate::syntax::Token,
+    ambient: ResolutionMode,
+    edges: &mut Vec<UnresolvedEdge>,
+) {
+    let bytes = text.as_bytes();
+    if bytes.len() < 3 || &bytes[..3] != b"///" || bytes.get(3) == Some(&b'/') {
+        return;
+    }
+    let tag = b"<reference";
+    let mut cursor = 3;
+    while cursor + tag.len() <= bytes.len() && &bytes[cursor..cursor + tag.len()] != tag {
+        cursor += 1;
+    }
+    if cursor + tag.len() > bytes.len() {
+        return;
+    }
+    cursor += tag.len();
+    loop {
+        skip_ascii_whitespace(bytes, &mut cursor);
+        if bytes.get(cursor) == Some(&b'/') {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b'>') {
+            break;
+        }
+        let Some(attribute) = next_directive_attribute(text, &mut cursor) else {
+            return;
+        };
+        let kind = match attribute.name {
+            "path" => ReferenceDirectiveKind::Path,
+            "types" => ReferenceDirectiveKind::Types,
+            "lib" => ReferenceDirectiveKind::Lib,
+            _ => continue,
+        };
+        edges.push(UnresolvedEdge {
+            kind: ModuleEdgeKind::TypeOnly,
+            mode: ambient,
+            specifier: Arc::from(attribute.value),
+            range: directive_value_range(
+                source,
+                token,
+                text,
+                attribute.value_start,
+                attribute.value_end,
+            ),
+            directive: Some(kind),
+        });
+    }
+}
+
+struct DirectiveAttribute<'a> {
+    name: &'a str,
+    value: &'a str,
+    value_start: usize,
+    value_end: usize,
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], cursor: &mut usize) {
+    while bytes.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
+        *cursor += 1;
+    }
+}
+
+fn next_directive_attribute<'a>(
+    text: &'a str,
+    cursor: &mut usize,
+) -> Option<DirectiveAttribute<'a>> {
+    let bytes = text.as_bytes();
+    let name_start = *cursor;
+    while bytes
+        .get(*cursor)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'_')
+    {
+        *cursor += 1;
+    }
+    if *cursor == name_start {
+        return None;
+    }
+    let name = &text[name_start..*cursor];
+    skip_ascii_whitespace(bytes, cursor);
+    if bytes.get(*cursor) != Some(&b'=') {
+        return None;
+    }
+    *cursor += 1;
+    skip_ascii_whitespace(bytes, cursor);
+    let quote = match bytes.get(*cursor) {
+        Some(b'"') | Some(b'\'') => bytes[*cursor],
+        _ => return None,
+    };
+    *cursor += 1;
+    let value_start = *cursor;
+    while bytes.get(*cursor).is_some_and(|byte| *byte != quote) {
+        *cursor += 1;
+    }
+    if bytes.get(*cursor) != Some(&quote) {
+        return None;
+    }
+    let value_end = *cursor;
+    *cursor += 1;
+    Some(DirectiveAttribute {
+        name,
+        value: &text[value_start..value_end],
+        value_start,
+        value_end,
+    })
+}
+
+fn directive_value_range(
+    source: &SourceFile,
+    token: &crate::syntax::Token,
+    text: &str,
+    start: usize,
+    end: usize,
+) -> TextRange {
+    let fallback = token.range();
+    let base = source.source_text().utf16_to_byte(token.range().start());
+    let Ok(base) = base else {
+        return fallback;
+    };
+    let (Some(value_start), Some(value_end)) = (base.checked_add(start), base.checked_add(end))
+    else {
+        return fallback;
+    };
+    if value_end > base + text.len() {
+        return fallback;
+    }
+    let source_text = source.source_text();
+    let (Ok(range_start), Ok(range_end)) = (
+        source_text.byte_to_utf16(value_start),
+        source_text.byte_to_utf16(value_end),
+    ) else {
+        return fallback;
+    };
+    TextRange::new(range_start, range_end).unwrap_or(fallback)
 }
 
 struct DynamicEdgeCollector<'a> {
@@ -1803,7 +2272,9 @@ impl DynamicEdgeCollector<'_> {
                     }
                 }
                 ClassMember::StaticBlock(block) => self.scan_statements(&block.data().statements),
-                ClassMember::IndexSignature(_) | ClassMember::Missing(_) => {}
+                ClassMember::IndexSignature(_)
+                | ClassMember::Missing(_)
+                | ClassMember::Semicolon => {}
             }
         }
     }
@@ -2009,7 +2480,9 @@ impl DynamicEdgeCollector<'_> {
             }
             AssignmentTarget::Array(value) => {
                 for element in &value.elements {
-                    if let AssignmentArrayElement::Target(value) = element {
+                    if let AssignmentArrayElement::Target(value)
+                    | AssignmentArrayElement::Rest(value) = element
+                    {
                         self.scan_target(value);
                     }
                 }
@@ -2057,6 +2530,7 @@ fn push_literal_edge(
         mode,
         specifier: Arc::from(specifier),
         range: literal.range(),
+        directive: None,
     });
     Ok(())
 }
@@ -2456,127 +2930,437 @@ pub fn lower_program_with_cancel(
         }
     }
 
-    let module_ids: HashMap<_, _> = resolved
-        .modules()
-        .iter()
-        .enumerate()
-        .map(|(index, module)| (module.source_id(), ModuleId::new(index as u32)))
-        .collect();
-    let mut raw_modules = Vec::with_capacity(resolved.modules().len());
-    for module in resolved.modules() {
-        check_lower_cancel(cancel, module.path(), ProgramLowerPhase::Metadata)?;
-        let output = frontend.module(module.source_id()).ok_or_else(|| {
-            program_lower_error(
-                module.path(),
-                ProgramLowerPhase::Frontend,
-                ProgramLowerErrorKind::MissingFrontend {
-                    source: module.source_id(),
-                },
-            )
-        })?;
-        let name = normalized_module_name(resolved.root(), module.path()).ok_or_else(|| {
-            program_lower_error(
-                module.path(),
-                ProgramLowerPhase::Metadata,
-                ProgramLowerErrorKind::InvalidModuleName,
-            )
-        })?;
-        raw_modules.push(collect_raw_module(
-            module,
-            output.source_file(),
-            output.semantic_model().enum_facts(),
-            output.semantic_model().namespace_facts(),
-            name,
-            &module_ids,
-        )?);
-        check_lower_cancel(cancel, module.path(), ProgramLowerPhase::Metadata)?;
-    }
-    check_lower_cancel(
-        cancel,
-        resolved.entrypoint().path(),
-        ProgramLowerPhase::Metadata,
-    )?;
-    resolve_import_equals_bindings(&mut raw_modules);
-    check_lower_cancel(
-        cancel,
-        resolved.entrypoint().path(),
-        ProgramLowerPhase::Metadata,
-    )?;
-    expand_star_exports(&mut raw_modules);
-    check_lower_cancel(
-        cancel,
-        resolved.entrypoint().path(),
-        ProgramLowerPhase::Metadata,
-    )?;
-
-    let mut linked_modules = Vec::with_capacity(raw_modules.len());
-    let mut provenance = Vec::with_capacity(raw_modules.len());
-    for (index, (resolved_module, raw)) in resolved
-        .modules()
-        .iter()
-        .zip(raw_modules.iter())
-        .enumerate()
+    let mut static_reachable: HashSet<SourceId> = HashSet::new();
     {
-        check_lower_cancel(cancel, resolved_module.path(), ProgramLowerPhase::Module)?;
-        let output = frontend
-            .module(resolved_module.source_id())
-            .expect("frontend presence checked above");
-        let file = output.source_file();
-        let strings = linkage_strings(raw);
-        let code = lower::assemble_program_module(
-            file,
-            options,
-            &strings,
-            raw.jsx_plan.as_ref(),
-            output.semantic_model().enum_facts(),
-            output.semantic_model().namespace_facts(),
-        )
-        .and_then(|module| {
-            module.verify().map_err(|error| LowerError {
-                source: file.source_id(),
-                range: file.range(),
-                kind: lower::LowerErrorKind::Verify(error),
-            })
-        })
-        .map_err(|error| {
-            program_lower_error(
-                resolved_module.path(),
-                ProgramLowerPhase::Module,
-                ProgramLowerErrorKind::Lower(error),
-            )
-        })?;
-        check_lower_cancel(cancel, resolved_module.path(), ProgramLowerPhase::Module)?;
-        linked_modules.push(materialize_program_module(code, raw));
-        provenance.push(ExecutableModuleProvenance {
-            module: ModuleId::new(index as u32),
-            source: resolved_module.identity().clone(),
-            edges: Arc::from(resolved_module.dependencies()),
-        });
+        let mut worklist = vec![resolved.entrypoint_id()];
+        static_reachable.insert(resolved.entrypoint_id());
+        while let Some(id) = worklist.pop() {
+            let Some(current) = resolved.module(id) else {
+                continue;
+            };
+            for dep in current.dependencies() {
+                if dep.kind() != ModuleEdgeKind::StaticRuntime {
+                    continue;
+                }
+                if let ModuleTarget::Local(target) = dep.target()
+                    && static_reachable.insert(*target)
+                {
+                    worklist.push(*target);
+                }
+            }
+        }
     }
-    let entry = module_ids[&resolved.entrypoint_id()];
-    check_lower_cancel(
-        cancel,
-        resolved.entrypoint().path(),
-        ProgramLowerPhase::Link,
-    )?;
-    let wire = BytecodeProgram::link(linked_modules, entry).map_err(|error| {
-        let path = error
-            .module
-            .and_then(|module| resolved.modules().get(module.get() as usize))
-            .map_or_else(|| resolved.entrypoint().path(), ResolvedModule::path);
-        program_lower_error(
-            path,
+    let mut excluded: HashSet<SourceId> = HashSet::new();
+    let mut stubbed: HashSet<SourceId> = HashSet::new();
+    let mut synthetic_id = resolved
+        .modules()
+        .iter()
+        .map(|module| module.source_id().get())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    loop {
+        let kept: Vec<&ResolvedModule> = resolved
+            .modules()
+            .iter()
+            .filter(|module| !excluded.contains(&module.source_id()))
+            .collect();
+        let new_ids: HashMap<SourceId, ModuleId> = kept
+            .iter()
+            .enumerate()
+            .map(|(index, module)| {
+                (
+                    module.source_id(),
+                    ModuleId::new(u32::try_from(index).expect("kept fits u32")),
+                )
+            })
+            .collect();
+        let orig_ids: HashMap<SourceId, ModuleId> = resolved
+            .modules()
+            .iter()
+            .enumerate()
+            .map(|(index, module)| {
+                (
+                    module.source_id(),
+                    ModuleId::new(u32::try_from(index).expect("resolved fits u32")),
+                )
+            })
+            .collect();
+        let mut raw_modules: Vec<RawModule> = Vec::with_capacity(kept.len());
+        let mut stub_codes: HashMap<SourceId, bamts_bytecode::Module<bamts_bytecode::Verified>> =
+            HashMap::new();
+        for module in &kept {
+            check_lower_cancel(cancel, module.path(), ProgramLowerPhase::Metadata)?;
+            if stubbed.contains(&module.source_id()) {
+                let name =
+                    normalized_module_name(resolved.root(), module.path()).ok_or_else(|| {
+                        program_lower_error(
+                            module.path(),
+                            ProgramLowerPhase::Metadata,
+                            ProgramLowerErrorKind::InvalidModuleName,
+                        )
+                    })?;
+                let stub_raw = RawModule {
+                    name: name.clone(),
+                    edges: Vec::new(),
+                    bindings: Vec::new(),
+                    exports: Vec::new(),
+                    stars: Vec::new(),
+                    jsx_plan: None,
+                };
+                let stub_source = SourceText::new(
+                    "throw new SyntaxError(\"dynamic import target failed to link\");",
+                )
+                .expect("stub fits budget");
+                let stub_arc = Arc::new(stub_source);
+                let stub_id = SourceId::new(synthetic_id);
+                synthetic_id = synthetic_id.saturating_add(1);
+                let scanned = scanner::scan_with_cancel(
+                    stub_id,
+                    module.script_kind(),
+                    Arc::clone(&stub_arc),
+                    cancel.clone(),
+                )
+                .map_err(|error| {
+                    let scanner::ScanError::Cancelled(cancelled) = error;
+                    program_lower_error(
+                        module.path(),
+                        ProgramLowerPhase::Module,
+                        ProgramLowerErrorKind::Cancelled(cancelled),
+                    )
+                })?;
+                let parsed =
+                    parser::parse_with_cancel(scanned, cancel.clone()).map_err(|error| {
+                        let parser::ParseError::Cancelled(cancelled) = error;
+                        program_lower_error(
+                            module.path(),
+                            ProgramLowerPhase::Module,
+                            ProgramLowerErrorKind::Cancelled(cancelled),
+                        )
+                    })?;
+                let synthetic = parsed.product();
+                let strings = linkage_strings(&stub_raw);
+                let enum_facts = crate::enum_plan::EnumFacts::unchecked();
+                let namespace_facts = crate::namespace_plan::NamespaceFacts::unchecked();
+                let code = lower::assemble_program_module(
+                    synthetic,
+                    LowerOptions {
+                        script_entry: false,
+                        javascript_compatibility: true,
+                    },
+                    &strings,
+                    None,
+                    &enum_facts,
+                    &namespace_facts,
+                )
+                .and_then(|unverified| {
+                    unverified.verify().map_err(|error| LowerError {
+                        source: synthetic.source_id(),
+                        range: synthetic.range(),
+                        kind: lower::LowerErrorKind::Verify(error),
+                    })
+                })
+                .map_err(|error| {
+                    program_lower_error(
+                        module.path(),
+                        ProgramLowerPhase::Module,
+                        ProgramLowerErrorKind::Lower(error),
+                    )
+                })?;
+                stub_codes.insert(module.source_id(), code);
+                raw_modules.push(stub_raw);
+                check_lower_cancel(cancel, module.path(), ProgramLowerPhase::Metadata)?;
+                continue;
+            }
+            let output = frontend.module(module.source_id()).ok_or_else(|| {
+                program_lower_error(
+                    module.path(),
+                    ProgramLowerPhase::Frontend,
+                    ProgramLowerErrorKind::MissingFrontend {
+                        source: module.source_id(),
+                    },
+                )
+            })?;
+            let name = normalized_module_name(resolved.root(), module.path()).ok_or_else(|| {
+                program_lower_error(
+                    module.path(),
+                    ProgramLowerPhase::Metadata,
+                    ProgramLowerErrorKind::InvalidModuleName,
+                )
+            })?;
+            let mut raw = collect_raw_module(
+                module,
+                output.source_file(),
+                output.semantic_model().enum_facts(),
+                output.semantic_model().namespace_facts(),
+                name,
+                &orig_ids,
+            )?;
+            for edge in &mut raw.edges {
+                if let EdgeTarget::Local(orig) = edge.target {
+                    let target_source = resolved.modules()[orig.get() as usize].source_id();
+                    if excluded.contains(&target_source) {
+                        edge.target = EdgeTarget::External;
+                        edge.external_identity = Some(edge.specifier.clone());
+                    } else if let Some(remapped) = new_ids.get(&target_source) {
+                        edge.target = EdgeTarget::Local(*remapped);
+                    }
+                }
+            }
+            if runs_as_script(resolved, module, output.source_file(), options) {
+                raw.bindings
+                    .retain(|binding| !matches!(binding.kind, RawBindingKind::Hoisted));
+            }
+            raw_modules.push(raw);
+            check_lower_cancel(cancel, module.path(), ProgramLowerPhase::Metadata)?;
+        }
+        check_lower_cancel(
+            cancel,
+            resolved.entrypoint().path(),
+            ProgramLowerPhase::Metadata,
+        )?;
+        resolve_import_equals_bindings(&mut raw_modules);
+        check_lower_cancel(
+            cancel,
+            resolved.entrypoint().path(),
+            ProgramLowerPhase::Metadata,
+        )?;
+        expand_star_exports(&mut raw_modules);
+        check_lower_cancel(
+            cancel,
+            resolved.entrypoint().path(),
+            ProgramLowerPhase::Metadata,
+        )?;
+        let mut linked_modules = Vec::with_capacity(raw_modules.len());
+        let mut provenance = Vec::with_capacity(raw_modules.len());
+        let mut module_failures: Vec<(SourceId, ProgramLowerError)> = Vec::new();
+        for (index, (kept_module, raw)) in kept.iter().zip(raw_modules.iter()).enumerate() {
+            check_lower_cancel(cancel, kept_module.path(), ProgramLowerPhase::Module)?;
+            let code = if let Some(stub) = stub_codes.remove(&kept_module.source_id()) {
+                stub
+            } else {
+                let output = frontend
+                    .module(kept_module.source_id())
+                    .expect("frontend presence checked above");
+                let file = output.source_file();
+                let strings = linkage_strings(raw);
+                match lower::assemble_program_module(
+                    file,
+                    LowerOptions {
+                        script_entry: runs_as_script(resolved, kept_module, file, options),
+                        ..options
+                    },
+                    &strings,
+                    raw.jsx_plan.as_ref(),
+                    output.semantic_model().enum_facts(),
+                    output.semantic_model().namespace_facts(),
+                )
+                .and_then(|unverified| {
+                    unverified.verify().map_err(|error| LowerError {
+                        source: file.source_id(),
+                        range: file.range(),
+                        kind: lower::LowerErrorKind::Verify(error),
+                    })
+                }) {
+                    Ok(code) => code,
+                    Err(error) => {
+                        module_failures.push((
+                            kept_module.source_id(),
+                            program_lower_error(
+                                kept_module.path(),
+                                ProgramLowerPhase::Module,
+                                ProgramLowerErrorKind::Lower(error),
+                            ),
+                        ));
+                        continue;
+                    }
+                }
+            };
+            check_lower_cancel(cancel, kept_module.path(), ProgramLowerPhase::Module)?;
+            linked_modules.push(materialize_program_module(code, raw));
+            provenance.push(ExecutableModuleProvenance {
+                module: ModuleId::new(u32::try_from(index).expect("kept fits u32")),
+                source: kept_module.identity().clone(),
+                edges: Arc::from(kept_module.dependencies()),
+            });
+        }
+        if !module_failures.is_empty() {
+            if let Some((_, failure)) = module_failures
+                .iter()
+                .find(|(source, _)| static_reachable.contains(source))
+            {
+                return Err(failure.clone());
+            }
+            let failing: Vec<SourceId> =
+                module_failures.iter().map(|(source, _)| *source).collect();
+            let (_, failure) = module_failures
+                .into_iter()
+                .next()
+                .expect("a non-empty failure list has a first failure");
+            let mut quarantine = DynamicQuarantine {
+                resolved,
+                static_reachable: &static_reachable,
+                stubbed: &mut stubbed,
+                excluded: &mut excluded,
+            };
+            if !quarantine.quarantine_all(&failing) {
+                return Err(failure);
+            }
+            continue;
+        }
+        let entry = new_ids[&resolved.entrypoint_id()];
+        check_lower_cancel(
+            cancel,
+            resolved.entrypoint().path(),
             ProgramLowerPhase::Link,
-            ProgramLowerErrorKind::Link(error),
-        )
-    })?;
-    check_lower_cancel(
-        cancel,
-        resolved.entrypoint().path(),
-        ProgramLowerPhase::Link,
-    )?;
-    Ok(ExecutableProgram { wire, provenance })
+        )?;
+        match BytecodeProgram::link(linked_modules, entry) {
+            Ok(wire) => {
+                check_lower_cancel(
+                    cancel,
+                    resolved.entrypoint().path(),
+                    ProgramLowerPhase::Link,
+                )?;
+                return Ok(ExecutableProgram { wire, provenance });
+            }
+            Err(link_error) => {
+                let failing_source = link_error
+                    .module
+                    .and_then(|mid| kept.get(mid.get() as usize))
+                    .map(|module| module.source_id());
+                let Some(failing) = failing_source else {
+                    let path = link_error
+                        .module
+                        .and_then(|module| resolved.modules().get(module.get() as usize))
+                        .map_or_else(|| resolved.entrypoint().path(), ResolvedModule::path);
+                    return Err(program_lower_error(
+                        path,
+                        ProgramLowerPhase::Link,
+                        ProgramLowerErrorKind::Link(link_error),
+                    ));
+                };
+                if static_reachable.contains(&failing) {
+                    let path = resolved
+                        .module(failing)
+                        .map_or_else(|| resolved.entrypoint().path(), ResolvedModule::path);
+                    return Err(program_lower_error(
+                        path,
+                        ProgramLowerPhase::Link,
+                        ProgramLowerErrorKind::Link(link_error),
+                    ));
+                }
+                let mut quarantine = DynamicQuarantine {
+                    resolved,
+                    static_reachable: &static_reachable,
+                    stubbed: &mut stubbed,
+                    excluded: &mut excluded,
+                };
+                if !quarantine.quarantine_all(&[failing]) {
+                    let path = resolved
+                        .module(failing)
+                        .map_or_else(|| resolved.entrypoint().path(), ResolvedModule::path);
+                    return Err(program_lower_error(
+                        path,
+                        ProgramLowerPhase::Link,
+                        ProgramLowerErrorKind::Link(link_error),
+                    ));
+                }
+                continue;
+            }
+        }
+    }
 }
+
+fn live_without(
+    resolved: &ResolvedProgram,
+    failing: &HashSet<SourceId>,
+    excluded: &HashSet<SourceId>,
+    stubbed: &HashSet<SourceId>,
+) -> HashSet<SourceId> {
+    let mut protected = HashSet::new();
+    let mut stack = vec![resolved.entrypoint_id()];
+    while let Some(current) = stack.pop() {
+        if failing.contains(&current) || !protected.insert(current) {
+            continue;
+        }
+
+        if excluded.contains(&current) || stubbed.contains(&current) {
+            continue;
+        }
+        let Some(node) = resolved.module(current) else {
+            continue;
+        };
+        for dependency in node.dependencies() {
+            if let ModuleTarget::Local(target) = dependency.target() {
+                if !failing.contains(target) {
+                    stack.push(*target);
+                }
+            }
+        }
+    }
+    protected
+}
+
+struct DynamicQuarantine<'a> {
+    resolved: &'a ResolvedProgram,
+    static_reachable: &'a HashSet<SourceId>,
+    stubbed: &'a mut HashSet<SourceId>,
+    excluded: &'a mut HashSet<SourceId>,
+}
+
+impl DynamicQuarantine<'_> {
+    fn quarantine_all(&mut self, failing: &[SourceId]) -> bool {
+        let mut progressed = false;
+        for source in failing {
+            progressed |= self.stubbed.insert(*source);
+        }
+        let failing: HashSet<SourceId> = failing.iter().copied().collect();
+        let protected = live_without(self.resolved, &failing, self.excluded, self.stubbed);
+        for source in &failing {
+            progressed |= self.exclude_transitive(*source, &protected);
+        }
+        progressed
+    }
+
+    fn exclude_transitive(&mut self, failing: SourceId, protected: &HashSet<SourceId>) -> bool {
+        let mut progressed = false;
+        let mut stack = vec![failing];
+        let mut seen = HashSet::new();
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            let Some(node) = self.resolved.module(current) else {
+                continue;
+            };
+            for dependency in node.dependencies() {
+                if let ModuleTarget::Local(target) = dependency.target() {
+                    progressed |= self.consider(target, failing, protected, &mut stack);
+                }
+            }
+        }
+        progressed
+    }
+
+    fn consider(
+        &mut self,
+        target: &SourceId,
+        failing: SourceId,
+        protected: &HashSet<SourceId>,
+        stack: &mut Vec<SourceId>,
+    ) -> bool {
+        stack.push(*target);
+        if *target == failing
+            || self.static_reachable.contains(target)
+            || protected.contains(target)
+            || self.stubbed.contains(target)
+        {
+            return false;
+        }
+        self.excluded.insert(*target)
+    }
+}
+
 fn check_lower_cancel(
     cancel: &CancellationToken,
     path: &Path,
@@ -3379,6 +4163,19 @@ fn materialize_program_module(
     }
 }
 
+/// Whether `module` is the Script the host asked for. A file with module syntax
+/// is a module either way, and the host decides whether that is an error.
+fn runs_as_script(
+    resolved: &ResolvedProgram,
+    module: &ResolvedModule,
+    file: &SourceFile,
+    options: LowerOptions,
+) -> bool {
+    options.script_entry
+        && module.source_id() == resolved.entrypoint().source_id()
+        && !crate::early_errors::is_module(file)
+}
+
 fn normalized_module_name(root: &ProjectRoot, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root.path()).ok()?;
     let mut name = String::new();
@@ -3498,7 +4295,7 @@ mod tests {
     use super::{
         ExecutableProgram, JsxRoutingDecision, ModuleEdgeKind, ModuleTarget, ProgramLoadError,
         ProgramLoader, ProgramLowerErrorKind, ProgramLowerPhase, ProgramOutputKind,
-        ResolutionFlavor, ResolutionMode, ResolvedProgram, lower_program,
+        ReferenceDirectiveKind, ResolutionFlavor, ResolutionMode, ResolvedProgram, lower_program,
         lower_program_with_cancel,
     };
     use crate::checker::ProgramCheckOptions;
@@ -3644,6 +4441,7 @@ mod tests {
             &frontend,
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
         )
         .unwrap()
@@ -3742,6 +4540,7 @@ mod tests {
             &frontend,
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
         )
         .expect_err("ill-formed metadata must not reach host String conversion");
@@ -4639,6 +5438,308 @@ mod tests {
                 .any(|instruction| matches!(instruction, Instruction::ImportDynamic { .. }))
         );
     }
+    #[test]
+    fn dynamic_missing_literal_does_not_fail_program_load() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "const pending = import('./THIS_FILE_DOES_NOT_EXIST.js'); pending;",
+        );
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("missing dynamic target loads");
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(edge.kind(), ModuleEdgeKind::DynamicRuntime);
+        assert!(edge.is_unresolved());
+    }
+
+    #[test]
+    fn dynamic_empty_specifier_does_not_fail_program_load() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "{ import(''); }");
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("empty dynamic specifier loads");
+        let main = resolved.entrypoint();
+        assert!(
+            main.dependencies()
+                .iter()
+                .all(|edge| edge.kind() != ModuleEdgeKind::StaticRuntime)
+        );
+    }
+
+    #[test]
+    fn dynamic_valid_target_stays_local() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 1;");
+        fixture.write("main.ts", "const pending = import('./dep.js'); pending;");
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("valid dynamic target loads");
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(edge.kind(), ModuleEdgeKind::DynamicRuntime);
+        assert!(!edge.is_unresolved());
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main_wire = module(&executable, "main.ts");
+        assert_eq!(main_wire.edges()[0].kind, EdgeKind::Dynamic);
+    }
+    #[test]
+    fn dynamic_link_failure_does_not_fail_program_link() {
+        let fixture = Fixture::new();
+        fixture.write("circular-1.ts", "export { x } from './circular-2.js';");
+        fixture.write("circular-2.ts", "export { x } from './circular-1.js';");
+        fixture.write(
+            "main.ts",
+            "const pending = import('./circular-1.js'); pending;",
+        );
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("dynamic link fixture loads");
+        let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+        let executable = lower_program(&resolved, &frontend, LowerOptions::default())
+            .expect("dynamic link failure becomes runtime rejection");
+        let main_wire = module(&executable, "main.ts");
+        assert!(
+            main_wire
+                .edges()
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::Dynamic)
+        );
+    }
+    #[test]
+    fn dynamic_link_failure_keeps_shared_dependency_of_surviving_branch() {
+        let fixture = Fixture::new();
+        fixture.write("shared.ts", "export const value = 1;");
+        fixture.write(
+            "good.ts",
+            "import { value } from './shared.js';\nexport const got = value;\n",
+        );
+        fixture.write(
+            "bad.ts",
+            "import { value } from './shared.js';\n\
+             export { x } from './bad-2.js';\n\
+             export const other = value;\n",
+        );
+        fixture.write("bad-2.ts", "export { x } from './bad.js';\n");
+        fixture.write(
+            "main.ts",
+            "const good = import('./good.js');\nconst bad = import('./bad.js');\ngood;\nbad;\n",
+        );
+        let executable = lower_fixture(&fixture, "main.ts");
+        let good = module(&executable, "good.ts");
+        let shared_edge = good
+            .edges()
+            .iter()
+            .find(|edge| constant_string(good, edge.specifier) == "./shared.js")
+            .expect("the surviving branch keeps its shared edge");
+        assert!(
+            matches!(shared_edge.target, EdgeTarget::Local(_)),
+            "the shared dependency stays local instead of being excluded with the failure"
+        );
+        module(&executable, "shared.ts");
+    }
+
+    #[test]
+    fn dynamic_assemble_failures_quarantine_every_failing_module_together() {
+        let fixture = Fixture::new();
+        fixture.write("good.ts", "export const got = 1;\n");
+        fixture.write("bad1.js", "export const bad = 1;\n");
+        fixture.write("bad2.js", "export const bad = 2;\n");
+        fixture.write(
+            "main.ts",
+            "const good = import('./good.js');\n\
+             const one = import('./bad1.js');\n\
+             const two = import('./bad2.js');\n\
+             good;\none;\ntwo;\n",
+        );
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+        let executable = lower_program(
+            &resolved,
+            &frontend,
+            LowerOptions {
+                javascript_compatibility: false,
+                ..LowerOptions::default()
+            },
+        )
+        .expect("two dynamic-only assemble failures quarantine without failing the run");
+        let main = module(&executable, "main.ts");
+        assert_eq!(main.edges().len(), 3);
+        assert!(
+            main.edges()
+                .iter()
+                .all(|edge| edge.kind == EdgeKind::Dynamic)
+        );
+        for name in ["bad1.js", "bad2.js"] {
+            assert!(
+                module(&executable, name).edges().is_empty(),
+                "{name} is stubbed instead of failing the run"
+            );
+        }
+        module(&executable, "good.ts");
+    }
+
+    #[test]
+    fn reference_path_directive_adds_type_only_dependency() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 1;\n");
+        fixture.write(
+            "main.ts",
+            "/// <reference path=\"./dep.ts\" />\nexport const x = 1;\n",
+        );
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("path directive loads");
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(edge.kind(), ModuleEdgeKind::TypeOnly);
+        assert_eq!(
+            edge.reference_directive(),
+            Some(ReferenceDirectiveKind::Path)
+        );
+        assert!(!edge.is_unresolved());
+        assert!(matches!(edge.target(), ModuleTarget::Local(_)));
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main_wire = module(&executable, "main.ts");
+        assert!(
+            main_wire.edges().is_empty(),
+            "a reference directive creates no runtime edge"
+        );
+    }
+
+    #[test]
+    fn reference_path_directive_to_missing_file_does_not_fail_program_load() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "/// <reference path=\"./missing.ts\" />\nexport const x = 1;\n",
+        );
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("missing path directive loads");
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(edge.kind(), ModuleEdgeKind::TypeOnly);
+        assert_eq!(
+            edge.reference_directive(),
+            Some(ReferenceDirectiveKind::Path)
+        );
+        assert!(edge.is_unresolved());
+    }
+
+    #[test]
+    fn reference_path_directive_to_self_loads_once() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "self.ts",
+            "///<reference path='self.ts'/>\nclass Named { }\n",
+        );
+        let resolved = fixture
+            .loader()
+            .load("self.ts")
+            .expect("self reference loads");
+        assert_eq!(resolved.modules().len(), 1);
+        let entry = resolved.entrypoint();
+        assert_eq!(entry.dependencies().len(), 1);
+        assert_eq!(
+            entry.dependencies()[0].reference_directive(),
+            Some(ReferenceDirectiveKind::Path)
+        );
+    }
+
+    #[test]
+    fn reference_lib_directive_records_external_lib_edge() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.ts",
+            "/// <reference lib=\"dom\" />\nexport const x = 1;\n",
+        );
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("lib directive loads");
+        assert_eq!(resolved.modules().len(), 1);
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(edge.kind(), ModuleEdgeKind::TypeOnly);
+        assert_eq!(
+            edge.reference_directive(),
+            Some(ReferenceDirectiveKind::Lib)
+        );
+        assert_eq!(edge.specifier(), "dom");
+        assert!(matches!(
+            edge.target(),
+            ModuleTarget::External(name) if name.as_ref() == "lib:dom"
+        ));
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main_wire = module(&executable, "main.ts");
+        assert!(
+            main_wire.edges().is_empty(),
+            "a reference directive creates no runtime edge"
+        );
+    }
+
+    #[test]
+    fn reference_directive_after_first_statement_is_ignored() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 1;\n");
+        fixture.write(
+            "main.ts",
+            "export const x = 1;\n/// <reference path=\"./dep.ts\" />\n",
+        );
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("trailing comment loads");
+        assert_eq!(resolved.modules().len(), 1);
+        assert!(resolved.entrypoint().dependencies().is_empty());
+    }
+
+    #[test]
+    fn reference_types_directive_resolves_at_types_package() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "node_modules/@types/foo/index.d.ts",
+            "export const value: number;\n",
+        );
+        fixture.write(
+            "main.ts",
+            "/// <reference types=\"foo\" />\nexport const x = 1;\n",
+        );
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("types directive loads");
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(edge.kind(), ModuleEdgeKind::TypeOnly);
+        assert_eq!(
+            edge.reference_directive(),
+            Some(ReferenceDirectiveKind::Types)
+        );
+        assert!(!edge.is_unresolved());
+        assert!(matches!(edge.target(), ModuleTarget::Local(_)));
+        let executable = lower_fixture(&fixture, "main.ts");
+        let main_wire = module(&executable, "main.ts");
+        assert!(
+            main_wire.edges().is_empty(),
+            "a reference directive creates no runtime edge"
+        );
+    }
 
     #[test]
     fn program_lowering_coalesces_static_and_dynamic_imports_of_one_target() {
@@ -5527,6 +6628,7 @@ mod tests {
                 &frontend,
                 LowerOptions {
                     javascript_compatibility: true,
+                    ..LowerOptions::default()
                 },
             )
             .unwrap_or_else(|error| panic!("{entrypoint}: {error}"));
@@ -5693,6 +6795,7 @@ mod tests {
             &frontend,
             LowerOptions {
                 javascript_compatibility: true,
+                ..LowerOptions::default()
             },
         )
         .unwrap();

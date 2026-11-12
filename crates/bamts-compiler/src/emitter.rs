@@ -24,14 +24,14 @@ pub mod transforms;
 pub mod transpile;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
     sync::Arc,
 };
 
 use crate::checker::{SemanticModel, Type, TypeId, render_type_declaration};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
-use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar};
+use crate::enum_plan::{EnumFacts, EnumScalar};
 use crate::jsx_desugar::JsxSourceDesugarPlan;
 use crate::source::{JsxEmit, SourceId, SourceText, TextRange, Utf16Pos};
 use crate::syntax::*;
@@ -87,6 +87,9 @@ pub enum ModuleKind {
     System,
     Es2015,
     EsNext,
+    /// A Node mode, where each file is CommonJS or an ES module. The project
+    /// resolves it per file before emit.
+    Node,
 }
 
 /// The structural line terminator the emitter inserts between lines.
@@ -118,11 +121,19 @@ pub struct EmitOptions {
     /// Assume downleveling helpers exist globally; emit no helper prelude
     /// (`noEmitHelpers`, tsc's noEmitHelpers).
     pub no_emit_helpers: bool,
+    /// Leave authored comments out of the output (`removeComments`).
+    pub remove_comments: bool,
+    /// Keeps every import and export as written instead of eliding by use.
+    pub verbatim_module_syntax: bool,
+    /// `(specifier, name)` pairs the program knows have no runtime form.
+    pub erased_imports: Arc<BTreeSet<(String, String)>>,
+    /// Something outside the source reads imports, so none can be proven unused.
+    pub keeps_imports: bool,
     pub use_define_for_class_fields: Option<bool>,
     pub declaration: bool,
     pub emit_declaration_only: bool,
     pub isolated_declarations: bool,
-    pub strip_private: bool,
+    pub strip_internal: bool,
     pub source_map: bool,
     pub inline_source_map: bool,
     pub inline_sources: bool,
@@ -148,11 +159,15 @@ impl Default for EmitOptions {
             always_strict: false,
             import_helpers: false,
             no_emit_helpers: false,
+            remove_comments: false,
+            verbatim_module_syntax: false,
+            erased_imports: Arc::default(),
+            keeps_imports: false,
             use_define_for_class_fields: None,
             declaration: false,
             emit_declaration_only: false,
             isolated_declarations: false,
-            strip_private: false,
+            strip_internal: false,
             source_map: false,
             inline_source_map: false,
             inline_sources: false,
@@ -254,6 +269,12 @@ impl EmitOptions {
                 };
                 self.no_emit_helpers = no_emit_helpers;
             }
+            "removecomments" => {
+                let Some(remove_comments) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.remove_comments = remove_comments;
+            }
             "module" => {
                 let Some(module) = parse_module(value) else {
                     return Some(invalid());
@@ -291,10 +312,10 @@ impl EmitOptions {
                 self.isolated_declarations = isolated_declarations;
             }
             "stripinternal" => {
-                let Some(strip_private) = parse_bool(value) else {
+                let Some(strip_internal) = parse_bool(value) else {
                     return Some(invalid());
                 };
-                self.strip_private = strip_private;
+                self.strip_internal = strip_internal;
             }
             "sourcemap" => {
                 let Some(source_map) = parse_bool(value) else {
@@ -392,6 +413,10 @@ impl EmitOptions {
             source_map: self.source_map,
             inline_source_map: self.inline_source_map,
             inline_sources: self.inline_sources,
+            remove_comments: self.remove_comments,
+            verbatim_module_syntax: self.verbatim_module_syntax,
+            erased_imports: Arc::clone(&self.erased_imports),
+            keeps_imports: self.keeps_imports,
         }
     }
 
@@ -399,8 +424,8 @@ impl EmitOptions {
         DeclarationOptions {
             newline: self.newline,
             indent_width: self.indent_width,
+            target: self.target,
             isolated_declarations: self.isolated_declarations,
-            strip_private: self.strip_private,
             declaration_map: self.declaration_map,
         }
     }
@@ -484,9 +509,15 @@ impl EmitOutput {
 pub(crate) struct PrintOptions {
     pub(crate) newline: Newline,
     pub(crate) indent_width: u8,
+    pub(crate) target: ScriptTarget,
     pub(crate) source_map: bool,
     pub(crate) inline_source_map: bool,
     pub(crate) inline_sources: bool,
+    pub(crate) remove_comments: bool,
+    /// An ES module whose output has no module syntax left ends in `export {};`.
+    pub(crate) module_marker: bool,
+    /// An import or re-export of only types still loads its module.
+    pub(crate) verbatim_module_syntax: bool,
 }
 
 pub(crate) struct PrintSource<'a> {
@@ -497,6 +528,8 @@ pub(crate) struct PrintSource<'a> {
     /// parser tree and any JSX-desugar consumption). Ids below it are
     /// parser-assigned and must carry ranges within the authored text.
     pub(crate) synthesized_floor: u32,
+    /// Raw lines that print in place of a marker statement.
+    pub(crate) inline_lines: Option<&'a HashMap<NodeId, String>>,
 }
 
 /// Print context for a braced block. Carries two tsc behaviors that split on
@@ -581,6 +614,7 @@ pub(crate) fn print(
             // No rewriter ran: every id is parser-assigned, so the mint
             // gate's range check applies universally.
             synthesized_floor: u32::MAX,
+            inline_lines: None,
         },
         model,
         options,
@@ -606,6 +640,7 @@ pub(crate) fn print_with_jsx_plan(
         original_content,
         synthesized,
         synthesized_floor,
+        inline_lines,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
         let mut builder = SourceMapBuilder::new()
@@ -640,6 +675,8 @@ pub(crate) fn print_with_jsx_plan(
             .map(|token| token.range())
             .collect(),
         tokens: file.tokens(),
+        pending_comments: Vec::new(),
+        comment_cursor: Utf16Pos::ZERO,
         source: file.source_text(),
         source_name: mapped_source_name,
         source_id: file.source_id(),
@@ -666,6 +703,8 @@ pub(crate) fn print_with_jsx_plan(
         authored_len: Utf16Pos::new(utf16_len(original_content)),
         synthesized,
         synthesized_floor,
+        emitted_module_syntax: false,
+        inline_lines,
     };
     if let Some(prelude) = prelude.filter(|prelude| !prelude.is_empty()) {
         let has_trailing_newline = prelude.ends_with('\n');
@@ -710,6 +749,92 @@ pub(crate) fn print_with_jsx_plan(
     }
 }
 
+#[must_use]
+pub(crate) fn print_json_value(
+    source: PrintSource<'_>,
+    model: &SemanticModel,
+    options: PrintOptions,
+    names: &EmitFileNames,
+    expression: &Expr,
+) -> EmitOutput {
+    let PrintSource {
+        file,
+        original_content,
+        synthesized,
+        synthesized_floor,
+        inline_lines,
+    } = source;
+    let mut source_map = (options.source_map || options.inline_source_map).then(|| {
+        let mut builder = SourceMapBuilder::new().with_sources_content(options.inline_sources);
+        if let Some(file_name) = names.js_file_name.as_deref() {
+            builder = builder.with_file(file_name);
+        }
+        if let Some(source_root) = names.source_root.as_deref() {
+            builder = builder.with_source_root(source_root);
+        }
+        builder
+    });
+    if let Some(builder) = &mut source_map {
+        builder.intern_source_with_content(
+            names
+                .js_file_name
+                .as_deref()
+                .unwrap_or(names.source_name.as_ref()),
+            original_content,
+        );
+    }
+    let mapped_source_name: &str = names
+        .js_file_name
+        .as_deref()
+        .unwrap_or(names.source_name.as_ref());
+    let mut emitter = Emitter {
+        line_comments: file
+            .tokens()
+            .iter()
+            .filter(|token| token.kind() == TokenKind::LineComment)
+            .map(|token| token.range())
+            .collect(),
+        tokens: file.tokens(),
+        pending_comments: Vec::new(),
+        comment_cursor: Utf16Pos::ZERO,
+        source: file.source_text(),
+        source_name: mapped_source_name,
+        source_id: file.source_id(),
+        model,
+        enum_facts: model.enum_facts(),
+        options,
+        map: source_map.take(),
+        generated_line: 0,
+        generated_column: 0,
+        out: String::new(),
+        indent: 0,
+        pending_indent: false,
+        anchor: file.range(),
+        last_mapped_end: None,
+        jsx_plan: None,
+        diagnostics: Vec::new(),
+        decl_ambient: false,
+        current_scope: model.module_scope(),
+        decl_drop_member_export: false,
+        decl_source_is_js: false,
+        authored_len: Utf16Pos::new(utf16_len(original_content)),
+        synthesized,
+        synthesized_floor,
+        emitted_module_syntax: false,
+        inline_lines,
+    };
+    emitter.emit_expression_prec(expression, 0);
+    emitter.newline();
+    let code = emitter.out;
+    emitter.diagnostics.sort();
+    let source_map = emitter.map.take().map(SourceMapBuilder::finish);
+    EmitOutput {
+        javascript: Some(EmittedFile { code, source_map }),
+        declaration: None,
+        diagnostics: emitter.diagnostics,
+    }
+}
+
 pub(crate) fn parse_target(value: &str) -> Option<ScriptTarget> {
     match value.trim().to_ascii_lowercase().as_str() {
         "es3" => Some(ScriptTarget::Es3),
@@ -737,7 +862,8 @@ pub(crate) fn parse_module(value: &str) -> Option<ModuleKind> {
         "umd" => Some(ModuleKind::Umd),
         "system" => Some(ModuleKind::System),
         "es6" | "es2015" => Some(ModuleKind::Es2015),
-        "esnext" => Some(ModuleKind::EsNext),
+        "es2020" | "es2022" | "esnext" | "preserve" => Some(ModuleKind::EsNext),
+        "node16" | "node18" | "node20" | "nodenext" => Some(ModuleKind::Node),
         _ => None,
     }
 }
@@ -822,6 +948,12 @@ struct Emitter<'a> {
     /// The full authored token stream, sorted by start. Backs authored-form
     /// lookups (arrow parameter parens) that the AST does not retain.
     tokens: &'a [Token],
+    /// Comments waiting for the next write. A statement that erases never
+    /// writes, so its comments go with it, as they do in `tsc`.
+    pending_comments: Vec<TextRange>,
+    /// Comments before this position are already spoken for, so rewritten
+    /// statements cannot print one twice.
+    comment_cursor: Utf16Pos,
     source_id: SourceId,
     model: &'a SemanticModel,
     enum_facts: &'a EnumFacts,
@@ -863,6 +995,41 @@ struct Emitter<'a> {
     /// First rewriter-minted id for this file; ids below it are
     /// parser-assigned and must carry ranges within the authored text.
     synthesized_floor: u32,
+    /// An import or export reached the output.
+    emitted_module_syntax: bool,
+    inline_lines: Option<&'a HashMap<NodeId, String>>,
+}
+
+/// The source text of an enum's numeric value.
+pub(crate) fn enum_number_lexeme(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value == f64::INFINITY {
+        "Infinity".to_owned()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+/// The contents of a double-quoted literal holding `value`.
+pub(crate) fn enum_string_lexeme(value: &bamts_bytecode::EcmaString) -> String {
+    let mut text = String::with_capacity(value.as_units().len());
+    for &unit in value.as_units() {
+        match unit {
+            0x08 => text.push_str("\\b"),
+            0x09 => text.push_str("\\t"),
+            0x0A => text.push_str("\\n"),
+            0x0C => text.push_str("\\f"),
+            0x0D => text.push_str("\\r"),
+            0x22 => text.push_str("\\\""),
+            0x5C => text.push_str("\\\\"),
+            0x20..=0x7E => text.push(char::from_u32(u32::from(unit)).expect("ASCII unit")),
+            _ => write!(text, "\\u{unit:04X}").expect("writing to a String cannot fail"),
+        }
+    }
+    text
 }
 
 impl Emitter<'_> {
@@ -895,18 +1062,168 @@ impl Emitter<'_> {
         self.source.as_str().get(start..end)
     }
 
-    /// Prints a statement list with tsc's default comment preservation: each
-    /// statement that emits is followed by its same-line trailing comment
-    /// before the newline. Single-line-preserved bodies do not route here —
-    /// tsc expands a body whose statement carries a trailing comment, a
-    /// rule queued separately.
+    fn is_comment(token: &Token) -> bool {
+        matches!(
+            token.kind(),
+            TokenKind::LineComment | TokenKind::BlockComment
+        )
+    }
+
+    fn is_trivia(token: &Token) -> bool {
+        Self::is_comment(token) || token.kind() == TokenKind::Whitespace
+    }
+
+    /// The comments before `position` back to the previous code token, which
+    /// comes with them. That token still exists for code that erased, which is
+    /// what keeps a comment from reaching past the declaration it belongs to.
+    fn comments_after_previous_token(
+        &self,
+        position: Utf16Pos,
+    ) -> (Vec<TextRange>, Option<&Token>) {
+        let end = self
+            .tokens
+            .partition_point(|token| token.range().start() < position);
+        let previous = self.tokens[..end]
+            .iter()
+            .rposition(|token| !Self::is_trivia(token));
+        let first = previous.map_or(0, |index| index + 1);
+        let comments = self.tokens[first..end]
+            .iter()
+            .filter(|token| Self::is_comment(token) && token.range().start() >= self.comment_cursor)
+            .map(|token| token.range())
+            .collect();
+        (comments, previous.map(|index| &self.tokens[index]))
+    }
+
+    fn source_line(&self, position: Utf16Pos) -> Option<usize> {
+        self.source.line_column(position).ok().map(|(line, _)| line)
+    }
+
+    /// The comments that lead the code at `position`. One on the line of the
+    /// previous token trails that token instead, unless that token opens a block.
+    fn leading_comments(&self, position: Utf16Pos) -> Vec<TextRange> {
+        let (comments, previous) = self.comments_after_previous_token(position);
+        let trailing_line = previous
+            .filter(|token| token.kind() != TokenKind::LBrace)
+            .and_then(|token| self.source_line(token.range().end()));
+        comments
+            .into_iter()
+            .filter(|comment| {
+                trailing_line.is_none() || self.source_line(comment.start()) != trailing_line
+            })
+            .collect()
+    }
+
+    /// Queues the comments before a statement. They print on its first write.
+    fn queue_leading_comments(&mut self, start: Utf16Pos) {
+        if self.options.remove_comments || start > self.authored_len {
+            return;
+        }
+        self.pending_comments = self.leading_comments(start);
+        self.comment_cursor = self.comment_cursor.max(start);
+    }
+
+    /// Prints the comments that close a file.
+    fn write_closing_comments(&mut self) {
+        self.queue_leading_comments(self.authored_len);
+        self.flush_comments();
+    }
+
+    /// The start of the first code in the file, or its end if there is none.
+    fn first_code_position(&self) -> Utf16Pos {
+        self.tokens
+            .iter()
+            .find(|token| !Self::is_trivia(token))
+            .map_or(self.authored_len, |token| token.range().start())
+    }
+
+    /// Prints the comment header of a file: a run with no blank line inside it
+    /// and a blank line after it survives whatever the first statement does.
+    fn write_detached_comments(&mut self) {
+        if self.options.remove_comments {
+            return;
+        }
+        let first_code = self.first_code_position();
+        let (comments, _) = self.comments_after_previous_token(first_code);
+        let starts_after = |emitter: &Self, index: usize| {
+            let next = comments
+                .get(index + 1)
+                .map_or(first_code, |next| next.start());
+            emitter
+                .source_line(next)
+                .zip(emitter.source_line(comments[index].end()))
+                .is_some_and(|(next, end)| next >= end + 2)
+        };
+        let Some(last) = (0..comments.len()).find(|&index| starts_after(self, index)) else {
+            return;
+        };
+        self.comment_cursor = comments[last].end();
+        self.pending_comments = comments[..=last].to_vec();
+        self.flush_comments();
+    }
+
+    fn flush_comments(&mut self) {
+        for comment in std::mem::take(&mut self.pending_comments) {
+            self.write_comment(comment);
+            if self.comment_ends_its_line(comment) {
+                self.newline();
+            } else {
+                self.raw(" ");
+            }
+        }
+    }
+
+    /// Whether code follows a comment on its own last line.
+    fn comment_ends_its_line(&self, comment: TextRange) -> bool {
+        let start = self
+            .tokens
+            .partition_point(|token| token.range().start() < comment.end());
+        let next = self.tokens[start..]
+            .iter()
+            .find(|token| !Self::is_trivia(token));
+        next.is_none_or(|token| {
+            self.source_line(token.range().start()) != self.source_line(comment.end())
+        })
+    }
+
+    /// Writes a comment at the current indentation. The lines of a block comment
+    /// keep their shape relative to where the comment began.
+    fn write_comment(&mut self, comment: TextRange) {
+        let Some(text) = self.source_slice(comment).map(str::to_owned) else {
+            return;
+        };
+        let column = self
+            .source
+            .line_column(comment.start())
+            .map_or(0, |(_, column)| column);
+        for (index, line) in text.split('\n').enumerate() {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if index > 0 {
+                self.newline();
+            }
+            let indent = line.len() - line.trim_start().len();
+            self.raw(&line[if index == 0 { 0 } else { indent.min(column) }..]);
+        }
+    }
+
+    /// Prints a statement list with tsc's default comment preservation: a
+    /// comment above a statement prints above it, and its same-line trailing
+    /// comment follows it before the newline. Single-line-preserved bodies do
+    /// not route here: tsc expands a body whose
+    /// statement carries a trailing comment, a rule queued separately.
     fn emit_statement_list(&mut self, statements: &[Stmt]) {
         for (index, statement) in statements.iter().enumerate() {
-            if self.emit_statement(statement) {
+            self.queue_leading_comments(statement.range().start());
+            let emitted = self.emit_statement(statement);
+            self.pending_comments.clear();
+            if emitted {
                 let limit = statements
                     .get(index + 1)
                     .map_or_else(|| Utf16Pos::new(usize::MAX), |next| next.range().start());
-                if let Some(comment) = self.trailing_line_comment(statement.range().end(), limit) {
+                if !self.options.remove_comments
+                    && let Some(comment) =
+                        self.trailing_line_comment(statement.range().end(), limit)
+                {
                     self.raw(" ");
                     if let Some(text) = self.source_slice(comment) {
                         let text = text.to_owned();
@@ -1195,6 +1512,9 @@ impl<'a> Emitter<'a> {
 
     /// Flushes pending indentation, updating `generated_column`.
     fn flush_indent(&mut self) {
+        if !self.pending_comments.is_empty() {
+            self.flush_comments();
+        }
         if self.pending_indent {
             let spaces = self.indent * self.options.indent_width as usize;
             for _ in 0..spaces {
@@ -1323,7 +1643,13 @@ impl<'a> Emitter<'a> {
     // ---- module drivers ---------------------------------------------------
 
     fn emit_module_js(&mut self, statements: &[Stmt]) {
+        self.write_detached_comments();
         self.emit_statement_list(statements);
+        if self.options.module_marker && !self.emitted_module_syntax {
+            self.raw("export {};");
+            self.newline();
+        }
+        self.write_closing_comments();
     }
 
     fn emit_module_decl(&mut self, statements: &[Stmt]) {
@@ -1340,20 +1666,41 @@ impl<'a> Emitter<'a> {
     // =======================================================================
 
     fn emit_statement(&mut self, statement: &Stmt) -> bool {
+        if let Some(lines) = self
+            .inline_lines
+            .and_then(|lines| lines.get(&statement.id()))
+        {
+            for (index, line) in lines.lines().enumerate() {
+                if index > 0 {
+                    self.newline();
+                }
+                self.raw(line);
+            }
+            return true;
+        }
         let previous = self.anchor;
         self.anchor = statement.range();
         let stmt_range = self.anchor;
         let emitted = match statement.data() {
-            Statement::Import(import) => self.emit_import(import, false),
+            Statement::Import(import) => {
+                let emitted = self.emit_import(import, false);
+                self.emitted_module_syntax |= emitted;
+                emitted
+            }
             Statement::ImportEquals(import) => {
                 if import.is_type_only {
                     false
                 } else {
                     self.emit_import_equals_js(import);
+                    self.emitted_module_syntax = true;
                     true
                 }
             }
-            Statement::Export(export) => self.emit_export_js(export),
+            Statement::Export(export) => {
+                let emitted = self.emit_export_js(export);
+                self.emitted_module_syntax |= emitted;
+                emitted
+            }
             Statement::Variable(declaration) => {
                 self.emit_variable_head(declaration);
                 let semi_start = Utf16Pos::new(stmt_range.end().get().saturating_sub(1));
@@ -1375,7 +1722,7 @@ impl<'a> Emitter<'a> {
                 true
             }
             Statement::Interface(_) | Statement::TypeAlias(_) | Statement::Declare(_) => false,
-            Statement::Enum(declaration) => self.emit_enum_js(statement.id(), declaration),
+            Statement::Enum(declaration) => self.emit_enum_js(declaration),
             Statement::Namespace(_) => {
                 self.diag_here(
                     codes::NAMESPACE_UNLOWERED,
@@ -1518,8 +1865,7 @@ impl<'a> Emitter<'a> {
         // Manual wrapping is only needed when emission would otherwise start
         // with a bare `{`, `function`, or `class`: a printed `(` anywhere on
         // the left edge already protects the statement position.
-        let wrap =
-            !self.starts_parenthesized(expression) && self.leads_with_bad_token(expression, false);
+        let wrap = !self.starts_parenthesized(expression) && self.leads_with_bad_token(expression);
         if wrap {
             self.raw("(");
             self.emit_expression_prec(expression, 0);
@@ -1874,7 +2220,10 @@ impl<'a> Emitter<'a> {
         // A clause that resolves to no value bindings is fully type-only and is
         // erased in JavaScript (a bare side-effect import keeps its clause-less
         // form below).
-        if !keep_types && let Some(clause) = &import.clause {
+        if !keep_types
+            && !self.options.verbatim_module_syntax
+            && let Some(clause) = &import.clause
+        {
             let has_value = clause.default.is_some()
                 || matches!(&clause.binding, Some(ImportBinding::Namespace(_)))
                 || matches!(
@@ -2022,17 +2371,22 @@ impl<'a> Emitter<'a> {
                     .iter()
                     .filter(|s| matches!(s.data().mode, ExportSpecifierMode::Value))
                     .collect();
-                if visible.is_empty() {
+                let loads_module = self.options.verbatim_module_syntax && source.is_some();
+                if visible.is_empty() && !loads_module {
                     return false;
                 }
-                self.raw("export { ");
-                for (index, specifier) in visible.iter().enumerate() {
-                    if index > 0 {
-                        self.raw(", ");
+                if visible.is_empty() {
+                    self.raw("export {}");
+                } else {
+                    self.raw("export { ");
+                    for (index, specifier) in visible.iter().enumerate() {
+                        if index > 0 {
+                            self.raw(", ");
+                        }
+                        self.emit_export_specifier(specifier.data(), false);
                     }
-                    self.emit_export_specifier(specifier.data(), false);
+                    self.raw(" }");
                 }
-                self.raw(" }");
                 if let Some(source) = source {
                     self.raw(" from ");
                     self.emit_string(source);
@@ -2133,129 +2487,28 @@ impl<'a> Emitter<'a> {
     // enum lowering (JavaScript)
     // =======================================================================
 
-    fn emit_enum_js(&mut self, declaration_id: NodeId, declaration: &EnumDeclaration) -> bool {
-        let Some(name) = self
-            .text(declaration.name.data().token())
-            .map(str::to_owned)
-        else {
-            self.diag(
-                codes::UNRESOLVED_TOKEN,
-                "token text is not a valid slice of the source",
-                declaration.name.range(),
-            );
-            return false;
-        };
-        if name.is_empty() || declaration.is_const {
-            return false;
-        }
-        let Some(plan) = self.enum_facts.declaration(declaration_id) else {
+    /// The rewriter lowers every enum it has facts for, so one that reaches
+    /// the printer is either erased or has none.
+    fn emit_enum_js(&mut self, declaration: &EnumDeclaration) -> bool {
+        if !declaration.is_const {
             self.diag_here(
                 codes::ENUM_FACTS_UNAVAILABLE,
                 "runtime enum lowering requires checked enum facts",
             );
-            return false;
-        };
-        if plan.members().len() != declaration.members.len() {
-            self.diag_here(
-                codes::ENUM_FACTS_UNAVAILABLE,
-                "runtime enum lowering requires a complete checked enum plan",
-            );
-            return false;
         }
-
-        self.raw("var ");
-        self.raw(&name);
-        self.raw(";");
-        self.newline();
-        self.raw("(function (");
-        self.raw(&name);
-        self.raw(") {");
-        self.newline();
-        self.indent += 1;
-        for (member, plan_member) in declaration.members.iter().zip(plan.members()) {
-            if self.emit_enum_member(&name, member.data(), plan_member) {
-                self.newline();
-            }
-        }
-        self.indent -= 1;
-        self.raw("})(");
-        self.raw(&name);
-        self.raw(" || (");
-        self.raw(&name);
-        self.raw(" = {}));");
-        true
-    }
-
-    fn emit_enum_member(
-        &mut self,
-        object: &str,
-        member: &EnumMember,
-        plan_member: &EnumMemberPlan,
-    ) -> bool {
-        let (Some(key), Some(value)) = (plan_member.name(), plan_member.value()) else {
-            return false;
-        };
-        let initializer = member.initializer.as_deref();
-        if value.constant().is_none() && initializer.is_none() {
-            return false;
-        }
-
-        self.raw(object);
-        self.raw("[");
-        if plan_member.reverse() {
-            self.raw(object);
-            self.raw("[");
-        }
-        self.emit_enum_string(key);
-        self.raw("] = ");
-        if let Some(constant) = value.constant() {
-            self.emit_enum_scalar(constant);
-        } else if let Some(initializer) = initializer {
-            self.emit_expression_prec(initializer, P_ASSIGN);
-        }
-        if plan_member.reverse() {
-            self.raw("] = ");
-            self.emit_enum_string(key);
-        }
-        self.raw(";");
-        true
+        false
     }
 
     fn emit_enum_scalar(&mut self, scalar: &EnumScalar) {
         match scalar {
-            EnumScalar::Number(value) => {
-                let value = value.to_f64();
-                if value.is_nan() {
-                    self.raw("NaN");
-                } else if value == f64::INFINITY {
-                    self.raw("Infinity");
-                } else if value == f64::NEG_INFINITY {
-                    self.raw("-Infinity");
-                } else {
-                    write!(self.out, "{value}").expect("writing to a String cannot fail");
-                }
-            }
+            EnumScalar::Number(value) => self.raw(&enum_number_lexeme(value.to_f64())),
             EnumScalar::String(value) => self.emit_enum_string(value),
         }
     }
 
     fn emit_enum_string(&mut self, value: &bamts_bytecode::EcmaString) {
         self.raw("\"");
-        for &unit in value.as_units() {
-            match unit {
-                0x08 => self.raw("\\b"),
-                0x09 => self.raw("\\t"),
-                0x0A => self.raw("\\n"),
-                0x0C => self.raw("\\f"),
-                0x0D => self.raw("\\r"),
-                0x22 => self.raw("\\\""),
-                0x5C => self.raw("\\\\"),
-                0x20..=0x7E => self
-                    .out
-                    .push(char::from_u32(u32::from(unit)).expect("ASCII unit")),
-                _ => write!(self.out, "\\u{unit:04X}").expect("writing to a String cannot fail"),
-            }
-        }
+        self.raw(&enum_string_lexeme(value));
         self.raw("\"");
     }
 
@@ -2342,7 +2595,7 @@ impl<'a> Emitter<'a> {
             }
             FunctionBody::Expression(expression) => {
                 if !self.starts_parenthesized(expression)
-                    && self.leads_with_bad_token(expression, true)
+                    && self.leads_with_bad_token_objects_only(expression)
                 {
                     self.raw("(");
                     self.emit_expression_prec(expression, 0);
@@ -2507,7 +2760,9 @@ impl<'a> Emitter<'a> {
 
     fn class_member_emits_js(&self, member: &ClassMember) -> bool {
         match member {
-            ClassMember::Constructor(_) | ClassMember::StaticBlock(_) => true,
+            ClassMember::Constructor(_) | ClassMember::StaticBlock(_) | ClassMember::Semicolon => {
+                true
+            }
             ClassMember::Method(method) => {
                 method.function.body.is_some() && !method.modifiers.is_abstract
             }
@@ -2578,6 +2833,10 @@ impl<'a> Emitter<'a> {
             ClassMember::Missing(_) => {
                 self.diag_here(codes::MISSING_MEMBER, "cannot emit a missing class member");
                 false
+            }
+            ClassMember::Semicolon => {
+                self.raw(";");
+                true
             }
         }
     }
@@ -2765,7 +3024,7 @@ impl<'a> Emitter<'a> {
             Expression::Logical(logical) => self.emit_logical(logical),
             Expression::Conditional(conditional) => self.emit_conditional(conditional),
             Expression::Assignment(assignment) => self.emit_assignment(assignment),
-            Expression::Sequence(sequence) => self.emit_sequence(sequence),
+            Expression::Sequence(_) => self.emit_sequence(expression),
             Expression::Parenthesized(inner) => {
                 self.raw("(");
                 self.emit_expression_prec(inner, 0);
@@ -2958,6 +3217,192 @@ impl<'a> Emitter<'a> {
         self.raw_mapped(text, range);
     }
 
+    fn numeric_radix(digits: &str) -> (u32, &str) {
+        if let Some(body) = digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+        {
+            (16, body)
+        } else if let Some(body) = digits
+            .strip_prefix("0b")
+            .or_else(|| digits.strip_prefix("0B"))
+        {
+            (2, body)
+        } else if let Some(body) = digits
+            .strip_prefix("0o")
+            .or_else(|| digits.strip_prefix("0O"))
+        {
+            (8, body)
+        } else {
+            (10, digits)
+        }
+    }
+
+    fn legacy_octal_value(digits: &str) -> Option<String> {
+        let body = digits.strip_prefix('0')?;
+        if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if body.bytes().any(|b| b == b'8' || b == b'9') {
+            return digits.parse::<f64>().ok().map(Self::format_js_number);
+        }
+        Self::decimal_from_base(body, 8)
+    }
+
+    fn decimal_from_base(body: &str, radix: u32) -> Option<String> {
+        if body.is_empty() {
+            return Some("0".to_owned());
+        }
+        let mut limbs: Vec<u32> = Vec::new();
+        for digit in body.chars() {
+            let mut carry = u64::from(digit.to_digit(radix)?);
+            for limb in limbs.iter_mut() {
+                let unit = u64::from(*limb) * u64::from(radix) + carry;
+                *limb = u32::try_from(unit % 1_000_000_000)
+                    .expect("a remainder below one billion fits u32");
+                carry = unit / 1_000_000_000;
+            }
+            while carry > 0 {
+                limbs.push(
+                    u32::try_from(carry % 1_000_000_000)
+                        .expect("a remainder below one billion fits u32"),
+                );
+                carry /= 1_000_000_000;
+            }
+        }
+        while limbs.len() > 1 && limbs.last() == Some(&0) {
+            limbs.pop();
+        }
+        match limbs.pop() {
+            Some(top) => {
+                let mut text = top.to_string();
+                for limb in limbs.iter().rev() {
+                    text.push_str(&format!("{limb:09}"));
+                }
+                Some(text)
+            }
+            None => Some("0".to_owned()),
+        }
+    }
+
+    fn digits_to_f64(body: &str, radix: u32) -> Option<f64> {
+        let mut value = 0.0;
+        for digit in body.chars() {
+            value = value * f64::from(radix) + f64::from(digit.to_digit(radix)?);
+        }
+        Some(value)
+    }
+
+    fn format_js_integer(value: f64) -> String {
+        if value.is_infinite() {
+            return "Infinity".to_owned();
+        }
+        if value.abs() < 1e21 {
+            return format!("{value:.0}");
+        }
+        let rendered = format!("{value:e}");
+        match rendered.find('e') {
+            Some(index) => {
+                let (mantissa, exponent) = rendered.split_at(index);
+                if exponent.starts_with("e-") {
+                    rendered
+                } else {
+                    format!("{mantissa}e+{}", &exponent[1..])
+                }
+            }
+            None => rendered,
+        }
+    }
+
+    fn format_js_number(value: f64) -> String {
+        if value.is_nan() {
+            return "NaN".to_owned();
+        }
+        if value == f64::INFINITY {
+            return "Infinity".to_owned();
+        }
+        if value == f64::NEG_INFINITY {
+            return "-Infinity".to_owned();
+        }
+        if value == 0.0 {
+            return "0".to_owned();
+        }
+        if value.abs() >= 1e-6 && value.abs() < 1e21 {
+            return value.to_string();
+        }
+        let rendered = format!("{:e}", value);
+        match rendered.find('e') {
+            Some(index) => {
+                let (mantissa, exponent) = rendered.split_at(index);
+                if exponent.starts_with("e-") {
+                    rendered
+                } else {
+                    format!("{mantissa}e+{}", &exponent[1..])
+                }
+            }
+            None => rendered,
+        }
+    }
+
+    fn normalize_bigint_literal(text: &str) -> Option<String> {
+        let digits = text.strip_suffix('n').unwrap_or(text);
+        let plain = digits.replace('_', "");
+        let (radix, body) = Self::numeric_radix(&plain);
+        let body = if body.is_empty() { "0" } else { body };
+        let mut normalized = if radix == 16 {
+            format!("0x{}", body.to_ascii_lowercase())
+        } else {
+            Self::decimal_from_base(body, radix)?
+        };
+        normalized.push('n');
+        (normalized != text).then_some(normalized)
+    }
+
+    fn normalize_number_literal(text: &str, target: ScriptTarget) -> Option<String> {
+        let plain = text.replace('_', "");
+        if let Some(legacy) = Self::legacy_octal_value(&plain) {
+            return Some(legacy);
+        }
+        let separated = plain.len() != text.len();
+        let (radix, body) = Self::numeric_radix(&plain);
+        let needs = (radix == 2 || radix == 8) && target < ScriptTarget::Es2015
+            || separated && target < ScriptTarget::Es2021;
+        if !needs {
+            return None;
+        }
+        if radix == 10 {
+            if plain.is_empty() {
+                return None;
+            }
+            match plain.parse::<f64>() {
+                Ok(value) => {
+                    let normalized = Self::format_js_number(value);
+                    (normalized != text).then_some(normalized)
+                }
+                Err(_) => (plain != text).then_some(plain),
+            }
+        } else {
+            if body.is_empty() || body.chars().any(|digit| digit.to_digit(radix).is_none()) {
+                return (plain != text).then_some(plain);
+            }
+            Self::digits_to_f64(body, radix)
+                .map(Self::format_js_integer)
+                .filter(|normalized| normalized != text)
+        }
+    }
+
+    fn emit_normalized_token(
+        &mut self,
+        token: &Token,
+        range: TextRange,
+        normalized: Option<String>,
+    ) {
+        match normalized {
+            Some(text) => self.raw_mapped(&text, range),
+            None => self.emit_token(token),
+        }
+    }
+
     fn emit_literal(&mut self, literal: &Literal) {
         if let Literal::String(node) = literal
             && self.generated_text(node.id()).is_some()
@@ -2981,8 +3426,18 @@ impl<'a> Emitter<'a> {
         }
         match literal {
             Literal::String(node) => self.emit_token(node.data().token()),
-            Literal::Number(node) => self.emit_token(node.data().token()),
-            Literal::BigInt(node) => self.emit_token(node.data().token()),
+            Literal::Number(node) => {
+                let token = node.data().token();
+                let normalized = self
+                    .text(token)
+                    .and_then(|text| Self::normalize_number_literal(text, self.options.target));
+                self.emit_normalized_token(token, node.range(), normalized);
+            }
+            Literal::BigInt(node) => {
+                let token = node.data().token();
+                let normalized = self.text(token).and_then(Self::normalize_bigint_literal);
+                self.emit_normalized_token(token, node.range(), normalized);
+            }
             Literal::Boolean(node) => self.emit_token(node.data().token()),
             Literal::Null(node) => match self.text(node.data().token()) {
                 Some(text) if !text.is_empty() => self.raw_mapped(text, node.range()),
@@ -2991,7 +3446,6 @@ impl<'a> Emitter<'a> {
             Literal::Regex(node) => self.emit_token(node.data().token()),
         }
     }
-
     fn emit_template(&mut self, template: &TemplateLiteral) {
         if template.elements.is_empty() {
             return;
@@ -3123,7 +3577,17 @@ impl<'a> Emitter<'a> {
             PropertyName::Identifier(ident) => self.emit_ident(ident),
             PropertyName::Private(private) => self.emit_token(private.data().token()),
             PropertyName::String(string) => self.emit_string(string),
-            PropertyName::Number(number) => self.emit_token(number.data().token()),
+            PropertyName::Number(number) => {
+                let token = number.data().token();
+                let normalized = self.text(token).and_then(|text| {
+                    if text.ends_with('n') {
+                        Self::normalize_bigint_literal(text)
+                    } else {
+                        Self::normalize_number_literal(text, self.options.target)
+                    }
+                });
+                self.emit_normalized_token(token, number.range(), normalized);
+            }
             PropertyName::Computed(expression) => {
                 self.raw("[");
                 self.emit_expression_prec(expression, P_ASSIGN);
@@ -3347,30 +3811,64 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_binary(&mut self, binary: &BinaryExpression) {
-        let prec = binary_prec(binary.operator);
         if matches!(binary.operator, BinaryOperator::Exponentiate) {
-            let left = self.unwrap_expression(&binary.left);
-            if matches!(left.data(), Expression::Unary(_) | Expression::Await(_))
-                || matches!(left.data(), Expression::Update(update) if update.prefix)
-            {
-                self.raw("(");
-                self.emit_expression_prec(left, 0);
-                self.raw(")");
-            } else {
-                self.emit_expression_prec(&binary.left, P_EXPONENT + 1);
-            }
-            self.raw_mapped_pos(" ** ", binary.left.range().end());
-            self.emit_expression_prec(&binary.right, P_EXPONENT);
+            self.emit_exponentiate(binary);
+            return;
+        }
+        self.emit_binary_chain(binary);
+    }
+
+    fn emit_exponentiate(&mut self, binary: &BinaryExpression) {
+        let left = self.unwrap_expression(&binary.left);
+        if matches!(left.data(), Expression::Unary(_) | Expression::Await(_))
+            || matches!(left.data(), Expression::Update(update) if update.prefix)
+        {
+            self.raw("(");
+            self.emit_expression_prec(left, 0);
+            self.raw(")");
         } else {
-            let operator_text = binary_str(binary.operator);
-            self.emit_expression_prec(&binary.left, prec);
+            self.emit_expression_prec(&binary.left, P_EXPONENT + 1);
+        }
+        self.raw_mapped_pos(" ** ", binary.left.range().end());
+        self.emit_expression_prec(&binary.right, P_EXPONENT);
+    }
+
+    fn emit_binary_chain(&mut self, binary: &BinaryExpression) {
+        let mut frames: Vec<&BinaryExpression> = Vec::new();
+        let mut cursor = binary;
+        loop {
+            frames.push(cursor);
+            match cursor.left.data() {
+                Expression::Binary(next)
+                    if !matches!(next.operator, BinaryOperator::Exponentiate) =>
+                {
+                    cursor = next;
+                }
+                _ => break,
+            }
+        }
+        let mut opened: Vec<bool> = Vec::with_capacity(frames.len());
+        let mut parent: Option<&BinaryExpression> = None;
+        for frame in frames.iter() {
+            let need = parent.is_some_and(|outer| binary_prec(frame.operator) < binary_prec(outer.operator));
+            if need {
+                self.raw("(");
+            }
+            opened.push(need);
+            parent = Some(*frame);
+        }
+        let Some(inner) = frames.last() else { return };
+        self.emit_expression_prec(&inner.left, binary_prec(inner.operator));
+        for (frame, open) in frames.iter().rev().zip(opened.iter().rev()) {
+            let prec = binary_prec(frame.operator);
+            let operator_text = binary_str(frame.operator);
             let op_pos = self
                 .source_pos_of(
-                    TextRange::new(binary.left.range().end(), binary.right.range().start())
+                    TextRange::new(frame.left.range().end(), frame.right.range().start())
                         .unwrap_or(self.anchor),
                     operator_text.chars().next().unwrap_or('+'),
                 )
-                .unwrap_or(binary.left.range().end())
+                .unwrap_or(frame.left.range().end())
                 .get()
                 .saturating_sub(1);
             let op_pos = Utf16Pos::new(op_pos);
@@ -3379,35 +3877,85 @@ impl<'a> Emitter<'a> {
                 op_pos,
                 operator_text.chars().count(),
             );
-            self.emit_expression_prec(&binary.right, prec + 1);
+            self.emit_expression_prec(&frame.right, prec + 1);
+            if *open {
+                self.raw(")");
+            }
         }
     }
 
+
+
     fn emit_logical(&mut self, logical: &LogicalExpression) {
-        let prec = match logical.operator {
+        self.emit_logical_chain(logical);
+    }
+
+    fn logical_prec(operator: LogicalOperator) -> u8 {
+        match operator {
             LogicalOperator::And => P_LOGICAL_AND,
             LogicalOperator::Or => P_LOGICAL_OR,
             LogicalOperator::Nullish => P_NULLISH,
-        };
-        let operator_text = logical_str(logical.operator);
-        self.emit_logical_operand(&logical.left, logical.operator, prec, true);
-        let op_pos = self
-            .source_pos_of(
-                TextRange::new(logical.left.range().end(), logical.right.range().start())
-                    .unwrap_or(self.anchor),
-                operator_text.chars().next().unwrap_or('&'),
-            )
-            .unwrap_or(logical.left.range().end())
-            .get()
-            .saturating_sub(1);
-        let op_pos = Utf16Pos::new(op_pos);
-        self.raw_mapped_token(
-            &format!(" {operator_text} "),
-            op_pos,
-            operator_text.chars().count(),
-        );
-        self.emit_logical_operand(&logical.right, logical.operator, prec, false);
+        }
     }
+
+    fn emit_logical_chain(&mut self, logical: &LogicalExpression) {
+        let mut frames: Vec<&LogicalExpression> = Vec::new();
+        let mut cursor = logical;
+        loop {
+            frames.push(cursor);
+            match cursor.left.data() {
+                Expression::Logical(next) => {
+                    cursor = next;
+                }
+                _ => break,
+            }
+        }
+        let Some(inner) = frames.last() else { return };
+        let left_starts_paren = self.starts_parenthesized(&inner.left);
+        let mut opened: Vec<bool> = Vec::with_capacity(frames.len());
+        let mut parent: Option<LogicalOperator> = None;
+        for frame in frames.iter() {
+            let prec = Self::logical_prec(frame.operator);
+            let need = match parent {
+                None => false,
+                Some(outer) => {
+                    let outer_prec = Self::logical_prec(outer);
+                    let mixed = matches!(outer, LogicalOperator::Nullish) != matches!(frame.operator, LogicalOperator::Nullish);
+                    prec < outer_prec || (mixed && !left_starts_paren)
+                }
+            };
+            if need {
+                self.raw("(");
+            }
+            opened.push(need);
+            parent = Some(frame.operator);
+        }
+        self.emit_logical_operand(&inner.left, inner.operator, Self::logical_prec(inner.operator), true);
+        for (frame, open) in frames.iter().rev().zip(opened.iter().rev()) {
+            let prec = Self::logical_prec(frame.operator);
+            let operator_text = logical_str(frame.operator);
+            let op_pos = self
+                .source_pos_of(
+                    TextRange::new(frame.left.range().end(), frame.right.range().start())
+                        .unwrap_or(self.anchor),
+                    operator_text.chars().next().unwrap_or('&'),
+                )
+                .unwrap_or(frame.left.range().end())
+                .get()
+                .saturating_sub(1);
+            let op_pos = Utf16Pos::new(op_pos);
+            self.raw_mapped_token(
+                &format!(" {operator_text} "),
+                op_pos,
+                operator_text.chars().count(),
+            );
+            self.emit_logical_operand(&frame.right, frame.operator, prec, false);
+            if *open {
+                self.raw(")");
+            }
+        }
+    }
+
 
     fn emit_logical_operand(
         &mut self,
@@ -3488,15 +4036,41 @@ impl<'a> Emitter<'a> {
         self.emit_expression_prec(&assignment.right, P_ASSIGN);
     }
 
-    fn emit_sequence(&mut self, sequence: &SequenceExpression) {
-        let mut previous_end: Option<Utf16Pos> = None;
-        for expression in sequence.expressions.iter() {
-            if let Some(end) = previous_end {
-                self.mapped_list_separator_from(end, expression.range().start());
+    fn emit_sequence(&mut self, expression: &Expr) {
+        let Expression::Sequence(sequence) = expression.data() else {
+            unreachable!("emit_sequence takes a sequence expression");
+        };
+        let lowered = self.is_synthesized(expression.id());
+        let multiline = lowered
+            && sequence.expressions.iter().any(|element| {
+                matches!(
+                    element.data(),
+                    Expression::Assignment(assignment)
+                        if matches!(assignment.right.data(), Expression::Class(_))
+                )
+            });
+        if !multiline {
+            let mut previous_end: Option<Utf16Pos> = None;
+            for element in sequence.expressions.iter() {
+                if let Some(end) = previous_end {
+                    self.mapped_list_separator_from(end, element.range().start());
+                }
+                self.emit_expression_prec(element, P_ASSIGN);
+                previous_end = Some(element.range().end());
             }
-            self.emit_expression_prec(expression, P_ASSIGN);
-            previous_end = Some(expression.range().end());
+            return;
         }
+        self.indent += 1;
+        let mut first = true;
+        for element in sequence.expressions.iter() {
+            if !first {
+                self.raw(",");
+                self.newline();
+            }
+            self.emit_expression_prec(element, P_ASSIGN);
+            first = false;
+        }
+        self.indent -= 1;
     }
 
     // ---- assignment targets / patterns ------------------------------------
@@ -3560,6 +4134,10 @@ impl<'a> Emitter<'a> {
                         AssignmentArrayElement::Target(target) => {
                             self.emit_assignment_target(target)
                         }
+                        AssignmentArrayElement::Rest(target) => {
+                            self.raw("...");
+                            self.emit_assignment_target(target);
+                        }
                         AssignmentArrayElement::Elision => {}
                         AssignmentArrayElement::Missing(_) => {
                             self.diag_here(codes::MISSING_TARGET, "cannot emit a missing target");
@@ -3587,6 +4165,11 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_assignment_object_property(&mut self, property: &AssignmentObjectProperty) {
+        if property.rest {
+            self.raw("...");
+            self.emit_assignment_target(&property.target);
+            return;
+        }
         let shorthand = property.initializer.is_none()
             && self.target_matches_name(&property.name, &property.target);
         if shorthand {
@@ -3766,109 +4349,130 @@ impl<'a> Emitter<'a> {
     // ---- expression classification ----------------------------------------
 
     fn unwrap_expression<'e>(&self, expression: &'e Expr) -> &'e Expr {
-        match expression.data() {
-            Expression::Parenthesized(inner) => self.unwrap_expression(inner),
-            Expression::As(as_expr) => self.unwrap_expression(&as_expr.expression),
-            Expression::Satisfies(satisfies) => self.unwrap_expression(&satisfies.expression),
-            Expression::TypeAssertion(assertion) => self.unwrap_expression(&assertion.expression),
-            Expression::NonNull(non_null) => self.unwrap_expression(&non_null.expression),
-            _ => expression,
+        let mut current = expression;
+        loop {
+            match current.data() {
+                Expression::Parenthesized(inner) => current = inner,
+                Expression::As(as_expr) => current = &as_expr.expression,
+                Expression::Satisfies(satisfies) => current = &satisfies.expression,
+                Expression::TypeAssertion(assertion) => current = &assertion.expression,
+                Expression::NonNull(non_null) => current = &non_null.expression,
+                _ => return current,
+            }
         }
     }
 
     fn chain_has_optional(&self, expression: &Expr) -> bool {
-        match expression.data() {
-            Expression::Member(member) => {
-                member.optional || self.chain_has_optional(&member.object)
+        let mut current = expression;
+        loop {
+            match current.data() {
+                Expression::Member(member) => {
+                    if member.optional {
+                        return true;
+                    }
+                    current = &member.object;
+                }
+                Expression::Call(call) => {
+                    if call.optional {
+                        return true;
+                    }
+                    current = &call.callee;
+                }
+                Expression::NonNull(non_null) => current = &non_null.expression,
+                Expression::Parenthesized(inner) => current = inner,
+                Expression::As(as_expr) => current = &as_expr.expression,
+                Expression::Satisfies(satisfies) => current = &satisfies.expression,
+                Expression::TypeAssertion(assertion) => current = &assertion.expression,
+                _ => return false,
             }
-            Expression::Call(call) => call.optional || self.chain_has_optional(&call.callee),
-            Expression::NonNull(non_null) => self.chain_has_optional(&non_null.expression),
-            Expression::Parenthesized(inner) => self.chain_has_optional(inner),
-            Expression::As(as_expr) => self.chain_has_optional(&as_expr.expression),
-            Expression::Satisfies(satisfies) => self.chain_has_optional(&satisfies.expression),
-            Expression::TypeAssertion(assertion) => self.chain_has_optional(&assertion.expression),
-            _ => false,
         }
     }
 
-    /// Whether an expression, at a statement or arrow-body position, would begin
-    /// with a token requiring wrapping parentheses (`{`, `function`, `class`).
-    fn leads_with_bad_token(&self, expression: &Expr, objects_only: bool) -> bool {
+    fn transparent_child<'e>(expression: &'e Expr) -> Option<&'e Expr> {
         match expression.data() {
-            Expression::Object(_) => true,
-            Expression::Function(_) | Expression::Class(_) => !objects_only,
-            Expression::Binary(binary) => self.leads_with_bad_token(&binary.left, objects_only),
-            Expression::Logical(logical) => self.leads_with_bad_token(&logical.left, objects_only),
-            Expression::Conditional(conditional) => {
-                self.leads_with_bad_token(&conditional.test, objects_only)
+            Expression::Parenthesized(inner) => Some(inner),
+            Expression::As(as_expr) => Some(&as_expr.expression),
+            Expression::Satisfies(satisfies) => Some(&satisfies.expression),
+            Expression::TypeAssertion(assertion) => Some(&assertion.expression),
+            Expression::NonNull(non_null) => Some(&non_null.expression),
+            _ => None,
+        }
+    }
+
+    fn left_position_child<'e>(expression: &'e Expr) -> Option<&'e Expr> {
+        match expression.data() {
+            Expression::Binary(binary) => Some(&binary.left),
+            Expression::Logical(logical) => Some(&logical.left),
+            Expression::Conditional(conditional) => Some(&conditional.test),
+            Expression::Call(call) => Some(&call.callee),
+            Expression::Member(member) => Some(&member.object),
+            Expression::TaggedTemplate(tagged) => Some(&tagged.tag),
+            Expression::Sequence(sequence) => sequence.expressions.first(),
+            _ => None,
+        }
+    }
+
+    fn leads_with_bad_token(&self, expression: &Expr) -> bool {
+        self.leads_with_bad_token_impl(expression, false)
+    }
+
+    fn leads_with_bad_token_objects_only(&self, expression: &Expr) -> bool {
+        self.leads_with_bad_token_impl(expression, true)
+    }
+
+    fn leads_with_bad_token_impl(&self, expression: &Expr, objects_only: bool) -> bool {
+        let mut current = expression;
+        loop {
+            match current.data() {
+                Expression::Object(_) => return true,
+                Expression::Function(_) | Expression::Class(_) => return !objects_only,
+                Expression::Assignment(assignment) => {
+                    return self.target_leads_with_object(&assignment.left)
+                }
+                Expression::Update(update) => {
+                    return !update.prefix && self.target_leads_with_object(&update.argument)
+                }
+                _ => (),
             }
-            Expression::Assignment(assignment) => self.target_leads_with_object(&assignment.left),
-            Expression::Sequence(sequence) => sequence
-                .expressions
-                .first()
-                .is_some_and(|first| self.leads_with_bad_token(first, objects_only)),
-            Expression::Call(call) => self.leads_with_bad_token(&call.callee, objects_only),
-            Expression::Member(member) => self.leads_with_bad_token(&member.object, objects_only),
-            Expression::TaggedTemplate(tagged) => {
-                self.leads_with_bad_token(&tagged.tag, objects_only)
+            if let Some(next) = Self::transparent_child(current) {
+                current = next;
+                continue;
             }
-            Expression::Update(update) => {
-                !update.prefix && self.target_leads_with_object(&update.argument)
+            match Self::left_position_child(current) {
+                Some(next) => current = next,
+                None => return false,
             }
-            Expression::NonNull(non_null) => {
-                self.leads_with_bad_token(&non_null.expression, objects_only)
-            }
-            Expression::As(as_expr) => self.leads_with_bad_token(&as_expr.expression, objects_only),
-            Expression::Satisfies(satisfies) => {
-                self.leads_with_bad_token(&satisfies.expression, objects_only)
-            }
-            Expression::TypeAssertion(assertion) => {
-                self.leads_with_bad_token(&assertion.expression, objects_only)
-            }
-            Expression::Parenthesized(inner) => self.leads_with_bad_token(inner, objects_only),
-            _ => false,
         }
     }
 
     fn target_leads_with_object(&self, target: &AssignmentTargetNode) -> bool {
         match target.data() {
             AssignmentTarget::Object(_) => true,
-            AssignmentTarget::Member(member) => self.leads_with_bad_token(&member.object, false),
+            AssignmentTarget::Member(member) => self.leads_with_bad_token(&member.object),
             _ => false,
         }
     }
-    /// Whether emission of this expression starts with a printed `(`.
-    /// Walks only the left edge through nodes whose emission forwards to
-    /// it, stopping at parenthesized nodes (which print their own parens)
-    /// instead of seeing through them like [`Self::leads_with_bad_token`]
-    /// does. Naming the upstream query: this is the `GetLeftmostExpression`
-    /// stop-at-parens half of the statement-position decision.
     fn starts_parenthesized(&self, expression: &Expr) -> bool {
-        match expression.data() {
-            Expression::Parenthesized(_) => true,
-            Expression::As(as_expr) => self.starts_parenthesized(&as_expr.expression),
-            Expression::Satisfies(satisfies) => self.starts_parenthesized(&satisfies.expression),
-            Expression::TypeAssertion(assertion) => {
-                self.starts_parenthesized(&assertion.expression)
+        let mut current = expression;
+        loop {
+            match current.data() {
+                Expression::Parenthesized(_) => return true,
+                Expression::Update(update) if !update.prefix => {
+                    return self.target_starts_parenthesized(&update.argument)
+                }
+                Expression::Assignment(assignment) => {
+                    return self.target_starts_parenthesized(&assignment.left)
+                }
+                _ => (),
             }
-            Expression::NonNull(non_null) => self.starts_parenthesized(&non_null.expression),
-            Expression::Binary(binary) => self.starts_parenthesized(&binary.left),
-            Expression::Logical(logical) => self.starts_parenthesized(&logical.left),
-            Expression::Conditional(conditional) => self.starts_parenthesized(&conditional.test),
-            Expression::Sequence(sequence) => sequence
-                .expressions
-                .first()
-                .is_some_and(|first| self.starts_parenthesized(first)),
-            Expression::Call(call) => self.starts_parenthesized(&call.callee),
-            Expression::Member(member) => self.starts_parenthesized(&member.object),
-            Expression::TaggedTemplate(tagged) => self.starts_parenthesized(&tagged.tag),
-            Expression::Update(update) if !update.prefix => {
-                self.target_starts_parenthesized(&update.argument)
+            if let Some(next) = Self::transparent_child(current) {
+                current = next;
+                continue;
             }
-            Expression::Assignment(assignment) => {
-                self.target_starts_parenthesized(&assignment.left)
+            match Self::left_position_child(current) {
+                Some(next) => current = next,
+                None => return false,
             }
-            _ => false,
         }
     }
 
@@ -4336,14 +4940,34 @@ impl<'a> Emitter<'a> {
     }
     fn emit_class_body_decl(&mut self, members: &[ClassMemberNode], range: TextRange) {
         self.raw("{");
-        let has = members
+        let has_private_name = members
             .iter()
-            .any(|member| self.class_member_emits_decl(member.data()));
+            .any(|member| Self::member_has_private_name(member.data()));
+        let has = has_private_name
+            || members
+                .iter()
+                .any(|member| self.class_member_emits_decl(member.data()));
         if has {
             self.newline();
             self.indent += 1;
         }
+        let mut printed_private_name = false;
+        let mut bare_private_methods: Vec<String> = Vec::new();
         for member in members {
+            if Self::member_has_private_name(member.data()) {
+                if !printed_private_name {
+                    self.raw("#private;");
+                    self.newline();
+                    printed_private_name = true;
+                }
+                continue;
+            }
+            if let Some(key) = self.bare_private_method_name(member.data()) {
+                if bare_private_methods.contains(&key) {
+                    continue;
+                }
+                bare_private_methods.push(key);
+            }
             if self.class_member_emits_decl(member.data()) {
                 self.emit_jsdoc_for_range(member.range());
             }
@@ -4362,14 +4986,41 @@ impl<'a> Emitter<'a> {
     fn class_member_emits_decl(&self, member: &ClassMember) -> bool {
         !matches!(
             member,
-            ClassMember::StaticBlock(_) | ClassMember::Missing(_)
+            ClassMember::StaticBlock(_) | ClassMember::Missing(_) | ClassMember::Semicolon
         )
+    }
+
+    fn member_has_private_name(member: &ClassMember) -> bool {
+        match member {
+            ClassMember::Method(method) => matches!(method.name, PropertyName::Private(_)),
+            ClassMember::Property(property) => {
+                matches!(property.name, PropertyName::Private(_))
+            }
+            ClassMember::AutoAccessor(accessor) => {
+                matches!(accessor.name, PropertyName::Private(_))
+            }
+            _ => false,
+        }
+    }
+
+    fn bare_private_method_name(&self, member: &ClassMember) -> Option<String> {
+        if let ClassMember::Method(method) = member
+            && method.modifiers.accessibility == Some(Accessibility::Private)
+            && method.modifier == PropertyModifier::None
+            && let PropertyName::Identifier(name) = &method.name
+            && let Some(key) = self.text(name.data().token())
+        {
+            return Some(key.to_owned());
+        }
+        None
     }
 
     fn emit_class_member_decl(&mut self, member: &ClassMember) -> bool {
         match member {
             ClassMember::Constructor(constructor) => {
-                if let Some(accessibility) = constructor.modifiers.accessibility {
+                if let Some(accessibility) = constructor.modifiers.accessibility
+                    && accessibility != Accessibility::Public
+                {
                     self.raw(accessibility_str(accessibility));
                     self.raw(" ");
                 }
@@ -4379,6 +5030,26 @@ impl<'a> Emitter<'a> {
                 true
             }
             ClassMember::Method(method) => {
+                if method.modifiers.accessibility == Some(Accessibility::Private) {
+                    self.emit_member_modifiers_decl(&method.modifiers);
+                    match method.modifier {
+                        PropertyModifier::Get => self.raw("get "),
+                        PropertyModifier::Set => self.raw("set "),
+                        PropertyModifier::None => {}
+                    }
+                    self.emit_property_name(&method.name);
+                    match method.modifier {
+                        PropertyModifier::Get => self.raw("();"),
+                        PropertyModifier::Set => self.raw("(value);"),
+                        PropertyModifier::None => {
+                            if method.optional {
+                                self.raw("?");
+                            }
+                            self.raw(";");
+                        }
+                    }
+                    return true;
+                }
                 self.emit_member_modifiers_decl(&method.modifiers);
                 match method.modifier {
                     PropertyModifier::Get => self.raw("get "),
@@ -4399,6 +5070,15 @@ impl<'a> Emitter<'a> {
                 true
             }
             ClassMember::Property(property) => {
+                if property.modifiers.accessibility == Some(Accessibility::Private) {
+                    self.emit_member_modifiers_decl(&property.modifiers);
+                    self.emit_property_name(&property.name);
+                    if property.optional {
+                        self.raw("?");
+                    }
+                    self.raw(";");
+                    return true;
+                }
                 self.emit_member_modifiers_decl(&property.modifiers);
                 self.emit_property_name(&property.name);
                 if property.optional {
@@ -4421,6 +5101,13 @@ impl<'a> Emitter<'a> {
                 true
             }
             ClassMember::AutoAccessor(accessor) => {
+                if accessor.modifiers.accessibility == Some(Accessibility::Private) {
+                    self.emit_member_modifiers_decl(&accessor.modifiers);
+                    self.raw("accessor ");
+                    self.emit_property_name(&accessor.name);
+                    self.raw(";");
+                    return true;
+                }
                 self.emit_member_modifiers_decl(&accessor.modifiers);
                 self.raw("accessor ");
                 self.emit_property_name(&accessor.name);
@@ -4442,7 +5129,7 @@ impl<'a> Emitter<'a> {
                 self.raw(";");
                 true
             }
-            ClassMember::StaticBlock(_) => false,
+            ClassMember::StaticBlock(_) | ClassMember::Semicolon => false,
             ClassMember::Missing(_) => {
                 self.diag_here(codes::MISSING_MEMBER, "cannot emit a missing class member");
                 false
@@ -4465,7 +5152,9 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_member_modifiers_decl(&mut self, modifiers: &DeclarationModifiers) {
-        if let Some(accessibility) = modifiers.accessibility {
+        if let Some(accessibility) = modifiers.accessibility
+            && accessibility != Accessibility::Public
+        {
             self.raw(accessibility_str(accessibility));
             self.raw(" ");
         }
@@ -5985,6 +6674,41 @@ export default answer;
     }
 
     #[test]
+    fn array_assignment_rest_and_defaults_emit_as_written() {
+        let input = "[a = 1, ...b] = c;\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(!output.has_errors());
+        assert_eq!(javascript(&output).code, input);
+    }
+
+    #[test]
+    fn a_bare_class_semicolon_survives_javascript_and_not_declarations() {
+        // Authority: `classWithSemicolonClassElement1` and `2` keep each `;`.
+        let input = "export class C {\n    ;\n    ;\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(!output.has_errors());
+        assert_eq!(
+            javascript(&output).code,
+            "export class C {\n    ;\n    ;\n}\n"
+        );
+        let declaration = emit_declaration(parsed.product());
+        assert!(!declaration.has_errors());
+        assert!(!format!("{declaration:?}").contains(";\\n    ;"));
+    }
+
+    #[test]
     fn empty_class_body_expands_in_javascript() {
         // Authority: `exnextmodulekindExportClassNameWithObject(target=es2015)`
         // emits `export class Object {}` as `export class Object {\n}`. The TS
@@ -6255,6 +6979,66 @@ export default answer;
             declaration(&output).code,
             "export default interface Foo {\n}\n"
         );
+    }
+
+    #[test]
+    fn comments_above_statements_survive_in_javascript() {
+        let emit = |input: &str, remove_comments: bool| {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+            ));
+            assert!(parsed.diagnostics().is_empty());
+            let options = EmitOptions {
+                remove_comments,
+                ..EmitOptions::default()
+            };
+            javascript(&emit_output(parsed.product(), &options))
+                .code
+                .clone()
+        };
+        assert_eq!(
+            emit("// above\nvar x = 1;\n// next\nvar y = 2;\n", false),
+            "// above\nvar x = 1;\n// next\nvar y = 2;\n"
+        );
+        assert_eq!(
+            emit("/* one */ var x = 1;\n", false),
+            "/* one */ var x = 1;\n"
+        );
+        assert_eq!(
+            emit("function f() {\n    // inner\n    return 1;\n}\n", false),
+            "function f() {\n    // inner\n    return 1;\n}\n"
+        );
+        assert_eq!(
+            emit("var x; // t\n// next\nvar y;\n", false),
+            "var x; // t\n// next\nvar y;\n"
+        );
+        // A comment on an erased declaration goes with it.
+        assert_eq!(
+            emit("// gone\ninterface I {}\n// kept\nvar x;\n", false),
+            "// kept\nvar x;\n"
+        );
+        // A header stays even when the first statement erases.
+        assert_eq!(
+            emit("// header\n\n// gone\ninterface I {}\nvar x;\n", false),
+            "// header\nvar x;\n"
+        );
+        assert_eq!(emit("var x;\n// end\n", false), "var x;\n// end\n");
+        // The rewriter removes a `declare` from the list, but its comment stays
+        // with it rather than moving to the next statement that prints.
+        assert_eq!(
+            emit(
+                "// one\ndeclare var a;\n\n// two\ndeclare var b;\nc();\n",
+                false
+            ),
+            "c();\n"
+        );
+        assert_eq!(
+            emit("if (a) {\n    /* a\n       b */\n    f();\n}\n", false),
+            "if (a) {\n    /* a\n       b */\n    f();\n}\n"
+        );
+        assert_eq!(emit("// above\nvar x; // t\n// end\n", true), "var x;\n");
     }
 
     #[test]
@@ -7313,11 +8097,11 @@ var c = () => 1;
             "the key's suspension must split:\n{code}"
         );
         assert!(
-            code.contains("_t1 = _a.sent()"),
+            code.contains("_t0 = _a.sent()"),
             "the key temp binds from sent():\n{code}"
         );
         assert!(
-            code.contains("[_t1]()"),
+            code.contains("[_t0]()"),
             "the member reads the hoisted temp:\n{code}"
         );
         assert!(live_yield_leak(&code).is_none(), "live yield leaked");
@@ -8144,6 +8928,43 @@ var c = () => 1;
             above.diagnostics()
         );
     }
+    #[test]
+    fn left_deep_binary_chain_emits_without_overflow() {
+        let mut builder = Builder::new();
+        let mut chain = builder.number("0");
+        for index in 1..20000 {
+            let right = builder.number(&index.to_string());
+            let left = chain;
+            chain = binary(BinaryOperator::Add, left, right);
+        }
+        let file = builder.finish(vec![expr_stmt(chain)]);
+        let empty_recovered = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new("").expect("fits")),
+        ));
+        let empty_checked = crate::checker::check(&empty_recovered);
+        let model = empty_checked.product();
+        let output = emit_checked(
+            &file,
+            model,
+            &EmitOptions {
+                target: ScriptTarget::EsNext,
+                remove_comments: true,
+                ..EmitOptions::default()
+            },
+            &EmitFileNames::default(),
+        );
+        let code = &javascript(&output).code;
+        assert!(code.starts_with("0 + 1 + 2"), "{code}");
+        assert!(code.trim_end().ends_with("19999;"), "{code}");
+        assert_eq!(code.matches(" + ").count(), 19999, "{code}");
+    }
+
+
+
+
+
 
     #[test]
     fn es5_generator_import_source_materializes_before_options_yield() {

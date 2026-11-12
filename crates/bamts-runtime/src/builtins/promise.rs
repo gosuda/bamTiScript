@@ -12,6 +12,8 @@ use crate::{
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
@@ -25,93 +27,47 @@ pub(super) fn install<H: Host>(
         },
     );
     builtins.set_promise_prototype(prototype);
-    let resolve_target = install_function(
-        heap,
-        builtins,
-        "Promise resolve target",
-        1,
-        resolve_target::<H>,
-    );
-    let reject_target = install_function(
-        heap,
-        builtins,
-        "Promise reject target",
-        1,
-        reject_target::<H>,
-    );
+    let resolve_target = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise resolve target", length: 1, handler: resolve_target::<H> });
+    let reject_target = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise reject target", length: 1, handler: reject_target::<H> });
     builtins.set_promise_resolver_targets(resolve_target, reject_target);
-    let all_fulfill = install_function(heap, builtins, "Promise all fulfill", 1, all_fulfill::<H>);
+    let all_fulfill = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise all fulfill", length: 1, handler: all_fulfill::<H> });
     builtins.set_promise_all_target(all_fulfill);
-    let capability_executor = install_function(
-        heap,
-        builtins,
-        "Promise capability executor",
-        2,
-        capability_executor::<H>,
-    );
-    let finally_value = install_function(
-        heap,
-        builtins,
-        "Promise finally value",
-        1,
-        finally_value::<H>,
-    );
-    let finally_throw = install_function(
-        heap,
-        builtins,
-        "Promise finally throw",
-        1,
-        finally_throw::<H>,
-    );
-    let species = install_function(heap, builtins, "get [Symbol.species]", 0, species::<H>);
-    let finally_return = install_function(
-        heap,
-        builtins,
-        "Promise finally return",
-        0,
-        finally_return::<H>,
-    );
-    let finally_rethrow = install_function(
-        heap,
-        builtins,
-        "Promise finally rethrow",
-        0,
-        finally_rethrow::<H>,
-    );
-    let then_fulfill = install_function(
-        heap,
-        builtins,
-        "Promise capability fulfill",
-        1,
-        then_fulfill::<H>,
-    );
-    let then_reject = install_function(
-        heap,
-        builtins,
-        "Promise capability reject",
-        1,
-        then_reject::<H>,
-    );
+    let capability_executor = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise capability executor", length: 2, handler: capability_executor::<H> });
+    let finally_value = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise finally value", length: 1, handler: finally_value::<H> });
+    let finally_throw = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise finally throw", length: 1, handler: finally_throw::<H> });
+    let species = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get [Symbol.species]", length: 0, handler: species::<H> });
+    let finally_return = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise finally return", length: 0, handler: finally_return::<H> });
+    let finally_rethrow = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise finally rethrow", length: 0, handler: finally_rethrow::<H> });
+    let then_fulfill = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise capability fulfill", length: 1, handler: then_fulfill::<H> });
+    let then_reject = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise capability reject", length: 1, handler: then_reject::<H> });
 
-    let constructor = install_constructor_function(heap, builtins, "Promise", 1, constructor::<H>);
-    builtins.set_constructor_prototype(heap, constructor, prototype);
+    let constructor =
+        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Promise", length: 1, handler: constructor::<H> });
+    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode("Promise"), constructor);
-    let queue_microtask =
-        install_function(heap, builtins, "queueMicrotask", 1, queue_microtask::<H>);
+    let queue_microtask = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "queueMicrotask", length: 1, handler: queue_microtask::<H> });
     globals.insert(EcmaString::encode("queueMicrotask"), queue_microtask);
 
-    let resolve = install_function(heap, builtins, "resolve", 1, resolve::<H>);
-    let reject = install_function(heap, builtins, "reject", 1, reject::<H>);
-    let all = install_function(heap, builtins, "all", 1, all::<H>);
-    let race = install_function(heap, builtins, "race", 1, race::<H>);
-    let all_settled = install_function(heap, builtins, "allSettled", 1, all_settled::<H>);
-    let any = install_function(heap, builtins, "any", 1, any::<H>);
-    define_static(heap, constructor, "resolve", resolve);
-    define_static(heap, constructor, "reject", reject);
-    define_static(heap, constructor, "all", all);
-    define_static(heap, constructor, "race", race);
-    define_static(heap, constructor, "allSettled", all_settled);
-    define_static(heap, constructor, "any", any);
+    let resolve = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "resolve", length: 1, handler: resolve::<H> });
+    let reject = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "reject", length: 1, handler: reject::<H> });
+    let all = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "all", length: 1, handler: all::<H> });
+    let race = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "race", length: 1, handler: race::<H> });
+    let all_settled = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "allSettled", length: 1, handler: all_settled::<H> });
+    let any = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "any", length: 1, handler: any::<H> });
+    let all_keyed = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "allKeyed", length: 1, handler: all_keyed::<H> });
+    let all_settled_keyed = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "allSettledKeyed", length: 1, handler: all_settled_keyed::<H> });
+    let try_method = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "try", length: 1, handler: promise_try::<H> });
+    let with_resolvers = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "withResolvers", length: 0, handler: with_resolvers::<H> });
+    define_static(heap, atoms, shapes, constructor, "resolve", resolve);
+    define_static(heap, atoms, shapes, constructor, "reject", reject);
+    define_static(heap, atoms, shapes, constructor, "all", all);
+    define_static(heap, atoms, shapes, constructor, "race", race);
+    define_static(heap, atoms, shapes, constructor, "allSettled", all_settled);
+    define_static(heap, atoms, shapes, constructor, "any", any);
+    define_static(heap, atoms, shapes, constructor, "allKeyed", all_keyed);
+    define_static(heap, atoms, shapes, constructor, "allSettledKeyed", all_settled_keyed);
+    define_static(heap, atoms, shapes, constructor, "try", try_method);
+    define_static(heap, atoms, shapes, constructor, "withResolvers", with_resolvers);
     builtins.set_promise_capability_executor(capability_executor);
     builtins.set_promise_finally_value(finally_value);
     builtins.set_promise_finally_throw(finally_throw);
@@ -124,6 +80,7 @@ pub(super) fn install<H: Host>(
         unreachable!("Promise constructor is native")
     };
     properties.insert(
+        shapes,
         PropertyKey::Symbol(super::heap_index(builtins.symbol_species()) as u32),
         crate::Property::Accessor {
             getter: Some(species),
@@ -132,23 +89,31 @@ pub(super) fn install<H: Host>(
             configurable: true,
         },
     );
-    let then = install_function(heap, builtins, "then", 2, then::<H>);
-    let catch = install_function(heap, builtins, "catch", 1, catch::<H>);
-    let finally = install_function(heap, builtins, "finally", 1, finally::<H>);
-    define_data(heap, prototype, "constructor", constructor);
-    define_data(heap, prototype, "then", then);
-    define_data(heap, prototype, "catch", catch);
-    define_data(heap, prototype, "finally", finally);
-    define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), "Promise");
+    let then = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "then", length: 2, handler: then::<H> });
+    let catch = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "catch", length: 1, handler: catch::<H> });
+    let finally = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "finally", length: 1, handler: finally::<H> });
+    define_data(heap, atoms, shapes, prototype, "constructor", constructor);
+    define_data(heap, atoms, shapes, prototype, "then", then);
+    define_data(heap, atoms, shapes, prototype, "catch", catch);
+    define_data(heap, atoms, shapes, prototype, "finally", finally);
+    define_to_string_tag(heap, shapes, prototype, builtins.symbol_to_string_tag(), "Promise");
 }
 
-fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
+fn define_static(
+    heap: &mut [HeapEntry],
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+    constructor: Value,
+    name: &str,
+    value: Value,
+) {
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[super::heap_index(constructor)]
     else {
         panic!("Promise constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
+        shapes,
+        PropertyKey::Named(atoms.intern(EcmaString::encode(name))),
         super::builtin_property(value),
     );
 }
@@ -227,7 +192,9 @@ fn capability_executor<H: Host>(
         }));
     }
     let record = args.first().copied().unwrap_or(Value::UNDEFINED);
-    if machine.get_named_property(record, "resolve")? != Value::UNDEFINED {
+    if machine.get_named_property(record, "resolve")? != Value::UNDEFINED
+        || machine.get_named_property(record, "reject")? != Value::UNDEFINED
+    {
         return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
             operation: "Promise capability executor",
         }));
@@ -279,7 +246,7 @@ fn species_constructor<H: Host>(
         }));
     }
     let species_symbol = machine.intrinsics.builtins.symbol_species();
-    let species_key = machine.to_property_key(species_symbol)?;
+    let species_key = machine.property_key_from_value(species_symbol)?;
     let species = machine.get_property_key(constructor, &species_key)?;
     if matches!(
         species.decode(),
@@ -460,6 +427,64 @@ fn reject<H: Host>(
     Ok(BuiltinOutcome::Value(capability.promise))
 }
 
+/// `Promise.try(callback, ...args)`: a synchronous throw rejects the result
+/// rather than reaching the caller. The capability stays rooted across the
+/// callback, which can run arbitrary code.
+fn promise_try<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_constructor(this)? {
+        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "Promise.try",
+        }));
+    }
+    let capability = new_promise_capability(machine, this)?;
+    let depth = machine.native_roots.len();
+    machine.push_native_roots(
+        depth,
+        &[capability.promise, capability.resolve, capability.reject],
+    );
+    let callback = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let callback_args = args.get(1..).unwrap_or_default();
+    let outcome = match machine.call_value(callback, Value::UNDEFINED, callback_args) {
+        Ok(value) => machine
+            .call_value(capability.resolve, Value::UNDEFINED, &[value])
+            .map(|_| BuiltinOutcome::Value(capability.promise)),
+        Err(failure) => reject_capability_failure(machine, &capability, failure),
+    };
+    machine.pop_native_roots(depth);
+    outcome
+}
+
+/// `Promise.withResolvers()`: a capability exposed as an ordinary object.
+fn with_resolvers<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    if !machine.is_constructor(this)? {
+        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "Promise.withResolvers",
+        }));
+    }
+    let capability = new_promise_capability(machine, this)?;
+    let prototype = machine.intrinsics.object_prototype;
+    let result = super::ordinary_runtime(machine, Some(prototype))?;
+    for (name, value) in [
+        ("promise", capability.promise),
+        ("resolve", capability.resolve),
+        ("reject", capability.reject),
+    ] {
+        let key = PropertyKey::Named(machine.intern_str(name));
+        machine.create_data_property_key(result, key, value)?;
+    }
+    Ok(BuiltinOutcome::Value(result))
+}
+
 fn all<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -521,9 +546,7 @@ fn race<H: Host>(
         let value = match machine.iterator_next(iterator) {
             Ok((true, _)) => break,
             Ok((false, value)) => value,
-            Err(failure) => {
-                return reject_iterator_failure(machine, &capability, iterator, failure);
-            }
+            Err(failure) => return reject_capability_failure(machine, &capability, failure),
         };
         let resolved = match machine.call_value(resolve, this, &[value]) {
             Ok(resolved) => resolved,
@@ -562,6 +585,245 @@ fn any<H: Host>(
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     aggregate_static(machine, this, args, constructing, AggregateKind::Any)
+}
+
+#[derive(Clone, Copy)]
+enum KeyedVariant {
+    All,
+    AllSettled,
+}
+
+fn all_keyed<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    keyed_static(machine, this, args, constructing, KeyedVariant::All)
+}
+
+fn all_settled_keyed<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    keyed_static(machine, this, args, constructing, KeyedVariant::AllSettled)
+}
+
+fn keyed_static<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+    variant: KeyedVariant,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let operation: &'static str = match variant {
+        KeyedVariant::All => "Promise.allKeyed",
+        KeyedVariant::AllSettled => "Promise.allSettledKeyed",
+    };
+    if constructing {
+        return Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }));
+    }
+    let capability = new_promise_capability(machine, this)?;
+    let resolve_operation: &'static str = match variant {
+        KeyedVariant::All => "Promise.allKeyed resolve",
+        KeyedVariant::AllSettled => "Promise.allSettledKeyed resolve",
+    };
+    let resolve = match machine.get_named_property(this, "resolve") {
+        Ok(candidate) => match machine.is_callable(candidate) {
+            Ok(true) => candidate,
+            Ok(false) => {
+                return reject_capability_failure(
+                    machine,
+                    &capability,
+                    EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: resolve_operation,
+                    }),
+                );
+            }
+            Err(failure) => return reject_capability_failure(machine, &capability, failure),
+        },
+        Err(failure) => return reject_capability_failure(machine, &capability, failure),
+    };
+    let promises = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if !machine.is_object(promises) {
+        return reject_capability_failure(
+            machine,
+            &capability,
+            EvalFailure::Throw(ThrowOrigin::TypeError { operation }),
+        );
+    }
+    perform_keyed(machine, promises, resolve, this, &capability, variant)?;
+    Ok(BuiltinOutcome::Value(capability.promise))
+}
+
+fn perform_keyed<H: Host>(
+    machine: &mut Machine<'_, H>,
+    promises: Value,
+    resolve_method: Value,
+    receiver: Value,
+    capability: &PromiseCapability,
+    variant: KeyedVariant,
+) -> Result<(), EvalFailure> {
+    let all_keys = match machine.internal_own_property_keys(promises) {
+        Ok(keys) => keys,
+        Err(failure) => {
+            reject_failure(machine, capability.reject, failure)?;
+            return Ok(());
+        }
+    };
+    let target = machine.intrinsics.builtins.promise_all_target();
+    let record = completion_record(
+        machine,
+        ReactionKind::KeyedComplete,
+        capability.resolve,
+        capability.reject,
+    )?;
+    let keys_placeholder = super::allocate_array(machine, Vec::new())?;
+    let keys_key = PropertyKey::Named(machine.intern_str("keys"));
+    machine.create_data_property_key(record, keys_key, keys_placeholder)?;
+    let keyed_complete = machine.create_promise_resolver_function(target, record)?;
+    let aggregate = machine
+        .allocate(HeapEntry::PromiseAll {
+            resolve: keyed_complete,
+            reject: capability.reject,
+            values: Vec::new(),
+            remaining: 1,
+            settled: false,
+        })
+        .map_err(EvalFailure::Runtime)?;
+    let mut keys: Vec<PropertyKey> = Vec::new();
+    for key in all_keys {
+        let desc = match machine.internal_get_own_property(promises, &key) {
+            Ok(desc) => desc,
+            Err(failure) => {
+                machine.mark_promise_all_settled(aggregate)?;
+                reject_failure(machine, capability.reject, failure)?;
+                return Ok(());
+            }
+        };
+        let Some(desc) = desc else { continue };
+        if desc.enumerable != Some(true) {
+            continue;
+        }
+        let property_value = match machine.get_property_key(promises, &key) {
+            Ok(value) => value,
+            Err(failure) => {
+                machine.mark_promise_all_settled(aggregate)?;
+                reject_failure(machine, capability.reject, failure)?;
+                return Ok(());
+            }
+        };
+        keys.push(key);
+        let index = match machine.add_promise_all_element(aggregate) {
+            Ok(index) => index,
+            Err(failure) => {
+                machine.mark_promise_all_settled(aggregate)?;
+                reject_failure(machine, capability.reject, failure)?;
+                return Ok(());
+            }
+        };
+        let element = match machine
+            .allocate(HeapEntry::PromiseAllElement {
+                aggregate,
+                index,
+                called: false,
+            })
+            .map_err(EvalFailure::Runtime)
+        {
+            Ok(element) => element,
+            Err(failure) => {
+                machine.mark_promise_all_settled(aggregate)?;
+                reject_failure(machine, capability.reject, failure)?;
+                return Ok(());
+            }
+        };
+        let (on_fulfilled, on_rejected) = match variant {
+            KeyedVariant::All => {
+                let on_fulfilled = match machine.create_promise_resolver_function(target, element) {
+                    Ok(callback) => callback,
+                    Err(failure) => {
+                        machine.mark_promise_all_settled(aggregate)?;
+                        reject_failure(machine, capability.reject, failure)?;
+                        return Ok(());
+                    }
+                };
+                (on_fulfilled, capability.reject)
+            }
+            KeyedVariant::AllSettled => {
+                match aggregate_callbacks(machine, AggregateKind::AllSettled, element, capability) {
+                    Ok(callbacks) => callbacks,
+                    Err(failure) => {
+                        machine.mark_promise_all_settled(aggregate)?;
+                        reject_failure(machine, capability.reject, failure)?;
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        let resolved = match machine.call_value(resolve_method, receiver, &[property_value]) {
+            Ok(resolved) => resolved,
+            Err(failure) => {
+                machine.mark_promise_all_settled(aggregate)?;
+                reject_failure(machine, capability.reject, failure)?;
+                return Ok(());
+            }
+        };
+        let then = match machine.get_named_property(resolved, "then") {
+            Ok(then) => then,
+            Err(failure) => {
+                machine.mark_promise_all_settled(aggregate)?;
+                reject_failure(machine, capability.reject, failure)?;
+                return Ok(());
+            }
+        };
+        if let Err(failure) = machine.call_value(then, resolved, &[on_fulfilled, on_rejected]) {
+            machine.mark_promise_all_settled(aggregate)?;
+            reject_failure(machine, capability.reject, failure)?;
+            return Ok(());
+        }
+    }
+    let mut key_values = Vec::with_capacity(keys.len());
+    for key in &keys {
+        match super::reflect::property_key_value(machine, key.clone()) {
+            Ok(value) => key_values.push(value),
+            Err(failure) => {
+                machine.mark_promise_all_settled(aggregate)?;
+                reject_failure(machine, capability.reject, failure)?;
+                return Ok(());
+            }
+        }
+    }
+    let keys_array = super::allocate_array(machine, key_values)?;
+    let keys_key = PropertyKey::Named(machine.intern_str("keys"));
+    machine.create_data_property_key(record, keys_key, keys_array)?;
+    if machine.finish_promise_all(aggregate)? {
+        let values = machine.move_promise_all_values_to_array(aggregate)?;
+        if let Err(failure) = machine.call_value(keyed_complete, Value::UNDEFINED, &[values]) {
+            reject_failure(machine, capability.reject, failure)?;
+        }
+    }
+    Ok(())
+}
+
+fn keyed_complete<H: Host>(
+    machine: &mut Machine<'_, H>,
+    record: Value,
+    values_array: Value,
+) -> Result<(), EvalFailure> {
+    let resolve = machine.get_named_property(record, "resolve")?;
+    let keys_array = machine.get_named_property(record, "keys")?;
+    let keys = machine.array_elements(keys_array)?.unwrap_or_default();
+    let values = machine.array_elements(values_array)?.unwrap_or_default();
+    let result = super::ordinary_runtime(machine, None)?;
+    let len = keys.len().min(values.len());
+    for i in 0..len {
+        let key = machine.property_key_from_value(keys[i])?;
+        machine.create_data_property_key(result, key, values[i])?;
+    }
+    machine.call_value(resolve, Value::UNDEFINED, &[result])?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -642,11 +904,8 @@ fn perform_ordered_aggregate<H: Host>(
                 Value::UNDEFINED,
                 Some(capability.reject),
             )?;
-            machine.create_data_property_key(
-                record,
-                PropertyKey::Named(EcmaString::encode("constructor")),
-                constructor,
-            )?;
+            let key = PropertyKey::Named(machine.intern_str("constructor"));
+            machine.create_data_property_key(record, key, constructor)?;
             machine.create_promise_resolver_function(
                 machine.intrinsics.builtins.promise_all_target(),
                 record,
@@ -674,13 +933,8 @@ fn perform_ordered_aggregate<H: Host>(
             Ok((true, _)) => break,
             Ok((false, value)) => value,
             Err(failure) => {
-                return reject_aggregate_failure(
-                    machine,
-                    aggregate,
-                    capability.reject,
-                    iterator,
-                    failure,
-                );
+                machine.mark_promise_all_settled(aggregate)?;
+                return reject_failure(machine, capability.reject, failure);
             }
         };
         let index = match machine.add_promise_all_element(aggregate) {
@@ -812,6 +1066,7 @@ enum ReactionKind {
     AnyComplete = 3,
     AllSettledComplete = 4,
     AnyFulfilled = 5,
+    KeyedComplete = 6,
 }
 
 fn reaction_record<H: Host>(
@@ -821,22 +1076,13 @@ fn reaction_record<H: Host>(
     reject: Option<Value>,
 ) -> Result<Value, EvalFailure> {
     let record = super::ordinary_runtime(machine, None)?;
-    machine.create_data_property_key(
-        record,
-        PropertyKey::Named(EcmaString::encode("kind")),
-        Value::int32(kind as u32),
-    )?;
-    machine.create_data_property_key(
-        record,
-        PropertyKey::Named(EcmaString::encode("element")),
-        element,
-    )?;
+    let kind_key = PropertyKey::Named(machine.intern_str("kind"));
+    machine.create_data_property_key(record, kind_key, Value::int32(kind as u32))?;
+    let element_key = PropertyKey::Named(machine.intern_str("element"));
+    machine.create_data_property_key(record, element_key, element)?;
     if let Some(reject) = reject {
-        machine.create_data_property_key(
-            record,
-            PropertyKey::Named(EcmaString::encode("reject")),
-            reject,
-        )?;
+        let reject_key = PropertyKey::Named(machine.intern_str("reject"));
+        machine.create_data_property_key(record, reject_key, reject)?;
     }
     Ok(record)
 }
@@ -848,11 +1094,8 @@ fn completion_record<H: Host>(
     reject: Value,
 ) -> Result<Value, EvalFailure> {
     let record = reaction_record(machine, kind, Value::UNDEFINED, Some(reject))?;
-    machine.create_data_property_key(
-        record,
-        PropertyKey::Named(EcmaString::encode("resolve")),
-        resolve,
-    )?;
+    let resolve_key = PropertyKey::Named(machine.intern_str("resolve"));
+    machine.create_data_property_key(record, resolve_key, resolve)?;
     Ok(record)
 }
 
@@ -1180,6 +1423,9 @@ fn all_fulfill<H: Host>(
             let resolve = machine.get_named_property(record, "resolve")?;
             machine.call_value(resolve, Value::UNDEFINED, &[value])?;
         }
+        raw if raw == ReactionKind::KeyedComplete as i32 => {
+            keyed_complete(machine, record, value)?;
+        }
         _ => {
             return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "Promise aggregate target",
@@ -1199,16 +1445,10 @@ fn settlement_result<H: Host>(
     let status = machine
         .allocate(HeapEntry::String(EcmaString::encode(status)))
         .map_err(EvalFailure::Runtime)?;
-    machine.create_data_property_key(
-        result,
-        PropertyKey::Named(EcmaString::encode("status")),
-        status,
-    )?;
-    machine.create_data_property_key(
-        result,
-        PropertyKey::Named(EcmaString::encode(field)),
-        value,
-    )?;
+    let status_key = PropertyKey::Named(machine.intern_str("status"));
+    machine.create_data_property_key(result, status_key, status)?;
+    let field_key = PropertyKey::Named(machine.intern_str(field));
+    machine.create_data_property_key(result, field_key, value)?;
     Ok(result)
 }
 
@@ -1240,18 +1480,82 @@ mod tests {
     use crate::intrinsics::BuiltinHandler;
     use crate::{Limits, PromiseState};
 
+    fn promise_state<'m>(machine: &'m Machine<'_, TestHost>, promise: Value) -> &'m PromiseState {
+        let index = machine.runtime_slot(promise).unwrap().unwrap();
+        let HeapEntry::Promise { state, .. } = &machine.heap[index] else {
+            panic!("expected a promise");
+        };
+        state
+    }
+
+    fn static_method(machine: &mut Machine<'_, TestHost>, name: &str) -> (Value, Value) {
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let method = machine.get_named_property(constructor, name).unwrap();
+        (constructor, method)
+    }
+
+    #[test]
+    fn promise_try_rejects_a_synchronous_throw_instead_of_propagating_it() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let (constructor, method) = static_method(&mut machine, "try");
+        let thrower = callback(&mut machine, "thrower", throw_99);
+        let promise = machine
+            .call_value(method, constructor, &[thrower])
+            .expect("the throw is captured by the promise");
+        assert!(matches!(
+            promise_state(&machine, promise),
+            PromiseState::Rejected { .. }
+        ));
+    }
+
+    #[test]
+    fn promise_try_and_with_resolvers_require_a_constructor() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let parse_int = machine.intrinsics.global("parseInt").unwrap();
+        for name in ["try", "withResolvers"] {
+            let (_, method) = static_method(&mut machine, name);
+            for receiver in [Value::UNDEFINED, parse_int] {
+                assert!(matches!(
+                    machine.call_value(method, receiver, &[]),
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn with_resolvers_exposes_a_working_capability() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let (constructor, method) = static_method(&mut machine, "withResolvers");
+        let record = machine.call_value(method, constructor, &[]).unwrap();
+        let promise = machine.get_named_property(record, "promise").unwrap();
+        let resolve = machine.get_named_property(record, "resolve").unwrap();
+        machine.get_named_property(record, "reject").unwrap();
+        assert!(matches!(
+            promise_state(&machine, promise),
+            PromiseState::Pending { .. }
+        ));
+        machine
+            .call_value(resolve, Value::UNDEFINED, &[Value::int32(1)])
+            .unwrap();
+        assert!(matches!(
+            promise_state(&machine, promise),
+            PromiseState::Fulfilled { .. }
+        ));
+    }
+
     fn callback(
         machine: &mut Machine<'_, TestHost>,
         name: &'static str,
         handler: BuiltinHandler<TestHost>,
     ) -> Value {
-        install_function(
-            &mut machine.heap,
-            &mut machine.intrinsics.builtins,
-            name,
-            0,
-            handler,
-        )
+        install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: name, length: 0, handler: handler })
     }
 
     fn return_undefined(
@@ -1584,7 +1888,7 @@ mod tests {
         let iterable = super::super::ordinary_runtime(machine, None).unwrap();
         let method = callback(machine, "test iterator method", iterator_method);
         let symbol = machine.intrinsics.builtins.symbol_iterator();
-        let key = machine.to_property_key(symbol).unwrap();
+        let key = machine.property_key_from_value(symbol).unwrap();
         machine
             .set_data_property_key(iterable, key, method)
             .unwrap();
@@ -1600,10 +1904,11 @@ mod tests {
         let resolve = callback(&mut machine, "throwing resolve", throwing_resolve);
         machine.test_set_global("throwingResolve", resolve);
         let getter = callback(&mut machine, "resolve getter", resolve_getter);
+        let resolve_key = PropertyKey::Named(machine.intern_str("resolve"));
         machine
             .define_accessor(
                 constructor,
-                PropertyKey::Named(EcmaString::encode("resolve")),
+                resolve_key,
                 getter,
                 crate::AccessorKind::Getter,
             )
@@ -1635,10 +1940,11 @@ mod tests {
         let constructor = machine.intrinsics.global("Promise").unwrap();
         let prototype = machine.intrinsics.builtins.promise_prototype();
         let throwing_getter = callback(&mut machine, "throwing then getter", throw_99);
+        let then_key = PropertyKey::Named(machine.intern_str("then"));
         machine
             .define_accessor(
                 prototype,
-                PropertyKey::Named(EcmaString::encode("then")),
+                then_key,
                 throwing_getter,
                 crate::AccessorKind::Getter,
             )
@@ -1877,13 +2183,9 @@ mod tests {
         // if the brand check did not short-circuit first.
         let spy = super::super::ordinary_runtime(&mut machine, None).unwrap();
         let getter = callback(&mut machine, "constructor getter", constructor_getter);
+        let constructor_key = PropertyKey::Named(machine.intern_str("constructor"));
         machine
-            .define_accessor(
-                spy,
-                PropertyKey::Named(EcmaString::encode("constructor")),
-                getter,
-                crate::AccessorKind::Getter,
-            )
+            .define_accessor(spy, constructor_key, getter, crate::AccessorKind::Getter)
             .unwrap();
 
         let then = machine
@@ -1983,10 +2285,10 @@ mod tests {
         let HeapEntry::NativeFunction { properties, .. } = &machine.heap[idx] else {
             panic!("Promise constructor is native");
         };
-        for (key, _) in properties.iter() {
+        for (key, _) in properties.iter(&machine.shapes) {
             if let PropertyKey::Named(name) = key {
                 assert!(
-                    !name.as_units().starts_with(&[0]),
+                    !machine.atoms.resolve(*name).as_units().starts_with(&[0]),
                     "Promise should have no NUL-prefixed own keys, found {:?}",
                     name
                 );
@@ -2001,10 +2303,10 @@ mod tests {
         let HeapEntry::Object { properties, .. } = &machine.heap[proto_idx] else {
             panic!("Promise prototype is object");
         };
-        for (key, _) in properties.iter() {
+        for (key, _) in properties.iter(&machine.shapes) {
             if let PropertyKey::Named(name) = key {
                 assert!(
-                    !name.as_units().starts_with(&[0]),
+                    !machine.atoms.resolve(*name).as_units().starts_with(&[0]),
                     "Promise.prototype should have no NUL-prefixed own keys, found {:?}",
                     name
                 );
@@ -2650,5 +2952,34 @@ mod tests {
             Some(Value::int32(1)),
             "Promise.any must invoke a throwing aggregate reject exactly once"
         );
+    }
+
+    #[test]
+    fn all_keyed_resolves_empty_object_to_null_prototype() {
+        let module = blank_program("<promise-all-keyed-empty>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let constructor = machine.intrinsics.global("Promise").unwrap();
+        let method = machine.get_named_property(constructor, "allKeyed").unwrap();
+        assert!(
+            machine.is_callable(method).unwrap(),
+            "Promise.allKeyed is callable"
+        );
+        let proto = machine.intrinsics.object_prototype;
+        let input = super::super::ordinary_runtime(&mut machine, Some(proto)).unwrap();
+        let promise = machine.call_value(method, constructor, &[input]).unwrap();
+        machine.drain_microtasks().unwrap();
+        match state(&machine, promise) {
+            PromiseState::Fulfilled { value } => {
+                let proto = machine.internal_get_prototype_of(value).unwrap();
+                assert_eq!(
+                    proto, None,
+                    "resolves-empty-object.js result has null prototype"
+                );
+                let keys = machine.internal_own_property_keys(value).unwrap();
+                assert!(keys.is_empty(), "empty input resolves to empty object");
+            }
+            other => panic!("empty allKeyed should fulfill, got {other:?}"),
+        }
     }
 }

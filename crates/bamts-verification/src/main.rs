@@ -12,7 +12,7 @@ use bamts_verification::{
     authority::verify_authority,
     catalog::{extract_catalog_cells, regenerate_manifest, write_catalog_json},
     completion::{
-        CompletionAspect, CompletionReport, CompletionScope, RegenerateMode, RegenerateOutcome,
+        CompletionReport, CompletionScope, RegenerateMode, RegenerateOutcome,
         regenerate_completion_program, verify_completion,
     },
     diagnostic_catalog::{self, CatalogError},
@@ -22,16 +22,17 @@ use bamts_verification::{
         regenerate_canonical_fixture, run_replay_canary_child,
     },
     formal_gates::audit_formal_gates,
-    leaf_evidence::generate as generate_leaf_evidence,
     ledger::verify_ledger_g0,
-    perf_guard::{self, Verdict},
-    perf_jit, perf_stage0,
     rebuild::{RebuildMode, discover_receipts, rebuild_ledger},
     shard::ShardSpec,
     source_fetch::{CommandBackend, materialize_named},
-    suite::completion::{SuiteMergeRequest, SuiteRunRequest, merge_suite, run_suite},
-    toolchain_schema::{
-        blocking_obligations, catalog_identifiers, emit_probe_object, load_target_cells,
+    suite::completion::{
+        SuiteMergeRequest, SuiteRecountRequest, SuiteRunRequest, merge_suite, recount_suite,
+        run_suite,
+    },
+    sweep_report::{
+        DiffRequest, FamiliesRequest, StatusRequest, diff as diff_receipts, families,
+        render_recount, status_report,
     },
     unicode,
     workspace_guard::audit_workspace,
@@ -60,36 +61,14 @@ enum Command {
     LedgerRebuild {
         check: bool,
     },
-    LeafEvidenceGenerate {
-        leaf: String,
-        aspect: String,
-        out: PathBuf,
-    },
     CompletionVerify {
         scope: CompletionScope,
-        aspect: CompletionAspect,
-    },
-    CompletionEvidence {
-        scope: CompletionScope,
-        aspect: CompletionAspect,
     },
     CompletionRegenerate {
         check: bool,
     },
     DiagnosticsRegenerate {
         check: bool,
-    },
-    ToolchainEvidence,
-    ToolchainObject {
-        target: String,
-        out: PathBuf,
-    },
-    PerfStage0,
-    PerfJit,
-    PerfCompare {
-        rules: PathBuf,
-        baseline: PathBuf,
-        scorecard: PathBuf,
     },
     FormalAudit(Vec<Gate>),
     RegenerateFixtures,
@@ -107,6 +86,14 @@ enum Command {
     },
     SuiteRun(SuiteRunRequest),
     SuiteMerge(SuiteMergeRequest),
+    SuiteFamilies(FamiliesRequest),
+    SuiteDiff(DiffRequest),
+    SuiteStatus(StatusRequest),
+    SuiteRecount {
+        request: SuiteRecountRequest,
+        limit: usize,
+        fail_on_regression: bool,
+    },
 }
 
 fn main() {
@@ -134,32 +121,9 @@ fn dispatch(root: &Path, command: Command) -> Result<()> {
         Command::CatalogRegenerate { release, check } => regenerate_catalog(root, &release, check),
         Command::LedgerVerify => verify_g0(root),
         Command::LedgerRebuild { check } => rebuild_ledger_command(root, check),
-        Command::LeafEvidenceGenerate { leaf, aspect, out } => {
-            let evidence = generate_leaf_evidence(root, &leaf, &aspect, &out)?;
-            writeln!(io::stdout().lock(), "{evidence}").map_err(|error| {
-                VerificationError::new(
-                    ErrorCode::Io,
-                    format!("cannot write receipt evidence: {error}"),
-                )
-            })
-        }
-        Command::CompletionVerify { scope, aspect } => {
-            verify_completion_command(root, &scope, aspect)
-        }
-        Command::CompletionEvidence { scope, aspect } => {
-            completion_evidence_command(root, &scope, aspect)
-        }
+        Command::CompletionVerify { scope } => verify_completion_command(root, &scope),
         Command::CompletionRegenerate { check } => regenerate_completion_command(root, check),
         Command::DiagnosticsRegenerate { check } => regenerate_diagnostics(root, check),
-        Command::ToolchainEvidence => audit_toolchain_evidence(root),
-        Command::ToolchainObject { target, out } => emit_toolchain_object(&target, &out),
-        Command::PerfStage0 => run_perf_stage0(),
-        Command::PerfJit => run_perf_jit(),
-        Command::PerfCompare {
-            rules,
-            baseline,
-            scorecard,
-        } => compare_perf(&rules, &baseline, &scorecard),
         Command::FormalAudit(gates) => audit_formal(root, &gates),
         Command::RegenerateFixtures => regenerate_fixtures(root),
         Command::SourceFetch { name, destination } => fetch_source(root, &name, &destination),
@@ -169,7 +133,41 @@ fn dispatch(root: &Path, command: Command) -> Result<()> {
         Command::ReplayCanary { faulty } => run_replay_canary_child(root, faulty),
         Command::SuiteRun(request) => run_suite(root, &request).map(|_| ()),
         Command::SuiteMerge(request) => merge_suite(root, &request).map(|_| ()),
+        Command::SuiteFamilies(request) => print_report(&families(&request)?),
+        Command::SuiteDiff(request) => {
+            let (report, regressions) = diff_receipts(&request)?;
+            print_report(&report)?;
+            fail_on_regressions(request.fail_on_regression, regressions)
+        }
+        Command::SuiteStatus(request) => print_report(&format!("{}\n", status_report(&request)?)),
+        Command::SuiteRecount {
+            request,
+            limit,
+            fail_on_regression,
+        } => {
+            let recount = recount_suite(root, &request)?;
+            let (report, regressions) =
+                render_recount(&request.family, &recount.before, &recount.after, limit);
+            print_report(&report)?;
+            fail_on_regressions(fail_on_regression, regressions)
+        }
     }
+}
+
+fn fail_on_regressions(enabled: bool, regressions: usize) -> Result<()> {
+    if enabled && regressions > 0 {
+        return Err(VerificationError::new(
+            ErrorCode::Transition,
+            format!("{regressions} row(s) regressed from PASS"),
+        ));
+    }
+    Ok(())
+}
+
+fn print_report(report: &str) -> Result<()> {
+    write!(io::stdout().lock(), "{report}").map_err(|error| {
+        VerificationError::new(ErrorCode::Io, format!("cannot write report: {error}"))
+    })
 }
 
 fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Command> {
@@ -180,11 +178,8 @@ fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Comman
         "authority" => parse_authority_command(&mut arguments),
         "catalog" => parse_catalog_command(&mut arguments),
         "ledger" => parse_ledger_command(&mut arguments),
-        "leaf-evidence" => parse_leaf_evidence_command(&mut arguments),
         "completion" => parse_completion_command(&mut arguments),
         "diagnostics" => parse_diagnostics_command(&mut arguments),
-        "toolchain" => parse_toolchain_command(&mut arguments),
-        "perf" => parse_perf_command(&mut arguments),
         "formal" => parse_formal_command(&mut arguments),
         "source" => parse_source_command(&mut arguments),
         "unicode" => parse_unicode_command(&mut arguments),
@@ -200,19 +195,6 @@ fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Comman
         _ if command.starts_with("--") => Err(usage(format!("unknown flag `{command}`"))),
         _ => Err(usage(format!("unknown command `{command}`"))),
     }
-}
-fn parse_leaf_evidence_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
-    expect_literal(arguments, "generate", "leaf-evidence subcommand")?;
-    let flags = parse_flags(arguments, &["--leaf", "--aspect", "--out"], &[])?;
-    Ok(Command::LeafEvidenceGenerate {
-        leaf: required_flag(&flags.values, "--leaf", "leaf-evidence generate")?,
-        aspect: required_flag(&flags.values, "--aspect", "leaf-evidence generate")?,
-        out: PathBuf::from(required_flag(
-            &flags.values,
-            "--out",
-            "leaf-evidence generate",
-        )?),
-    })
 }
 
 fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
@@ -277,9 +259,99 @@ fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result
                 },
             }))
         }
+        "families" => {
+            let receipt = path_argument(arguments, "suite families receipt")?;
+            let flags = parse_flags(arguments, &["--top", "--family", "--root"], &[])?;
+            Ok(Command::SuiteFamilies(FamiliesRequest {
+                receipt,
+                top: count_flag(&flags.values, "--top", 20)?,
+                family: flags.values.get("--family").cloned(),
+                root: flags.values.get("--root").map(PathBuf::from),
+            }))
+        }
+        "diff" => {
+            let a = path_argument(arguments, "first receipt of suite diff")?;
+            let b = path_argument(arguments, "second receipt of suite diff")?;
+            let flags = parse_flags(arguments, &["--limit"], &["--fail-on-regression"])?;
+            Ok(Command::SuiteDiff(DiffRequest {
+                a,
+                b,
+                limit: count_flag(&flags.values, "--limit", 20)?,
+                fail_on_regression: flags.switches.contains("--fail-on-regression"),
+            }))
+        }
+        "status" => {
+            let flags = parse_flags(arguments, &["--receipts", "--out"], &[])?;
+            Ok(Command::SuiteStatus(StatusRequest {
+                receipts: PathBuf::from(required_flag(
+                    &flags.values,
+                    "--receipts",
+                    "suite status",
+                )?),
+                out: PathBuf::from(required_flag(&flags.values, "--out", "suite status")?),
+            }))
+        }
+        "recount" => {
+            let flags = parse_flags(
+                arguments,
+                &[
+                    "--catalog",
+                    "--runner",
+                    "--baseline",
+                    "--family",
+                    "--limit",
+                    "--guard",
+                ],
+                &["--fail-on-regression"],
+            )?;
+            let guard = count_flag(&flags.values, "--guard", 500)?;
+            let fail_on_regression = flags.switches.contains("--fail-on-regression");
+            if fail_on_regression && guard == 0 {
+                return Err(usage(
+                    "`--fail-on-regression` needs passing rows to watch, so `--guard` cannot be 0",
+                ));
+            }
+            Ok(Command::SuiteRecount {
+                request: SuiteRecountRequest {
+                    catalog: required_flag(&flags.values, "--catalog", "suite recount")?,
+                    runner: required_flag(&flags.values, "--runner", "suite recount")?,
+                    baseline: PathBuf::from(required_flag(
+                        &flags.values,
+                        "--baseline",
+                        "suite recount",
+                    )?),
+                    family: required_flag(&flags.values, "--family", "suite recount")?,
+                    guard,
+                },
+                limit: count_flag(&flags.values, "--limit", 20)?,
+                fail_on_regression,
+            })
+        }
         _ if subcommand.starts_with("--") => Err(usage(format!("unknown flag `{subcommand}`"))),
         _ => Err(usage(format!("unknown suite subcommand `{subcommand}`"))),
     }
+}
+
+/// A positional path. A word that looks like a flag is a missing path.
+fn path_argument(
+    arguments: &mut impl Iterator<Item = OsString>,
+    description: &str,
+) -> Result<PathBuf> {
+    let value = required_argument(arguments, description)?;
+    if value.starts_with("--") {
+        return Err(usage(format!(
+            "missing {description}, found flag `{value}`"
+        )));
+    }
+    Ok(PathBuf::from(value))
+}
+
+fn count_flag(values: &BTreeMap<String, String>, flag: &str, default: usize) -> Result<usize> {
+    values.get(flag).map_or(Ok(default), |value| {
+        value
+            .parse::<usize>()
+            .map_err(|_| usage(format!("`{flag}` must be an unsigned integer")))
+    })
 }
 
 /// Parses low-level suite coordinates as zero-based `<index>/<count>`.
@@ -402,16 +474,12 @@ fn parse_ledger_command(arguments: &mut impl Iterator<Item = OsString>) -> Resul
     }
 }
 
-/// Accepted `--aspect` values, for the unknown-aspect usage detail.
-const COMPLETION_ASPECTS: &str = "contract, evidence, coverage, regression, mutation, aggregate";
-
 fn parse_completion_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
     let subcommand = required_argument(arguments, "completion subcommand")?;
     match subcommand.as_str() {
-        "verify" => parse_completion_request(arguments)
-            .map(|(scope, aspect)| Command::CompletionVerify { scope, aspect }),
-        "evidence" => parse_completion_request(arguments)
-            .map(|(scope, aspect)| Command::CompletionEvidence { scope, aspect }),
+        "verify" => {
+            parse_completion_request(arguments).map(|scope| Command::CompletionVerify { scope })
+        }
         "regenerate" => {
             let flags = parse_flags(arguments, &[], &["--check"])?;
             let check = flags.switches.contains("--check");
@@ -426,23 +494,9 @@ fn parse_completion_command(arguments: &mut impl Iterator<Item = OsString>) -> R
 
 fn parse_completion_request(
     arguments: &mut impl Iterator<Item = OsString>,
-) -> Result<(CompletionScope, CompletionAspect)> {
-    let flags = parse_flags(
-        arguments,
-        &[
-            "--leaf",
-            "--cluster",
-            "--track",
-            "--wave",
-            "--root",
-            "--aspect",
-        ],
-        &[],
-    )?;
-    Ok((
-        completion_scope(&flags.values)?,
-        completion_aspect(&flags.values)?,
-    ))
+) -> Result<CompletionScope> {
+    let flags = parse_flags(arguments, &["--leaf", "--cluster", "--root"], &[])?;
+    completion_scope(&flags.values)
 }
 
 fn completion_scope(values: &BTreeMap<String, String>) -> Result<CompletionScope> {
@@ -452,8 +506,6 @@ fn completion_scope(values: &BTreeMap<String, String>) -> Result<CompletionScope
             CompletionScope::Leaf as fn(String) -> CompletionScope,
         ),
         ("--cluster", CompletionScope::Cluster),
-        ("--track", CompletionScope::Track),
-        ("--wave", CompletionScope::Wave),
         ("--root", CompletionScope::Root),
     ]
     .into_iter()
@@ -462,22 +514,11 @@ fn completion_scope(values: &BTreeMap<String, String>) -> Result<CompletionScope
     match found.as_slice() {
         [scope] => Ok(scope.clone()),
         [] => Err(usage(
-            "completion verify requires exactly one of --leaf, --cluster, --track, --wave, or --root",
+            "completion verify requires exactly one of --leaf, --cluster, or --root",
         )),
         _ => Err(usage(
-            "completion scope flags are mutually exclusive; pass exactly one of --leaf, --cluster, --track, --wave, or --root",
+            "completion scope flags are mutually exclusive; pass exactly one of --leaf, --cluster, or --root",
         )),
-    }
-}
-
-fn completion_aspect(values: &BTreeMap<String, String>) -> Result<CompletionAspect> {
-    match values.get("--aspect") {
-        None => Ok(CompletionAspect::Aggregate),
-        Some(value) => CompletionAspect::parse(value).ok_or_else(|| {
-            usage(format!(
-                "unknown aspect `{value}`; expected one of {COMPLETION_ASPECTS}"
-            ))
-        }),
     }
 }
 
@@ -488,53 +529,6 @@ fn parse_diagnostics_command(arguments: &mut impl Iterator<Item = OsString>) -> 
     let flags = parse_flags(arguments, &[], &["--check"])?;
     let check = flags.switches.contains("--check");
     Ok(Command::DiagnosticsRegenerate { check })
-}
-
-fn parse_toolchain_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
-    let subcommand = required_argument(arguments, "toolchain subcommand")?;
-    match subcommand.as_str() {
-        "evidence" => {
-            reject_extra_arguments(arguments, &[])?;
-            Ok(Command::ToolchainEvidence)
-        }
-        "object" => {
-            let flags = parse_flags(arguments, &["--target", "--out"], &[])?;
-            let target = required_flag(&flags.values, "--target", "toolchain object")?;
-            let out = PathBuf::from(required_flag(&flags.values, "--out", "toolchain object")?);
-            Ok(Command::ToolchainObject { target, out })
-        }
-        _ => Err(usage(format!(
-            "unknown toolchain subcommand `{subcommand}`"
-        ))),
-    }
-}
-fn parse_perf_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
-    let subcommand = required_argument(arguments, "perf subcommand")?;
-    match subcommand.as_str() {
-        "stage0" => {
-            reject_extra_arguments(arguments, &[])?;
-            Ok(Command::PerfStage0)
-        }
-        "jit" => {
-            reject_extra_arguments(arguments, &[])?;
-            Ok(Command::PerfJit)
-        }
-        "compare" => {
-            let flags = parse_flags(arguments, &["--rules", "--baseline", "--scorecard"], &[])?;
-            let rules = PathBuf::from(required_flag(&flags.values, "--rules", "perf compare")?);
-            let baseline =
-                PathBuf::from(required_flag(&flags.values, "--baseline", "perf compare")?);
-            let scorecard =
-                PathBuf::from(required_flag(&flags.values, "--scorecard", "perf compare")?);
-            Ok(Command::PerfCompare {
-                rules,
-                baseline,
-                scorecard,
-            })
-        }
-        _ if subcommand.starts_with("--") => Err(usage(format!("unknown flag `{subcommand}`"))),
-        _ => Err(usage(format!("unknown perf subcommand `{subcommand}`"))),
-    }
 }
 
 /// Parsed `--flag value` pairs and bare `--flag` switches, in any order.
@@ -829,12 +823,8 @@ fn regenerate_fixtures(root: &Path) -> Result<()> {
     let transitions = regenerate_canonical_fixture(root)?;
     emit(&format!("G6 FIXTURES transitions={transitions}\n"))
 }
-fn verify_completion_command(
-    root: &Path,
-    scope: &CompletionScope,
-    aspect: CompletionAspect,
-) -> Result<()> {
-    let report = verified_completion_report(root, scope, aspect)?;
+fn verify_completion_command(root: &Path, scope: &CompletionScope) -> Result<()> {
+    let report = verified_completion_report(root, scope)?;
     let line = report.success_line().ok_or_else(|| {
         VerificationError::new(
             ErrorCode::Schema,
@@ -844,27 +834,8 @@ fn verify_completion_command(
     emit(&format!("{line}\n"))
 }
 
-fn completion_evidence_command(
-    root: &Path,
-    scope: &CompletionScope,
-    aspect: CompletionAspect,
-) -> Result<()> {
-    let report = verified_completion_report(root, scope, aspect)?;
-    let evidence = report.gate_evidence.ok_or_else(|| {
-        VerificationError::new(
-            ErrorCode::Schema,
-            "canonical evidence is available only for direct leaf aspect checks",
-        )
-    })?;
-    emit(&format!("{evidence}\n"))
-}
-
-fn verified_completion_report(
-    root: &Path,
-    scope: &CompletionScope,
-    aspect: CompletionAspect,
-) -> Result<CompletionReport> {
-    let report = verify_completion(root, scope, aspect)?;
+fn verified_completion_report(root: &Path, scope: &CompletionScope) -> Result<CompletionReport> {
+    let report = verify_completion(root, scope)?;
     if report.is_pass() {
         return Ok(report);
     }
@@ -881,10 +852,7 @@ fn verified_completion_report(
     }
     Err(VerificationError::new(
         ErrorCode::Workspace,
-        format!(
-            "completion verification failed for aspect `{}`: {detail}",
-            aspect.as_str()
-        ),
+        format!("completion verification failed: {detail}"),
     ))
 }
 
@@ -980,115 +948,6 @@ fn diagnostic_catalog_error(error: CatalogError) -> VerificationError {
             ErrorCode::SetMismatch,
             format!("generated diagnostic catalog drifted from {DIAGNOSTIC_SOURCE}: {path}"),
         ),
-    }
-}
-
-fn audit_toolchain_evidence(root: &Path) -> Result<()> {
-    let cells = load_target_cells(root)?;
-    let blocked = blocking_obligations(&cells);
-    if !blocked.is_empty() {
-        let identifiers: Vec<&str> = blocked
-            .iter()
-            .map(|(identifier, _)| identifier.as_str())
-            .collect();
-        return Err(VerificationError::new(
-            ErrorCode::SetMismatch,
-            format!(
-                "toolchain evidence declares {} non-PASS obligations: {}",
-                identifiers.len(),
-                identifiers.join(", ")
-            ),
-        ));
-    }
-    emit(&format!(
-        "TOOLCHAIN EVIDENCE PASS cells={} obligations={} blocking=0 external_blocked=0\n",
-        cells.len(),
-        catalog_identifiers().len(),
-    ))
-}
-fn emit_toolchain_object(target: &str, out: &Path) -> Result<()> {
-    let object = emit_probe_object(target, out)?;
-    emit(&format!(
-        "TOOLCHAIN OBJECT PASS target={} sha256={} bytes={} entry={} helpers={}\n",
-        object.target,
-        object.sha256,
-        object.byte_len,
-        object.entry_symbol,
-        object.required_helpers.join(","),
-    ))
-}
-
-fn run_perf_stage0() -> Result<()> {
-    let receipt = perf_stage0::run();
-    emit_perf_receipt("STAGE0", receipt)
-}
-
-fn run_perf_jit() -> Result<()> {
-    let receipt = perf_jit::run().map_err(|error| {
-        VerificationError::new(
-            ErrorCode::ToolFailed,
-            format!("perf jit measurement failed: {error:#}"),
-        )
-    })?;
-    let receipt = serde_json::from_str(&receipt).map_err(|error| {
-        VerificationError::new(
-            ErrorCode::Json,
-            format!("perf jit returned invalid JSON: {error}"),
-        )
-    })?;
-    emit_perf_receipt("JIT", receipt)
-}
-
-fn emit_perf_receipt(name: &str, receipt: serde_json::Value) -> Result<()> {
-    let state = receipt
-        .get("state")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            VerificationError::new(
-                ErrorCode::Schema,
-                format!("perf {} receipt omits `state`", name.to_ascii_lowercase()),
-            )
-        })?;
-    if state != "ACCEPTED" {
-        return Err(VerificationError::new(
-            ErrorCode::ToolFailed,
-            format!(
-                "perf {} receipt state={state}: {receipt}",
-                name.to_ascii_lowercase()
-            ),
-        ));
-    }
-    let receipt = serde_json::to_string(&receipt).map_err(|error| {
-        VerificationError::new(
-            ErrorCode::Json,
-            format!(
-                "cannot encode perf {} receipt: {error}",
-                name.to_ascii_lowercase()
-            ),
-        )
-    })?;
-    emit(&format!("PERF {name} PASS receipt={receipt}\n"))
-}
-
-fn compare_perf(rules: &Path, baseline: &Path, scorecard: &Path) -> Result<()> {
-    match perf_guard::evaluate_stage1_guard_from_paths(rules, baseline, scorecard).map_err(
-        |error| {
-            VerificationError::new(
-                ErrorCode::ToolFailed,
-                format!("perf comparison failed: {error}"),
-            )
-        },
-    )? {
-        Verdict::Pass {
-            current_median,
-            bound,
-        } => emit(&format!(
-            "PERF COMPARE PASS current_median={current_median} bound={bound}\n"
-        )),
-        Verdict::Fail(detail) => Err(VerificationError::new(
-            ErrorCode::SetMismatch,
-            format!("perf comparison rejected: {detail}"),
-        )),
     }
 }
 
@@ -1232,47 +1091,109 @@ mod tests {
     }
 
     #[test]
-    fn parses_leaf_evidence_generation_request() {
-        let command = parse(&[
+    fn rejects_completion_verify_aspect_flag() {
+        let error = parse(&[
             "bamts-verification",
-            "leaf-evidence",
-            "generate",
+            "completion",
+            "verify",
             "--leaf",
-            "B0.1",
+            "B4.1",
             "--aspect",
-            "mutation",
-            "--out",
-            ".outline/evidence/B0.1-mutation.json",
+            "contract",
         ])
-        .expect("leaf evidence generation command");
+        .expect_err("aspect flag is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
         assert_eq!(
-            command,
-            Command::LeafEvidenceGenerate {
-                leaf: "B0.1".to_owned(),
-                aspect: "mutation".to_owned(),
-                out: PathBuf::from(".outline/evidence/B0.1-mutation.json"),
-            }
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown flag `--aspect`"
         );
     }
 
     #[test]
-    fn parses_completion_evidence_request() {
-        let command = parse(&[
+    fn rejects_completion_verify_track_flag() {
+        let error = parse(&[
+            "bamts-verification",
+            "completion",
+            "verify",
+            "--track",
+            "T1",
+        ])
+        .expect_err("track flag is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert_eq!(
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown flag `--track`"
+        );
+    }
+
+    #[test]
+    fn rejects_completion_verify_wave_flag() {
+        let error = parse(&["bamts-verification", "completion", "verify", "--wave", "W1"])
+            .expect_err("wave flag is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert_eq!(
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown flag `--wave`"
+        );
+    }
+
+    #[test]
+    fn rejects_completion_evidence_subcommand() {
+        let error = parse(&[
             "bamts-verification",
             "completion",
             "evidence",
             "--leaf",
-            "B0.1",
-            "--aspect",
-            "contract",
+            "B4.1",
         ])
-        .expect("completion evidence command");
+        .expect_err("evidence subcommand is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
         assert_eq!(
-            command,
-            Command::CompletionEvidence {
-                scope: CompletionScope::Leaf("B0.1".to_owned()),
-                aspect: CompletionAspect::Contract,
-            }
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown completion subcommand `evidence`"
+        );
+    }
+
+    #[test]
+    fn rejects_leaf_evidence_command() {
+        let error = parse(&[
+            "bamts-verification",
+            "leaf-evidence",
+            "generate",
+            "--leaf",
+            "B4.1",
+            "--aspect",
+            "mutation",
+            "--out",
+            ".outline/evidence/B4.1-mutation.json",
+        ])
+        .expect_err("leaf-evidence command is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert_eq!(
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown command `leaf-evidence`"
+        );
+    }
+
+    #[test]
+    fn rejects_perf_command() {
+        let error =
+            parse(&["bamts-verification", "perf", "stage0"]).expect_err("perf command is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert_eq!(
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown command `perf`"
+        );
+    }
+
+    #[test]
+    fn rejects_toolchain_command() {
+        let error = parse(&["bamts-verification", "toolchain", "x"])
+            .expect_err("toolchain command is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert_eq!(
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown command `toolchain`"
         );
     }
 
@@ -1358,6 +1279,226 @@ mod tests {
     }
 
     #[test]
+    fn parses_suite_families_with_its_optional_flags() {
+        let Command::SuiteFamilies(plain) =
+            parse(&["bamts-verification", "suite", "families", "merged.jsonl"]).expect("plain")
+        else {
+            panic!("suite families variant")
+        };
+        assert_eq!(plain.receipt, PathBuf::from("merged.jsonl"));
+        assert_eq!(plain.top, 20);
+        assert_eq!(plain.family, None);
+        assert_eq!(plain.root, None);
+
+        let Command::SuiteFamilies(one) = parse(&[
+            "bamts-verification",
+            "suite",
+            "families",
+            "merged.jsonl",
+            "--top",
+            "5",
+            "--family",
+            "types/mismatch",
+            "--root",
+            "target/authority/test262",
+        ])
+        .expect("flags") else {
+            panic!("suite families variant")
+        };
+        assert_eq!(one.top, 5);
+        assert_eq!(one.family.as_deref(), Some("types/mismatch"));
+        assert_eq!(one.root, Some(PathBuf::from("target/authority/test262")));
+    }
+
+    #[test]
+    fn parses_suite_diff_with_two_receipts_and_a_regression_switch() {
+        let Command::SuiteDiff(request) = parse(&[
+            "bamts-verification",
+            "suite",
+            "diff",
+            "before.jsonl",
+            "after.jsonl",
+            "--limit",
+            "3",
+            "--fail-on-regression",
+        ])
+        .expect("diff") else {
+            panic!("suite diff variant")
+        };
+        assert_eq!(request.a, PathBuf::from("before.jsonl"));
+        assert_eq!(request.b, PathBuf::from("after.jsonl"));
+        assert_eq!(request.limit, 3);
+        assert!(request.fail_on_regression);
+
+        let Command::SuiteDiff(defaults) =
+            parse(&["bamts-verification", "suite", "diff", "a.jsonl", "b.jsonl"])
+                .expect("defaults")
+        else {
+            panic!("suite diff variant")
+        };
+        assert_eq!(defaults.limit, 20);
+        assert!(!defaults.fail_on_regression);
+    }
+
+    #[test]
+    fn parses_suite_recount_with_its_required_and_optional_flags() {
+        let Command::SuiteRecount {
+            request,
+            limit,
+            fail_on_regression,
+        } = parse(&[
+            "bamts-verification",
+            "suite",
+            "recount",
+            "--catalog",
+            "typescript-7.0.2",
+            "--runner",
+            "compiler",
+            "--baseline",
+            "merged.jsonl",
+            "--family",
+            "types/mismatch",
+            "--limit",
+            "4",
+            "--fail-on-regression",
+        ])
+        .expect("recount")
+        else {
+            panic!("suite recount variant")
+        };
+        assert_eq!(request.catalog, "typescript-7.0.2");
+        assert_eq!(request.runner, "compiler");
+        assert_eq!(request.baseline, PathBuf::from("merged.jsonl"));
+        assert_eq!(request.family, "types/mismatch");
+        assert_eq!(request.guard, 500);
+        assert_eq!(limit, 4);
+        assert!(fail_on_regression);
+
+        let unguarded = parse(&[
+            "bamts-verification",
+            "suite",
+            "recount",
+            "--catalog",
+            "test262",
+            "--runner",
+            "jit",
+            "--baseline",
+            "merged.jsonl",
+            "--family",
+            "types/mismatch",
+            "--guard",
+            "0",
+            "--fail-on-regression",
+        ]);
+        assert!(
+            unguarded.is_err_and(|error| error.code() == ErrorCode::Usage),
+            "a regression check with nothing to watch"
+        );
+
+        let missing = parse(&[
+            "bamts-verification",
+            "suite",
+            "recount",
+            "--catalog",
+            "test262",
+            "--runner",
+            "jit",
+            "--baseline",
+            "m.jsonl",
+        ])
+        .expect_err("a family is required");
+        assert_eq!(missing.code(), ErrorCode::Usage);
+        assert!(missing.to_string().contains("--family"));
+    }
+
+    #[test]
+    fn parses_suite_status_with_both_paths_and_requires_each() {
+        let Command::SuiteStatus(request) = parse(&[
+            "bamts-verification",
+            "suite",
+            "status",
+            "--receipts",
+            "target/evidence-local/merged",
+            "--out",
+            "target/evidence-local/status.md",
+        ])
+        .expect("status") else {
+            panic!("suite status variant")
+        };
+        assert_eq!(
+            request.receipts,
+            PathBuf::from("target/evidence-local/merged")
+        );
+        assert_eq!(
+            request.out,
+            PathBuf::from("target/evidence-local/status.md")
+        );
+
+        for (missing, arguments) in [
+            ("--out", vec!["--receipts", "merged"]),
+            ("--receipts", vec!["--out", "status.md"]),
+        ] {
+            let mut command = vec!["bamts-verification", "suite", "status"];
+            command.extend(arguments);
+            let error = parse(&command).expect_err("a required flag is missing");
+            assert_eq!(error.code(), ErrorCode::Usage);
+            assert!(error.to_string().contains(missing), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_suite_report_arguments() {
+        for arguments in [
+            vec!["bamts-verification", "suite", "families"],
+            vec!["bamts-verification", "suite", "families", "--top", "5"],
+            vec![
+                "bamts-verification",
+                "suite",
+                "families",
+                "r.jsonl",
+                "--top",
+                "many",
+            ],
+            vec![
+                "bamts-verification",
+                "suite",
+                "families",
+                "r.jsonl",
+                "--top",
+            ],
+            vec!["bamts-verification", "suite", "diff", "only-one.jsonl"],
+            vec![
+                "bamts-verification",
+                "suite",
+                "diff",
+                "a.jsonl",
+                "--limit",
+                "2",
+            ],
+            vec![
+                "bamts-verification",
+                "suite",
+                "diff",
+                "a.jsonl",
+                "b.jsonl",
+                "--limit",
+                "x",
+            ],
+            vec![
+                "bamts-verification",
+                "suite",
+                "diff",
+                "a.jsonl",
+                "b.jsonl",
+                "c.jsonl",
+            ],
+        ] {
+            let error = parse(&arguments).expect_err(&format!("{arguments:?}"));
+            assert_eq!(error.code(), ErrorCode::Usage, "{arguments:?}");
+        }
+    }
+
+    #[test]
     fn rejects_malformed_suite_shard() {
         let error = parse(&[
             "bamts-verification",
@@ -1413,7 +1554,7 @@ mod tests {
             "--catalog",
             "test262",
             "--catalog",
-            "benchmarks",
+            "test262",
             "--receipts",
             "receipts",
             "--out",

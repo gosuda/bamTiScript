@@ -6,6 +6,8 @@
 **/.lake/
 verification/ts-suite/
 verification/ts-suite-ledger.json
+proof/completeness-ledger.json
+verification/evidence/
 perf/fixtures/boundary/
 /out/
 /.merge_file_*
@@ -14,13 +16,8 @@ perf/fixtures/boundary/
 # paths, so scratch that comes and goes must not perturb them.
 /local/
 
-# The tracked completion program binds .outline/gates/*.md as product
-# authority, so those ledgers belong in the repository. Excluding
-# .outline is a machine-local global rule, not this repository's policy.
-# Re-include the directory so git descends, re-exclude its other
-# children, then admit only the gate ledgers and the root contract.
 !/.outline/
 /.outline/*
-!/.outline/gates/
 !/.outline/GATES.md
 !/.outline/type-script-7.0.2-completion.md
+/tasks/
