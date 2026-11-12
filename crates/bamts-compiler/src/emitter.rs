@@ -29,6 +29,8 @@ use std::{
     sync::Arc,
 };
 
+use smallvec::SmallVec;
+
 use crate::checker::{SemanticModel, Type, TypeId, render_type_declaration};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{EnumFacts, EnumScalar};
@@ -3010,8 +3012,7 @@ impl<'a> Emitter<'a> {
             }
             Expression::Class(class) => self.emit_class_js(&class.class),
             Expression::Arrow(arrow) => self.emit_arrow_js(arrow, self.anchor),
-            Expression::Call(call) => self.emit_call(call),
-            Expression::Member(member) => self.emit_member(member),
+            Expression::Call(_) | Expression::Member(_) => self.emit_access_chain(expression),
             Expression::New(new) => self.emit_new(new),
             Expression::Await(await_expr) => {
                 self.raw("await ");
@@ -3602,9 +3603,51 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn emit_call(&mut self, call: &CallExpression) {
+    fn emit_access_chain(&mut self, expression: &Expr) {
+        let outer = self.anchor;
+        let mut links: SmallVec<[&Expr; 8]> = SmallVec::new();
+        links.push(expression);
+        let mut current = expression;
+        while let Some(inner) = access_link_object(current) {
+            if !self.prints_as_access_link(inner) {
+                break;
+            }
+            links.push(inner);
+            current = inner;
+        }
+        self.anchor = if links.len() == 1 {
+            outer
+        } else {
+            current.range()
+        };
+        match current.data() {
+            Expression::Call(call) => self.emit_expression_prec(&call.callee, P_CALL_MEMBER),
+            Expression::Member(member) => self.emit_member_object(member),
+            _ => {}
+        }
+        for (index, link) in links.iter().enumerate().rev() {
+            self.anchor = if index == 0 { outer } else { link.range() };
+            match link.data() {
+                Expression::Call(call) => self.emit_call_arguments(call),
+                Expression::Member(member) => self.emit_member_property(member),
+                _ => {}
+            }
+        }
+        self.anchor = outer;
+    }
+
+    fn prints_as_access_link(&self, expression: &Expr) -> bool {
+        matches!(
+            expression.data(),
+            Expression::Call(_) | Expression::Member(_)
+        ) && self.enum_facts.const_use(expression.id()).is_none()
+            && !self
+                .jsx_plan
+                .is_some_and(|plan| plan.expression_desugars.contains_key(&expression.id()))
+    }
+
+    fn emit_call_arguments(&mut self, call: &CallExpression) {
         let range = self.anchor;
-        self.emit_expression_prec(&call.callee, P_CALL_MEMBER);
         let open_pos = self
             .source_pos_of(
                 TextRange::new(call.callee.range().end(), range.end()).unwrap_or(range),
@@ -3678,8 +3721,7 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn emit_member(&mut self, member: &MemberExpression) {
-        let range = self.anchor;
+    fn emit_member_object(&mut self, member: &MemberExpression) {
         let dotted = !matches!(member.property, MemberProperty::Computed(_));
         let numeric_object = dotted
             && matches!(
@@ -3693,6 +3735,10 @@ impl<'a> Emitter<'a> {
         } else {
             self.emit_expression_prec(&member.object, P_CALL_MEMBER);
         }
+    }
+
+    fn emit_member_property(&mut self, member: &MemberExpression) {
+        let range = self.anchor;
         match &member.property {
             MemberProperty::Named(name) => {
                 let dot_pos = self
@@ -5938,6 +5984,14 @@ const fn type_operator_str(operator: TypeOperator) -> &'static str {
         TypeOperator::Keyof => "keyof",
         TypeOperator::Unique => "unique",
         TypeOperator::Readonly => "readonly",
+    }
+}
+
+fn access_link_object(expression: &Expr) -> Option<&Expr> {
+    match expression.data() {
+        Expression::Call(call) => Some(&call.callee),
+        Expression::Member(member) => Some(&member.object),
+        _ => None,
     }
 }
 
@@ -8992,6 +9046,43 @@ var c = () => 1;
         assert!(code.starts_with("x0 || x1 || x2"), "{code}");
         assert!(code.trim_end().ends_with("x19999;"), "{code}");
         assert_eq!(code.matches(" || ").count(), 19999, "{code}");
+    }
+
+    #[test]
+    fn left_deep_member_chain_emits_without_overflow() {
+        let code = emit_left_deep_chain(
+            |builder| builder.ident_expr("x"),
+            |builder, object, _| {
+                builder.token(TokenKind::Dot, ".");
+                let name = builder.ident("p");
+                expr(Expression::Member(MemberExpression {
+                    object: Box::new(object),
+                    property: MemberProperty::Named(name),
+                    optional: false,
+                }))
+            },
+        );
+        assert!(code.starts_with("x.p.p"), "{code}");
+        assert_eq!(code.matches(".p").count(), 19999, "{code}");
+    }
+
+    #[test]
+    fn left_deep_call_chain_emits_without_overflow() {
+        let code = emit_left_deep_chain(
+            |builder| builder.ident_expr("f"),
+            |builder, callee, index| {
+                let argument = builder.number(&index.to_string());
+                expr(Expression::Call(CallExpression {
+                    callee: Box::new(callee),
+                    optional: false,
+                    type_arguments: None,
+                    arguments: vec![CallArgument::Expression(Box::new(argument))],
+                }))
+            },
+        );
+        assert!(code.starts_with("f(1)(2)(3)"), "{code}");
+        assert!(code.trim_end().ends_with("(19999);"), "{code}");
+        assert_eq!(code.matches(")(").count(), 19998, "{code}");
     }
 
     #[test]
