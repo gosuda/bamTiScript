@@ -33,6 +33,7 @@ pub(crate) mod atomics;
 pub(crate) mod dataview;
 mod disposable_stack;
 mod error_edge;
+pub(crate) use error_edge::initialize_error;
 mod map_set_edge;
 mod math_edge;
 mod number_format;

@@ -3801,6 +3801,31 @@ impl<'a, H: Host> Machine<'a, H> {
         .map_err(EvalFailure::Runtime)
     }
 
+    /// A native function that calls `target` with an undefined receiver and
+    /// `arguments` prepended, as `Function.prototype.bind` would build it, but
+    /// without looking up or running guest-replaceable `bind`.
+    pub(crate) fn bound_native_function(
+        &mut self,
+        target: Value,
+        arguments: Vec<Value>,
+        name: &str,
+    ) -> Result<Value, EvalFailure> {
+        let name = self
+            .allocate(HeapEntry::String(EcmaString::encode(name)))
+            .map_err(EvalFailure::Runtime)?;
+        let properties = intrinsics::function_properties(&mut self.atoms, &mut self.shapes, 0, name);
+        self.allocate(HeapEntry::native_function(
+            NativeCallable::Bound(Box::new(BoundCallable {
+                target,
+                this_value: Value::UNDEFINED,
+                arguments,
+            })),
+            properties,
+            Some(self.intrinsics.function_prototype),
+        ))
+        .map_err(EvalFailure::Runtime)
+    }
+
     pub(crate) fn resolve_promise_resolver(
         &mut self,
         record: Value,
@@ -4702,7 +4727,7 @@ impl<'a, H: Host> Machine<'a, H> {
             .builtins
             .id_named(name)
             .expect("error constructor is installed");
-        match self.throw_error(id, message.to_owned()) {
+        match self.throw_error(id, EcmaString::encode(message)) {
             EvalFailure::ThrowValue(value) => Ok(value),
             EvalFailure::Runtime(kind) => Err(kind),
             _ => unreachable!("error materialization returns a thrown value"),
@@ -7134,10 +7159,12 @@ impl<'a, H: Host> Machine<'a, H> {
         if self.internal_has_property(global, &key)? {
             return Ok(());
         }
-        Err(self.intrinsic_error(
-            "ReferenceError",
-            format!("{} is not defined", name.to_utf8_lossy()),
-        ))
+        let mut message = EcmaStringBuilder::new();
+        for &unit in name.as_units() {
+            message.push_unit(unit);
+        }
+        message.push_utf8(" is not defined");
+        Err(self.intrinsic_error("ReferenceError", message.finish()))
     }
 
     fn intern(&mut self, text: EcmaString) -> Atom {
@@ -8634,44 +8661,33 @@ impl<'a, H: Host> Machine<'a, H> {
         self.kept_alive.clear();
     }
 
+    /// A thrown error of the intrinsic constructor `id` with `message`, with
+    /// the own properties the constructor itself gives a new error.
     pub(crate) fn throw_error(
         &mut self,
         id: intrinsics::BuiltinId,
-        message: String,
+        message: EcmaString,
     ) -> EvalFailure {
-        let message = match self.allocate(HeapEntry::String(EcmaString::encode(&message))) {
-            Ok(value) => value,
-            Err(kind) => return EvalFailure::Runtime(kind),
-        };
-        let message_key = PropertyKey::Named(self.intern_str("message"));
-        let brand_key = self.intrinsics.builtins.error_brand_key();
-        let mut properties = PropertyMap::default();
-        properties.insert(
-            &mut self.shapes,
-            message_key,
-            Property::Data {
-                value: message,
-                writable: true,
-                enumerable: true,
-                configurable: true,
-            },
-        );
-        properties.insert(&mut self.shapes, brand_key, error_brand());
-        match self.allocate(HeapEntry::Object {
-            properties,
+        let object = match self.allocate(HeapEntry::Object {
+            properties: PropertyMap::default(),
             prototype: Some(self.intrinsics.error_prototype(id)),
             boxed_primitive: None,
             extensible: true,
         }) {
-            Ok(value) => EvalFailure::ThrowValue(value),
-            Err(kind) => EvalFailure::Runtime(kind),
+            Ok(value) => value,
+            Err(kind) => return EvalFailure::Runtime(kind),
+        };
+        let name = self.intrinsics.builtins.get(id).name;
+        match builtins::initialize_error(self, object, name, Some(&message)) {
+            Ok(()) => EvalFailure::ThrowValue(object),
+            Err(failure) => failure,
         }
     }
 
     /// A thrown error object built from the realm's own `constructor`
     /// intrinsic, whatever guest code has since stored in the global binding
     /// of that name.
-    pub(crate) fn intrinsic_error(&mut self, constructor: &str, message: String) -> EvalFailure {
+    pub(crate) fn intrinsic_error(&mut self, constructor: &str, message: EcmaString) -> EvalFailure {
         let id = self
             .intrinsics
             .builtins
@@ -8688,7 +8704,7 @@ impl<'a, H: Host> Machine<'a, H> {
         kind: IntrinsicErrorKind,
         message: ConstantId,
     ) -> EvalFailure {
-        let message = self.constant_text(module, message).to_utf8_lossy().to_string();
+        let message = self.constant_text(module, message).clone();
         self.intrinsic_error(kind.constructor_name(), message)
     }
 
@@ -9398,7 +9414,7 @@ impl<'a, H: Host> Machine<'a, H> {
             .expect("ReferenceError intrinsic is installed");
         match self.throw_error(
             id,
-            "Cannot access lexical binding before initialization".into(),
+            EcmaString::encode("Cannot access lexical binding before initialization"),
         ) {
             EvalFailure::ThrowValue(value) => EvalFailure::ThrowValueOrigin {
                 value,
@@ -20015,6 +20031,134 @@ mod tests {
                 assert_eq!(machine.test_global("called"), Some(Value::int32(0)));
             }
         }
+    }
+
+    /// Asserts the own-property shape `new Error(message)` gives an error:
+    /// named keys `stack` then `message`, `message` a non-enumerable writable
+    /// configurable data property, and `stack` a non-enumerable accessor.
+    fn assert_constructed_error_shape<H: Host>(machine: &mut Machine<'_, H>, error: Value) {
+        let keys: Vec<String> = machine
+            .own_property_keys(error)
+            .unwrap()
+            .into_iter()
+            .filter_map(|key| match key {
+                PropertyKey::Named(atom) => Some(machine.resolve_atom(atom).to_utf8_lossy().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, ["stack", "message"]);
+        let message_key = PropertyKey::Named(machine.intern_str("message"));
+        assert!(matches!(
+            machine.own_descriptor(error, &message_key).unwrap(),
+            Some(Property::Data {
+                writable: true,
+                enumerable: false,
+                configurable: true,
+                ..
+            })
+        ));
+        let stack_key = PropertyKey::Named(machine.intern_str("stack"));
+        assert!(matches!(
+            machine.own_descriptor(error, &stack_key).unwrap(),
+            Some(Property::Accessor {
+                enumerable: false,
+                configurable: true,
+                ..
+            })
+        ));
+    }
+
+    /// Runs `throwing` (one instruction at pc 1) under a handler that catches
+    /// into `r0` and returns the caught value. `r1` holds an empty array.
+    fn caught_by_handler(constants: Vec<Constant>, throwing: Instruction) -> Program<Verified> {
+        let entry = Function::new(
+            None,
+            0,
+            0,
+            3,
+            FunctionFlags::default(),
+            vec![
+                Instruction::CreateArray { dst: reg(1) },
+                throwing,
+                Instruction::Return { value: reg(1) },
+                Instruction::Return { value: reg(0) },
+            ],
+            vec![ExceptionHandler {
+                start: pc(1),
+                end: pc(2),
+                handler: pc(3),
+                catch_register: reg(0),
+            }],
+        );
+        verified(constants, vec![entry])
+    }
+
+    fn caught_error(program: &Program<Verified>, check: impl FnOnce(&mut Machine<'_, TestHost>, Value)) {
+        let mut host = TestHost;
+        let mut machine = Machine::new(program, &mut host, Limits::default());
+        let caught = machine.evaluate().unwrap().value;
+        check(&mut machine, caught);
+    }
+
+    #[test]
+    fn intrinsic_error_has_the_constructed_error_shape() {
+        let program = caught_by_handler(
+            vec![Constant::String(EcmaString::encode("m"))],
+            Instruction::ThrowIntrinsicError {
+                kind: IntrinsicErrorKind::TypeError,
+                message: cid(0),
+            },
+        );
+        caught_error(&program, |machine, error| {
+            assert_intrinsic_error(machine, error, "TypeError", "m");
+            assert_constructed_error_shape(machine, error);
+        });
+    }
+
+    #[test]
+    fn strict_global_reference_error_has_the_constructed_error_shape() {
+        let program = caught_by_handler(
+            vec![Constant::String(EcmaString::encode("undeclared"))],
+            Instruction::RequireGlobalBinding { name: cid(0) },
+        );
+        caught_error(&program, |machine, error| {
+            assert_intrinsic_error(machine, error, "ReferenceError", "undeclared is not defined");
+            assert_constructed_error_shape(machine, error);
+        });
+    }
+
+    #[test]
+    fn engine_type_error_has_the_constructed_error_shape() {
+        let program = caught_by_handler(
+            Vec::new(),
+            Instruction::Call {
+                dst: reg(2),
+                callee: reg(1),
+                this_value: reg(1),
+                arguments: reg(1),
+            },
+        );
+        caught_error(&program, |machine, error| {
+            assert_intrinsic_prototype(machine, error, "TypeError");
+            assert_constructed_error_shape(machine, error);
+        });
+    }
+
+    #[test]
+    fn intrinsic_error_message_keeps_a_lone_surrogate() {
+        let units = [u16::from(b'x'), 0xD800];
+        let program = caught_by_handler(
+            vec![Constant::String(EcmaString::from_units(&units))],
+            Instruction::ThrowIntrinsicError {
+                kind: IntrinsicErrorKind::TypeError,
+                message: cid(0),
+            },
+        );
+        caught_error(&program, |machine, error| {
+            let slot = assert_intrinsic_prototype(machine, error, "TypeError");
+            let message = machine.own_data_property(slot, "message").unwrap();
+            assert_eq!(machine.string_value(message).unwrap().as_units(), units);
+        });
     }
 
     #[test]

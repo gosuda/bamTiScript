@@ -333,9 +333,6 @@ pub(super) fn error_constructor<H: Host>(
             .map_err(EvalFailure::Runtime)?
     };
 
-    let brand = machine.intrinsics.builtins.error_brand_key();
-    machine.define_descriptor(object, brand, crate::error_brand())?;
-
     let (message_index, options_index) = match name {
         "AggregateError" => (1, 2),
         "SuppressedError" => (2, 3),
@@ -348,10 +345,7 @@ pub(super) fn error_constructor<H: Host>(
             .filter(|value| *value != Value::UNDEFINED)
             .map(|value| machine.coerce_string_observable(value))
             .transpose()?;
-        if let Some(text) = &message {
-            let value = allocate_string(machine, text.clone())?;
-            define_own(machine, object, "message", value)?;
-        }
+        initialize_error(machine, object, name, message.as_ref())?;
 
         if let Some(options) = args.get(options_index).copied()
             && machine.is_object(options)
@@ -387,8 +381,29 @@ pub(super) fn error_constructor<H: Host>(
             _ => {}
         }
 
-        install_stack(machine, object, name, message.as_ref(), None)?;
         Ok(BuiltinOutcome::Value(object))
+    })
+}
+
+/// Gives `object` the own state of an error constructed with `message`: the
+/// error brand, then an own `stack` accessor, then a non-enumerable `message`
+/// when one is present. Engine-raised errors and the error constructors share
+/// this, so both have the same property descriptors in the same order.
+pub(crate) fn initialize_error<H: Host>(
+    machine: &mut Machine<'_, H>,
+    object: Value,
+    name: &str,
+    message: Option<&EcmaString>,
+) -> Result<(), EvalFailure> {
+    with_roots(machine, &[object], |machine, _| {
+        let brand = machine.intrinsics.builtins.error_brand_key();
+        machine.define_descriptor(object, brand, crate::error_brand())?;
+        install_stack(machine, object, name, message, None)?;
+        if let Some(text) = message {
+            let value = allocate_string(machine, text.clone())?;
+            define_own(machine, object, "message", value)?;
+        }
+        Ok(())
     })
 }
 
@@ -406,25 +421,14 @@ fn install_stack<H: Host>(
     )?;
     let frames = format_frames(machine, skip);
     let frames_value = allocate_string(machine, frames)?;
-    let error = machine
-        .intrinsics
-        .global("Error")
-        .ok_or_else(|| type_error("Error constructor is not installed"))?;
-    let error_prototype = machine.get_named_property(error, "prototype")?;
+    let error_prototype = prototype_of_error(machine)?;
     let getter = machine.get_named_property(error_prototype, STACK_GETTER)?;
-    let bind = machine.get_named_property(getter, "bind")?;
-    let getter = machine.call_value(
-        bind,
-        getter,
-        &[
-            Value::UNDEFINED,
-            object,
-            name_value,
-            message_value,
-            frames_value,
-        ],
-    )?;
     let setter = machine.get_named_property(error_prototype, STACK_SETTER)?;
+    let getter = machine.bound_native_function(
+        getter,
+        vec![object, name_value, message_value, frames_value],
+        "bound get stack",
+    )?;
     let stack_key = PropertyKey::Named(machine.intern_str("stack"));
     machine.define_descriptor(
         object,

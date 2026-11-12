@@ -1001,7 +1001,7 @@ fn encoding_syntax_error<H: Host>(
         .builtins
         .id_named("SyntaxError")
         .expect("SyntaxError installed");
-    machine.throw_error(id, message.into())
+    machine.throw_error(id, EcmaString::encode(&Into::<String>::into(message)))
 }
 
 fn options_object<H: Host>(

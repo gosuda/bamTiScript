@@ -290,7 +290,7 @@ pub(super) fn throw<H: Host>(machine: &mut Machine<'_, H>, error: TemporalError)
         .builtins
         .id_named(name)
         .expect("error constructor is installed");
-    machine.throw_error(id, error.message)
+    machine.throw_error(id, EcmaString::encode(&error.message))
 }
 
 /// Lifts a core result into the binding's error channel.

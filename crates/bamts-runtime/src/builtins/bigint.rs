@@ -1284,7 +1284,7 @@ fn bigint_failure<H: Host>(machine: &mut Machine<'_, H>, error: BigIntError) -> 
                 .builtins
                 .id_named("SyntaxError")
                 .expect("SyntaxError intrinsic is installed");
-            machine.throw_error(id, message.to_owned())
+            machine.throw_error(id, EcmaString::encode(message))
         }
     }
 }

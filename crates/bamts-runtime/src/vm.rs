@@ -449,7 +449,7 @@ pub(crate) fn compile_error<H: Host>(
         .builtins
         .id_named(kind)
         .expect("error constructors install before external modules");
-    machine.throw_error(id, message)
+    machine.throw_error(id, EcmaString::encode(&message))
 }
 
 fn script_prototype<H: Host>(machine: &Machine<'_, H>) -> Value {

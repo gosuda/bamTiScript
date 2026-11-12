@@ -436,7 +436,7 @@ pub(super) fn compile<H: Host>(
             .builtins
             .id_named("SyntaxError")
             .expect("SyntaxError installed");
-        machine.throw_error(id, error.message().to_owned())
+        machine.throw_error(id, EcmaString::encode(error.message()))
     })
 }
 

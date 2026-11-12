@@ -247,7 +247,7 @@ fn throw<H: Host>(machine: &mut Machine<'_, H>, name: &str, message: String) -> 
         .builtins
         .id_named(name)
         .expect("error constructor is installed");
-    machine.throw_error(id, message)
+    machine.throw_error(id, EcmaString::encode(&message))
 }
 
 pub(super) fn range_error<H: Host>(
