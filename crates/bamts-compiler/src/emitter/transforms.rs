@@ -15,6 +15,7 @@
 //!   ES2015, and generators below ES2015 produce typed diagnostics instead of
 //!   silently emitting later syntax.
 
+use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -8616,6 +8617,59 @@ impl<'a> Rewriter<'a> {
         rebuilt
     }
 
+    fn rewrite_access_spine(&mut self, expression: &Expr) -> Expr {
+        let mut links: SmallVec<[&Expr; 8]> = SmallVec::new();
+        let mut current = expression;
+        while let Some(inner) = self.access_link_object(current) {
+            links.push(current);
+            current = inner;
+        }
+        let mut rebuilt = self.rewrite_expr(current);
+        for link in links.into_iter().rev() {
+            rebuilt = self.rebuild_access_link(link, rebuilt);
+        }
+        rebuilt
+    }
+
+    fn access_link_object<'e>(&self, expression: &'e Expr) -> Option<&'e Expr> {
+        match expression.data() {
+            Expression::Member(_) if self.is_const_enum_use(expression.id()) => None,
+            Expression::Call(call) => Some(&call.callee),
+            Expression::Member(member) => Some(&member.object),
+            _ => None,
+        }
+    }
+
+    fn rebuild_access_link(&mut self, link: &Expr, inner: Expr) -> Expr {
+        let data = match link.data() {
+            Expression::Call(call) => {
+                let callee = if self.cjs_call_needs_safe_wrap(&call.callee) {
+                    self.cjs_wrap_callee(inner)
+                } else {
+                    inner
+                };
+                Expression::Call(CallExpression {
+                    callee: Box::new(callee),
+                    optional: call.optional,
+                    type_arguments: None,
+                    arguments: self.rewrite_call_arguments(&call.arguments),
+                })
+            }
+            Expression::Member(member) => Expression::Member(MemberExpression {
+                object: Box::new(inner),
+                property: match &member.property {
+                    MemberProperty::Computed(value) => {
+                        MemberProperty::Computed(Box::new(self.rewrite_expr(value)))
+                    }
+                    other => other.clone(),
+                },
+                optional: member.optional,
+            }),
+            _ => return inner,
+        };
+        self.node(link.range(), data)
+    }
+
     fn rewrite_expression(&mut self, expression: &Expr) -> Expr {
         if self.replace_await
             && let Expression::Await(awaited) = expression.data()
@@ -8669,31 +8723,13 @@ impl<'a> Rewriter<'a> {
                     }),
                 )
             }
-            Expression::Call(_)
+            Expression::Call(_) | Expression::Member(_)
                 if Self::needs(LanguageFeature::OptionalChaining, self.options)
                     && spine_has_optional(expression) =>
             {
                 self.lower_optional_chain(expression)
             }
-            Expression::Call(call) => {
-                let needs_safe_wrap = self.cjs_call_needs_safe_wrap(&call.callee);
-                let callee = self.rewrite_expr(&call.callee);
-                let callee = if needs_safe_wrap {
-                    self.cjs_wrap_callee(callee)
-                } else {
-                    callee
-                };
-                let arguments = self.rewrite_call_arguments(&call.arguments);
-                self.node(
-                    expression.range(),
-                    Expression::Call(CallExpression {
-                        callee: Box::new(callee),
-                        optional: call.optional,
-                        type_arguments: None,
-                        arguments,
-                    }),
-                )
-            }
+            Expression::Call(_) | Expression::Member(_) => self.rewrite_access_spine(expression),
             Expression::New(new_expr) => {
                 let callee = self.rewrite_expr(&new_expr.callee);
                 let arguments = self.rewrite_call_arguments(&new_expr.arguments);
@@ -8703,29 +8739,6 @@ impl<'a> Rewriter<'a> {
                         callee: Box::new(callee),
                         type_arguments: None,
                         arguments,
-                    }),
-                )
-            }
-            Expression::Member(_)
-                if Self::needs(LanguageFeature::OptionalChaining, self.options)
-                    && spine_has_optional(expression) =>
-            {
-                self.lower_optional_chain(expression)
-            }
-            Expression::Member(member) => {
-                let object = self.rewrite_expr(&member.object);
-                let property = match &member.property {
-                    MemberProperty::Computed(value) => {
-                        MemberProperty::Computed(Box::new(self.rewrite_expr(value)))
-                    }
-                    other => other.clone(),
-                };
-                self.node(
-                    expression.range(),
-                    Expression::Member(MemberExpression {
-                        object: Box::new(object),
-                        property,
-                        optional: member.optional,
                     }),
                 )
             }
