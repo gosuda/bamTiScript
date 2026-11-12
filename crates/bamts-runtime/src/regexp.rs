@@ -1553,9 +1553,24 @@ thread_local! {
     static RANGE_PROBES: Cell<u64> = const { Cell::new(0) };
 }
 
+#[cfg(test)]
 fn ranges_contain(ranges: &[(u32, u32)], value: u32) -> bool {
-    #[cfg(test)]
-    RANGE_PROBES.with(|probes| probes.set(probes.get() + 1));
+    let mut low = 0usize;
+    let mut high = ranges.len();
+    while low < high {
+        RANGE_PROBES.with(|probes| probes.set(probes.get() + 1));
+        let mid = low + (high - low) / 2;
+        if ranges[mid].0 <= value {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    low > 0 && value <= ranges[low - 1].1
+}
+
+#[cfg(not(test))]
+fn ranges_contain(ranges: &[(u32, u32)], value: u32) -> bool {
     let index = ranges.partition_point(|&(start, _)| start <= value);
     index > 0 && value <= ranges[index - 1].1
 }
@@ -2799,6 +2814,7 @@ mod tests {
             large < 8 * 200_000,
             "probe count must stay a small constant per code point: {large}"
         );
+        assert!(large <= 9 * 200_000, "unexpected probe volume {large}");
     }
 
     #[test]
