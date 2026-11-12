@@ -1087,6 +1087,7 @@ macro_rules! canonical_node_match {
             NodeRef::Statement(node) => $operation(node, $($argument),*),
             NodeRef::Expression(node) => $operation(node, $($argument),*),
             NodeRef::Identifier(node) => $operation(node, $($argument),*),
+            NodeRef::PrivateIdentifier(node) => $operation(node, $($argument),*),
             NodeRef::StringLiteral(node) => $operation(node, $($argument),*),
             NodeRef::TypeNode(node) => $operation(node, $($argument),*),
             NodeRef::BindingPattern(node) => $operation(node, $($argument),*),

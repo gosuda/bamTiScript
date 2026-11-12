@@ -94,6 +94,7 @@ where
         NodeRef::ImportSpecifier(_)
         | NodeRef::ExportSpecifier(_)
         | NodeRef::Identifier(_)
+        | NodeRef::PrivateIdentifier(_)
         | NodeRef::StringLiteral(_)
         | NodeRef::JsxText(_)
         | NodeRef::Token(_) => {}
@@ -662,6 +663,9 @@ where
     for decorator in &class.decorators {
         visit_node(NodeRef::Decorator(decorator), visitor)?;
     }
+    if let Some(name) = &class.name {
+        visit_node(NodeRef::Identifier(name), visitor)?;
+    }
     visit_type_parameters(class.type_parameters.as_ref(), visitor)?;
     if let Some(heritage) = &class.extends {
         visit_node(NodeRef::Expression(&heritage.expression), visitor)?;
@@ -680,8 +684,12 @@ fn visit_property_name<'ast, V>(name: &'ast PropertyName, visitor: &mut V) -> Co
 where
     V: Visitor<'ast>,
 {
-    if let PropertyName::Computed(expression) = name {
-        visit_node(NodeRef::Expression(expression), visitor)?;
+    match name {
+        PropertyName::Identifier(identifier) => visit_node(NodeRef::Identifier(identifier), visitor)?,
+        PropertyName::Private(private) => visit_node(NodeRef::PrivateIdentifier(private), visitor)?,
+        PropertyName::String(string) => visit_node(NodeRef::StringLiteral(string), visitor)?,
+        PropertyName::Computed(expression) => visit_node(NodeRef::Expression(expression), visitor)?,
+        PropertyName::Number(_) | PropertyName::Missing(_) => {}
     }
     ControlFlow::Continue(())
 }
@@ -696,7 +704,7 @@ where
     match property {
         MemberProperty::Named(name) => visit_node(NodeRef::Identifier(name), visitor)?,
         MemberProperty::Computed(expression) => visit_node(NodeRef::Expression(expression), visitor)?,
-        MemberProperty::Private(_) => {}
+        MemberProperty::Private(private) => visit_node(NodeRef::PrivateIdentifier(private), visitor)?,
     }
     ControlFlow::Continue(())
 }
@@ -1102,4 +1110,38 @@ mod tests {
         );
     }
 
+    /// Expected: pinned typescript 7.0.2 `visitEachChild` preorder of
+    /// `class C { m() {} }`, as `[getStart, end)` of each node except the
+    /// end-of-file token.
+    #[test]
+    fn class_and_method_names_are_visited() {
+        assert_eq!(
+            visited_ranges("class C { m() {} }"),
+            [(0, 18), (0, 18), (6, 7), (10, 16), (10, 11), (14, 16)]
+        );
+    }
+
+    /// Expected: pinned typescript 7.0.2 `visitEachChild` preorder of
+    /// `class C { #x; m() { this.#x; } }`, as `[getStart, end)` of each node
+    /// except the end-of-file token.
+    #[test]
+    fn private_names_are_visited() {
+        assert_eq!(
+            visited_ranges("class C { #x; m() { this.#x; } }"),
+            [
+                (0, 32),
+                (0, 32),
+                (6, 7),
+                (10, 13),
+                (10, 12),
+                (14, 30),
+                (14, 15),
+                (18, 30),
+                (20, 28),
+                (20, 27),
+                (20, 24),
+                (25, 27)
+            ]
+        );
+    }
 }
