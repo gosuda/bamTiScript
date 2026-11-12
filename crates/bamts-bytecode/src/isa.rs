@@ -487,7 +487,7 @@ mod tests {
                 name: ConstantId::new(21),
             },
             Instruction::ThrowIntrinsicError {
-                kind: IntrinsicErrorKind::SyntaxError,
+                kind: IntrinsicErrorKind::TypeError,
                 message: ConstantId::new(22),
             },
         ]
@@ -566,10 +566,10 @@ mod tests {
 
     #[test]
     fn decode_rejects_an_unknown_intrinsic_error_kind() {
-        let error = decode_encoding(&[59, 4, 0]).expect_err("selector 4 names no kind");
+        let error = decode_encoding(&[59, 2, 0]).expect_err("selector 2 names no kind");
         assert_eq!(
             error.kind,
-            DecodeErrorKind::InvalidIntrinsicErrorKind { selector: 4 }
+            DecodeErrorKind::InvalidIntrinsicErrorKind { selector: 2 }
         );
         assert_eq!(error.offset, 1, "error points at the kind operand");
     }

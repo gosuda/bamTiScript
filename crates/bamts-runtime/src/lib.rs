@@ -20019,8 +20019,6 @@ mod tests {
                 "ReferenceError",
                 "Unsupported reference to 'super'",
             ),
-            (IntrinsicErrorKind::SyntaxError, "SyntaxError", "syntax"),
-            (IntrinsicErrorKind::RangeError, "RangeError", "range"),
         ] {
             for tamper in [replace, delete] {
                 let program = intrinsic_error_program(kind, constructor, message, tamper);
