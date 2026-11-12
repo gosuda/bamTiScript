@@ -1446,9 +1446,10 @@ struct SimpleSet {
 
 impl CharacterClass {
     fn new(negated: bool, items: Vec<ClassItem>) -> Self {
-        let simple = if items.iter().all(|item| {
-            matches!(item, ClassItem::Character(_) | ClassItem::Range(_, _))
-        }) {
+        let simple = if items
+            .iter()
+            .all(|item| matches!(item, ClassItem::Character(_) | ClassItem::Range(_, _)))
+        {
             let mut raw_ranges: Vec<(u32, u32)> = items
                 .iter()
                 .filter_map(|item| match item {
@@ -1575,9 +1576,11 @@ impl ClassItem {
             Self::Range(start, end) => {
                 (*start..=*end).contains(&value)
                     || (ignore_case
-                        && canonical_range_member(canonicalize(value, unicode), unicode, |candidate| {
-                            (*start..=*end).contains(&candidate)
-                        }))
+                        && canonical_range_member(
+                            canonicalize(value, unicode),
+                            unicode,
+                            |candidate| (*start..=*end).contains(&candidate),
+                        ))
             }
             Self::Digit => value <= 0x7f && (value as u8).is_ascii_digit(),
             Self::NotDigit => !(value <= 0x7f && (value as u8).is_ascii_digit()),
@@ -1617,7 +1620,8 @@ fn canonicalize(value: u32, unicode: bool) -> u32 {
 /// canonicalizes back to `canonical`, which rejects fold images that
 /// non-unicode Canonicalize keeps apart (U+212A, U+017F against ASCII).
 fn canonical_range_member(canonical: u32, unicode: bool, contains: impl Fn(u32) -> bool) -> bool {
-    let member = |candidate: u32| contains(candidate) && canonicalize(candidate, unicode) == canonical;
+    let member =
+        |candidate: u32| contains(candidate) && canonicalize(candidate, unicode) == canonical;
     let folded = unicode_simple_fold(canonical);
     member(canonical)
         || member(folded)
@@ -2675,15 +2679,28 @@ mod tests {
         let kelvin = "\u{212A}";
         let long_s = "\u{017F}";
         assert!(!regex(r"[k]", "i").exec(&text(kelvin), 0).unwrap().is_some());
-        assert!(regex(r"[^k]", "i").exec(&text(kelvin), 0).unwrap().is_some());
+        assert!(
+            regex(r"[^k]", "i")
+                .exec(&text(kelvin), 0)
+                .unwrap()
+                .is_some()
+        );
         assert!(!regex(r"[s]", "i").exec(&text(long_s), 0).unwrap().is_some());
-        assert!(regex(r"[^s]", "i").exec(&text(long_s), 0).unwrap().is_some());
+        assert!(
+            regex(r"[^s]", "i")
+                .exec(&text(long_s), 0)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
     fn range_items_compare_canonical_forms_without_unicode() {
         let matches = |pattern: &str, flags: &str, input: &str| {
-            regex(pattern, flags).exec(&text(input), 0).unwrap().is_some()
+            regex(pattern, flags)
+                .exec(&text(input), 0)
+                .unwrap()
+                .is_some()
         };
         for pattern in [r"[a-z]", r"[\u0061-\u007A]"] {
             for input in ["\u{212A}", "\u{017F}"] {
@@ -2737,8 +2754,8 @@ mod tests {
             }
         }
         let pool: &[u32] = &[
-            0x212A, 0x17F, 0xB5, 0x41, 0x5A, 0x61, 0x7A, 0x6B, 0x4B, 0x73, 0x53, 0x30, 0x39,
-            0xE9, 0xC9, 0x180, 0x2130, 0x3BC, 0x39C, 0x1E9E, 0xDF, 0x100, 0x101, 0xFF21,
+            0x212A, 0x17F, 0xB5, 0x41, 0x5A, 0x61, 0x7A, 0x6B, 0x4B, 0x73, 0x53, 0x30, 0x39, 0xE9,
+            0xC9, 0x180, 0x2130, 0x3BC, 0x39C, 0x1E9E, 0xDF, 0x100, 0x101, 0xFF21,
         ];
         let mut rng = XorShift64(0x2545F4914F6CDD1D);
         for _ in 0..4000 {
@@ -2790,7 +2807,9 @@ mod tests {
     }
 
     fn naive_contains(ranges: &[(u32, u32)], value: u32) -> bool {
-        ranges.iter().any(|&(start, end)| start <= value && value <= end)
+        ranges
+            .iter()
+            .any(|&(start, end)| start <= value && value <= end)
     }
 
     #[test]
@@ -2802,7 +2821,11 @@ mod tests {
             })
             .collect();
         let class = CharacterClass::new(false, items);
-        let ranges = &class.simple.as_ref().expect("ranges only form a simple set").ranges;
+        let ranges = &class
+            .simple
+            .as_ref()
+            .expect("ranges only form a simple set")
+            .ranges;
         assert_eq!(ranges.len(), 200);
         let counting = CountingRanges {
             ranges,
@@ -2833,7 +2856,9 @@ mod tests {
             &[(0, 0), (2, 3), (10, 20), (u32::MAX - 1, u32::MAX)],
         ];
         for ranges in cases {
-            let mut probes = vec![0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 19, 20, 21, 0x40, 0x41, 0x5A, 0x5B];
+            let mut probes = vec![
+                0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 19, 20, 21, 0x40, 0x41, 0x5A, 0x5B,
+            ];
             probes.extend([u32::MAX - 2, u32::MAX - 1, u32::MAX]);
             for value in probes {
                 assert_eq!(

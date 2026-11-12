@@ -183,7 +183,12 @@ fn format_to_parts<H: Host>(
             RelativeTimePartKind::Number(kind) => number_part_type(kind),
         };
         let extra = part.unit.map(|unit| ("unit", unit.as_str()));
-        elements.push(part_object(machine, part_type, EcmaString::encode(&part.value), extra)?);
+        elements.push(part_object(
+            machine,
+            part_type,
+            EcmaString::encode(&part.value),
+            extra,
+        )?);
     }
     allocate_array(machine, elements).map(BuiltinOutcome::Value)
 }

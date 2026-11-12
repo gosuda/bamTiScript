@@ -323,7 +323,14 @@ impl DurationFormat {
         .map_err(DurationFormatError::List)?;
         let strings: Vec<EcmaString> = groups
             .iter()
-            .map(|parts| EcmaString::from_units(&parts.iter().flat_map(|part| part.value.as_units().iter().copied()).collect::<Vec<u16>>()))
+            .map(|parts| {
+                EcmaString::from_units(
+                    &parts
+                        .iter()
+                        .flat_map(|part| part.value.as_units().iter().copied())
+                        .collect::<Vec<u16>>(),
+                )
+            })
             .collect();
         let formatted = list
             .format_to_parts(&strings)

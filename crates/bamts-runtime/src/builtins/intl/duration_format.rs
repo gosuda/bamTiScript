@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
-use super::super::{allocate_array, allocate_string};
 use super::super::temporal::to_temporal_duration;
+use super::super::{allocate_array, allocate_string};
 use super::options::{
     Options, canonicalize_locale_list, get_options_object, locale_matcher_option, number_option,
     string_option,
@@ -265,7 +265,12 @@ fn format_to_parts<H: Host>(
     let mut elements = Vec::with_capacity(parts.len());
     for part in &parts {
         let extra = part.unit.map(|unit| ("unit", unit));
-        elements.push(part_object(machine, part.part_type, part.value.clone(), extra)?);
+        elements.push(part_object(
+            machine,
+            part.part_type,
+            part.value.clone(),
+            extra,
+        )?);
     }
     allocate_array(machine, elements).map(BuiltinOutcome::Value)
 }

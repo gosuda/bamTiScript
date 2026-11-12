@@ -209,9 +209,7 @@ fn word_breaks(text: &[Scalar]) -> Vec<usize> {
         } else {
             0
         };
-        if index + 1 == text.len()
-            || !word_joined(&classes, &pictographic, index, indicators)
-        {
+        if index + 1 == text.len() || !word_joined(&classes, &pictographic, index, indicators) {
             breaks.push(index);
         }
     }
@@ -435,7 +433,13 @@ mod tests {
     /// through them.
     #[test]
     fn regional_indicators_pair_as_in_node() {
-        const CASES: &[(&str, &str, &[(&str, bool)], &[&str])] = &[
+        type RegionalCase = (
+            &'static str,
+            &'static str,
+            &'static [(&'static str, bool)],
+            &'static [&'static str],
+        );
+        const CASES: &[RegionalCase] = &[
             ("ri_1", "\u{1F1E6}", &[("\u{1F1E6}", false)], &["\u{1F1E6}"]),
             (
                 "ri_2",
@@ -452,10 +456,7 @@ mod tests {
             (
                 "ri_4",
                 "\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}",
-                &[
-                    ("\u{1F1E6}\u{1F1E6}", false),
-                    ("\u{1F1E6}\u{1F1E6}", false),
-                ],
+                &[("\u{1F1E6}\u{1F1E6}", false), ("\u{1F1E6}\u{1F1E6}", false)],
                 &["\u{1F1E6}\u{1F1E6}", "\u{1F1E6}\u{1F1E6}"],
             ),
             (
@@ -564,19 +565,13 @@ mod tests {
             (
                 "ri_zwj_ri_ri",
                 "\u{1F1E6}\u{200D}\u{1F1E6}\u{1F1E6}",
-                &[
-                    ("\u{1F1E6}\u{200D}\u{1F1E6}", false),
-                    ("\u{1F1E6}", false),
-                ],
+                &[("\u{1F1E6}\u{200D}\u{1F1E6}", false), ("\u{1F1E6}", false)],
                 &["\u{1F1E6}\u{200D}", "\u{1F1E6}\u{1F1E6}"],
             ),
             (
                 "ri_ri_zwj_ri",
                 "\u{1F1E6}\u{1F1E6}\u{200D}\u{1F1E6}",
-                &[
-                    ("\u{1F1E6}\u{1F1E6}\u{200D}", false),
-                    ("\u{1F1E6}", false),
-                ],
+                &[("\u{1F1E6}\u{1F1E6}\u{200D}", false), ("\u{1F1E6}", false)],
                 &["\u{1F1E6}\u{1F1E6}\u{200D}", "\u{1F1E6}"],
             ),
             (
@@ -588,19 +583,13 @@ mod tests {
             (
                 "ri_extend_ri_ri",
                 "\u{1F1E6}\u{301}\u{1F1E6}\u{1F1E6}",
-                &[
-                    ("\u{1F1E6}\u{301}\u{1F1E6}", false),
-                    ("\u{1F1E6}", false),
-                ],
+                &[("\u{1F1E6}\u{301}\u{1F1E6}", false), ("\u{1F1E6}", false)],
                 &["\u{1F1E6}\u{301}", "\u{1F1E6}\u{1F1E6}"],
             ),
             (
                 "ri_ri_extend_ri",
                 "\u{1F1E6}\u{1F1E6}\u{301}\u{1F1E6}",
-                &[
-                    ("\u{1F1E6}\u{1F1E6}\u{301}", false),
-                    ("\u{1F1E6}", false),
-                ],
+                &[("\u{1F1E6}\u{1F1E6}\u{301}", false), ("\u{1F1E6}", false)],
                 &["\u{1F1E6}\u{1F1E6}\u{301}", "\u{1F1E6}"],
             ),
             (
@@ -656,9 +645,15 @@ mod tests {
                 .iter()
                 .map(|(segment, like)| ((*segment).to_owned(), *like))
                 .collect();
-            assert_eq!(word_segments(text), expected_word, "word segments of {name}");
-            let expected_grapheme: Vec<String> =
-                grapheme.iter().map(|segment| (*segment).to_owned()).collect();
+            assert_eq!(
+                word_segments(text),
+                expected_word,
+                "word segments of {name}"
+            );
+            let expected_grapheme: Vec<String> = grapheme
+                .iter()
+                .map(|segment| (*segment).to_owned())
+                .collect();
             assert_eq!(
                 grapheme_segments(text),
                 expected_grapheme,

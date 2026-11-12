@@ -1664,7 +1664,10 @@ impl Parser {
                 Some(Box::new(self.parse_expression(false)))
             } else if self.eat(TokenKind::KwDefault).is_some() {
                 if seen_default {
-                    self.error_here(EXPECTED_TOKEN, "a switch can only have one `default` clause");
+                    self.error_here(
+                        EXPECTED_TOKEN,
+                        "a switch can only have one `default` clause",
+                    );
                 }
                 seen_default = true;
                 None
