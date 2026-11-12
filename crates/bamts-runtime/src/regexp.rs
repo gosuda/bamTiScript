@@ -1501,78 +1501,55 @@ impl CharacterClass {
 impl SimpleSet {
     /// The same disjunction `ClassItem::matches` makes for `Character` and
     /// `Range` items: characters match on raw or canonical equality, ranges on
-    /// raw membership plus `canonicalized_range_contains`. Range membership is
-    /// a binary search; the fold scans run once over the merged union, which
-    /// equals the per-range disjunction.
+    /// raw membership plus `canonical_range_member`. Range membership is a
+    /// binary search; the canonical rule runs once over the merged union,
+    /// which equals the per-range disjunction.
     fn matches(&self, value: u32, ignore_case: bool, unicode: bool) -> bool {
-        if ranges_contain(&self.ranges, value) || self.characters.contains(&value) {
+        if ranges_contain(self.ranges.as_slice(), value) || self.characters.contains(&value) {
             return true;
         }
         if !ignore_case {
             return false;
         }
         let canonical = canonicalize(value, unicode);
-        if self
-            .characters
+        self.characters
             .iter()
             .any(|&character| canonicalize(character, unicode) == canonical)
-            || ranges_contain(&self.ranges, canonical)
-        {
-            return true;
-        }
-        let folded = unicode_simple_fold(canonical);
-        if ranges_contain(&self.ranges, folded) {
-            return true;
-        }
-        if UNICODE_SIMPLE_FOLD_RANGES.iter().any(|(first, last, step, delta)| {
-            let source = offset_code_point(folded, -*delta);
-            source.is_some_and(|source| {
-                (*first..=*last).contains(&source)
-                    && (source - *first).is_multiple_of(*step)
-                    && ranges_contain(&self.ranges, source)
-                    && canonicalize(source, unicode) == canonical
-            })
-        }) {
-            return true;
-        }
-        UNICODE_SIMPLE_FOLD_SINGLETONS
-            .iter()
-            .any(|&(source, target)| {
-                target == folded
-                    && ranges_contain(&self.ranges, source)
-                    && canonicalize(source, unicode) == canonical
+            || canonical_range_member(canonical, unicode, |candidate| {
+                ranges_contain(self.ranges.as_slice(), candidate)
             })
     }
 }
 
-#[cfg(test)]
-use std::cell::Cell;
-
-#[cfg(test)]
-thread_local! {
-    static RANGE_PROBES: Cell<u64> = const { Cell::new(0) };
+trait RangeProbe {
+    fn count(&self) -> usize;
+    fn at(&self, index: usize) -> (u32, u32);
 }
 
-#[cfg(test)]
-fn ranges_contain(ranges: &[(u32, u32)], value: u32) -> bool {
+impl RangeProbe for [(u32, u32)] {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn at(&self, index: usize) -> (u32, u32) {
+        self[index]
+    }
+}
+
+/// Membership in sorted, disjoint, merged ranges. Generic over the storage so
+/// the complexity guard can count every element read of this one body.
+fn ranges_contain<R: RangeProbe + ?Sized>(ranges: &R, value: u32) -> bool {
     let mut low = 0usize;
-    let mut high = ranges.len();
+    let mut high = ranges.count();
     while low < high {
-        RANGE_PROBES.with(|probes| probes.set(probes.get() + 1));
         let mid = low + (high - low) / 2;
-        if ranges[mid].0 <= value {
+        if ranges.at(mid).0 <= value {
             low = mid + 1;
         } else {
             high = mid;
         }
     }
-    low > 0 && value <= ranges[low - 1].1
-}
-
-#[cfg(not(test))]
-fn ranges_contain(ranges: &[(u32, u32)], value: u32) -> bool {
-    let index = ranges.partition_point(|&(start, _)| start <= value);
-    index > 0 && value <= ranges[index - 1].1
+    low > 0 && value <= ranges.at(low - 1).1
 }
 
 #[derive(Clone, Debug)]
@@ -1597,7 +1574,10 @@ impl ClassItem {
             }
             Self::Range(start, end) => {
                 (*start..=*end).contains(&value)
-                    || (ignore_case && canonicalized_range_contains(*start, *end, value, unicode))
+                    || (ignore_case
+                        && canonical_range_member(canonicalize(value, unicode), unicode, |candidate| {
+                            (*start..=*end).contains(&candidate)
+                        }))
             }
             Self::Digit => value <= 0x7f && (value as u8).is_ascii_digit(),
             Self::NotDigit => !(value <= 0x7f && (value as u8).is_ascii_digit()),
@@ -1631,33 +1611,28 @@ fn canonicalize(value: u32, unicode: bool) -> u32 {
     }
 }
 
-fn canonicalized_range_contains(start: u32, end: u32, value: u32, unicode: bool) -> bool {
-    let canonical = canonicalize(value, unicode);
+/// Whether a range admits some member whose canonical form is `canonical`
+/// (ECMA-262 CharacterSetMatcher). The candidates are the code points whose
+/// simple case fold equals the fold of `canonical`; each counts only when it
+/// canonicalizes back to `canonical`, which rejects fold images that
+/// non-unicode Canonicalize keeps apart (U+212A, U+017F against ASCII).
+fn canonical_range_member(canonical: u32, unicode: bool, contains: impl Fn(u32) -> bool) -> bool {
+    let member = |candidate: u32| contains(candidate) && canonicalize(candidate, unicode) == canonical;
     let folded = unicode_simple_fold(canonical);
-    if (start..=end).contains(&canonical) || (start..=end).contains(&folded) {
-        return true;
-    }
-    if UNICODE_SIMPLE_FOLD_RANGES
-        .iter()
-        .any(|(first, last, step, delta)| {
-            let source = offset_code_point(folded, -*delta);
-            source.is_some_and(|source| {
-                (*first..=*last).contains(&source)
-                    && (source - *first).is_multiple_of(*step)
-                    && (start..=end).contains(&source)
-                    && canonicalize(source, unicode) == canonical
+    member(canonical)
+        || member(folded)
+        || UNICODE_SIMPLE_FOLD_RANGES
+            .iter()
+            .any(|(first, last, step, delta)| {
+                offset_code_point(folded, -*delta).is_some_and(|source| {
+                    (*first..=*last).contains(&source)
+                        && (source - *first).is_multiple_of(*step)
+                        && member(source)
+                })
             })
-        })
-    {
-        return true;
-    }
-    UNICODE_SIMPLE_FOLD_SINGLETONS
-        .iter()
-        .any(|(source, target)| {
-            *target == folded
-                && (start..=end).contains(source)
-                && canonicalize(*source, unicode) == canonical
-        })
+        || UNICODE_SIMPLE_FOLD_SINGLETONS
+            .iter()
+            .any(|&(source, target)| target == folded && member(source))
 }
 
 fn unicode_simple_fold(value: u32) -> u32 {
@@ -2706,6 +2681,25 @@ mod tests {
     }
 
     #[test]
+    fn range_items_compare_canonical_forms_without_unicode() {
+        let matches = |pattern: &str, flags: &str, input: &str| {
+            regex(pattern, flags).exec(&text(input), 0).unwrap().is_some()
+        };
+        for pattern in [r"[a-z]", r"[\u0061-\u007A]"] {
+            for input in ["\u{212A}", "\u{017F}"] {
+                assert!(!matches(pattern, "i", input), "{pattern}/i on {input:?}");
+                let negated = format!("[^{}", &pattern[1..]);
+                assert!(matches(&negated, "i", input), "{negated}/i on {input:?}");
+            }
+        }
+        assert!(matches(r"[a-z]", "iu", "\u{212A}"));
+        assert!(matches(r"[a-z]", "iu", "\u{017F}"));
+        assert!(!matches(r"[^a-z]", "iu", "\u{212A}"));
+        assert!(matches(r"[A-Z]", "i", "k"));
+        assert!(matches(r"[\u00e0-\u00ff]", "i", "\u{00C9}"));
+    }
+
+    #[test]
     fn range_items_keep_the_fold_singleton_disjunct() {
         let kelvin_source = regex(r"[\u{212A}-\u{2130}]", "iu");
         let long_s_source = regex(r"[\u{17F}-\u{180}]", "iu");
@@ -2779,42 +2773,76 @@ mod tests {
         }
     }
 
+    struct CountingRanges<'a> {
+        ranges: &'a [(u32, u32)],
+        reads: std::cell::Cell<u64>,
+    }
+
+    impl super::RangeProbe for CountingRanges<'_> {
+        fn count(&self) -> usize {
+            self.ranges.len()
+        }
+
+        fn at(&self, index: usize) -> (u32, u32) {
+            self.reads.set(self.reads.get() + 1);
+            self.ranges[index]
+        }
+    }
+
+    fn naive_contains(ranges: &[(u32, u32)], value: u32) -> bool {
+        ranges.iter().any(|&(start, end)| start <= value && value <= end)
+    }
+
     #[test]
     fn property_class_probes_stay_logarithmic_per_code_point() {
-        let mut pattern = String::from("^[");
-        for index in 0..200u32 {
-            let start = 0x100 * index + 0x41;
-            let end = start + 0x20;
-            pattern.push_str(&format!(
-                "\\u{{{:x}}}-\\u{{{:x}}}",
-                start, end
-            ));
-        }
-        pattern.push_str("]+$");
-        let compiled = regex(&pattern, "u");
-        let run = |units: usize| -> u64 {
-            let input: String = (0..units)
-                .map(|index| {
-                    let index = u32::try_from(index).expect("unit index fits u32");
-                    let start = 0x100 * (index % 200) + 0x41;
-                    char::from_u32(start + index % 0x21).unwrap()
-                })
-                .collect();
-            super::RANGE_PROBES.with(|probes| probes.set(0));
-            assert!(compiled.exec(&text(&input), 0).unwrap().is_some());
-            super::RANGE_PROBES.with(|probes| probes.get())
+        let items: Vec<ClassItem> = (0..200u32)
+            .map(|index| {
+                let start = 0x100 * index + 0x41;
+                ClassItem::Range(start, start + 0x20)
+            })
+            .collect();
+        let class = CharacterClass::new(false, items);
+        let ranges = &class.simple.as_ref().expect("ranges only form a simple set").ranges;
+        assert_eq!(ranges.len(), 200);
+        let counting = CountingRanges {
+            ranges,
+            reads: std::cell::Cell::new(0),
         };
-        let small = run(100_000);
-        let large = run(200_000);
+        let lookups = 200_000u32;
+        for index in 0..lookups {
+            let value = 0x100 * (index % 200) + 0x41 + index % 0x40;
+            assert_eq!(
+                super::ranges_contain(&counting, value),
+                naive_contains(ranges, value),
+                "membership at {value:#x}"
+            );
+        }
+        let reads = counting.reads.get();
         assert!(
-            (large as f64) < 2.5 * small as f64,
-            "probe count must scale linearly: {small} then {large}"
+            reads <= 9 * u64::from(lookups),
+            "range reads must stay logarithmic per lookup: {reads}"
         );
-        assert!(
-            large < 8 * 200_000,
-            "probe count must stay a small constant per code point: {large}"
-        );
-        assert!(large <= 9 * 200_000, "unexpected probe volume {large}");
+    }
+
+    #[test]
+    fn ranges_contain_equals_naive_membership() {
+        let cases: &[&[(u32, u32)]] = &[
+            &[],
+            &[(5, 5)],
+            &[(0x41, 0x5A)],
+            &[(0, 0), (2, 3), (10, 20), (u32::MAX - 1, u32::MAX)],
+        ];
+        for ranges in cases {
+            let mut probes = vec![0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 19, 20, 21, 0x40, 0x41, 0x5A, 0x5B];
+            probes.extend([u32::MAX - 2, u32::MAX - 1, u32::MAX]);
+            for value in probes {
+                assert_eq!(
+                    super::ranges_contain(*ranges, value),
+                    naive_contains(ranges, value),
+                    "{ranges:?} at {value:#x}"
+                );
+            }
+        }
     }
 
     #[test]
