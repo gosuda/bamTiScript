@@ -1041,4 +1041,65 @@ mod tests {
             ControlFlow::Break(NodeId::new(2))
         );
     }
+
+    struct RangeRecorder(Vec<(usize, usize)>);
+
+    impl<'ast> Visitor<'ast> for RangeRecorder {
+        type Break = ();
+
+        fn visit(&mut self, node: NodeRef<'ast>) -> ControlFlow<Self::Break> {
+            let range = node.range();
+            self.0.push((range.start().get(), range.end().get()));
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn visited_ranges(text: &str) -> Vec<(usize, usize)> {
+        let source = std::sync::Arc::new(
+            crate::source::SourceText::new(text).expect("test source fits the per-file budget"),
+        );
+        let scanned = crate::scanner::scan(
+            crate::source::SourceId::new(0),
+            crate::source::ScriptKind::TypeScript,
+            source,
+        );
+        let parsed = crate::parser::parse(scanned);
+        let mut recorder = RangeRecorder(Vec::new());
+        assert!(visit_source_file(parsed.product(), &mut recorder).is_continue());
+        recorder.0
+    }
+
+    /// Expected: pinned typescript 7.0.2 `visitEachChild` preorder of
+    /// `if (0) { this; }`, as `[getStart, end)` of each node except the
+    /// end-of-file token.
+    #[test]
+    fn block_inside_if_is_visited_once() {
+        assert_eq!(
+            visited_ranges("if (0) { this; }"),
+            [(0, 16), (0, 16), (4, 5), (7, 16), (9, 14), (9, 13)]
+        );
+    }
+
+    /// Expected: pinned typescript 7.0.2 `visitEachChild` preorder of
+    /// `function f() {}`, as `[getStart, end)` of each node except the
+    /// end-of-file token.
+    #[test]
+    fn function_declaration_name_is_visited_before_its_body() {
+        assert_eq!(
+            visited_ranges("function f() {}"),
+            [(0, 15), (0, 15), (9, 10), (13, 15)]
+        );
+    }
+
+    /// Expected: pinned typescript 7.0.2 `visitEachChild` preorder of
+    /// `this.b;`, as `[getStart, end)` of each node except the end-of-file
+    /// token.
+    #[test]
+    fn property_access_name_is_visited_after_its_object() {
+        assert_eq!(
+            visited_ranges("this.b;"),
+            [(0, 7), (0, 7), (0, 6), (0, 4), (5, 6)]
+        );
+    }
+
 }
