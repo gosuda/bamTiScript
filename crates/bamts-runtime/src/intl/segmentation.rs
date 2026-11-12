@@ -98,10 +98,29 @@ fn letter(class: WordBreak) -> bool {
     matches!(class, WordBreak::ALetter | WordBreak::HebrewLetter)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static RULE_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn rule_step() {
+    #[cfg(test)]
+    RULE_STEPS.with(|steps| steps.set(steps.get() + 1));
+}
+
 /// Whether the word rules keep positions `index` and `index + 1` together.
-fn word_joined(classes: &[WordBreak], pictographic: &[bool], index: usize) -> bool {
+fn word_joined(
+    classes: &[WordBreak],
+    pictographic: &[bool],
+    index: usize,
+    indicators: usize,
+) -> bool {
+    let class = |position: usize| {
+        rule_step();
+        classes[position]
+    };
     use WordBreak as Wb;
-    let (here, next) = (classes[index], classes[index + 1]);
+    let (here, next) = (class(index), class(index + 1));
     if here == Wb::CR && next == Wb::LF {
         return true;
     }
@@ -119,19 +138,19 @@ fn word_joined(classes: &[WordBreak], pictographic: &[bool], index: usize) -> bo
     }
     // Later rules see through Extend, Format and ZWJ.
     let significant = |mut position: usize| {
-        while ignorable_word(classes[position]) && position > 0 {
+        while ignorable_word(class(position)) && position > 0 {
             position -= 1;
         }
         position
     };
     let before = significant(index);
-    let left = classes[before];
-    let previous = (before > 0).then(|| classes[significant(before - 1)]);
+    let left = class(before);
+    let previous = (before > 0).then(|| class(significant(before - 1)));
     let mut following = index + 2;
-    while following < classes.len() && ignorable_word(classes[following]) {
+    while following < classes.len() && ignorable_word(class(following)) {
         following += 1;
     }
-    let after = classes.get(following).copied();
+    let after = (following < classes.len()).then(|| class(following));
     match (left, next) {
         (l, r) if letter(l) && letter(r) => true,
         (l, Wb::MidLetter | Wb::MidNumLet | Wb::SingleQuote)
@@ -167,22 +186,7 @@ fn word_joined(classes: &[WordBreak], pictographic: &[bool], index: usize) -> bo
             true
         }
         (Wb::ExtendNumLet, r) if letter(r) || matches!(r, Wb::Numeric | Wb::Katakana) => true,
-        (Wb::RegionalIndicator, Wb::RegionalIndicator) => {
-            let mut count = 0;
-            let mut position = before;
-            loop {
-                if classes[position] == Wb::RegionalIndicator {
-                    count += 1;
-                } else if !ignorable_word(classes[position]) {
-                    break;
-                }
-                if position == 0 {
-                    break;
-                }
-                position -= 1;
-            }
-            count % 2 == 1
-        }
+        (Wb::RegionalIndicator, Wb::RegionalIndicator) => indicators % 2 == 1,
         _ => false,
     }
 }
@@ -195,9 +199,23 @@ fn word_breaks(text: &[Scalar]) -> Vec<usize> {
         .iter()
         .map(|s| extended.contains(s.character))
         .collect();
-    (0..text.len())
-        .filter(|index| index + 1 == text.len() || !word_joined(&classes, &pictographic, *index))
-        .collect()
+    let mut breaks = Vec::new();
+    let mut indicators = 0_usize;
+    for index in 0..text.len() {
+        indicators = if classes[index] == WordBreak::RegionalIndicator {
+            indicators + 1
+        } else if ignorable_word(classes[index]) {
+            indicators
+        } else {
+            0
+        };
+        if index + 1 == text.len()
+            || !word_joined(&classes, &pictographic, index, indicators)
+        {
+            breaks.push(index);
+        }
+    }
+    breaks
 }
 
 fn ignorable_sentence(class: SentenceBreak) -> bool {
@@ -382,6 +400,292 @@ mod tests {
             .iter()
             .map(|boundary| boundary.end)
             .collect()
+    }
+
+    fn word_segments(text: &str) -> Vec<(String, bool)> {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mut start = 0;
+        boundaries(SegmenterGranularity::Word, &units)
+            .into_iter()
+            .map(|boundary| {
+                let segment = String::from_utf16(&units[start..boundary.end]).unwrap();
+                start = boundary.end;
+                (segment, boundary.is_word_like)
+            })
+            .collect()
+    }
+
+    fn grapheme_segments(text: &str) -> Vec<String> {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mut start = 0;
+        boundaries(SegmenterGranularity::Grapheme, &units)
+            .into_iter()
+            .map(|boundary| {
+                let segment = String::from_utf16(&units[start..boundary.end]).unwrap();
+                start = boundary.end;
+                segment
+            })
+            .collect()
+    }
+
+    /// WB15 and WB16 pair regional indicators, and GB12 and GB13 pair them for
+    /// graphemes. The expected segments and word-likeness values are those of
+    /// Node 24.18 `new Intl.Segmenter('en', { granularity }).segment(text)`;
+    /// Extend and ZWJ stand between indicators to show that the pair count sees
+    /// through them.
+    #[test]
+    fn regional_indicators_pair_as_in_node() {
+        const CASES: &[(&str, &str, &[(&str, bool)], &[&str])] = &[
+            ("ri_1", "\u{1F1E6}", &[("\u{1F1E6}", false)], &["\u{1F1E6}"]),
+            (
+                "ri_2",
+                "\u{1F1E6}\u{1F1E6}",
+                &[("\u{1F1E6}\u{1F1E6}", false)],
+                &["\u{1F1E6}\u{1F1E6}"],
+            ),
+            (
+                "ri_3",
+                "\u{1F1E6}\u{1F1E6}\u{1F1E6}",
+                &[("\u{1F1E6}\u{1F1E6}", false), ("\u{1F1E6}", false)],
+                &["\u{1F1E6}\u{1F1E6}", "\u{1F1E6}"],
+            ),
+            (
+                "ri_4",
+                "\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}",
+                &[
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                ],
+                &["\u{1F1E6}\u{1F1E6}", "\u{1F1E6}\u{1F1E6}"],
+            ),
+            (
+                "ri_5",
+                "\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}",
+                &[
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}", false),
+                ],
+                &["\u{1F1E6}\u{1F1E6}", "\u{1F1E6}\u{1F1E6}", "\u{1F1E6}"],
+            ),
+            (
+                "ri_6",
+                "\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}",
+                &[
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                ],
+                &[
+                    "\u{1F1E6}\u{1F1E6}",
+                    "\u{1F1E6}\u{1F1E6}",
+                    "\u{1F1E6}\u{1F1E6}",
+                ],
+            ),
+            (
+                "ri_7",
+                "\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}",
+                &[
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}", false),
+                ],
+                &[
+                    "\u{1F1E6}\u{1F1E6}",
+                    "\u{1F1E6}\u{1F1E6}",
+                    "\u{1F1E6}\u{1F1E6}",
+                    "\u{1F1E6}",
+                ],
+            ),
+            (
+                "ri_8",
+                "\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}",
+                &[
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                ],
+                &[
+                    "\u{1F1E6}\u{1F1E6}",
+                    "\u{1F1E6}\u{1F1E6}",
+                    "\u{1F1E6}\u{1F1E6}",
+                    "\u{1F1E6}\u{1F1E6}",
+                ],
+            ),
+            (
+                "ri_9",
+                "\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}",
+                &[
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}", false),
+                ],
+                &[
+                    "\u{1F1E6}\u{1F1E6}",
+                    "\u{1F1E6}\u{1F1E6}",
+                    "\u{1F1E6}\u{1F1E6}",
+                    "\u{1F1E6}\u{1F1E6}",
+                    "\u{1F1E6}",
+                ],
+            ),
+            (
+                "letter_ri_1_letter",
+                "a\u{1F1E6}b",
+                &[("a", true), ("\u{1F1E6}", false), ("b", true)],
+                &["a", "\u{1F1E6}", "b"],
+            ),
+            (
+                "letter_ri_2_letter",
+                "a\u{1F1E6}\u{1F1E6}b",
+                &[("a", true), ("\u{1F1E6}\u{1F1E6}", false), ("b", true)],
+                &["a", "\u{1F1E6}\u{1F1E6}", "b"],
+            ),
+            (
+                "letter_ri_3_letter",
+                "a\u{1F1E6}\u{1F1E6}\u{1F1E6}b",
+                &[
+                    ("a", true),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}", false),
+                    ("b", true),
+                ],
+                &["a", "\u{1F1E6}\u{1F1E6}", "\u{1F1E6}", "b"],
+            ),
+            (
+                "ri_zwj_ri",
+                "\u{1F1E6}\u{200D}\u{1F1E6}",
+                &[("\u{1F1E6}\u{200D}\u{1F1E6}", false)],
+                &["\u{1F1E6}\u{200D}", "\u{1F1E6}"],
+            ),
+            (
+                "ri_zwj_ri_ri",
+                "\u{1F1E6}\u{200D}\u{1F1E6}\u{1F1E6}",
+                &[
+                    ("\u{1F1E6}\u{200D}\u{1F1E6}", false),
+                    ("\u{1F1E6}", false),
+                ],
+                &["\u{1F1E6}\u{200D}", "\u{1F1E6}\u{1F1E6}"],
+            ),
+            (
+                "ri_ri_zwj_ri",
+                "\u{1F1E6}\u{1F1E6}\u{200D}\u{1F1E6}",
+                &[
+                    ("\u{1F1E6}\u{1F1E6}\u{200D}", false),
+                    ("\u{1F1E6}", false),
+                ],
+                &["\u{1F1E6}\u{1F1E6}\u{200D}", "\u{1F1E6}"],
+            ),
+            (
+                "ri_extend_ri",
+                "\u{1F1E6}\u{301}\u{1F1E6}",
+                &[("\u{1F1E6}\u{301}\u{1F1E6}", false)],
+                &["\u{1F1E6}\u{301}", "\u{1F1E6}"],
+            ),
+            (
+                "ri_extend_ri_ri",
+                "\u{1F1E6}\u{301}\u{1F1E6}\u{1F1E6}",
+                &[
+                    ("\u{1F1E6}\u{301}\u{1F1E6}", false),
+                    ("\u{1F1E6}", false),
+                ],
+                &["\u{1F1E6}\u{301}", "\u{1F1E6}\u{1F1E6}"],
+            ),
+            (
+                "ri_ri_extend_ri",
+                "\u{1F1E6}\u{1F1E6}\u{301}\u{1F1E6}",
+                &[
+                    ("\u{1F1E6}\u{1F1E6}\u{301}", false),
+                    ("\u{1F1E6}", false),
+                ],
+                &["\u{1F1E6}\u{1F1E6}\u{301}", "\u{1F1E6}"],
+            ),
+            (
+                "ri_zwj_extend_ri",
+                "\u{1F1E6}\u{200D}\u{301}\u{1F1E6}",
+                &[("\u{1F1E6}\u{200D}\u{301}\u{1F1E6}", false)],
+                &["\u{1F1E6}\u{200D}\u{301}", "\u{1F1E6}"],
+            ),
+            (
+                "ri_extend_zwj_ri",
+                "\u{1F1E6}\u{301}\u{200D}\u{1F1E6}",
+                &[("\u{1F1E6}\u{301}\u{200D}\u{1F1E6}", false)],
+                &["\u{1F1E6}\u{301}\u{200D}", "\u{1F1E6}"],
+            ),
+            (
+                "letters_ri_4_letters",
+                "ab\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}cd",
+                &[
+                    ("ab", true),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("cd", true),
+                ],
+                &[
+                    "a",
+                    "b",
+                    "\u{1F1E6}\u{1F1E6}",
+                    "\u{1F1E6}\u{1F1E6}",
+                    "c",
+                    "d",
+                ],
+            ),
+            (
+                "ri_2_letters_ri_3",
+                "\u{1F1E6}\u{1F1E6}ab\u{1F1E6}\u{1F1E6}\u{1F1E6}",
+                &[
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("ab", true),
+                    ("\u{1F1E6}\u{1F1E6}", false),
+                    ("\u{1F1E6}", false),
+                ],
+                &[
+                    "\u{1F1E6}\u{1F1E6}",
+                    "a",
+                    "b",
+                    "\u{1F1E6}\u{1F1E6}",
+                    "\u{1F1E6}",
+                ],
+            ),
+        ];
+        for (name, text, word, grapheme) in CASES {
+            let expected_word: Vec<(String, bool)> = word
+                .iter()
+                .map(|(segment, like)| ((*segment).to_owned(), *like))
+                .collect();
+            assert_eq!(word_segments(text), expected_word, "word segments of {name}");
+            let expected_grapheme: Vec<String> =
+                grapheme.iter().map(|segment| (*segment).to_owned()).collect();
+            assert_eq!(
+                grapheme_segments(text),
+                expected_grapheme,
+                "grapheme clusters of {name}"
+            );
+        }
+    }
+
+    fn word_rule_steps(text: &str) -> usize {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        RULE_STEPS.with(|steps| steps.set(0));
+        let boundaries = boundaries(SegmenterGranularity::Word, &units);
+        assert_eq!(boundaries.len(), text.chars().count() / 2);
+        RULE_STEPS.with(std::cell::Cell::get)
+    }
+
+    /// The word rules count every class they read. Each boundary reads a bounded
+    /// number of them, so twice the input costs about twice the reads; a rescan of
+    /// the run before every boundary costs four times as much for this input.
+    #[test]
+    fn regional_indicator_runs_take_work_linear_in_their_length() {
+        let short = word_rule_steps(&"\u{1F1E6}".repeat(2_000));
+        let long = word_rule_steps(&"\u{1F1E6}".repeat(4_000));
+        assert!(
+            long * 2 < short * 5,
+            "2000 indicators took {short} rule evaluations and 4000 took {long}"
+        );
     }
 
     #[test]
