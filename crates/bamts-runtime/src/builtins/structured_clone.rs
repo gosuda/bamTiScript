@@ -344,8 +344,10 @@ fn build_plan<H: Host>(
                 properties,
                 ..
             } => {
-                let source_value = regexp_property(&properties, &machine.shapes, &mut machine.atoms, "source")?;
-                let canonical_flags = regexp_property(&properties, &machine.shapes, &mut machine.atoms, "flags")?;
+                let source_value =
+                    regexp_property(&properties, &machine.shapes, &mut machine.atoms, "source")?;
+                let canonical_flags =
+                    regexp_property(&properties, &machine.shapes, &mut machine.atoms, "flags")?;
                 PlannedNode::RegExp {
                     pattern,
                     flags,

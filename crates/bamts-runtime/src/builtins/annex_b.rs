@@ -63,8 +63,28 @@ fn install_proto_accessor<H: Host>(
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get __proto__", length: 0, handler: proto_getter::<H> });
-    let setter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "set __proto__", length: 1, handler: proto_setter::<H> });
+    let getter = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "get __proto__",
+            length: 0,
+            handler: proto_getter::<H>,
+        },
+    );
+    let setter = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "set __proto__",
+            length: 1,
+            handler: proto_setter::<H>,
+        },
+    );
     define_property(
         heap,
         atoms,
@@ -107,7 +127,17 @@ fn install_object_accessor_methods<H: Host>(
         ("__lookupGetter__", 1, lookup_getter::<H>),
         ("__lookupSetter__", 1, lookup_setter::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, prototype, name, function);
     }
 }
@@ -275,7 +305,17 @@ fn install_string_annex_b<H: Host>(
         ("sup", 0, sup::<H>),
         ("substr", 2, substr::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, prototype, name, function);
     }
     // §B.2.3: `trimLeft` is the same function object as `trimStart`, and
@@ -293,8 +333,25 @@ fn install_regexp_compile<H: Host>(
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let method = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "compile", length: 1, handler: regexp_compile::<H> });
-    define_data(heap, atoms, shapes, builtins.regexp_prototype(), "compile", method);
+    let method = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "compile",
+            length: 1,
+            handler: regexp_compile::<H>,
+        },
+    );
+    define_data(
+        heap,
+        atoms,
+        shapes,
+        builtins.regexp_prototype(),
+        "compile",
+        method,
+    );
 }
 const LEGACY_STATE_PRIVATE_NAME: &str = "RegExp legacy static state";
 const CAPTURE_START_NAMES: [&str; 9] = [
@@ -407,8 +464,28 @@ fn install_regexp_legacy_statics<H: Host>(
         ),
         ("$_", "get $_", legacy_input_get::<H>, "set $_"),
     ] {
-        let getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: getter_name, length: 0, handler: getter });
-        let setter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: setter_name, length: 1, handler: legacy_input_set::<H> });
+        let getter = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name: getter_name,
+                length: 0,
+                handler: getter,
+            },
+        );
+        let setter = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name: setter_name,
+                length: 1,
+                handler: legacy_input_set::<H>,
+            },
+        );
         define_property(
             heap,
             atoms,
@@ -454,7 +531,17 @@ fn install_regexp_legacy_statics<H: Host>(
         ("$8", "get $8", legacy_capture_8_get::<H>),
         ("$9", "get $9", legacy_capture_9_get::<H>),
     ] {
-        let getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: getter_name, length: 0, handler: getter });
+        let getter = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name: getter_name,
+                length: 0,
+                handler: getter,
+            },
+        );
         define_property(
             heap,
             atoms,
@@ -581,42 +668,84 @@ fn legacy_static_get<H: Host>(
     kind: LegacyStatic,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let state = checked_legacy_state(machine, this)?;
-    let input_value = legacy_state_value(&machine.heap, &machine.atoms, &machine.shapes, state,
-    if matches!(kind, LegacyStatic::Input) {
-        "input"
-    } else {
-        "matchInput"
-    },);
+    let input_value = legacy_state_value(
+        &machine.heap,
+        &machine.atoms,
+        &machine.shapes,
+        state,
+        if matches!(kind, LegacyStatic::Input) {
+            "input"
+        } else {
+            "matchInput"
+        },
+    );
     if matches!(kind, LegacyStatic::Input) {
         return Ok(BuiltinOutcome::Value(input_value));
     }
     let input = machine
         .string_value(input_value)
         .expect("RegExp legacy input is a string");
-    let range =
-        match kind {
-            LegacyStatic::Input => unreachable!("handled above"),
-            LegacyStatic::LastMatch => {
-                stored_index(&machine.heap, &machine.atoms, &machine.shapes, state, "matchStart").zip(stored_index(&machine.heap, &machine.atoms, &machine.shapes, state,
-                "matchEnd",))
-            }
-            LegacyStatic::LastParen => {
-                stored_index(&machine.heap, &machine.atoms, &machine.shapes, state, "lastParenStart").zip(
-                    stored_index(&machine.heap, &machine.atoms, &machine.shapes, state, "lastParenEnd"),
-                )
-            }
-            LegacyStatic::LeftContext => {
-                stored_index(&machine.heap, &machine.atoms, &machine.shapes, state, "matchStart").map(|end| (0, end))
-            }
-            LegacyStatic::RightContext => {
-                stored_index(&machine.heap, &machine.atoms, &machine.shapes, state, "matchEnd")
-                    .map(|start| (start, input.len_units()))
-            }
-            LegacyStatic::Capture(index) => stored_index(&machine.heap, &machine.atoms, &machine.shapes, state,
-            CAPTURE_START_NAMES[index],)
-            .zip(stored_index(&machine.heap, &machine.atoms, &machine.shapes, state,
-            CAPTURE_END_NAMES[index],)),
-        };
+    let range = match kind {
+        LegacyStatic::Input => unreachable!("handled above"),
+        LegacyStatic::LastMatch => stored_index(
+            &machine.heap,
+            &machine.atoms,
+            &machine.shapes,
+            state,
+            "matchStart",
+        )
+        .zip(stored_index(
+            &machine.heap,
+            &machine.atoms,
+            &machine.shapes,
+            state,
+            "matchEnd",
+        )),
+        LegacyStatic::LastParen => stored_index(
+            &machine.heap,
+            &machine.atoms,
+            &machine.shapes,
+            state,
+            "lastParenStart",
+        )
+        .zip(stored_index(
+            &machine.heap,
+            &machine.atoms,
+            &machine.shapes,
+            state,
+            "lastParenEnd",
+        )),
+        LegacyStatic::LeftContext => stored_index(
+            &machine.heap,
+            &machine.atoms,
+            &machine.shapes,
+            state,
+            "matchStart",
+        )
+        .map(|end| (0, end)),
+        LegacyStatic::RightContext => stored_index(
+            &machine.heap,
+            &machine.atoms,
+            &machine.shapes,
+            state,
+            "matchEnd",
+        )
+        .map(|start| (start, input.len_units())),
+        LegacyStatic::Capture(index) => stored_index(
+            &machine.heap,
+            &machine.atoms,
+            &machine.shapes,
+            state,
+            CAPTURE_START_NAMES[index],
+        )
+        .zip(stored_index(
+            &machine.heap,
+            &machine.atoms,
+            &machine.shapes,
+            state,
+            CAPTURE_END_NAMES[index],
+        )),
+    };
     let result = range
         .and_then(|(start, end)| input.slice_units(start..end))
         .unwrap_or_default();
@@ -644,7 +773,14 @@ fn legacy_input_set<H: Host>(
     let input =
         machine.coerce_string_observable(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let input = allocate_string(machine, input)?;
-    set_legacy_state_value(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, state, "input", input);
+    set_legacy_state_value(
+        &mut machine.heap,
+        &mut machine.atoms,
+        &mut machine.shapes,
+        state,
+        "input",
+        input,
+    );
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 
@@ -686,8 +822,22 @@ fn store_range(
     range: Option<&std::ops::Range<usize>>,
 ) {
     let (start, end) = range.map_or((-1.0, -1.0), |range| (range.start as f64, range.end as f64));
-    set_legacy_state_value(heap, atoms, shapes, state, start_name, crate::number_value(start));
-    set_legacy_state_value(heap, atoms, shapes, state, end_name, crate::number_value(end));
+    set_legacy_state_value(
+        heap,
+        atoms,
+        shapes,
+        state,
+        start_name,
+        crate::number_value(start),
+    );
+    set_legacy_state_value(
+        heap,
+        atoms,
+        shapes,
+        state,
+        end_name,
+        crate::number_value(end),
+    );
 }
 
 /// Records the successful match state used by the Annex B RegExp constructor
@@ -701,31 +851,56 @@ pub(super) fn record_legacy_match<H: Host>(
     let constructor = regexp_constructor(machine)?;
     let state = legacy_state(&machine.heap, &machine.shapes, constructor);
     let input_value = allocate_string(machine, input.clone())?;
-    set_legacy_state_value(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, state,
-    "input",
-    input_value,);
-    set_legacy_state_value(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, state,
-    "matchInput",
-    input_value,);
-    store_range(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, state,
-    "matchStart",
-    "matchEnd",
-    Some(&matched.range),);
+    set_legacy_state_value(
+        &mut machine.heap,
+        &mut machine.atoms,
+        &mut machine.shapes,
+        state,
+        "input",
+        input_value,
+    );
+    set_legacy_state_value(
+        &mut machine.heap,
+        &mut machine.atoms,
+        &mut machine.shapes,
+        state,
+        "matchInput",
+        input_value,
+    );
+    store_range(
+        &mut machine.heap,
+        &mut machine.atoms,
+        &mut machine.shapes,
+        state,
+        "matchStart",
+        "matchEnd",
+        Some(&matched.range),
+    );
     let last_paren = matched
         .captures
         .iter()
         .skip(1)
         .rev()
         .find_map(Option::as_ref);
-    store_range(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, state,
-    "lastParenStart",
-    "lastParenEnd",
-    last_paren,);
+    store_range(
+        &mut machine.heap,
+        &mut machine.atoms,
+        &mut machine.shapes,
+        state,
+        "lastParenStart",
+        "lastParenEnd",
+        last_paren,
+    );
     for index in 0..9 {
-        store_range(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, state,
-        CAPTURE_START_NAMES[index],
-        CAPTURE_END_NAMES[index],
-        matched.captures.get(index + 1).and_then(Option::as_ref),);
+        store_range(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            state,
+            CAPTURE_START_NAMES[index],
+            CAPTURE_END_NAMES[index],
+            matched.captures.get(index + 1).and_then(Option::as_ref),
+        );
     }
     Ok(())
 }
@@ -756,7 +931,11 @@ fn define_property(
     name: &str,
     property: Property,
 ) {
-    properties_of(heap, object).insert(shapes, PropertyKey::Named(atoms.intern_str(name)), property);
+    properties_of(heap, object).insert(
+        shapes,
+        PropertyKey::Named(atoms.intern_str(name)),
+        property,
+    );
 }
 
 fn clone_property(
@@ -1153,7 +1332,14 @@ mod tests {
             length,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            length,
+        )
     }
 
     fn assert_type_error(result: Result<Value, EvalFailure>) {

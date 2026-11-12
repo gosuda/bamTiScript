@@ -1630,8 +1630,7 @@ function $ERROR(message) {\n\
         );
         let parsed = parse_test(&source).expect("the missing-import case parses");
         let plan = plan_execution(&parsed.frontmatter, &harness).expect("the plan builds");
-        let sources =
-            load_harness_sources(&plan, &FileHarnessLoader).expect("the harness loads");
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).expect("the harness loads");
         let runner =
             backend_runner(ExecutionMode::Interpreter, &scratch).expect("the runner builds");
         let report = evaluate_in_mode(
@@ -1660,8 +1659,7 @@ function $ERROR(message) {\n\
         );
         let parsed = parse_test(&source).expect("the valid case parses");
         let plan = plan_execution(&parsed.frontmatter, &harness).expect("the plan builds");
-        let sources =
-            load_harness_sources(&plan, &FileHarnessLoader).expect("the harness loads");
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).expect("the harness loads");
         let runner =
             backend_runner(ExecutionMode::Interpreter, &scratch).expect("the runner builds");
         let report = evaluate_in_mode(
@@ -1690,8 +1688,7 @@ function $ERROR(message) {\n\
         );
         let parsed = parse_test(&source).expect("the negative case parses its frontmatter");
         let plan = plan_execution(&parsed.frontmatter, &harness).expect("the plan builds");
-        let sources =
-            load_harness_sources(&plan, &FileHarnessLoader).expect("the harness loads");
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).expect("the harness loads");
         let runner =
             backend_runner(ExecutionMode::Interpreter, &scratch).expect("the runner builds");
         let report = evaluate_in_mode(
@@ -1711,8 +1708,7 @@ function $ERROR(message) {\n\
     #[test]
     fn dynamic_target_link_error_rejects_with_syntax_error() {
         let root =
-            std::env::temp_dir()
-                .join(format!("bamts-test262-dyn-link-{}", std::process::id()));
+            std::env::temp_dir().join(format!("bamts-test262-dyn-link-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let tests = root.join("tests");
         let scratch = root.join("scratch");
@@ -1721,7 +1717,9 @@ function $ERROR(message) {\n\
              // This code is governed by the BSD license found in the LICENSE file.\n\n";
         fs::write(
             tests.join("instn-iee-err-ambiguous-export_FIXTURE.js"),
-            format!("{fixture_header}export {{ x }} from './instn-iee-err-ambiguous_FIXTURE.js';\n"),
+            format!(
+                "{fixture_header}export {{ x }} from './instn-iee-err-ambiguous_FIXTURE.js';\n"
+            ),
         )
         .expect("export fixture");
         fs::write(
@@ -1751,10 +1749,8 @@ function $ERROR(message) {\n\
         );
         let parsed = parse_test(&source).expect("the rejection case parses");
         let plan = plan_execution(&parsed.frontmatter, &harness).expect("the plan builds");
-        let sources =
-            load_harness_sources(&plan, &FileHarnessLoader).expect("the harness loads");
-        let runner =
-            InterpreterRunner::new(&scratch).for_test_file(tests.join("case.js"));
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).expect("the harness loads");
+        let runner = InterpreterRunner::new(&scratch).for_test_file(tests.join("case.js"));
         let report = evaluate_in_mode(
             &runner,
             ExecutionMode::Interpreter,

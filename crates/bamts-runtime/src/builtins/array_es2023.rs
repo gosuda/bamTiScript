@@ -37,11 +37,38 @@ pub(super) fn install<H: Host>(
         ("toSpliced", 2, to_spliced::<H>),
         ("with", 2, with::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, array_prototype, name, function);
     }
-    let from_async = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "fromAsync", length: 3, handler: from_async::<H> });
-    define_static(heap, atoms, shapes, array_constructor, "fromAsync", from_async);
+    let from_async = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "fromAsync",
+            length: 3,
+            handler: from_async::<H>,
+        },
+    );
+    define_static(
+        heap,
+        atoms,
+        shapes,
+        array_constructor,
+        "fromAsync",
+        from_async,
+    );
     let mut targets = Vec::new();
     for (name, handler) in [
         (
@@ -55,7 +82,17 @@ pub(super) fn install<H: Host>(
         ("Array.fromAsync close settled", close_settled::<H>),
         ("Array.fromAsync array-like mapped", arraylike_mapped::<H>),
     ] {
-        targets.push(install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 1, handler: handler }));
+        targets.push(install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length: 1,
+                handler,
+            },
+        ));
     }
     let target_table = crate::intrinsics::push(
         heap,
@@ -67,7 +104,14 @@ pub(super) fn install<H: Host>(
             length_writable: true,
         },
     );
-    define_data(heap, atoms, shapes, array_prototype, TARGETS_PROPERTY, target_table);
+    define_data(
+        heap,
+        atoms,
+        shapes,
+        array_prototype,
+        TARGETS_PROPERTY,
+        target_table,
+    );
 }
 
 fn argument(args: &[Value], index: usize) -> Value {
@@ -166,7 +210,11 @@ pub(super) fn create_data_property<H: Host>(
             properties,
             extensible,
             ..
-        } => Some((elements.len(), properties.contains_key(&machine.shapes, &key), *extensible)),
+        } => Some((
+            elements.len(),
+            properties.contains_key(&machine.shapes, &key),
+            *extensible,
+        )),
         _ => None,
     };
     let Some((length, explicit_descriptor, extensible)) = array_state else {
@@ -1081,7 +1129,14 @@ mod tests {
             length,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            length,
+        )
     }
 
     fn is_seven<H: Host>(
@@ -1702,7 +1757,7 @@ mod tests {
             install(
                 &mut machine.heap,
                 &mut machine.atoms,
-            &mut machine.shapes,
+                &mut machine.shapes,
                 &mut machine.intrinsics.builtins,
                 prototype,
                 constructor,

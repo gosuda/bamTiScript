@@ -28,20 +28,59 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let constructor =
-        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "RegExp", length: 2, handler: constructor::<H> });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "RegExp",
+            length: 2,
+            handler: constructor::<H>,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     for (name, length, handler) in [
         ("exec", 1, exec::<H> as BuiltinHandler<H>),
         ("test", 1, test::<H>),
         ("toString", 0, to_string::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, prototype, name, function);
     }
-    let source_get = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get source", length: 0, handler: source_getter::<H> });
+    let source_get = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "get source",
+            length: 0,
+            handler: source_getter::<H>,
+        },
+    );
     define_getter(heap, atoms, shapes, prototype, "source", source_get);
-    let flags_get = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get flags", length: 0, handler: flags_getter::<H> });
+    let flags_get = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "get flags",
+            length: 0,
+            handler: flags_getter::<H>,
+        },
+    );
     define_getter(heap, atoms, shapes, prototype, "flags", flags_get);
     super::regexp_protocol::install(heap, atoms, shapes, builtins, prototype, constructor);
     builtins.set_regexp_prototype(prototype);
@@ -191,7 +230,10 @@ pub(super) fn compile<H: Host>(
 /// ECMA-262 §22.2.3.3: only `lastIndex` is an own data property.
 /// Called from the constructor, the bytecode literal path, and the native
 /// helper path so all three agree by construction.
-pub(crate) fn initial_regexp_properties(atoms: &mut crate::AtomTable, shapes: &mut crate::ShapeTable) -> PropertyMap {
+pub(crate) fn initial_regexp_properties(
+    atoms: &mut crate::AtomTable,
+    shapes: &mut crate::ShapeTable,
+) -> PropertyMap {
     let mut properties = PropertyMap::default();
     properties.insert(
         shapes,
@@ -787,8 +829,14 @@ mod tests {
         // Comparing against the shared helper (not a hand-copied duplicate)
         // means the test's expected set drifts with the helper. If a call
         // site stops using the helper, this assertion catches the divergence.
-        let expected = initial_regexp_properties(&mut constructed_machine.atoms, &mut constructed_machine.shapes);
-        let expected_keys: Vec<PropertyKey> = expected.iter(&constructed_machine.shapes).map(|(k, _)| k.clone()).collect();
+        let expected = initial_regexp_properties(
+            &mut constructed_machine.atoms,
+            &mut constructed_machine.shapes,
+        );
+        let expected_keys: Vec<PropertyKey> = expected
+            .iter(&constructed_machine.shapes)
+            .map(|(k, _)| k.clone())
+            .collect();
         assert_eq!(
             texts(&constructed_machine, &constructed_keys),
             texts(&constructed_machine, &expected_keys),
@@ -991,7 +1039,17 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
         // Install a getter on new_target.prototype that throws.
-        let getter = install_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, &mut machine.intrinsics.builtins, crate::intrinsics::BuiltinDef { name: "throwing prototype getter", length: 0, handler: throw_prototype_getter::<TestHost> });
+        let getter = install_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            &mut machine.intrinsics.builtins,
+            crate::intrinsics::BuiltinDef {
+                name: "throwing prototype getter",
+                length: 0,
+                handler: throw_prototype_getter::<TestHost>,
+            },
+        );
         let new_target = super::super::ordinary_runtime(&mut machine, None).unwrap();
         let prototype_key = PropertyKey::Named(machine.intern_str("prototype"));
         machine
@@ -1037,7 +1095,14 @@ mod tests {
             length: 1,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 1)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            1,
+        )
     }
 
     fn counting_exec_override(

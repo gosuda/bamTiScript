@@ -34,7 +34,17 @@ pub(crate) fn install<H: Host>(
     script_compiler: bool,
 ) {
     let prototype = builtins.function_prototype();
-    let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Function", length: 1, handler: function_constructor::<H> as BuiltinHandler<H> });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "Function",
+            length: 1,
+            handler: function_constructor::<H> as BuiltinHandler<H>,
+        },
+    );
     define_frozen_data(heap, atoms, shapes, constructor, "prototype", prototype);
     define_data(heap, atoms, shapes, prototype, "constructor", constructor);
     globals.insert(EcmaString::encode("Function"), constructor);
@@ -42,14 +52,19 @@ pub(crate) fn install<H: Host>(
     let async_generator_prototype = builtins.async_generator_prototype();
     let tag = builtins.symbol_to_string_tag();
     define_to_string_tag(heap, shapes, generator_prototype, tag, "Generator");
-    define_to_string_tag(heap, shapes, async_generator_prototype, tag, "AsyncGenerator");
+    define_to_string_tag(
+        heap,
+        shapes,
+        async_generator_prototype,
+        tag,
+        "AsyncGenerator",
+    );
     let generator = install_function_kind(
         heap,
         atoms,
         shapes,
         builtins,
-        "GeneratorFunction",
-        generator_function_constructor::<H>,
+        function_kind("GeneratorFunction", generator_function_constructor::<H>),
         constructor,
         Some(generator_prototype),
     );
@@ -58,8 +73,7 @@ pub(crate) fn install<H: Host>(
         atoms,
         shapes,
         builtins,
-        "AsyncFunction",
-        async_function_constructor::<H>,
+        function_kind("AsyncFunction", async_function_constructor::<H>),
         constructor,
         None,
     );
@@ -68,8 +82,10 @@ pub(crate) fn install<H: Host>(
         atoms,
         shapes,
         builtins,
-        "AsyncGeneratorFunction",
-        async_generator_function_constructor::<H>,
+        function_kind(
+            "AsyncGeneratorFunction",
+            async_generator_function_constructor::<H>,
+        ),
         constructor,
         Some(async_generator_prototype),
     );
@@ -82,6 +98,14 @@ pub(crate) fn install<H: Host>(
         });
         let function = native_function(heap, atoms, shapes, id, "eval", 1);
         globals.insert(EcmaString::encode("eval"), function);
+    }
+}
+
+fn function_kind<H: Host>(name: &'static str, handler: BuiltinHandler<H>) -> BuiltinDef<H> {
+    BuiltinDef {
+        name,
+        length: 1,
+        handler,
     }
 }
 
@@ -117,11 +141,11 @@ fn install_function_kind<H: Host>(
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
-    name: &'static str,
-    handler: BuiltinHandler<H>,
+    kind: BuiltinDef<H>,
     function_constructor: Value,
     instance_prototype: Option<Value>,
 ) -> Value {
+    let name = kind.name;
     let prototype = crate::intrinsics::push(
         heap,
         HeapEntry::Object {
@@ -131,7 +155,7 @@ fn install_function_kind<H: Host>(
             boxed_primitive: None,
         },
     );
-    let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 1, handler: handler });
+    let constructor = install_constructor_function(heap, atoms, shapes, builtins, kind);
     let HeapEntry::NativeFunction {
         prototype: parent, ..
     } = &mut heap[heap_index(constructor)]
@@ -141,10 +165,30 @@ fn install_function_kind<H: Host>(
     *parent = Some(function_constructor);
     define_frozen_data(heap, atoms, shapes, constructor, "prototype", prototype);
     define_link(heap, atoms, shapes, prototype, "constructor", constructor);
-    define_to_string_tag(heap, shapes, prototype, builtins.symbol_to_string_tag(), name);
+    define_to_string_tag(
+        heap,
+        shapes,
+        prototype,
+        builtins.symbol_to_string_tag(),
+        name,
+    );
     if let Some(instance_prototype) = instance_prototype {
-        define_link(heap, atoms, shapes, prototype, "prototype", instance_prototype);
-        define_link(heap, atoms, shapes, instance_prototype, "constructor", prototype);
+        define_link(
+            heap,
+            atoms,
+            shapes,
+            prototype,
+            "prototype",
+            instance_prototype,
+        );
+        define_link(
+            heap,
+            atoms,
+            shapes,
+            instance_prototype,
+            "constructor",
+            prototype,
+        );
     }
     prototype
 }

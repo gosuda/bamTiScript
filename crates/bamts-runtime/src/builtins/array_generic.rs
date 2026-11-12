@@ -1376,7 +1376,14 @@ mod tests {
             length: 1,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 1)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            1,
+        )
     }
 
     fn return_this(

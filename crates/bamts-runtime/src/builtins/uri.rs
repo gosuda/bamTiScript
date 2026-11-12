@@ -27,7 +27,17 @@ pub(super) fn install<H: Host>(
         ("escape", escape::<H>),
         ("unescape", unescape::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 1, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length: 1,
+                handler,
+            },
+        );
         globals.insert(EcmaString::encode(name), function);
     }
 }
@@ -506,9 +516,14 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id,
-        "coercion hook",
-        0,)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            "coercion hook",
+            0,
+        )
     }
 
     #[test]

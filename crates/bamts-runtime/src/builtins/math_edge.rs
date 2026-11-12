@@ -28,7 +28,17 @@ pub(super) fn install<H: Host>(
         define_frozen_data(heap, atoms, shapes, math, name, crate::number_value(value));
     }
     for (name, length, handler) in functions::<H>() {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, math, name, function);
     }
 }
@@ -783,7 +793,14 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "math valueOf", 0)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            "math valueOf",
+            0,
+        )
     }
 
     fn coercible(

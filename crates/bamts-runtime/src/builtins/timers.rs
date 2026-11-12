@@ -20,14 +20,53 @@ pub(crate) fn install<H: Host>(
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let set_timeout = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "setTimeout", length: 2, handler: set_timeout::<H> });
+    let set_timeout = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "setTimeout",
+            length: 2,
+            handler: set_timeout::<H>,
+        },
+    );
     globals.insert(EcmaString::encode("setTimeout"), set_timeout);
-    let clear_timeout =
-        install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "clearTimeout", length: 1, handler: clear_timeout::<H> });
+    let clear_timeout = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "clearTimeout",
+            length: 1,
+            handler: clear_timeout::<H>,
+        },
+    );
     globals.insert(EcmaString::encode("clearTimeout"), clear_timeout);
-    let set_interval = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "setInterval", length: 2, handler: set_interval::<H> });
+    let set_interval = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "setInterval",
+            length: 2,
+            handler: set_interval::<H>,
+        },
+    );
     globals.insert(EcmaString::encode("setInterval"), set_interval);
-    let clear_interval = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "clearInterval", length: 1, handler: clear_interval::<H> });
+    let clear_interval = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "clearInterval",
+            length: 1,
+            handler: clear_interval::<H>,
+        },
+    );
     globals.insert(EcmaString::encode("clearInterval"), clear_interval);
 }
 

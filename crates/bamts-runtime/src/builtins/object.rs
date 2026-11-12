@@ -58,8 +58,17 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.object_prototype();
-    let constructor =
-        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Object", length: 1, handler: constructor::<H> });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "Object",
+            length: 1,
+            handler: constructor::<H>,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode("Object"), constructor);
 
@@ -73,7 +82,17 @@ pub(super) fn install<H: Host>(
         ("valueOf", 0, value_of::<H>),
         ("propertyIsEnumerable", 1, property_is_enumerable::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, prototype, name, function);
         if name == "toString" {
             builtins.set_object_to_string(function);
@@ -85,8 +104,25 @@ pub(super) fn install<H: Host>(
         ("bind", 1, function_bind::<H>),
         ("toString", 0, function_to_string::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
-        define_data(heap, atoms, shapes, builtins.function_prototype(), name, function);
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
+        define_data(
+            heap,
+            atoms,
+            shapes,
+            builtins.function_prototype(),
+            name,
+            function,
+        );
     }
     install_restricted_function_properties(heap, atoms, shapes, builtins);
     let reified = crate::intrinsics::push(
@@ -96,15 +132,29 @@ pub(super) fn install<H: Host>(
         },
     );
     builtins.set_function_reified_brand(reified);
-    let has_instance = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "[Symbol.hasInstance]", length: 1, handler: function_has_instance::<H> });
-    define_symbol_property(heap, shapes, builtins.function_prototype(),
-    builtins.symbol_has_instance(),
-    Property::Data {
-        value: has_instance,
-        writable: false,
-        enumerable: false,
-        configurable: false,
-    },);
+    let has_instance = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "[Symbol.hasInstance]",
+            length: 1,
+            handler: function_has_instance::<H>,
+        },
+    );
+    define_symbol_property(
+        heap,
+        shapes,
+        builtins.function_prototype(),
+        builtins.symbol_has_instance(),
+        Property::Data {
+            value: has_instance,
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        },
+    );
 }
 
 /// `AddRestrictedFunctionProperties` for %Function.prototype%, around a frozen
@@ -115,7 +165,17 @@ fn install_restricted_function_properties<H: Host>(
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let thrower = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "", length: 0, handler: throw_type_error::<H> });
+    let thrower = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "",
+            length: 0,
+            handler: throw_type_error::<H>,
+        },
+    );
     builtins.set_throw_type_error(thrower);
     let HeapEntry::NativeFunction {
         properties,
@@ -2117,7 +2177,14 @@ mod tests {
                 length,
                 handler: probe_handler::<TestHost>,
             });
-        crate::intrinsics::native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
+        crate::intrinsics::native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            length,
+        )
     }
 
     fn call_method(
@@ -2270,7 +2337,7 @@ mod tests {
             let getter = crate::intrinsics::native_function(
                 &mut machine.heap,
                 &mut machine.atoms,
-            &mut machine.shapes,
+                &mut machine.shapes,
                 id,
                 name,
                 0,

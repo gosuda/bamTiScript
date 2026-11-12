@@ -3850,7 +3850,8 @@ impl<'a> Emitter<'a> {
         let mut opened: Vec<bool> = Vec::with_capacity(frames.len());
         let mut parent: Option<&BinaryExpression> = None;
         for frame in frames.iter() {
-            let need = parent.is_some_and(|outer| binary_prec(frame.operator) < binary_prec(outer.operator));
+            let need = parent
+                .is_some_and(|outer| binary_prec(frame.operator) < binary_prec(outer.operator));
             if need {
                 self.raw("(");
             }
@@ -3883,8 +3884,6 @@ impl<'a> Emitter<'a> {
             }
         }
     }
-
-
 
     fn emit_logical(&mut self, logical: &LogicalExpression) {
         self.emit_logical_chain(logical);
@@ -3920,7 +3919,8 @@ impl<'a> Emitter<'a> {
                 None => false,
                 Some(outer) => {
                     let outer_prec = Self::logical_prec(outer);
-                    let mixed = matches!(outer, LogicalOperator::Nullish) != matches!(frame.operator, LogicalOperator::Nullish);
+                    let mixed = matches!(outer, LogicalOperator::Nullish)
+                        != matches!(frame.operator, LogicalOperator::Nullish);
                     prec < outer_prec || (mixed && !left_starts_paren)
                 }
             };
@@ -3930,7 +3930,12 @@ impl<'a> Emitter<'a> {
             opened.push(need);
             parent = Some(frame.operator);
         }
-        self.emit_logical_operand(&inner.left, inner.operator, Self::logical_prec(inner.operator), true);
+        self.emit_logical_operand(
+            &inner.left,
+            inner.operator,
+            Self::logical_prec(inner.operator),
+            true,
+        );
         for (frame, open) in frames.iter().rev().zip(opened.iter().rev()) {
             let prec = Self::logical_prec(frame.operator);
             let operator_text = logical_str(frame.operator);
@@ -3955,7 +3960,6 @@ impl<'a> Emitter<'a> {
             }
         }
     }
-
 
     fn emit_logical_operand(
         &mut self,
@@ -4388,7 +4392,7 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn transparent_child<'e>(expression: &'e Expr) -> Option<&'e Expr> {
+    fn transparent_child(expression: &Expr) -> Option<&Expr> {
         match expression.data() {
             Expression::Parenthesized(inner) => Some(inner),
             Expression::As(as_expr) => Some(&as_expr.expression),
@@ -4399,7 +4403,7 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn left_position_child<'e>(expression: &'e Expr) -> Option<&'e Expr> {
+    fn left_position_child(expression: &Expr) -> Option<&Expr> {
         match expression.data() {
             Expression::Binary(binary) => Some(&binary.left),
             Expression::Logical(logical) => Some(&logical.left),
@@ -4427,10 +4431,10 @@ impl<'a> Emitter<'a> {
                 Expression::Object(_) => return true,
                 Expression::Function(_) | Expression::Class(_) => return !objects_only,
                 Expression::Assignment(assignment) => {
-                    return self.target_leads_with_object(&assignment.left)
+                    return self.target_leads_with_object(&assignment.left);
                 }
                 Expression::Update(update) => {
-                    return !update.prefix && self.target_leads_with_object(&update.argument)
+                    return !update.prefix && self.target_leads_with_object(&update.argument);
                 }
                 _ => (),
             }
@@ -4458,10 +4462,10 @@ impl<'a> Emitter<'a> {
             match current.data() {
                 Expression::Parenthesized(_) => return true,
                 Expression::Update(update) if !update.prefix => {
-                    return self.target_starts_parenthesized(&update.argument)
+                    return self.target_starts_parenthesized(&update.argument);
                 }
                 Expression::Assignment(assignment) => {
-                    return self.target_starts_parenthesized(&assignment.left)
+                    return self.target_starts_parenthesized(&assignment.left);
                 }
                 _ => (),
             }
@@ -8960,11 +8964,6 @@ var c = () => 1;
         assert!(code.trim_end().ends_with("19999;"), "{code}");
         assert_eq!(code.matches(" + ").count(), 19999, "{code}");
     }
-
-
-
-
-
 
     #[test]
     fn es5_generator_import_source_materializes_before_options_yield() {

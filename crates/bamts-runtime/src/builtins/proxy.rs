@@ -94,8 +94,28 @@ pub(super) fn install<H: Host>(
     globals: &mut std::collections::BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let constructor = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Proxy", length: 2, handler: constructor::<H> });
-    let revocable = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "revocable", length: 2, handler: revocable::<H> });
+    let constructor = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "Proxy",
+            length: 2,
+            handler: constructor::<H>,
+        },
+    );
+    let revocable = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "revocable",
+            length: 2,
+            handler: revocable::<H>,
+        },
+    );
     define_data(heap, atoms, shapes, constructor, "revocable", revocable);
     globals.insert(EcmaString::encode("Proxy"), constructor);
 }
@@ -778,7 +798,14 @@ mod tests {
                 length,
                 handler,
             });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            length,
+        )
     }
 
     fn is_type_error<T>(result: Result<T, EvalFailure>) -> bool {

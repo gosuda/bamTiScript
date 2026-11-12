@@ -50,12 +50,41 @@ pub(super) fn install<H: Host>(
     builtins.set_symbol_unscopables(unscopables);
     builtins.set_symbol_prototype(prototype);
 
-    let constructor =
-        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Symbol", length: 0, handler: constructor::<H> });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "Symbol",
+            length: 0,
+            handler: constructor::<H>,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
-    let symbol_for = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "for", length: 1, handler: symbol_for::<H> });
+    let symbol_for = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "for",
+            length: 1,
+            handler: symbol_for::<H>,
+        },
+    );
     define_native_property(heap, atoms, shapes, constructor, "for", symbol_for);
-    let key_for = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "keyFor", length: 1, handler: key_for::<H> });
+    let key_for = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "keyFor",
+            length: 1,
+            handler: key_for::<H>,
+        },
+    );
     define_native_property(heap, atoms, shapes, constructor, "keyFor", key_for);
     for (name, value) in [
         ("iterator", iterator),
@@ -77,12 +106,52 @@ pub(super) fn install<H: Host>(
         define_readonly_property(heap, atoms, shapes, constructor, name, value);
     }
 
-    let to_string = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "toString", length: 0, handler: to_string::<H> });
-    let value_of_method = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "valueOf", length: 0, handler: value_of::<H> });
-    let description = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get description", length: 0, handler: description::<H> });
+    let to_string = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "toString",
+            length: 0,
+            handler: to_string::<H>,
+        },
+    );
+    let value_of_method = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "valueOf",
+            length: 0,
+            handler: value_of::<H>,
+        },
+    );
+    let description = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "get description",
+            length: 0,
+            handler: description::<H>,
+        },
+    );
     define_data(heap, atoms, shapes, prototype, "toString", to_string);
     define_data(heap, atoms, shapes, prototype, "valueOf", value_of_method);
-    let to_primitive_method = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "[Symbol.toPrimitive]", length: 1, handler: value_of::<H> });
+    let to_primitive_method = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "[Symbol.toPrimitive]",
+            length: 1,
+            handler: value_of::<H>,
+        },
+    );
     define_to_string_tag(heap, shapes, prototype, to_string_tag, "Symbol");
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
         unreachable!()
@@ -376,7 +445,14 @@ mod tests {
             length: 1,
             handler: echo_hint,
         });
-        let method = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "echo hint", 1);
+        let method = native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            "echo hint",
+            1,
+        );
         let object = with_to_primitive(&mut machine, method);
 
         let string = machine.coerce_primitive_observable(object, true).unwrap();
@@ -411,7 +487,14 @@ mod tests {
             length: 0,
             handler: return_seven,
         });
-        let method = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "return seven", 0);
+        let method = native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            "return seven",
+            0,
+        );
         let object = with_to_primitive(&mut machine, method);
         assert_eq!(
             machine.eval_unary(UnaryOp::Plus, object).unwrap(),
@@ -429,7 +512,14 @@ mod tests {
             length: 0,
             handler: return_this,
         });
-        let method = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "return this", 0);
+        let method = native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            "return this",
+            0,
+        );
         for method in [method, Value::int32(1)] {
             let object = with_to_primitive(&mut machine, method);
             assert!(matches!(
@@ -775,9 +865,14 @@ mod tests {
             length: 1,
             handler: custom_has_instance::<TestHost>,
         });
-        let handler = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, handler_id,
-        "custom hasInstance",
-        1,);
+        let handler = native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            handler_id,
+            "custom hasInstance",
+            1,
+        );
         machine
             .set_data_property(constructor, "_hasInstanceResult", Value::TRUE)
             .unwrap();
@@ -843,9 +938,14 @@ mod tests {
             length: 1,
             handler: custom_has_instance::<TestHost>,
         });
-        let handler = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, handler_id,
-        "custom hasInstance override",
-        1,);
+        let handler = native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            handler_id,
+            "custom hasInstance override",
+            1,
+        );
         machine
             .set_data_property(constructor, "_hasInstanceResult", Value::FALSE)
             .unwrap();

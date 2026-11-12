@@ -4130,11 +4130,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         Err(failure) => self.fail(failure),
                     }
                 }
-                HelperCall::GetProperty {
-                    object,
-                    key,
-                    site,
-                } => {
+                HelperCall::GetProperty { object, key, site } => {
                     let key = {
                         let coerced = self.machine.borrow_mut().computed_property_key(object, key);
                         match coerced {
@@ -4193,10 +4189,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     if cached.is_some() {
                         break 'result HelperResult::normal(Value::UNDEFINED);
                     }
-                    let outcome = self
-                        .machine
-                        .borrow_mut()
-                        .internal_set(object, key.clone(), value, object);
+                    let outcome =
+                        self.machine
+                            .borrow_mut()
+                            .internal_set(object, key.clone(), value, object);
                     if matches!(outcome, Ok(true)) {
                         self.machine.borrow_mut().property_site_record_set(
                             target.module,
@@ -11802,7 +11798,14 @@ mod tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            0,
+        )
     }
 
     #[test]

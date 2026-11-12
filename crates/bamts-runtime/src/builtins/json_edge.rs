@@ -99,7 +99,17 @@ pub(super) fn install<H: Host>(
         ("rawJSON", 1, raw_json::<H>),
         ("isRawJSON", 1, is_raw_json::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, json, name, function);
     }
     let brand_index = heap.len() as u32;
@@ -137,13 +147,15 @@ fn raw_json_brand<H: Host>(machine: &Machine<'_, H>) -> Option<(u32, Value)> {
     let HeapEntry::Object { properties, .. } = &machine.heap[json_index] else {
         return None;
     };
-    properties.iter(&machine.shapes).find_map(|(key, property)| {
-        if let (PropertyKey::Private(slot), Property::Data { value, .. }) = (key, property) {
-            Some((*slot, *value))
-        } else {
-            None
-        }
-    })
+    properties
+        .iter(&machine.shapes)
+        .find_map(|(key, property)| {
+            if let (PropertyKey::Private(slot), Property::Data { value, .. }) = (key, property) {
+                Some((*slot, *value))
+            } else {
+                None
+            }
+        })
 }
 
 fn has_raw_json_brand<H: Host>(machine: &Machine<'_, H>, value: Value) -> bool {
@@ -1378,7 +1390,14 @@ mod tests {
             length,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            length,
+        )
     }
 
     fn json_parse(

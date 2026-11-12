@@ -181,10 +181,10 @@ fn tracing_follows_composed_production_heap_edges() {
 
     let array_property = stress.object();
     let mut array_properties = PropertyMap::default();
-        let edge_key = PropertyKey::Named(stress.machine.intern_str("edge"));
-        array_properties.insert(
-            &mut stress.machine.shapes,
-            edge_key,
+    let edge_key = PropertyKey::Named(stress.machine.intern_str("edge"));
+    array_properties.insert(
+        &mut stress.machine.shapes,
+        edge_key,
         Property::Data {
             value: array_property,
             writable: true,
@@ -207,10 +207,10 @@ fn tracing_follows_composed_production_heap_edges() {
     let setter_edge = stress.object();
     let prototype_edge = stress.object();
     let mut root_properties = PropertyMap::default();
-        let data_key = PropertyKey::Named(stress.machine.intern_str("data"));
-        root_properties.insert(
-            &mut stress.machine.shapes,
-            data_key,
+    let data_key = PropertyKey::Named(stress.machine.intern_str("data"));
+    root_properties.insert(
+        &mut stress.machine.shapes,
+        data_key,
         Property::Data {
             value: array,
             writable: true,
@@ -218,10 +218,10 @@ fn tracing_follows_composed_production_heap_edges() {
             configurable: true,
         },
     );
-        let accessor_key = PropertyKey::Named(stress.machine.intern_str("accessor"));
-        root_properties.insert(
-            &mut stress.machine.shapes,
-            accessor_key,
+    let accessor_key = PropertyKey::Named(stress.machine.intern_str("accessor"));
+    root_properties.insert(
+        &mut stress.machine.shapes,
+        accessor_key,
         Property::Accessor {
             getter: Some(getter_edge),
             setter: Some(setter_edge),

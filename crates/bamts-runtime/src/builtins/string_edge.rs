@@ -36,7 +36,17 @@ pub(super) fn install<H: Host>(
         ),
         ("raw", 1, raw::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)]
         else {
             panic!("String constructor must be native")
@@ -61,7 +71,17 @@ pub(super) fn install<H: Host>(
         ("trimEnd", 0, trim_end::<H>),
         ("repeat", 1, repeat::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         super::define_data(heap, atoms, shapes, prototype, name, function);
     }
 }
@@ -872,7 +892,14 @@ mod tests {
             length: 2,
             handler: symbol_replace_hook::<TestHost>,
         });
-        let hook = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "replace hook", 2);
+        let hook = native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            "replace hook",
+            2,
+        );
         let symbol = machine.intrinsics.builtins.symbol_replace();
         let key = machine.property_key_from_value(symbol).unwrap();
         machine.set_data_property_key(search, key, hook).unwrap();
@@ -1017,7 +1044,14 @@ mod tests {
             length: 2,
             handler: symbol_replace_hook::<TestHost>,
         });
-        let hook = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "replace hook", 2);
+        let hook = native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            "replace hook",
+            2,
+        );
         let match_symbol = machine.intrinsics.builtins.symbol_match();
         let match_key = machine.property_key_from_value(match_symbol).unwrap();
         let replace_symbol = machine.intrinsics.builtins.symbol_replace();

@@ -19,15 +19,34 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.string_prototype();
-    let constructor =
-        install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "String", length: 1, handler: constructor::<H> });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "String",
+            length: 1,
+            handler: constructor::<H>,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode("String"), constructor);
     for (name, length, handler) in [
         ("fromCharCode", 1, from_char_code::<H> as BuiltinHandler<H>),
         ("raw", 1, raw::<H>),
     ] {
-        let f = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let f = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_static(heap, atoms, shapes, constructor, name, f)
     }
     for (name, length, handler) in [
@@ -63,7 +82,17 @@ pub(super) fn install<H: Host>(
         ("search", 1, search::<H>),
         ("localeCompare", 1, locale_compare::<H>),
     ] {
-        let f = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let f = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, prototype, name, f)
     }
     let iterator = install_function(
@@ -71,7 +100,11 @@ pub(super) fn install<H: Host>(
         atoms,
         shapes,
         builtins,
-        crate::intrinsics::BuiltinDef { name: "[Symbol.iterator]", length: 0, handler: string_iterator::<H> },
+        crate::intrinsics::BuiltinDef {
+            name: "[Symbol.iterator]",
+            length: 0,
+            handler: string_iterator::<H>,
+        },
     );
     let HeapEntry::Object { properties, .. } = &mut heap[super::heap_index(prototype)] else {
         unreachable!()
@@ -1255,7 +1288,14 @@ mod unescape_tests {
             length: 0,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, 0)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            0,
+        )
     }
 
     #[test]

@@ -84,21 +84,67 @@ fn install_class<H: Host>(
     class: &Class<'_, H>,
 ) {
     let prototype = builtins.intl_prototype(class.kind);
-    let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: class.name, length: class.length, handler: class.constructor });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: class.name,
+            length: class.length,
+            handler: class.constructor,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     for &(name, length, handler) in class.statics {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, constructor, name, function);
     }
     for &(property, name, handler) in class.getters {
-        let getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 0, handler: handler });
+        let getter = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length: 0,
+                handler,
+            },
+        );
         super::temporal::define_getter(heap, atoms, shapes, prototype, property, getter);
     }
     for &(name, length, handler) in class.methods {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, prototype, name, function);
     }
-    super::define_to_string_tag(heap, shapes, prototype, builtins.symbol_to_string_tag(), class.tag);
+    super::define_to_string_tag(
+        heap,
+        shapes,
+        prototype,
+        builtins.symbol_to_string_tag(),
+        class.tag,
+    );
     define_data(heap, atoms, shapes, namespace, class.name, constructor);
 }
 
@@ -130,7 +176,17 @@ pub(super) fn install<H: Host>(
         ("supportedValuesOf", 1, supported_values_of::<H>),
     ];
     for (name, length, handler) in functions {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, namespace, name, function);
     }
     locale::install(heap, atoms, shapes, builtins, namespace);
@@ -556,7 +612,13 @@ pub(super) fn is_type_sequence(value: &str) -> bool {
 }
 
 /// Sets a symbol-keyed method, as a data property like any other.
-fn define_symbol_method(heap: &mut [HeapEntry], shapes: &mut crate::ShapeTable, object: Value, symbol: Value, function: Value) {
+fn define_symbol_method(
+    heap: &mut [HeapEntry],
+    shapes: &mut crate::ShapeTable,
+    object: Value,
+    symbol: Value,
+    function: Value,
+) {
     let symbol = super::heap_index(symbol);
     let HeapEntry::Object { properties, .. } = &mut heap[super::heap_index(object)] else {
         panic!("method target is an ordinary object");
@@ -580,7 +642,13 @@ fn set_prototype(heap: &mut [HeapEntry], object: Value, parent: Value) {
     *prototype = Some(parent);
 }
 
-fn define_tag(heap: &mut Vec<HeapEntry>, shapes: &mut crate::ShapeTable, object: Value, symbol: Value, tag: &str) {
+fn define_tag(
+    heap: &mut Vec<HeapEntry>,
+    shapes: &mut crate::ShapeTable,
+    object: Value,
+    symbol: Value,
+    tag: &str,
+) {
     super::define_to_string_tag(heap, shapes, object, symbol, tag);
 }
 

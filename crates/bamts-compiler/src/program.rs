@@ -3291,10 +3291,10 @@ fn live_without(
             continue;
         };
         for dependency in node.dependencies() {
-            if let ModuleTarget::Local(target) = dependency.target() {
-                if !failing.contains(target) {
-                    stack.push(*target);
-                }
+            if let ModuleTarget::Local(target) = dependency.target()
+                && !failing.contains(target)
+            {
+                stack.push(*target);
             }
         }
     }

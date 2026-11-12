@@ -38,7 +38,17 @@ pub(super) fn install<H: Host>(
         ("plainTimeISO", 0, plain_time_iso::<H>),
     ];
     for (name, length, handler) in methods {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, now, name, function);
     }
     let tag_symbol = builtins.symbol_to_string_tag();

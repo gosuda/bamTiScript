@@ -21,7 +21,17 @@ pub(super) fn install<H: Host>(
         ("isSupersetOf", is_superset_of::<H>),
         ("isDisjointFrom", is_disjoint_from::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: 1, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length: 1,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, set_prototype, name, function);
     }
 }
@@ -478,7 +488,14 @@ mod tests {
             length,
             handler,
         });
-        native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, name, length)
+        native_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            id,
+            name,
+            length,
+        )
     }
 
     fn make_set(machine: &mut Machine<'_, TestHost>, values: &[Value]) -> Value {

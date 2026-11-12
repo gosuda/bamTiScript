@@ -43,7 +43,17 @@ fn install_shared_array_buffer<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let constructor = install_constructor_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "SharedArrayBuffer", length: 1, handler: constructor::<H> });
+    let constructor = install_constructor_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "SharedArrayBuffer",
+            length: 1,
+            handler: constructor::<H>,
+        },
+    );
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     builtins.set_sharedarraybuffer_constructor(constructor);
     builtins.set_sharedarraybuffer_prototype(prototype);
@@ -52,7 +62,17 @@ fn install_shared_array_buffer<H: Host>(
         ("grow", 1, grow::<H> as BuiltinHandler<H>),
         ("slice", 2, slice::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, prototype, name, function);
     }
     for (property_name, function_name, handler) in [
@@ -64,12 +84,22 @@ fn install_shared_array_buffer<H: Host>(
         ("maxByteLength", "get maxByteLength", max_byte_length::<H>),
         ("growable", "get growable", growable::<H>),
     ] {
-        let getter = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: function_name, length: 0, handler: handler });
+        let getter = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name: function_name,
+                length: 0,
+                handler,
+            },
+        );
         let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
             unreachable!("SharedArrayBuffer.prototype is ordinary")
         };
         properties.insert(
-        shapes,
+            shapes,
             PropertyKey::Named(atoms.intern_str(property_name)),
             Property::Accessor {
                 getter: Some(getter),
@@ -79,7 +109,17 @@ fn install_shared_array_buffer<H: Host>(
             },
         );
     }
-    let species = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "get [Symbol.species]", length: 0, handler: species::<H> });
+    let species = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "get [Symbol.species]",
+            length: 0,
+            handler: species::<H>,
+        },
+    );
     let HeapEntry::NativeFunction { properties, .. } = &mut heap[heap_index(constructor)] else {
         unreachable!("SharedArrayBuffer constructor is native")
     };
@@ -93,9 +133,13 @@ fn install_shared_array_buffer<H: Host>(
             configurable: true,
         },
     );
-    define_to_string_tag(heap, shapes, prototype,
-    builtins.symbol_to_string_tag(),
-    "SharedArrayBuffer",);
+    define_to_string_tag(
+        heap,
+        shapes,
+        prototype,
+        builtins.symbol_to_string_tag(),
+        "SharedArrayBuffer",
+    );
     globals.insert(EcmaString::encode("SharedArrayBuffer"), constructor);
 }
 
@@ -123,12 +167,38 @@ fn install_atomics<H: Host>(
         ("waitAsync", 4, wait_async::<H>),
         ("xor", 3, xor::<H>),
     ] {
-        let function = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: name, length: length, handler: handler });
+        let function = install_function(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            crate::intrinsics::BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         define_data(heap, atoms, shapes, atomics, name, function);
     }
-    let timeout = install_function(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "", length: 1, handler: wait_async_timeout::<H> });
+    let timeout = install_function(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "",
+            length: 1,
+            handler: wait_async_timeout::<H>,
+        },
+    );
     builtins.set_wait_async_timeout(timeout);
-    define_to_string_tag(heap, shapes, atomics, builtins.symbol_to_string_tag(), "Atomics");
+    define_to_string_tag(
+        heap,
+        shapes,
+        atomics,
+        builtins.symbol_to_string_tag(),
+        "Atomics",
+    );
     globals.insert(EcmaString::encode("Atomics"), atomics);
 }
 
@@ -1511,7 +1581,14 @@ mod tests {
                 length: 0,
                 handler: shrink_buffer,
             });
-            let value_of = native_function(&mut machine.heap, &mut machine.atoms, &mut machine.shapes, id, "valueOf", 0);
+            let value_of = native_function(
+                &mut machine.heap,
+                &mut machine.atoms,
+                &mut machine.shapes,
+                id,
+                "valueOf",
+                0,
+            );
             let atomics = atomics(machine);
             let constructor = machine.intrinsics.global("ArrayBuffer").unwrap();
             let operations: [(&str, Arguments); 4] = [

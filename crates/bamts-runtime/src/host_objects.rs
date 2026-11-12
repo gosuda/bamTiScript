@@ -22,7 +22,17 @@ pub(crate) fn install<H: Host>(
         ("debug", console_debug::<H> as _),
         ("info", console_info::<H> as _),
     ] {
-        let function = register(heap, atoms, shapes, builtins, BuiltinDef { name, length: 0, handler });
+        let function = register(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            BuiltinDef {
+                name,
+                length: 0,
+                handler,
+            },
+        );
         put(heap, atoms, shapes, console, name, function);
     }
 
@@ -53,18 +63,45 @@ pub(crate) fn install<H: Host>(
     put(heap, atoms, shapes, process, "stderr", stderr);
     put(heap, atoms, shapes, process, "env", env);
     put(heap, atoms, shapes, process, "argv", argv);
-    put_text(heap, atoms, shapes, process, "platform", std::env::consts::OS);
+    put_text(
+        heap,
+        atoms,
+        shapes,
+        process,
+        "platform",
+        std::env::consts::OS,
+    );
     put_text(heap, atoms, shapes, process, "version", "v24.18.0");
     put(heap, atoms, shapes, process, "versions", versions);
     for (name, length, handler) in [
         ("exit", 1, process_exit::<H> as _),
         ("nextTick", 1, process_next_tick::<H> as _),
     ] {
-        let function = register(heap, atoms, shapes, builtins, BuiltinDef { name, length, handler });
+        let function = register(
+            heap,
+            atoms,
+            shapes,
+            builtins,
+            BuiltinDef {
+                name,
+                length,
+                handler,
+            },
+        );
         put(heap, atoms, shapes, process, name, function);
     }
 
-    let print_fn = register(heap, atoms, shapes, builtins, BuiltinDef { name: "print", length: 1, handler: print_fn::<H> as _ });
+    let print_fn = register(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        BuiltinDef {
+            name: "print",
+            length: 1,
+            handler: print_fn::<H> as _,
+        },
+    );
     globals.insert(EcmaString::encode("print"), print_fn);
     globals.insert(EcmaString::encode("console"), console);
     globals.insert(EcmaString::encode("process"), process);
@@ -130,7 +167,17 @@ fn stream<H: Host>(
     handler: crate::intrinsics::BuiltinHandler<H>,
 ) -> Value {
     let stream = object(heap, builtins.object_prototype());
-    let write = register(heap, atoms, shapes, builtins, BuiltinDef { name: "write", length: 1, handler });
+    let write = register(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        BuiltinDef {
+            name: "write",
+            length: 1,
+            handler,
+        },
+    );
     put(heap, atoms, shapes, stream, "write", write);
     put_text(heap, atoms, shapes, stream, "_name", name);
     stream

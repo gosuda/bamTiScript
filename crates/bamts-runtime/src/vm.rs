@@ -40,20 +40,38 @@ pub(crate) fn install<H: Host>(
             extensible: true,
         },
     );
-    let script = register_constructor(heap, atoms, shapes, builtins, crate::intrinsics::BuiltinDef { name: "Script", length: 1, handler: script_constructor::<H> });
+    let script = register_constructor(
+        heap,
+        atoms,
+        shapes,
+        builtins,
+        crate::intrinsics::BuiltinDef {
+            name: "Script",
+            length: 1,
+            handler: script_constructor::<H>,
+        },
+    );
     let run_in_this_context = register_constructor(
         heap,
         atoms,
         shapes,
         builtins,
-        crate::intrinsics::BuiltinDef { name: "runInThisContext", length: 2, handler: run_in_this_context::<H> },
+        crate::intrinsics::BuiltinDef {
+            name: "runInThisContext",
+            length: 2,
+            handler: run_in_this_context::<H>,
+        },
     );
     let run_in_new_context = register_constructor(
         heap,
         atoms,
         shapes,
         builtins,
-        crate::intrinsics::BuiltinDef { name: "runInNewContext", length: 3, handler: run_in_new_context::<H> },
+        crate::intrinsics::BuiltinDef {
+            name: "runInNewContext",
+            length: 3,
+            handler: run_in_new_context::<H>,
+        },
     );
     let run_prototype = intrinsics::push(
         heap,
@@ -102,11 +120,22 @@ pub(crate) fn install<H: Host>(
         atoms,
         shapes,
         builtins,
-        crate::intrinsics::BuiltinDef { name: "runInThisContext", length: 1, handler: script_run_in_this_context::<H> },
+        crate::intrinsics::BuiltinDef {
+            name: "runInThisContext",
+            length: 1,
+            handler: script_run_in_this_context::<H>,
+        },
     );
 
     builtins.set_constructor_prototype(heap, atoms, shapes, script, script_prototype);
-    crate::intrinsics::builtins::define_data(heap, atoms, shapes, script_prototype, "constructor", script);
+    crate::intrinsics::builtins::define_data(
+        heap,
+        atoms,
+        shapes,
+        script_prototype,
+        "constructor",
+        script,
+    );
     crate::intrinsics::builtins::define_data(
         heap,
         atoms,
