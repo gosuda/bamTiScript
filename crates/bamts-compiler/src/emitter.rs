@@ -8932,14 +8932,14 @@ var c = () => 1;
             above.diagnostics()
         );
     }
-    #[test]
-    fn left_deep_binary_chain_emits_without_overflow() {
+    fn emit_left_deep_chain(
+        first: impl FnOnce(&mut Builder) -> Expr,
+        link: impl Fn(&mut Builder, Expr, usize) -> Expr,
+    ) -> String {
         let mut builder = Builder::new();
-        let mut chain = builder.number("0");
+        let mut chain = first(&mut builder);
         for index in 1..20000 {
-            let right = builder.number(&index.to_string());
-            let left = chain;
-            chain = binary(BinaryOperator::Add, left, right);
+            chain = link(&mut builder, chain, index);
         }
         let file = builder.finish(vec![expr_stmt(chain)]);
         let empty_recovered = crate::parser::parse(crate::scanner::scan(
@@ -8959,10 +8959,39 @@ var c = () => 1;
             },
             &EmitFileNames::default(),
         );
-        let code = &javascript(&output).code;
+        javascript(&output).code.clone()
+    }
+
+    #[test]
+    fn left_deep_binary_chain_emits_without_overflow() {
+        let code = emit_left_deep_chain(
+            |builder| builder.number("0"),
+            |builder, left, index| {
+                let right = builder.number(&index.to_string());
+                binary(BinaryOperator::Add, left, right)
+            },
+        );
         assert!(code.starts_with("0 + 1 + 2"), "{code}");
         assert!(code.trim_end().ends_with("19999;"), "{code}");
         assert_eq!(code.matches(" + ").count(), 19999, "{code}");
+    }
+
+    #[test]
+    fn left_deep_logical_chain_of_reads_emits_without_overflow() {
+        let code = emit_left_deep_chain(
+            |builder| builder.ident_expr("x0"),
+            |builder, left, index| {
+                let right = builder.ident_expr(&format!("x{index}"));
+                expr(Expression::Logical(LogicalExpression {
+                    operator: LogicalOperator::Or,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }))
+            },
+        );
+        assert!(code.starts_with("x0 || x1 || x2"), "{code}");
+        assert!(code.trim_end().ends_with("x19999;"), "{code}");
+        assert_eq!(code.matches(" || ").count(), 19999, "{code}");
     }
 
     #[test]
