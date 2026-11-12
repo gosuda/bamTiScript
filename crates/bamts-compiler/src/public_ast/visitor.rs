@@ -626,6 +626,9 @@ where
     for decorator in &function.decorators {
         visit_node(NodeRef::Decorator(decorator), visitor)?;
     }
+    if let Some(name) = &function.name {
+        visit_node(NodeRef::Identifier(name), visitor)?;
+    }
     visit_type_parameters(function.type_parameters.as_ref(), visitor)?;
     for parameter in &function.parameters {
         visit_node(NodeRef::Parameter(parameter), visitor)?;
@@ -690,8 +693,10 @@ fn visit_member_property<'ast, V>(
 where
     V: Visitor<'ast>,
 {
-    if let MemberProperty::Computed(expression) = property {
-        visit_node(NodeRef::Expression(expression), visitor)?;
+    match property {
+        MemberProperty::Named(name) => visit_node(NodeRef::Identifier(name), visitor)?,
+        MemberProperty::Computed(expression) => visit_node(NodeRef::Expression(expression), visitor)?,
+        MemberProperty::Private(_) => {}
     }
     ControlFlow::Continue(())
 }
