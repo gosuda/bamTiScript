@@ -201,9 +201,9 @@ pub(in crate::intrinsics::builtins) fn duration_to_locale_string<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let format = create_duration_format(machine, locales, options)?;
     let parts = duration_parts(machine, &format, duration)?;
-    let mut text = String::new();
+    let mut text = Vec::new();
     for part in &parts {
-        text.push_str(&part.value);
+        text.extend_from_slice(part.value.as_units());
     }
-    super::super::allocate_string(machine, EcmaString::encode(&text)).map(BuiltinOutcome::Value)
+    super::super::allocate_string(machine, EcmaString::from_units(&text)).map(BuiltinOutcome::Value)
 }

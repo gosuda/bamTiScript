@@ -1,5 +1,7 @@
 //! ECMA-402 `Intl.DurationFormat` mechanics.
 
+use bamts_bytecode::EcmaString;
+
 use super::locale_data::IntlData;
 use super::number_data::NoHostLocale;
 use super::number_format::{
@@ -122,7 +124,7 @@ pub fn settled_unit_style(unit: usize, style: UnitStyle, previous: Option<UnitSt
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurationPart {
     pub part_type: &'static str,
-    pub value: String,
+    pub value: EcmaString,
     pub unit: Option<&'static str>,
 }
 
@@ -257,14 +259,14 @@ impl DurationFormat {
                     self.unit_parts(&number, value, exact.as_deref(), negative && !hide_sign)?;
                 let tagged = parts.into_iter().map(|part| DurationPart {
                     part_type: part.part_type.as_str(),
-                    value: part.value,
+                    value: EcmaString::encode(&part.value),
                     unit: Some(singular),
                 });
                 if need_separator {
                     let list = groups.last_mut().expect("a separator follows a group");
                     list.push(DurationPart {
                         part_type: "literal",
-                        value: String::from(":"),
+                        value: EcmaString::encode(":"),
                         unit: None,
                     });
                     list.extend(tagged);
@@ -319,9 +321,9 @@ impl DurationFormat {
             &NoHostLocale,
         )
         .map_err(DurationFormatError::List)?;
-        let strings: Vec<String> = groups
+        let strings: Vec<EcmaString> = groups
             .iter()
-            .map(|parts| parts.iter().map(|part| part.value.as_str()).collect())
+            .map(|parts| EcmaString::from_units(&parts.iter().flat_map(|part| part.value.as_units().iter().copied()).collect::<Vec<u16>>()))
             .collect();
         let formatted = list
             .format_to_parts(&strings)

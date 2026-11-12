@@ -10,6 +10,8 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
+use bamts_bytecode::EcmaString;
+
 use super::locale_negotiation::{
     HostLocaleHook, LanguageTag, LocaleDataProvider, LocaleError, LocaleMatcher,
     canonicalize_unicode_locale_id, default_locale, resolve_locale,
@@ -1992,8 +1994,8 @@ pub enum ListPartKind {
 pub struct ListPart {
     /// Part kind.
     pub kind: ListPartKind,
-    /// Rendered value.
-    pub value: String,
+    /// Rendered value, with its exact UTF-16 code units.
+    pub value: EcmaString,
     /// Start index in UTF-16 code units.
     pub index: usize,
 }
@@ -2001,7 +2003,7 @@ pub struct ListPart {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RawListPart {
     kind: ListPartKind,
-    value: String,
+    value: EcmaString,
 }
 
 /// ECMA-402 ListFormat service core.
@@ -2049,25 +2051,26 @@ impl<'a> ListFormat<'a> {
     ///
     /// # Errors
     /// Returns a data error for missing or malformed locale patterns.
-    pub fn format(&self, elements: &[String]) -> Result<String, IntlError> {
-        Ok(self
-            .format_to_parts(elements)?
-            .into_iter()
-            .map(|part| part.value)
-            .collect())
+    pub fn format(&self, elements: &[EcmaString]) -> Result<EcmaString, IntlError> {
+        let parts = self.format_to_parts(elements)?;
+        let mut text = Vec::with_capacity(parts.iter().map(|part| part.value.len_units()).sum());
+        for part in &parts {
+            text.extend_from_slice(part.value.as_units());
+        }
+        Ok(EcmaString::from_units(&text))
     }
 
     /// Partitions a list and records UTF-16 start indices.
     ///
     /// # Errors
     /// Returns a data error for missing or malformed locale patterns.
-    pub fn format_to_parts(&self, elements: &[String]) -> Result<Vec<ListPart>, IntlError> {
+    pub fn format_to_parts(&self, elements: &[EcmaString]) -> Result<Vec<ListPart>, IntlError> {
         let mut raw = self.partition(elements)?;
         let mut index = 0;
         let mut parts = Vec::with_capacity(raw.len());
         for part in raw.drain(..) {
             let start = index;
-            index += utf16_len(&part.value);
+            index += part.value.len_units();
             parts.push(ListPart {
                 kind: part.kind,
                 value: part.value,
@@ -2087,8 +2090,8 @@ impl<'a> ListFormat<'a> {
         }
     }
 
-    fn partition(&self, elements: &[String]) -> Result<Vec<RawListPart>, IntlError> {
-        let element = |value: &String| {
+    fn partition(&self, elements: &[EcmaString]) -> Result<Vec<RawListPart>, IntlError> {
+        let element = |value: &EcmaString| {
             vec![RawListPart {
                 kind: ListPartKind::Element,
                 value: value.clone(),
@@ -2161,7 +2164,7 @@ fn apply_two_placeholder_pattern(
         match piece {
             PatternPiece::Literal(value) if !value.is_empty() => result.push(RawListPart {
                 kind: ListPartKind::Literal,
-                value,
+                value: EcmaString::encode(&value),
             }),
             PatternPiece::Literal(_) => {}
             PatternPiece::Left => result.extend(left.take().expect("validated unique left slot")),
