@@ -38,6 +38,7 @@ use bamts_bytecode::{
     MAX_INSTRUCTIONS, MAX_REGISTERS, Module, NumberBits, Pc, RESUME_RETURN, RESUME_THROW, Register,
     UnaryOp, Verified, VerifyError,
 };
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
@@ -10955,11 +10956,49 @@ impl<'a> FreeVarScanner<'a> {
         self.pop();
     }
     fn scan_expression(&mut self, expression: &Expr) {
+        let mut spine: SmallVec<[&Expr; 8]> = SmallVec::new();
+        let mut current = expression;
+        while let Some(left) = self.scan_expression_head(current) {
+            spine.push(current);
+            current = left;
+        }
+        for node in spine.into_iter().rev() {
+            self.scan_expression_tail(node);
+        }
+    }
+    fn scan_expression_tail(&mut self, expression: &Expr) {
+        match expression.data() {
+            Expression::Call(call) => self.scan_call_arguments(&call.arguments),
+            Expression::Member(member) => {
+                if let MemberProperty::Computed(expression) = &member.property {
+                    self.scan_expression(expression);
+                }
+                if let MemberProperty::Private(private) = &member.property
+                    && let Some(name) = private_name(self.file, private)
+                {
+                    self.use_name(&name);
+                }
+            }
+            Expression::Binary(binary) => self.scan_expression(&binary.right),
+            Expression::Logical(logical) => self.scan_expression(&logical.right),
+            _ => {}
+        }
+    }
+    fn scan_call_arguments(&mut self, arguments: &[CallArgument]) {
+        for argument in arguments {
+            match argument {
+                CallArgument::Expression(expression) => self.scan_expression(expression),
+                CallArgument::Spread(spread) => self.scan_expression(&spread.argument),
+                CallArgument::Missing(_) => {}
+            }
+        }
+    }
+    fn scan_expression_head<'e>(&mut self, expression: &'e Expr) -> Option<&'e Expr> {
         if self
             .inlined_enums
             .is_some_and(|facts| facts.const_use(expression.id()).is_some())
         {
-            return;
+            return None;
         }
         if let Some(replacement) = self
             .jsx_plan
@@ -10967,7 +11006,7 @@ impl<'a> FreeVarScanner<'a> {
             .cloned()
         {
             self.scan_expression(&replacement);
-            return;
+            return None;
         }
         match expression.data() {
             Expression::JsxElement(element) if self.scans_jsx => {
@@ -11064,36 +11103,13 @@ impl<'a> FreeVarScanner<'a> {
                     self.calls_super = true;
                     self.arrow_calls_super |= self.function_depth > 0;
                 }
-                self.scan_expression(&call.callee);
-                for argument in &call.arguments {
-                    match argument {
-                        CallArgument::Expression(expression) => self.scan_expression(expression),
-                        CallArgument::Spread(spread) => self.scan_expression(&spread.argument),
-                        CallArgument::Missing(_) => {}
-                    }
-                }
+                return Some(&call.callee);
             }
             Expression::New(new) => {
                 self.scan_expression(&new.callee);
-                for argument in &new.arguments {
-                    match argument {
-                        CallArgument::Expression(expression) => self.scan_expression(expression),
-                        CallArgument::Spread(spread) => self.scan_expression(&spread.argument),
-                        CallArgument::Missing(_) => {}
-                    }
-                }
+                self.scan_call_arguments(&new.arguments);
             }
-            Expression::Member(member) => {
-                self.scan_expression(&member.object);
-                if let MemberProperty::Computed(expression) = &member.property {
-                    self.scan_expression(expression);
-                }
-                if let MemberProperty::Private(private) = &member.property
-                    && let Some(name) = private_name(self.file, private)
-                {
-                    self.use_name(&name);
-                }
-            }
+            Expression::Member(member) => return Some(&member.object),
             Expression::Await(await_expression) => self.scan_expression(&await_expression.argument),
             Expression::Yield(yield_expression) => {
                 if let Some(argument) = &yield_expression.argument {
@@ -11102,14 +11118,8 @@ impl<'a> FreeVarScanner<'a> {
             }
             Expression::Unary(unary) => self.scan_expression(&unary.argument),
             Expression::Update(update) => self.scan_assignment_target(&update.argument),
-            Expression::Binary(binary) => {
-                self.scan_expression(&binary.left);
-                self.scan_expression(&binary.right);
-            }
-            Expression::Logical(logical) => {
-                self.scan_expression(&logical.left);
-                self.scan_expression(&logical.right);
-            }
+            Expression::Binary(binary) => return Some(&binary.left),
+            Expression::Logical(logical) => return Some(&logical.left),
             Expression::Conditional(conditional) => {
                 self.scan_expression(&conditional.test);
                 self.scan_expression(&conditional.consequent);
@@ -11139,6 +11149,7 @@ impl<'a> FreeVarScanner<'a> {
             }
             Expression::Missing(_) => {}
         }
+        None
     }
     fn scan_assignment_target(&mut self, target: &AssignmentTargetNode) {
         match target.data() {
@@ -11648,7 +11659,7 @@ mod tests {
     use super::{
         BigIntTextError, CaptureKey, ConstEnumOperation, ContainerKind, IteratorCloseMode,
         LowerError, LowerErrorKind, LowerOptions, UnsupportedConstruct, canonical_bigint_text,
-        lower, lower_checked,
+        lower, lower_checked, value_read_names,
     };
     use crate::checker::{ProgramCheckInput, ResolvedModuleEdge, check, check_program};
     use crate::literal::cook_escapes;
@@ -17170,6 +17181,55 @@ mod tests {
                 Instruction::CreateObject { .. }
             )),
             "identifier namespaces must keep runtime lowering"
+        );
+    }
+
+    fn read_names(source: String) -> BTreeSet<String> {
+        let parsed = parse(scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(source).expect("test source fits the per-file budget")),
+        ));
+        value_read_names(parsed.product(), None)
+    }
+
+    fn left_deep_chain(head: &str, links: &[&str]) -> String {
+        let mut source = head.to_owned();
+        for index in 0..20_000 {
+            source.push_str(links[index % links.len()]);
+        }
+        source.push_str(";\n");
+        source
+    }
+
+    fn names(expected: &[&str]) -> BTreeSet<String> {
+        expected.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn value_reads_of_a_left_deep_member_chain_do_not_overflow() {
+        assert_eq!(read_names(left_deep_chain("x", &[".p"])), names(&["x"]));
+    }
+
+    #[test]
+    fn value_reads_of_a_left_deep_call_chain_do_not_overflow() {
+        assert_eq!(read_names(left_deep_chain("f", &["(a)"])), names(&["a", "f"]));
+    }
+
+    #[test]
+    fn value_reads_of_a_left_deep_mixed_chain_do_not_overflow() {
+        assert_eq!(
+            read_names(left_deep_chain("x", &[".p", "(a)", "[k]", ".q(b, ...c)"])),
+            names(&["a", "b", "c", "k", "x"])
+        );
+    }
+
+    #[test]
+    fn value_reads_of_a_shallow_mixed_spine_are_exact() {
+        let source = "class C extends B {\n  #p = 1;\n  constructor() {\n    super(a)[k].#p + d.e(f, ...g) || h;\n  }\n}\n";
+        assert_eq!(
+            read_names(source.to_owned()),
+            names(&["#p", "B", "a", "d", "f", "g", "h", "k"])
         );
     }
 }

@@ -12,6 +12,7 @@ description = "TypeScript/JavaScript compiler frontend for BamTS"
 bamts-bytecode.workspace = true
 bamts-cancel.workspace = true
 sha2 = "=0.10.9"
+smallvec.workspace = true
 unicode-id-start = "=1.1.2"
 
 [lints]

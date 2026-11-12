@@ -121,6 +121,7 @@ dependencies = [
  "bamts-bytecode",
  "bamts-cancel",
  "sha2",
+ "smallvec",
  "unicode-id-start",
 ]
 
