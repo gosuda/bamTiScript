@@ -6,6 +6,6 @@
     "node": ">=18"
   },
   "devDependencies": {
-    "@informalsystems/quint": "0.32.0"
+    "@informalsystems/quint": "0.33.1"
   }
 }
