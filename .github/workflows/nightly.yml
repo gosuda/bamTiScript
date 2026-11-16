@@ -385,7 +385,7 @@ jobs:
           package-manager-cache: false
 
       - name: Install Quint
-        run: npm ci --prefix formal/quint
+        uses: ./.github/actions/setup-quint
 
       - name: Assert Node version
         run: test "$(node --version)" = "v24.18.0"
