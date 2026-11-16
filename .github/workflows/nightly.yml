@@ -52,6 +52,9 @@ jobs:
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
           rustup default "$TOOLCHAIN"
 
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
+
       # Build one profile once; shards also reuse the snapshot tool.
       - name: Build canonical compiler receipt tools
         run: |
@@ -241,6 +244,8 @@ jobs:
           TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rust-src
           rustup default "$TOOLCHAIN"
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
       - name: Sync snapshot
         run: cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
       - name: Write strict AArch64 receipt
@@ -289,6 +294,8 @@ jobs:
           TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rust-src
           rustup default "$TOOLCHAIN"
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: nightly-test262-${{ matrix.backend }}-aarch64-${{ github.run_id }}-${{ github.run_attempt }}
@@ -349,6 +356,8 @@ jobs:
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
           rustup default "$TOOLCHAIN"
 
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
 
       - name: Corpus differential
         run: |
@@ -403,6 +412,9 @@ jobs:
           TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
           rustup default "$TOOLCHAIN"
+
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
 
       # The workspace/formal guards resolve the graph for every target and so
       # need crates the host build never downloads. `cargo fetch` without

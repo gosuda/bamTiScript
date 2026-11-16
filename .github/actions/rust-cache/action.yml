@@ -1,0 +1,17 @@
+name: Cache Rust dependencies
+description: Cache Cargo dependencies without authority snapshots or receipt artifacts.
+
+runs:
+  using: composite
+  steps:
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        # Cleanup removes workspace crates, but leaves empty authority directories.
+        # Cache only Cargo profiles so source fetch always sees a fresh destination.
+        cache-targets: false
+        cache-directories: |
+          target/debug
+          target/release
+        cache-bin: false
+        cache-on-failure: true
+        save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}

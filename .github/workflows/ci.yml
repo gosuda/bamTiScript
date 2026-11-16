@@ -42,6 +42,8 @@ jobs:
           rustup toolchain install $toolchain --profile minimal --component clippy
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default $toolchain
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
       - name: Test Windows cache ownership and publication
         run: cargo test --locked -p bamts-native --features cache-guard
       # Every other job runs on Linux, where the Win32 backend, the Microsoft
@@ -82,6 +84,9 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all --check
+
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
 
       - name: Check workspace
         run: cargo check --workspace --locked
@@ -152,6 +157,9 @@ jobs:
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
           rustup default "$TOOLCHAIN"
 
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
+
       # Build one profile once; shards also reuse the snapshot tool.
       - name: Build canonical compiler receipt tools
         run: |
@@ -211,6 +219,9 @@ jobs:
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
           rustup default "$TOOLCHAIN"
 
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
+
       - name: Corpus differential
         run: |
           cargo test -p bamts-verification --test corpus_differential --locked -- --nocapture
@@ -263,6 +274,9 @@ jobs:
           TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
           rustup default "$TOOLCHAIN"
+
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
 
       # The workspace/formal guards resolve the graph for every target and so
       # need crates the host build never downloads. `cargo fetch` without
