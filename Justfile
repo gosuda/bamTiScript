@@ -122,20 +122,24 @@ family-show family catalog="typescript-7.0.2" runner="compiler" receipt="":
     receipt="${receipt:-target/evidence-local/merged/{{catalog}}-{{runner}}-{{host_triple}}.jsonl}"
     cargo run --locked -q -p bamts-verification --bin bamts-verification -- suite families "$receipt" --family "{{family}}" --root "$root"
 
-# Rebuilds the lane workers, reruns one family plus a sample of the passing rows, and
-# fails if a sampled row no longer passes. A fix must convert a row and regress none.
-# The sample catches a broad regression between sweeps; only a sweep proves none.
-recount family catalog="typescript-7.0.2" runner="compiler" receipt="":
+recount $family $catalog="typescript-7.0.2" $runner="compiler" $receipt="" $directory="":
     #!/usr/bin/env bash
     set -euo pipefail
-    receipt="{{receipt}}"
-    receipt="${receipt:-target/evidence-local/merged/{{catalog}}-{{runner}}-{{host_triple}}.jsonl}"
+    if [[ -n "$family" && -z "$directory" ]]; then
+        selector=(--family "$family")
+    elif [[ -z "$family" && -n "$directory" ]]; then
+        selector=(--directory "$directory")
+    else
+        printf '%s\n' 'recount requires either a family or a directory' >&2
+        exit 2
+    fi
+    receipt="${receipt:-target/evidence-local/merged/${catalog}-${runner}-{{host_triple}}.jsonl}"
     cargo build --locked --release -p bamts-verification --bin ts_lane_worker --bin runtime_lane_worker
     export BAMTS_SUITE_COMPILER_ADAPTER=target/release/ts_lane_worker
     export BAMTS_SUITE_INTERPRETER_ADAPTER=target/release/runtime_lane_worker
     export BAMTS_SUITE_JIT_ADAPTER=target/release/runtime_lane_worker
     export BAMTS_SUITE_AOT_ADAPTER=target/release/runtime_lane_worker
-    cargo run --locked -q -p bamts-verification --bin bamts-verification -- suite recount --catalog {{catalog}} --runner {{runner}} --baseline "$receipt" --family "{{family}}" --fail-on-regression
+    cargo run --locked -q -p bamts-verification --bin bamts-verification -- suite recount --catalog "$catalog" --runner "$runner" --baseline "$receipt" "${selector[@]}" --fail-on-regression
 
 # Rewrites target/evidence-local/status.md from every receipt in a directory (the merged
 # ones `sweep` writes) and shows what changed since the previous report.

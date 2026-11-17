@@ -9,6 +9,9 @@ version has shipped, and no tag or stable package exists while any gate in
 
 ### Changed
 
+- Directory recount reruns every baseline PASS row under the selected case
+  directory, without a sample limit. Family recount keeps its passing guard
+  sample. Use the fifth `just recount` argument with an empty family.
 - Symbol comparison reports empty expected or actual names and source-line
   versus symbol-row mismatches separately. Ordinary name mismatches keep
   their existing family.

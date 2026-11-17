@@ -27,8 +27,8 @@ use bamts_verification::{
     shard::ShardSpec,
     source_fetch::{CommandBackend, materialize_named},
     suite::completion::{
-        SuiteMergeRequest, SuiteRecountRequest, SuiteRunRequest, merge_suite, recount_suite,
-        run_suite,
+        SuiteMergeRequest, SuiteRecountRequest, SuiteRecountSelector, SuiteRunRequest, merge_suite,
+        normalize_recount_directory, recount_suite, run_suite,
     },
     sweep_report::{
         DiffRequest, FamiliesRequest, StatusRequest, diff as diff_receipts, families,
@@ -146,8 +146,20 @@ fn dispatch(root: &Path, command: Command) -> Result<()> {
             fail_on_regression,
         } => {
             let recount = recount_suite(root, &request)?;
-            let (report, regressions) =
-                render_recount(&request.family, &recount.before, &recount.after, limit);
+            let (report, regressions) = match &request.selector {
+                SuiteRecountSelector::Family { family, .. } => render_recount(
+                    format_args!("family `{family}`"),
+                    &recount.before,
+                    &recount.after,
+                    limit,
+                ),
+                SuiteRecountSelector::Directory { directory } => render_recount(
+                    format_args!("directory `{directory}`"),
+                    &recount.before,
+                    &recount.after,
+                    limit,
+                ),
+            };
             print_report(&report)?;
             fail_on_regressions(fail_on_regression, regressions)
         }
@@ -299,18 +311,56 @@ fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result
                     "--runner",
                     "--baseline",
                     "--family",
+                    "--directory",
                     "--limit",
                     "--guard",
                 ],
                 &["--fail-on-regression"],
             )?;
-            let guard = count_flag(&flags.values, "--guard", 500)?;
             let fail_on_regression = flags.switches.contains("--fail-on-regression");
-            if fail_on_regression && guard == 0 {
-                return Err(usage(
-                    "`--fail-on-regression` needs passing rows to watch, so `--guard` cannot be 0",
-                ));
-            }
+            let selector = match (
+                flags.values.get("--family"),
+                flags.values.get("--directory"),
+            ) {
+                (Some(family), None) => {
+                    let guard = count_flag(&flags.values, "--guard", 500)?;
+                    if fail_on_regression && guard == 0 {
+                        return Err(usage(
+                            "`--fail-on-regression` needs passing rows to watch, so `--guard` cannot be 0",
+                        ));
+                    }
+                    SuiteRecountSelector::Family {
+                        family: family.clone(),
+                        guard,
+                    }
+                }
+                (None, Some(directory)) => {
+                    if flags.values.contains_key("--guard") {
+                        return Err(usage(
+                            "suite recount `--guard` applies to `--family`, not `--directory`; \
+                             a directory reruns every passing row",
+                        ));
+                    }
+                    if flags.values.contains_key("--limit") {
+                        return Err(usage(
+                            "suite recount `--limit` applies to `--family`, not `--directory`",
+                        ));
+                    }
+                    SuiteRecountSelector::Directory {
+                        directory: normalize_recount_directory(directory)?,
+                    }
+                }
+                (None, None) => {
+                    return Err(usage(
+                        "suite recount requires exactly one of `--family` or `--directory`",
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(usage(
+                        "suite recount accepts `--family` or `--directory`, not both",
+                    ));
+                }
+            };
             Ok(Command::SuiteRecount {
                 request: SuiteRecountRequest {
                     catalog: required_flag(&flags.values, "--catalog", "suite recount")?,
@@ -320,8 +370,7 @@ fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result
                         "--baseline",
                         "suite recount",
                     )?),
-                    family: required_flag(&flags.values, "--family", "suite recount")?,
-                    guard,
+                    selector,
                 },
                 limit: count_flag(&flags.values, "--limit", 20)?,
                 fail_on_regression,
@@ -1369,8 +1418,13 @@ mod tests {
         assert_eq!(request.catalog, "typescript-7.0.2");
         assert_eq!(request.runner, "compiler");
         assert_eq!(request.baseline, PathBuf::from("merged.jsonl"));
-        assert_eq!(request.family, "types/mismatch");
-        assert_eq!(request.guard, 500);
+        assert_eq!(
+            request.selector,
+            SuiteRecountSelector::Family {
+                family: "types/mismatch".to_owned(),
+                guard: 500,
+            }
+        );
         assert_eq!(limit, 4);
         assert!(fail_on_regression);
 
@@ -1406,9 +1460,82 @@ mod tests {
             "--baseline",
             "m.jsonl",
         ])
-        .expect_err("a family is required");
+        .expect_err("a selector is required");
         assert_eq!(missing.code(), ErrorCode::Usage);
         assert!(missing.to_string().contains("--family"));
+        assert!(missing.to_string().contains("--directory"));
+    }
+
+    #[test]
+    fn parses_suite_recount_directory_and_rejects_bad_selectors() {
+        let argv = |extra: &[&'static str]| {
+            let mut owned = vec![
+                "bamts-verification",
+                "suite",
+                "recount",
+                "--catalog",
+                "typescript-7.0.2",
+                "--runner",
+                "compiler",
+                "--baseline",
+                "merged.jsonl",
+                "--directory",
+                "compiler/tests/cases/compiler",
+            ];
+            owned.extend(extra.iter().copied());
+            owned
+        };
+        let Command::SuiteRecount { request, .. } = parse(&argv(&[])).expect("directory recount")
+        else {
+            panic!("suite recount variant")
+        };
+        assert_eq!(
+            request.selector,
+            SuiteRecountSelector::Directory {
+                directory: "compiler/tests/cases/compiler".to_owned(),
+            }
+        );
+
+        let mut trailing = argv(&[]);
+        *trailing.last_mut().expect("directory argument") = "compiler/tests/cases/compiler/";
+        let Command::SuiteRecount { request, .. } =
+            parse(&trailing).expect("one trailing slash is canonical")
+        else {
+            panic!("suite recount variant")
+        };
+        assert_eq!(
+            request.selector,
+            SuiteRecountSelector::Directory {
+                directory: "compiler/tests/cases/compiler".to_owned(),
+            }
+        );
+
+        for extra in [
+            vec!["--family", "types/mismatch"],
+            vec!["--guard", "5"],
+            vec!["--guard", "0"],
+            vec!["--limit", "5"],
+        ] {
+            let rejected = parse(&argv(&extra)).expect_err("bad selector combination");
+            assert_eq!(rejected.code(), ErrorCode::Usage, "{extra:?}");
+        }
+        for directory in ["", "../escape", "/absolute", "a//b", "a/./b", ".", "a\\b"] {
+            let rejected = parse(&[
+                "bamts-verification",
+                "suite",
+                "recount",
+                "--catalog",
+                "typescript-7.0.2",
+                "--runner",
+                "compiler",
+                "--baseline",
+                "merged.jsonl",
+                "--directory",
+                directory,
+            ])
+            .expect_err("non-canonical directory");
+            assert_eq!(rejected.code(), ErrorCode::Usage, "{directory:?}");
+        }
     }
 
     #[test]
