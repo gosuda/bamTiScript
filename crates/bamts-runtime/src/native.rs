@@ -631,14 +631,15 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         module.get() as usize >= self.machine.borrow().dynamic_base
     }
 
-    /// Builds the root set for the current native activation. The registers are
-    /// driver-stack locals, so they must be copied into the Machine before GC.
-    fn native_root_snapshot(&self, registers: &[Value]) -> Vec<Value> {
+    /// Appends the root set of the current native activation to `roots`. The
+    /// registers are driver-stack locals, so they must be copied into the Machine
+    /// before GC.
+    fn extend_with_native_roots(&self, registers: &[Value], roots: &mut Vec<Value>) {
         let activations = self.activations.borrow();
         let activation = activations
             .last()
             .expect("a native root snapshot requires an active activation");
-        let mut roots = Vec::with_capacity(
+        roots.reserve(
             registers.len()
                 + activation.args.len()
                 + 2
@@ -657,21 +658,24 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 .map(|completion| completion.value()),
         );
         roots.extend(self.pending_throw.get().map(|pending| pending.value));
-        roots
     }
 
     fn push_native_roots(&self, registers: &[Value]) {
         let depth = self.activations.borrow().len() - 1;
-        let roots = self.native_root_snapshot(registers);
+        let mut roots = Vec::new();
+        self.extend_with_native_roots(registers, &mut roots);
         self.machine.borrow_mut().push_native_roots(depth, &roots);
     }
 
+    /// Rebuilds the activation's roots inside the vector the Machine already
+    /// holds, so a helper call allocates nothing for them.
     fn refresh_native_roots(&self, frame: &NativeFrame<'_>) {
         let depth = self.activations.borrow().len() - 1;
-        let roots = self.native_root_snapshot(frame.registers());
         self.machine
             .borrow_mut()
-            .refresh_native_roots(depth, &roots);
+            .refresh_native_roots_with(depth, |roots| {
+                self.extend_with_native_roots(frame.registers(), roots);
+            });
     }
 
     fn pop_native_roots(&self) {

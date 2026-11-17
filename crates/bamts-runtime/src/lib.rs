@@ -657,6 +657,9 @@ impl AtomTable {
     fn find(&self, text: &str) -> Option<Atom> {
         self.map.get(&EcmaString::encode(text)).copied()
     }
+    fn find_text(&self, text: &EcmaString) -> Option<Atom> {
+        self.map.get(text).copied()
+    }
     fn resolve(&self, atom: Atom) -> &EcmaString {
         &self.strings[atom.index()]
     }
@@ -7452,14 +7455,13 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             return Ok(Some(value));
         }
-        let name = self.constant_text(module, name).to_owned();
-        let atom = self.intern(name.clone());
+        let atom = self.global_name_atom(module, name);
         let key = PropertyKey::Named(atom);
         let global = self.context_global.unwrap_or(self.global_object);
         if self.internal_has_property(global, &key)? {
             return self.get_property_key(global, &key).map(Some);
         }
-        self.missing_global = Some(name);
+        self.missing_global = Some(self.resolve_atom(atom).clone());
         Ok(None)
     }
 
@@ -7485,12 +7487,13 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             return Ok(());
         }
-        let name = self.constant_text(module, name).to_owned();
-        let key = PropertyKey::Named(self.intern(name.clone()));
+        let atom = self.global_name_atom(module, name);
+        let key = PropertyKey::Named(atom);
         let global = self.context_global.unwrap_or(self.global_object);
         if self.internal_has_property(global, &key)? {
             return Ok(());
         }
+        let name = self.resolve_atom(atom).clone();
         let mut message = EcmaStringBuilder::new();
         for &unit in name.as_units() {
             message.push_unit(unit);
@@ -7501,6 +7504,16 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn intern(&mut self, text: EcmaString) -> Atom {
         self.atoms.intern(text)
+    }
+    /// The atom of a global-name constant. Program load interned every such
+    /// name, so this is one lookup by reference; the text is copied only for a
+    /// name load did not see.
+    fn global_name_atom(&mut self, module: ModuleId, name: ConstantId) -> Atom {
+        if let Some(atom) = self.atoms.find_text(self.constant_text(module, name)) {
+            return atom;
+        }
+        let text = self.constant_text(module, name).to_owned();
+        self.intern(text)
     }
     fn intern_str(&mut self, text: &str) -> Atom {
         self.atoms.intern_str(text)
@@ -7707,9 +7720,8 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             self.registry.cells[cell.0].value = value;
         } else {
-            let name = self.constant_text(module, name).to_owned();
             let global = self.context_global.unwrap_or(self.global_object);
-            let atom = self.intern(name);
+            let atom = self.global_name_atom(module, name);
             let key = PropertyKey::Named(atom);
             let stored = self.internal_set(global, key.clone(), value, global)?;
             // This instruction also carries global declarations, whose failure
@@ -14455,21 +14467,20 @@ impl<'a, H: Host> Machine<'a, H> {
         self.push_native_roots(depth, &[iterator]);
         let result: Result<Vec<Value>, EvalFailure> = (|| {
             let mut values = Vec::new();
-            let mut roots = Vec::with_capacity(1);
             loop {
-                roots.clear();
-                roots.push(iterator);
-                roots.extend_from_slice(&values);
-                self.refresh_native_roots(depth, &roots);
+                self.refresh_native_roots_with(depth, |roots| {
+                    roots.push(iterator);
+                    roots.extend_from_slice(&values);
+                });
                 let (done, value) = self.iterator_next(iterator)?;
                 if done {
                     return Ok(values);
                 }
                 values.push(value);
-                roots.clear();
-                roots.push(iterator);
-                roots.extend_from_slice(&values);
-                self.refresh_native_roots(depth, &roots);
+                self.refresh_native_roots_with(depth, |roots| {
+                    roots.push(iterator);
+                    roots.extend_from_slice(&values);
+                });
                 let bytes = values
                     .len()
                     .checked_mul(std::mem::size_of::<Value>())

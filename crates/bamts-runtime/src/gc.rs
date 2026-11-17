@@ -142,6 +142,16 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn refresh_native_roots(&mut self, depth: usize, roots: &[Value]) {
+        self.refresh_native_roots_with(depth, |frame| frame.extend_from_slice(roots));
+    }
+
+    /// Empties the roots of the activation at `depth` and lets `fill` rebuild
+    /// them in the same vector.
+    pub(crate) fn refresh_native_roots_with(
+        &mut self,
+        depth: usize,
+        fill: impl FnOnce(&mut Vec<Value>),
+    ) {
         assert_eq!(
             depth + 1,
             self.native_roots.len(),
@@ -152,7 +162,7 @@ impl<'a, H: Host> Machine<'a, H> {
             .last_mut()
             .expect("a matching native root frame exists");
         frame.clear();
-        frame.extend_from_slice(roots);
+        fill(frame);
     }
 
     pub(crate) fn pop_native_roots(&mut self, depth: usize) {
