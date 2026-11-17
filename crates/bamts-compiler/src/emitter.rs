@@ -1963,7 +1963,8 @@ impl<'a> Emitter<'a> {
             // `{\n}` for statement blocks, ParameterList6 for function bodies;
             // an empty block authored on one line prints `{ }`, its space
             // synthesized and unmapped.
-            if self.node_spans_authored_lines(block) && self.source.spans_multiple_lines(block.range())
+            if self.node_spans_authored_lines(block)
+                && self.source.spans_multiple_lines(block.range())
             {
                 self.newline();
             } else {
