@@ -105,8 +105,9 @@ test("native-loader.js exists", () => {
   assert.ok(existsSync(join(npmRoot, "bamti", "native-loader.js")));
 });
 
-const CLI = process.env.BAMTS_CLI ?? join(process.env.HOME, ".cache", "bamts-main-target", "release", "bamts");
-test("prebuilt CLI --version succeeds", () => {
+const targetDir = process.env.CARGO_TARGET_DIR ?? join(npmRoot, "..", "target");
+const CLI = process.env.BAMTS_CLI ?? join(targetDir, "debug", process.platform === "win32" ? "bamts.exe" : "bamts");
+test("the built CLI --version succeeds", () => {
   const r = spawnSync(CLI, ["--version"], { encoding: "utf8", timeout: 10000 });
   assert.equal(r.status, 0, `exit ${r.status}, stderr=${r.stderr}`);
   assert.ok(r.stdout.trim().length > 0, `stdout empty`);
