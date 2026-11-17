@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
     process,
@@ -32,7 +33,7 @@ use bamts_verification::{
     },
     sweep_report::{
         DiffRequest, FamiliesRequest, StatusRequest, diff as diff_receipts, families,
-        render_recount, status_report,
+        render_blocked_rows, render_recount, status_report,
     },
     unicode,
     workspace_guard::audit_workspace,
@@ -93,6 +94,7 @@ enum Command {
         request: SuiteRecountRequest,
         limit: usize,
         fail_on_regression: bool,
+        blocked_rows: Option<PathBuf>,
     },
 }
 
@@ -144,6 +146,7 @@ fn dispatch(root: &Path, command: Command) -> Result<()> {
             request,
             limit,
             fail_on_regression,
+            blocked_rows,
         } => {
             let recount = recount_suite(root, &request)?;
             let (report, regressions) = match &request.selector {
@@ -160,6 +163,11 @@ fn dispatch(root: &Path, command: Command) -> Result<()> {
                     limit,
                 ),
             };
+            if let Some(path) = &blocked_rows {
+                fs::write(path, render_blocked_rows(&recount.after)).map_err(|error| {
+                    VerificationError::new(ErrorCode::Io, format!("{}: {error}", path.display()))
+                })?;
+            }
             print_report(&report)?;
             fail_on_regressions(fail_on_regression, regressions)
         }
@@ -314,6 +322,7 @@ fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result
                     "--directory",
                     "--limit",
                     "--guard",
+                    "--blocked-rows",
                 ],
                 &["--fail-on-regression"],
             )?;
@@ -369,6 +378,7 @@ fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result
                 },
                 limit: count_flag(&flags.values, "--limit", 20)?,
                 fail_on_regression,
+                blocked_rows: flags.values.get("--blocked-rows").map(PathBuf::from),
             })
         }
         _ if subcommand.starts_with("--") => Err(usage(format!("unknown flag `{subcommand}`"))),
@@ -1390,6 +1400,7 @@ mod tests {
             request,
             limit,
             fail_on_regression,
+            blocked_rows,
         } = parse(&[
             "bamts-verification",
             "suite",
@@ -1405,6 +1416,8 @@ mod tests {
             "--limit",
             "4",
             "--fail-on-regression",
+            "--blocked-rows",
+            "blocked.tsv",
         ])
         .expect("recount")
         else {
@@ -1422,6 +1435,7 @@ mod tests {
         );
         assert_eq!(limit, 4);
         assert!(fail_on_regression);
+        assert_eq!(blocked_rows, Some(PathBuf::from("blocked.tsv")));
 
         let unguarded = parse(&[
             "bamts-verification",
