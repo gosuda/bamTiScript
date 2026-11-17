@@ -13400,6 +13400,22 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
     }
 
     #[test]
+    fn an_empty_enum_body_prints_across_two_lines() {
+        let output = emit_with_options(
+            "enum E {\n}\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("(function (E) {\n})(E || (E = {}));"),
+            "{code}"
+        );
+    }
+
+    #[test]
     fn commonjs_local_specifier_exports_assign_each_name() {
         // Same `exports.NAME = LOCAL;` identifier-assignment form as the
         // identifier default export in es6ImportDefaultBindingWithExport

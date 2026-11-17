@@ -799,6 +799,11 @@ impl Rewriter<'_> {
                 initializer: None,
             },
         );
+        let body = if body.is_empty() {
+            vec![self.syn_node(range, Statement::Empty)]
+        } else {
+            body
+        };
         let body = self.syn_node(range, Block { statements: body });
         let function = self.syn_node(
             range,
