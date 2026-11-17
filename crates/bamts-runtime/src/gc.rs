@@ -130,6 +130,10 @@ impl<'a, H: Host> Machine<'a, H> {
 /// large limit would let garbage fill gigabytes before anything collects it.
 const FIRST_COLLECTION_BYTES: usize = 32 << 20;
 const FIRST_COLLECTION_SLOTS: usize = 1 << 19;
+/// The allocation a collection waits for at least, so a program with a small live
+/// set does not collect every few allocations and pay for the roots each time.
+pub(super) const MIN_NURSERY_BYTES: usize = 1 << 20;
+pub(super) const MIN_NURSERY_SLOTS: usize = 1 << 13;
 
 impl GcState {
     pub(super) fn new(limits: &Limits) -> Self {
@@ -168,11 +172,11 @@ impl GcState {
     fn recompute_watermarks<H: Host>(&mut self, machine: &Machine<'_, H>) {
         self.byte_watermark = machine
             .heap_bytes
-            .saturating_mul(2)
+            .saturating_add(machine.heap_bytes.max(MIN_NURSERY_BYTES))
             .min(machine.limits.max_heap_bytes);
-        self.slot_watermark = machine
-            .live_runtime_slots()
-            .saturating_mul(2)
+        let live_slots = machine.live_runtime_slots();
+        self.slot_watermark = live_slots
+            .saturating_add(live_slots.max(MIN_NURSERY_SLOTS))
             .min(machine.limits.max_heap_slots);
     }
 
@@ -208,11 +212,13 @@ impl GcState {
         let intrinsics = self.marks.len().min(machine.intrinsic_slots);
         self.marks[..intrinsics].fill(false);
         let heap_len = machine.heap.len();
+        if heap_len < self.marks.len() {
+            self.survivors.retain(|&index| index < heap_len);
+            self.free_slots.retain(|&index| index < heap_len);
+            self.young_reused.retain(|&index| index < heap_len);
+            self.swept_len = self.swept_len.min(heap_len);
+        }
         self.marks.resize(heap_len, false);
-        self.survivors.retain(|&index| index < heap_len);
-        self.free_slots.retain(|&index| index < heap_len);
-        self.young_reused.retain(|&index| index < heap_len);
-        self.swept_len = self.swept_len.min(heap_len);
     }
 
     fn trace_roots<H: Host>(&mut self, machine: &Machine<'_, H>) {
