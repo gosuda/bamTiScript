@@ -6456,12 +6456,19 @@ let x = b1;
             .map(|javascript| javascript.code.clone())
             .expect("json module carries compiler emit");
         assert!(
-            !compiler_body.is_empty(),
-            "the harness must have compiler output to carry: {emitted}"
+            compiler_body.is_empty(),
+            "requireOfJsonFileWithNoContent.js emits an empty JSON body: {compiler_body:?}"
         );
-        assert!(
-            emitted.contains(&format!("//// [b.json]\n{compiler_body}")),
-            "the json output section carries the compiler's emit for that unit, not the raw unit text (requireOfJsonFileWithNoContent.js prints an empty out/b.json body; the compiler has no json output mapping, crates/bamts-compiler/src/project/output.rs:417, and emits its own prelude instead): {emitted}"
+        let (_, json_output) = emitted
+            .rsplit_once("//// [b.json]\n")
+            .expect("the imported JSON has an output section after its input echo");
+        let (json_body, _) = json_output
+            .split_once("//// [file1.js]\n")
+            .expect("the JavaScript output follows the JSON output");
+        assert_eq!(
+            json_body.trim_end_matches('\n'),
+            compiler_body,
+            "the JSON output section carries the compiler's empty emit without a prelude: {emitted}"
         );
     }
     #[test]
