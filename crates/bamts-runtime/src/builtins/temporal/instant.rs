@@ -1,5 +1,6 @@
 //! `Temporal.Instant`.
 
+use crate::heap::Heap;
 use bamts_native::Value;
 
 use super::super::bigint::to_bigint;
@@ -28,10 +29,10 @@ use crate::temporal::zoned_date_time::{
     CalendarId, TimeZoneId, ZonedDateTime, iso_date_time_for_instant,
 };
 use crate::temporal::{TemporalKind, TemporalObject};
-use crate::{EvalFailure, HeapEntry, Host, Machine};
+use crate::{EvalFailure, Host, Machine};
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,

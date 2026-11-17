@@ -24,6 +24,7 @@ pub(super) use integration::{
     duration_to_locale_string, number_to_locale_string, temporal_to_locale_string,
 };
 
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
@@ -76,7 +77,7 @@ struct Class<'a, H: Host> {
 }
 
 fn install_class<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -149,7 +150,7 @@ fn install_class<H: Host>(
 }
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -613,7 +614,7 @@ pub(super) fn is_type_sequence(value: &str) -> bool {
 
 /// Sets a symbol-keyed method, as a data property like any other.
 fn define_symbol_method(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     shapes: &mut crate::ShapeTable,
     object: Value,
     symbol: Value,
@@ -635,7 +636,7 @@ fn define_symbol_method(
     );
 }
 
-fn set_prototype(heap: &mut [HeapEntry], object: Value, parent: Value) {
+fn set_prototype(heap: &mut Heap, object: Value, parent: Value) {
     let HeapEntry::Object { prototype, .. } = &mut heap[super::heap_index(object)] else {
         panic!("prototype target is an ordinary object");
     };
@@ -643,7 +644,7 @@ fn set_prototype(heap: &mut [HeapEntry], object: Value, parent: Value) {
 }
 
 fn define_tag(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     shapes: &mut crate::ShapeTable,
     object: Value,
     symbol: Value,

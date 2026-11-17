@@ -1,5 +1,6 @@
 //! `Intl.DateTimeFormat`.
 
+use crate::heap::Heap;
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
@@ -28,12 +29,12 @@ use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::temporal::TemporalObject;
 use crate::temporal::instant_duration::epoch_days_from_ymd;
 use crate::temporal::plain_types::{PlainDate, PlainTime};
-use crate::{EvalFailure, HeapEntry, Host, Machine};
+use crate::{EvalFailure, Host, Machine};
 
 const FORMAT: &str = "Intl.DateTimeFormat format";
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,

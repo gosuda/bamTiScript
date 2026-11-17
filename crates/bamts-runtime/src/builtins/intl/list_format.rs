@@ -1,5 +1,6 @@
 //! `Intl.ListFormat`.
 
+use crate::heap::Heap;
 use bamts_native::Value;
 
 use super::super::{allocate_array, allocate_string};
@@ -17,10 +18,10 @@ use crate::intl::number_data::NoHostLocale;
 use crate::intl::plural_rules::{ListFormat, ListFormatOptions, ListPartKind};
 use crate::intl::{IntlKind, IntlObject};
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine};
+use crate::{EvalFailure, Host, Machine};
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,

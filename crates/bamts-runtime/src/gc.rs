@@ -1,4 +1,5 @@
 use super::*;
+use crate::heap::Heap;
 
 #[cfg(test)]
 thread_local! {
@@ -330,17 +331,17 @@ impl GcState {
         }
     }
 
-    fn mark_value(&mut self, heap: &[HeapEntry], value: Value) {
+    fn mark_value(&mut self, heap: &Heap, value: Value) {
         mark_value(heap, &mut self.marks, &mut self.work, value);
     }
 
-    fn mark_values(&mut self, heap: &[HeapEntry], values: &[Value]) {
+    fn mark_values(&mut self, heap: &Heap, values: &[Value]) {
         for value in values {
             self.mark_value(heap, *value);
         }
     }
 
-    fn drain(&mut self, heap: &[HeapEntry], shapes: &ShapeTable) {
+    fn drain(&mut self, heap: &Heap, shapes: &ShapeTable) {
         while let Some(index) = self.work.pop() {
             if matches!(
                 heap[index],
@@ -360,7 +361,7 @@ impl GcState {
         }
     }
 
-    fn ephemeron_fixed_point(&mut self, heap: &[HeapEntry], shapes: &ShapeTable) {
+    fn ephemeron_fixed_point(&mut self, heap: &Heap, shapes: &ShapeTable) {
         loop {
             let weak_count = self.weak_collections.len();
             for list_index in 0..weak_count {
@@ -578,7 +579,7 @@ impl GcState {
 }
 
 #[cfg(debug_assertions)]
-fn check_value(value: Value, heap: &[HeapEntry]) {
+fn check_value(value: Value, heap: &Heap) {
     if let Some(index) = runtime_index(value)
         && index < heap.len()
         && matches!(heap[index], HeapEntry::Vacant)
@@ -588,14 +589,14 @@ fn check_value(value: Value, heap: &[HeapEntry]) {
 }
 
 #[cfg(debug_assertions)]
-fn check_values(values: &[Value], heap: &[HeapEntry]) {
+fn check_values(values: &[Value], heap: &Heap) {
     for &value in values {
         check_value(value, heap);
     }
 }
 
 #[cfg(debug_assertions)]
-fn check_activation(activation: &SuspendedActivation, heap: &[HeapEntry]) {
+fn check_activation(activation: &SuspendedActivation, heap: &Heap) {
     check_values(&activation.registers, heap);
     check_value(activation.this_value, heap);
     check_value(activation.new_target, heap);
@@ -609,7 +610,7 @@ fn check_activation(activation: &SuspendedActivation, heap: &[HeapEntry]) {
 }
 
 #[cfg(debug_assertions)]
-fn check_generator_resume(resume: &GeneratorResume, heap: &[HeapEntry]) {
+fn check_generator_resume(resume: &GeneratorResume, heap: &Heap) {
     match resume {
         GeneratorResume::Yield { value, activation } => {
             check_value(*value, heap);
@@ -622,7 +623,7 @@ fn check_generator_resume(resume: &GeneratorResume, heap: &[HeapEntry]) {
 }
 
 #[cfg(debug_assertions)]
-fn check_microtask(job: &MicrotaskJob, heap: &[HeapEntry]) {
+fn check_microtask(job: &MicrotaskJob, heap: &Heap) {
     match job {
         MicrotaskJob::Reaction {
             reaction, value, ..
@@ -659,7 +660,7 @@ fn check_microtask(job: &MicrotaskJob, heap: &[HeapEntry]) {
 }
 
 #[cfg(debug_assertions)]
-fn check_promise_reaction(reaction: &PromiseReaction, heap: &[HeapEntry]) {
+fn check_promise_reaction(reaction: &PromiseReaction, heap: &Heap) {
     match reaction {
         PromiseReaction::Fulfilled {
             handler, derived, ..
@@ -713,7 +714,7 @@ fn check_promise_reaction(reaction: &PromiseReaction, heap: &[HeapEntry]) {
 }
 
 #[cfg(debug_assertions)]
-fn check_runtime_error(error: &RuntimeError, heap: &[HeapEntry]) {
+fn check_runtime_error(error: &RuntimeError, heap: &Heap) {
     match &error.kind {
         RuntimeErrorKind::UncaughtThrow { value, .. }
         | RuntimeErrorKind::InvalidValue { value } => check_value(*value, heap),
@@ -738,14 +739,14 @@ fn is_marked_value(marks: &[bool], value: Value) -> bool {
     runtime_index(value).is_some_and(|index| marks.get(index).copied().unwrap_or(false))
 }
 
-fn mark_value(heap: &[HeapEntry], marks: &mut [bool], work: &mut Vec<usize>, value: Value) {
+fn mark_value(heap: &Heap, marks: &mut [bool], work: &mut Vec<usize>, value: Value) {
     let Some(index) = runtime_index(value) else {
         return;
     };
     mark_index(heap, marks, work, index);
 }
 
-fn mark_index(heap: &[HeapEntry], marks: &mut [bool], work: &mut Vec<usize>, index: usize) {
+fn mark_index(heap: &Heap, marks: &mut [bool], work: &mut Vec<usize>, index: usize) {
     if index >= heap.len() || marks[index] || matches!(heap[index], HeapEntry::Vacant) {
         return;
     }
@@ -756,7 +757,7 @@ fn mark_index(heap: &[HeapEntry], marks: &mut [bool], work: &mut Vec<usize>, ind
 fn trace_property_map(
     properties: &PropertyMap,
     shapes: &ShapeTable,
-    heap: &[HeapEntry],
+    heap: &Heap,
     marks: &mut [bool],
     work: &mut Vec<usize>,
 ) {
@@ -785,7 +786,7 @@ fn trace_properties_and_prototype(
     properties: &PropertyMap,
     shapes: &ShapeTable,
     prototype: Option<Value>,
-    heap: &[HeapEntry],
+    heap: &Heap,
     marks: &mut [bool],
     work: &mut Vec<usize>,
 ) {
@@ -795,7 +796,7 @@ fn trace_properties_and_prototype(
     }
 }
 
-fn trace_values(heap: &[HeapEntry], marks: &mut [bool], work: &mut Vec<usize>, values: &[Value]) {
+fn trace_values(heap: &Heap, marks: &mut [bool], work: &mut Vec<usize>, values: &[Value]) {
     for value in values {
         mark_value(heap, marks, work, *value);
     }
@@ -803,7 +804,7 @@ fn trace_values(heap: &[HeapEntry], marks: &mut [bool], work: &mut Vec<usize>, v
 
 fn trace_activation(
     activation: &SuspendedActivation,
-    heap: &[HeapEntry],
+    heap: &Heap,
     marks: &mut [bool],
     work: &mut Vec<usize>,
 ) {
@@ -821,7 +822,7 @@ fn trace_activation(
 
 fn trace_generator_start(
     start: &GeneratorStart,
-    heap: &[HeapEntry],
+    heap: &Heap,
     marks: &mut [bool],
     work: &mut Vec<usize>,
 ) {
@@ -836,7 +837,7 @@ fn trace_generator_start(
 
 fn trace_generator_state(
     state: &GeneratorState,
-    heap: &[HeapEntry],
+    heap: &Heap,
     marks: &mut [bool],
     work: &mut Vec<usize>,
 ) {
@@ -849,7 +850,7 @@ fn trace_generator_state(
 
 fn trace_async_generator_state(
     state: &AsyncGeneratorState,
-    heap: &[HeapEntry],
+    heap: &Heap,
     marks: &mut [bool],
     work: &mut Vec<usize>,
 ) {
@@ -871,7 +872,7 @@ fn trace_async_generator_state(
 
 fn trace_generator_resume(
     resume: &GeneratorResume,
-    heap: &[HeapEntry],
+    heap: &Heap,
     marks: &mut [bool],
     work: &mut Vec<usize>,
 ) {
@@ -888,7 +889,7 @@ fn trace_generator_resume(
 
 fn trace_promise_reaction(
     reaction: &PromiseReaction,
-    heap: &[HeapEntry],
+    heap: &Heap,
     marks: &mut [bool],
     work: &mut Vec<usize>,
 ) {
@@ -946,7 +947,7 @@ fn trace_promise_reaction(
 
 fn trace_promise_state(
     state: &PromiseState,
-    heap: &[HeapEntry],
+    heap: &Heap,
     marks: &mut [bool],
     work: &mut Vec<usize>,
 ) {
@@ -964,12 +965,7 @@ fn trace_promise_state(
     }
 }
 
-fn trace_microtask(
-    job: &MicrotaskJob,
-    heap: &[HeapEntry],
-    marks: &mut [bool],
-    work: &mut Vec<usize>,
-) {
+fn trace_microtask(job: &MicrotaskJob, heap: &Heap, marks: &mut [bool], work: &mut Vec<usize>) {
     match job {
         MicrotaskJob::Reaction {
             reaction, value, ..
@@ -1005,12 +1001,7 @@ fn trace_microtask(
     }
 }
 
-fn trace_execution(
-    execution: &Execution,
-    heap: &[HeapEntry],
-    marks: &mut [bool],
-    work: &mut Vec<usize>,
-) {
+fn trace_execution(execution: &Execution, heap: &Heap, marks: &mut [bool], work: &mut Vec<usize>) {
     mark_value(heap, marks, work, execution.value);
     mark_value(heap, marks, work, execution.link);
     trace_values(heap, marks, work, &execution.entry_registers);
@@ -1018,7 +1009,7 @@ fn trace_execution(
 
 fn trace_runtime_error(
     error: &RuntimeError,
-    heap: &[HeapEntry],
+    heap: &Heap,
     marks: &mut [bool],
     work: &mut Vec<usize>,
 ) {
@@ -1057,7 +1048,7 @@ fn trace_entry(
     entry: &HeapEntry,
     index: usize,
     shapes: &ShapeTable,
-    heap: &[HeapEntry],
+    heap: &Heap,
     marks: &mut [bool],
     work: &mut Vec<usize>,
     weak_collections: &mut Vec<usize>,

@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
@@ -5,7 +6,7 @@ use bamts_native::Value;
 
 use super::{allocate_string, install_function, uri_error};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine};
+use crate::{EvalFailure, Host, Machine};
 
 const URI_RESERVED: &[u8] = b";/?:@&=+$,#";
 const URI_UNESCAPED: &[u8] = b"-_.!~*'()";
@@ -13,7 +14,7 @@ const ESCAPE_UNESCAPED: &[u8] = b"@*_+-./";
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -341,7 +342,7 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
     use crate::intrinsics::{BuiltinDef, native_function};
-    use crate::{Limits, Property, PropertyKey, ThrowOrigin};
+    use crate::{HeapEntry, Limits, Property, PropertyKey, ThrowOrigin};
 
     fn text(value: &str) -> EcmaString {
         EcmaString::encode(value)

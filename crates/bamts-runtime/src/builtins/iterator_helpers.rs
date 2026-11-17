@@ -6,6 +6,7 @@
 //! the closure per `next()`. The `status` slot carries the generator states,
 //! which is what makes a helper reject re-entry while it is running.
 
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
@@ -1420,7 +1421,7 @@ fn accessor(getter: Value, setter: Value) -> Property {
 }
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,

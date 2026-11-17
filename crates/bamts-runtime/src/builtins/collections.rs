@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
@@ -17,7 +18,7 @@ use crate::{
 use bamts_bytecode::IteratorKind;
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -30,7 +31,7 @@ pub(super) fn install<H: Host>(
 }
 
 fn install_map<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -100,7 +101,7 @@ fn install_map<H: Host>(
 }
 
 fn install_set<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -170,7 +171,7 @@ fn install_set<H: Host>(
 }
 
 fn install_weak_map<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -213,7 +214,7 @@ fn install_weak_map<H: Host>(
 }
 
 fn install_weak_set<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -255,7 +256,7 @@ fn install_weak_set<H: Host>(
 }
 
 pub(super) fn install_iterator_prototype<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -310,7 +311,7 @@ pub(super) fn install_iterator_prototype<H: Host>(
 }
 
 pub(super) fn install_async_iterator_prototype<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -338,7 +339,7 @@ pub(super) fn install_async_iterator_prototype<H: Host>(
 }
 
 pub(super) fn install_generator_prototype<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -367,7 +368,7 @@ pub(super) fn install_generator_prototype<H: Host>(
 }
 
 pub(super) fn install_async_generator_prototype<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -1607,10 +1608,10 @@ fn constructor_prototype<H: Host>(
     };
     Ok(prototype)
 }
-pub(super) fn ordinary_intrinsic(heap: &mut Vec<HeapEntry>, prototype: Value) -> Value {
+pub(super) fn ordinary_intrinsic(heap: &mut Heap, prototype: Value) -> Value {
     ordinary(heap, Some(prototype))
 }
-fn ordinary(heap: &mut Vec<HeapEntry>, prototype: Option<Value>) -> Value {
+fn ordinary(heap: &mut Heap, prototype: Option<Value>) -> Value {
     super::super::push(
         heap,
         HeapEntry::Object {
@@ -1635,7 +1636,7 @@ pub(crate) fn ordinary_runtime<H: Host>(
         .map_err(EvalFailure::Runtime)
 }
 fn define_getter(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,
@@ -1657,7 +1658,7 @@ fn define_getter(
     );
 }
 fn define_symbol(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     shapes: &mut crate::ShapeTable,
     object: Value,
     symbol: Value,
@@ -1673,7 +1674,7 @@ fn define_symbol(
     );
 }
 fn define_to_string_tag(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     shapes: &mut crate::ShapeTable,
     object: Value,
     symbol: Value,
@@ -1694,7 +1695,7 @@ fn define_to_string_tag(
     );
 }
 fn named_property(
-    heap: &[HeapEntry],
+    heap: &Heap,
     atoms: &mut crate::AtomTable,
     shapes: &crate::ShapeTable,
     object: Value,

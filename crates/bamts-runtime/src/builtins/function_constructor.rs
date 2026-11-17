@@ -9,6 +9,7 @@
 //! `TypeError` at the call instead of being absent, keeping the failure at
 //! the one place that needs dynamic compilation.
 
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
@@ -26,7 +27,7 @@ use crate::{
 };
 
 pub(crate) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -111,7 +112,7 @@ fn function_kind<H: Host>(name: &'static str, handler: BuiltinHandler<H>) -> Bui
 
 /// A read-only link between function-kind intrinsics.
 fn define_link(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,
@@ -137,7 +138,7 @@ fn define_link(
 /// prototype its closures inherit from. Neither is reachable from a global:
 /// they are found through `Object.getPrototypeOf(function* () {})`.
 fn install_function_kind<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,

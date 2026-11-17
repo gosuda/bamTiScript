@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
@@ -13,7 +14,7 @@ use crate::{
 };
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
@@ -158,7 +159,7 @@ fn length_getter<H: Host>(
 }
 
 fn define_getter(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     object: Value,
     name: &str,

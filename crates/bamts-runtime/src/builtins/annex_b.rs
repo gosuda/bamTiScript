@@ -29,6 +29,7 @@
 //! `regexp::install`; `date_full::install`, `object::install`, and
 //! `string::install` must already have installed the delegated targets.
 
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
@@ -44,7 +45,7 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, Proper
 /// Installs the Annex B surface owned by this module. Runs after the core
 /// Object, String, and RegExp installers; see the module documentation.
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -58,7 +59,7 @@ pub(super) fn install<H: Host>(
 }
 
 fn install_proto_accessor<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -111,7 +112,7 @@ enum LegacyAccessorSlot {
 /// as writable, non-enumerable, configurable data properties, matching the
 /// surrounding `Object.prototype` surface.
 fn install_object_accessor_methods<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -283,7 +284,7 @@ fn lookup_legacy_accessor<H: Host>(
 }
 
 fn install_string_annex_b<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -328,7 +329,7 @@ fn install_string_annex_b<H: Host>(
 }
 
 fn install_regexp_compile<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -393,7 +394,7 @@ fn reject_construction(constructing: bool, operation: &'static str) -> Result<()
     Ok(())
 }
 fn install_regexp_legacy_statics<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &BTreeMap<EcmaString, Value>,
@@ -575,7 +576,7 @@ fn regexp_constructor<H: Host>(machine: &Machine<'_, H>) -> Result<Value, EvalFa
         .ok_or_else(|| type_error("RegExp constructor is unavailable"))
 }
 
-fn legacy_state(heap: &[HeapEntry], shapes: &crate::ShapeTable, constructor: Value) -> Value {
+fn legacy_state(heap: &Heap, shapes: &crate::ShapeTable, constructor: Value) -> Value {
     let index = heap_index(constructor);
     let HeapEntry::NativeFunction { properties, .. } = &heap[index] else {
         panic!("RegExp constructor must be a native function");
@@ -602,7 +603,7 @@ fn legacy_state(heap: &[HeapEntry], shapes: &crate::ShapeTable, constructor: Val
 }
 
 fn legacy_state_value(
-    heap: &[HeapEntry],
+    heap: &Heap,
     atoms: &crate::AtomTable,
     shapes: &crate::ShapeTable,
     state: Value,
@@ -621,7 +622,7 @@ fn legacy_state_value(
 }
 
 fn set_legacy_state_value(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     state: Value,
@@ -652,7 +653,7 @@ fn checked_legacy_state<H: Host>(
 }
 
 fn stored_index(
-    heap: &[HeapEntry],
+    heap: &Heap,
     atoms: &crate::AtomTable,
     shapes: &crate::ShapeTable,
     state: Value,
@@ -813,7 +814,7 @@ legacy_static_getter!(legacy_capture_8_get, LegacyStatic::Capture(7));
 legacy_static_getter!(legacy_capture_9_get, LegacyStatic::Capture(8));
 
 fn store_range(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     state: Value,
@@ -907,7 +908,7 @@ pub(super) fn record_legacy_match<H: Host>(
 
 /// Returns a mutable view of the named-property map of an intrinsic that has
 /// one, mirroring the target kinds accepted by `define_data`.
-fn properties_of(heap: &mut [HeapEntry], object: Value) -> &mut PropertyMap {
+fn properties_of(heap: &mut Heap, object: Value) -> &mut PropertyMap {
     let index = heap_index(object);
     match &mut heap[index] {
         HeapEntry::Object { properties, .. }
@@ -924,7 +925,7 @@ fn properties_of(heap: &mut [HeapEntry], object: Value) -> &mut PropertyMap {
 }
 
 fn define_property(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,
@@ -939,7 +940,7 @@ fn define_property(
 }
 
 fn clone_property(
-    heap: &[HeapEntry],
+    heap: &Heap,
     atoms: &crate::AtomTable,
     shapes: &crate::ShapeTable,
     object: Value,

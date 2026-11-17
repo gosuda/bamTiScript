@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
@@ -18,7 +19,7 @@ pub(crate) mod generator_async;
 pub(crate) mod import_attributes;
 
 pub(crate) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -158,7 +159,7 @@ pub(crate) fn install<H: Host>(
 }
 
 fn register<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -172,7 +173,7 @@ fn register<H: Host>(
 /// Registers a function `new` can reach. Node's `runIn*Context` are plain
 /// functions, so unlike `Script` they work with or without it.
 fn register_constructor<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,

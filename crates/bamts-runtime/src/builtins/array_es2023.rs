@@ -4,6 +4,7 @@
 //! 23.1.3.33--35, and 23.1.3.39. `Array.fromAsync` is draft-ES2026 rather than ES2025,
 //! but the TypeScript ESNext compatibility target requires it.
 
+use crate::heap::Heap;
 use std::cmp::Ordering;
 use std::mem::size_of;
 
@@ -23,7 +24,7 @@ const MAX_ARRAY_LENGTH: usize = u32::MAX as usize;
 /// ES2023 copy-by-change family on `%Array.prototype%`, and installs
 /// `Array.fromAsync` plus its hidden continuation targets on `%Array%`.
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -574,7 +575,7 @@ const FIELD_CAP: &str = "\0cap";
 /// constructor lives in a `NativeFunction` entry, which `define_data` does
 /// not accept.
 fn define_static(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     constructor: Value,

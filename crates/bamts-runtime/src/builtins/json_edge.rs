@@ -22,6 +22,7 @@
 //!   loading: it parses module source text into the fresh JSON tree that the
 //!   default export of a JSON module namespace binds.
 
+use crate::heap::Heap;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
@@ -74,7 +75,7 @@ fn syntax_error<H: Host>(machine: &mut Machine<'_, H>, message: String) -> EvalF
 /// anchors the raw-JSON brand, applies `@@toStringTag`, and publishes the
 /// global only after the object is complete.
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,

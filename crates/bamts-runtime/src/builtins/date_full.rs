@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -476,7 +477,7 @@ fn time_clip(time: f64) -> f64 {
 }
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -670,7 +671,7 @@ fn builtin_property(value: Value) -> Property {
         configurable: true,
     }
 }
-fn native_properties(heap: &mut [HeapEntry], object: Value) -> &mut PropertyMap {
+fn native_properties(heap: &mut Heap, object: Value) -> &mut PropertyMap {
     let Some(bamts_native::Decoded::HeapRef(id)) = object.decode() else {
         panic!("native function reference")
     };

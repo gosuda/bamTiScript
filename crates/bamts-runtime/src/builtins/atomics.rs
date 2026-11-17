@@ -1,6 +1,7 @@
 //! SharedArrayBuffer over the shared data block in `arraybuffer.rs`, and the
 //! Atomics operations over TypedArray views of it.
 
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,7 +26,7 @@ use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -36,7 +37,7 @@ pub(super) fn install<H: Host>(
 }
 
 fn install_shared_array_buffer<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -144,7 +145,7 @@ fn install_shared_array_buffer<H: Host>(
 }
 
 fn install_atomics<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,

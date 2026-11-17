@@ -1,5 +1,6 @@
 //! `Temporal.Duration`.
 
+use crate::heap::Heap;
 use std::cmp::Ordering;
 
 use bamts_native::Value;
@@ -30,10 +31,10 @@ use crate::temporal::relative::{
 };
 use crate::temporal::zoned_date_time::add_zoned_date_time;
 use crate::temporal::{TemporalKind, TemporalObject};
-use crate::{EvalFailure, HeapEntry, Host, Machine};
+use crate::{EvalFailure, Host, Machine};
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,

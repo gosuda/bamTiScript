@@ -4,6 +4,7 @@
 //! ordering, and identifiers. An interval re-arms itself after each fire until
 //! its handle is cleared.
 
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
@@ -11,10 +12,10 @@ use bamts_native::Value;
 
 use super::install_function;
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine, ThrowOrigin};
+use crate::{EvalFailure, Host, Machine, ThrowOrigin};
 
 pub(crate) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,

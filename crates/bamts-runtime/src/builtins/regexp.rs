@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::rc::Rc;
@@ -21,7 +22,7 @@ use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, Proper
 const COMPILE_CACHE_ENTRIES: usize = 8;
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -369,7 +370,7 @@ fn source_getter<H: Host>(
 }
 
 pub(super) fn define_getter(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,

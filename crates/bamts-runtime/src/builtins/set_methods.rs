@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use bamts_native::{Decoded, Value};
 
 use super::collections::append_collection_entry;
@@ -6,7 +7,7 @@ use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{CollectionIndex, CollectionKind, EvalFailure, HeapEntry, Host, Machine, PropertyMap};
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
