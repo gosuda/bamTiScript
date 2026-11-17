@@ -102,6 +102,11 @@ impl<'machine, 'program, H: Host> GcStress<'machine, 'program, H> {
         self.assert_ledger();
     }
 
+    fn collect_minor(&mut self) {
+        self.machine.collect_minor_for_test();
+        self.assert_ledger();
+    }
+
     fn assert_ledger(&self) {
         assert_eq!(self.machine.slot_bytes.len(), self.machine.heap.len());
         assert_eq!(
@@ -597,4 +602,122 @@ fn churn_keeps_peak_heap_slots_bounded() {
     for value in &survivors {
         stress.assert_live(*value);
     }
+}
+
+#[test]
+fn a_minor_collection_keeps_a_young_value_stored_into_an_old_object() {
+    let program = blank_program();
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    let mut stress = GcStress::new(&mut machine);
+
+    let holder = stress.construct("Map", &[]);
+    stress.root("holder", holder);
+    stress.collect();
+    assert!(stress.machine.heap.is_old(stress.slot(holder)));
+
+    let young = stress.object();
+    stress.call_method(holder, "set", &[Value::UNDEFINED, young]);
+    stress.collect_minor();
+
+    stress.assert_live(young);
+    assert_eq!(
+        stress.call_method(holder, "get", &[Value::UNDEFINED]),
+        young
+    );
+}
+
+#[test]
+fn a_minor_collection_reclaims_an_unreachable_young_cycle() {
+    let program = blank_program();
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    let mut stress = GcStress::new(&mut machine);
+
+    let first = stress.construct("Map", &[]);
+    let second = stress.construct("Map", &[]);
+    stress.call_method(first, "set", &[Value::UNDEFINED, second]);
+    stress.call_method(second, "set", &[Value::UNDEFINED, first]);
+    stress.collect_minor();
+
+    stress.assert_dead(first);
+    stress.assert_dead(second);
+}
+
+#[test]
+fn only_a_major_collection_reclaims_old_garbage() {
+    let program = blank_program();
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    let mut stress = GcStress::new(&mut machine);
+
+    let holder = stress.object();
+    stress.root("holder", holder);
+    stress.collect();
+    stress.unroot("holder");
+    stress.collect_minor();
+    stress.assert_live(holder);
+
+    stress.collect();
+    stress.assert_dead(holder);
+}
+
+#[test]
+fn a_minor_collection_keeps_weak_targets_and_a_major_collection_clears_them() {
+    let program = blank_program();
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    let mut stress = GcStress::new(&mut machine);
+
+    let target = stress.object();
+    let weak_ref = stress.construct("WeakRef", &[target]);
+    stress.machine.clear_kept_alive_for_job();
+    stress.root("weak", weak_ref);
+    stress.collect_minor();
+    stress.assert_live(target);
+
+    stress.collect();
+    stress.assert_dead(target);
+    assert_eq!(stress.call_method(weak_ref, "deref", &[]), Value::UNDEFINED);
+}
+
+#[test]
+fn every_eighth_scheduled_collection_is_major() {
+    let program = blank_program();
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    let mut stress = GcStress::new(&mut machine);
+
+    let holder = stress.object();
+    stress.root("holder", holder);
+    stress.collect();
+    stress.unroot("holder");
+    for _ in 0..7 {
+        stress.machine.collect_scheduled();
+        stress.assert_live(holder);
+    }
+    stress.machine.collect_scheduled();
+    stress.assert_dead(holder);
+}
+
+#[test]
+fn a_minor_collection_that_frees_little_makes_the_next_collection_major() {
+    let program = blank_program();
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    let mut stress = GcStress::new(&mut machine);
+
+    let old_garbage = stress.object();
+    stress.root("old_garbage", old_garbage);
+    stress.collect();
+    stress.unroot("old_garbage");
+    for name in ["a", "b", "c", "d"] {
+        let kept = stress.object();
+        stress.root(name, kept);
+    }
+    stress.machine.collect_scheduled();
+    stress.assert_live(old_garbage);
+
+    stress.machine.collect_scheduled();
+    stress.assert_dead(old_garbage);
 }

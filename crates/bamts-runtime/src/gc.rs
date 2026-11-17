@@ -26,12 +26,24 @@ impl Drop for StressSuspended {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CollectionScope {
+    /// Traces the young slots and the remembered old slots only.
+    Minor,
+    /// Traces everything and is the only scope that processes weak references.
+    Major,
+}
+
+/// Every eighth collection is major, so old garbage is reclaimed in bounded time.
+const COLLECTIONS_PER_MAJOR: u32 = 8;
+
 #[derive(Default)]
 pub(super) struct GcState {
     marks: Vec<bool>,
-    /// Runtime slots the last collection found live, plus every slot
-    /// refilled since. A collection only walks this set and the unswept
-    /// tail, so it never pays for every allocation the program ever made.
+    /// Runtime slots the last major collection found live, plus every young
+    /// slot a minor collection has kept since. A major collection walks this
+    /// set and the unswept tail, so it never pays for every allocation the
+    /// program ever made.
     pub(super) survivors: Vec<usize>,
     /// Heap indices the last sweep vacated; allocation hands them out again
     /// before it grows the heap.
@@ -50,23 +62,50 @@ pub(super) struct GcState {
     /// Every allocation requests a collection, which runs at the next safe
     /// point: the only places a collection is sound in production too.
     every_allocation: bool,
+    /// The collection in progress is minor.
+    minor: bool,
+    minors_since_major: u32,
+    /// The last minor collection freed under a quarter of the young slots it
+    /// examined, so the next collection is major.
+    last_minor_was_ineffective: bool,
     #[cfg(test)]
     schedule_pinned: bool,
     byte_watermark: usize,
     slot_watermark: usize,
 }
 
+struct SweepReport {
+    examined: usize,
+    freed: usize,
+}
+
 impl<'a, H: Host> Machine<'a, H> {
+    /// An explicit collection request is always major.
+    #[cfg(test)]
     pub(crate) fn collect_garbage(&mut self) {
-        let mut gc = std::mem::take(&mut self.gc);
-        gc.collect(self);
-        self.gc = gc;
+        self.collect_scope(CollectionScope::Major);
     }
 
     pub(crate) fn collect_if_pending(&mut self) {
         if self.gc.pending {
-            self.collect_garbage();
+            self.collect_scheduled();
         }
+    }
+
+    pub(crate) fn collect_scheduled(&mut self) {
+        let scope = self.gc.next_scope(self);
+        self.collect_scope(scope);
+    }
+
+    fn collect_scope(&mut self, scope: CollectionScope) {
+        let mut gc = std::mem::take(&mut self.gc);
+        gc.collect(self, scope);
+        self.gc = gc;
+    }
+
+    #[cfg(test)]
+    pub(super) fn collect_minor_for_test(&mut self) {
+        self.collect_scope(CollectionScope::Minor);
     }
 
     pub(crate) fn gc_pending(&self) -> bool {
@@ -151,6 +190,22 @@ impl GcState {
             || live_slots >= self.slot_watermark;
     }
 
+    /// A collection is major when asked to be, every eighth time, after a minor
+    /// collection that freed little, and once the heap nears its limits, where
+    /// old garbage must not be left to a later pass.
+    fn next_scope<H: Host>(&self, machine: &Machine<'_, H>) -> CollectionScope {
+        let under_pressure = machine.heap_bytes >= machine.limits.max_heap_bytes / 2
+            || machine.live_runtime_slots() >= machine.limits.max_heap_slots / 2;
+        if under_pressure
+            || self.last_minor_was_ineffective
+            || self.minors_since_major + 1 >= COLLECTIONS_PER_MAJOR
+        {
+            CollectionScope::Major
+        } else {
+            CollectionScope::Minor
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn stress_from_environment(&mut self) {
         if !self.schedule_pinned
@@ -180,19 +235,33 @@ impl GcState {
             .min(machine.limits.max_heap_slots);
     }
 
-    fn collect<H: Host>(&mut self, machine: &mut Machine<'_, H>) {
+    fn collect<H: Host>(&mut self, machine: &mut Machine<'_, H>, scope: CollectionScope) {
+        let minor = scope == CollectionScope::Minor;
+        self.minor = minor;
         self.reset_marks(machine);
         self.work.clear();
         self.weak_collections.clear();
         self.weak_holders.clear();
 
+        let remembered = machine.heap.take_remembered();
+        machine.heap.set_young_only_trace(minor);
         self.trace_roots(machine);
+        if minor {
+            self.trace_remembered(&machine.heap, &remembered);
+        }
         self.drain(&machine.heap, &machine.shapes);
-        self.ephemeron_fixed_point(&machine.heap, &machine.shapes);
-        self.weak_holders.sort_unstable();
-        machine.process_weak_targets_after_marking(&self.marks, &self.weak_holders);
-        self.purge_weak_entries(machine);
-        self.sweep(machine);
+        if !minor {
+            self.ephemeron_fixed_point(&machine.heap, &machine.shapes);
+            self.weak_holders.sort_unstable();
+            machine.process_weak_targets_after_marking(&self.marks, &self.weak_holders);
+            self.purge_weak_entries(machine);
+        }
+        machine.heap.set_young_only_trace(false);
+        let report = self.sweep(machine, scope);
+        if !minor {
+            machine.heap.forget_remembered();
+        }
+        self.record_collection(scope, &report);
         self.pending = false;
         self.recompute_watermarks(machine);
 
@@ -203,14 +272,32 @@ impl GcState {
         );
     }
 
-    /// Clears the last collection's marks, which are all on intrinsics or
-    /// survivors, and accounts for a rolled-back clone shortening the heap.
-    fn reset_marks<H: Host>(&mut self, machine: &Machine<'_, H>) {
-        for &index in &self.survivors {
-            self.marks[index] = false;
+    fn record_collection(&mut self, scope: CollectionScope, report: &SweepReport) {
+        match scope {
+            CollectionScope::Major => {
+                self.minors_since_major = 0;
+                self.last_minor_was_ineffective = false;
+            }
+            CollectionScope::Minor => {
+                self.minors_since_major += 1;
+                self.last_minor_was_ineffective = report.freed * 4 < report.examined;
+            }
         }
-        let intrinsics = self.marks.len().min(machine.intrinsic_slots);
-        self.marks[..intrinsics].fill(false);
+    }
+
+    /// Old slots written since the last collection may now hold young
+    /// references, so a minor collection traces them as roots.
+    fn trace_remembered(&mut self, heap: &Heap, remembered: &[usize]) {
+        for &index in remembered {
+            if index < heap.len() && !matches!(heap[index], HeapEntry::Vacant) {
+                self.work.push(index);
+            }
+        }
+    }
+
+    /// The marks are clear when a collection starts: each sweep clears the ones
+    /// it set. A rolled-back clone may have shortened the heap since.
+    fn reset_marks<H: Host>(&mut self, machine: &Machine<'_, H>) {
         let heap_len = machine.heap.len();
         if heap_len < self.marks.len() {
             self.survivors.retain(|&index| index < heap_len);
@@ -222,8 +309,10 @@ impl GcState {
     }
 
     fn trace_roots<H: Host>(&mut self, machine: &Machine<'_, H>) {
-        for index in 0..machine.intrinsic_slots {
-            mark_index(&machine.heap, &mut self.marks, &mut self.work, index);
+        if !self.minor {
+            for index in 0..machine.intrinsic_slots {
+                mark_index(&machine.heap, &mut self.marks, &mut self.work, index);
+            }
         }
 
         for frame in &machine.frames {
@@ -349,14 +438,17 @@ impl GcState {
 
     fn drain(&mut self, heap: &Heap, shapes: &ShapeTable) {
         while let Some(index) = self.work.pop() {
-            if matches!(
-                heap[index],
-                HeapEntry::WeakRef { .. } | HeapEntry::FinalizationRegistry { .. }
-            ) {
+            let entry = &heap[index];
+            if !self.minor
+                && matches!(
+                    entry,
+                    HeapEntry::WeakRef { .. } | HeapEntry::FinalizationRegistry { .. }
+                )
+            {
                 self.weak_holders.push(index);
             }
             trace_entry(
-                &heap[index],
+                entry,
                 index,
                 shapes,
                 heap,
@@ -364,6 +456,9 @@ impl GcState {
                 &mut self.work,
                 &mut self.weak_collections,
             );
+            if self.minor {
+                mark_weak_edges(entry, heap, &mut self.marks, &mut self.work);
+            }
         }
     }
 
@@ -446,38 +541,88 @@ impl GcState {
         }
     }
 
-    /// Reclaims every unmarked slot in `survivors` plus every slot in the
-    /// unswept tail `swept_len..heap.len()`; a slot refilled since the last
-    /// sweep sits in `young_reused` and joins the sweep through `survivors`,
-    /// which `allocate` extends when it reuses a free slot. A vacated slot
-    /// joins `free_slots`, so the next `allocate` hands it out again.
+    /// Reclaims every unmarked young slot: those refilled since the last sweep
+    /// (`young_reused`) and the unswept tail `swept_len..heap.len()`. A major
+    /// collection also visits `survivors`, the old slots. Every slot kept
+    /// becomes old, and every slot vacated joins `free_slots`, so the next
+    /// `allocate` hands it out again.
     ///
     /// Precondition: after marking, no root, frame register, shadow frame,
     /// weak table entry or finalization cell references a swept (Vacant)
     /// runtime slot. `trace_roots` walks the same root set the debug
-    /// assertion at the end of this method re-walks.
-    fn sweep<H: Host>(&mut self, machine: &mut Machine<'_, H>) {
-        self.survivors.append(&mut self.young_reused);
-        let tail = self.swept_len.max(machine.intrinsic_slots)..machine.heap.len();
-        let mut retained = Vec::with_capacity(self.survivors.len() + tail.len());
-        for index in self.survivors.drain(..).chain(tail) {
+    /// assertion at the end of this method re-walks. After a minor
+    /// collection, a debug build also checks that a full mark reaches no
+    /// slot the sweep vacated.
+    fn sweep<H: Host>(
+        &mut self,
+        machine: &mut Machine<'_, H>,
+        scope: CollectionScope,
+    ) -> SweepReport {
+        let mut candidates = match scope {
+            CollectionScope::Major => std::mem::take(&mut self.survivors),
+            CollectionScope::Minor => Vec::new(),
+        };
+        candidates.append(&mut self.young_reused);
+        candidates.extend(self.swept_len.max(machine.intrinsic_slots)..machine.heap.len());
+        #[cfg(debug_assertions)]
+        let full_marks = (scope == CollectionScope::Minor).then(|| self.full_marks(machine));
+        let mut retained = Vec::with_capacity(candidates.len());
+        let mut freed = 0;
+        for &index in &candidates {
             if self.marks[index] && !matches!(machine.heap[index], HeapEntry::Vacant) {
+                machine.heap.mark_old(index);
                 retained.push(index);
                 continue;
             }
+            #[cfg(debug_assertions)]
+            if let Some(full) = &full_marks {
+                debug_assert!(
+                    !full[index],
+                    "a minor collection swept slot {index}, which a full mark reaches"
+                );
+            }
             if !matches!(machine.heap[index], HeapEntry::Vacant) {
-                machine.heap[index] = HeapEntry::Vacant;
+                machine.heap.vacate(index);
                 let charge = std::mem::take(&mut machine.slot_bytes[index]);
                 machine.heap_bytes -= charge;
                 machine.vacant_count += 1;
+                freed += 1;
             }
             self.free_slots.push(index);
         }
-        self.survivors = retained;
+        for &index in &retained {
+            self.marks[index] = false;
+        }
+        match scope {
+            CollectionScope::Major => {
+                let intrinsics = machine.intrinsic_slots.min(self.marks.len());
+                self.marks[..intrinsics].fill(false);
+                self.survivors = retained;
+            }
+            CollectionScope::Minor => self.survivors.extend(retained),
+        }
         self.swept_len = machine.heap.len();
         machine.has_instance_symbol = None;
         self.assert_no_rooted_vacant(machine);
+        SweepReport {
+            examined: candidates.len(),
+            freed,
+        }
     }
+
+    /// What a full mark from the same roots reaches, computed before the sweep.
+    #[cfg(debug_assertions)]
+    fn full_marks<H: Host>(&self, machine: &Machine<'_, H>) -> Vec<bool> {
+        let mut full = GcState {
+            marks: vec![false; machine.heap.len()],
+            ..GcState::default()
+        };
+        full.trace_roots(machine);
+        full.drain(&machine.heap, &machine.shapes);
+        full.ephemeron_fixed_point(&machine.heap, &machine.shapes);
+        full.marks
+    }
+
     /// The sweep precondition: after marking, nothing the root walk visits
     /// names a slot that is now `Vacant`. The check re-derives every rooted
     /// `Value` the same way `trace_roots` did, then asserts each decoded
@@ -753,11 +898,42 @@ fn mark_value(heap: &Heap, marks: &mut [bool], work: &mut Vec<usize>, value: Val
 }
 
 fn mark_index(heap: &Heap, marks: &mut [bool], work: &mut Vec<usize>, index: usize) {
-    if index >= heap.len() || marks[index] || matches!(heap[index], HeapEntry::Vacant) {
+    if index >= heap.len()
+        || marks[index]
+        || matches!(heap[index], HeapEntry::Vacant)
+        || heap.skips_marking(index)
+    {
         return;
     }
     marks[index] = true;
     work.push(index);
+}
+
+/// A minor collection cannot tell which weak targets are dead, so it keeps
+/// every one it reaches; a major collection decides.
+fn mark_weak_edges(entry: &HeapEntry, heap: &Heap, marks: &mut [bool], work: &mut Vec<usize>) {
+    match entry {
+        HeapEntry::WeakRef {
+            target: Some(target),
+            ..
+        } => mark_value(heap, marks, work, *target),
+        HeapEntry::FinalizationRegistry { cells, .. } => {
+            for cell in cells {
+                mark_value(heap, marks, work, cell.target);
+            }
+        }
+        HeapEntry::Collection {
+            kind: CollectionKind::WeakMap | CollectionKind::WeakSet,
+            entries,
+            ..
+        } => {
+            for entry in entries.iter().filter(|entry| entry.live) {
+                mark_value(heap, marks, work, entry.key);
+                mark_value(heap, marks, work, entry.value);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn trace_property_map(

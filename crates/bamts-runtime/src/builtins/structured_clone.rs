@@ -188,7 +188,7 @@ impl HeapCheckpoint {
             if index >= self.heap_len {
                 continue;
             }
-            machine.heap[index] = HeapEntry::Vacant;
+            machine.heap.vacate(index);
             machine.slot_bytes[index] = 0;
             machine.gc.free_slots.push(index);
         }

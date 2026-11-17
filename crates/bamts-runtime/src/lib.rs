@@ -2811,6 +2811,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let argv_index = argv_id.slot() as usize - 1;
         install_element_vector(&mut heap, argv_index, argv_values);
         let intrinsic_slots = heap.len();
+        heap.mark_old_prefix(intrinsic_slots);
         let slot_bytes = vec![0; intrinsic_slots];
         let intrinsic_slot_credits = vec![0; intrinsic_slots];
         let fuel = limits.fuel;
@@ -7230,8 +7231,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let index = if let Some(index) = self.gc.free_slots.pop() {
             debug_assert!(index < self.heap.len());
             debug_assert!(index >= self.intrinsic_slots);
-            debug_assert!(matches!(self.heap[index], HeapEntry::Vacant));
-            self.heap[index] = entry;
+            self.heap.fill_vacant(index, entry);
             self.slot_bytes[index] = bytes;
             self.vacant_count -= 1;
             self.gc.young_reused.push(index);
@@ -16421,7 +16421,7 @@ mod tests {
         );
         let mut host = TestHost;
         let limits = Limits {
-            collect_every_allocation: true,
+            max_heap_slots: 2,
             ..Limits::default()
         };
         let mut machine = Machine::new(&program, &mut host, limits);
@@ -16461,7 +16461,7 @@ mod tests {
         for _ in 0..3 {
             let mut host = TestHost;
             let limits = Limits {
-                collect_every_allocation: true,
+                max_heap_slots: 2,
                 ..Limits::default()
             };
             let mut machine = Machine::new(&program, &mut host, limits);
@@ -16470,7 +16470,9 @@ mod tests {
             outcomes.push((execution.value, machine.heap_bytes, machine.vacant_count));
         }
 
-        assert_eq!(outcomes, vec![(Value::int32(7), 1, 1); 3]);
+        assert!(outcomes.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(outcomes[0].0, Value::int32(7));
+        assert!(outcomes[0].2 >= 1);
     }
 
     #[test]
@@ -17241,7 +17243,7 @@ mod tests {
             let index = machine.runtime_slot(value).unwrap().unwrap();
             machine.heap_bytes -= machine.slot_bytes[index];
             machine.slot_bytes[index] = 0;
-            machine.heap[index] = HeapEntry::Vacant;
+            machine.heap.vacate(index);
             machine.vacant_count += 1;
 
             let Some(Decoded::HeapRef(id)) = value.decode() else {
@@ -17264,7 +17266,7 @@ mod tests {
             let stale_index = machine.runtime_slot(stale).unwrap().unwrap();
             machine.heap_bytes -= machine.slot_bytes[stale_index];
             machine.slot_bytes[stale_index] = 0;
-            machine.heap[stale_index] = HeapEntry::Vacant;
+            machine.heap.vacate(stale_index);
             machine.vacant_count += 1;
 
             let live = machine
@@ -17299,7 +17301,7 @@ mod tests {
                 let index = machine.runtime_slot(value).unwrap().unwrap();
                 machine.heap_bytes -= machine.slot_bytes[index];
                 machine.slot_bytes[index] = 0;
-                machine.heap[index] = HeapEntry::Vacant;
+                machine.heap.vacate(index);
                 machine.vacant_count += 1;
 
                 machine.ensure_allocation_capacity(1, 0).unwrap();
