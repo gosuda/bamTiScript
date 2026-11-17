@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::{Constant, EcmaString, EcmaStringBuilder};
@@ -29,7 +30,7 @@ const ERROR_TYPES: [(&str, u32); 9] = [
 /// Replaces the baseline error constructors while retaining their realm-owned
 /// prototypes. Main must call this after the baseline error installation.
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -176,7 +177,7 @@ pub(super) fn install<H: Host>(
 }
 
 fn prototype_of(
-    heap: &[HeapEntry],
+    heap: &Heap,
     atoms: &mut crate::AtomTable,
     shapes: &crate::ShapeTable,
     globals: &BTreeMap<EcmaString, Value>,
@@ -190,7 +191,7 @@ fn prototype_of(
 }
 
 fn own_data(
-    heap: &[HeapEntry],
+    heap: &Heap,
     atoms: &mut crate::AtomTable,
     shapes: &crate::ShapeTable,
     object: Value,
@@ -212,7 +213,7 @@ fn own_data(
 }
 
 fn define_static(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     constructor: Value,
@@ -230,7 +231,7 @@ fn define_static(
 }
 
 fn define_hidden(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,

@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 #[cfg(test)]
 use bamts_bytecode::EcmaString;
 use bamts_bytecode::IteratorKind;
@@ -5,7 +6,7 @@ use bamts_native::{Decoded, Value};
 
 use super::{define_data, define_frozen_data, install_function, type_error, value_number};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine};
+use crate::{EvalFailure, Host, Machine};
 
 /// Installs the ES2025 `Math` surface that the baseline installer either omits or
 /// implements without user-observable coercion.
@@ -16,7 +17,7 @@ use crate::{EvalFailure, HeapEntry, Host, Machine};
 ///
 /// https://tc39.es/ecma262/2025/multipage/numbers-and-dates.html#sec-math-object
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,

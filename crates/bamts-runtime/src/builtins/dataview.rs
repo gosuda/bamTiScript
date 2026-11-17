@@ -1,5 +1,6 @@
 //! DataView over the canonical ArrayBuffer and SharedArrayBuffer backings.
 
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
@@ -101,7 +102,7 @@ fn bounds_for<H: Host>(
 }
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,

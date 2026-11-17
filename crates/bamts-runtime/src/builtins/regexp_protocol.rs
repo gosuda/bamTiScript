@@ -6,6 +6,7 @@
 //! the order of `Get`, `Set` and coercion is part of the specification, so the
 //! only path to the engine is the builtin `exec`.
 
+use crate::heap::Heap;
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
@@ -929,7 +930,7 @@ fn escape<H: Host>(
 
 /// Installs the flag accessors, the `Symbol`-keyed methods and `RegExp.escape`.
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,

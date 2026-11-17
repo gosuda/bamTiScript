@@ -1,5 +1,6 @@
 //! `Intl.DurationFormat`.
 
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
@@ -25,10 +26,10 @@ use crate::intl::locale_negotiation::resolve_locale;
 use crate::intl::{IntlKind, IntlObject};
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::temporal::instant_duration::Duration;
-use crate::{EvalFailure, HeapEntry, Host, Machine};
+use crate::{EvalFailure, Host, Machine};
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,

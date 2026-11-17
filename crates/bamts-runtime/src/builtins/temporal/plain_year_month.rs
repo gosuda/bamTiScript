@@ -1,5 +1,6 @@
 //! `Temporal.PlainYearMonth`.
 
+use crate::heap::Heap;
 use bamts_native::Value;
 
 use super::super::intl::temporal_to_locale_string;
@@ -26,10 +27,10 @@ use crate::temporal::plain_types::PlainYearMonth;
 use crate::temporal::relative::{DifferenceRounding, difference_plain_year_month};
 use crate::temporal::zoned_date_time::{CalendarDateFields, CalendarId};
 use crate::temporal::{TemporalKind, TemporalObject};
-use crate::{EvalFailure, HeapEntry, Host, Machine};
+use crate::{EvalFailure, Host, Machine};
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,

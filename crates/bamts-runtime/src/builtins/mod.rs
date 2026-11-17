@@ -1,5 +1,6 @@
 use super::{BuiltinDef, BuiltinOutcome, BuiltinTable, native_function, push};
 use crate::GetOutcome;
+use crate::heap::Heap;
 use crate::{
     ArrayElementKind, EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap,
     ShapeTable, ThrowOrigin,
@@ -58,7 +59,7 @@ pub(crate) struct InstallOptions {
     pub(crate) script_compiler: bool,
 }
 pub(crate) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -143,7 +144,7 @@ fn release_roots<H: Host>(machine: &mut Machine<'_, H>, depth: usize, count: usi
     machine.native_roots[depth].truncate(count);
 }
 fn install_function<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -158,7 +159,7 @@ fn install_function<H: Host>(
 /// static, and accessor installs keep using `install_function`, which
 /// registers non-constructable by default.
 pub(crate) fn install_constructor_function<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -169,7 +170,7 @@ pub(crate) fn install_constructor_function<H: Host>(
     native_function(heap, atoms, shapes, id, installed.name, installed.length)
 }
 pub(crate) fn define_data(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,
@@ -198,7 +199,7 @@ pub(crate) fn define_data(
 }
 /// Installs a symbol-keyed property on an intrinsic object of any shape.
 pub(crate) fn define_symbol_property(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     shapes: &mut crate::ShapeTable,
     object: Value,
     symbol: Value,
@@ -219,7 +220,7 @@ pub(crate) fn define_symbol_property(
     }
 }
 pub(super) fn define_to_string_tag(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     shapes: &mut crate::ShapeTable,
     object: Value,
     symbol: Value,
@@ -244,7 +245,7 @@ pub(super) fn define_to_string_tag(
 /// Installs a named data property that is non-writable, non-enumerable, and
 /// non-configurable onto an ordinary object, array, or native function.
 pub(crate) fn define_frozen_data(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,
@@ -418,7 +419,7 @@ fn define_array_length(
     }
 }
 fn install_boolean<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -507,7 +508,7 @@ fn boolean_to_string<H: Host>(
     allocate_string(machine, text).map(BuiltinOutcome::Value)
 }
 fn install_math<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -731,7 +732,7 @@ fn math_imul<H: Host>(
     Ok(BuiltinOutcome::Value(Value::int32(a.wrapping_mul(b))))
 }
 fn install_globals<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -777,7 +778,7 @@ fn install_globals<H: Host>(
     number::share_global_parsers(heap, atoms, shapes, globals);
 }
 fn install_errors<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -864,7 +865,7 @@ fn install_errors<H: Host>(
     }
 }
 struct InstallContext<'a, H: Host> {
-    heap: &'a mut Vec<HeapEntry>,
+    heap: &'a mut Heap,
     atoms: &'a mut crate::AtomTable,
     globals: &'a mut BTreeMap<EcmaString, Value>,
     builtins: &'a mut BuiltinTable<H>,

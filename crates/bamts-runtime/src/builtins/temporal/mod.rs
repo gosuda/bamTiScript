@@ -127,6 +127,7 @@ mod zoned_date_time;
 
 pub(in crate::intrinsics::builtins) use fields::to_temporal_duration;
 
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
@@ -157,7 +158,7 @@ struct Class<'a, H: Host> {
 }
 
 fn install_class<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -225,7 +226,7 @@ fn install_class<H: Host>(
 }
 
 pub(in crate::intrinsics::builtins) fn define_getter(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,
@@ -251,7 +252,7 @@ pub(in crate::intrinsics::builtins) fn define_getter(
 }
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,

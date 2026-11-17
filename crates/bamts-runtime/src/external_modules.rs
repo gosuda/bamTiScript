@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use std::{collections::BTreeMap, mem};
 
 use bamts_bytecode::EcmaString;
@@ -17,7 +18,7 @@ pub(crate) struct InstalledModule {
 }
 
 pub(crate) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -111,7 +112,7 @@ pub(crate) fn install<H: Host>(
 }
 
 fn register<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,

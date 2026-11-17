@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use crate::vm::generator_async::GeneratorCompletion;
 use crate::{
     ArrayElementKind, EvalFailure, Found, HeapEntry, Host, Machine, NativeCallable, Property,
@@ -732,7 +733,7 @@ impl<H: Host> BuiltinTable<H> {
     }
     pub(crate) fn set_constructor_prototype(
         &mut self,
-        heap: &mut [HeapEntry],
+        heap: &mut Heap,
         atoms: &mut crate::AtomTable,
         shapes: &mut crate::ShapeTable,
         constructor: Value,
@@ -776,7 +777,7 @@ impl<H: Host> BuiltinTable<H> {
     }
     pub(crate) fn set_function_prototype(
         &mut self,
-        heap: &mut [HeapEntry],
+        heap: &mut Heap,
         atoms: &mut crate::AtomTable,
         shapes: &mut crate::ShapeTable,
         function: Value,
@@ -799,7 +800,7 @@ impl<H: Host> BuiltinTable<H> {
     }
     pub(crate) fn set_error_prototype(
         &mut self,
-        heap: &mut [HeapEntry],
+        heap: &mut Heap,
         constructor: Value,
         prototype: Value,
     ) {
@@ -1041,7 +1042,7 @@ pub(crate) struct Intrinsics<H: Host> {
 }
 impl<H: Host> Intrinsics<H> {
     pub(crate) fn initialize(
-        heap: &mut Vec<HeapEntry>,
+        heap: &mut Heap,
         atoms: &mut crate::AtomTable,
         shapes: &mut crate::ShapeTable,
         timers_available: bool,
@@ -1154,11 +1155,7 @@ impl<H: Host> Intrinsics<H> {
     }
 }
 /// A prototype that is itself a wrapper around `primitive`.
-fn wrapper_prototype(
-    heap: &mut Vec<HeapEntry>,
-    object_prototype: Value,
-    primitive: Value,
-) -> Value {
+fn wrapper_prototype(heap: &mut Heap, object_prototype: Value, primitive: Value) -> Value {
     push(
         heap,
         HeapEntry::Object {
@@ -1169,7 +1166,7 @@ fn wrapper_prototype(
         },
     )
 }
-fn ordinary_prototype(heap: &mut Vec<HeapEntry>, object_prototype: Value) -> Value {
+fn ordinary_prototype(heap: &mut Heap, object_prototype: Value) -> Value {
     push(
         heap,
         HeapEntry::Object {
@@ -1181,7 +1178,7 @@ fn ordinary_prototype(heap: &mut Vec<HeapEntry>, object_prototype: Value) -> Val
     )
 }
 pub(crate) fn native_function_properties(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     name: &'static str,
@@ -1215,7 +1212,7 @@ pub(crate) fn function_properties(
     properties
 }
 pub(crate) fn native_function(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     id: BuiltinId,
@@ -1228,7 +1225,7 @@ pub(crate) fn native_function(
         HeapEntry::native_function(NativeCallable::Builtin(id), properties, None),
     )
 }
-pub(crate) fn push(heap: &mut Vec<HeapEntry>, entry: HeapEntry) -> Value {
+pub(crate) fn push(heap: &mut Heap, entry: HeapEntry) -> Value {
     heap.push(entry);
     let slot = u32::try_from(heap.len()).expect("intrinsic heap fits in a u32 slot");
     Value::heap_ref(

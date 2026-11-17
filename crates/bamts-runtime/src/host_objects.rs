@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
@@ -9,7 +10,7 @@ use crate::{
 };
 
 pub(crate) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -162,7 +163,7 @@ pub(crate) fn install<H: Host>(
     globals.insert(EcmaString::encode("globalThis"), global_this);
 }
 fn stream<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -187,7 +188,7 @@ fn stream<H: Host>(
 }
 
 fn register<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -198,7 +199,7 @@ fn register<H: Host>(
     intrinsics::native_function(heap, atoms, shapes, id, installed.name, installed.length)
 }
 
-fn object(heap: &mut Vec<HeapEntry>, prototype: Value) -> Value {
+fn object(heap: &mut Heap, prototype: Value) -> Value {
     intrinsics::push(
         heap,
         HeapEntry::Object {
@@ -210,7 +211,7 @@ fn object(heap: &mut Vec<HeapEntry>, prototype: Value) -> Value {
     )
 }
 fn put(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,
@@ -221,7 +222,7 @@ fn put(
 }
 
 fn define_data(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     shapes: &mut crate::ShapeTable,
     object: Value,
     key: PropertyKey,
@@ -238,7 +239,7 @@ fn define_data(
 }
 
 fn put_ecma(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,
@@ -260,7 +261,7 @@ fn put_ecma(
 }
 
 fn define_global_data(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,
@@ -282,7 +283,7 @@ fn define_global_data(
 }
 
 fn put_text(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,

@@ -2,6 +2,7 @@
 //!
 //! A typed array is a view over an ArrayBuffer or SharedArrayBuffer backing
 //! store. This module never owns a second byte vector.
+use crate::heap::Heap;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -704,7 +705,7 @@ fn canonical_index(text: &str) -> Option<Option<usize>> {
 }
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,

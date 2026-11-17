@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
 
@@ -27,7 +28,7 @@ impl FinalizationCell {
 }
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -344,7 +345,7 @@ fn constructor_prototype<H: Host>(
     })
 }
 
-fn ordinary(heap: &mut Vec<HeapEntry>, prototype: Option<Value>) -> Value {
+fn ordinary(heap: &mut Heap, prototype: Option<Value>) -> Value {
     super::super::push(
         heap,
         HeapEntry::Object {

@@ -15,6 +15,7 @@
 //!   the installed `SyntaxError` constructor (mirrors `json_edge.rs`); a zero-length
 //!   or whitespace-only string is `0n`, never an error.
 
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
@@ -1645,7 +1646,7 @@ pub(crate) fn json_reject<H: Host>(
 /// (`builtins.set_bigint_prototype(value)`), which then lets the Machine's
 /// boxing path find `[[Prototype]]` for BigInt values.
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -1756,7 +1757,7 @@ pub(super) fn install<H: Host>(
 }
 
 fn define_native_property(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,

@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::{DisposeHint, EcmaString};
@@ -95,7 +96,7 @@ fn async_disposable_stack_public_method<H: Host>(
 }
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -204,7 +205,7 @@ pub(super) fn install<H: Host>(
     }
 }
 
-fn ordinary(heap: &mut Vec<HeapEntry>, prototype: Option<Value>) -> Value {
+fn ordinary(heap: &mut Heap, prototype: Option<Value>) -> Value {
     super::super::push(
         heap,
         HeapEntry::Object {
@@ -217,7 +218,7 @@ fn ordinary(heap: &mut Vec<HeapEntry>, prototype: Option<Value>) -> Value {
 }
 
 fn define_getter(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,
@@ -240,7 +241,7 @@ fn define_getter(
 }
 
 fn define_symbol(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     shapes: &mut crate::ShapeTable,
     object: Value,
     symbol: Value,

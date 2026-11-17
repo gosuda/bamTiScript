@@ -40,10 +40,12 @@ use bamts_bytecode::{
 };
 pub use bamts_cancel::CancellationToken;
 use bamts_native::{Decoded, SlotId, Value};
+use heap::Heap;
 use intrinsics::builtins::typedarray_all::{self, ElementKind, LengthSlot};
 
 mod external_modules;
 mod gc;
+mod heap;
 mod host_objects;
 pub mod intl;
 mod intrinsics;
@@ -1698,7 +1700,7 @@ impl ArrayElementKind {
     }
 }
 
-fn install_element_vector(heap: &mut [HeapEntry], array_slot: usize, elements: Vec<Value>) {
+fn install_element_vector(heap: &mut Heap, array_slot: usize, elements: Vec<Value>) {
     let kind = ArrayElementKind::for_elements(&elements);
     let HeapEntry::Array {
         elements: current,
@@ -2427,7 +2429,7 @@ pub struct Machine<'a, H: Host> {
     /// Microtask jobs that have left the queue and are still running.
     running_jobs: Vec<MicrotaskJob>,
     frames: Vec<Frame>,
-    heap: Vec<HeapEntry>,
+    heap: Heap,
     slot_bytes: Vec<usize>,
     /// Freed bootstrap bytes that runtime mutations can reuse before they
     /// consume the runtime heap budget.
@@ -2738,7 +2740,7 @@ impl<'a, H: Host> Machine<'a, H> {
             },
         );
         let live_registers = frame.registers.len();
-        let mut heap = Vec::new();
+        let mut heap = Heap::default();
         let mut atoms = AtomTable::default();
         let mut shapes = ShapeTable::new();
         let timers_available = host.timers().is_some();

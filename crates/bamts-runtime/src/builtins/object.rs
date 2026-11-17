@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use super::property_descriptor::{
@@ -23,7 +24,7 @@ use crate::{
 /// object that had to exist before the builtin table could. Its prototype is
 /// stated explicitly: a native function without one falls back to this object.
 pub(super) fn install_function_prototype<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
@@ -51,7 +52,7 @@ fn function_prototype_call<H: Host>(
 }
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -160,7 +161,7 @@ pub(super) fn install<H: Host>(
 /// `AddRestrictedFunctionProperties` for %Function.prototype%, around a frozen
 /// %ThrowTypeError%.
 fn install_restricted_function_properties<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,

@@ -1,5 +1,6 @@
 //! `Intl.Collator`.
 
+use crate::heap::Heap;
 use bamts_native::Value;
 
 use super::options::{Options, canonicalize_locale_list, coerce_options_to_object, read};
@@ -14,12 +15,12 @@ use crate::intl::collator::{
 use crate::intl::locale_data::DATA;
 use crate::intl::{IntlKind, IntlObject};
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine};
+use crate::{EvalFailure, Host, Machine};
 
 const COMPARE: &str = "Intl.Collator compare";
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,

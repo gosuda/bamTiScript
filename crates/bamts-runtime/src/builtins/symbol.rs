@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
@@ -11,7 +12,7 @@ use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey};
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -180,7 +181,7 @@ pub(super) fn install<H: Host>(
     globals.insert(EcmaString::encode("Symbol"), constructor);
 }
 
-fn symbol(heap: &mut Vec<HeapEntry>, description: &str) -> Value {
+fn symbol(heap: &mut Heap, description: &str) -> Value {
     super::super::push(
         heap,
         HeapEntry::Symbol {
@@ -190,7 +191,7 @@ fn symbol(heap: &mut Vec<HeapEntry>, description: &str) -> Value {
 }
 
 fn define_native_property(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,
@@ -208,7 +209,7 @@ fn define_native_property(
 }
 
 fn define_readonly_property(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     object: Value,

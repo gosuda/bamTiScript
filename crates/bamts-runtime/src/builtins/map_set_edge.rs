@@ -1,3 +1,4 @@
+use crate::heap::Heap;
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
@@ -16,7 +17,7 @@ use crate::{
 /// Installs the collection algorithms whose observable ordering and iterator-close
 /// requirements cannot be expressed by the baseline eager constructors.
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -185,7 +186,7 @@ struct InstalledConstructor {
 }
 
 fn replace_constructor<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     globals: &mut BTreeMap<EcmaString, Value>,
@@ -213,7 +214,7 @@ fn replace_constructor<H: Host>(
     }
 }
 fn prototype_of(
-    heap: &[HeapEntry],
+    heap: &Heap,
     atoms: &mut crate::AtomTable,
     shapes: &ShapeTable,
     name: &str,
@@ -227,7 +228,7 @@ fn prototype_of(
 }
 
 fn own_data_property(
-    heap: &[HeapEntry],
+    heap: &Heap,
     atoms: &mut crate::AtomTable,
     shapes: &ShapeTable,
     object: Value,
@@ -249,7 +250,7 @@ fn own_data_property(
 }
 
 fn define_constructor_data(
-    heap: &mut [HeapEntry],
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     constructor: Value,
@@ -272,7 +273,7 @@ fn define_constructor_data(
 }
 
 fn define_collection_tag(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     shapes: &mut crate::ShapeTable,
     prototype: Value,
     tag_symbol: Value,

@@ -1,5 +1,6 @@
 //! `Intl.Segmenter`, its `Segments` objects, and their iterator.
 
+use crate::heap::Heap;
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
@@ -21,7 +22,7 @@ use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine};
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,

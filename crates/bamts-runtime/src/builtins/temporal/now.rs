@@ -1,5 +1,6 @@
 //! `Temporal.Now`.
 
+use crate::heap::Heap;
 use std::convert::Infallible;
 
 use bamts_native::Value;
@@ -19,10 +20,10 @@ use crate::temporal::plain_types::PlainDate;
 use crate::temporal::zoned_date_time::{
     CalendarId, FixedOffsetTimeZones, TimeZoneId, TimeZoneProvider, ZonedDateTime,
 };
-use crate::{EvalFailure, HeapEntry, Host, Machine};
+use crate::{EvalFailure, Host, Machine};
 
 pub(super) fn install<H: Host>(
-    heap: &mut Vec<HeapEntry>,
+    heap: &mut Heap,
     atoms: &mut crate::AtomTable,
     shapes: &mut crate::ShapeTable,
     builtins: &mut BuiltinTable<H>,
