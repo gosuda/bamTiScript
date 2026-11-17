@@ -5633,11 +5633,11 @@ var s: string = \"hi\";\n\
         }
     }
 
-    /// The rendered trace of the one-edge fixture project, written with the
-    /// fixture's logical project root instead of the loader's temporary root.
+    /// The rendered trace of the one-edge fixture project with no tsconfig,
+    /// using default resolution and the fixture's logical project root.
     const PROJECT_TRACE_BASELINE: &str = "\
 ======== Resolving module './util.js' from 'tests/cases/projects/trace/main.ts'. ========\n\
-Explicitly specified module resolution kind: 'Bundler'.\n\
+Module resolution kind is not specified, using 'Bundler'.\n\
 Resolving in ESM mode with conditions 'import', 'types'.\n\
 Loading module as file / folder, candidate module location 'tests/cases/projects/trace/util.js', target file types: TypeScript, JavaScript, Declaration, JSON.\n\
 File name 'tests/cases/projects/trace/util.js' has a '.js' extension - stripping it.\n\
@@ -5661,7 +5661,7 @@ File 'tests/cases/projects/trace/util.ts' exists - use it as a name resolution r
         assert_eq!(
             observation.class,
             FailureClass::Pass,
-            "{}; [DEBUG-a19f] trace={:?}",
+            "{}; trace={:?}",
             observation.detail,
             observation.artifacts.get("trace")
         );
