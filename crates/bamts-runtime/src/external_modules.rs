@@ -405,7 +405,7 @@ fn parse_config<H: Host>(
                     return Err(type_error("parseArgs short option must be a string"));
                 };
                 let text =
-                    strict_host_text(text, "parseArgs short option must be well-formed UTF-16")?;
+                    strict_host_text(&text, "parseArgs short option must be well-formed UTF-16")?;
                 let mut chars = text.chars();
                 let Some(short) = chars.next().filter(|_| chars.next().is_none()) else {
                     return Err(type_error("parseArgs short option must be one character"));
@@ -491,30 +491,31 @@ fn optional_boolean<H: Host>(
 }
 
 fn string_array<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<Vec<String>, EvalFailure> {
     let Some(index) = machine.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
         return Err(type_error("parseArgs args must be a string array"));
     };
-    let HeapEntry::Array { elements, .. } = &machine.heap[index] else {
-        return Err(type_error("parseArgs args must be a string array"));
+    let elements = match &machine.heap[index] {
+        HeapEntry::Array { elements, .. } => elements.clone(),
+        _ => return Err(type_error("parseArgs args must be a string array")),
     };
-    elements
-        .iter()
-        .map(|value| {
-            machine
-                .string_text(*value)
-                .ok_or_else(|| type_error("parseArgs args must contain strings"))
-                .and_then(|text| {
-                    strict_host_text(text, "parseArgs args must be well-formed UTF-16")
-                })
-        })
-        .collect()
+    let mut strings = Vec::with_capacity(elements.len());
+    for value in elements {
+        let text = machine
+            .string_text(value)
+            .ok_or_else(|| type_error("parseArgs args must contain strings"))?;
+        strings.push(strict_host_text(
+            &text,
+            "parseArgs args must be well-formed UTF-16",
+        )?);
+    }
+    Ok(strings)
 }
 
 fn validate_default<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     value: Value,
     kind: OptionType,
     multiple: bool,
@@ -523,11 +524,12 @@ fn validate_default<H: Host>(
         let Some(index) = machine.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
             return Err(type_error("parseArgs multiple default must be an array"));
         };
-        let HeapEntry::Array { elements, .. } = &machine.heap[index] else {
-            return Err(type_error("parseArgs multiple default must be an array"));
+        let elements = match &machine.heap[index] {
+            HeapEntry::Array { elements, .. } => elements.clone(),
+            _ => return Err(type_error("parseArgs multiple default must be an array")),
         };
         for value in elements {
-            validate_scalar(machine, *value, kind)?;
+            validate_scalar(machine, value, kind)?;
         }
         return Ok(());
     }
@@ -535,7 +537,7 @@ fn validate_default<H: Host>(
 }
 
 fn validate_scalar<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     value: Value,
     kind: OptionType,
 ) -> Result<(), EvalFailure> {
@@ -734,7 +736,7 @@ fn create_hash<H: Host>(
         .and_then(|value| machine.string_text(*value))
         .map(|text| {
             strict_host_text(
-                text,
+                &text,
                 "crypto.createHash algorithm must be well-formed UTF-16",
             )
         })
@@ -777,7 +779,7 @@ fn hash_update<H: Host>(
     let Some(text) = args
         .first()
         .and_then(|value| machine.string_text(*value))
-        .map(EcmaString::to_utf8_lossy)
+        .map(|text| text.to_utf8_lossy())
     else {
         return Err(type_error("hash.update data must be a string"));
     };
@@ -786,7 +788,7 @@ fn hash_update<H: Host>(
         Some(value) => machine
             .string_text(value)
             .ok_or_else(|| type_error("hash.update encoding must be a string"))
-            .and_then(|text| strict_host_text(text, "hash.update encoding must be ASCII"))?,
+            .and_then(|text| strict_host_text(&text, "hash.update encoding must be ASCII"))?,
     };
     let bytes = decode_input(&text, &encoding)?;
     let Some(index) = machine.runtime_slot(this).map_err(EvalFailure::Runtime)? else {
@@ -820,7 +822,7 @@ fn hash_digest<H: Host>(
     let Some(encoding) = args
         .first()
         .and_then(|value| machine.string_text(*value))
-        .map(|text| strict_host_text(text, "hash.digest encoding must be ASCII"))
+        .map(|text| strict_host_text(&text, "hash.digest encoding must be ASCII"))
         .transpose()?
     else {
         return Err(type_error(
@@ -1071,7 +1073,7 @@ mod tests {
         elements.clone()
     }
 
-    fn text(machine: &Machine<'_, EchoHost>, value: Value) -> String {
+    fn text(machine: &mut Machine<'_, EchoHost>, value: Value) -> String {
         machine
             .string_text(value)
             .expect("expected string")
@@ -1220,18 +1222,24 @@ mod tests {
     fn node_globals_share_identity_and_report_pinned_version() {
         let program = blank_program();
         let mut host = EchoHost;
-        let machine = Machine::new(&program, &mut host, Limits::default());
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
         let global = machine.intrinsics.global("global").unwrap();
         let global_this = machine.intrinsics.global("globalThis").unwrap();
         assert_eq!(global, global_this);
         let process = machine.intrinsics.global("process").unwrap();
         assert_eq!(
-            text(&machine, machine_value(&machine, process, "version")),
+            {
+                let value = machine_value(&machine, process, "version");
+                text(&mut machine, value)
+            },
             "v24.18.0"
         );
         let versions = machine_value(&machine, process, "versions");
         assert_eq!(
-            text(&machine, machine_value(&machine, versions, "node")),
+            {
+                let value = machine_value(&machine, versions, "node");
+                text(&mut machine, value)
+            },
             "24.18.0"
         );
     }
@@ -1261,7 +1269,7 @@ mod tests {
 
         let result = call_parse_args(&mut machine, config).unwrap();
         let positionals = array_values(&machine, machine_value(&machine, result, "positionals"));
-        assert_eq!(text(&machine, positionals[0]), "positional");
+        assert_eq!(text(&mut machine, positionals[0]), "positional");
     }
 
     #[test]
@@ -1275,7 +1283,10 @@ mod tests {
         let result = call_parse_args(&mut machine, defaults_config).unwrap();
         let values = machine_value(&machine, result, "values");
         assert_eq!(
-            text(&machine, machine_value(&machine, values, "name")),
+            {
+                let value = machine_value(&machine, values, "name");
+                text(&mut machine, value)
+            },
             "fallback"
         );
         let unknown = config(&mut machine, &["--unknown"], &[], &[]);
@@ -1297,14 +1308,17 @@ mod tests {
         let loose_result = call_parse_args(&mut machine, loose).unwrap();
         let loose_values = machine_value(&machine, loose_result, "values");
         assert_eq!(
-            text(&machine, machine_value(&machine, loose_values, "other")),
+            {
+                let value = machine_value(&machine, loose_values, "other");
+                text(&mut machine, value)
+            },
             "value"
         );
         let loose_positionals = array_values(
             &machine,
             machine_value(&machine, loose_result, "positionals"),
         );
-        assert_eq!(text(&machine, loose_positionals[0]), "tail");
+        assert_eq!(text(&mut machine, loose_positionals[0]), "tail");
         let string = descriptor(&mut machine, "string", None, false, None);
         let missing = config(&mut machine, &["--name"], &[("name", string)], &[]);
         assert!(matches!(
@@ -1360,7 +1374,10 @@ mod tests {
         let result = call_parse_args(&mut machine, loose).unwrap();
         let values = machine_value(&machine, result, "values");
         assert_eq!(
-            text(&machine, machine_value(&machine, values, "boolean")),
+            {
+                let value = machine_value(&machine, values, "boolean");
+                text(&mut machine, value)
+            },
             "false"
         );
 
@@ -1402,20 +1419,26 @@ mod tests {
         let tags = array_values(&machine, machine_value(&machine, values, "tag"));
         assert_eq!(
             tags.iter()
-                .map(|value| text(&machine, *value))
+                .map(|value| text(&mut machine, *value))
                 .collect::<Vec<_>>(),
             ["a", "b"]
         );
         let positionals = array_values(&machine, machine_value(&machine, result, "positionals"));
-        assert_eq!(text(&machine, positionals[0]), "tail");
+        assert_eq!(text(&mut machine, positionals[0]), "tail");
         let tokens = array_values(&machine, machine_value(&machine, result, "tokens"));
         assert_eq!(tokens.len(), 6);
         assert_eq!(
-            text(&machine, machine_value(&machine, tokens[4], "kind")),
+            {
+                let value = machine_value(&machine, tokens[4], "kind");
+                text(&mut machine, value)
+            },
             "option-terminator"
         );
         assert_eq!(
-            text(&machine, machine_value(&machine, tokens[5], "kind")),
+            {
+                let value = machine_value(&machine, tokens[5], "kind");
+                text(&mut machine, value)
+            },
             "positional"
         );
     }
@@ -1477,7 +1500,7 @@ mod tests {
         else {
             unreachable!()
         };
-        assert_eq!(text(&machine, digest), "YWJj");
+        assert_eq!(text(&mut machine, digest), "YWJj");
         assert!(matches!(
             hash_digest(&mut machine, hash, &[output], false),
             Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
@@ -1558,7 +1581,7 @@ mod tests {
         else {
             unreachable!()
         };
-        assert_eq!(text(&machine, digest), "efbfbd");
+        assert_eq!(text(&mut machine, digest), "efbfbd");
         assert_eq!(machine.slot_bytes[index], retained_before_update);
         assert!(matches!(
             &machine.heap[index],
@@ -1709,7 +1732,10 @@ mod tests {
         let result = call_parse_args(&mut machine, loose_long).unwrap();
         let values = machine_value(&machine, result, "values");
         assert_eq!(
-            text(&machine, machine_value(&machine, values, "name")),
+            {
+                let value = machine_value(&machine, values, "name");
+                text(&mut machine, value)
+            },
             "-bar"
         );
 
@@ -1722,7 +1748,10 @@ mod tests {
         let result = call_parse_args(&mut machine, loose_short).unwrap();
         let values = machine_value(&machine, result, "values");
         assert_eq!(
-            text(&machine, machine_value(&machine, values, "file")),
+            {
+                let value = machine_value(&machine, values, "file");
+                text(&mut machine, value)
+            },
             "-bar"
         );
 
@@ -1730,7 +1759,10 @@ mod tests {
         let result = call_parse_args(&mut machine, inline_long).unwrap();
         let values = machine_value(&machine, result, "values");
         assert_eq!(
-            text(&machine, machine_value(&machine, values, "name")),
+            {
+                let value = machine_value(&machine, values, "name");
+                text(&mut machine, value)
+            },
             "-bar"
         );
 
@@ -1738,7 +1770,10 @@ mod tests {
         let result = call_parse_args(&mut machine, inline_short).unwrap();
         let values = machine_value(&machine, result, "values");
         assert_eq!(
-            text(&machine, machine_value(&machine, values, "file")),
+            {
+                let value = machine_value(&machine, values, "file");
+                text(&mut machine, value)
+            },
             "-bar"
         );
     }
@@ -1764,6 +1799,6 @@ mod tests {
         else {
             unreachable!()
         };
-        assert_eq!(text(&machine, digest), "+/8=");
+        assert_eq!(text(&mut machine, digest), "+/8=");
     }
 }

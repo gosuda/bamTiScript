@@ -446,17 +446,15 @@ fn weak_collection_purge_rebuilds_index_size_and_refunds_exactly() {
     let entry_charge = CollectionEntry::BYTES + CollectionIndex::ENTRY_BYTES;
     stress.call_method(weak_map, "set", &[key, value]);
 
-    let HeapEntry::Collection {
-        entries,
-        index,
-        size,
-        ..
-    } = &stress.machine.heap[weak_map_slot]
-    else {
+    let HeapEntry::Collection { entries, size, .. } = &stress.machine.heap[weak_map_slot] else {
         panic!("WeakMap has a collection entry");
     };
-    assert_eq!((*size, entries.len()), (1, 1));
-    assert_eq!(index.get(stress.machine, entries, key), Some(0));
+    let (size, entry_count) = (*size, entries.len());
+    assert_eq!((size, entry_count), (1, 1));
+    assert_eq!(
+        crate::collection_lookup(stress.machine, weak_map_slot, key),
+        Some(0)
+    );
     assert_eq!(
         stress.machine.slot_bytes[weak_map_slot],
         weak_map_base + entry_charge

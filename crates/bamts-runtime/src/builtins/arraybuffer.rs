@@ -500,7 +500,7 @@ impl ArrayBufferHandle {
         Ok(())
     }
 
-    fn same_value<H: Host>(machine: &Machine<'_, H>, left: Value, right: Value) -> bool {
+    fn same_value<H: Host>(machine: &mut Machine<'_, H>, left: Value, right: Value) -> bool {
         let numeric = |value: Value| match value.decode() {
             Some(Decoded::Int32(value)) => Some(f64::from(value as i32)),
             Some(Decoded::Number(value)) => Some(value),

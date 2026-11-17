@@ -1060,7 +1060,10 @@ fn last_chunk_handling<H: Host>(
     }
 }
 
-fn string_argument<H: Host>(machine: &Machine<'_, H>, value: Value) -> Result<String, EvalFailure> {
+fn string_argument<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<String, EvalFailure> {
     machine
         .string_value(value)
         .map(|text| text.to_utf8_lossy())

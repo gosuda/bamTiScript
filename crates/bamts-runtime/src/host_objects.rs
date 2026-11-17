@@ -448,7 +448,7 @@ fn join_bounded(parts: Vec<String>, total: usize) -> String {
 
 impl<H: Host> Machine<'_, H> {
     fn console_format(
-        &self,
+        &mut self,
         value: Value,
         top_level: bool,
         depth: usize,
@@ -462,18 +462,80 @@ impl<H: Host> Machine<'_, H> {
             Some(Decoded::Int32(value)) => Ok((value as i32).to_string()),
             Some(Decoded::Number(value)) => Ok(crate::format_number(value)),
             Some(Decoded::HeapRef(_)) => {
+                if let Some(slot) = self.string_slot(value) {
+                    let text = self.flat_string(slot);
+                    return if top_level {
+                        Ok(env_value_text_lossy(&text))
+                    } else {
+                        Ok(quote(&text))
+                    };
+                }
                 let index = self
                     .runtime_slot(value)
                     .map_err(EvalFailure::Runtime)?
                     .ok_or(EvalFailure::Runtime(
                         crate::RuntimeErrorKind::InvalidValue { value },
                     ))?;
+                let elements = match &self.heap[index] {
+                    HeapEntry::Array { elements, .. } => Some(elements.clone()),
+                    _ => None,
+                };
+                if let Some(elements) = elements {
+                    if depth >= 2 {
+                        return Ok("[Array]".to_owned());
+                    }
+                    let total = elements.len();
+                    let take = total.min(INSPECT_MAX_ITEMS);
+                    let mut parts = Vec::with_capacity(take);
+                    for element in &elements[..take] {
+                        if *element == Value::HOLE {
+                            parts.push("<1 empty item>".to_owned());
+                        } else {
+                            parts.push(self.console_format(*element, false, depth + 1)?);
+                        }
+                    }
+                    return Ok(format!("[ {} ]", join_bounded(parts, total)));
+                }
+                let entries = self.console_entries(index);
+                if let Some(entries) = entries {
+                    if depth >= 2 {
+                        return Ok("[Object]".to_owned());
+                    }
+                    let mut parts = Vec::new();
+                    for (name, entry) in entries {
+                        parts.push(format!(
+                            "{}: {}",
+                            inspect_key(&name),
+                            self.console_format(entry, false, depth + 1)?
+                        ));
+                    }
+                    return Ok(format!("{{ {} }}", parts.join(", ")));
+                }
                 match &self.heap[index] {
                     HeapEntry::Vacant => {
                         unreachable!("runtime_slot rejects vacant heap entries")
                     }
-                    HeapEntry::String(text) if top_level => Ok(env_value_text_lossy(text)),
-                    HeapEntry::String(text) => Ok(quote(text)),
+                    HeapEntry::String(_) | HeapEntry::Rope { .. } => {
+                        unreachable!("string text is formatted before the heap match")
+                    }
+                    HeapEntry::Array { .. } => {
+                        unreachable!("array text is formatted before the heap match")
+                    }
+                    HeapEntry::Object { .. }
+                    | HeapEntry::Script { .. }
+                    | HeapEntry::Date { .. }
+                    | HeapEntry::Temporal { .. }
+                    | HeapEntry::Intl { .. }
+                    | HeapEntry::BuiltinIterator { .. }
+                    | HeapEntry::Collection { .. }
+                    | HeapEntry::Generator { .. }
+                    | HeapEntry::AsyncGenerator { .. }
+                    | HeapEntry::AsyncFromSync { .. }
+                    | HeapEntry::Promise { .. }
+                    | HeapEntry::DisposableStack { .. }
+                    | HeapEntry::Timeout { .. } => {
+                        unreachable!("object text is formatted before the heap match")
+                    }
                     HeapEntry::BigInt(text) => Ok(format!("{text}n")),
                     HeapEntry::Symbol { description } => {
                         Ok(format!("Symbol({})", env_value_text_lossy(description)))
@@ -482,22 +544,6 @@ impl<H: Host> Machine<'_, H> {
                         "PrivateName({})",
                         env_value_text_lossy(description)
                     )),
-                    HeapEntry::Array { elements, .. } => {
-                        if depth >= 2 {
-                            return Ok("[Array]".to_owned());
-                        }
-                        let total = elements.len();
-                        let take = total.min(INSPECT_MAX_ITEMS);
-                        let mut parts = Vec::with_capacity(take);
-                        for element in &elements[..take] {
-                            if *element == Value::HOLE {
-                                parts.push("<1 empty item>".to_owned());
-                            } else {
-                                parts.push(self.console_format(*element, false, depth + 1)?);
-                            }
-                        }
-                        Ok(format!("[ {} ]", join_bounded(parts, total)))
-                    }
                     HeapEntry::TypedArray { kind, .. } => {
                         if depth >= 2 {
                             return Ok(format!("[{}]", kind.name()));
@@ -518,43 +564,6 @@ impl<H: Host> Machine<'_, H> {
                     HeapEntry::ArrayBuffer { .. } => Ok("[ArrayBuffer]".to_owned()),
                     HeapEntry::SharedArrayBuffer { .. } => Ok("[SharedArrayBuffer]".to_owned()),
                     HeapEntry::DataView { .. } => Ok("[DataView]".to_owned()),
-                    HeapEntry::Object { properties, .. }
-                    | HeapEntry::Script { properties, .. }
-                    | HeapEntry::Date { properties, .. }
-                    | HeapEntry::Temporal { properties, .. }
-                    | HeapEntry::Intl { properties, .. }
-                    | HeapEntry::BuiltinIterator { properties, .. }
-                    | HeapEntry::Collection { properties, .. }
-                    | HeapEntry::Generator { properties, .. }
-                    | HeapEntry::AsyncGenerator { properties, .. }
-                    | HeapEntry::AsyncFromSync { properties, .. }
-                    | HeapEntry::Promise { properties, .. }
-                    | HeapEntry::DisposableStack { properties, .. }
-                    | HeapEntry::Timeout { properties, .. } => {
-                        if depth >= 2 {
-                            return Ok("[Object]".to_owned());
-                        }
-                        let mut parts = Vec::new();
-                        for (key, property) in properties.iter(&self.shapes) {
-                            let (
-                                PropertyKey::Named(name),
-                                Property::Data {
-                                    value,
-                                    enumerable: true,
-                                    ..
-                                },
-                            ) = (key, property)
-                            else {
-                                continue;
-                            };
-                            parts.push(format!(
-                                "{}: {}",
-                                inspect_key(self.atoms.resolve(*name)),
-                                self.console_format(*value, false, depth + 1)?
-                            ));
-                        }
-                        Ok(format!("{{ {} }}", parts.join(", ")))
-                    }
                     HeapEntry::Proxy { record } => {
                         let _ = record;
                         if self.is_callable(value)? {
@@ -586,6 +595,42 @@ impl<H: Host> Machine<'_, H> {
                 }
             }
         }
+    }
+
+    /// The enumerable string-keyed data properties of the object at `index`,
+    /// with each key already resolved, so the caller's heap borrow ends.
+    fn console_entries(&self, index: usize) -> Option<Vec<(EcmaString, Value)>> {
+        let properties = match &self.heap[index] {
+            HeapEntry::Object { properties, .. }
+            | HeapEntry::Script { properties, .. }
+            | HeapEntry::Date { properties, .. }
+            | HeapEntry::Temporal { properties, .. }
+            | HeapEntry::Intl { properties, .. }
+            | HeapEntry::BuiltinIterator { properties, .. }
+            | HeapEntry::Collection { properties, .. }
+            | HeapEntry::Generator { properties, .. }
+            | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::AsyncFromSync { properties, .. }
+            | HeapEntry::Promise { properties, .. }
+            | HeapEntry::DisposableStack { properties, .. }
+            | HeapEntry::Timeout { properties, .. } => properties,
+            _ => return None,
+        };
+        let mut entries = Vec::new();
+        for (key, property) in properties.iter(&self.shapes) {
+            if let (
+                PropertyKey::Named(name),
+                Property::Data {
+                    value,
+                    enumerable: true,
+                    ..
+                },
+            ) = (key, property)
+            {
+                entries.push((self.atoms.resolve(*name).clone(), *value));
+            }
+        }
+        Some(entries)
     }
 }
 

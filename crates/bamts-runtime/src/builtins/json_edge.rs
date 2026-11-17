@@ -158,7 +158,7 @@ fn raw_json_brand<H: Host>(machine: &Machine<'_, H>) -> Option<(u32, Value)> {
         })
 }
 
-fn has_raw_json_brand<H: Host>(machine: &Machine<'_, H>, value: Value) -> bool {
+fn has_raw_json_brand<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> bool {
     let Some((brand_slot, _)) = raw_json_brand(machine) else {
         return false;
     };
@@ -169,46 +169,45 @@ fn has_raw_json_brand<H: Host>(machine: &Machine<'_, H>, value: Value) -> bool {
     // itself anchors the brand, so also require the frozen null-prototype
     // shape with an own `rawJSON` string. Scripts can satisfy the shape but
     // never the private key, so the conjunction is still unforgeable.
-    let HeapEntry::Object {
-        properties,
-        prototype: None,
-        extensible: false,
-        ..
-    } = &machine.heap[index]
-    else {
-        return false;
+    let (branded, text_value) = match &machine.heap[index] {
+        HeapEntry::Object {
+            properties,
+            prototype: None,
+            extensible: false,
+            ..
+        } => (
+            properties.contains_key(&machine.shapes, &PropertyKey::Private(brand_slot)),
+            match properties.get_ascii(&machine.shapes, &machine.atoms, "rawJSON") {
+                Some(Property::Data {
+                    value,
+                    writable: false,
+                    configurable: false,
+                    ..
+                }) => Some(*value),
+                _ => None,
+            },
+        ),
+        _ => (false, None),
     };
-    if !properties.contains_key(&machine.shapes, &PropertyKey::Private(brand_slot)) {
-        return false;
-    }
-    let Some(Property::Data {
-        value: text_value,
-        writable: false,
-        configurable: false,
-        ..
-    }) = properties.get_ascii(&machine.shapes, &machine.atoms, "rawJSON")
-    else {
-        return false;
-    };
-    machine.string_value(*text_value).is_some()
+    branded && text_value.is_some_and(|text| machine.string_value(text).is_some())
 }
 
 /// The verbatim text of a genuine raw-JSON object, without quoting.
-fn raw_json_text<H: Host>(machine: &Machine<'_, H>, value: Value) -> Option<EcmaString> {
+fn raw_json_text<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Option<EcmaString> {
     if !has_raw_json_brand(machine, value) {
         return None;
     }
     let index = machine.runtime_slot(value).ok()??;
-    let HeapEntry::Object { properties, .. } = &machine.heap[index] else {
-        return None;
-    };
-    let Some(Property::Data {
-        value: text_value, ..
-    }) = properties.get_ascii(&machine.shapes, &machine.atoms, "rawJSON")
-    else {
-        return None;
-    };
-    machine.string_value(*text_value)
+    let text_value = match &machine.heap[index] {
+        HeapEntry::Object { properties, .. } => {
+            match properties.get_ascii(&machine.shapes, &machine.atoms, "rawJSON") {
+                Some(Property::Data { value, .. }) => Some(*value),
+                _ => None,
+            }
+        }
+        _ => None,
+    }?;
+    machine.string_value(text_value)
 }
 
 /// CreateDataPropertyOrThrow semantics: defines an own data property on the

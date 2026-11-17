@@ -324,26 +324,32 @@ impl GcState {
             if !self.marks[index] {
                 continue;
             }
-            let (replacement, removed) = match &machine.heap[index] {
+            let retained = match &machine.heap[index] {
                 HeapEntry::Collection {
                     kind: CollectionKind::WeakMap | CollectionKind::WeakSet,
                     entries,
                     size,
                     ..
-                } => {
-                    let retained_entries: Vec<_> = entries
+                } => Some((
+                    entries
                         .iter()
                         .copied()
                         .filter(|entry| entry.live && is_marked_value(&self.marks, entry.key))
-                        .collect();
+                        .collect::<Vec<_>>(),
+                    *size,
+                )),
+                _ => None,
+            };
+            let (replacement, removed) = match retained {
+                Some((retained_entries, size)) => {
                     let mut rebuilt = crate::CollectionIndex::default();
                     for (entry_index, entry) in retained_entries.iter().enumerate() {
                         rebuilt.insert(crate::collection_key_hash(machine, entry.key), entry_index);
                     }
-                    let removed = *size - retained_entries.len();
+                    let removed = size - retained_entries.len();
                     (Some((retained_entries, rebuilt)), removed)
                 }
-                _ => (None, 0),
+                None => (None, 0),
             };
             if let Some((retained_entries, rebuilt)) = replacement {
                 let HeapEntry::Collection {
@@ -728,6 +734,10 @@ fn trace_entry(
     weak_collections: &mut Vec<usize>,
 ) {
     match entry {
+        HeapEntry::Rope { left, right, .. } => {
+            mark_value(heap, marks, work, *left);
+            mark_value(heap, marks, work, *right);
+        }
         HeapEntry::Vacant
         | HeapEntry::String(_)
         | HeapEntry::BigInt(_)

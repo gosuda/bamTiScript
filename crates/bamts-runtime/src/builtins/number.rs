@@ -561,7 +561,7 @@ mod tests {
         );
     }
 
-    fn outcome_text(machine: &Machine<'_, TestHost>, outcome: BuiltinOutcome) -> String {
+    fn outcome_text(machine: &mut Machine<'_, TestHost>, outcome: BuiltinOutcome) -> String {
         let BuiltinOutcome::Value(value) = outcome else {
             panic!("expected a string value outcome");
         };
@@ -604,13 +604,13 @@ mod tests {
             let implicit = Machine::<TestHost>::ordinary_number_to_string(value);
             let number = crate::number_value(value);
             let prototype_outcome = to_string(&mut machine, number, &[], false).expect("toString");
-            let prototype = outcome_text(&machine, prototype_outcome);
+            let prototype = outcome_text(&mut machine, prototype_outcome);
             let radix_outcome =
                 to_string(&mut machine, number, &[Value::int32(10)], false).expect("toString(10)");
-            let radix_ten = outcome_text(&machine, radix_outcome);
+            let radix_ten = outcome_text(&mut machine, radix_outcome);
             let precision_outcome =
                 to_precision(&mut machine, number, &[], false).expect("toPrecision");
-            let precision_default = outcome_text(&machine, precision_outcome);
+            let precision_default = outcome_text(&mut machine, precision_outcome);
             assert_eq!(implicit, expected, "implicit ToString for {value}");
             assert_eq!(prototype, expected, "Number.prototype.toString for {value}");
             assert_eq!(
@@ -640,7 +640,7 @@ mod tests {
             );
             let number = crate::number_value(value);
             let outcome = to_string(&mut machine, number, &[], false).expect("toString");
-            assert_eq!(outcome_text(&machine, outcome), expected);
+            assert_eq!(outcome_text(&mut machine, outcome), expected);
         }
     }
 
@@ -653,9 +653,9 @@ mod tests {
             .box_primitive(crate::number_value(1e21))
             .expect("Number wrapper");
         let text_outcome = to_string(&mut machine, boxed, &[], false).expect("wrapper toString");
-        assert_eq!(outcome_text(&machine, text_outcome), "1e+21");
+        assert_eq!(outcome_text(&mut machine, text_outcome), "1e+21");
         let fixed_outcome =
             to_fixed(&mut machine, boxed, &[Value::int32(2)], false).expect("wrapper toFixed");
-        assert_eq!(outcome_text(&machine, fixed_outcome), "1e+21");
+        assert_eq!(outcome_text(&mut machine, fixed_outcome), "1e+21");
     }
 }

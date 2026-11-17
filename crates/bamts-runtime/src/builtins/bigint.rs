@@ -1376,28 +1376,27 @@ fn to_bigint_primitive<H: Host>(
             "Cannot convert a Number value to a BigInt without an explicit conversion",
         )),
         Some(Decoded::HeapRef(_)) => {
+            if let Some(text) = machine.string_value(primitive) {
+                let utf8 = match text.to_utf8_strict() {
+                    Ok(text) => text,
+                    Err(_) => {
+                        return Err(bigint_failure(
+                            machine,
+                            BigIntError::Syntax("invalid BigInt string"),
+                        ));
+                    }
+                };
+                return match BigIntValue::parse_string(&utf8) {
+                    Ok(bigint) => allocate_bigint(machine, &bigint),
+                    Err(error) => Err(bigint_failure(machine, error)),
+                };
+            }
             let index = machine
                 .runtime_slot(primitive)
                 .map_err(EvalFailure::Runtime)?
                 .expect("heap reference decodes to a slot");
             match &machine.heap[index] {
                 HeapEntry::BigInt(_) => Ok(primitive),
-                HeapEntry::String(text) => {
-                    let text = text.clone();
-                    let utf8 = match text.to_utf8_strict() {
-                        Ok(text) => text,
-                        Err(_) => {
-                            return Err(bigint_failure(
-                                machine,
-                                BigIntError::Syntax("invalid BigInt string"),
-                            ));
-                        }
-                    };
-                    match BigIntValue::parse_string(&utf8) {
-                        Ok(bigint) => allocate_bigint(machine, &bigint),
-                        Err(error) => Err(bigint_failure(machine, error)),
-                    }
-                }
                 HeapEntry::Symbol { .. } | HeapEntry::PrivateName { .. } => {
                     Err(type_error("Cannot convert a Symbol value to a BigInt"))
                 }
@@ -1547,7 +1546,7 @@ pub(crate) fn strict_equals<H: Host>(
 /// objects to primitives first, per ECMA-262 §7.2.15). `None` means no BigInt
 /// participates and the caller's path applies.
 pub(crate) fn loose_equals<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     left: Value,
     right: Value,
 ) -> Result<Option<bool>, EvalFailure> {
@@ -1560,49 +1559,36 @@ pub(crate) fn loose_equals<H: Host>(
         (None, None) => Ok(None),
     }
 }
-
 fn compare_equal_with_non_bigint<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     bigint: &BigIntValue,
     other: Value,
 ) -> Result<bool, EvalFailure> {
-    match other.decode() {
-        Some(Decoded::Undefined) | Some(Decoded::Null) => Ok(false),
-        Some(Decoded::Boolean(flag)) => {
-            Ok(bigint.cmp(&BigIntValue::from_u64(u64::from(flag))) == std::cmp::Ordering::Equal)
-        }
-        Some(Decoded::Number(_)) | Some(Decoded::Int32(_)) => Ok(bigint
-            .compare_with_f64(numeric_f64(other).expect("number decodes"))
-            .is_some_and(|order| order == std::cmp::Ordering::Equal)),
-        Some(Decoded::HeapRef(_)) => {
-            let index = machine
-                .runtime_slot(other)
-                .map_err(EvalFailure::Runtime)?
-                .expect("heap reference decodes to a slot");
-            match &machine.heap[index] {
-                HeapEntry::String(text) => {
-                    let text = text.clone();
-                    match text.to_utf8_strict() {
-                        Ok(utf8) => Ok(match BigIntValue::parse_string(&utf8) {
-                            Ok(parsed) => parsed.cmp(bigint) == std::cmp::Ordering::Equal,
-                            Err(_) => false,
-                        }),
-                        Err(_) => Ok(false),
-                    }
-                }
-                HeapEntry::Symbol { .. } | HeapEntry::PrivateName { .. } => Ok(false),
-                _ => Ok(false),
-            }
-        }
-        _ => Ok(false),
+    if let Some(text) = machine.string_value(other)
+        && let Ok(utf8) = text.to_utf8_strict()
+    {
+        return Ok(match BigIntValue::parse_string(&utf8) {
+            Ok(parsed) => parsed.cmp(bigint) == std::cmp::Ordering::Equal,
+            Err(_) => false,
+        });
     }
+    Ok(match other.decode() {
+        Some(Decoded::Undefined) | Some(Decoded::Null) => false,
+        Some(Decoded::Boolean(flag)) => {
+            bigint.cmp(&BigIntValue::from_u64(u64::from(flag))) == std::cmp::Ordering::Equal
+        }
+        Some(Decoded::Number(_)) | Some(Decoded::Int32(_)) => bigint
+            .compare_with_f64(numeric_f64(other).expect("number decodes"))
+            .is_some_and(|order| order == std::cmp::Ordering::Equal),
+        _ => false,
+    })
 }
 
 /// Relational comparison contribution over primitive operands. The outer
 /// `None` means no BigInt participates; `Some(None)` preserves unordered
 /// Number comparisons such as `1n < NaN`.
 pub(crate) fn compare<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     left: Value,
     right: Value,
 ) -> Result<Option<Option<std::cmp::Ordering>>, EvalFailure> {
@@ -1621,13 +1607,11 @@ pub(crate) fn compare<H: Host>(
 }
 
 fn compare_relational_non_bigint<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     bigint: &BigIntValue,
     other: Value,
 ) -> Result<Option<std::cmp::Ordering>, EvalFailure> {
-    if let Some(index) = machine.runtime_slot(other).map_err(EvalFailure::Runtime)?
-        && let HeapEntry::String(text) = &machine.heap[index]
-    {
+    if let Some(text) = machine.string_value(other) {
         let Ok(utf8) = text.to_utf8_strict() else {
             return Ok(None);
         };

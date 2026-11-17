@@ -4062,7 +4062,7 @@ mod tests {
     fn same_value_handles_nan_and_signed_zero_across_number_and_int32() {
         let module = blank_program("<test>");
         let mut host = TestHost;
-        let machine = Machine::new(&module, &mut host, Limits::default());
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
 
         let nan = Value::number(f64::NAN);
         let pos_zero = Value::number(0.0);
@@ -4072,44 +4072,44 @@ mod tests {
 
         // Number/Number: NaN equals NaN, and +0/-0 stay distinct.
         assert!(
-            same_value(&machine, nan, nan),
+            same_value(&mut machine, nan, nan),
             "NaN === NaN under SameValue"
         );
         assert!(
-            !same_value(&machine, nan, pos_zero),
+            !same_value(&mut machine, nan, pos_zero),
             "NaN !== 0 under SameValue"
         );
         assert!(
-            !same_value(&machine, pos_zero, neg_zero),
+            !same_value(&mut machine, pos_zero, neg_zero),
             "+0 !== -0 under SameValue"
         );
         assert!(
-            same_value(&machine, neg_zero, neg_zero),
+            same_value(&mut machine, neg_zero, neg_zero),
             "-0 === -0 under SameValue"
         );
-        assert!(same_value(&machine, pos_zero, pos_zero), "+0 === +0");
+        assert!(same_value(&mut machine, pos_zero, pos_zero), "+0 === +0");
 
         // Number/Int32: the Int32 side is always finite, so NaN can only come
         // from the Number side and must NOT match any integer. Int32(0) is
         // +0.0, so -0.0 must be distinct from it while +0.0 matches.
         assert!(
-            !same_value(&machine, nan, int_zero),
+            !same_value(&mut machine, nan, int_zero),
             "NaN !== Int32(0) under SameValue"
         );
         assert!(
-            !same_value(&machine, int_zero, nan),
+            !same_value(&mut machine, int_zero, nan),
             "Int32(0) !== NaN under SameValue (symmetric)"
         );
         assert!(
-            same_value(&machine, pos_zero, int_zero),
+            same_value(&mut machine, pos_zero, int_zero),
             "+0.0 === Int32(0)"
         );
         assert!(
-            !same_value(&machine, neg_zero, int_zero),
+            !same_value(&mut machine, neg_zero, int_zero),
             "-0.0 !== Int32(0): signed-zero distinction crosses the mixed branch"
         );
         assert!(
-            same_value(&machine, Value::number(5.0), int_five),
+            same_value(&mut machine, Value::number(5.0), int_five),
             "5.0 === Int32(5)"
         );
     }
@@ -4118,17 +4118,17 @@ mod tests {
     fn same_value_negative_int32_matches_equivalent_number() {
         let module = blank_program("<test>");
         let mut host = TestHost;
-        let machine = Machine::new(&module, &mut host, Limits::default());
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
 
         let neg_one_number = Value::number(-1.0);
         let neg_one_int32 = Value::int32((-1i32) as u32);
 
         assert!(
-            same_value(&machine, neg_one_number, neg_one_int32),
+            same_value(&mut machine, neg_one_number, neg_one_int32),
             "-1.0 === Int32(-1) under SameValue"
         );
         assert!(
-            same_value(&machine, neg_one_int32, neg_one_number),
+            same_value(&mut machine, neg_one_int32, neg_one_number),
             "Int32(-1) === -1.0 under SameValue (symmetric)"
         );
 
@@ -4136,17 +4136,17 @@ mod tests {
         // not be confused with the positive Number 4_294_967_295.0.
         let large_unsigned = Value::number(4_294_967_295.0);
         assert!(
-            !same_value(&machine, large_unsigned, neg_one_int32),
+            !same_value(&mut machine, large_unsigned, neg_one_int32),
             "4_294_967_295.0 !== Int32(-1)"
         );
 
         // NaN and signed zero must remain untouched.
         assert!(
-            !same_value(&machine, Value::number(f64::NAN), neg_one_int32),
+            !same_value(&mut machine, Value::number(f64::NAN), neg_one_int32),
             "NaN !== Int32(-1) under SameValue"
         );
         assert!(
-            !same_value(&machine, Value::number(-0.0), Value::int32(0)),
+            !same_value(&mut machine, Value::number(-0.0), Value::int32(0)),
             "-0.0 !== Int32(0) under SameValue"
         );
     }

@@ -1546,7 +1546,7 @@ impl<'a, H: Host> Machine<'a, H> {
     /// `+0` and `-0` are distinct. Mirrors the helper in `object.rs`; kept here
     /// so `validate_property_redefinition` does not depend on a private free
     /// function in another module.
-    fn same_value(&self, left: Value, right: Value) -> bool {
+    fn same_value(&mut self, left: Value, right: Value) -> bool {
         match (left.decode(), right.decode()) {
             (Some(Decoded::Number(a)), Some(Decoded::Number(b))) => {
                 if a.is_nan() && b.is_nan() {
@@ -1570,7 +1570,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
     fn validate_property_redefinition(
-        &self,
+        &mut self,
         current: Option<&Property>,
         next: &Property,
     ) -> Result<(), EvalFailure> {
@@ -2154,7 +2154,10 @@ impl<'a, H: Host> Machine<'a, H> {
                 Some(index) if matches!(self.heap[index], HeapEntry::PrivateName { .. }) => {
                     PropertyKey::Private(index as u32)
                 }
-                _ => PropertyKey::Named(self.intern(self.to_string(primitive)?)),
+                _ => {
+                    let text = self.to_string(primitive)?;
+                    PropertyKey::Named(self.intern(text))
+                }
             },
         )
     }

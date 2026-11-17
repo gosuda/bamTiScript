@@ -168,11 +168,13 @@ pub(super) fn own_keys<H: Host>(
     else {
         return Ok(stored);
     };
-    let HeapEntry::String(text) = &machine.heap[index] else {
+    if !matches!(
+        &machine.heap[index],
+        HeapEntry::String(_) | HeapEntry::Rope { .. }
+    ) {
         return Ok(stored);
-    };
-
-    let len = text.len_units();
+    }
+    let len = machine.string_len(index);
     let mut indices = BTreeMap::new();
     for offset in 0..len {
         let index_key = PropertyKey::Named(machine.intern_str(&offset.to_string()));
