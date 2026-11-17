@@ -625,6 +625,20 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_include_the_syntax_errors_of_the_scanner_and_parser() {
+        let (root, mut state) = state("let text = \"unterminated;\r\n");
+        let diagnostics = state.diagnostics("a.ts").expect("diagnostics");
+        assert!(
+            diagnostics.iter().any(|item| {
+                item.severity == DiagnosticSeverity::Error
+                    && item.range.start() == Utf16Pos::new(25)
+            }),
+            "{diagnostics:?}"
+        );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
     fn diagnostics_and_failure_paths_are_public_data() {
         let (root, mut state) = state("const value: number = 'wrong';");
         assert!(

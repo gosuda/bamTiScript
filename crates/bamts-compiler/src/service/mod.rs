@@ -551,7 +551,10 @@ fn build_snapshot_with_cancel<F: FileSystem>(
         cancel.clone(),
     )
     .map_err(|_| ServiceError::Cancelled)?;
-    let mut diagnostics = semantic.diagnostics().to_vec();
+    let mut diagnostics = parsed.diagnostics().to_vec();
+    diagnostics.extend_from_slice(semantic.diagnostics());
+    diagnostics.sort();
+    diagnostics.dedup();
     if let Some(config) = resolution {
         let host = ServiceResolutionHost { filesystem };
         diagnostics.extend(collect_resolution_diagnostics(
