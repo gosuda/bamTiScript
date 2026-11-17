@@ -1032,9 +1032,7 @@ pub enum Instruction {
     },
     /// Throw a `ReferenceError` when the global `name` is unbound, without
     /// reading its value or invoking any accessor.
-    RequireGlobalBinding {
-        name: ConstantId,
-    },
+    RequireGlobalBinding { name: ConstantId },
     /// Throw a new error built from the realm's intrinsic `kind` constructor
     /// with the string constant `message`.
     ThrowIntrinsicError {

@@ -35,9 +35,8 @@ use crate::vm::generator_async::GeneratorCompletion;
 use bamts_bytecode::{
     AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, DisposeHint, EcmaString,
     EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IntrinsicErrorKind,
-    IteratorCloseMode,
-    IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, ResolvedExport, UnaryOp, Verified,
-    format_number,
+    IteratorCloseMode, IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, ResolvedExport,
+    UnaryOp, Verified, format_number,
 };
 pub use bamts_cancel::CancellationToken;
 use bamts_native::{Decoded, SlotId, Value};
@@ -3813,7 +3812,8 @@ impl<'a, H: Host> Machine<'a, H> {
         let name = self
             .allocate(HeapEntry::String(EcmaString::encode(name)))
             .map_err(EvalFailure::Runtime)?;
-        let properties = intrinsics::function_properties(&mut self.atoms, &mut self.shapes, 0, name);
+        let properties =
+            intrinsics::function_properties(&mut self.atoms, &mut self.shapes, 0, name);
         self.allocate(HeapEntry::native_function(
             NativeCallable::Bound(Box::new(BoundCallable {
                 target,
@@ -8687,7 +8687,11 @@ impl<'a, H: Host> Machine<'a, H> {
     /// A thrown error object built from the realm's own `constructor`
     /// intrinsic, whatever guest code has since stored in the global binding
     /// of that name.
-    pub(crate) fn intrinsic_error(&mut self, constructor: &str, message: EcmaString) -> EvalFailure {
+    pub(crate) fn intrinsic_error(
+        &mut self,
+        constructor: &str,
+        message: EcmaString,
+    ) -> EvalFailure {
         let id = self
             .intrinsics
             .builtins
@@ -19685,7 +19689,10 @@ mod tests {
     ) -> usize {
         let id = machine.intrinsics.builtins.id_named(constructor).unwrap();
         let expected = machine.intrinsics.error_prototype(id);
-        let slot = machine.runtime_slot(value).unwrap().expect("an error object");
+        let slot = machine
+            .runtime_slot(value)
+            .unwrap()
+            .expect("an error object");
         let HeapEntry::Object { prototype, .. } = &machine.heap[slot] else {
             panic!("{constructor} must be an ordinary object");
         };
@@ -20040,7 +20047,9 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter_map(|key| match key {
-                PropertyKey::Named(atom) => Some(machine.resolve_atom(atom).to_utf8_lossy().to_string()),
+                PropertyKey::Named(atom) => {
+                    Some(machine.resolve_atom(atom).to_utf8_lossy().to_string())
+                }
                 _ => None,
             })
             .collect();
@@ -20091,7 +20100,10 @@ mod tests {
         verified(constants, vec![entry])
     }
 
-    fn caught_error(program: &Program<Verified>, check: impl FnOnce(&mut Machine<'_, TestHost>, Value)) {
+    fn caught_error(
+        program: &Program<Verified>,
+        check: impl FnOnce(&mut Machine<'_, TestHost>, Value),
+    ) {
         let mut host = TestHost;
         let mut machine = Machine::new(program, &mut host, Limits::default());
         let caught = machine.evaluate().unwrap().value;
@@ -20120,7 +20132,12 @@ mod tests {
             Instruction::RequireGlobalBinding { name: cid(0) },
         );
         caught_error(&program, |machine, error| {
-            assert_intrinsic_error(machine, error, "ReferenceError", "undeclared is not defined");
+            assert_intrinsic_error(
+                machine,
+                error,
+                "ReferenceError",
+                "undeclared is not defined",
+            );
             assert_constructed_error_shape(machine, error);
         });
     }

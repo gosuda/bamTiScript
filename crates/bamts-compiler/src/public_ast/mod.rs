@@ -31,8 +31,8 @@ use crate::syntax::{
     JsxAttributeNode, JsxClosingElementNode, JsxExpressionContainerNode, JsxOpeningElementNode,
     JsxSpreadAttributeNode, JsxSpreadChildNode, JsxTextNode, NodeId, NodeKind, ObjectMemberNode,
     ParameterNode, Pattern, PrivateIdentifierNode, SourceFile, Stmt, StringLiteralNode,
-    SwitchCaseNode, SyntaxKind, Token,
-    Ty, TypeAnnotationNode, TypeMemberNode, TypeParameterNode, VariableDeclaratorNode,
+    SwitchCaseNode, SyntaxKind, Token, Ty, TypeAnnotationNode, TypeMemberNode, TypeParameterNode,
+    VariableDeclaratorNode,
 };
 
 /// A borrowed reference to any node of the public AST.

@@ -34,9 +34,8 @@ use bamts_bytecode::{
     AccessorKind, BigIntLiteral, BinaryOp, Constant, ConstantId, DescriptorSlot, DisposeHint,
     EcmaString, ExceptionHandler, Function, FunctionFlags, FunctionId, Instruction,
     IntrinsicErrorKind, IteratorCloseMode, IteratorKind, MAX_BIGINT_BYTES, MAX_CONSTANTS,
-    MAX_FUNCTIONS,
-    MAX_INSTRUCTIONS, MAX_REGISTERS, Module, NumberBits, Pc, RESUME_RETURN, RESUME_THROW, Register,
-    UnaryOp, Verified, VerifyError,
+    MAX_FUNCTIONS, MAX_INSTRUCTIONS, MAX_REGISTERS, Module, NumberBits, Pc, RESUME_RETURN,
+    RESUME_THROW, Register, UnaryOp, Verified, VerifyError,
 };
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -11900,9 +11899,7 @@ mod tests {
             )
             .expect("snippet lowers to a verified module");
             let constants = module.constants();
-            let named = |id: ConstantId| {
-                matches!(&constants[id.get() as usize], Constant::String(text) if text.eq_ascii(name))
-            };
+            let named = |id: ConstantId| matches!(&constants[id.get() as usize], Constant::String(text) if text.eq_ascii(name));
             module.functions()[module.entry().get() as usize]
                 .code()
                 .iter()
@@ -11945,10 +11942,13 @@ mod tests {
         ] {
             let module = lower_js(src);
             let constants = module.constants();
-            let names = |id: ConstantId, wanted: &[&str]| {
-                matches!(&constants[id.get() as usize], Constant::String(text) if wanted.iter().any(|name| text.eq_ascii(name)))
+            let names = |id: ConstantId, wanted: &[&str]| matches!(&constants[id.get() as usize], Constant::String(text) if wanted.iter().any(|name| text.eq_ascii(name)));
+            let code = || {
+                module
+                    .functions()
+                    .iter()
+                    .flat_map(|function| function.code())
             };
-            let code = || module.functions().iter().flat_map(|function| function.code());
             assert!(
                 !code().any(|instruction| matches!(*instruction, Instruction::LoadGlobal { name, .. } if names(name, &["TypeError", "ReferenceError"]))),
                 "{src}"
@@ -17213,7 +17213,10 @@ mod tests {
 
     #[test]
     fn value_reads_of_a_left_deep_call_chain_do_not_overflow() {
-        assert_eq!(read_names(left_deep_chain("f", &["(a)"])), names(&["a", "f"]));
+        assert_eq!(
+            read_names(left_deep_chain("f", &["(a)"])),
+            names(&["a", "f"])
+        );
     }
 
     #[test]

@@ -943,9 +943,16 @@ mod tests {
             script_fixture("language-errors", LANGUAGE_ERRORS).expect("the fixture");
         let executable = compile_source_file(&entrypoint).expect("the fixture compiles");
         let mut host = bamts_node::NodeHost::new();
-        bamts_runtime::run(executable.wire(), &mut host, &bamts_runtime::Limits::default())
-            .expect("the interpreter runs the program");
-        assert_eq!(String::from_utf8_lossy(host.stdout()), LANGUAGE_ERROR_OUTPUT);
+        bamts_runtime::run(
+            executable.wire(),
+            &mut host,
+            &bamts_runtime::Limits::default(),
+        )
+        .expect("the interpreter runs the program");
+        assert_eq!(
+            String::from_utf8_lossy(host.stdout()),
+            LANGUAGE_ERROR_OUTPUT
+        );
         let compiled = bamts_codegen::compile_jit(executable.wire()).expect("the JIT compiles");
         let mut host = bamts_node::NodeHost::new();
         let (tiered, _) = bamts_runtime::run_linked_program_tiered(

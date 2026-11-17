@@ -1915,11 +1915,9 @@ fn run_jit_program(
     limits: &Limits,
 ) -> Result<CommandOutcome, DriverError> {
     let program = bamts_codegen::compile_jit_with_cancel(inputs.executable.wire(), cancel)
-        .map_err(|error| {
-            match error {
-                bamts_codegen::JitError::Cancelled => DriverError::Cancelled,
-                error => DriverError::Jit(error),
-            }
+        .map_err(|error| match error {
+            bamts_codegen::JitError::Cancelled => DriverError::Cancelled,
+            error => DriverError::Jit(error),
         })?;
     let mut host = inputs.host()?;
     let (tiered, _) = run_linked_program_tiered(
@@ -1938,7 +1936,10 @@ fn run_jit_program(
 /// Runs a program in the AOT tier. Its image is a linked executable in its own
 /// process with the program limits and the CLI argv, so the caller's budget does
 /// not reach it; cancellation terminates the child.
-fn run_aot(inputs: RunInputs<'_>, cancel: &CancellationToken) -> Result<CommandOutcome, DriverError> {
+fn run_aot(
+    inputs: RunInputs<'_>,
+    cancel: &CancellationToken,
+) -> Result<CommandOutcome, DriverError> {
     let args = inputs.args;
     let entrypoint = inputs.entrypoint;
     let context = inputs.context;
