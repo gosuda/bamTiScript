@@ -68,9 +68,9 @@ use bamts_native::{
 use crate::intrinsics::BuiltinOutcome;
 use crate::vm::generator_async::GeneratorCompletion;
 use crate::{
-    CalleeKind, EvalFailure, Execution, ExecutionOutcome, GeneratorResume, GeneratorStart,
-    GetOutcome, HeapEntry, Host, IteratorNextPrepared, Limits, Machine, Property, PropertyMap,
-    RuntimeError, RuntimeErrorKind, SetOutcome, SuspendedActivation, ThrowOrigin,
+    ArrayElementKind, CalleeKind, EvalFailure, Execution, ExecutionOutcome, GeneratorResume,
+    GeneratorStart, GetOutcome, HeapEntry, Host, IteratorNextPrepared, Limits, Machine, Property,
+    PropertyMap, RuntimeError, RuntimeErrorKind, SetOutcome, SuspendedActivation, ThrowOrigin,
     accessor_from_selector, binary_from_selector, iterator_kind_from_selector, unary_from_selector,
 };
 
@@ -3429,6 +3429,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         let sloppy = self.running_is_sloppy();
         let properties = self.machine.borrow_mut().arguments_properties(sloppy);
         let allocated = self.machine.borrow_mut().allocate(HeapEntry::Array {
+            kind: ArrayElementKind::for_elements(&args),
             elements: args,
             properties,
             prototype: Some(prototype),
@@ -4088,6 +4089,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 HelperCall::CreateArray => {
                     let prototype = self.machine.borrow().intrinsics.array_prototype;
                     self.allocated(HeapEntry::Array {
+                        kind: ArrayElementKind::for_elements(&[]),
                         elements: Vec::new(),
                         properties: PropertyMap::default(),
                         prototype: Some(prototype),
@@ -4097,8 +4099,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::CreateCell => {
                     let prototype = self.machine.borrow().intrinsics.array_prototype;
+                    let elements = vec![Value::UNINITIALIZED];
                     self.allocated(HeapEntry::Array {
-                        elements: vec![Value::UNINITIALIZED],
+                        kind: ArrayElementKind::for_elements(&elements),
+                        elements,
                         properties: PropertyMap::default(),
                         prototype: Some(prototype),
                         extensible: true,
@@ -4927,8 +4931,8 @@ mod tests {
     use crate::intrinsics::{BuiltinDef, BuiltinHandler, BuiltinOutcome, native_function};
     use crate::vm::generator_async::GeneratorCompletion;
     use crate::{
-        EvalFailure, GeneratorState, HeapEntry, Host, Limits, Machine, Property, PropertyKey,
-        PropertyMap, RuntimeError, RuntimeErrorKind, ThrowOrigin,
+        ArrayElementKind, EvalFailure, GeneratorState, HeapEntry, Host, Limits, Machine, Property,
+        PropertyKey, PropertyMap, RuntimeError, RuntimeErrorKind, ThrowOrigin,
     };
 
     use super::EcmaString;
@@ -8718,6 +8722,7 @@ mod tests {
             let array_prototype = machine.intrinsics.array_prototype;
             let arguments = machine
                 .allocate(HeapEntry::Array {
+                    kind: ArrayElementKind::for_elements(&[]),
                     elements: Vec::new(),
                     properties: PropertyMap::default(),
                     prototype: Some(array_prototype),
@@ -9476,6 +9481,7 @@ mod tests {
                 .machine
                 .borrow_mut()
                 .allocate(HeapEntry::Array {
+                    kind: ArrayElementKind::for_elements(&[]),
                     elements: Vec::new(),
                     properties: PropertyMap::default(),
                     prototype: Some(prototype),

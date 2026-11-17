@@ -1,8 +1,8 @@
 use super::{BuiltinDef, BuiltinOutcome, BuiltinTable, native_function, push};
 use crate::GetOutcome;
 use crate::{
-    EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap, ShapeTable,
-    ThrowOrigin,
+    ArrayElementKind, EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap,
+    ShapeTable, ThrowOrigin,
 };
 use bamts_bytecode::{DescriptorSlot, EcmaString};
 use bamts_native::{Decoded, Value};
@@ -301,6 +301,7 @@ fn allocate_array<H: Host>(
 ) -> Result<Value, EvalFailure> {
     machine
         .allocate(HeapEntry::Array {
+            kind: ArrayElementKind::for_elements(&elements),
             elements,
             properties: PropertyMap::default(),
             prototype: Some(machine.intrinsics.array_prototype),
@@ -399,6 +400,7 @@ fn uri_error(operation: &'static str) -> EvalFailure {
     EvalFailure::Throw(ThrowOrigin::UriError { operation })
 }
 fn define_array_length(
+    kind: &mut crate::ArrayElementKind,
     elements: &mut Vec<Value>,
     properties: &mut PropertyMap,
     atoms: &crate::AtomTable,
@@ -409,7 +411,7 @@ fn define_array_length(
     if !length_writable && length != elements.len() {
         return Err(type_error("Cannot redefine non-writable array length"));
     }
-    if crate::apply_array_length(elements, properties, atoms, length, shapes) {
+    if crate::apply_array_length(kind, elements, properties, atoms, length, shapes) {
         Ok(())
     } else {
         Err(type_error("define array length"))
@@ -1738,6 +1740,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 let HeapEntry::Array {
                     elements,
                     properties,
+                    kind,
                     length_writable,
                     ..
                 } = &mut self.heap[index]
@@ -1745,6 +1748,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     unreachable!("array checked above");
                 };
                 let result = define_array_length(
+                    kind,
                     elements,
                     properties,
                     &self.atoms,
@@ -1966,17 +1970,19 @@ impl<'a, H: Host> Machine<'a, H> {
         self.validate_property_redefinition(current.as_ref(), &descriptor)?;
         self.charge_slot(index, property_growth.saturating_add(element_growth))
             .map_err(EvalFailure::Runtime)?;
+        let mut hole_store = None;
         match &mut self.heap[index] {
             HeapEntry::Array {
                 elements,
                 properties,
+                kind,
                 length_writable,
                 ..
             } => {
                 if let Some(offset) = array_index {
                     if elements.len() <= offset {
                         crate::array_set_length(
-                            elements,
+                            crate::ArrayVector { kind, elements },
                             properties,
                             &self.atoms,
                             *length_writable,
@@ -1985,7 +1991,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             &self.shapes,
                         )?;
                     }
-                    elements[offset] = Value::HOLE;
+                    hole_store = Some(offset);
                 }
                 properties.insert(&mut self.shapes, key, descriptor);
             }
@@ -2013,6 +2019,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties.insert(&mut self.shapes, key, descriptor);
             }
             _ => unreachable!("validated object cannot change heap entry kind"),
+        }
+        if let Some(offset) = hole_store {
+            self.store_element(index, offset, Value::HOLE);
         }
         self.refund_slot(index, property_refund);
         Ok(())
@@ -2823,6 +2832,7 @@ mod tests {
             .expect("AggregateError exists");
         let errors_array = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[error]),
                 elements: vec![error],
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),
@@ -2973,6 +2983,11 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let array = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[
+                    Value::int32(1),
+                    Value::int32(2),
+                    Value::int32(3),
+                ]),
                 elements: vec![Value::int32(1), Value::int32(2), Value::int32(3)],
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),

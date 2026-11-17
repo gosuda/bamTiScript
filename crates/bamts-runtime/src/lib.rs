@@ -1628,6 +1628,62 @@ enum CollectionKind {
     WeakSet,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ArrayElementKind {
+    Int32,
+    Number,
+    Any,
+}
+
+/// An array's element vector together with the kind that describes it.
+pub(crate) struct ArrayVector<'a> {
+    pub(crate) kind: &'a mut ArrayElementKind,
+    pub(crate) elements: &'a mut Vec<Value>,
+}
+
+impl ArrayElementKind {
+    fn of_value(value: Value) -> Self {
+        match value.decode() {
+            Some(Decoded::Int32(_)) => Self::Int32,
+            Some(Decoded::Number(_)) => Self::Number,
+            _ => Self::Any,
+        }
+    }
+
+    pub(crate) fn including(self, value: Value) -> Self {
+        self.max(Self::of_value(value))
+    }
+
+    pub(crate) fn for_elements(elements: &[Value]) -> Self {
+        elements
+            .iter()
+            .fold(Self::Int32, |kind, value| kind.including(*value))
+    }
+
+    fn admits(self, value: Value) -> bool {
+        self >= Self::of_value(value)
+    }
+
+    fn matches(self, elements: &[Value]) -> bool {
+        elements.iter().all(|value| self.admits(*value))
+    }
+}
+
+fn install_element_vector(heap: &mut [HeapEntry], array_slot: usize, elements: Vec<Value>) {
+    let kind = ArrayElementKind::for_elements(&elements);
+    let HeapEntry::Array {
+        elements: current,
+        kind: stored_kind,
+        ..
+    } = &mut heap[array_slot]
+    else {
+        unreachable!("element vector replacement requires an array slot");
+    };
+    *current = elements;
+    *stored_kind = kind;
+    debug_assert!(kind.matches(current));
+}
+
 #[derive(Clone, Debug)]
 enum HeapEntry {
     Vacant,
@@ -1640,6 +1696,7 @@ enum HeapEntry {
         extensible: bool,
     },
     Array {
+        kind: ArrayElementKind,
         elements: Vec<Value>,
         properties: PropertyMap,
         prototype: Option<Value>,
@@ -2673,6 +2730,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let template_objects = intrinsics::push(
             &mut heap,
             HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[]),
                 elements: Vec::new(),
                 properties: PropertyMap::default(),
                 prototype: None,
@@ -2704,10 +2762,7 @@ impl<'a, H: Host> Machine<'a, H> {
             unreachable!("process.argv is an engine array");
         };
         let argv_index = argv_id.slot() as usize - 1;
-        let HeapEntry::Array { elements, .. } = &mut heap[argv_index] else {
-            unreachable!("process.argv is an array");
-        };
-        *elements = argv_values;
+        install_element_vector(&mut heap, argv_index, argv_values);
         let intrinsic_slots = heap.len();
         let slot_bytes = vec![0; intrinsic_slots];
         let intrinsic_slot_credits = vec![0; intrinsic_slots];
@@ -4612,10 +4667,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
         };
         let bytes = values.len().saturating_mul(std::mem::size_of::<Value>());
-        let HeapEntry::Array { elements, .. } = &mut self.heap[array_index] else {
-            unreachable!("create_array returned a non-array");
-        };
-        *elements = values;
+        self.replace_element_vector(array_index, values);
         self.transfer_slot_charge(aggregate_index, array_index, bytes);
         Ok(array)
     }
@@ -4687,6 +4739,7 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn create_array(&mut self, elements: Vec<Value>) -> Result<Value, EvalFailure> {
         self.allocate(HeapEntry::Array {
+            kind: ArrayElementKind::for_elements(&elements),
             elements,
             properties: PropertyMap::default(),
             prototype: Some(self.intrinsics.array_prototype),
@@ -6251,6 +6304,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 Instruction::CreateArray { dst } => {
                     let value = self
                         .allocate(HeapEntry::Array {
+                            kind: ArrayElementKind::for_elements(&[]),
                             elements: Vec::new(),
                             properties: PropertyMap::default(),
                             prototype: Some(self.intrinsics.array_prototype),
@@ -6262,9 +6316,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.frames[frame_index].pc = pc + 1;
                 }
                 Instruction::CreateCell { dst } => {
+                    let elements = vec![Value::UNINITIALIZED];
                     let value = self
                         .allocate(HeapEntry::Array {
-                            elements: vec![Value::UNINITIALIZED],
+                            kind: ArrayElementKind::for_elements(&elements),
+                            elements,
                             properties: PropertyMap::default(),
                             prototype: Some(self.intrinsics.array_prototype),
                             extensible: true,
@@ -7827,6 +7883,7 @@ impl<'a, H: Host> Machine<'a, H> {
             self.arguments_properties(self.is_sloppy(self.frames[frame].module, function));
         let value = self
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&args),
                 elements: args,
                 properties,
                 prototype: Some(self.intrinsics.array_prototype),
@@ -8460,6 +8517,27 @@ impl<'a, H: Host> Machine<'a, H> {
         })
     }
 
+    pub(crate) fn store_element(&mut self, array_slot: usize, index: usize, value: Value) {
+        let HeapEntry::Array { elements, kind, .. } = &mut self.heap[array_slot] else {
+            unreachable!("element store requires an array slot");
+        };
+        let next_kind = kind.including(value);
+        debug_assert!(next_kind.admits(value));
+        if index == elements.len() {
+            elements.push(value);
+        } else {
+            elements[index] = value;
+        }
+        *kind = next_kind;
+        if elements.len() <= 64 {
+            debug_assert!(next_kind.matches(elements));
+        }
+    }
+
+    pub(crate) fn replace_element_vector(&mut self, array_slot: usize, elements: Vec<Value>) {
+        install_element_vector(&mut self.heap, array_slot, elements);
+    }
+
     pub(crate) fn array_elements(&self, value: Value) -> Result<Option<Vec<Value>>, EvalFailure> {
         let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
             return Ok(None);
@@ -8478,6 +8556,15 @@ impl<'a, H: Host> Machine<'a, H> {
         match &self.heap[index] {
             HeapEntry::Array { elements, .. } => Ok(Some(elements.len())),
             _ => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn array_element_kind(&self, value: Value) -> Option<ArrayElementKind> {
+        let index = self.runtime_slot(value).ok().flatten()?;
+        match &self.heap[index] {
+            HeapEntry::Array { kind, .. } => Some(*kind),
+            _ => None,
         }
     }
 
@@ -8516,13 +8603,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let released = old_length
             .saturating_sub(elements.len())
             .saturating_mul(element_bytes);
-        let HeapEntry::Array {
-            elements: current, ..
-        } = &mut self.heap[index]
-        else {
-            unreachable!("array brand was checked before its heap charge");
-        };
-        *current = elements;
+        self.replace_element_vector(index, elements);
         self.refund_slot(index, released);
         Ok(())
     }
@@ -10681,12 +10762,20 @@ impl<'a, H: Host> Machine<'a, H> {
         let HeapEntry::Array {
             elements,
             properties,
+            kind,
             ..
         } = &mut self.heap[index]
         else {
             unreachable!("resize_array requires an array");
         };
-        let reached = apply_array_length(elements, properties, &self.atoms, length, &self.shapes);
+        let reached = apply_array_length(
+            kind,
+            elements,
+            properties,
+            &self.atoms,
+            length,
+            &self.shapes,
+        );
         let (new_length, new_property_bytes) =
             old_length_and_bytes(&self.heap[index], &self.shapes, &self.atoms);
         let released = old_length
@@ -10976,7 +11065,7 @@ impl<'a, H: Host> Machine<'a, H> {
         };
         self.charge_slot(index, growth)
             .map_err(EvalFailure::Runtime)?;
-        match &mut self.heap[index] {
+        let direct_store = match &mut self.heap[index] {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Generator { properties, .. }
             | HeapEntry::AsyncGenerator { properties, .. }
@@ -11020,21 +11109,23 @@ impl<'a, H: Host> Machine<'a, H> {
                     },
                 };
                 properties.insert(&mut self.shapes, key, descriptor);
-                Ok(())
+                None
             }
             HeapEntry::Array {
                 elements,
                 properties,
+                kind,
                 length_writable,
                 ..
             } => {
+                let mut direct_store = None;
                 match key {
                     PropertyKey::Named(name) => {
                         if let Some(offset) = self.atoms.array_index(name) {
                             let offset = offset as usize;
-                            if elements.len() <= offset {
+                            if elements.len() < offset {
                                 array_set_length(
-                                    elements,
+                                    ArrayVector { kind, elements },
                                     properties,
                                     &self.atoms,
                                     *length_writable,
@@ -11049,7 +11140,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             {
                                 *stored = value;
                             } else {
-                                elements[offset] = value;
+                                direct_store = Some(offset);
                             }
                         } else {
                             let key = PropertyKey::Named(name);
@@ -11098,13 +11189,19 @@ impl<'a, H: Host> Machine<'a, H> {
                         properties.insert(&mut self.shapes, identity, descriptor);
                     }
                 }
-                Ok(())
+                direct_store
             }
-            HeapEntry::ProcessEnv { .. } => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "set internal process environment",
-            })),
+            HeapEntry::ProcessEnv { .. } => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "set internal process environment",
+                }));
+            }
             _ => unreachable!("primitive and identity entries rejected above"),
+        };
+        if let Some(offset) = direct_store {
+            self.store_element(index, offset, value);
         }
+        Ok(())
     }
 
     fn define_accessor(
@@ -11354,7 +11451,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         bounds.out_of_bounds || offset >= bounds.element_length
                     }));
                 }
-                let released = match &mut self.heap[index] {
+                let (released, hole_store) = match &mut self.heap[index] {
                     HeapEntry::Object { properties, .. }
                     | HeapEntry::Generator { properties, .. }
                     | HeapEntry::AsyncGenerator { properties, .. }
@@ -11388,9 +11485,9 @@ impl<'a, H: Host> Machine<'a, H> {
                             .charge_bytes(&self.atoms)
                             .saturating_add(property.charge_bytes());
                         properties.remove(&self.shapes, key);
-                        released
+                        (released, None)
                     }
-                    HeapEntry::Proxy { .. } => 0,
+                    HeapEntry::Proxy { .. } => (0, None),
                     HeapEntry::Array {
                         elements,
                         properties,
@@ -11404,19 +11501,20 @@ impl<'a, H: Host> Machine<'a, H> {
                                 .charge_bytes(&self.atoms)
                                 .saturating_add(property.charge_bytes());
                             properties.remove(&self.shapes, key);
-                            released
+                            (released, None)
                         } else {
+                            let mut hole_store = None;
                             if let PropertyKey::Named(name) = key {
                                 if self.atoms.eq_ascii(*name, "length") {
                                     return Ok(false);
                                 }
                                 if let Some(offset) = self.atoms.array_index(*name)
-                                    && let Some(element) = elements.get_mut(offset as usize)
+                                    && elements.get(offset as usize).is_some()
                                 {
-                                    *element = Value::HOLE;
+                                    hole_store = Some(offset as usize);
                                 }
                             }
-                            0
+                            (0, hole_store)
                         }
                     }
                     // An environment variable is always configurable, so this
@@ -11443,6 +11541,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::ExternalModuleNamespace { .. } => return Ok(false),
                     HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
                 };
+                if let Some(offset) = hole_store {
+                    self.store_element(index, offset, Value::HOLE);
+                }
                 self.refund_slot(index, released);
                 Ok(true)
             }
@@ -11532,19 +11633,14 @@ impl<'a, H: Host> Machine<'a, H> {
                         operation: "add property to non-extensible object",
                     }));
                 }
-                let next_length = offset
-                    .checked_add(1)
-                    .filter(|length| *length <= u32::MAX as usize)
-                    .ok_or(EvalFailure::Throw(ThrowOrigin::RangeError {
+                if offset >= u32::MAX as usize {
+                    return Err(EvalFailure::Throw(ThrowOrigin::RangeError {
                         operation: "push beyond maximum array length",
-                    }))?;
+                    }));
+                }
                 self.charge_slot(index, std::mem::size_of::<Value>())
                     .map_err(EvalFailure::Runtime)?;
-                let HeapEntry::Array { elements, .. } = &mut self.heap[index] else {
-                    unreachable!("array checked before its heap charge");
-                };
-                elements.resize(next_length, Value::HOLE);
-                elements[offset] = value;
+                self.store_element(index, offset, value);
                 Ok(())
             }
             None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -15173,14 +15269,20 @@ fn exact_array_length(value: Value) -> Option<usize> {
 /// Resizes to `length`, stopping above the highest non-configurable element, and
 /// says whether the whole of `length` was reached.
 pub(crate) fn apply_array_length(
+    kind: &mut ArrayElementKind,
     elements: &mut Vec<Value>,
     properties: &mut PropertyMap,
     atoms: &AtomTable,
     length: usize,
     shapes: &ShapeTable,
 ) -> bool {
+    let grew = length > elements.len();
     if length >= elements.len() {
         elements.resize(length, Value::HOLE);
+        if grew {
+            *kind = kind.including(Value::HOLE);
+        }
+        debug_assert!(kind.matches(elements));
         return true;
     }
     let blocked = properties
@@ -15200,11 +15302,12 @@ pub(crate) fn apply_array_length(
             .is_none_or(|offset| (offset as usize) < effective_length)
     });
     elements.resize(effective_length, Value::HOLE);
+    debug_assert!(kind.matches(elements));
     blocked.is_none()
 }
 
 pub(crate) fn array_set_length(
-    elements: &mut Vec<Value>,
+    vector: ArrayVector<'_>,
     properties: &mut PropertyMap,
     atoms: &AtomTable,
     length_writable: bool,
@@ -15217,7 +15320,14 @@ pub(crate) fn array_set_length(
     if !length_writable {
         return Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }));
     }
-    if apply_array_length(elements, properties, atoms, length, shapes) {
+    if apply_array_length(
+        vector.kind,
+        vector.elements,
+        properties,
+        atoms,
+        length,
+        shapes,
+    ) {
         Ok(())
     } else {
         Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }))
@@ -16174,6 +16284,7 @@ mod tests {
         with_machine(Limits::default(), |machine| {
             let array = machine
                 .allocate(HeapEntry::Array {
+                    kind: ArrayElementKind::for_elements(&[]),
                     elements: Vec::new(),
                     properties: PropertyMap::default(),
                     prototype: Some(machine.intrinsics.array_prototype),
@@ -16230,11 +16341,170 @@ mod tests {
         });
     }
 
+    struct XorShift64(u64);
+
+    impl XorShift64 {
+        fn next_u64(&mut self) -> u64 {
+            let value = self.0;
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            value
+        }
+
+        fn value(&mut self, text: Value) -> Value {
+            match self.next_u64() % 8 {
+                0..=2 => Value::int32(self.next_u64() as u32),
+                3 => Value::number((self.next_u64() % 1000) as f64 / 8.0),
+                4 => Value::number(f64::NAN),
+                5 => Value::number(-0.0),
+                6 => text,
+                _ => Value::UNDEFINED,
+            }
+        }
+    }
+
+    fn narrowest_element_kind(elements: &[Value]) -> ArrayElementKind {
+        elements
+            .iter()
+            .fold(ArrayElementKind::Int32, |kind, value| {
+                let value_kind = match value.decode() {
+                    Some(Decoded::Int32(_)) => ArrayElementKind::Int32,
+                    Some(Decoded::Number(_)) => ArrayElementKind::Number,
+                    _ => ArrayElementKind::Any,
+                };
+                kind.max(value_kind)
+            })
+    }
+
+    #[test]
+    fn element_kind_tracks_a_random_write_sequence_against_a_scan_oracle() {
+        with_machine(Limits::default(), |machine| {
+            let array = machine.create_array(Vec::new()).unwrap();
+            let slot = machine.runtime_slot(array).unwrap().unwrap();
+            let text = machine
+                .allocate(HeapEntry::String(EcmaString::encode("kind")))
+                .unwrap();
+            let mut rng = XorShift64(0x1234_5678_9abc_def0);
+            let mut expected = ArrayElementKind::Int32;
+
+            for _ in 0..2_000 {
+                let mut whole_replacement = false;
+                match rng.next_u64() % 7 {
+                    0 => {
+                        let value = rng.value(text);
+                        machine.array_push(array, value).unwrap();
+                    }
+                    1 | 2 => {
+                        let length = machine.array_length(array).unwrap();
+                        let offset = rng.next_u64() as usize % (length + 3);
+                        let key = PropertyKey::Named(machine.intern_str(&offset.to_string()));
+                        machine.set_own_data(slot, key, rng.value(text)).unwrap();
+                    }
+                    3 => {
+                        let length = machine.array_length(array).unwrap();
+                        let length = rng.next_u64() as usize % (length + 4);
+                        let key = PropertyKey::Named(machine.intern_str("length"));
+                        machine
+                            .set_own_data(slot, key, crate::number_value(length as f64))
+                            .unwrap();
+                    }
+                    4 => {
+                        let length = machine.array_length(array).unwrap();
+                        if length > 0 {
+                            let offset = rng.next_u64() as usize % length;
+                            let key = PropertyKey::Named(machine.intern_str(&offset.to_string()));
+                            machine.internal_delete(array, &key).unwrap();
+                        }
+                    }
+                    5 => {
+                        let length = 1 + rng.next_u64() as usize % 5;
+                        let elements = (0..length).map(|_| rng.value(text)).collect();
+                        machine.replace_array_elements(array, elements).unwrap();
+                        whole_replacement = true;
+                    }
+                    _ => {
+                        let value = rng.value(text);
+                        machine.array_push(array, value).unwrap();
+                    }
+                }
+
+                let elements = machine.array_elements(array).unwrap().unwrap();
+                let narrowest = narrowest_element_kind(&elements);
+                expected = if whole_replacement {
+                    narrowest
+                } else {
+                    expected.max(narrowest)
+                };
+                let stored = machine.array_element_kind(array).unwrap();
+                assert!(stored >= narrowest);
+                assert_eq!(stored, expected);
+            }
+        });
+    }
+
+    #[test]
+    fn a_deleted_element_forces_any() {
+        with_machine(Limits::default(), |machine| {
+            let array = machine.create_array(Vec::new()).unwrap();
+            machine.array_push(array, Value::int32(7)).unwrap();
+            assert_eq!(
+                machine.array_element_kind(array).unwrap(),
+                ArrayElementKind::Int32
+            );
+
+            let key = PropertyKey::Named(machine.intern_str("0"));
+            machine.internal_delete(array, &key).unwrap();
+            let elements = machine.array_elements(array).unwrap().unwrap();
+            assert_eq!(narrowest_element_kind(&elements), ArrayElementKind::Any);
+            assert_eq!(
+                machine.array_element_kind(array).unwrap(),
+                ArrayElementKind::Any
+            );
+        });
+    }
+
+    #[test]
+    fn whole_vector_replacement_recomputes_the_kind() {
+        with_machine(Limits::default(), |machine| {
+            let array = machine.create_array(Vec::new()).unwrap();
+            let text = machine
+                .allocate(HeapEntry::String(EcmaString::encode("kind")))
+                .unwrap();
+            machine.array_push(array, Value::int32(1)).unwrap();
+            machine.array_push(array, text).unwrap();
+            assert_eq!(
+                machine.array_element_kind(array).unwrap(),
+                ArrayElementKind::Any
+            );
+
+            machine
+                .replace_array_elements(array, vec![Value::int32(1), Value::int32(2)])
+                .unwrap();
+            assert_eq!(
+                machine.array_element_kind(array).unwrap(),
+                ArrayElementKind::Int32
+            );
+
+            machine
+                .replace_array_elements(
+                    array,
+                    vec![Value::int32(1), Value::number(2.5), Value::HOLE],
+                )
+                .unwrap();
+            assert_eq!(
+                machine.array_element_kind(array).unwrap(),
+                ArrayElementKind::Any
+            );
+        });
+    }
+
     #[test]
     fn nonempty_array_shrink_refunds_its_initial_element_charge() {
         with_machine(Limits::default(), |machine| {
             let array = machine
                 .allocate(HeapEntry::Array {
+                    kind: ArrayElementKind::for_elements(&[Value::int32(1), Value::int32(2)]),
                     elements: vec![Value::int32(1), Value::int32(2)],
                     properties: PropertyMap::default(),
                     prototype: Some(machine.intrinsics.array_prototype),
@@ -16284,6 +16554,7 @@ mod tests {
             );
             let array = machine
                 .allocate(HeapEntry::Array {
+                    kind: ArrayElementKind::for_elements(&[]),
                     elements: Vec::new(),
                     properties,
                     prototype: Some(machine.intrinsics.array_prototype),
@@ -16399,6 +16670,7 @@ mod tests {
         with_machine(Limits::default(), |machine| {
             let array = machine
                 .allocate(HeapEntry::Array {
+                    kind: ArrayElementKind::for_elements(&[]),
                     elements: Vec::new(),
                     properties: PropertyMap::default(),
                     prototype: Some(machine.intrinsics.array_prototype),
@@ -17538,6 +17810,7 @@ mod tests {
         let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
         let array = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[]),
                 elements: Vec::new(),
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),
@@ -19085,6 +19358,7 @@ mod tests {
             .unwrap();
         let target = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[]),
                 elements: Vec::new(),
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),
@@ -25087,6 +25361,7 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let array = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[]),
                 elements: Vec::new(),
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),
@@ -25169,6 +25444,7 @@ mod tests {
                 .unwrap();
             let array = machine
                 .allocate(HeapEntry::Array {
+                    kind: ArrayElementKind::for_elements(&[Value::int32(1), array_string]),
                     elements: vec![Value::int32(1), array_string],
                     properties: PropertyMap::default(),
                     prototype: Some(machine.intrinsics.array_prototype),
@@ -27825,6 +28101,7 @@ mod tests {
         let third = runtime_function(&mut machine, 3);
         let order = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[]),
                 elements: Vec::new(),
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),
@@ -29144,6 +29421,7 @@ mod tests {
     fn install_order_array(machine: &mut Machine<'_, TimerTestHost>) -> Value {
         let order = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[]),
                 elements: Vec::new(),
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),
@@ -31920,6 +32198,7 @@ mod tests {
                 .unwrap();
             let excluded = machine
                 .allocate(HeapEntry::Array {
+                    kind: ArrayElementKind::for_elements(&[gone]),
                     elements: vec![gone],
                     properties: PropertyMap::default(),
                     prototype: Some(machine.intrinsics.array_prototype),
@@ -31975,9 +32254,10 @@ mod tests {
                     .allocate(HeapEntry::String(EcmaString::encode(value)))
                     .unwrap()
             };
-            let array = |machine: &mut Machine<'_, TestHost>, elements| {
+            let array = |machine: &mut Machine<'_, TestHost>, elements: Vec<Value>| {
                 machine
                     .allocate(HeapEntry::Array {
+                        kind: ArrayElementKind::for_elements(&elements),
                         elements,
                         properties: PropertyMap::default(),
                         prototype: Some(machine.intrinsics.array_prototype),
@@ -32248,6 +32528,7 @@ mod tests {
         }
         let array = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&values),
                 elements: values,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),

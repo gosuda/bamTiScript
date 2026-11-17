@@ -328,7 +328,7 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
     use crate::intrinsics::{BuiltinDef, native_function};
-    use crate::{Limits, NativeCallable, PropertyMap, ThrowOrigin};
+    use crate::{ArrayElementKind, Limits, NativeCallable, PropertyMap, ThrowOrigin};
 
     static NEXT_CALLS: AtomicUsize = AtomicUsize::new(0);
     static ITERATION_COMPLETE: AtomicBool = AtomicBool::new(false);
@@ -586,6 +586,7 @@ mod tests {
             .expect("valueOf install succeeds");
         let array_input = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[element]),
                 elements: vec![element],
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),
@@ -659,9 +660,11 @@ mod tests {
     }
 
     fn array_of(machine: &mut Machine<'_, TestHost>, elements: &[Value]) -> Value {
+        let elements = elements.to_vec();
         machine
             .allocate(HeapEntry::Array {
-                elements: elements.to_vec(),
+                kind: ArrayElementKind::for_elements(&elements),
+                elements,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),
                 extensible: true,

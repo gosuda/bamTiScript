@@ -5,7 +5,8 @@ use bamts_native::{Decoded, Value};
 
 use crate::intrinsics::{self, BuiltinDef, BuiltinOutcome, BuiltinTable};
 use crate::{
-    EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap, ThrowOrigin,
+    ArrayElementKind, EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap,
+    ThrowOrigin,
 };
 
 pub(crate) struct InstalledModule {
@@ -573,10 +574,10 @@ fn store_option<H: Host>(
     machine
         .charge_slot(index, std::mem::size_of::<Value>())
         .map_err(EvalFailure::Runtime)?;
-    let HeapEntry::Array { elements, .. } = &mut machine.heap[index] else {
-        unreachable!()
-    };
-    elements.push(value);
+    let offset = machine
+        .array_len(array)?
+        .expect("allocated option array is a runtime array");
+    machine.store_element(index, offset, value);
     Ok(())
 }
 
@@ -667,6 +668,7 @@ fn alloc_array<H: Host>(
 ) -> Result<Value, EvalFailure> {
     machine
         .allocate(HeapEntry::Array {
+            kind: ArrayElementKind::for_elements(&elements),
             elements,
             properties: PropertyMap::default(),
             prototype: Some(machine.intrinsics.array_prototype),

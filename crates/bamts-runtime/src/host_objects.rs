@@ -4,7 +4,9 @@ use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use crate::intrinsics::{self, BuiltinDef, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
+use crate::{
+    ArrayElementKind, EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap,
+};
 
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -48,6 +50,7 @@ pub(crate) fn install<H: Host>(
     let argv = intrinsics::push(
         heap,
         HeapEntry::Array {
+            kind: ArrayElementKind::for_elements(&[]),
             elements: Vec::new(),
             properties: PropertyMap::default(),
             prototype: Some(builtins.array_prototype()),
@@ -618,7 +621,7 @@ mod tests {
     };
     use bamts_native::Value;
 
-    use crate::{HeapEntry, Host, Limits, Machine, PropertyMap};
+    use crate::{ArrayElementKind, HeapEntry, Host, Limits, Machine, PropertyMap};
 
     struct TestHost;
     impl Host for TestHost {}
@@ -686,6 +689,7 @@ mod tests {
     fn make_array(machine: &mut Machine<'_, TestHost>, elements: Vec<Value>) -> Value {
         machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&elements),
                 elements,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),

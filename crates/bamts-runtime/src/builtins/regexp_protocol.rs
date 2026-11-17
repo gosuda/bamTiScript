@@ -14,7 +14,7 @@ use super::array_generic::tick;
 use super::regexp::{builtin_exec, regexp_parts};
 use super::{allocate_array, allocate_string, keep_root, type_error, with_roots};
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine, Property};
+use crate::{ArrayElementKind, EvalFailure, HeapEntry, Host, Machine, Property};
 
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
@@ -625,14 +625,16 @@ fn regexp_string_iterator<H: Host>(
     global: bool,
     unicode: bool,
 ) -> Result<Value, EvalFailure> {
+    let elements = vec![
+        matcher,
+        input,
+        Value::boolean(global),
+        Value::boolean(unicode),
+    ];
     let state = machine
         .allocate(HeapEntry::Array {
-            elements: vec![
-                matcher,
-                input,
-                Value::boolean(global),
-                Value::boolean(unicode),
-            ],
+            kind: ArrayElementKind::for_elements(&elements),
+            elements,
             properties: crate::PropertyMap::default(),
             prototype: None,
             extensible: false,

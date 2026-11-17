@@ -1,7 +1,7 @@
 use crate::vm::generator_async::GeneratorCompletion;
 use crate::{
-    EvalFailure, Found, HeapEntry, Host, Machine, NativeCallable, Property, PropertyMap,
-    ThrowOrigin,
+    ArrayElementKind, EvalFailure, Found, HeapEntry, Host, Machine, NativeCallable, Property,
+    PropertyMap, ThrowOrigin,
 };
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
@@ -1060,6 +1060,7 @@ impl<H: Host> Intrinsics<H> {
         let array_prototype = push(
             heap,
             HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[]),
                 elements: Vec::new(),
                 properties: PropertyMap::default(),
                 prototype: Some(object_prototype),
@@ -1699,6 +1700,7 @@ mod tests {
         let keys = call_static(&mut machine, "Object", "keys", &[ordered]);
         let array = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[]),
                 elements: Vec::new(),
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),
@@ -1881,6 +1883,7 @@ mod tests {
         assert!(machine.own_property_keys(clone).unwrap().is_empty());
         let pair = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[date, date]),
                 elements: vec![date, date],
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),
@@ -1904,6 +1907,7 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let array = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[Value::HOLE, Value::int32(1)]),
                 elements: vec![Value::HOLE, Value::int32(1)],
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),
