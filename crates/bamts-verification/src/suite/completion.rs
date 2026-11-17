@@ -3133,6 +3133,30 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::Usage);
     }
 
+    #[test]
+    fn recount_directory_without_a_passing_baseline_row_is_a_usage_error() {
+        let (scratch, baseline, ..) = two_family_baseline(&["jit/a", "jit/b", "jit/c"]);
+        let error = recount_suite(
+            &scratch.root,
+            &SuiteRecountRequest {
+                catalog: "formal-redex".to_owned(),
+                runner: "redex".to_owned(),
+                baseline,
+                selector: SuiteRecountSelector::Directory {
+                    directory: "jit".to_owned(),
+                },
+            },
+        )
+        .expect_err("every row of the directory failed in the baseline");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert!(
+            error
+                .to_string()
+                .contains("no baseline row is a PASS in directory `jit`"),
+            "{error}"
+        );
+    }
+
     /// `fourslash/…` obligations are language-service authority cases: the
     /// executor routes them to `INAPPLICABLE_LANGUAGE_SERVICE` before any lane
     /// adapter runs, while compiler/conformance cases stay routable.

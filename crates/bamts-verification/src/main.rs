@@ -341,11 +341,6 @@ fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result
                              a directory reruns every passing row",
                         ));
                     }
-                    if flags.values.contains_key("--limit") {
-                        return Err(usage(
-                            "suite recount `--limit` applies to `--family`, not `--directory`",
-                        ));
-                    }
                     SuiteRecountSelector::Directory {
                         directory: normalize_recount_directory(directory)?,
                     }
@@ -1510,11 +1505,17 @@ mod tests {
             }
         );
 
+        let Command::SuiteRecount { limit, .. } =
+            parse(&argv(&["--limit", "5"])).expect("--limit caps printed rows in directory mode")
+        else {
+            panic!("suite recount variant")
+        };
+        assert_eq!(limit, 5);
+
         for extra in [
             vec!["--family", "types/mismatch"],
             vec!["--guard", "5"],
             vec!["--guard", "0"],
-            vec!["--limit", "5"],
         ] {
             let rejected = parse(&argv(&extra)).expect_err("bad selector combination");
             assert_eq!(rejected.code(), ErrorCode::Usage, "{extra:?}");
