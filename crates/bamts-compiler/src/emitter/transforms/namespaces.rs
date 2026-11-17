@@ -21,8 +21,6 @@ pub(super) struct NamespaceFrame {
     container: SymbolId,
     /// The body function's parameter, which holds the container.
     parameter: String,
-    /// Temporaries taken in this body so far.
-    temps: usize,
 }
 
 /// How a declaration reaches the container it fills.
@@ -314,7 +312,6 @@ impl Rewriter<'_> {
         self.namespace_frames.push(NamespaceFrame {
             container,
             parameter: parameter.to_owned(),
-            temps: 0,
         });
         self.declared_names.push(BTreeSet::new());
         self.expression_temp_scopes.push(Vec::new());
@@ -535,36 +532,10 @@ impl Rewriter<'_> {
     }
 
     fn hold_in_temp(&mut self, value: Expr, range: TextRange, out: &mut Vec<Expr>) -> Expr {
-        let temp = self.namespace_temp();
+        let temp = self.reserved_temp();
         let left = self.syn_node(range, AssignmentTarget::Identifier(temp.clone()));
         out.push(self.assignment(left, value, range));
         self.node(temp.range(), Expression::Identifier(temp))
-    }
-
-    /// The next free `_a`-style name in the innermost body, declared with it.
-    pub(super) fn namespace_temp(&mut self) -> IdentifierNode {
-        const LETTERS: &[u8] = b"abcdefghjklmopqrstuvwxyz";
-        let file = self.file;
-        let occupied = self
-            .occupied_names
-            .get_or_insert_with(|| super::identifier_names(file));
-        let temps = match self.namespace_frames.last_mut() {
-            Some(frame) => &mut frame.temps,
-            None => &mut self.module_temps,
-        };
-        let (index, name) = (*temps..)
-            .map(|index| match LETTERS.get(index) {
-                Some(&letter) => (index, format!("_{}", char::from(letter))),
-                None => (index, format!("_{}", index - LETTERS.len())),
-            })
-            .find(|(_, candidate)| !occupied.contains(candidate))
-            .expect("an unbounded index range reaches an unused name");
-        *temps = index + 1;
-        let temp = self.ident(&name);
-        if let Some(scope) = self.expression_temp_scopes.last_mut() {
-            scope.push(temp.clone());
-        }
-        temp
     }
 
     fn property_read(&mut self, source: &Expr, name: PropertyName, range: TextRange) -> Expr {

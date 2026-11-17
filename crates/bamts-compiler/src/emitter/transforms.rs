@@ -266,6 +266,7 @@ fn emit_json_file(
                 synthesized: None,
                 synthesized_floor: u32::MAX,
                 inline_lines: None,
+                prelude_tail: None,
             },
             model,
             print_options,
@@ -373,6 +374,7 @@ fn emit_json_object(
                 synthesized: None,
                 synthesized_floor: u32::MAX,
                 inline_lines: None,
+                prelude_tail: None,
             },
             model,
             *options,
@@ -454,13 +456,11 @@ pub fn emit_transformed(
     let helper_emit =
         helpers::emit_helpers_for_source(&used_helpers, &options.helpers, &rewritten, is_module);
     let cjs_marker = rewriter.cjs_marker_prelude(!runtime_prelude.is_empty());
-    let prelude = join_preludes(
+    let head = join_preludes(
         &strict_prelude(file, options, is_module),
-        &join_preludes(
-            &helper_emit.prelude,
-            &join_preludes(&cjs_marker, &runtime_prelude),
-        ),
+        &helper_emit.prelude,
     );
+    let tail = join_preludes(&cjs_marker, &runtime_prelude);
     let mut output = print_with_jsx_plan(
         PrintSource {
             file: &rewritten,
@@ -468,6 +468,7 @@ pub fn emit_transformed(
             synthesized: Some(&rewriter.synthesized_ids),
             synthesized_floor: rewriter.synthesized_floor,
             inline_lines: Some(&rewriter.inline_lines),
+            prelude_tail: Some(&tail),
         },
         model,
         PrintOptions {
@@ -487,7 +488,7 @@ pub fn emit_transformed(
         },
         names,
         Surface::JavaScript,
-        Some(prelude),
+        Some(head),
         jsx_plan.as_ref(),
     );
     output.diagnostics.extend(plan.diagnostics);
@@ -796,8 +797,6 @@ struct Rewriter<'a> {
     value_symbol_ranges: Option<std::collections::HashMap<String, Vec<TextRange>>>,
     /// Where each alias read as a value is declared, once one needs to know.
     read_aliases: Option<BTreeSet<Utf16Pos>>,
-    /// Temporaries taken outside any namespace body.
-    module_temps: usize,
     /// The parameter holding each alias a namespace body publishes.
     published_aliases: BTreeMap<crate::checker::SymbolId, String>,
 }
@@ -943,7 +942,6 @@ impl<'a> Rewriter<'a> {
             occupied_names: None,
             value_symbol_ranges: None,
             read_aliases: None,
-            module_temps: 0,
             published_aliases: BTreeMap::new(),
         }
     }
@@ -1837,14 +1835,58 @@ impl<'a> Rewriter<'a> {
         Node::new(self.alloc_id(), range, StringLiteral::new(token))
     }
 
+    /// A placeholder for a compiler temporary; the printer gives it tsc's
+    /// name (`_a`, `_b`, …) for its function scope.
     fn temp_ident(&mut self) -> IdentifierNode {
+        let name = self.temp_ident_text();
+        self.ident(&name)
+    }
+
+    fn temp_ident_text(&mut self) -> String {
         let name = format!("_t{}", self.next_temp);
         self.next_temp += 1;
+        name
+    }
+
+    /// A placeholder for a loop index, which tsc names `_i` once per scope.
+    fn loop_index_ident(&mut self) -> IdentifierNode {
+        let name = format!("_tl{}", self.next_temp);
+        self.next_temp += 1;
+        self.ident(&name)
+    }
+
+    /// `base_1`, `base_2`, …: tsc's name for what an identifier's value is
+    /// copied into, unique within the file.
+    fn source_name_ident(&mut self, base: &str) -> IdentifierNode {
+        let file = self.file;
+        let occupied = self
+            .occupied_names
+            .get_or_insert_with(|| identifier_names(file));
+        let mut suffix = 1;
+        let name = loop {
+            let candidate = format!("{base}_{suffix}");
+            if occupied.insert(candidate.clone()) {
+                break candidate;
+            }
+            suffix += 1;
+        };
         self.ident(&name)
     }
 
     fn expression_temp(&mut self) -> IdentifierNode {
         let temp = self.temp_ident();
+        if let Some(scope) = self.expression_temp_scopes.last_mut() {
+            scope.push(temp.clone());
+        }
+        temp
+    }
+
+    /// A temporary whose name nested functions must not reuse: tsc reserves
+    /// the ones it hands to class and namespace lowering that way.
+    fn reserved_temp(&mut self) -> IdentifierNode {
+        let name = format!("_tr{}", self.next_temp);
+        self.next_temp += 1;
+        let temp = self.ident(&name);
         if let Some(scope) = self.expression_temp_scopes.last_mut() {
             scope.push(temp.clone());
         }
@@ -2335,9 +2377,15 @@ impl<'a> Rewriter<'a> {
     /// bindings and defaults compose with the destructuring lowering.
     fn lower_sync_for_of(&mut self, statement: &Stmt, for_of: &ForOfStatement) -> Vec<Stmt> {
         let range = statement.range();
-        let counter = self.temp_ident();
-        let source = self.temp_ident();
         let iterable = self.rewrite_expr(&for_of.iterable);
+        let counter = self.loop_index_ident();
+        let source = match iterable.data() {
+            Expression::Identifier(identifier) => match self.identifier_name(identifier) {
+                Some(base) => self.source_name_ident(&base),
+                None => self.temp_ident(),
+            },
+            _ => self.temp_ident(),
+        };
         let zero = self.number_expr("0");
         let counter_decl = self.make_declarator(counter.clone(), Some(zero), range);
         let counter_expr = self.node(counter.range(), Expression::Identifier(counter.clone()));
@@ -5642,29 +5690,12 @@ impl<'a> Rewriter<'a> {
     }
 
     fn generator_machine(&mut self, block: &BlockNode) -> Option<MachineParts> {
-        // User var names join the skip set so machine temps and the state
-        // parameter never collide with them. A probe pass with a throwaway
-        // state name discovers the temp count; a second pass builds the
-        // real tree with tsc's allocation: temps `_a`.. first, then the
-        // state parameter after them.
-        let mut skip = std::collections::HashSet::new();
-        for statement in &block.data().statements {
-            if let Statement::Variable(declaration) = statement.data() {
-                for declarator in &declaration.declarations {
-                    if let BindingPattern::Identifier(name) = declarator.data().binding.data()
-                        && let Some(text) = self.identifier_name(name)
-                    {
-                        skip.insert(text);
-                    }
-                }
-            }
-        }
-        let mut probe = MachineCtx::new("_m0s", skip.clone());
-        self.machine_statements(block, &mut probe)?;
-        let state = machine_state_name(&skip, &probe.temp_names);
-        let mut ctx = MachineCtx::new(&state, skip);
+        // The state parameter and the machine's temps are placeholders, so the
+        // printer allocates `_a`.. for the temps first and the state parameter
+        // after them, as tsc does.
+        let state = self.temp_ident_text();
+        let mut ctx = MachineCtx::new(&state);
         self.machine_statements(block, &mut ctx)?;
-        debug_assert_eq!(ctx.temp_names.len(), probe.temp_names.len());
         let range = block.range();
         let hoisted = ctx.hoisted.clone();
         let temps = ctx.temps.clone();
@@ -7230,9 +7261,7 @@ impl<'a> Rewriter<'a> {
         ctx: &mut MachineCtx,
         range: TextRange,
     ) -> Option<(IdentifierNode, Expr)> {
-        let name_text = ctx.next_temp_name()?;
-        ctx.temp_names.push(name_text.clone());
-        let name = self.ident(&name_text);
+        let name = self.temp_ident();
         ctx.temps.push(name.clone());
         let left = self.node(name.range(), AssignmentTarget::Identifier(name.clone()));
         let assign = self.node(
@@ -8467,7 +8496,7 @@ impl<'a> Rewriter<'a> {
             &class_expression.class,
             FieldMode::for_options(self.options),
         );
-        let temp = self.namespace_temp();
+        let temp = self.reserved_temp();
         let mut class = class_expression.class.clone();
         if hoists_statics
             && let Some(name) = class.name.as_ref()
@@ -10581,23 +10610,19 @@ type MachineParts = (Vec<IdentifierNode>, String, Vec<IdentifierNode>, Vec<Stmt>
 struct MachineCtx {
     hoisted: Vec<IdentifierNode>,
     temps: Vec<IdentifierNode>,
-    temp_names: Vec<String>,
     segments: Vec<Vec<Stmt>>,
     terminated: bool,
     state: String,
-    skip: std::collections::HashSet<String>,
     loop_labels: Vec<String>,
 }
 
 impl MachineCtx {
-    fn new(state: &str, skip: std::collections::HashSet<String>) -> Self {
+    fn new(state: &str) -> Self {
         Self {
             hoisted: Vec::new(),
             temps: Vec::new(),
-            temp_names: Vec::new(),
             segments: vec![Vec::new()],
             terminated: false,
-            skip,
             loop_labels: Vec::new(),
             state: state.to_string(),
         }
@@ -10608,54 +10633,6 @@ impl MachineCtx {
             .last_mut()
             .expect("open segment")
             .push(statement);
-    }
-
-    /// The next free `_a`-style temp name, skipping user var names, the
-    /// state parameter, and temps already allocated.
-    fn next_temp_name(&self) -> Option<String> {
-        let taken: std::collections::HashSet<String> = self
-            .skip
-            .iter()
-            .chain(self.temp_names.iter())
-            .chain([&self.state])
-            .cloned()
-            .collect();
-        let mut index = 0u32;
-        loop {
-            let name = machine_name(index)?;
-            if !taken.contains(&name) {
-                return Some(name);
-            }
-            index += 1;
-        }
-    }
-}
-
-/// The `_a`, `_b`, … sequence used by the machine's temps and state.
-fn machine_name(index: u32) -> Option<String> {
-    let letters = b"abcdefghijklmnopqrstuvwxyz";
-    let index = index as usize;
-    if index >= letters.len() {
-        return None;
-    }
-    Some(format!("_{}", letters[index] as char))
-}
-
-/// The state parameter takes the first free name after the temps.
-fn machine_state_name(skip: &std::collections::HashSet<String>, temps: &[String]) -> String {
-    let taken: std::collections::HashSet<&String> = skip.iter().chain(temps.iter()).collect();
-    let mut index = 0u32;
-    loop {
-        // Past the alphabet machine_name returns None forever; a fixed
-        // "_state" fallback would then loop endlessly when _state is also
-        // taken, so the suffix keeps every candidate fresh and the loop
-        // terminates.
-        let name =
-            machine_name(index).unwrap_or_else(|| format!("_state{}", index.saturating_sub(26)));
-        if !taken.contains(&name) {
-            return name;
-        }
-        index += 1;
     }
 }
 
@@ -12755,8 +12732,8 @@ mod tests {
         );
         let code = javascript(&output);
         assert_eq!(code.matches("key()").count(), 1, "{code}");
-        assert!(code.contains("let _t0 = key()"), "{code}");
-        assert!(code.contains("this[_t0] = 1"), "{code}");
+        assert!(code.contains("let _a = key()"), "{code}");
+        assert!(code.contains("this[_a] = 1"), "{code}");
     }
     #[test]
     fn computed_keys_preserve_heritage_and_member_evaluation_order() {
@@ -12769,14 +12746,14 @@ mod tests {
         let field = code.find("field()").expect("first computed field");
         let method = code.find("method()").expect("computed method");
         let later = code.find("later()").expect("later computed field");
-        let class = code.find("class C extends _t0").expect("rewritten class");
+        let class = code.find("class C extends _a").expect("rewritten class");
         assert!(
             heritage < field && field < method && method < later && later < class,
             "{code}"
         );
-        assert!(code.contains("this[_t1] = 1"), "{code}");
-        assert!(code.contains("[_t2]()"), "{code}");
-        assert!(code.contains("this[_t3] = 2"), "{code}");
+        assert!(code.contains("this[_b] = 1"), "{code}");
+        assert!(code.contains("[_c]()"), "{code}");
+        assert!(code.contains("this[_d] = 2"), "{code}");
     }
     #[test]
     fn static_computed_field_runs_key_and_value_and_assigns_the_property() {
@@ -12787,10 +12764,10 @@ mod tests {
         let code = javascript(&output);
         assert_eq!(code.matches("key()").count(), 1, "{code}");
         assert_eq!(code.matches("value()").count(), 1, "{code}");
-        let key = code.find("let _t0 = key()").expect("key setup");
+        let key = code.find("let _a = key()").expect("key setup");
         let class = code.find("class C").expect("class declaration");
         let assignment = code
-            .find("C[_t0] = value()")
+            .find("C[_a] = value()")
             .expect("post-class static property assignment");
         assert!(key < class && class < assignment, "{code}");
     }
@@ -12801,16 +12778,16 @@ mod tests {
             ScriptTarget::Es2015,
         );
         let code = javascript(&output);
-        let prelude = code.find("let _t0 = key()").expect("ordinary key prelude");
+        let prelude = code.find("let _a = key()").expect("ordinary key prelude");
         let class = code
             .find("export class C")
             .expect("exported rewritten class");
         let postlude = code
-            .find("C[_t0] = value()")
+            .find("C[_a] = value()")
             .expect("ordinary static postlude");
         assert!(prelude < class && class < postlude, "{code}");
-        assert!(!code.contains("export let _t0"), "{code}");
-        assert!(!code.contains("export C[_t0]"), "{code}");
+        assert!(!code.contains("export let _a"), "{code}");
+        assert!(!code.contains("export C[_a]"), "{code}");
     }
 
     #[test]
@@ -12820,12 +12797,12 @@ mod tests {
             ScriptTarget::Es2015,
         );
         let code = javascript(&output);
-        let prelude = code.find("let _t0 = key()").expect("ordinary key prelude");
+        let prelude = code.find("let _a = key()").expect("ordinary key prelude");
         let class = code
             .find("export default class C")
             .expect("named default class");
         let postlude = code
-            .find("C[_t0] = value()")
+            .find("C[_a] = value()")
             .expect("ordinary static postlude");
         assert!(prelude < class && class < postlude, "{code}");
         assert!(code.contains("this.field = 1"), "{code}");
@@ -12861,12 +12838,12 @@ mod tests {
             ScriptTarget::Es2015,
         );
         let code = javascript(&output);
-        let prelude = code.find("let _t1 = key()").expect("ordinary key prelude");
+        let prelude = code.find("let _a = key()").expect("ordinary key prelude");
         let class = code
-            .find("export default class _t0")
+            .find("export default class _b")
             .expect("synthetically named default class");
         let postlude = code
-            .find("_t0[_t1] = value()")
+            .find("_b[_a] = value()")
             .expect("static assignment uses synthetic class name");
         assert!(prelude < class && class < postlude, "{code}");
         assert_eq!(code.matches("key()").count(), 1, "{code}");
@@ -12880,14 +12857,12 @@ mod tests {
         );
         let code = javascript(&output);
         let class = code
-            .find("export default class _t0")
+            .find("export default class _a")
             .expect("synthetically named default class");
         let restore = code
-            .find(r#"Object.defineProperty(_t0, "name""#)
+            .find(r#"Object.defineProperty(_a, "name""#)
             .expect("default name restoration");
-        let static_assignment = code
-            .find("_t0.x = 1")
-            .expect("post-class static assignment");
+        let static_assignment = code.find("_a.x = 1").expect("post-class static assignment");
         assert!(class < restore && restore < static_assignment, "{code}");
         assert!(code.contains(r#"value: "default""#), "{code}");
         assert!(code.contains("configurable: true"), "{code}");
@@ -14910,8 +14885,8 @@ console.log(JSON.stringify([bar, bar4, log]));
         let code = javascript(&output);
         // ES5 temps are `var` (a `let` inside cloned machine bodies is a
         // SyntaxError at ES5); ES2015+ keeps the tighter `let` binding.
-        assert!(code.contains("var _t"), "ES5 temp kind: {code}");
-        assert!(!code.contains("let _t"), "ES5 temp kind: {code}");
+        assert!(code.contains("var _a"), "ES5 temp kind: {code}");
+        assert!(!code.contains("let _a"), "ES5 temp kind: {code}");
         let key_read_at = code.find(" = key").expect("key temp declared");
         let temp_name: String = code[..key_read_at]
             .chars()
@@ -14921,7 +14896,7 @@ console.log(JSON.stringify([bar, bar4, log]));
             .into_iter()
             .rev()
             .collect();
-        assert!(temp_name.starts_with("_t"), "key temp name: {code}");
+        assert_eq!(temp_name, "_b", "key temp name: {code}");
         assert_eq!(
             code.matches(" = key").count(),
             1,
@@ -14997,10 +14972,10 @@ console.log(JSON.stringify([bar, bar4, log]));
         );
         let code = javascript(&output);
         assert!(
-            code.contains("(_t0 = pick()).v = Math.pow(_t0.v, 3)"),
+            code.contains("(_a = pick()).v = Math.pow(_a.v, 3)"),
             "{code}"
         );
-        assert_eq!(code.matches("_t0 = pick()").count(), 1, "{code}");
+        assert_eq!(code.matches("_a = pick()").count(), 1, "{code}");
         // Declaration plus the pick return; the lowering never re-evaluates it.
         assert_eq!(code.matches("obj").count(), 2, "{code}");
     }
@@ -15013,7 +14988,7 @@ console.log(JSON.stringify([bar, bar4, log]));
         );
         let code = javascript(&output);
         assert!(
-            code.contains("(_t0 = obj)[_t1 = __propKey(\"a\")] = Math.pow(_t0[_t1], 3)"),
+            code.contains("(_a = obj)[_b = __propKey(\"a\")] = Math.pow(_a[_b], 3)"),
             "{code}"
         );
     }
@@ -15025,11 +15000,8 @@ console.log(JSON.stringify([bar, bar4, log]));
             ScriptTarget::Es5,
         );
         let code = javascript(&output);
-        assert!(code.contains("var _t0;"), "{code}");
-        assert!(
-            code.contains("(_t0 = obj).v = Math.pow(_t0.v, 3)"),
-            "{code}"
-        );
+        assert!(code.contains("var _a;"), "{code}");
+        assert!(code.contains("(_a = obj).v = Math.pow(_a.v, 3)"), "{code}");
     }
 
     /// ES5 for-of lowers to the index form and still loops: the
@@ -15083,7 +15055,7 @@ console.log(JSON.stringify([bar, bar4, log]));
         assert!(!code.contains("await values"), "{code}");
         assert!(!code.contains(" of "), "{code}");
         assert!(code.contains("/*yield*/, values]"), "{code}");
-        assert!(code.contains("x = _t1[_t0]"), "{code}");
+        assert!(code.contains("x = _a[_i]"), "{code}");
     }
 
     #[test]
@@ -15210,7 +15182,7 @@ console.log(JSON.stringify([bar, bar4, log]));
         );
         let code = javascript(&output);
         assert!(
-            code.contains("(_t0 = obj)[_t1 = __propKey(key)] = Math.pow(_t0[_t1], 3)"),
+            code.contains("(_a = obj)[_b = __propKey(key)] = Math.pow(_a[_b], 3)"),
             "{code}"
         );
     }
@@ -15556,7 +15528,7 @@ console.log(JSON.stringify([bar, bar4, log]));
         // position (JS evaluates a logical chain's left operand first).
         let output = emit_at("let o = { p: 0 };\no.p ||= 1;\n", ScriptTarget::Es5);
         let code = javascript(&output);
-        assert!(code.contains("(_t0 = o).p || (_t0.p = 1)"), "{code}");
+        assert!(code.contains("(_a = o).p || (_a.p = 1)"), "{code}");
         assert!(!code.contains("||="), "{code}");
     }
 
