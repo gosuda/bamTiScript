@@ -3753,14 +3753,17 @@ impl<'a> Rewriter<'a> {
             return vec![statement.clone()];
         }
         let mut class = class.clone();
-        let restored_name = if matches!(wrapper, ExportWrapper::Default) && class.name.is_none() {
+        let mut restored_name = None;
+        if matches!(wrapper, ExportWrapper::Default) && class.name.is_none() {
             let name = self.temp_ident();
             class.name = Some(name.clone());
-            Some(name)
-        } else {
-            None
-        };
+            restored_name = Some(name);
+        }
         let mut lowered = self.lower_class(&class, class_range, None);
+        if restored_name.is_some() && lowered.postlude.is_empty() {
+            restored_name = None;
+            lowered.class.name = None;
+        }
         let class_statement = self.node(class_range, Statement::Class(lowered.class));
         let wrapped = match wrapper {
             ExportWrapper::None => class_statement,
