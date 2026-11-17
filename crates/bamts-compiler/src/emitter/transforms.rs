@@ -14613,8 +14613,8 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             "var c_1 = require(\"./c\");",
             "Object.defineProperty(exports, \"x\", { enumerable: true, get: function () { return c_1.x; } });",
             "Object.defineProperty(exports, \"z\", { enumerable: true, get: function () { return c_1.y; } });",
-            "function __exportStar(",
-            "function __importStar(",
+            "var __exportStar = (this && this.__exportStar) ||",
+            "var __importStar = (this && this.__importStar) ||",
         ] {
             assert!(code.contains(expected), "missing {expected}: {code}");
         }

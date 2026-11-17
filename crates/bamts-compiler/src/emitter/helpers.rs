@@ -108,27 +108,30 @@ impl HelperOptions {
     }
 }
 
-/// One emit helper. Discriminant order is the emit order.
+/// One emit helper. Discriminant order is the emit order, which follows the
+/// order tsc 7.0.2 prints helpers in its baselines: no baseline puts a later
+/// variant before an earlier one that it also contains.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum HelperKind {
     Extends,
+    CreateBinding,
     Assign,
-    Rest,
+    SetModuleDefault,
     Decorate,
-    Param,
+    ExportStar,
+    ImportStar,
     Metadata,
+    Param,
     Awaiter,
     Generator,
-    ExportStar,
-    CreateBinding,
-    Values,
-    Read,
-    SpreadArray,
-    ImportStar,
     ImportDefault,
     ClassPrivateFieldGet,
     ClassPrivateFieldSet,
     ClassPrivateFieldIn,
+    Rest,
+    Values,
+    Read,
+    SpreadArray,
     PropKey,
 }
 
@@ -138,23 +141,24 @@ impl HelperKind {
     pub const fn all() -> &'static [Self] {
         &[
             Self::Extends,
+            Self::CreateBinding,
             Self::Assign,
-            Self::Rest,
+            Self::SetModuleDefault,
             Self::Decorate,
-            Self::Param,
+            Self::ExportStar,
+            Self::ImportStar,
             Self::Metadata,
+            Self::Param,
             Self::Awaiter,
             Self::Generator,
-            Self::ExportStar,
-            Self::CreateBinding,
-            Self::Values,
-            Self::Read,
-            Self::SpreadArray,
-            Self::ImportStar,
             Self::ImportDefault,
             Self::ClassPrivateFieldGet,
             Self::ClassPrivateFieldSet,
             Self::ClassPrivateFieldIn,
+            Self::Rest,
+            Self::Values,
+            Self::Read,
+            Self::SpreadArray,
             Self::PropKey,
         ]
     }
@@ -173,6 +177,7 @@ impl HelperKind {
             Self::Generator => "__generator",
             Self::ExportStar => "__exportStar",
             Self::CreateBinding => "__createBinding",
+            Self::SetModuleDefault => "__setModuleDefault",
             Self::Values => "__values",
             Self::Read => "__read",
             Self::SpreadArray => "__spreadArray",
@@ -191,7 +196,7 @@ impl HelperKind {
         match self {
             Self::Awaiter => &[],
             Self::ExportStar => &[Self::CreateBinding],
-            Self::ImportStar => &[Self::CreateBinding],
+            Self::ImportStar => &[Self::CreateBinding, Self::SetModuleDefault],
             _ => &[],
         }
     }
@@ -206,60 +211,29 @@ impl HelperKind {
     #[must_use]
     pub const fn inline_source(self) -> &'static str {
         match self {
-            Self::Extends => {
-                "function __extends(d, b) {\n    var __ = function () { this.constructor = d; };\n    __.prototype = b.prototype;\n    d.prototype = new __();\n}\n"
-            }
-            Self::Assign => {
-                "function __assign(t) {\n    for (var s, i = 1, n = arguments.length; i < n; i++) {\n        s = arguments[i];\n        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p)) t[p] = s[p];\n    }\n    return t;\n}\n"
-            }
-            Self::Rest => {
-                "function __rest(s, e) {\n    var t = {};\n    for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p) && e.indexOf(p) < 0) t[p] = s[p];\n    return t;\n}\n"
-            }
-            Self::Decorate => {
-                "function __decorate(decorators, target, key, desc) {\n    var c = arguments.length, r = c < 3 ? target : desc === null ? desc = Object.getOwnPropertyDescriptor(target, key) : desc, d;\n    if (typeof Reflect === \"object\" && typeof Reflect.decorate === \"function\") r = Reflect.decorate(decorators, target, key, desc);\n    else for (var i = decorators.length - 1; i >= 0; i--) if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;\n    return c > 3 && r && Object.defineProperty(target, key, r), r;\n}\n"
-            }
-            Self::Param => {
-                "function __param(paramIndex, decorator) {\n    return function (target, key) { decorator(target, key, paramIndex); };\n}\n"
-            }
-            Self::Metadata => {
-                "function __metadata(metadataKey, metadataValue) {\n    if (typeof Reflect === \"object\" && typeof Reflect.metadata === \"function\") return Reflect.metadata(metadataKey, metadataValue);\n}\n"
-            }
+            Self::Extends => include_str!("helper_text/extends.js"),
+            Self::Assign => include_str!("helper_text/assign.js"),
+            Self::Rest => include_str!("helper_text/rest.js"),
+            Self::Decorate => include_str!("helper_text/decorate.js"),
+            Self::Param => include_str!("helper_text/param.js"),
+            Self::Metadata => include_str!("helper_text/metadata.js"),
             Self::Awaiter => {
                 "var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {\n    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }\n    return new (P || (P = Promise))(function (resolve, reject) {\n        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }\n        function rejected(value) { try { step(generator[\"throw\"](value)); } catch (e) { reject(e); } }\n        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }\n        step((generator = generator.apply(thisArg, _arguments || [])).next());\n    });\n};\n"
             }
             Self::Generator => {
                 "var __generator = (this && this.__generator) || function (thisArg, body) {\n    var _ = { label: 0, sent: function() { if (t[0] & 1) throw t[1]; return t[1]; }, trys: [], ops: [] }, f, y, t, g = Object.create((typeof Iterator === \"function\" ? Iterator : Object).prototype);\n    return g.next = verb(0), g[\"throw\"] = verb(1), g[\"return\"] = verb(2), typeof Symbol === \"function\" && (g[Symbol.iterator] = function() { return this; }), g;\n    function verb(n) { return function (v) { return step([n, v]); }; }\n    function step(op) {\n        if (f) throw new TypeError(\"Generator is already executing.\");\n        while (g && (g = 0, op[0] && (_ = 0)), _) try {\n            if (f = 1, y && (t = op[0] & 2 ? y[\"return\"] : op[0] ? y[\"throw\"] || ((t = y[\"return\"]) && t.call(y), 0) : y.next) && !(t = t.call(y, op[1])).done) return t;\n            if (y = 0, t) op = [op[0] & 2, t.value];\n            switch (op[0]) {\n                case 0: case 1: t = op; break;\n                case 4: _.label++; return { value: op[1], done: false };\n                case 5: _.label++; y = op[1]; op = [0]; continue;\n                case 7: op = _.ops.pop(); _.trys.pop(); continue;\n                default:\n                    if (!(t = _.trys, t = t.length > 0 && t[t.length - 1]) && (op[0] === 6 || op[0] === 2)) { _ = 0; continue; }\n                    if (op[0] === 3 && (!t || (op[1] > t[0] && op[1] < t[3]))) { _.label = op[1]; break; }\n                    if (op[0] === 6 && _.label < t[1]) { _.label = t[1]; t = op; break; }\n                    if (t && _.label < t[2]) { _.label = t[2]; _.ops.push(op); break; }\n                    if (t[2]) _.ops.pop();\n                    _.trys.pop(); continue;\n            }\n            op = body.call(thisArg, _);\n        } catch (e) { op = [6, e]; y = 0; } finally { f = t = 0; }\n        if (op[0] & 5) throw op[1]; return { value: op[0] ? op[1] : void 0, done: true };\n    }\n};\n"
             }
-            Self::ExportStar => {
-                "function __exportStar(m, o) {\n    for (var p in m) if (p !== \"default\" && !Object.prototype.hasOwnProperty.call(o, p)) __createBinding(o, m, p);\n}\n"
-            }
-            Self::CreateBinding => {
-                "function __createBinding(o, m, k, k2) {\n    if (k2 === undefined) k2 = k;\n    var desc = Object.getOwnPropertyDescriptor(m, k);\n    if (!desc || (\"get\" in desc ? !m.__esModule : desc.writable || desc.configurable)) desc = { enumerable: true, get: function () { return m[k]; } };\n    Object.defineProperty(o, k2, desc);\n}\n"
-            }
-            Self::Values => {
-                "function __values(o) {\n    var s = typeof Symbol === \"function\" && Symbol.iterator, m = s && o[s], i = 0;\n    if (m) return m.call(o);\n    if (o && typeof o.length === \"number\") return { next: function () { if (o && i >= o.length) o = void 0; return { value: o && o[i++], done: !o }; } };\n    throw new TypeError(s ? \"Object is not iterable.\" : \"Symbol.iterator is not defined.\");\n}\n"
-            }
-            Self::Read => {
-                "function __read(o, n) {\n    var m = typeof Symbol === \"function\" && o[Symbol.iterator];\n    if (!m) return o;\n    var i = m.call(o), r, ar = [], e;\n    try { while ((n === void 0 || n-- > 0) && !(r = i.next()).done) ar.push(r.value); }\n    catch (error) { e = { error: error }; }\n    finally { try { if (r && !r.done && (m = i[\"return\"])) m.call(i); } finally { if (e) throw e.error; } }\n    return ar;\n}\n"
-            }
-            Self::SpreadArray => {
-                "function __spreadArray(to, from, pack) {\n    if (pack || arguments.length === 2) for (var i = 0, l = from.length, ar; i < l; i++) {\n        if (ar || !(i in from)) {\n            if (!ar) ar = Array.prototype.slice.call(from, 0, i);\n            ar[i] = from[i];\n        }\n    }\n    return to.concat(ar || Array.prototype.slice.call(from));\n}\n"
-            }
-            Self::ImportStar => {
-                "function __importStar(mod) {\n    if (mod && mod.__esModule) return mod;\n    var result = {};\n    if (mod != null) for (var k in mod) if (k !== \"default\" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);\n    result.default = mod;\n    return result;\n}\n"
-            }
-            Self::ImportDefault => {
-                "function __importDefault(mod) {\n    return (mod && mod.__esModule) ? mod : { default: mod };\n}\n"
-            }
-            Self::ClassPrivateFieldGet => {
-                "function __classPrivateFieldGet(receiver, state, kind, f) {\n    if (kind === \"a\" && !f) throw new TypeError(\"Private accessor was defined without a getter\");\n    if (typeof state === \"function\" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError(\"Cannot read private member from an object whose class did not declare it\");\n    return kind === \"m\" ? f : kind === \"a\" ? f.call(receiver) : f ? f.value : state.get(receiver);\n}\n"
-            }
-            Self::ClassPrivateFieldSet => {
-                "function __classPrivateFieldSet(receiver, state, value, kind, f) {\n    if (kind === \"m\") throw new TypeError(\"Private method is not writable\");\n    if (kind === \"a\" && !f) throw new TypeError(\"Private accessor was defined without a setter\");\n    if (typeof state === \"function\" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError(\"Cannot write private member to an object whose class did not declare it\");\n    return (kind === \"a\" ? f.call(receiver, value) : f ? f.value = value : state.set(receiver, value)), value;\n}\n"
-            }
-            Self::ClassPrivateFieldIn => {
-                "function __classPrivateFieldIn(state, receiver) {\n    if (receiver === null || (typeof receiver !== \"object\" && typeof receiver !== \"function\")) throw new TypeError(\"Cannot use 'in' operator on non-object\");\n    return typeof state === \"function\" ? receiver === state : state.has(receiver);\n}\n"
-            }
+            Self::ExportStar => include_str!("helper_text/exportStar.js"),
+            Self::CreateBinding => include_str!("helper_text/createBinding.js"),
+            Self::SetModuleDefault => include_str!("helper_text/setModuleDefault.js"),
+            Self::Values => include_str!("helper_text/values.js"),
+            Self::Read => include_str!("helper_text/read.js"),
+            Self::SpreadArray => include_str!("helper_text/spreadArray.js"),
+            Self::ImportStar => include_str!("helper_text/importStar.js"),
+            Self::ImportDefault => include_str!("helper_text/importDefault.js"),
+            Self::ClassPrivateFieldGet => include_str!("helper_text/classPrivateFieldGet.js"),
+            Self::ClassPrivateFieldSet => include_str!("helper_text/classPrivateFieldSet.js"),
+            Self::ClassPrivateFieldIn => include_str!("helper_text/classPrivateFieldIn.js"),
             Self::PropKey => {
                 "function __propKey(value) {\n    var exotic, method, primitive, type = typeof value;\n    if (value === null || (type !== \"object\" && type !== \"function\")) return type === \"symbol\" ? value : \"\" + value;\n    exotic = typeof Symbol === \"function\" && Symbol.toPrimitive ? value[Symbol.toPrimitive] : void 0;\n    if (exotic !== void 0 && exotic !== null) {\n        if (typeof exotic !== \"function\") throw new TypeError(\"@@toPrimitive must be a function\");\n        primitive = exotic.call(value, \"string\");\n        type = typeof primitive;\n        if (primitive !== null && (type === \"object\" || type === \"function\")) throw new TypeError(\"@@toPrimitive must return a primitive value\");\n        return type === \"symbol\" ? primitive : \"\" + primitive;\n    }\n    method = value.toString;\n    if (typeof method === \"function\") {\n        primitive = method.call(value);\n        type = typeof primitive;\n        if (primitive === null || (type !== \"object\" && type !== \"function\")) return type === \"symbol\" ? primitive : \"\" + primitive;\n    }\n    method = value.valueOf;\n    if (typeof method === \"function\") {\n        primitive = method.call(value);\n        type = typeof primitive;\n        if (primitive === null || (type !== \"object\" && type !== \"function\")) return type === \"symbol\" ? primitive : \"\" + primitive;\n    }\n    throw new TypeError(\"Cannot convert object to primitive value\");\n}\n"
             }
@@ -601,6 +575,26 @@ mod tests {
     }
 
     #[test]
+    fn every_inline_helper_parses_as_one_complete_statement() {
+        for kind in HelperKind::all() {
+            let parsed = parser::parse(scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(
+                    SourceText::new(kind.inline_source()).expect("helper text fits size limit"),
+                ),
+            ));
+            assert!(
+                parsed.diagnostics().is_empty(),
+                "{}: {:?}",
+                kind.ident(),
+                parsed.diagnostics()
+            );
+            assert_eq!(parsed.product().statements().len(), 1, "{}", kind.ident());
+        }
+    }
+
+    #[test]
     fn esm_import_lists_helpers_in_catalog_order() {
         let file = parse("export const x = 1;\n");
         let emitted = emit_helpers(
@@ -696,7 +690,11 @@ mod tests {
         assert!(emitted.has_errors());
         assert_eq!(emitted.diagnostics[0].code(), codes::UNKNOWN_HELPER);
         assert_eq!(emitted.helpers, vec![HelperKind::Rest]);
-        assert!(emitted.prelude.contains("function __rest"));
+        assert!(
+            emitted
+                .prelude
+                .contains("var __rest = (this && this.__rest) ||")
+        );
     }
 
     #[test]
@@ -723,6 +721,38 @@ mod tests {
     }
 
     #[test]
+    fn helpers_print_in_the_order_the_tsc_baselines_do() {
+        // Authority: amdDependencyCommentName4 (createBinding, setModuleDefault,
+        // importStar, importDefault) and the baselines that print __awaiter or
+        // __generator before __importDefault and __rest.
+        let emitted = emit_helpers(
+            &[
+                HelperKind::Rest,
+                HelperKind::ImportDefault,
+                HelperKind::Awaiter,
+                HelperKind::ImportStar,
+                HelperKind::Decorate,
+                HelperKind::Extends,
+            ],
+            &HelperOptions::inline(),
+            None,
+        );
+        assert_eq!(
+            emitted.helpers,
+            vec![
+                HelperKind::Extends,
+                HelperKind::CreateBinding,
+                HelperKind::SetModuleDefault,
+                HelperKind::Decorate,
+                HelperKind::ImportStar,
+                HelperKind::Awaiter,
+                HelperKind::ImportDefault,
+                HelperKind::Rest,
+            ]
+        );
+    }
+
+    #[test]
     fn import_helpers_false_inlines_even_when_style_is_esm() {
         let options = HelperOptions {
             import_helpers: false,
@@ -731,7 +761,11 @@ mod tests {
             module_specifier: String::from("tslib"),
         };
         let emitted = emit_helpers(&[HelperKind::Rest], &options, None);
-        assert!(emitted.prelude.starts_with("function __rest("));
+        assert!(
+            emitted
+                .prelude
+                .starts_with("var __rest = (this && this.__rest) ||")
+        );
         assert!(!emitted.prelude.contains("import"));
     }
 
