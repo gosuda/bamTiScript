@@ -104,6 +104,7 @@ pub enum LanguageFeature {
     ClassFields,
     Using,
     ForOf,
+    ObjectLiteralMembers,
 }
 
 impl LanguageFeature {
@@ -121,7 +122,7 @@ impl LanguageFeature {
             Self::LogicalAssignment => ScriptTarget::Es2021,
             Self::ClassFields => ScriptTarget::Es2022,
             Self::Using => ScriptTarget::EsNext,
-            Self::ForOf => ScriptTarget::Es2015,
+            Self::ForOf | Self::ObjectLiteralMembers => ScriptTarget::Es2015,
         }
     }
 }
@@ -267,6 +268,7 @@ fn emit_json_file(
                 synthesized_floor: u32::MAX,
                 inline_lines: None,
                 prelude_tail: None,
+                expanded_sequences: None,
             },
             model,
             print_options,
@@ -375,6 +377,7 @@ fn emit_json_object(
                 synthesized_floor: u32::MAX,
                 inline_lines: None,
                 prelude_tail: None,
+                expanded_sequences: None,
             },
             model,
             *options,
@@ -469,6 +472,7 @@ pub fn emit_transformed(
             synthesized_floor: rewriter.synthesized_floor,
             inline_lines: Some(&rewriter.inline_lines),
             prelude_tail: Some(&tail),
+            expanded_sequences: Some(&rewriter.expanded_sequences),
         },
         model,
         PrintOptions {
@@ -772,6 +776,9 @@ struct Rewriter<'a> {
     used_helpers: BTreeSet<HelperKind>,
     key_prelude: Vec<Stmt>,
     expression_temp_scopes: Vec<Vec<IdentifierNode>>,
+    /// Comma sequences that print one element per line, as tsc lays out the
+    /// lowering of a class or a multi-line object literal.
+    expanded_sequences: BTreeSet<NodeId>,
     parameter_initializer_depths: Vec<usize>,
     cjs: Option<CjsPlan>,
     /// Names `import type` binds, which an `export { name }` cannot publish.
@@ -928,6 +935,7 @@ impl<'a> Rewriter<'a> {
             used_helpers,
             key_prelude: Vec::new(),
             expression_temp_scopes: Vec::new(),
+            expanded_sequences: BTreeSet::new(),
             parameter_initializer_depths: Vec::new(),
             cjs,
             type_imports: type_import_names(file, options),
@@ -4625,6 +4633,15 @@ impl<'a> Rewriter<'a> {
     /// untainted descriptor collapsed `Object.defineProperty(this, "foo",
     /// { ... })` onto one line where tsc expands (override18 regression).
     fn object_literal(&mut self, entries: Vec<(&str, Expr)>, range: TextRange) -> Expr {
+        let members = self.object_members(entries, range);
+        self.syn_node(range, Expression::Object(ObjectLiteral { members }))
+    }
+
+    fn object_members(
+        &mut self,
+        entries: Vec<(&str, Expr)>,
+        range: TextRange,
+    ) -> Vec<ObjectMemberNode> {
         let mut members = Vec::new();
         for (name, value) in entries {
             let property = ObjectProperty {
@@ -4635,7 +4652,7 @@ impl<'a> Rewriter<'a> {
             };
             members.push(self.syn_node(range, ObjectMember::Property(property)));
         }
-        self.syn_node(range, Expression::Object(ObjectLiteral { members }))
+        members
     }
 
     fn substitute_static_block(
@@ -8591,10 +8608,12 @@ impl<'a> Rewriter<'a> {
                 .map(|statement| self.sequence_part(statement)),
         );
         parts.push(self.syn_node(temp.range(), Expression::Identifier(temp.clone())));
-        self.syn_node(
+        let sequence = self.syn_node(
             expression.range(),
             Expression::Sequence(SequenceExpression { expressions: parts }),
-        )
+        );
+        self.expanded_sequences.insert(sequence.id());
+        sequence
     }
 
     fn rewrite_call_arguments(&mut self, arguments: &[CallArgument]) -> Vec<CallArgument> {
@@ -9003,17 +9022,7 @@ impl<'a> Rewriter<'a> {
                     Expression::Array(ArrayLiteral { elements }),
                 )
             }
-            Expression::Object(object) => {
-                let members = object
-                    .members
-                    .iter()
-                    .map(|member| self.rewrite_object_member(member))
-                    .collect();
-                self.node(
-                    expression.range(),
-                    Expression::Object(ObjectLiteral { members }),
-                )
-            }
+            Expression::Object(object) => self.rewrite_object_literal(expression, object),
             Expression::Yield(value) => {
                 let argument = value
                     .argument
@@ -9051,6 +9060,225 @@ impl<'a> Rewriter<'a> {
                 .map(|value| self.rewrite_expr(value))
                 .collect(),
         }
+    }
+
+    /// An object literal for a target without shorthand properties, methods,
+    /// or computed names. Members before the first computed name stay in the
+    /// literal; the rest assign through a temporary, in source order.
+    fn rewrite_object_literal(&mut self, expression: &Expr, object: &ObjectLiteral) -> Expr {
+        let range = expression.range();
+        let members: Vec<ObjectMemberNode> = object
+            .members
+            .iter()
+            .map(|member| self.rewrite_object_member(member))
+            .collect();
+        if !Self::needs(LanguageFeature::ObjectLiteralMembers, self.options)
+            || !members
+                .iter()
+                .all(|member| object_member_downlevels(member.data()))
+            || contains_yield(expression)
+            || contains_await(expression)
+        {
+            return self.node(range, Expression::Object(ObjectLiteral { members }));
+        }
+        let split = members
+            .iter()
+            .position(|member| object_member_is_computed(member.data()))
+            .unwrap_or(members.len());
+        let (plain, computed) = members.split_at(split);
+        let initial = plain
+            .iter()
+            .map(|member| self.downlevel_object_member(member))
+            .collect();
+        let literal = self.node(
+            range,
+            Expression::Object(ObjectLiteral { members: initial }),
+        );
+        if computed.is_empty() {
+            return literal;
+        }
+        let temp = self.expression_temp();
+        let mut parts = vec![self.store_temp(&temp, literal, range)];
+        for index in 0..computed.len() {
+            let part = self.assign_object_member(&temp, computed, index, range);
+            parts.extend(part);
+        }
+        parts.push(self.syn_node(temp.range(), Expression::Identifier(temp.clone())));
+        let sequence = self.syn_node(
+            range,
+            Expression::Sequence(SequenceExpression { expressions: parts }),
+        );
+        if self.file.source_text().spans_multiple_lines(range) {
+            self.expanded_sequences.insert(sequence.id());
+        }
+        sequence
+    }
+
+    fn downlevel_object_member(&mut self, member: &ObjectMemberNode) -> ObjectMemberNode {
+        let converted = match member.data() {
+            ObjectMember::Property(property) if property.shorthand => {
+                ObjectMember::Property(ObjectProperty {
+                    shorthand: false,
+                    ..property.clone()
+                })
+            }
+            ObjectMember::Method(method) if matches!(method.modifier, PropertyModifier::None) => {
+                ObjectMember::Property(ObjectProperty {
+                    name: method.name.clone(),
+                    value: Box::new(self.method_function(method, member.range())),
+                    modifier: PropertyModifier::None,
+                    shorthand: false,
+                })
+            }
+            _ => return member.clone(),
+        };
+        self.node(member.range(), converted)
+    }
+
+    fn method_function(&mut self, method: &ObjectMethod, range: TextRange) -> Expr {
+        let function = FunctionLike {
+            decorators: Vec::new(),
+            name: None,
+            type_parameters: None,
+            return_type: None,
+            ..method.function.clone()
+        };
+        self.syn_node(range, Expression::Function(FunctionExpression { function }))
+    }
+
+    /// The statement-free form of one member after the first computed name:
+    /// `temp[key] = value`, or one `Object.defineProperty` for an accessor
+    /// pair. A second accessor of a pair yields nothing.
+    fn assign_object_member(
+        &mut self,
+        temp: &IdentifierNode,
+        members: &[ObjectMemberNode],
+        index: usize,
+        literal_range: TextRange,
+    ) -> Option<Expr> {
+        let member = &members[index];
+        let range = member.range();
+        match member.data() {
+            ObjectMember::Property(property) => {
+                let value = (*property.value).clone();
+                Some(self.assign_through_temp(temp, &property.name, value, range))
+            }
+            ObjectMember::Method(method) if matches!(method.modifier, PropertyModifier::None) => {
+                let value = self.method_function(method, range);
+                Some(self.assign_through_temp(temp, &method.name, value, range))
+            }
+            ObjectMember::Method(accessor) => {
+                self.define_accessor(temp, members, index, accessor, literal_range)
+            }
+            ObjectMember::Spread(_) | ObjectMember::Missing(_) => {
+                unreachable!("object_member_downlevels rejects spreads and missing members")
+            }
+        }
+    }
+
+    fn assign_through_temp(
+        &mut self,
+        temp: &IdentifierNode,
+        name: &PropertyName,
+        value: Expr,
+        range: TextRange,
+    ) -> Expr {
+        let object = self.syn_node(temp.range(), Expression::Identifier(temp.clone()));
+        let property = self.member_property(name, range);
+        let left = self.syn_node(
+            range,
+            AssignmentTarget::Member(AssignmentMemberTarget {
+                object: Box::new(object),
+                property,
+            }),
+        );
+        self.syn_node(
+            range,
+            Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left,
+                right: Box::new(value),
+            }),
+        )
+    }
+
+    /// `Object.defineProperty(temp, key, { get, set, enumerable, configurable })`
+    /// for the accessor at `index` and its same-named partner, which tsc
+    /// emits once, at the first of the two.
+    fn define_accessor(
+        &mut self,
+        temp: &IdentifierNode,
+        members: &[ObjectMemberNode],
+        index: usize,
+        accessor: &ObjectMethod,
+        literal_range: TextRange,
+    ) -> Option<Expr> {
+        let partner_of = |other: &ObjectMemberNode| match other.data() {
+            ObjectMember::Method(method) => {
+                !matches!(method.modifier, PropertyModifier::None)
+                    && std::mem::discriminant(&method.modifier)
+                        != std::mem::discriminant(&accessor.modifier)
+                    && self.same_static_name(&method.name, &accessor.name)
+            }
+            _ => false,
+        };
+        if members[..index].iter().any(partner_of) {
+            return None;
+        }
+        let partner = members[index + 1..].iter().find(|other| partner_of(other));
+        let partner = partner.and_then(|other| match other.data() {
+            ObjectMember::Method(method) => Some(method),
+            _ => None,
+        });
+        let range = members[index].range();
+        let (getter, setter) = match accessor.modifier {
+            PropertyModifier::Get => (Some(accessor), partner),
+            _ => (partner, Some(accessor)),
+        };
+        let mut entries = Vec::new();
+        for (key, method) in [("get", getter), ("set", setter)] {
+            if let Some(method) = method {
+                entries.push((key, self.method_function(method, range)));
+            }
+        }
+        entries.push(("enumerable", self.boolean_expr(false)));
+        entries.push(("configurable", self.boolean_expr(true)));
+        let descriptor_members = self.object_members(entries, literal_range);
+        let descriptor = self.node(
+            literal_range,
+            Expression::Object(ObjectLiteral {
+                members: descriptor_members,
+            }),
+        );
+        let object = self.ident("Object");
+        let callee = self.member_ident(&object, "defineProperty", range);
+        let receiver = self.syn_node(temp.range(), Expression::Identifier(temp.clone()));
+        let key = self.property_key_expression(&accessor.name, range);
+        Some(self.syn_node(
+            range,
+            Expression::Call(CallExpression {
+                callee: Box::new(callee),
+                optional: false,
+                type_arguments: None,
+                arguments: vec![
+                    CallArgument::Expression(Box::new(receiver)),
+                    CallArgument::Expression(Box::new(key)),
+                    CallArgument::Expression(Box::new(descriptor)),
+                ],
+            }),
+        ))
+    }
+
+    fn same_static_name(&self, left: &PropertyName, right: &PropertyName) -> bool {
+        let text = |name: &PropertyName| match name {
+            PropertyName::Identifier(identifier) => {
+                Some(self.token_text(identifier.data().token()))
+            }
+            PropertyName::String(literal) => Some(self.token_text(literal.data().token())),
+            PropertyName::Number(literal) => Some(self.token_text(literal.data().token())),
+            _ => None,
+        };
+        text(left).is_some_and(|left| text(right) == Some(left))
     }
 
     fn rewrite_object_member(&mut self, member: &ObjectMemberNode) -> ObjectMemberNode {
@@ -12145,6 +12373,13 @@ fn scan_expression_inner(expression: &Expr, features: &mut BTreeSet<LanguageFeat
             }
         }
         Expression::Object(value) => {
+            if value
+                .members
+                .iter()
+                .any(|member| object_member_is_es2015_syntax(member.data()))
+            {
+                features.insert(LanguageFeature::ObjectLiteralMembers);
+            }
             for member in &value.members {
                 match member.data() {
                     ObjectMember::Property(property) => {
@@ -12280,6 +12515,36 @@ fn scan_target(target: &AssignmentTarget, features: &mut BTreeSet<LanguageFeatur
 fn scan_computed_name(name: &PropertyName, features: &mut BTreeSet<LanguageFeature>) {
     if let PropertyName::Computed(key) = name {
         scan_expression(key, features);
+    }
+}
+
+/// A member the lowering below ES2015 rewrites: a property or a method.
+fn object_member_downlevels(member: &ObjectMember) -> bool {
+    matches!(member, ObjectMember::Property(_) | ObjectMember::Method(_))
+}
+
+fn object_member_is_computed(member: &ObjectMember) -> bool {
+    matches!(
+        member,
+        ObjectMember::Property(ObjectProperty {
+            name: PropertyName::Computed(_),
+            ..
+        }) | ObjectMember::Method(ObjectMethod {
+            name: PropertyName::Computed(_),
+            ..
+        })
+    )
+}
+
+/// Shorthand properties, methods, and computed names: the object-literal
+/// syntax ES2015 added.
+fn object_member_is_es2015_syntax(member: &ObjectMember) -> bool {
+    match member {
+        ObjectMember::Property(property) => {
+            property.shorthand || matches!(property.name, PropertyName::Computed(_))
+        }
+        ObjectMember::Method(_) => true,
+        ObjectMember::Spread(_) | ObjectMember::Missing(_) => false,
     }
 }
 
@@ -15161,6 +15426,56 @@ console.log(JSON.stringify([bar, bar4, log]));
         let code = javascript(&output);
         assert_eq!(code.matches("Math.pow").count(), 2, "{code}");
         assert!(!code.contains("**"), "{code}");
+    }
+
+    #[test]
+    fn es5_object_literal_members_after_a_computed_name_assign_through_a_temp() {
+        let output = emit_at(
+            "declare var k: string;\n\
+             var o = { a: 1, [k]: 2, m() { return 3; }, get z() { return 0; }, set z(v) { } };\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        for expected in [
+            "var _a;",
+            "var o = (_a = { a: 1 }, _a[k] = 2, _a.m = function () { return 3; }, ",
+            r#"Object.defineProperty(_a, "z", { get: function () { return 0; }, set: function (v) { }, enumerable: false, configurable: true }), _a);"#,
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+    }
+
+    #[test]
+    fn es5_multi_line_computed_object_literal_prints_one_element_per_line() {
+        let output = emit_at("var o = {\n    [\"\" || 0]: 0\n};\n", ScriptTarget::Es5);
+        let code = javascript(&output);
+        assert!(
+            code.contains("var _a;\nvar o = (_a = {},\n    _a[\"\" || 0] = 0,\n    _a);\n"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn es5_shorthand_properties_and_methods_become_plain_properties() {
+        let output = emit_at(
+            "var x = 1;\nvar o = { x, m() { return x; } };\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("var o = { x: x, m: function () { return x; } };"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn es2015_keeps_object_literal_syntax() {
+        let output = emit_at(
+            "var x = 1, k = 2;\nvar o = { x, [k]: 1, m() { } };\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("{ x, [k]: 1, m() { } }"), "{code}");
     }
 
     #[test]
