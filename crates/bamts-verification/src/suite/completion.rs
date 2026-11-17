@@ -802,20 +802,34 @@ pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> 
     }
 }
 
-/// Reruns the obligations of one failure family named by an earlier receipt.
+/// Which baseline rows a recount reruns: one failure family plus a passing
+/// guard sample, or every passing row in one case directory.
+///
+/// The enum keeps the two modes exclusive: a request names a family or a
+/// directory, never both and never neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuiteRecountSelector {
+    /// Rerun the rows of one failure family, plus `guard` evenly spaced
+    /// passing rows. A family holds only failing rows, so these are the
+    /// rows a fix can regress.
+    Family { family: String, guard: usize },
+    /// Rerun every baseline `PASS` row in one case directory, with no
+    /// sampling and no guard.
+    Directory { directory: String },
+}
+
+/// Reruns the obligations of one failure family named by an earlier receipt,
+/// or every passing row of one case directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuiteRecountRequest {
     pub catalog: String,
     pub runner: String,
     pub baseline: PathBuf,
-    pub family: String,
-    /// How many passing rows to rerun beside the family. A family holds only
-    /// failing rows, so these are the rows a fix can regress.
-    pub guard: usize,
+    pub selector: SuiteRecountSelector,
 }
 
-/// The rerun rows before and after, in the same order: the family, then the
-/// passing rows that guard against a regression.
+/// The rerun rows before and after, in baseline order: the family then the
+/// passing guard sample, or every passing row of the directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuiteRecount {
     pub before: Vec<ReportRow>,
@@ -836,8 +850,49 @@ fn evenly_spaced(rows: Vec<ReportRow>, count: usize) -> Vec<ReportRow> {
         .collect()
 }
 
-/// Reruns the rows of `family` and a sample of the passing rows, on the
-/// platform the baseline recorded.
+/// Canonicalizes a `--directory` selector. One trailing `/` is stripped;
+/// everything else must already be canonical. Matching is a byte prefix on
+/// `directory + '/'`, so `Foo` never matches `FooBar`. Segments are never
+/// resolved through the host filesystem: absolute paths, `.`/`..` segments,
+/// empty segments, and `\` separators are rejected. Comparison stays
+/// case-sensitive.
+pub fn normalize_recount_directory(raw: &str) -> Result<String> {
+    if raw.contains('\\') {
+        return Err(VerificationError::new(
+            ErrorCode::Usage,
+            "suite recount `--directory` must be a canonical case directory like \
+             `compiler/tests/cases/compiler`, not a host path",
+        ));
+    }
+    let canonical = raw.strip_suffix('/').unwrap_or(raw);
+    let well_formed = !canonical.is_empty()
+        && !canonical.starts_with('/')
+        && canonical
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+    if !well_formed {
+        return Err(VerificationError::new(
+            ErrorCode::Usage,
+            "suite recount `--directory` must be a canonical case directory like \
+             `compiler/tests/cases/compiler`, not a host path",
+        ));
+    }
+    Ok(canonical.to_owned())
+}
+
+/// Every baseline `PASS` row whose case sits under `directory`: a byte
+/// prefix on `directory + '/'`, so a sibling like `FooBar` never matches
+/// `Foo`.
+fn select_directory_rows(rows: Vec<ReportRow>, directory: &str) -> Vec<ReportRow> {
+    let prefix = format!("{directory}/");
+    rows.into_iter()
+        .filter(|row| row.state().is_pass() && row.key().case().starts_with(&prefix))
+        .collect()
+}
+
+/// Reruns the selected rows on the platform the baseline recorded: the rows
+/// of `family` plus a sample of the passing rows, or every passing row of
+/// `directory`.
 ///
 /// This answers one question for a repair loop: did the fix convert rows and
 /// regress none. Only a full sweep proves none regressed; the sample catches a
@@ -845,31 +900,59 @@ fn evenly_spaced(rows: Vec<ReportRow>, count: usize) -> Vec<ReportRow> {
 /// the same lane executor and `derive_row` as a sweep, so a rerun cannot mint a
 /// `PASS` that a sweep could not.
 pub fn recount_suite(root: &Path, request: &SuiteRecountRequest) -> Result<SuiteRecount> {
-    let (mut before, others): (Vec<ReportRow>, Vec<ReportRow>) = read_receipt(&request.baseline)?
-        .into_iter()
-        .partition(|row| row.family().as_deref() == Some(request.family.as_str()));
-    let Some(first) = before.first() else {
-        return Err(VerificationError::new(
-            ErrorCode::Usage,
-            format!(
-                "{}: no row belongs to family `{}`",
-                request.baseline.display(),
-                request.family
-            ),
-        ));
+    let rows = read_receipt(&request.baseline)?;
+    let (before, platform): (Vec<ReportRow>, String) = match &request.selector {
+        SuiteRecountSelector::Family { family, guard } => {
+            let (mut selected, others): (Vec<ReportRow>, Vec<ReportRow>) = rows
+                .into_iter()
+                .partition(|row| row.family().as_deref() == Some(family.as_str()));
+            let Some(first) = selected.first() else {
+                return Err(VerificationError::new(
+                    ErrorCode::Usage,
+                    format!(
+                        "{}: no row belongs to family `{}`",
+                        request.baseline.display(),
+                        family
+                    ),
+                ));
+            };
+            let platform = canonical_platform(first.key().platform())?;
+            if selected.iter().any(|row| row.key().platform() != platform) {
+                return Err(VerificationError::new(
+                    ErrorCode::Usage,
+                    format!("family `{family}` spans more than one platform"),
+                ));
+            }
+            let passing = others
+                .into_iter()
+                .filter(|row| row.state().is_pass() && row.key().platform() == platform)
+                .collect();
+            selected.extend(evenly_spaced(passing, *guard));
+            (selected, platform)
+        }
+        SuiteRecountSelector::Directory { directory } => {
+            let directory = normalize_recount_directory(directory)?;
+            let selected = select_directory_rows(rows, &directory);
+            let Some(first) = selected.first() else {
+                return Err(VerificationError::new(
+                    ErrorCode::Usage,
+                    format!(
+                        "{}: no baseline row is a PASS in directory `{}`",
+                        request.baseline.display(),
+                        directory
+                    ),
+                ));
+            };
+            let platform = canonical_platform(first.key().platform())?;
+            if selected.iter().any(|row| row.key().platform() != platform) {
+                return Err(VerificationError::new(
+                    ErrorCode::Usage,
+                    format!("directory `{directory}` spans more than one platform"),
+                ));
+            }
+            (selected, platform)
+        }
     };
-    let platform = canonical_platform(first.key().platform())?;
-    if before.iter().any(|row| row.key().platform() != platform) {
-        return Err(VerificationError::new(
-            ErrorCode::Usage,
-            format!("family `{}` spans more than one platform", request.family),
-        ));
-    }
-    let passing = others
-        .into_iter()
-        .filter(|row| row.state().is_pass() && row.key().platform() == platform)
-        .collect();
-    before.extend(evenly_spaced(passing, request.guard));
     let runner = resolve_runner(&request.catalog, &request.runner)?;
     let catalog = load_catalog_manifest(root, &request.catalog)?;
     let obligations =
@@ -2849,8 +2932,10 @@ mod tests {
             catalog: "formal-redex".to_owned(),
             runner: "redex".to_owned(),
             baseline: baseline.to_owned(),
-            family: family.to_owned(),
-            guard: 0,
+            selector: SuiteRecountSelector::Family {
+                family: family.to_owned(),
+                guard: 0,
+            },
         }
     }
 
@@ -2902,15 +2987,26 @@ mod tests {
 
         let mut request = recount_request(&baseline, &beta);
         let unguarded = recount_suite(&scratch.root, &request).expect("recount without a guard");
-        let (_, regressions) =
-            crate::sweep_report::render_recount(&beta, &unguarded.before, &unguarded.after, 5);
+        let (_, regressions) = crate::sweep_report::render_recount(
+            format_args!("family `{beta}`"),
+            &unguarded.before,
+            &unguarded.after,
+            5,
+        );
         assert_eq!(unguarded.after.len(), 1);
         assert_eq!(regressions, 0);
 
-        request.guard = 5;
+        request.selector = SuiteRecountSelector::Family {
+            family: beta.clone(),
+            guard: 5,
+        };
         let guarded = recount_suite(&scratch.root, &request).expect("recount with a guard");
-        let (report, regressions) =
-            crate::sweep_report::render_recount(&beta, &guarded.before, &guarded.after, 5);
+        let (report, regressions) = crate::sweep_report::render_recount(
+            format_args!("family `{beta}`"),
+            &guarded.before,
+            &guarded.after,
+            5,
+        );
         assert_eq!(guarded.after.len(), 2, "{report}");
         assert_eq!(regressions, 1, "{report}");
     }
@@ -2959,6 +3055,82 @@ mod tests {
         let error = recount_suite(&smaller.root, &recount_request(&baseline, &beta))
             .expect_err("jit.b is gone from the catalog");
         assert_eq!(error.code(), ErrorCode::SetMismatch);
+    }
+
+    #[test]
+    fn directory_selection_has_no_sample_cap() {
+        fn row(case: &str, state: TerminalState) -> ReportRow {
+            ReportRow::new(
+                ObligationKey::new(
+                    "formal-redex",
+                    case,
+                    "default",
+                    ExecutionMode::Interpreter,
+                    "ubuntu-latest",
+                )
+                .expect("key"),
+                "redex",
+                state,
+                "",
+            )
+        }
+        let mut rows = Vec::new();
+        for index in 0..251 {
+            rows.push(row(&format!("stress/case-{index:04}"), TerminalState::Pass));
+        }
+        rows.push(row("stress/zz-fail", TerminalState::BlockingFail));
+        rows.push(row("stress", TerminalState::Pass));
+        rows.push(row("stress-sibling/one", TerminalState::Pass));
+        rows.push(row("other/two", TerminalState::Pass));
+        rows.push(row("Stress/one", TerminalState::Pass));
+        for index in 251..502 {
+            rows.push(row(&format!("stress/case-{index:04}"), TerminalState::Pass));
+        }
+        let selected = select_directory_rows(rows, "stress");
+        let actual: Vec<String> = selected
+            .iter()
+            .map(|selected| selected.key().case().to_owned())
+            .collect();
+        let expected: Vec<String> = (0..502)
+            .map(|index| format!("stress/case-{index:04}"))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn recount_directory_rejects_non_canonical_identifiers() {
+        for directory in [
+            "", "/", "a//b", "/abs", "a/../b", "../b", "./b", "a/./b", ".", "..", "a\\b",
+        ] {
+            let error = normalize_recount_directory(directory).expect_err("non-canonical");
+            assert_eq!(error.code(), ErrorCode::Usage, "{directory:?}");
+        }
+        assert_eq!(
+            normalize_recount_directory("alpha/").expect("trailing slash"),
+            "alpha"
+        );
+        assert_eq!(
+            normalize_recount_directory("alpha/one").expect("canonical"),
+            "alpha/one"
+        );
+    }
+
+    #[test]
+    fn recount_suite_rejects_a_non_canonical_directory() {
+        let (scratch, baseline, ..) = two_family_baseline(&["jit.a", "jit.b", "jit.c"]);
+        let error = recount_suite(
+            &scratch.root,
+            &SuiteRecountRequest {
+                catalog: "formal-redex".to_owned(),
+                runner: "redex".to_owned(),
+                baseline,
+                selector: SuiteRecountSelector::Directory {
+                    directory: "a/../b".to_owned(),
+                },
+            },
+        )
+        .expect_err("non-canonical directory");
+        assert_eq!(error.code(), ErrorCode::Usage);
     }
 
     /// `fourslash/…` obligations are language-service authority cases: the

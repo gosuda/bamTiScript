@@ -7,7 +7,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt::Write as _,
+    fmt::{self, Write as _},
     fs, io,
     path::{Path, PathBuf},
     process,
@@ -462,10 +462,11 @@ pub fn render_diff(a: &str, b: &str, diff: &Diff, limit: usize) -> String {
     out
 }
 
-/// The report of a family rerun, and how many of its rows stopped passing.
+/// The report of a selector recount, and how many of its rows regressed from PASS.
+/// The subject names what ran: `family \`…\`` or `directory \`…\``.
 #[must_use]
 pub fn render_recount(
-    family: &str,
+    subject: fmt::Arguments<'_>,
     before: &[ReportRow],
     after: &[ReportRow],
     limit: usize,
@@ -473,7 +474,7 @@ pub fn render_recount(
     let diff = diff_rows(before, after);
     let guard = before.iter().filter(|row| row.state.is_pass()).count();
     let mut report = format!(
-        "recount of family `{family}`: {} row(s) rerun, {guard} of them passing rows kept as a \
+        "recount of {subject}: {} row(s) rerun, {guard} of them passing rows kept as a \
          regression guard\n",
         after.len()
     );
@@ -1100,13 +1101,14 @@ mod tests {
     fn a_recount_report_names_the_family_and_counts_regressions() {
         let before = vec![failing("a", "x"), passing("b")];
         let after = vec![passing("a"), failing("b", "x")];
-        let (report, regressions) = render_recount("diagnostics/x", &before, &after, 5);
+        let (report, regressions) =
+            render_recount(format_args!("family `diagnostics/x`"), &before, &after, 5);
         assert_eq!(regressions, 1, "{report}");
         assert!(report.contains("family `diagnostics/x`"), "{report}");
         assert!(report.contains("2 row(s) rerun"), "{report}");
         assert!(report.contains("conversions to PASS: 1"), "{report}");
-
-        let (clean, none) = render_recount("diagnostics/x", &before, &before, 5);
+        let (clean, none) =
+            render_recount(format_args!("family `diagnostics/x`"), &before, &before, 5);
         assert_eq!(none, 0, "{clean}");
         assert!(clean.contains("changed: 0"), "{clean}");
     }
