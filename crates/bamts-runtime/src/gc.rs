@@ -1,20 +1,56 @@
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static STRESS_SUSPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Engine-parity tests compare raw slot numbers, which follow collection
+/// timing; they run with the environment stress schedule suspended.
+#[cfg(test)]
+pub(crate) struct StressSuspended(());
+
+#[cfg(test)]
+impl StressSuspended {
+    pub(crate) fn begin() -> Self {
+        STRESS_SUSPENDED.set(true);
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for StressSuspended {
+    fn drop(&mut self) {
+        STRESS_SUSPENDED.set(false);
+    }
+}
+
 #[derive(Default)]
 pub(super) struct GcState {
     marks: Vec<bool>,
-    /// Runtime slots that outlived the last collection. Allocation never
-    /// reuses a slot, so a collection that walked the heap would pay for every
-    /// allocation the program ever made.
-    survivors: Vec<usize>,
+    /// Runtime slots the last collection found live, plus every slot
+    /// refilled since. A collection only walks this set and the unswept
+    /// tail, so it never pays for every allocation the program ever made.
+    pub(super) survivors: Vec<usize>,
+    /// Heap indices the last sweep vacated; allocation hands them out again
+    /// before it grows the heap.
+    pub(super) free_slots: Vec<usize>,
+    /// Vacated slots refilled since the last sweep. They sit below
+    /// `swept_len`, so the unswept range alone would miss them.
+    pub(super) young_reused: Vec<usize>,
     /// The heap length at the last sweep; every later slot is unswept.
-    swept_len: usize,
+    pub(super) swept_len: usize,
     work: Vec<usize>,
     weak_collections: Vec<usize>,
     /// Marked `WeakRef`s and `FinalizationRegistry`s, found while marking so
     /// that clearing them need not search the heap.
     weak_holders: Vec<usize>,
     pending: bool,
+    /// Every allocation requests a collection, which runs at the next safe
+    /// point: the only places a collection is sound in production too.
+    every_allocation: bool,
+    #[cfg(test)]
+    schedule_pinned: bool,
     byte_watermark: usize,
     slot_watermark: usize,
 }
@@ -52,6 +88,19 @@ impl<'a, H: Host> Machine<'a, H> {
         self.native_roots.push(roots.to_vec());
     }
 
+    /// Keeps `roots` alive while `body` runs code that can reach a safe point.
+    pub(crate) fn with_native_roots<T>(
+        &mut self,
+        roots: &[Value],
+        body: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let depth = self.native_roots.len();
+        self.push_native_roots(depth, roots);
+        let result = body(self);
+        self.pop_native_roots(depth);
+        result
+    }
+
     pub(crate) fn refresh_native_roots(&mut self, depth: usize, roots: &[Value]) {
         assert_eq!(
             depth + 1,
@@ -86,18 +135,33 @@ impl GcState {
         Self {
             byte_watermark: (limits.max_heap_bytes / 2).min(FIRST_COLLECTION_BYTES),
             slot_watermark: (limits.max_heap_slots / 2).min(FIRST_COLLECTION_SLOTS),
+            every_allocation: limits.collect_every_allocation,
             ..Self::default()
         }
     }
 
     pub(super) fn request_collection(&mut self, heap_bytes: usize, live_slots: usize) {
-        self.pending |= heap_bytes >= self.byte_watermark || live_slots >= self.slot_watermark;
+        self.pending |= self.every_allocation
+            || heap_bytes >= self.byte_watermark
+            || live_slots >= self.slot_watermark;
+    }
+
+    #[cfg(test)]
+    pub(super) fn stress_from_environment(&mut self) {
+        if !self.schedule_pinned
+            && !STRESS_SUSPENDED.get()
+            && std::env::var_os("BAMTS_TEST_COLLECT_EVERY_ALLOCATION").is_some()
+        {
+            self.every_allocation = true;
+        }
     }
 
     #[cfg(test)]
     fn set_watermarks(&mut self, bytes: usize, slots: usize) {
         self.byte_watermark = bytes;
         self.slot_watermark = slots;
+        self.every_allocation = false;
+        self.schedule_pinned = true;
     }
 
     fn recompute_watermarks<H: Host>(&mut self, machine: &Machine<'_, H>) {
@@ -145,6 +209,8 @@ impl GcState {
         let heap_len = machine.heap.len();
         self.marks.resize(heap_len, false);
         self.survivors.retain(|&index| index < heap_len);
+        self.free_slots.retain(|&index| index < heap_len);
+        self.young_reused.retain(|&index| index < heap_len);
         self.swept_len = self.swept_len.min(heap_len);
     }
 
@@ -181,6 +247,7 @@ impl GcState {
         self.mark_value(&machine.heap, machine.current_new_target);
         self.mark_values(&machine.heap, &machine.kept_alive);
         self.mark_values(&machine.heap, &machine.builtin_temporaries);
+        self.mark_values(&machine.heap, &machine.array_join_stack);
         self.mark_values(&machine.heap, &machine.callback_results);
         if let Some(resume) = &machine.pending_generator_resume {
             trace_generator_resume(resume, &machine.heap, &mut self.marks, &mut self.work);
@@ -372,13 +439,24 @@ impl GcState {
         }
     }
 
+    /// Reclaims every unmarked slot in `survivors` plus every slot in the
+    /// unswept tail `swept_len..heap.len()`; a slot refilled since the last
+    /// sweep sits in `young_reused` and joins the sweep through `survivors`,
+    /// which `allocate` extends when it reuses a free slot. A vacated slot
+    /// joins `free_slots`, so the next `allocate` hands it out again.
+    ///
+    /// Precondition: after marking, no root, frame register, shadow frame,
+    /// weak table entry or finalization cell references a swept (Vacant)
+    /// runtime slot. `trace_roots` walks the same root set the debug
+    /// assertion at the end of this method re-walks.
     fn sweep<H: Host>(&mut self, machine: &mut Machine<'_, H>) {
-        let unswept = self.swept_len.max(machine.intrinsic_slots)..machine.heap.len();
-        self.survivors.extend(unswept);
-        let marks = &self.marks;
-        self.survivors.retain(|&index| {
-            if marks[index] {
-                return true;
+        self.survivors.append(&mut self.young_reused);
+        let tail = self.swept_len.max(machine.intrinsic_slots)..machine.heap.len();
+        let mut retained = Vec::with_capacity(self.survivors.len() + tail.len());
+        for index in self.survivors.drain(..).chain(tail) {
+            if self.marks[index] && !matches!(machine.heap[index], HeapEntry::Vacant) {
+                retained.push(index);
+                continue;
             }
             if !matches!(machine.heap[index], HeapEntry::Vacant) {
                 machine.heap[index] = HeapEntry::Vacant;
@@ -386,9 +464,260 @@ impl GcState {
                 machine.heap_bytes -= charge;
                 machine.vacant_count += 1;
             }
-            false
-        });
+            self.free_slots.push(index);
+        }
+        self.survivors = retained;
         self.swept_len = machine.heap.len();
+        machine.has_instance_symbol = None;
+        self.assert_no_rooted_vacant(machine);
+    }
+    /// The sweep precondition: after marking, nothing the root walk visits
+    /// names a slot that is now `Vacant`. The check re-derives every rooted
+    /// `Value` the same way `trace_roots` did, then asserts each decoded
+    /// index still holds a live entry.
+    #[cfg(debug_assertions)]
+    fn assert_no_rooted_vacant<H: Host>(&self, machine: &Machine<'_, H>) {
+        let heap = &machine.heap;
+        for frame in &machine.frames {
+            check_values(&frame.registers, heap);
+            check_value(frame.this_value, heap);
+            check_value(frame.new_target, heap);
+            check_values(&frame.args, heap);
+            if let Some(value) = frame.context {
+                check_value(value, heap);
+            }
+            if let Some(value) = frame.outer_context {
+                check_value(value, heap);
+            }
+            if let Some(value) = frame.arguments_object {
+                check_value(value, heap);
+            }
+            if let Some(value) = frame.return_to.and_then(|return_to| return_to.constructed) {
+                check_value(value, heap);
+            }
+        }
+        check_value(machine.global_object, heap);
+        if let Some(value) = machine.context_global {
+            check_value(value, heap);
+        }
+        if let Some(value) = machine.last_completion {
+            check_value(value, heap);
+        }
+        check_value(machine.current_new_target, heap);
+        check_values(&machine.kept_alive, heap);
+        check_values(&machine.builtin_temporaries, heap);
+        check_values(&machine.array_join_stack, heap);
+        check_values(&machine.callback_results, heap);
+        if let Some(resume) = &machine.pending_generator_resume {
+            check_generator_resume(resume, heap);
+        }
+        if let Some((awaited, activation)) = &machine.pending_async_suspend {
+            check_value(*awaited, heap);
+            check_activation(activation, heap);
+        }
+        for job in &machine.microtasks {
+            check_microtask(&job.job, heap);
+        }
+        for job in &machine.running_jobs {
+            check_microtask(job, heap);
+        }
+        for &registry in &machine.finalization_cleanup_queue {
+            check_value(registry, heap);
+        }
+        for waiter in machine.async_waiters.values() {
+            check_value(waiter.promise, heap);
+        }
+        for timer in machine.timers.values() {
+            check_value(timer.callback, heap);
+            check_values(&timer.arguments, heap);
+            check_value(timer.handle, heap);
+            if let Some(context) = timer.context {
+                check_value(context, heap);
+            }
+        }
+        machine
+            .intrinsics
+            .for_each_value(|value| check_value(value, heap));
+        for module in &machine.registry.modules {
+            if let Some(value) = module.namespace {
+                check_value(value, heap);
+            }
+            if let Some(value) = module.import_meta {
+                check_value(value, heap);
+            }
+            match &module.state {
+                ModuleState::EvaluatingAsync {
+                    record, promise, ..
+                } => {
+                    check_value(*record, heap);
+                    check_value(*promise, heap);
+                }
+                ModuleState::Evaluated(Err(error)) => check_runtime_error(error, heap),
+                _ => {}
+            }
+        }
+        for cell in &machine.registry.cells {
+            check_value(cell.value, heap);
+        }
+        for external in machine.registry.external.values() {
+            check_value(external.namespace, heap);
+            for export in external.exports.values() {
+                check_value(export.value, heap);
+            }
+            for value in external.internals.values().copied() {
+                check_value(value, heap);
+            }
+        }
+        for roots in &machine.native_roots {
+            check_values(roots, heap);
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn assert_no_rooted_vacant<H: Host>(&self, _machine: &Machine<'_, H>) {}
+}
+
+#[cfg(debug_assertions)]
+fn check_value(value: Value, heap: &[HeapEntry]) {
+    if let Some(index) = runtime_index(value)
+        && index < heap.len()
+        && matches!(heap[index], HeapEntry::Vacant)
+    {
+        panic!("rooted value names swept slot {index}");
+    }
+}
+
+#[cfg(debug_assertions)]
+fn check_values(values: &[Value], heap: &[HeapEntry]) {
+    for &value in values {
+        check_value(value, heap);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn check_activation(activation: &SuspendedActivation, heap: &[HeapEntry]) {
+    check_values(&activation.registers, heap);
+    check_value(activation.this_value, heap);
+    check_value(activation.new_target, heap);
+    check_values(&activation.args, heap);
+    if let Some(value) = activation.arguments_object {
+        check_value(value, heap);
+    }
+    if let Some(value) = activation.context {
+        check_value(value, heap);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn check_generator_resume(resume: &GeneratorResume, heap: &[HeapEntry]) {
+    match resume {
+        GeneratorResume::Yield { value, activation } => {
+            check_value(*value, heap);
+            check_activation(activation, heap);
+        }
+        GeneratorResume::Return(value) | GeneratorResume::Throw { value, .. } => {
+            check_value(*value, heap);
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn check_microtask(job: &MicrotaskJob, heap: &[HeapEntry]) {
+    match job {
+        MicrotaskJob::Reaction {
+            reaction, value, ..
+        } => {
+            check_promise_reaction(reaction, heap);
+            check_value(*value, heap);
+        }
+        MicrotaskJob::Thenable {
+            promise,
+            thenable,
+            then,
+            context,
+        } => {
+            check_value(*promise, heap);
+            check_value(*thenable, heap);
+            check_value(*then, heap);
+            if let Some(context) = context {
+                check_value(*context, heap);
+            }
+        }
+        MicrotaskJob::Callback { callback, context } => {
+            check_value(*callback, heap);
+            if let Some(context) = context {
+                check_value(*context, heap);
+            }
+        }
+        MicrotaskJob::FinalizationCleanup { registry, context } => {
+            check_value(*registry, heap);
+            if let Some(context) = context {
+                check_value(*context, heap);
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn check_promise_reaction(reaction: &PromiseReaction, heap: &[HeapEntry]) {
+    match reaction {
+        PromiseReaction::Fulfilled {
+            handler, derived, ..
+        }
+        | PromiseReaction::Rejected {
+            handler, derived, ..
+        } => {
+            check_value(*handler, heap);
+            check_value(*derived, heap);
+        }
+        PromiseReaction::AsyncFulfill { activation, .. }
+        | PromiseReaction::AsyncReject { activation, .. } => {
+            check_value(*activation, heap);
+        }
+        PromiseReaction::AsyncGeneratorFulfill { generator, .. }
+        | PromiseReaction::AsyncGeneratorReject { generator, .. } => {
+            check_value(*generator, heap);
+        }
+        PromiseReaction::ModuleDepFulfill { .. } | PromiseReaction::ModuleDepReject { .. } => {}
+        PromiseReaction::AsyncFromSyncFulfill { derived, .. } => {
+            check_value(*derived, heap);
+        }
+        PromiseReaction::AsyncFromSyncReject {
+            derived,
+            sync_iterator,
+            ..
+        } => {
+            check_value(*derived, heap);
+            check_value(*sync_iterator, heap);
+        }
+        PromiseReaction::AsyncDisposeStep {
+            stack,
+            pending_error,
+            capability,
+            ..
+        } => {
+            check_value(*stack, heap);
+            if let Some(error) = pending_error {
+                check_value(*error, heap);
+            }
+            check_value(*capability, heap);
+        }
+        PromiseReaction::DynamicImportFulfill { promise, .. }
+        | PromiseReaction::DynamicImportReject { promise, .. } => {
+            check_value(*promise, heap);
+        }
+    }
+    if let Some(context) = reaction.context() {
+        check_value(context, heap);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn check_runtime_error(error: &RuntimeError, heap: &[HeapEntry]) {
+    match &error.kind {
+        RuntimeErrorKind::UncaughtThrow { value, .. }
+        | RuntimeErrorKind::InvalidValue { value } => check_value(*value, heap),
+        _ => {}
     }
 }
 

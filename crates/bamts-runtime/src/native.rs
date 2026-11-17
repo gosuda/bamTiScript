@@ -6985,6 +6985,7 @@ mod tests {
     }
 
     fn assert_parity<H: Host, F: Fn() -> H>(module: &Module<Verified>, make_host: F) -> Value {
+        let _suspended = crate::gc::StressSuspended::begin();
         let limits = Limits::default();
         let program = one_module_program(module);
 
@@ -7285,8 +7286,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn first_static_dependency_tla_rejection_skips_the_native_graph() {
+    fn rejecting_dependency_graph() -> Program<Verified> {
         let rejecting = program_module(
             "rejecting",
             vec![Constant::Undefined, Constant::Int32(9)],
@@ -7377,20 +7377,52 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let program = linked(vec![rejecting, pending, root], 2);
+        linked(vec![rejecting, pending, root], 2)
+    }
+
+    #[test]
+    fn a_rejected_first_dependency_survives_a_collection_at_every_safe_point() {
+        let program = rejecting_dependency_graph();
+        let mut host = SilentHost;
+        let limits = Limits {
+            collect_every_allocation: true,
+            ..Limits::default()
+        };
+        let mut machine = Machine::new(&program, &mut host, limits);
+        let error = machine
+            .evaluate()
+            .expect_err("the dependency rejection propagates");
+        assert!(
+            matches!(
+                error.kind,
+                RuntimeErrorKind::UncaughtThrow { value, .. } if value == Value::int32(9)
+            ),
+            "unexpected error: {:?}",
+            error.kind
+        );
+        assert!(machine.test_global("root-ran").is_none());
+    }
+
+    #[test]
+    fn first_static_dependency_tla_rejection_skips_the_native_graph() {
+        let program = rejecting_dependency_graph();
 
         let mut interpreter_host = SilentHost;
         let mut machine = Machine::new(&program, &mut interpreter_host, Limits::default());
         let error = machine
             .evaluate()
             .expect_err("interpreter propagates the first dependency rejection");
-        assert!(matches!(
-            error.kind,
-            RuntimeErrorKind::UncaughtThrow {
-                value,
-                ..
-            } if value == Value::int32(9)
-        ));
+        assert!(
+            matches!(
+                error.kind,
+                RuntimeErrorKind::UncaughtThrow {
+                    value,
+                    ..
+                } if value == Value::int32(9)
+            ),
+            "unexpected error: {:?}",
+            error.kind
+        );
         assert!(
             machine.test_global("root-ran").is_none(),
             "the root body must not run after a dependency rejects"

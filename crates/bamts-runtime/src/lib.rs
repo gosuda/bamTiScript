@@ -113,6 +113,9 @@ pub struct Limits {
     pub max_timers: usize,
     /// This agent's `[[CanBlock]]`: whether `Atomics.wait` may suspend it.
     pub agent_can_suspend: bool,
+    /// Test hook: every allocation requests a collection, which runs at the next
+    /// safe point. Defaults to false.
+    pub collect_every_allocation: bool,
 }
 
 impl Default for Limits {
@@ -131,6 +134,7 @@ impl Default for Limits {
             max_microtasks: 1 << 20,
             max_timers: 1 << 20,
             agent_can_suspend: true,
+            collect_every_allocation: false,
         }
     }
 }
@@ -1420,6 +1424,19 @@ enum AsyncStep {
         execution: Option<Execution>,
     },
     Throw(RuntimeError),
+}
+
+impl AsyncStep {
+    fn held_value(&self) -> Option<Value> {
+        match self {
+            Self::Suspend { awaited, .. } => Some(*awaited),
+            Self::Return { value, .. } => Some(*value),
+            Self::Throw(error) => match &error.kind {
+                RuntimeErrorKind::UncaughtThrow { value, .. } => Some(*value),
+                _ => None,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2920,6 +2937,8 @@ impl<'a, H: Host> Machine<'a, H> {
     /// Otherwise the machine remains available for an explicit
     /// [`Self::drain_microtasks`] checkpoint.
     pub fn evaluate(&mut self) -> Result<Execution, RuntimeError> {
+        #[cfg(test)]
+        self.gc.stress_from_environment();
         let result = (|| {
             if let Some(program) = self.program {
                 let entry = program.entry();
@@ -2967,6 +2986,16 @@ impl<'a, H: Host> Machine<'a, H> {
     /// and no timer beyond the settling turn fires here. A never-settling
     /// entry with no live timer is a stall, not a hang.
     fn drive_entry_to_settlement(
+        &mut self,
+        pending: ModulePending,
+        entry: ModuleId,
+    ) -> Result<Execution, RuntimeError> {
+        self.with_native_roots(&[pending.record, pending.promise], |machine| {
+            machine.settle_pending_entry(pending, entry)
+        })
+    }
+
+    fn settle_pending_entry(
         &mut self,
         pending: ModulePending,
         entry: ModuleId,
@@ -3841,7 +3870,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         return Err(error.kind);
                     }
                 };
-                self.settle_async_step(pair.record, pair.promise, step)
+                self.settle_async_step_rooted(pair.record, pair.promise, step)
                     .map_err(|failure| self.module_eval_failure(parent, failure).kind)
             }
             ModuleStart::Pending(_) => Ok(()),
@@ -5584,8 +5613,9 @@ impl<'a, H: Host> Machine<'a, H> {
         }) {
             return ModuleStart::Settled(Err(error));
         }
-        let step = self.drive_async_activation(stop_depth, None);
-        if let Err(failure) = self.settle_async_step(pair.record, pair.promise, step) {
+        if let Err(failure) =
+            self.drive_and_settle_async(pair.record, pair.promise, stop_depth, None)
+        {
             let error = self.module_eval_failure(module, failure);
             if !matches!(error.kind, RuntimeErrorKind::UncaughtThrow { .. }) {
                 // A fatal failure before settlement leaves the module
@@ -6063,35 +6093,9 @@ impl<'a, H: Host> Machine<'a, H> {
             ModuleEvaluation::Evaluated(result) => return result.map(|()| ModuleStart::Cached),
             ModuleEvaluation::Ready(dependencies) => dependencies,
         };
-        let mut pending_deps = 0usize;
-        let mut pending_pair: Option<ModulePending> = None;
-        for dependency in dependencies {
-            match self.evaluate_module(dependency) {
-                Ok(ModuleStart::Settled(_)) | Ok(ModuleStart::Cached) => {}
-                Ok(ModuleStart::Pending(pair)) => {
-                    if pending_pair.is_none() {
-                        pending_pair = Some(match self.create_module_async_pair(module) {
-                            Ok(pair) => pair,
-                            Err(failure) => {
-                                return Err(self.module_alloc_failure(module, failure));
-                            }
-                        });
-                    }
-                    if let Err(failure) = self.attach_module_reactions(module, pair.promise) {
-                        return Err(self.module_alloc_failure(module, failure));
-                    }
-                    pending_deps += 1;
-                }
-                Err(error) => {
-                    // A dependency's failure becomes this module's stored
-                    // failure without running its entry.
-                    match self.finish_module_evaluation(module, Err(error)) {
-                        Err(error) => return Err(error),
-                        Ok(_) => unreachable!("a dependency failure stays an error"),
-                    }
-                }
-            }
-        }
+        let (pending_deps, pending_pair) = self.with_native_roots(&[], |machine| {
+            machine.evaluate_dependencies(module, dependencies)
+        })?;
         if pending_deps > 0 {
             let pair = pending_pair.expect("pending dependencies forced the shared pair");
             self.registry.modules[module.get() as usize].state = ModuleState::EvaluatingAsync {
@@ -6109,6 +6113,47 @@ impl<'a, H: Host> Machine<'a, H> {
             self.finish_module_evaluation(module, result.clone())?;
         }
         Ok(start)
+    }
+
+    /// Evaluates each static dependency of `module`, counting the pending
+    /// ones. The shared pair is not in the module state until the count is
+    /// known, so it stays in the innermost native root frame meanwhile.
+    fn evaluate_dependencies(
+        &mut self,
+        module: ModuleId,
+        dependencies: Vec<ModuleId>,
+    ) -> Result<(usize, Option<ModulePending>), RuntimeError> {
+        let mut pending_deps = 0usize;
+        let mut pending_pair: Option<ModulePending> = None;
+        for dependency in dependencies {
+            match self.evaluate_module(dependency) {
+                Ok(ModuleStart::Settled(_)) | Ok(ModuleStart::Cached) => {}
+                Ok(ModuleStart::Pending(pair)) => {
+                    if pending_pair.is_none() {
+                        let shared = match self.create_module_async_pair(module) {
+                            Ok(pair) => pair,
+                            Err(failure) => {
+                                return Err(self.module_alloc_failure(module, failure));
+                            }
+                        };
+                        self.native_roots
+                            .last_mut()
+                            .expect("the caller pushed a native root frame")
+                            .extend([shared.record, shared.promise]);
+                        pending_pair = Some(shared);
+                    }
+                    if let Err(failure) = self.attach_module_reactions(module, pair.promise) {
+                        return Err(self.module_alloc_failure(module, failure));
+                    }
+                    pending_deps += 1;
+                }
+                Err(error) => match self.finish_module_evaluation(module, Err(error)) {
+                    Err(error) => return Err(error),
+                    Ok(_) => unreachable!("a dependency failure stays an error"),
+                },
+            }
+        }
+        Ok((pending_deps, pending_pair))
     }
 
     /// Settles an allocation failure while starting or awaiting module
@@ -7180,10 +7225,23 @@ impl<'a, H: Host> Machine<'a, H> {
         let bytes = entry.initial_bytes(&self.shapes, &self.atoms);
         self.ensure_allocation_capacity(1, bytes)?;
         self.sync_slot_ledger();
-        let slot = self.heap.len() as u32 + 1;
-        self.heap.push(entry);
-        self.slot_bytes.push(bytes);
+        let index = if let Some(index) = self.gc.free_slots.pop() {
+            debug_assert!(index < self.heap.len());
+            debug_assert!(index >= self.intrinsic_slots);
+            debug_assert!(matches!(self.heap[index], HeapEntry::Vacant));
+            self.heap[index] = entry;
+            self.slot_bytes[index] = bytes;
+            self.vacant_count -= 1;
+            self.gc.young_reused.push(index);
+            index
+        } else {
+            let index = self.heap.len();
+            self.heap.push(entry);
+            self.slot_bytes.push(bytes);
+            index
+        };
         self.heap_bytes += bytes;
+        let slot = index as u32 + 1;
         let id = SlotId::from_parts(RUNTIME_HEAP_SEGMENT, slot)
             .expect("runtime segment and one-based slot are nonzero");
         self.request_garbage_collection();
@@ -12417,9 +12475,52 @@ impl<'a, H: Host> Machine<'a, H> {
             return_to,
         })
         .map_err(|error| EvalFailure::Runtime(error.kind))?;
-        let step = self.drive_async_activation(stop_depth, None);
-        self.settle_async_step(record, promise, step)?;
+        self.drive_and_settle_async(record, promise, stop_depth, None)?;
         Ok(promise)
+    }
+
+    /// Runs one async step and settles it. The result Promise, the activation
+    /// record and the step's value live in Rust locals across code that can
+    /// collect, so they stay rooted until the step is settled.
+    fn drive_and_settle_async(
+        &mut self,
+        record: Value,
+        promise: Value,
+        stop_depth: usize,
+        inject: Option<(Value, ThrowOrigin, usize)>,
+    ) -> Result<(), EvalFailure> {
+        self.with_native_roots(&[record, promise], |machine| {
+            let step = machine.drive_async_activation(stop_depth, inject);
+            machine.settle_async_step_keeping_value(record, promise, step)
+        })
+    }
+
+    fn settle_async_step_rooted(
+        &mut self,
+        record: Value,
+        promise: Value,
+        step: Result<AsyncStep, EvalFailure>,
+    ) -> Result<(), EvalFailure> {
+        self.with_native_roots(&[record, promise], |machine| {
+            machine.settle_async_step_keeping_value(record, promise, step)
+        })
+    }
+
+    /// Settles inside the innermost native root frame, adding the step's value
+    /// to it first.
+    fn settle_async_step_keeping_value(
+        &mut self,
+        record: Value,
+        promise: Value,
+        step: Result<AsyncStep, EvalFailure>,
+    ) -> Result<(), EvalFailure> {
+        if let Some(value) = step.as_ref().ok().and_then(AsyncStep::held_value) {
+            self.native_roots
+                .last_mut()
+                .expect("the caller pushed a native root frame")
+                .push(value);
+        }
+        self.settle_async_step(record, promise, step)
     }
 
     /// Resumes a suspended async activation inside its Promise reaction job. On
@@ -12486,8 +12587,7 @@ impl<'a, H: Host> Machine<'a, H> {
         };
         frame.outer_context = std::mem::replace(&mut self.context_global, frame.context);
         self.frames.push(frame);
-        let step = self.drive_async_activation(stop_depth, inject);
-        match self.settle_async_step(record, promise, step) {
+        match self.drive_and_settle_async(record, promise, stop_depth, inject) {
             Ok(()) => Ok(()),
             Err(EvalFailure::Runtime(kind)) => {
                 // A fatal failure during a module entry's resume leaves the
@@ -16313,11 +16413,11 @@ mod tests {
         let execution = machine.evaluate().unwrap();
         machine.run_to_quiescence().unwrap();
         assert_eq!(execution.value, Value::int32(7));
-        assert!(matches!(
-            machine.heap[machine.intrinsic_slots],
-            HeapEntry::Vacant
-        ));
-        assert!(machine.vacant_count >= 2);
+        assert!(
+            machine.heap.len() - machine.intrinsic_slots < 3,
+            "three overwritten objects reuse swept slots instead of growing the heap by three"
+        );
+        assert!(machine.vacant_count >= 1);
         machine.assert_heap_ledger();
     }
 
@@ -16351,7 +16451,7 @@ mod tests {
             outcomes.push((execution.value, machine.heap_bytes, machine.vacant_count));
         }
 
-        assert_eq!(outcomes, vec![(Value::int32(7), 1, 2); 3]);
+        assert_eq!(outcomes, vec![(Value::int32(7), 1, 1); 3]);
     }
 
     #[test]
@@ -26833,8 +26933,7 @@ mod tests {
         assert_eq!(execution.value, Value::int32(7));
     }
 
-    #[test]
-    fn top_level_await_resumes_module_entry() {
+    fn top_level_await_program() -> Program<Verified> {
         let module = program_module(
             "root",
             vec![
@@ -26866,16 +26965,36 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let program = linked(vec![module], 0);
-        let mut host = TestHost;
-        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        linked(vec![module], 0)
+    }
 
+    fn assert_top_level_await_completes(machine: &mut Machine<'_, TestHost>) {
         let execution = machine.evaluate().expect("top-level await completes");
         machine.run_to_quiescence().expect("event loop drains");
 
         assert_eq!(execution.value, Value::int32(7));
         assert_eq!(execution.entry_registers[1], Value::int32(7));
         assert_eq!(machine.test_global("after"), Some(Value::int32(7)));
+    }
+
+    #[test]
+    fn top_level_await_resumes_module_entry() {
+        let program = top_level_await_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        assert_top_level_await_completes(&mut machine);
+    }
+
+    #[test]
+    fn a_pending_module_entry_survives_a_collection_at_every_safe_point() {
+        let program = top_level_await_program();
+        let mut host = TestHost;
+        let limits = Limits {
+            collect_every_allocation: true,
+            ..Limits::default()
+        };
+        let mut machine = Machine::new(&program, &mut host, limits);
+        assert_top_level_await_completes(&mut machine);
     }
 
     #[test]

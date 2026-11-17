@@ -64,6 +64,13 @@ version has shipped, and no tag or stable package exists while any gate in
   charged a constant. Room for the flat text is required when the rope is
   made, and the flat size is charged when the rope is flattened, so a long
   append chain stays inside the default heap limit.
+- A collection hands the heap slots it vacates to later allocations, so an
+  allocate-and-drop loop no longer grows the heap. `Limits` gains
+  `collect_every_allocation`, a stress option that requests a collection
+  after every allocation and runs it at the next safe point. Stress runs
+  found three places where a Promise, an activation record or a module
+  evaluation pair lived only in a Rust local across a safe point; each is
+  rooted now.
 
 ### Known incomplete
 
