@@ -4,13 +4,13 @@ use std::collections::BTreeSet;
 
 use bamts_bytecode::{
     AccessorKind, BinaryOp, Constant, ConstantId, EcmaString, ExceptionHandler, Function,
-    FunctionFlags, FunctionId, Instruction, IntrinsicErrorKind, Module, ModuleId, Pc, Program,
-    ProgramModule, Register, Verified,
+    FunctionFlags, FunctionId, Instruction, IntrinsicErrorKind, Module, ModuleId, NumberBits, Pc,
+    Program, ProgramModule, Register, Verified,
 };
-use bamts_codegen::compile_jit;
 use bamts_codegen::helpers::{
     HelperDemand, ISA_REPRESENTATIVES, STRUCTURAL_HELPERS, helper_demand, verify_helper_coverage,
 };
+use bamts_codegen::{JitProgram, compile_jit, compile_jit_with_failing_guards};
 use bamts_native::tiering::{
     DeoptReason, OsrEntry, Tier, TierTransition, TieringState, WarmupPolicy,
     verify_tiering_contract,
@@ -116,7 +116,7 @@ fn cid(index: u32) -> ConstantId {
 
 /// Emits one observable value through the real `print` host builtin. The
 /// computation before this suffix is therefore visible on both execution paths.
-fn print_suffix(value: Register, scratch: u32) -> Vec<Instruction> {
+fn print_value(value: Register, scratch: u32) -> Vec<Instruction> {
     vec![
         Instruction::LoadGlobal {
             dst: reg(scratch),
@@ -139,8 +139,13 @@ fn print_suffix(value: Register, scratch: u32) -> Vec<Instruction> {
             this_value: reg(scratch + 2),
             arguments: reg(scratch + 1),
         },
-        Instruction::Halt,
     ]
+}
+
+fn print_suffix(value: Register, scratch: u32) -> Vec<Instruction> {
+    let mut code = print_value(value, scratch);
+    code.push(Instruction::Halt);
+    code
 }
 
 fn arithmetic_program(left: i32, right: i32, op: BinaryOp) -> Program<Verified> {
@@ -214,7 +219,7 @@ fn every_classified_opcode_and_helper_is_accounted_for() {
     let expected: BTreeSet<_> = (0..bamts_native::HELPER_COUNT).collect();
     assert_eq!(helpers, expected, "every runtime helper must be reachable");
     assert_eq!(ISA_REPRESENTATIVES.len(), 60, "append-only ISA changed");
-    assert_eq!(helpers.len(), 55, "runtime helper namespace changed");
+    assert_eq!(helpers.len(), 56, "runtime helper namespace changed");
 }
 
 #[test]
@@ -442,6 +447,15 @@ fn tiered(
     policy: WarmupPolicy,
 ) -> (Observable, TieredRunReport) {
     let compiled = compile_jit(program).expect("stress fixture must compile to native code");
+    tiered_on(&compiled, program, limits, policy)
+}
+
+fn tiered_on(
+    compiled: &JitProgram,
+    program: &Program<Verified>,
+    limits: &Limits,
+    policy: WarmupPolicy,
+) -> (Observable, TieredRunReport) {
     assert_eq!(
         compiled.program_bytes(),
         program.encode(),
@@ -450,7 +464,7 @@ fn tiered(
     let mut host = RecordingHost::default();
     let (outcome, report) = run_linked_program_tiered(
         program,
-        &compiled,
+        compiled,
         &mut host,
         limits,
         policy,
@@ -1540,4 +1554,462 @@ fn intrinsic_errors_ignore_a_replaced_or_deleted_global_constructor() {
             );
         }
     }
+}
+
+struct Xorshift64(u64);
+
+impl Xorshift64 {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0 | 1;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound as u64) as usize
+    }
+}
+
+const SPECULATIVE_OPERATORS: [BinaryOp; 18] = [
+    BinaryOp::Add,
+    BinaryOp::Subtract,
+    BinaryOp::Multiply,
+    BinaryOp::Divide,
+    BinaryOp::Remainder,
+    BinaryOp::BitAnd,
+    BinaryOp::BitOr,
+    BinaryOp::BitXor,
+    BinaryOp::ShiftLeft,
+    BinaryOp::ShiftRight,
+    BinaryOp::UnsignedShiftRight,
+    BinaryOp::StrictEqual,
+    BinaryOp::StrictNotEqual,
+    BinaryOp::LessThan,
+    BinaryOp::LessThanOrEqual,
+    BinaryOp::GreaterThan,
+    BinaryOp::GreaterThanOrEqual,
+    BinaryOp::Equal,
+];
+
+/// The first constant index of the operand pool.
+const POOL_BASE: u32 = 4;
+/// How many leading pool entries are `Int32` constants.
+const POOL_INT32_COUNT: usize = 8;
+
+fn operand_pool() -> Vec<Constant> {
+    vec![
+        Constant::Int32(0),
+        Constant::Int32(1),
+        Constant::Int32(-1),
+        Constant::Int32(7),
+        Constant::Int32(46_340),
+        Constant::Int32(65_536),
+        Constant::Int32(i32::MAX),
+        Constant::Int32(i32::MIN),
+        Constant::Number(NumberBits::from_f64(0.5)),
+        Constant::Number(NumberBits::from_f64(-0.0)),
+        Constant::Number(NumberBits::from_f64(1.0e10)),
+        Constant::Number(NumberBits::from_f64(f64::NAN)),
+        Constant::Number(NumberBits::from_f64(2_147_483_648.0)),
+        Constant::Boolean(true),
+        Constant::Null,
+        Constant::String(EcmaString::encode("3")),
+    ]
+}
+
+/// An entry that calls `mix(a, b)` six times with operands drawn from the pool
+/// (the first call from the `Int32` entries only, so the first profile is
+/// integer-only), printing each result. `mix` is a chain of six binary
+/// operators over its parameters and earlier results. The pool includes
+/// operands that overflow `Int32`, mix integers with doubles, and one object
+/// whose `valueOf` runs user code.
+fn speculative_program(random: &mut Xorshift64) -> Program<Verified> {
+    const STEPS: u32 = 6;
+    const CALLS: usize = 6;
+    let pool = operand_pool();
+    let mut constants = vec![
+        Constant::String(EcmaString::encode("entry")),
+        Constant::String(EcmaString::encode("print")),
+        Constant::Undefined,
+        Constant::String(EcmaString::encode("valueOf")),
+    ];
+    constants.extend(pool.iter().cloned());
+
+    let mut entry = vec![
+        Instruction::CreateArray { dst: reg(0) },
+        Instruction::CreateClosure {
+            dst: reg(1),
+            function: FunctionId::new(1),
+            captures: reg(0),
+        },
+        Instruction::CreateClosure {
+            dst: reg(2),
+            function: FunctionId::new(2),
+            captures: reg(0),
+        },
+        Instruction::CreateObject { dst: reg(3) },
+        Instruction::LoadConst {
+            dst: reg(4),
+            constant: cid(3),
+        },
+        Instruction::SetProperty {
+            object: reg(3),
+            key: reg(4),
+            value: reg(2),
+        },
+        Instruction::LoadConst {
+            dst: reg(5),
+            constant: cid(2),
+        },
+    ];
+    for call in 0..CALLS {
+        entry.push(Instruction::CreateArray { dst: reg(6) });
+        for slot in [7, 8] {
+            let choices = if call == 0 {
+                POOL_INT32_COUNT
+            } else {
+                pool.len() + 1
+            };
+            let choice = random.below(choices);
+            entry.push(if choice == pool.len() {
+                Instruction::Move {
+                    dst: reg(slot),
+                    src: reg(3),
+                }
+            } else {
+                Instruction::LoadConst {
+                    dst: reg(slot),
+                    constant: cid(POOL_BASE + choice as u32),
+                }
+            });
+            entry.push(Instruction::ArrayPush {
+                array: reg(6),
+                value: reg(slot),
+            });
+        }
+        entry.push(Instruction::Call {
+            dst: reg(9),
+            callee: reg(1),
+            this_value: reg(5),
+            arguments: reg(6),
+        });
+        entry.extend(print_value(reg(9), 10));
+    }
+    entry.push(Instruction::Halt);
+
+    let mut mix = Vec::new();
+    for step in 0..STEPS {
+        let available = 2 + step as usize;
+        mix.push(Instruction::Binary {
+            dst: reg(2 + step),
+            op: SPECULATIVE_OPERATORS[random.below(SPECULATIVE_OPERATORS.len())],
+            left: reg(if step == 0 { 0 } else { 1 + step }),
+            right: reg(random.below(available) as u32),
+        });
+    }
+    mix.push(Instruction::Return {
+        value: reg(1 + STEPS),
+    });
+
+    let value_of = vec![
+        Instruction::LoadConst {
+            dst: reg(0),
+            constant: cid(POOL_BASE + 3),
+        },
+        Instruction::Return { value: reg(0) },
+    ];
+    module_program(
+        constants,
+        vec![
+            Function::new(None, 0, 0, 14, FunctionFlags::default(), entry, Vec::new()),
+            Function::new(
+                None,
+                0,
+                2,
+                2 + STEPS,
+                FunctionFlags::default(),
+                mix,
+                Vec::new(),
+            ),
+            Function::new(
+                None,
+                0,
+                0,
+                1,
+                FunctionFlags::default(),
+                value_of,
+                Vec::new(),
+            ),
+        ],
+    )
+}
+
+fn mix_summary(report: &TieredRunReport) -> &UnitTieringSummary {
+    report
+        .units
+        .iter()
+        .find(|unit| unit.module == ModuleId::new(0) && unit.function == FunctionId::new(1))
+        .expect("mix unit is reported")
+}
+
+fn eager_policy() -> WarmupPolicy {
+    WarmupPolicy {
+        baseline_invocations: 1,
+        optimized_invocations: 2,
+        osr_back_edges: 2,
+        deopt_budget: 8,
+    }
+}
+
+/// `mix(a, b) = a + b`, called once per operand pair with each result printed.
+fn add_program(pairs: &[(Constant, Constant)]) -> Program<Verified> {
+    let mut constants = vec![
+        Constant::String(EcmaString::encode("entry")),
+        Constant::String(EcmaString::encode("print")),
+        Constant::Undefined,
+    ];
+    let mut entry = vec![
+        Instruction::CreateArray { dst: reg(0) },
+        Instruction::CreateClosure {
+            dst: reg(1),
+            function: FunctionId::new(1),
+            captures: reg(0),
+        },
+        Instruction::LoadConst {
+            dst: reg(2),
+            constant: cid(2),
+        },
+    ];
+    for (left, right) in pairs {
+        let left_id = constants.len() as u32;
+        constants.push(left.clone());
+        constants.push(right.clone());
+        entry.extend([
+            Instruction::CreateArray { dst: reg(3) },
+            Instruction::LoadConst {
+                dst: reg(4),
+                constant: cid(left_id),
+            },
+            Instruction::ArrayPush {
+                array: reg(3),
+                value: reg(4),
+            },
+            Instruction::LoadConst {
+                dst: reg(5),
+                constant: cid(left_id + 1),
+            },
+            Instruction::ArrayPush {
+                array: reg(3),
+                value: reg(5),
+            },
+            Instruction::Call {
+                dst: reg(6),
+                callee: reg(1),
+                this_value: reg(2),
+                arguments: reg(3),
+            },
+        ]);
+        entry.extend(print_value(reg(6), 7));
+    }
+    entry.push(Instruction::Halt);
+    let mix = vec![
+        Instruction::Binary {
+            dst: reg(2),
+            op: BinaryOp::Add,
+            left: reg(0),
+            right: reg(1),
+        },
+        Instruction::Return { value: reg(2) },
+    ];
+    module_program(
+        constants,
+        vec![
+            Function::new(None, 0, 0, 11, FunctionFlags::default(), entry, Vec::new()),
+            Function::new(None, 0, 2, 3, FunctionFlags::default(), mix, Vec::new()),
+        ],
+    )
+}
+
+#[test]
+fn optimized_int32_add_overflows_to_a_double_and_deoptimizes_on_a_double_operand() {
+    let program = add_program(&[
+        (Constant::Int32(1), Constant::Int32(2)),
+        (Constant::Int32(3), Constant::Int32(4)),
+        (Constant::Int32(i32::MAX), Constant::Int32(1)),
+        (
+            Constant::Number(NumberBits::from_f64(0.5)),
+            Constant::Int32(1),
+        ),
+        (Constant::Int32(5), Constant::Int32(6)),
+    ]);
+    let limits = Limits::default();
+    let expected = interpreter(&program, &limits);
+    assert_eq!(
+        expected,
+        Observable::Normal {
+            stdout: b"3\n7\n2147483648\n1.5\n11\n".to_vec(),
+            exit_code: 0,
+        }
+    );
+    let (observed, report) = tiered(&program, &limits, eager_policy());
+    assert_eq!(observed, expected);
+    assert!(
+        mix_summary(&report).deopts >= 1,
+        "the double operand must fail the integer-only guard"
+    );
+}
+
+#[test]
+fn speculative_tier_matches_interpreter_baseline_and_forced_deoptimization() {
+    let eager = eager_policy();
+    let baseline_only = WarmupPolicy {
+        optimized_invocations: u32::MAX,
+        ..eager
+    };
+    let limits = Limits::default();
+    let mut random = Xorshift64(0x5eed_0c12_a11c_e5ed);
+    let mut optimized_units = 0;
+    let mut forced_deopts = 0;
+    for case in 0..200 {
+        let program = speculative_program(&mut random);
+        let expected = interpreter(&program, &limits);
+
+        let (baseline, _) = tiered(&program, &limits, baseline_only);
+        assert_eq!(baseline, expected, "baseline-only mismatch in case {case}");
+
+        let (optimized, report) = tiered(&program, &limits, eager);
+        assert_eq!(optimized, expected, "optimized mismatch in case {case}");
+        if mix_summary(&report).tier == Tier::Optimized {
+            optimized_units += 1;
+        }
+
+        let failing = compile_jit_with_failing_guards(&program)
+            .expect("stress fixture must compile to native code");
+        let (forced, report) = tiered_on(&failing, &program, &limits, eager);
+        assert_eq!(forced, expected, "forced-deopt mismatch in case {case}");
+        forced_deopts += mix_summary(&report).deopts;
+    }
+    assert!(
+        optimized_units > 0,
+        "no generated program ever held the optimized tier"
+    );
+    assert!(
+        forced_deopts > 0,
+        "forced guard failures never reached the deoptimization path"
+    );
+}
+
+/// `read(a, i) = a[i]`, called with a numeric array, an out-of-bounds index, a
+/// negative index, and an array holding a string, each result printed.
+fn indexed_read_program() -> Program<Verified> {
+    let constants = vec![
+        Constant::String(EcmaString::encode("entry")),
+        Constant::String(EcmaString::encode("print")),
+        Constant::Undefined,
+        Constant::Int32(10),
+        Constant::Number(NumberBits::from_f64(2.5)),
+        Constant::String(EcmaString::encode("s")),
+        Constant::Int32(0),
+        Constant::Int32(1),
+        Constant::Int32(2),
+        Constant::Int32(7),
+        Constant::Int32(-1),
+    ];
+    let mut entry = vec![
+        Instruction::CreateArray { dst: reg(0) },
+        Instruction::CreateClosure {
+            dst: reg(1),
+            function: FunctionId::new(1),
+            captures: reg(0),
+        },
+        Instruction::LoadConst {
+            dst: reg(2),
+            constant: cid(2),
+        },
+        Instruction::CreateArray { dst: reg(3) },
+        Instruction::CreateArray { dst: reg(4) },
+    ];
+    for (array, element) in [(3, 3), (3, 4), (3, 3), (4, 3), (4, 5)] {
+        entry.push(Instruction::LoadConst {
+            dst: reg(5),
+            constant: cid(element),
+        });
+        entry.push(Instruction::ArrayPush {
+            array: reg(array),
+            value: reg(5),
+        });
+    }
+    for (array, index) in [
+        (3, 6),
+        (3, 7),
+        (3, 8),
+        (3, 9),
+        (3, 10),
+        (4, 6),
+        (4, 7),
+        (4, 8),
+        (3, 6),
+    ] {
+        entry.extend([
+            Instruction::CreateArray { dst: reg(6) },
+            Instruction::ArrayPush {
+                array: reg(6),
+                value: reg(array),
+            },
+            Instruction::LoadConst {
+                dst: reg(7),
+                constant: cid(index),
+            },
+            Instruction::ArrayPush {
+                array: reg(6),
+                value: reg(7),
+            },
+            Instruction::Call {
+                dst: reg(8),
+                callee: reg(1),
+                this_value: reg(2),
+                arguments: reg(6),
+            },
+        ]);
+        entry.extend(print_value(reg(8), 9));
+    }
+    entry.push(Instruction::Halt);
+    let read = vec![
+        Instruction::GetProperty {
+            dst: reg(2),
+            object: reg(0),
+            key: reg(1),
+        },
+        Instruction::Return { value: reg(2) },
+    ];
+    module_program(
+        constants,
+        vec![
+            Function::new(None, 0, 0, 13, FunctionFlags::default(), entry, Vec::new()),
+            Function::new(None, 0, 2, 3, FunctionFlags::default(), read, Vec::new()),
+        ],
+    )
+}
+
+#[test]
+fn optimized_indexed_reads_match_the_generic_read_and_deoptimize_on_a_miss() {
+    let program = indexed_read_program();
+    let limits = Limits::default();
+    let expected = interpreter(&program, &limits);
+    assert_eq!(
+        expected,
+        Observable::Normal {
+            stdout: b"10\n2.5\n10\nundefined\nundefined\n10\ns\nundefined\n10\n".to_vec(),
+            exit_code: 0,
+        }
+    );
+    let (observed, report) = tiered(&program, &limits, eager_policy());
+    assert_eq!(observed, expected);
+    assert!(
+        mix_summary(&report).deopts >= 1,
+        "an out-of-bounds read must fail the numeric-array guard"
+    );
 }

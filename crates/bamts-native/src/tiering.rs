@@ -10,7 +10,7 @@
 
 use crate::{
     CompletionTag, TRAP_INVALID_COMPLETION_TAG, TRAP_INVALID_FRAME, TRAP_INVALID_REGISTER,
-    TRAP_MISSING_NATIVE_OPS, TRAP_PANIC,
+    TRAP_MISSING_NATIVE_OPS, TRAP_PANIC, TRAP_SPECULATION, Value,
 };
 use bamts_bytecode::Pc;
 
@@ -94,6 +94,64 @@ pub struct OsrEntry {
     pub pc: Pc,
 }
 
+/// The operand kinds one bytecode site has observed, as a bit set.
+///
+/// A site's profile is the disjunction of the kinds of every operand it has
+/// seen: [`SiteProfile::INT32`] when the operand was a boxed `int32`,
+/// [`SiteProfile::DOUBLE`] when it was a non-boxed number, and
+/// [`SiteProfile::OTHER`] for anything else. The optimized tier compiles a
+/// site only from a profile that admits a numeric fast path, and each fast
+/// path re-checks the operand words at run time, so a stale profile costs one
+/// speculation trap and never a wrong result.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SiteProfile(pub u8);
+
+impl SiteProfile {
+    /// The operand was a well-formed boxed `int32`.
+    pub const INT32: u8 = 1;
+    /// The operand was a non-boxed number (a double).
+    pub const DOUBLE: u8 = 2;
+    /// The operand was neither an `int32` nor a double.
+    pub const OTHER: u8 = 4;
+
+    /// The profile bit one observed operand contributes.
+    #[must_use]
+    pub const fn of(value: Value) -> u8 {
+        if value.as_int32().is_some() {
+            Self::INT32
+        } else if value.is_number() {
+            Self::DOUBLE
+        } else {
+            Self::OTHER
+        }
+    }
+
+    /// The observed-kind bit set.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// This profile plus one more observation.
+    #[must_use]
+    pub const fn observe(self, observed: u8) -> SiteProfile {
+        SiteProfile(self.0 | observed)
+    }
+
+    /// True when every observed operand was a boxed `int32`.
+    #[must_use]
+    pub const fn is_int32_only(self) -> bool {
+        self.0 == Self::INT32
+    }
+
+    /// True when every observed operand was a number (`int32` or double) and
+    /// at least one operand was observed.
+    #[must_use]
+    pub const fn is_numeric(self) -> bool {
+        self.0 != 0 && self.0 & !(Self::INT32 | Self::DOUBLE) == 0
+    }
+}
+
 /// Why a native activation abandoned compiled code.
 ///
 /// Only [`CompletionTag::FatalTrap`] deoptimizes. `Normal` and `Throw` are
@@ -112,6 +170,10 @@ pub enum DeoptReason {
     InvalidRegister,
     /// A native entry returned an unrecognized completion tag.
     InvalidCompletionTag,
+    /// A speculative guard failed: an optimized artifact guessed an operand
+    /// kind that the operand no longer has. The activation resumes in the
+    /// interpreter and the unit drops back to baseline code.
+    Speculation,
     /// A fatal trap whose record id this policy does not recognize. Kept
     /// distinct so an unknown failure still demotes loudly instead of being
     /// absorbed into a known bucket.
@@ -139,6 +201,7 @@ pub const fn deopt_reason(tag: CompletionTag, trap_id: u32) -> Option<DeoptReaso
             TRAP_PANIC => DeoptReason::Panic,
             TRAP_INVALID_REGISTER => DeoptReason::InvalidRegister,
             TRAP_INVALID_COMPLETION_TAG => DeoptReason::InvalidCompletionTag,
+            TRAP_SPECULATION => DeoptReason::Speculation,
             trap_id => DeoptReason::UnknownTrap { trap_id },
         }),
     }
@@ -194,6 +257,8 @@ pub struct TieringState {
     invocations: u32,
     back_edges: u32,
     deopts: u32,
+    speculation_deopts: u32,
+    optimization_barred: bool,
     pinned: bool,
     cancelled: bool,
 }
@@ -214,6 +279,8 @@ impl TieringState {
             invocations: 0,
             back_edges: 0,
             deopts: 0,
+            speculation_deopts: 0,
+            optimization_barred: false,
             pinned: false,
             cancelled: false,
         })
@@ -243,6 +310,20 @@ impl TieringState {
         self.deopts
     }
 
+    /// Saturating speculative-deoptimization counter observed so far.
+    #[must_use]
+    pub const fn speculation_deopts(&self) -> u32 {
+        self.speculation_deopts
+    }
+
+    /// True once optimization is refused for good: either the speculative
+    /// deopt budget was spent or the backend declined to compile an optimized
+    /// artifact.
+    #[must_use]
+    pub const fn optimization_barred(&self) -> bool {
+        self.optimization_barred
+    }
+
     /// True once the deopt budget is exhausted; a pinned unit never leaves
     /// the interpreter again.
     #[must_use]
@@ -269,7 +350,10 @@ impl TieringState {
             Tier::Interpreter if self.invocations >= self.policy.baseline_invocations => {
                 Tier::Baseline
             }
-            Tier::Baseline if self.invocations >= self.policy.optimized_invocations => {
+            Tier::Baseline
+                if !self.optimization_barred
+                    && self.invocations >= self.policy.optimized_invocations =>
+            {
                 Tier::Optimized
             }
             Tier::Interpreter | Tier::Baseline | Tier::Optimized => return None,
@@ -284,14 +368,15 @@ impl TieringState {
     ///
     /// Only true back edges (`target <= current`) count: a forward branch is
     /// not a loop, and replacing an activation at a pc it has not reached
-    /// would fabricate state. Interpreted-tier activations are the only OSR
-    /// beneficiaries; compiled tiers are already native.
+    /// would fabricate state. Its only caller is the interpreter loop, so the
+    /// activation is interpreted whatever tier its unit holds; a unit whose
+    /// baseline artifact already runs can still re-enter it at the header.
     pub fn observe_back_edge(&mut self, target: Pc, current: Pc) -> Option<OsrEntry> {
         if self.cancelled || self.pinned || target.get() > current.get() {
             return None;
         }
         self.back_edges = self.back_edges.saturating_add(1);
-        if self.tier == Tier::Interpreter && self.back_edges >= self.policy.osr_back_edges {
+        if self.back_edges >= self.policy.osr_back_edges {
             // Consume the accumulated heat: one OSR decision per warmup, so a
             // caller that ignores the decision must re-earn it.
             self.back_edges = 0;
@@ -300,11 +385,24 @@ impl TieringState {
         None
     }
 
-    /// Records one deoptimization: the unit re-enters the interpreter, its
-    /// warmup restarts from cold, and once the budget is spent the unit is
-    /// pinned there permanently.
-    pub fn record_deopt(&mut self, _reason: DeoptReason) -> Tier {
+    /// Records one deoptimization. Every reason but
+    /// [`DeoptReason::Speculation`] re-enters the interpreter, restarts the
+    /// warmup from cold, and pins the unit once the budget is spent. A
+    /// speculative failure instead drops the unit to baseline code, whose
+    /// artifact is still valid; after the same number of speculative failures
+    /// the unit is barred from optimization permanently.
+    pub fn record_deopt(&mut self, reason: DeoptReason) -> Tier {
         if self.cancelled {
+            return self.tier;
+        }
+        if matches!(reason, DeoptReason::Speculation) {
+            self.tier = Tier::Baseline;
+            self.invocations = 0;
+            self.deopts = self.deopts.saturating_add(1);
+            self.speculation_deopts = self.speculation_deopts.saturating_add(1);
+            if self.speculation_deopts >= self.policy.deopt_budget {
+                self.optimization_barred = true;
+            }
             return self.tier;
         }
         self.tier = Tier::Interpreter;
@@ -315,6 +413,16 @@ impl TieringState {
             self.pinned = true;
         }
         self.tier
+    }
+
+    /// Refuses the optimized promotion just requested: the unit keeps its
+    /// baseline artifact and never asks the backend again.
+    pub fn decline_optimization(&mut self) {
+        if self.cancelled {
+            return;
+        }
+        self.optimization_barred = true;
+        self.tier = Tier::Baseline;
     }
 
     /// Cancels the unit: every later observation and deopt is inert.
@@ -384,6 +492,23 @@ pub fn verify_tiering_contract() -> Result<(), TieringError> {
         return Err(vector("OSR heat is consumed by the decision"));
     }
 
+    // OSR for a compiled tier: the only caller is the interpreter loop, so a
+    // baseline unit's interpreted activation still transfers at the header.
+    let mut state = TieringState::new(policy)?;
+    state.observe_invocation();
+    state.observe_invocation();
+    if state.tier() != Tier::Baseline {
+        return Err(vector("warmup precedes the compiled-tier OSR vector"));
+    }
+    if state.observe_back_edge(header, latch).is_some()
+        || state.observe_back_edge(header, latch).is_some()
+    {
+        return Err(vector("no compiled-tier OSR before the threshold"));
+    }
+    if state.observe_back_edge(header, latch) != Some(OsrEntry { pc: header }) {
+        return Err(vector("compiled-tier OSR at exactly the threshold"));
+    }
+
     // Deopt: demotion, budget exhaustion, and pin permanence.
     let mut state = TieringState::new(policy)?;
     state.observe_invocation();
@@ -403,6 +528,52 @@ pub fn verify_tiering_contract() -> Result<(), TieringError> {
     for _ in 0..policy.optimized_invocations {
         if state.observe_invocation().is_some() {
             return Err(vector("a pinned unit never re-promotes"));
+        }
+    }
+
+    // Speculation: baseline fallback, a separate budget, then a permanent bar.
+    let mut state = TieringState::new(policy)?;
+    state.observe_invocation();
+    state.observe_invocation();
+    state.observe_invocation();
+    state.observe_invocation();
+    if state.tier() != Tier::Optimized {
+        return Err(vector("optimized warmup precedes the speculation vector"));
+    }
+    if state.record_deopt(DeoptReason::Speculation) != Tier::Baseline {
+        return Err(vector("a speculation failure drops to baseline"));
+    }
+    if state.invocations() != 0 {
+        return Err(vector("a speculation failure restarts the warmup"));
+    }
+    if state.optimization_barred() || state.is_pinned() {
+        return Err(vector("speculation budget remains"));
+    }
+    if state.record_deopt(DeoptReason::Speculation) != Tier::Baseline
+        || !state.optimization_barred()
+        || state.is_pinned()
+    {
+        return Err(vector("speculation budget exhaustion bars optimization"));
+    }
+    for _ in 0..policy.optimized_invocations {
+        if state.observe_invocation().is_some() {
+            return Err(vector("a barred unit never re-promotes"));
+        }
+    }
+
+    // Declined optimization: the backend said no, so the unit never asks again.
+    let mut state = TieringState::new(policy)?;
+    state.observe_invocation();
+    state.observe_invocation();
+    state.observe_invocation();
+    state.observe_invocation();
+    state.decline_optimization();
+    if state.tier() != Tier::Baseline || !state.optimization_barred() {
+        return Err(vector("a declined promotion keeps the baseline artifact"));
+    }
+    for _ in 0..policy.optimized_invocations {
+        if state.observe_invocation().is_some() {
+            return Err(vector("a declined unit never re-promotes"));
         }
     }
 
@@ -570,15 +741,73 @@ mod tests {
     }
 
     #[test]
-    fn compiled_tiers_do_not_request_osr() {
+    fn compiled_tiers_earn_osr_from_the_interpreter_loop() {
         let mut state = TieringState::new(tight_policy()).expect("valid policy");
         for _ in 0..3 {
             state.observe_invocation();
         }
         assert_eq!(state.tier(), Tier::Baseline);
-        for _ in 0..8 {
-            assert_eq!(state.observe_back_edge(Pc::new(1), Pc::new(9)), None);
+        let header = Pc::new(1);
+        let latch = Pc::new(9);
+        assert_eq!(state.observe_back_edge(header, latch), None);
+        assert_eq!(
+            state.observe_back_edge(header, latch),
+            Some(OsrEntry { pc: header }),
+            "the interpreter loop still transfers a baseline unit's activation"
+        );
+    }
+
+    #[test]
+    fn speculation_deopt_keeps_the_baseline_artifact_and_spends_its_own_budget() {
+        let policy = WarmupPolicy {
+            deopt_budget: 2,
+            ..tight_policy()
+        };
+        let mut state = TieringState::new(policy).expect("valid policy");
+        for _ in 0..5 {
+            state.observe_invocation();
         }
+        assert_eq!(state.tier(), Tier::Optimized);
+        assert_eq!(state.record_deopt(DeoptReason::Speculation), Tier::Baseline);
+        assert_eq!(state.invocations(), 0);
+        assert!(!state.optimization_barred());
+        assert!(!state.is_pinned());
+        // A second speculative failure spends the budget and bars optimization.
+        assert_eq!(state.record_deopt(DeoptReason::Speculation), Tier::Baseline);
+        assert_eq!(state.speculation_deopts(), 2);
+        assert_eq!(state.deopts(), 2);
+        assert!(state.optimization_barred());
+        assert!(
+            !state.is_pinned(),
+            "speculation never pins to the interpreter"
+        );
+        for _ in 0..16 {
+            assert_eq!(state.observe_invocation(), None);
+        }
+        assert_eq!(state.tier(), Tier::Baseline);
+    }
+
+    #[test]
+    fn decline_optimization_bars_promotion_but_keeps_running_baseline_code() {
+        let mut state = TieringState::new(tight_policy()).expect("valid policy");
+        for _ in 0..5 {
+            state.observe_invocation();
+        }
+        assert_eq!(state.tier(), Tier::Optimized);
+        state.decline_optimization();
+        assert_eq!(state.tier(), Tier::Baseline);
+        assert!(state.optimization_barred());
+        for _ in 0..16 {
+            assert_eq!(state.observe_invocation(), None);
+        }
+    }
+
+    #[test]
+    fn a_cancelled_unit_ignores_a_declined_optimization() {
+        let mut state = TieringState::new(tight_policy()).expect("valid policy");
+        state.cancel();
+        state.decline_optimization();
+        assert!(!state.optimization_barred());
     }
 
     #[test]
@@ -652,6 +881,7 @@ mod tests {
                 TRAP_INVALID_COMPLETION_TAG,
                 DeoptReason::InvalidCompletionTag,
             ),
+            (TRAP_SPECULATION, DeoptReason::Speculation),
         ] {
             assert_eq!(
                 deopt_reason(CompletionTag::FatalTrap, trap_id),
@@ -661,6 +891,27 @@ mod tests {
         assert_eq!(
             deopt_reason(CompletionTag::FatalTrap, 0xffff),
             Some(DeoptReason::UnknownTrap { trap_id: 0xffff })
+        );
+    }
+
+    #[test]
+    fn site_profile_accumulates_every_operand_kind_it_saw() {
+        assert_eq!(SiteProfile::of(Value::int32(7)), SiteProfile::INT32);
+        assert_eq!(SiteProfile::of(Value::number(1.5)), SiteProfile::DOUBLE);
+        assert_eq!(SiteProfile::of(Value::TRUE), SiteProfile::OTHER);
+        assert_eq!(SiteProfile::of(Value::UNDEFINED), SiteProfile::OTHER);
+
+        let empty = SiteProfile::default();
+        assert!(!empty.is_numeric() && !empty.is_int32_only());
+        let int32 = empty.observe(SiteProfile::of(Value::int32(1)));
+        assert!(int32.is_int32_only() && int32.is_numeric());
+        let numeric = int32.observe(SiteProfile::of(Value::number(2.0)));
+        assert!(!numeric.is_int32_only() && numeric.is_numeric());
+        let mixed = numeric.observe(SiteProfile::of(Value::NULL));
+        assert!(!mixed.is_numeric() && !mixed.is_int32_only());
+        assert_eq!(
+            mixed.bits(),
+            SiteProfile::INT32 | SiteProfile::DOUBLE | SiteProfile::OTHER
         );
     }
 }

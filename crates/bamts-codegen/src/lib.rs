@@ -192,7 +192,7 @@ mod jit_memory;
 #[cfg(feature = "host-jit")]
 pub use jit::{
     JitError, JitProgram, JitTelemetry, compile_jit, compile_jit_with_cancel,
-    compile_jit_with_telemetry, compile_jit_with_telemetry_cancel,
+    compile_jit_with_failing_guards, compile_jit_with_telemetry, compile_jit_with_telemetry_cancel,
 };
 
 #[cfg(feature = "aot")]
@@ -222,6 +222,10 @@ use bamts_bytecode::{
 };
 use bamts_cancel::{CancellationToken, Cancelled};
 
+#[cfg(feature = "host-jit")]
+use cranelift_codegen::ir::Endianness;
+#[cfg(feature = "host-jit")]
+use cranelift_codegen::ir::condcodes::FloatCC;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
     AbiParam, Block, ExtFuncData, ExternalName, Function, InstBuilder, MemFlagsData, Signature,
@@ -261,6 +265,55 @@ const TAG_THROW: i64 = 1;
 const TAG_SUSPEND: i64 = 2;
 /// [`CompletionTag::FatalTrap`] discriminant.
 const TAG_FATAL_TRAP: i64 = 3;
+
+// -- Speculative fast-path word algebra (optimized tier only) ----------------
+
+/// The high 32 bits of a well-formed boxed `int32`: the canonical NaN header
+/// plus `TAG_INT32 = 2` in the tag field, with the payload's upper half zero.
+/// `bamts_native::Value::as_int32` accepts exactly this word shape.
+#[cfg(feature = "host-jit")]
+const INT32_HIGH_WORD: i64 = 0x7ffa_0000;
+/// `INT32_HIGH_WORD << 32`: the boxed-`int32` word's constant prefix.
+#[cfg(feature = "host-jit")]
+const INT32_WORD_PREFIX: i64 = 0x7ffa_0000_0000_0000;
+/// The canonical NaN header (bits 63..51).
+#[cfg(feature = "host-jit")]
+const BOXED_HEADER_MASK: i64 = 0xfff8_0000_0000_0000u64 as i64;
+/// The canonical positive quiet NaN word.
+#[cfg(feature = "host-jit")]
+const CANONICAL_NAN_BITS: i64 = 0x7ff8_0000_0000_0000;
+/// The three-bit tag field (bits 50..48).
+#[cfg(feature = "host-jit")]
+const BOXED_TAG_MASK: i64 = 0x0007_0000_0000_0000;
+/// `bamts_native::Value::boolean(false)`.
+#[cfg(feature = "host-jit")]
+const FALSE_BITS: i64 = 0x7ffd_0000_0000_0000;
+/// `out.value` for a failed speculation guard: `TRAP_SPECULATION` boxed as an
+/// `int32`, the one trap shape `bamts_native::tiering::deopt_reason` recognizes.
+#[cfg(feature = "host-jit")]
+const SPECULATION_TRAP_BITS: i64 = 0x7ffa_0000_0000_0000 | bamts_native::TRAP_SPECULATION as i64;
+/// The largest `f64` that still compacts to an `int32`.
+#[cfg(feature = "host-jit")]
+const INT32_MAX_AS_F64: f64 = 2_147_483_647.0;
+/// The smallest `f64` that still compacts to an `int32`.
+#[cfg(feature = "host-jit")]
+const INT32_MIN_AS_F64: f64 = -2_147_483_648.0;
+/// The flags a `bitcast` accepts: endianness only. The host JIT targets
+/// little-endian machines.
+#[cfg(feature = "host-jit")]
+const BITCAST_FLAGS: MemFlagsData = MemFlagsData::new().with_endianness(Endianness::Little);
+
+// Pin the hand-written speculation words to the canonical encoders.
+#[cfg(feature = "host-jit")]
+const _: () = {
+    assert!(
+        bamts_native::Value::int32(bamts_native::TRAP_SPECULATION).to_bits() as i64
+            == SPECULATION_TRAP_BITS
+    );
+    assert!(bamts_native::Value::FALSE.to_bits() as i64 == FALSE_BITS);
+    assert!(bamts_native::Value::CANON_NAN as i64 == CANONICAL_NAN_BITS);
+    assert!(bamts_native::Value::int32(0).to_bits() as i64 == INT32_WORD_PREFIX);
+};
 
 /// Cranelift external-name namespace for lowered bytecode functions: a name
 /// `u0:<index>` refers to the lowered function whose [`FunctionId`] is `index`.
@@ -347,6 +400,7 @@ const _: () = {
 /// | 44 | `DefineOwnDescriptorSlot` | `object: i64, key: i64, src: i64, slot: i32` |
 /// | 45 | `WithHasBinding`    | `object: i64, key: i64`                     |
 /// | 46 | `ResumeMode`        | —                                            |
+/// | 55 | `ArrayGetNumber`    | `array: i64, index: i64`                     |
 ///
 /// Every helper except [`Helper::Truthy`] returns a
 /// `bamts_native::CompletionTag`. [`Helper::Truthy`] returns `0`/`1`.
@@ -535,6 +589,12 @@ pub enum Helper {
     /// realm's intrinsic error of selector `kind` with string constant
     /// `message`.
     ThrowIntrinsicError,
+    /// `bamts_array_get_number(frame, array, index, out)`: the element word of
+    /// `array[index]` when the receiver is an array whose element kind is
+    /// `Int32` or `Number` and the index is in bounds; otherwise the fatal
+    /// trap `bamts_native::TRAP_SPECULATION`. Emitted only by the speculative
+    /// optimized lowering, so the interpreter never calls it.
+    ArrayGetNumber,
 }
 
 impl Helper {
@@ -597,6 +657,7 @@ impl Helper {
             Helper::GetTemplateObject => "bamts_get_template_object",
             Helper::RequireGlobalBinding => "bamts_require_global_binding",
             Helper::ThrowIntrinsicError => "bamts_throw_intrinsic_error",
+            Helper::ArrayGetNumber => "bamts_array_get_number",
         }
     }
 
@@ -660,6 +721,7 @@ impl Helper {
             Helper::GetTemplateObject => 52,
             Helper::RequireGlobalBinding => 53,
             Helper::ThrowIntrinsicError => 54,
+            Helper::ArrayGetNumber => 55,
         }
     }
 
@@ -723,6 +785,7 @@ impl Helper {
             52 => Some(Helper::GetTemplateObject),
             53 => Some(Helper::RequireGlobalBinding),
             54 => Some(Helper::ThrowIntrinsicError),
+            55 => Some(Helper::ArrayGetNumber),
             _ => None,
         }
     }
@@ -855,6 +918,8 @@ impl Helper {
             Helper::CopyDataProperties => &[types::I64, types::I64, types::I64, types::I64, types::I64],
             // (frame, cooked, raw, out)
             Helper::GetTemplateObject => &[types::I64, types::I64, types::I64, types::I64],
+            // (frame, array, index, out)
+            Helper::ArrayGetNumber => &[types::I64, types::I64, types::I64, types::I64],
             // (frame, value)
             Helper::Truthy => &[types::I64, types::I64],
         }
@@ -1145,6 +1210,58 @@ pub struct LoweredProgram {
     pub entry_function: FunctionId,
 }
 
+/// The per-site profile that drives one optimized compile.
+///
+/// `profile` is indexed by bytecode instruction; a site whose entry admits a
+/// numeric fast path is lowered inline instead of through its helper.
+/// `force_guard_failure` makes every emitted guard fail, which the
+/// interpreter-differential test uses to prove the guard-failure path.
+#[cfg(feature = "host-jit")]
+#[derive(Clone, Copy)]
+struct Speculation<'a> {
+    profile: &'a [bamts_native::tiering::SiteProfile],
+    force_guard_failure: bool,
+}
+
+/// Lowers one function of a verified program with the speculative fast paths
+/// selected by `profile`.
+///
+/// This is the optimized-tier entry point: the same function is lowered again,
+/// independently of the baseline artifact, so both remain callable at once.
+#[cfg(feature = "host-jit")]
+pub(crate) fn lower_speculative_function(
+    module_id: ModuleId,
+    function_id: FunctionId,
+    function: &bamts_bytecode::Function,
+    profile: &[bamts_native::tiering::SiteProfile],
+    config: TargetFrontendConfig,
+    cancel: &CancellationToken,
+    force_guard_failure: bool,
+) -> Result<LoweredFunction, LowerError> {
+    cancel.check()?;
+    if config.pointer_bits() != 64 {
+        return Err(LowerError::UnsupportedPointerWidth {
+            bits: config.pointer_bits(),
+        });
+    }
+    let entry_signature = entry_signature(config.default_call_conv);
+    let flags = Flags::new(settings::builder());
+    let mut builder_context = FunctionBuilderContext::new();
+    let mut context = LowerFunctionContext {
+        module_id,
+        entry_signature: &entry_signature,
+        config,
+        flags: &flags,
+        builder_context: &mut builder_context,
+        cancel,
+        speculation: Some(Speculation {
+            profile,
+            force_guard_failure,
+        }),
+    };
+    lower_function(function_id, function, &mut context)
+}
+
 /// A deterministic failure from validating the structure of a lowered program.
 #[cfg(any(test, feature = "aot", feature = "host-jit"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1329,6 +1446,8 @@ fn lower_code_module_with_cancel(
         flags: &flags,
         builder_context: &mut builder_context,
         cancel,
+        #[cfg(feature = "host-jit")]
+        speculation: None,
     };
 
     let mut functions = Vec::with_capacity(function_count);
@@ -1381,6 +1500,10 @@ struct LowerFunctionContext<'a> {
     flags: &'a Flags,
     builder_context: &'a mut FunctionBuilderContext,
     cancel: &'a CancellationToken,
+    /// The per-site profile of an optimized compile, or `None` for baseline
+    /// lowering.
+    #[cfg(feature = "host-jit")]
+    speculation: Option<Speculation<'a>>,
 }
 
 fn lower_function(
@@ -1405,6 +1528,8 @@ fn lower_function(
             code.len(),
             handlers,
             context.config.default_call_conv,
+            #[cfg(feature = "host-jit")]
+            context.speculation,
         );
         lowering.build(code, &reachable);
         lowering.finish(context.config)
@@ -1450,6 +1575,12 @@ struct Lowering<'a> {
     frame: Value,
     out: Value,
     helper_refs: BTreeMap<Helper, cranelift_codegen::ir::FuncRef>,
+    /// The optimized compile's per-site profile and guard-failure injection.
+    #[cfg(feature = "host-jit")]
+    speculation: Option<Speculation<'a>>,
+    /// One shared speculation-exit block, created when the first guard fails.
+    #[cfg(feature = "host-jit")]
+    speculation_exit: Option<Block>,
 }
 
 impl<'a> Lowering<'a> {
@@ -1458,6 +1589,7 @@ impl<'a> Lowering<'a> {
         code_len: usize,
         handlers: &'a [ExceptionHandler],
         call_conv: CallConv,
+        #[cfg(feature = "host-jit")] speculation: Option<Speculation<'a>>,
     ) -> Self {
         let pc_blocks = vec![None; code_len];
         // The entry/dispatch block owns the function parameters. Reachable pc
@@ -1476,6 +1608,10 @@ impl<'a> Lowering<'a> {
             frame,
             out,
             helper_refs: BTreeMap::new(),
+            #[cfg(feature = "host-jit")]
+            speculation,
+            #[cfg(feature = "host-jit")]
+            speculation_exit: None,
         }
     }
 
@@ -1506,6 +1642,8 @@ impl<'a> Lowering<'a> {
                 _ => {}
             }
         }
+        #[cfg(feature = "host-jit")]
+        self.emit_speculation_exit_body();
         self.builder.seal_all_blocks();
     }
 
@@ -1595,7 +1733,7 @@ impl<'a> Lowering<'a> {
             self.frame,
             SHADOW_FRAME_PC_OFFSET,
         );
-        if is_inline_instruction(instruction) {
+        if is_inline_instruction(instruction) && !self.speculates_at(pc, instruction) {
             self.emit_consume_fuel();
         }
         match instruction {
@@ -1626,6 +1764,10 @@ impl<'a> Lowering<'a> {
                 left,
                 right,
             } => {
+                #[cfg(feature = "host-jit")]
+                if self.emit_speculated_binary(pc, dst, op, left, right) {
+                    return;
+                }
                 let handles = self.load_handles();
                 let left_value = self.load_register(handles, left);
                 let right_value = self.load_register(handles, right);
@@ -1669,6 +1811,10 @@ impl<'a> Lowering<'a> {
                 self.route_completion(pc, tag, Some(dst));
             }
             Instruction::GetProperty { dst, object, key } => {
+                #[cfg(feature = "host-jit")]
+                if self.emit_speculated_indexed_get(pc, dst, object, key) {
+                    return;
+                }
                 let handles = self.load_handles();
                 let object_value = self.load_register(handles, object);
                 let key_value = self.load_register(handles, key);
@@ -2502,6 +2648,441 @@ impl<'a> Lowering<'a> {
 
         self.builder.switch_to_block(normal);
     }
+
+    /// No speculative lowering exists without the host JIT, so every site
+    /// keeps its ordinary fuel prologue.
+    #[cfg(not(feature = "host-jit"))]
+    fn speculates_at(&self, _pc: usize, _instruction: Instruction) -> bool {
+        false
+    }
+}
+
+// -- Speculative fast paths (optimized tier only) ----------------------------
+
+#[cfg(feature = "host-jit")]
+impl<'a> Lowering<'a> {
+    /// The profile of `pc` when this compile is optimized and the site saw at
+    /// least one operand.
+    fn speculation_profile(&self, pc: usize) -> Option<bamts_native::tiering::SiteProfile> {
+        let speculation = self.speculation?;
+        let profile = speculation.profile.get(pc).copied()?;
+        (profile.bits() != 0).then_some(profile)
+    }
+
+    /// True when `pc` lowers to a guarded fast path, which moves the fuel
+    /// prologue after the guards so a failed guard charges nothing.
+    fn speculates_at(&self, pc: usize, instruction: Instruction) -> bool {
+        let Some(profile) = self.speculation_profile(pc) else {
+            return false;
+        };
+        if self.speculation.is_some_and(|s| s.force_guard_failure) {
+            return true;
+        }
+        match instruction {
+            Instruction::Binary { op, .. } => speculative_plan(op, profile).is_some(),
+            Instruction::GetProperty { .. } => profile.is_numeric(),
+            _ => false,
+        }
+    }
+
+    /// The shared speculation-exit block, created on first use. Its body is
+    /// written once, after every instruction, by
+    /// [`Lowering::emit_speculation_exit_body`].
+    fn speculation_exit(&mut self) -> Block {
+        *self
+            .speculation_exit
+            .get_or_insert_with(|| self.builder.create_block())
+    }
+
+    /// Writes the boxed `TRAP_SPECULATION` word to `out.value` and returns
+    /// `FatalTrap`, when any guard branched to the exit block.
+    fn emit_speculation_exit_body(&mut self) {
+        let Some(block) = self.speculation_exit else {
+            return;
+        };
+        self.builder.switch_to_block(block);
+        let value = self.builder.ins().iconst(types::I64, SPECULATION_TRAP_BITS);
+        self.store_completion_value(value);
+        let tag = self.iconst32(TAG_FATAL_TRAP);
+        self.builder.ins().return_(&[tag]);
+    }
+
+    /// Continues only when `ok` holds; otherwise jumps to the shared exit.
+    ///
+    /// Every guard of an instruction is emitted before its value is computed
+    /// and before `dst` is stored, so a failing guard leaves no observable
+    /// effect: the faulting `bytecode_pc`, the untouched register file, and no
+    /// helper call.
+    fn speculation_guard(&mut self, ok: Value) {
+        let ok = match self.speculation {
+            Some(speculation) if speculation.force_guard_failure => self.iconst32(0),
+            _ => ok,
+        };
+        let exit = self.speculation_exit();
+        let proceed = self.builder.create_block();
+        self.builder.ins().brif(ok, proceed, &[], exit, &[]);
+        self.builder.switch_to_block(proceed);
+    }
+
+    /// `(word >> 32) == 0x7ffa_0000`: a well-formed boxed `int32`.
+    fn is_int32_word(&mut self, word: Value) -> Value {
+        let high = self.builder.ins().ushr_imm_u(word, 32);
+        self.builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, high, INT32_HIGH_WORD)
+    }
+
+    /// `!is_boxed(word)`: a non-boxed arithmetic double (including `NaN`).
+    fn is_number_word(&mut self, word: Value) -> Value {
+        let header = self.builder.ins().band_imm_s(word, BOXED_HEADER_MASK);
+        let header_is_nan = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, header, CANONICAL_NAN_BITS);
+        let tag = self.builder.ins().band_imm_s(word, BOXED_TAG_MASK);
+        let tag_nonzero = self.builder.ins().icmp_imm_u(IntCC::NotEqual, tag, 0);
+        let boxed = self.builder.ins().band(header_is_nan, tag_nonzero);
+        self.builder.ins().icmp_imm_u(IntCC::Equal, boxed, 0)
+    }
+
+    /// A boxed `int32` or a non-boxed number: the set `number_operand`
+    /// converts. Guarding on `is_number_word` alone would reject every boxed
+    /// `int32` and deopt a genuine numeric site forever.
+    fn is_numeric_word(&mut self, word: Value) -> Value {
+        let int32 = self.is_int32_word(word);
+        let double = self.is_number_word(word);
+        self.builder.ins().bor(int32, double)
+    }
+
+    /// The f64 the interpreter's `numeric_f64` would read from `word`, which
+    /// must already have passed [`Lowering::is_number_word`] or
+    /// [`Lowering::is_int32_word`].
+    fn number_operand(&mut self, word: Value) -> Value {
+        let is_int32 = self.is_int32_word(word);
+        let low = self.builder.ins().ireduce(types::I32, word);
+        let wide = self.builder.ins().sextend(types::I64, low);
+        let from_int32 = self.builder.ins().fcvt_from_sint(types::F64, wide);
+        let from_bits = self.builder.ins().bitcast(types::F64, BITCAST_FLAGS, word);
+        self.builder.ins().select(is_int32, from_int32, from_bits)
+    }
+
+    /// `Value::int32(raw)`: `0x7ffa_0000_0000_0000 | zext(raw)`.
+    fn tagged_int32(&mut self, raw: Value) -> Value {
+        let wide = self.builder.ins().uextend(types::I64, raw);
+        self.builder.ins().bor_imm_u(wide, INT32_WORD_PREFIX)
+    }
+
+    /// `Value::number(number)`: canonical NaN, else the raw IEEE bits.
+    fn double_word(&mut self, number: Value) -> Value {
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I64, BITCAST_FLAGS, number);
+        let is_nan = self.builder.ins().fcmp(FloatCC::Unordered, number, number);
+        let canonical = self.builder.ins().iconst(types::I64, CANONICAL_NAN_BITS);
+        self.builder.ins().select(is_nan, canonical, bits)
+    }
+
+    /// The word `number_value(number)` produces: a boxed `int32` for a finite
+    /// integral value inside the `i32` range that is not negative zero, else a
+    /// double. `-0.0` must stay a double because `1 / -0` distinguishes it.
+    fn compacted_number_word(&mut self, number: Value) -> Value {
+        let zero = self.builder.ins().f64const(0.0);
+        let lower_bound = self.builder.ins().f64const(INT32_MIN_AS_F64);
+        let upper_bound = self.builder.ins().f64const(INT32_MAX_AS_F64);
+        let at_least_min =
+            self.builder
+                .ins()
+                .fcmp(FloatCC::GreaterThanOrEqual, number, lower_bound);
+        let at_most_max = self
+            .builder
+            .ins()
+            .fcmp(FloatCC::LessThanOrEqual, number, upper_bound);
+        let in_range = self.builder.ins().band(at_least_min, at_most_max);
+        let truncated = self.builder.ins().trunc(number);
+        let integral = self.builder.ins().fcmp(FloatCC::Equal, truncated, number);
+        let is_zero = self.builder.ins().fcmp(FloatCC::Equal, number, zero);
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I64, BITCAST_FLAGS, number);
+        let negative = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::SignedLessThan, bits, 0);
+        let negative_zero = self.builder.ins().band(is_zero, negative);
+        let not_negative_zero = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, negative_zero, 0);
+        let compact = self.builder.ins().band(in_range, integral);
+        let compact = self.builder.ins().band(compact, not_negative_zero);
+        let raw = self.builder.ins().fcvt_to_sint_sat(types::I32, number);
+        let boxed = self.tagged_int32(raw);
+        let double = self.double_word(number);
+        self.builder.ins().select(compact, boxed, double)
+    }
+
+    /// `Value::boolean(condition)`.
+    fn boolean_word(&mut self, condition: Value) -> Value {
+        let raw = self.builder.ins().uextend(types::I64, condition);
+        self.builder.ins().bor_imm_u(raw, FALSE_BITS)
+    }
+
+    /// Emits the optimized form of a `Binary` site, or returns `false` when the
+    /// profile and operator select no fast path (the helper call then runs).
+    fn emit_speculated_binary(
+        &mut self,
+        pc: usize,
+        dst: Register,
+        op: BinaryOp,
+        left: Register,
+        right: Register,
+    ) -> bool {
+        let Some(profile) = self.speculation_profile(pc) else {
+            return false;
+        };
+        let Some(plan) = speculative_plan(op, profile) else {
+            return false;
+        };
+        let handles = self.load_handles();
+        let left_word = self.load_register(handles, left);
+        let right_word = self.load_register(handles, right);
+        match plan {
+            SpeculativePlan::Int32 => {
+                let ok_left = self.is_int32_word(left_word);
+                let ok_right = self.is_int32_word(right_word);
+                let ok = self.builder.ins().band(ok_left, ok_right);
+                self.speculation_guard(ok);
+                self.emit_consume_fuel();
+                let handles = self.load_handles();
+                let left_raw = self.builder.ins().ireduce(types::I32, left_word);
+                let right_raw = self.builder.ins().ireduce(types::I32, right_word);
+                let result = self.emit_int32_binary(op, left_raw, right_raw);
+                self.store_register(handles, dst, result);
+            }
+            SpeculativePlan::Double => {
+                let ok_left = self.is_numeric_word(left_word);
+                let ok_right = self.is_numeric_word(right_word);
+                let ok = self.builder.ins().band(ok_left, ok_right);
+                self.speculation_guard(ok);
+                self.emit_consume_fuel();
+                let handles = self.load_handles();
+                let left_number = self.number_operand(left_word);
+                let right_number = self.number_operand(right_word);
+                let result = self.emit_double_binary(op, left_number, right_number);
+                self.store_register(handles, dst, result);
+            }
+        }
+        self.jump_to_next(pc);
+        true
+    }
+
+    /// The inline `int32` operation. Add, subtract, and multiply widen to 64
+    /// bits so an `i32` overflow is visible, then compact exactly like
+    /// `number_value`; bitwise operators reproduce `to_int32`/`to_uint32`.
+    fn emit_int32_binary(&mut self, op: BinaryOp, left: Value, right: Value) -> Value {
+        match op {
+            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => {
+                let left_wide = self.builder.ins().sextend(types::I64, left);
+                let right_wide = self.builder.ins().sextend(types::I64, right);
+                let wide = match op {
+                    BinaryOp::Add => self.builder.ins().iadd(left_wide, right_wide),
+                    BinaryOp::Subtract => self.builder.ins().isub(left_wide, right_wide),
+                    _ => self.builder.ins().imul(left_wide, right_wide),
+                };
+                let low = self.builder.ins().ireduce(types::I32, wide);
+                let narrow = self.builder.ins().sextend(types::I64, low);
+                let fits = self.builder.ins().icmp(IntCC::Equal, narrow, wide);
+                let boxed = self.tagged_int32(low);
+                let number = self.builder.ins().fcvt_from_sint(types::F64, wide);
+                let double = self.double_word(number);
+                self.builder.ins().select(fits, boxed, double)
+            }
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
+                let raw = match op {
+                    BinaryOp::BitAnd => self.builder.ins().band(left, right),
+                    BinaryOp::BitOr => self.builder.ins().bor(left, right),
+                    _ => self.builder.ins().bxor(left, right),
+                };
+                self.tagged_int32(raw)
+            }
+            BinaryOp::ShiftLeft | BinaryOp::ShiftRight => {
+                let amount = self.builder.ins().band_imm_u(right, 31);
+                let raw = match op {
+                    BinaryOp::ShiftLeft => self.builder.ins().ishl(left, amount),
+                    _ => self.builder.ins().sshr(left, amount),
+                };
+                self.tagged_int32(raw)
+            }
+            BinaryOp::UnsignedShiftRight => {
+                let amount = self.builder.ins().band_imm_u(right, 31);
+                let shifted = self.builder.ins().ushr(left, amount);
+                let wide = self.builder.ins().uextend(types::I64, shifted);
+                let fits = self.builder.ins().icmp_imm_s(
+                    IntCC::SignedLessThanOrEqual,
+                    wide,
+                    i64::from(i32::MAX),
+                );
+                let boxed = self.tagged_int32(shifted);
+                let number = self.builder.ins().fcvt_from_uint(types::F64, shifted);
+                let double = self.double_word(number);
+                self.builder.ins().select(fits, boxed, double)
+            }
+            _ => {
+                let condition = self.builder.ins().icmp(int_compare(op), left, right);
+                self.boolean_word(condition)
+            }
+        }
+    }
+
+    /// The inline `f64` operation, matching `number_value` for add, subtract,
+    /// and multiply, `Value::number` (never compacted) for divide, and the
+    /// quiet float comparisons for the relational and strict operators.
+    fn emit_double_binary(&mut self, op: BinaryOp, left: Value, right: Value) -> Value {
+        match op {
+            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => {
+                let number = match op {
+                    BinaryOp::Add => self.builder.ins().fadd(left, right),
+                    BinaryOp::Subtract => self.builder.ins().fsub(left, right),
+                    _ => self.builder.ins().fmul(left, right),
+                };
+                self.compacted_number_word(number)
+            }
+            BinaryOp::Divide => {
+                let number = self.builder.ins().fdiv(left, right);
+                self.double_word(number)
+            }
+            _ => {
+                let condition = self.builder.ins().fcmp(float_compare(op), left, right);
+                self.boolean_word(condition)
+            }
+        }
+    }
+
+    /// Emits the optimized numeric indexed read, or returns `false` when the
+    /// site's profile is not numeric.
+    ///
+    /// The helper is the guard: it inspects only the receiver and index words
+    /// and answers the speculation trap before any effect, so a non-array, a
+    /// hole, or an out-of-range index resumes the interpreter with nothing
+    /// written.
+    fn emit_speculated_indexed_get(
+        &mut self,
+        pc: usize,
+        dst: Register,
+        object: Register,
+        key: Register,
+    ) -> bool {
+        let Some(profile) = self.speculation_profile(pc) else {
+            return false;
+        };
+        if !profile.is_numeric() {
+            return false;
+        }
+        let handles = self.load_handles();
+        let object_word = self.load_register(handles, object);
+        let key_word = self.load_register(handles, key);
+        let tag = self.call_helper(
+            Helper::ArrayGetNumber,
+            &[self.frame, object_word, key_word, self.out],
+        );
+        self.route_completion(pc, tag, Some(dst));
+        true
+    }
+}
+
+/// Which guarded fast path an optimized site lowers to.
+#[cfg(feature = "host-jit")]
+#[derive(Clone, Copy)]
+enum SpeculativePlan {
+    /// Both operands are boxed `int32` words.
+    Int32,
+    /// Both operands are numbers (`int32` or double).
+    Double,
+}
+
+/// The fast path a profile and operator select, or `None` for a helper call.
+#[cfg(feature = "host-jit")]
+fn speculative_plan(
+    op: BinaryOp,
+    profile: bamts_native::tiering::SiteProfile,
+) -> Option<SpeculativePlan> {
+    if profile.is_int32_only() && int32_operator(op) {
+        return Some(SpeculativePlan::Int32);
+    }
+    if profile.is_numeric() && double_operator(op) {
+        return Some(SpeculativePlan::Double);
+    }
+    None
+}
+
+/// True for the operators whose `int32` form is exact on boxed operands.
+#[cfg(feature = "host-jit")]
+const fn int32_operator(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Subtract
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::ShiftLeft
+            | BinaryOp::ShiftRight
+            | BinaryOp::UnsignedShiftRight
+            | BinaryOp::LessThan
+            | BinaryOp::LessThanOrEqual
+            | BinaryOp::GreaterThan
+            | BinaryOp::GreaterThanOrEqual
+            | BinaryOp::StrictEqual
+            | BinaryOp::StrictNotEqual
+    )
+}
+
+/// True for the operators whose `f64` form is exact on numeric operands.
+#[cfg(feature = "host-jit")]
+const fn double_operator(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Subtract
+            | BinaryOp::Multiply
+            | BinaryOp::Divide
+            | BinaryOp::LessThan
+            | BinaryOp::LessThanOrEqual
+            | BinaryOp::GreaterThan
+            | BinaryOp::GreaterThanOrEqual
+            | BinaryOp::StrictEqual
+            | BinaryOp::StrictNotEqual
+    )
+}
+
+/// The integer comparison for a comparison operator, for operands that already
+/// proved they are boxed `int32` words.
+#[cfg(feature = "host-jit")]
+const fn int_compare(op: BinaryOp) -> IntCC {
+    match op {
+        BinaryOp::LessThan => IntCC::SignedLessThan,
+        BinaryOp::LessThanOrEqual => IntCC::SignedLessThanOrEqual,
+        BinaryOp::GreaterThan => IntCC::SignedGreaterThan,
+        BinaryOp::GreaterThanOrEqual => IntCC::SignedGreaterThanOrEqual,
+        BinaryOp::StrictEqual => IntCC::Equal,
+        _ => IntCC::NotEqual,
+    }
+}
+
+/// The quiet float comparison for a comparison operator. Every arm returns
+/// false for an unordered pair, exactly like `f64::partial_cmp`.
+#[cfg(feature = "host-jit")]
+const fn float_compare(op: BinaryOp) -> FloatCC {
+    match op {
+        BinaryOp::LessThan => FloatCC::LessThan,
+        BinaryOp::LessThanOrEqual => FloatCC::LessThanOrEqual,
+        BinaryOp::GreaterThan => FloatCC::GreaterThan,
+        BinaryOp::GreaterThanOrEqual => FloatCC::GreaterThanOrEqual,
+        BinaryOp::StrictEqual => FloatCC::Equal,
+        _ => FloatCC::NotEqual,
+    }
 }
 
 /// The byte offset of a register slot within the handles array. [`validate_slots`]
@@ -3003,6 +3584,7 @@ mod tests {
             Helper::GetTemplateObject,
             Helper::RequireGlobalBinding,
             Helper::ThrowIntrinsicError,
+            Helper::ArrayGetNumber,
         ];
         let mut symbols = BTreeSet::new();
         for (expected_index, helper) in helpers.iter().copied().enumerate() {
@@ -3015,8 +3597,8 @@ mod tests {
             );
             assert!(symbols.insert(helper.symbol()), "unique symbol {helper:?}");
         }
-        assert_eq!(symbols.len(), 55);
-        assert_eq!(Helper::from_external_index(55), None);
+        assert_eq!(symbols.len(), 56);
+        assert_eq!(Helper::from_external_index(56), None);
     }
     #[test]
     fn iterator_close_helpers_use_the_pinned_abis() {

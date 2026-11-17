@@ -71,6 +71,16 @@ version has shipped, and no tag or stable package exists while any gate in
   found three places where a Promise, an activation record or a module
   evaluation pair lived only in a Rust local across a safe point; each is
   rooted now.
+- Under `--jit`, a function invoked often enough is recompiled with a
+  speculative lowering. The interpreter records which operand types each
+  `Binary`, `Unary` and indexed-read instruction saw. The optimized code
+  checks them in registers and does 32-bit integer or `f64` arithmetic
+  inline. A failed check returns the new trap `TRAP_SPECULATION`, adds the
+  operand types to the profile and resumes the same activation in the
+  interpreter at that instruction, with no visible effect from the failed
+  attempt. A unit that fails eight times stays in baseline code. Indexed reads
+  of arrays that hold only numbers use the new helper
+  `bamts_array_get_number`. AOT images never promote.
 
 ### Known incomplete
 

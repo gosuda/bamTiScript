@@ -8645,6 +8645,20 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// The element at `index` when `array` holds only numbers and `index` is an
+    /// in-bounds Int32; `None` otherwise, so the caller falls back to the
+    /// generic read.
+    pub(crate) fn array_element_number(&self, array: Value, index: Value) -> Option<Value> {
+        let slot = self.runtime_slot(array).ok().flatten()?;
+        let position = usize::try_from(index.as_int32()?).ok()?;
+        match &self.heap[slot] {
+            HeapEntry::Array { kind, elements, .. } if *kind != ArrayElementKind::Any => {
+                elements.get(position).copied()
+            }
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     fn array_element_kind(&self, value: Value) -> Option<ArrayElementKind> {
         let index = self.runtime_slot(value).ok().flatten()?;
@@ -16777,6 +16791,39 @@ mod tests {
                 machine.array_element_kind(array).unwrap(),
                 ArrayElementKind::Any
             );
+        });
+    }
+
+    #[test]
+    fn numeric_element_read_answers_only_in_bounds_int32_indexes_of_number_arrays() {
+        with_machine(Limits::default(), |machine| {
+            let array = machine.create_array(Vec::new()).unwrap();
+            machine.array_push(array, Value::int32(7)).unwrap();
+            machine.array_push(array, crate::number_value(2.5)).unwrap();
+            assert_eq!(
+                machine.array_element_number(array, Value::int32(0)),
+                Some(Value::int32(7))
+            );
+            assert_eq!(
+                machine.array_element_number(array, Value::int32(1)),
+                Some(crate::number_value(2.5))
+            );
+            assert_eq!(machine.array_element_number(array, Value::int32(2)), None);
+            assert_eq!(
+                machine.array_element_number(array, Value::int32(u32::MAX)),
+                None
+            );
+            assert_eq!(
+                machine.array_element_number(array, crate::number_value(0.5)),
+                None
+            );
+
+            let text = machine
+                .allocate(HeapEntry::String(EcmaString::encode("x")))
+                .unwrap();
+            machine.array_push(array, text).unwrap();
+            assert_eq!(machine.array_element_number(array, Value::int32(0)), None);
+            assert_eq!(machine.array_element_number(text, Value::int32(0)), None);
         });
     }
 

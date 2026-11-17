@@ -59,10 +59,10 @@ use bamts_bytecode::{
 };
 pub use bamts_native::AbiError;
 pub use bamts_native::tiering::WarmupPolicy;
-use bamts_native::tiering::{DeoptReason, Tier, TieringState, deopt_reason};
+use bamts_native::tiering::{DeoptReason, SiteProfile, Tier, TieringState, deopt_reason};
 use bamts_native::{
     Completion, CompletionTag, Decoded, HelperCall, HelperResult, NativeEntryTable, NativeFrame,
-    NativeOps, ShadowFrame, Value, with_native_ops, with_native_ops_ref,
+    NativeOps, ShadowFrame, Value, with_native_ops_ref,
 };
 
 use crate::intrinsics::BuiltinOutcome;
@@ -368,10 +368,11 @@ struct TieringTable {
     units: std::collections::BTreeMap<(ModuleId, FunctionId), UnitTier>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct UnitTier {
     state: TieringState,
     osr_entries: u32,
+    profile: Vec<SiteProfile>,
 }
 
 impl TieringTable {
@@ -382,13 +383,14 @@ impl TieringTable {
         let mut units = std::collections::BTreeMap::new();
         for (module_index, module) in program.modules().iter().enumerate() {
             let module_id = ModuleId::new(module_index as u32);
-            for (function_index, _) in module.code().functions().iter().enumerate() {
+            for (function_index, function) in module.code().functions().iter().enumerate() {
                 let function_id = FunctionId::new(function_index as u32);
                 units.insert(
                     (module_id, function_id),
                     UnitTier {
                         state: TieringState::new(policy)?,
                         osr_entries: 0,
+                        profile: vec![SiteProfile::default(); function.code().len()],
                     },
                 );
             }
@@ -2852,8 +2854,92 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         let Some(unit) = table.get_mut(module, function) else {
             return true;
         };
-        let _ = unit.state.observe_invocation();
+        if let Some(transition) = unit.state.observe_invocation()
+            && transition.to == Tier::Optimized
+            && !self
+                .entries
+                .promote(self.program, module.get(), function.get(), &unit.profile)
+        {
+            unit.state.decline_optimization();
+        }
         unit.state.is_pinned() || matches!(unit.state.tier(), Tier::Interpreter)
+    }
+
+    /// Ors the kinds of `operands` into the profile of instruction `pc` of the
+    /// running unit.
+    fn observe_operands(&self, pc: u32, operands: &[Value]) {
+        let Some(table) = &self.tiering else {
+            return;
+        };
+        let target = self.running_function();
+        let mut table = table.borrow_mut();
+        let Some(unit) = table.get_mut(target.module, target.function) else {
+            return;
+        };
+        if let Some(site) = unit.profile.get_mut(pc as usize) {
+            *site = operands.iter().fold(*site, |profile, value| {
+                profile.observe(SiteProfile::of(*value))
+            });
+        }
+    }
+
+    /// After a speculation trap, records what the failed site saw so the next
+    /// optimized compile of the unit does not repeat the guess.
+    fn record_speculation_failure(
+        &self,
+        target: crate::RuntimeFunction,
+        instruction: Instruction,
+        pc: usize,
+        registers: &[Value],
+    ) {
+        let word = |register: bamts_bytecode::Register| {
+            registers
+                .get(register.get() as usize)
+                .copied()
+                .unwrap_or(Value::UNDEFINED)
+        };
+        let observed = match instruction {
+            Instruction::Binary { left, right, .. } => {
+                SiteProfile::of(word(left)) | SiteProfile::of(word(right))
+            }
+            Instruction::Unary { operand, .. } => SiteProfile::of(word(operand)),
+            Instruction::GetProperty { .. } => SiteProfile::OTHER,
+            _ => return,
+        };
+        let Some(table) = &self.tiering else {
+            return;
+        };
+        let mut table = table.borrow_mut();
+        if let Some(site) = table
+            .get_mut(target.module, target.function)
+            .and_then(|unit| unit.profile.get_mut(pc))
+        {
+            *site = site.observe(observed);
+        }
+    }
+
+    /// Enters the compiled entry of a unit: the newest optimized artifact when
+    /// the unit holds that tier, the baseline artifact otherwise.
+    fn invoke_entry(
+        &self,
+        module: ModuleId,
+        function: FunctionId,
+        shadow: &mut ShadowFrame,
+        out: &mut Completion,
+    ) -> Result<CompletionTag, AbiError> {
+        let optimized = self.tiering.as_ref().is_some_and(|table| {
+            table
+                .borrow_mut()
+                .get_mut(module, function)
+                .is_some_and(|unit| matches!(unit.state.tier(), Tier::Optimized))
+        });
+        if optimized {
+            self.entries
+                .invoke_optimized(module.get(), function.get(), shadow, out)
+        } else {
+            self.entries
+                .invoke(module.get(), function.get(), shadow, out)
+        }
     }
 
     /// Polls the tiering table for an OSR decision on a taken back edge.
@@ -3079,23 +3165,12 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 length,
             );
             let mut out = Completion::new(Value::UNDEFINED);
-            let entries = self.entries;
             let tag = if self.tiering_enabled() {
                 with_native_ops_ref(self, || {
-                    entries.invoke(
-                        target.module.get(),
-                        target.function.get(),
-                        &mut shadow,
-                        &mut out,
-                    )
+                    self.invoke_entry(target.module, target.function, &mut shadow, &mut out)
                 })
             } else {
-                entries.invoke(
-                    target.module.get(),
-                    target.function.get(),
-                    &mut shadow,
-                    &mut out,
-                )
+                self.invoke_entry(target.module, target.function, &mut shadow, &mut out)
             };
             (tag, out, shadow.bytecode_pc as usize)
         };
@@ -3142,6 +3217,19 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                                 table.borrow_mut().get_mut(target.module, target.function)
                         {
                             let _ = unit.state.record_deopt(reason);
+                        }
+                        if matches!(reason, DeoptReason::Speculation) {
+                            let handle = self.code_ref(target.module);
+                            let code = handle.code(target.module);
+                            if let Some(instruction) = code.functions()[index].code().get(fault_pc)
+                            {
+                                self.record_speculation_failure(
+                                    target,
+                                    *instruction,
+                                    fault_pc,
+                                    &registers,
+                                );
+                            }
                         }
                         // Panic: record deopt/pin, but do not resume this activation.
                         if matches!(reason, DeoptReason::Panic) {
@@ -3797,13 +3885,12 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             return Err(self.native_cancel());
         }
         let handles = registers.as_mut_ptr();
-        let entries = self.entries;
         let (tag, out, fault_pc) = {
             let mut shadow =
                 ShadowFrame::new(std::ptr::null_mut(), 0, module.get(), handles, length);
             let mut out = Completion::new(Value::UNDEFINED);
-            let tag = with_native_ops(self, || {
-                entries.invoke(module.get(), function_id.get(), &mut shadow, &mut out)
+            let tag = with_native_ops_ref(&*self, || {
+                self.invoke_entry(module, function_id, &mut shadow, &mut out)
             });
             (tag, out, shadow.bytecode_pc as usize)
         };
@@ -4057,6 +4144,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 }
                 HelperCall::Unary { op, operand } => match unary_from_selector(op) {
                     Some(op) => {
+                        self.observe_operands(frame.pc(), &[operand]);
                         let result = self.machine.borrow_mut().eval_unary(op, operand);
                         self.eval_result(result)
                     }
@@ -4066,6 +4154,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 },
                 HelperCall::Binary { op, left, right } => match binary_from_selector(op) {
                     Some(op) => {
+                        self.observe_operands(frame.pc(), &[left, right]);
                         let result = self.machine.borrow_mut().eval_binary(op, left, right);
                         self.eval_result(result)
                     }
@@ -4145,6 +4234,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     }
                 }
                 HelperCall::GetProperty { object, key, site } => {
+                    let key_value = key;
                     let key = {
                         let coerced = self.machine.borrow_mut().computed_property_key(object, key);
                         match coerced {
@@ -4161,6 +4251,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         &key,
                     );
                     if let Some(value) = cached {
+                        self.observe_operands(site, &[key_value, value]);
                         break 'result self.validated(value);
                     }
                     let outcome = self.machine.borrow_mut().internal_get(object, &key, object);
@@ -4174,7 +4265,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         );
                     }
                     match outcome {
-                        Ok(value) => self.validated(value),
+                        Ok(value) => {
+                            self.observe_operands(site, &[key_value, value]);
+                            self.validated(value)
+                        }
                         Err(failure) => self.fail(failure),
                     }
                 }
@@ -4720,6 +4814,16 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     self.fail(EvalFailure::Throw(ThrowOrigin::TypeError {
                         operation: "export outside an engine-owned module registry",
                     }))
+                }
+                HelperCall::ArrayGetNumber { array, index } => {
+                    let element = self.machine.borrow().array_element_number(array, index);
+                    match element {
+                        Some(value) => HelperResult::normal(value),
+                        None => HelperResult {
+                            tag: CompletionTag::FatalTrap,
+                            value: Value::int32(bamts_native::TRAP_SPECULATION),
+                        },
+                    }
                 }
                 HelperCall::ConsumeFuel { .. } => HelperResult::normal(Value::UNDEFINED),
             }
@@ -10997,7 +11101,7 @@ mod tests {
             "bamts_with_has_binding"
         );
         assert_eq!(NativeHelper::ResumeMode.as_u32(), 46);
-        assert_eq!(HELPER_COUNT, 55);
+        assert_eq!(HELPER_COUNT, 56);
     }
 
     #[test]

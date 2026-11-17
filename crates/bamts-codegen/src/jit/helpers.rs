@@ -20,15 +20,22 @@ use crate::Helper;
 /// grows a helper must extend [`helper_demand`] or [`STRUCTURAL_HELPERS`] and
 /// raise this bound; [`verify_helper_coverage`] refuses to certify coverage
 /// against an unexamined helper set.
-pub const EXPECTED_HELPER_COUNT: u32 = 55;
+pub const EXPECTED_HELPER_COUNT: u32 = 56;
 
 /// Helpers that no opcode requests.
 ///
 /// [`Helper::ConsumeFuel`] is emitted by the per-block fuel prologue, and
 /// [`Helper::ResumeMode`] is emitted by the `Suspend` resume prologue after
-/// [`Helper::ResumeValue`] succeeds. Opcode classification alone cannot reach
-/// either of them.
-pub const STRUCTURAL_HELPERS: &[Helper] = &[Helper::ConsumeFuel, Helper::ResumeMode];
+/// [`Helper::ResumeValue`] succeeds. [`Helper::ArrayGetNumber`] is emitted only
+/// by the speculative optimized lowering: `GetProperty` keeps its general
+/// helper in baseline code, and the optimized form of a numeric indexed read
+/// calls this one instead. Opcode classification alone cannot reach any of
+/// them.
+pub const STRUCTURAL_HELPERS: &[Helper] = &[
+    Helper::ConsumeFuel,
+    Helper::ResumeMode,
+    Helper::ArrayGetNumber,
+];
 
 /// How one opcode reaches the runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -705,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn consume_fuel_and_resume_mode_are_the_helpers_no_opcode_requests() {
+    fn structural_helpers_are_the_ones_no_opcode_requests() {
         let from_opcodes = reachable_with(helper_demand);
         let mut without_structural = from_opcodes.clone();
         without_structural.retain(|helper| !STRUCTURAL_HELPERS.contains(helper));
@@ -714,14 +721,16 @@ mod tests {
             HELPER_COUNT as usize - STRUCTURAL_HELPERS.len(),
             "opcode-reachable helper count changed"
         );
-        assert!(
-            !without_structural.contains(&Helper::ConsumeFuel),
-            "no opcode may request the fuel prologue helper"
-        );
-        assert!(
-            !without_structural.contains(&Helper::ResumeMode),
-            "no opcode may request the suspend resume-mode helper"
-        );
+        for structural in [
+            Helper::ConsumeFuel,
+            Helper::ResumeMode,
+            Helper::ArrayGetNumber,
+        ] {
+            assert!(
+                !without_structural.contains(&structural),
+                "no opcode may request {structural:?}"
+            );
+        }
         assert_eq!(from_opcodes.len(), HELPER_COUNT as usize);
     }
 
