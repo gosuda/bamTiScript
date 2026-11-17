@@ -1181,23 +1181,6 @@ struct CollectionIndex {
 impl CollectionIndex {
     const ENTRY_BYTES: usize = std::mem::size_of::<usize>();
 
-    fn get<H: Host>(
-        &self,
-        machine: &Machine<'_, H>,
-        entries: &[CollectionEntry],
-        key: Value,
-    ) -> Option<usize> {
-        self.buckets
-            .get(&collection_key_hash(machine, key))?
-            .iter()
-            .copied()
-            .find(|&index| {
-                entries
-                    .get(index)
-                    .is_some_and(|entry| entry.live && machine.same_value_zero(entry.key, key))
-            })
-    }
-
     fn insert(&mut self, hash: u64, index: usize) {
         self.buckets.entry(hash).or_default().push(index);
     }
@@ -1207,7 +1190,36 @@ impl CollectionIndex {
     }
 }
 
-fn collection_key_hash<H: Host>(machine: &Machine<'_, H>, key: Value) -> u64 {
+/// Finds the live entry whose key equals `key`. The bucket is copied out
+/// before any key is flattened, so the heap borrow never overlaps a write.
+pub(crate) fn collection_lookup<H: Host>(
+    machine: &mut Machine<'_, H>,
+    slot: usize,
+    key: Value,
+) -> Option<usize> {
+    let hash = collection_key_hash(machine, key);
+    let candidates = {
+        let HeapEntry::Collection { index, .. } = &machine.heap[slot] else {
+            return None;
+        };
+        index.buckets.get(&hash).cloned()?
+    };
+    for candidate in candidates {
+        let (live, entry_key) = {
+            let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
+                return None;
+            };
+            let entry = entries.get(candidate)?;
+            (entry.live, entry.key)
+        };
+        if live && machine.same_value_zero(entry_key, key) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn collection_key_hash<H: Host>(machine: &mut Machine<'_, H>, key: Value) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1684,10 +1696,25 @@ fn install_element_vector(heap: &mut [HeapEntry], array_slot: usize, elements: V
     debug_assert!(kind.matches(current));
 }
 
+/// A concatenation of this many UTF-16 units or more keeps its halves
+/// instead of copying them.
+const ROPE_MIN_UNITS: u32 = 32;
+/// What a rope node itself costs: two halves and a length. Reading the units
+/// later costs the flat text, which `flat_string` charges at that point.
+const ROPE_NODE_BYTES: usize = 2 * std::mem::size_of::<Value>() + std::mem::size_of::<u32>();
+
 #[derive(Clone, Debug)]
 enum HeapEntry {
     Vacant,
     String(EcmaString),
+    /// The two halves of a concatenation and its total length in UTF-16
+    /// units. The halves are string or rope entries and are never written
+    /// after creation; reading the units replaces this entry with `String`.
+    Rope {
+        left: Value,
+        right: Value,
+        len: u32,
+    },
     BigInt(String),
     Object {
         properties: PropertyMap,
@@ -1958,6 +1985,7 @@ impl HeapEntry {
             Self::String(text)
             | Self::Symbol { description: text }
             | Self::PrivateName { description: text } => text.len_units().saturating_mul(2),
+            Self::Rope { .. } => ROPE_NODE_BYTES,
             Self::BigInt(text) => text.len(),
             Self::RegExp { pattern, flags, .. } => pattern
                 .len_units()
@@ -8608,12 +8636,80 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(())
     }
 
-    pub(crate) fn string_value(&self, value: Value) -> Option<EcmaString> {
-        let index = self.runtime_slot(value).ok().flatten()?;
-        match &self.heap[index] {
-            HeapEntry::String(text) => Some(text.clone()),
-            _ => None,
+    /// The UTF-16 units of a string or rope entry. A rope is walked with an
+    /// explicit stack and the entry is replaced by its flat text, so later
+    /// reads copy nothing.
+    pub(crate) fn flat_string(&mut self, slot: usize) -> EcmaString {
+        if let HeapEntry::String(text) = &self.heap[slot] {
+            return text.clone();
         }
+        let HeapEntry::Rope { left, right, len } = &self.heap[slot] else {
+            unreachable!("flat_string reads a string or rope entry");
+        };
+        let (left, right, len) = (*left, *right, *len as usize);
+        let mut units = Vec::with_capacity(len);
+        let mut stack = vec![right, left];
+        while let Some(value) = stack.pop() {
+            let child = self
+                .runtime_slot(value)
+                .ok()
+                .flatten()
+                .expect("rope halves are runtime string entries");
+            match &self.heap[child] {
+                HeapEntry::String(text) => units.extend_from_slice(text.as_units()),
+                HeapEntry::Rope { left, right, .. } => {
+                    stack.push(*right);
+                    stack.push(*left);
+                }
+                _ => unreachable!("rope halves are string entries"),
+            }
+        }
+        debug_assert_eq!(units.len(), len);
+        let text = EcmaString::from_units(&units);
+        self.heap[slot] = HeapEntry::String(text.clone());
+        self.charge_flattened_rope(slot, len);
+        text
+    }
+
+    /// Moves a flattened rope's charge from its node cost to its flat text. The
+    /// creation check already required room for this text; the heap may have
+    /// grown since, in which case the next allocation reports the limit.
+    fn charge_flattened_rope(&mut self, slot: usize, len: usize) {
+        self.sync_slot_ledger();
+        let extra = len.saturating_mul(2).saturating_sub(ROPE_NODE_BYTES);
+        self.slot_bytes[slot] += extra;
+        self.heap_bytes += extra;
+        self.request_garbage_collection();
+    }
+
+    /// The UTF-16 length of a string or rope entry, without flattening it.
+    pub(crate) fn string_len(&self, slot: usize) -> usize {
+        match &self.heap[slot] {
+            HeapEntry::String(text) => text.len_units(),
+            HeapEntry::Rope { len, .. } => *len as usize,
+            _ => unreachable!("string_len reads a string or rope entry"),
+        }
+    }
+
+    /// Whether the entry at `slot` is still an unflattened rope.
+    #[cfg(test)]
+    fn is_rope(&self, slot: usize) -> bool {
+        matches!(self.heap[slot], HeapEntry::Rope { .. })
+    }
+
+    /// The heap slot of a value holding a string or a rope.
+    fn string_slot(&self, value: Value) -> Option<usize> {
+        let index = self.runtime_slot(value).ok().flatten()?;
+        matches!(
+            &self.heap[index],
+            HeapEntry::String(_) | HeapEntry::Rope { .. }
+        )
+        .then_some(index)
+    }
+
+    pub(crate) fn string_value(&mut self, value: Value) -> Option<EcmaString> {
+        let index = self.string_slot(value)?;
+        Some(self.flat_string(index))
     }
 
     pub(crate) fn get_named_property(
@@ -8679,6 +8775,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             }
             | HeapEntry::String(_)
+            | HeapEntry::Rope { .. }
             | HeapEntry::Array { .. }
             | HeapEntry::TypedArray { .. }
             | HeapEntry::Function { .. }
@@ -8793,7 +8890,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 .map_err(EvalFailure::Runtime)?
                 .map(|index| &self.heap[index])
             {
-                Some(HeapEntry::String(_)) => self.intrinsics.string_prototype,
+                Some(HeapEntry::String(_) | HeapEntry::Rope { .. }) => {
+                    self.intrinsics.string_prototype
+                }
                 Some(HeapEntry::BigInt(_)) => self.intrinsics.builtins.bigint_prototype(),
                 Some(HeapEntry::Symbol { .. }) => self.intrinsics.builtins.symbol_prototype(),
                 _ => self.intrinsics.object_prototype,
@@ -8826,6 +8925,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 matches!(
                     self.heap[index],
                     HeapEntry::String(_)
+                        | HeapEntry::Rope { .. }
                         | HeapEntry::BigInt(_)
                         | HeapEntry::Symbol { .. }
                         | HeapEntry::PrivateName { .. }
@@ -8841,19 +8941,15 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     /// The string inside a String exotic object.
-    fn boxed_string(&self, index: usize) -> Option<&EcmaString> {
-        let HeapEntry::Object {
-            boxed_primitive: Some(primitive),
-            ..
-        } = &self.heap[index]
-        else {
-            return None;
+    fn boxed_string(&mut self, index: usize) -> Option<EcmaString> {
+        let primitive = match &self.heap[index] {
+            HeapEntry::Object {
+                boxed_primitive: Some(primitive),
+                ..
+            } => *primitive,
+            _ => return None,
         };
-        let slot = self.runtime_slot(*primitive).ok().flatten()?;
-        match &self.heap[slot] {
-            HeapEntry::String(text) => Some(text),
-            _ => None,
-        }
+        self.string_value(primitive)
     }
 
     /// `StringGetOwnProperty`, plus the `length` every String exotic object owns.
@@ -8864,7 +8960,7 @@ impl<'a, H: Host> Machine<'a, H> {
     ) -> Result<Option<Property>, EvalFailure> {
         let found = self
             .boxed_string(index)
-            .and_then(|text| string_own_get(text, &self.atoms, key));
+            .and_then(|text| string_own_get(&text, &self.atoms, key));
         let (value, enumerable) = match found {
             Some(Found::Value(length)) => (length, false),
             Some(Found::Text(unit)) => {
@@ -8982,7 +9078,7 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn has_own_property_key(
-        &self,
+        &mut self,
         object: Value,
         key: &PropertyKey,
     ) -> Result<bool, EvalFailure> {
@@ -9455,17 +9551,9 @@ impl<'a, H: Host> Machine<'a, H> {
     /// its text; a private name yields its slot identity; everything else is
     /// coerced with `ToString`.
     fn property_key_from_value(&mut self, value: Value) -> Result<PropertyKey, EvalFailure> {
-        let text_opt = match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
-            Some(index) => match &self.heap[index] {
-                HeapEntry::String(text) => Some(text.clone()),
-                HeapEntry::Symbol { .. } | HeapEntry::PrivateName { .. } => None,
-                _ => None,
-            },
-            None => None,
-        };
-        if let Some(text) = text_opt {
-            let atom = self.atoms.intern(text);
-            return Ok(PropertyKey::Named(atom));
+        if let Some(index) = self.string_slot(value) {
+            let text = self.flat_string(index);
+            return Ok(PropertyKey::Named(self.atoms.intern(text)));
         }
         match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
@@ -9515,7 +9603,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     return self.found_outcome(found);
                 }
                 match self.heap[index] {
-                    HeapEntry::String(_) => self
+                    HeapEntry::String(_) | HeapEntry::Rope { .. } => self
                         .runtime_slot(self.intrinsics.string_prototype)
                         .map_err(EvalFailure::Runtime)?,
                     HeapEntry::BigInt(_) => self
@@ -9599,18 +9687,22 @@ impl<'a, H: Host> Machine<'a, H> {
                         None => Ok(GetOutcome::Value(Value::UNDEFINED)),
                     };
                 }
-                if let HeapEntry::String(text) = &self.heap[index] {
-                    if self.atoms.eq_ascii(atom, "length") {
-                        return Ok(GetOutcome::Value(number_value(text.len_units() as f64)));
-                    }
-                    if let Some(offset) = self.atoms.array_index(atom)
-                        && let Some(unit) = text.unit_at(offset as usize)
-                    {
+                let is_string = matches!(
+                    &self.heap[index],
+                    HeapEntry::String(_) | HeapEntry::Rope { .. }
+                );
+                if is_string && self.atoms.eq_ascii(atom, "length") {
+                    let len = self.string_len(index);
+                    return Ok(GetOutcome::Value(number_value(len as f64)));
+                }
+                if is_string && let Some(offset) = self.atoms.array_index(atom) {
+                    let text = self.flat_string(index);
+                    if let Some(unit) = text.unit_at(offset as usize) {
                         return Ok(GetOutcome::Text(EcmaString::from_units(&[unit])));
                     }
                 }
                 match self.heap[index] {
-                    HeapEntry::String(_) => self
+                    HeapEntry::String(_) | HeapEntry::Rope { .. } => self
                         .runtime_slot(self.intrinsics.string_prototype)
                         .map_err(EvalFailure::Runtime)?,
                     HeapEntry::BigInt(_) => self
@@ -9716,15 +9808,32 @@ impl<'a, H: Host> Machine<'a, H> {
         (!bounds.out_of_bounds).then_some(bounds.element_length)
     }
 
-    fn primitive_get(&self, index: usize, key: &PropertyKey) -> Option<Found> {
-        match &self.heap[index] {
-            HeapEntry::String(text) => string_own_get(text, &self.atoms, key),
-            _ => None,
+    fn primitive_get(&mut self, index: usize, key: &PropertyKey) -> Option<Found> {
+        if !matches!(
+            &self.heap[index],
+            HeapEntry::String(_) | HeapEntry::Rope { .. }
+        ) {
+            return None;
         }
+        if let PropertyKey::Named(atom) = key
+            && self.atoms.eq_ascii(*atom, "length")
+        {
+            return Some(Found::Value(number_value(self.string_len(index) as f64)));
+        }
+        let text = self.flat_string(index);
+        string_own_get(&text, &self.atoms, key)
     }
 
-    fn own_get_atom(&self, index: usize, atom: Atom) -> Option<Found> {
+    fn own_get_atom(&mut self, index: usize, atom: Atom) -> Option<Found> {
         debug_assert!(self.atoms.is_ascii(atom));
+        let boxed_text = match &self.heap[index] {
+            HeapEntry::Object {
+                boxed_primitive: Some(primitive),
+                ..
+            } => self.string_slot(*primitive),
+            _ => None,
+        };
+        let boxed_text = boxed_text.map(|slot| self.flat_string(slot));
         match &self.heap[index] {
             HeapEntry::Object {
                 properties,
@@ -9736,11 +9845,10 @@ impl<'a, H: Host> Machine<'a, H> {
                 {
                     return Some(found);
                 }
-                if let Some(primitive) = boxed_primitive
-                    && let Some(slot) = self.runtime_slot(*primitive).ok().flatten()
-                    && let HeapEntry::String(text) = &self.heap[slot]
-                {
-                    return string_own_get(text, &self.atoms, &PropertyKey::Named(atom));
+                if boxed_primitive.is_some() {
+                    return boxed_text.as_ref().and_then(|text| {
+                        string_own_get(text, &self.atoms, &PropertyKey::Named(atom))
+                    });
                 }
                 None
             }
@@ -9870,6 +9978,7 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::HashState { .. } => None,
             HeapEntry::ProcessEnv { .. }
             | HeapEntry::String(_)
+            | HeapEntry::Rope { .. }
             | HeapEntry::BigInt(_)
             | HeapEntry::Symbol { .. }
             | HeapEntry::PrivateName { .. }
@@ -9885,21 +9994,47 @@ impl<'a, H: Host> Machine<'a, H> {
 
     /// Looks up an own property of the heap entry at `index`, returning `None`
     /// when the key is absent so the caller may continue up the prototype chain.
-    fn own_get(&self, index: usize, key: &PropertyKey) -> Option<Found> {
-        match &self.heap[index] {
+    fn own_get(&mut self, index: usize, key: &PropertyKey) -> Option<Found> {
+        let is_string = matches!(
+            &self.heap[index],
+            HeapEntry::String(_) | HeapEntry::Rope { .. }
+        );
+        if is_string
+            && let PropertyKey::Named(atom) = key
+            && self.atoms.eq_ascii(*atom, "length")
+        {
+            return Some(Found::Value(number_value(self.string_len(index) as f64)));
+        }
+        let boxed = match &self.heap[index] {
             HeapEntry::Object {
                 properties,
-                boxed_primitive,
+                boxed_primitive: Some(primitive),
                 ..
             } => {
                 if let Some(found) = property_lookup(properties, &self.shapes, key) {
                     return Some(found);
                 }
-                if let Some(primitive) = boxed_primitive
-                    && let Some(slot) = self.runtime_slot(*primitive).ok().flatten()
-                    && let HeapEntry::String(text) = &self.heap[slot]
-                {
-                    return string_own_get(text, &self.atoms, key);
+                Some(*primitive)
+            }
+            _ => None,
+        };
+        if let Some(primitive) = boxed
+            && let Some(slot) = self.string_slot(primitive)
+        {
+            if let PropertyKey::Named(atom) = key
+                && self.atoms.eq_ascii(*atom, "length")
+            {
+                return Some(Found::Value(number_value(self.string_len(slot) as f64)));
+            }
+            let text = self.flat_string(slot);
+            return string_own_get(&text, &self.atoms, key);
+        }
+        let direct_text =
+            (is_string && matches!(key, PropertyKey::Named(_))).then(|| self.flat_string(index));
+        match &self.heap[index] {
+            HeapEntry::Object { properties, .. } => {
+                if let Some(found) = property_lookup(properties, &self.shapes, key) {
+                    return Some(found);
                 }
                 None
             }
@@ -10024,7 +10159,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     None
                 }
             }
-            HeapEntry::String(text) => string_own_get(text, &self.atoms, key),
+            HeapEntry::String(_) | HeapEntry::Rope { .. } => direct_text
+                .as_ref()
+                .and_then(|text| string_own_get(text, &self.atoms, key)),
             HeapEntry::ProcessEnv { .. }
             | HeapEntry::BigInt(_)
             | HeapEntry::Symbol { .. }
@@ -10365,7 +10502,10 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(slot.filter(|index| {
             !matches!(
                 self.heap[*index],
-                HeapEntry::String(_) | HeapEntry::BigInt(_) | HeapEntry::Symbol { .. }
+                HeapEntry::String(_)
+                    | HeapEntry::Rope { .. }
+                    | HeapEntry::BigInt(_)
+                    | HeapEntry::Symbol { .. }
             )
         }))
     }
@@ -11030,7 +11170,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     operation: "set property on proxy",
                 }));
             }
-            HeapEntry::String(_) | HeapEntry::BigInt(_) => {
+            HeapEntry::String(_) | HeapEntry::Rope { .. } | HeapEntry::BigInt(_) => {
                 return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "set property on primitive",
                 }));
@@ -11433,10 +11573,8 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
-                if self
-                    .boxed_string(index)
-                    .is_some_and(|text| string_own_get(text, &self.atoms, key).is_some())
-                {
+                let boxed = self.boxed_string(index);
+                if boxed.is_some_and(|text| string_own_get(&text, &self.atoms, key).is_some()) {
                     return Ok(false);
                 }
                 self.reify_function_properties(index)?;
@@ -11528,6 +11666,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         return Ok(true);
                     }
                     HeapEntry::String(_)
+                    | HeapEntry::Rope { .. }
                     | HeapEntry::BigInt(_)
                     | HeapEntry::Symbol { .. }
                     | HeapEntry::PrivateName { .. }
@@ -13567,11 +13706,8 @@ impl<'a, H: Host> Machine<'a, H> {
                         .chain(suffix)
                         .collect())
                 }
-                HeapEntry::String(_) => {
-                    let len = match &self.heap[index] {
-                        HeapEntry::String(text) => text.len_units(),
-                        _ => 0,
-                    };
+                HeapEntry::String(_) | HeapEntry::Rope { .. } => {
+                    let len = self.string_len(index);
                     let mut keys = Vec::with_capacity(len);
                     for i in 0..len {
                         keys.push(PropertyKey::Named(self.intern_str(&i.to_string())));
@@ -13637,9 +13773,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 .internal_get_own_property(src, key)?
                 .is_some_and(|descriptor| descriptor.enumerable == Some(true)));
         }
-        if self
-            .boxed_string(index)
-            .is_some_and(|text| string_has_index(text, &self.atoms, key))
+        if let Some(text) = self.boxed_string(index)
+            && string_has_index(&text, &self.atoms, key)
         {
             return Ok(true);
         }
@@ -13660,7 +13795,10 @@ impl<'a, H: Host> Machine<'a, H> {
                 },
                 Property::enumerable,
             ),
-            HeapEntry::String(text) => string_has_index(text, &self.atoms, key),
+            HeapEntry::String(_) | HeapEntry::Rope { .. } => {
+                let text = self.flat_string(index);
+                string_has_index(&text, &self.atoms, key)
+            }
             HeapEntry::TypedArray { properties, .. } => {
                 properties.get(&self.shapes, key).map_or_else(
                     || {
@@ -14349,29 +14487,12 @@ impl<'a, H: Host> Machine<'a, H> {
     fn add(&mut self, left: Value, right: Value) -> Result<Value, EvalFailure> {
         let left = self.coerce_primitive_default(left)?;
         let right = self.coerce_primitive_default(right)?;
-        let left_string = self.string_text(left).cloned();
-        let right_string = self.string_text(right).cloned();
-        if left_string.is_some() || right_string.is_some() {
-            let left = match left_string {
-                Some(text) => text,
-                None => self.to_string(left)?,
-            };
-            let right = match right_string {
-                Some(text) => text,
-                None => self.to_string(right)?,
-            };
-            let mut builder = EcmaStringBuilder::with_capacity(
-                left.len_units().saturating_add(right.len_units()),
-            );
-            for &unit in left.as_units() {
-                builder.push_unit(unit);
-            }
-            for &unit in right.as_units() {
-                builder.push_unit(unit);
-            }
-            return self
-                .allocate(HeapEntry::String(builder.finish()))
-                .map_err(EvalFailure::Runtime);
+        let left_is_string = self.string_slot(left).is_some();
+        let right_is_string = self.string_slot(right).is_some();
+        if left_is_string || right_is_string {
+            let left = self.coerce_string_value(left)?;
+            let right = self.coerce_string_value(right)?;
+            return self.concat_string_values(left, right);
         }
         if let Some(sum) = intrinsics::builtins::bigint::binary_op(
             self,
@@ -14433,6 +14554,7 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(matches!(
             self.heap[index],
             HeapEntry::String(_)
+                | HeapEntry::Rope { .. }
                 | HeapEntry::BigInt(_)
                 | HeapEntry::Symbol { .. }
                 | HeapEntry::PrivateName { .. }
@@ -14519,12 +14641,90 @@ impl<'a, H: Host> Machine<'a, H> {
         self.to_string(primitive)
     }
 
+    /// Coerces a primitive to a string value, keeping an existing string or
+    /// rope instead of reallocating its text.
+    pub(crate) fn coerce_string_value(&mut self, value: Value) -> Result<Value, EvalFailure> {
+        if self.string_slot(value).is_some() {
+            return Ok(value);
+        }
+        let text = self.to_string(value)?;
+        self.allocate(HeapEntry::String(text))
+            .map_err(EvalFailure::Runtime)
+    }
+
+    /// Concatenates two string values. An empty operand yields the other
+    /// value, and a result of `ROPE_MIN_UNITS` or more keeps its halves.
+    pub(crate) fn concat_string_values(
+        &mut self,
+        left: Value,
+        right: Value,
+    ) -> Result<Value, EvalFailure> {
+        let left_len =
+            u32::try_from(self.string_len(self.string_slot(left).expect("left is a string")))
+                .expect("a string length fits in u32");
+        let right_len =
+            u32::try_from(self.string_len(self.string_slot(right).expect("right is a string")))
+                .expect("a string length fits in u32");
+        if left_len == 0 {
+            return Ok(right);
+        }
+        if right_len == 0 {
+            return Ok(left);
+        }
+        let len = left_len.checked_add(right_len).ok_or(EvalFailure::Runtime(
+            RuntimeErrorKind::HeapByteLimitExceeded {
+                limit: self.limits.max_heap_bytes,
+            },
+        ))?;
+        if len >= ROPE_MIN_UNITS {
+            self.ensure_allocation_capacity(1, (len as usize).saturating_mul(2))
+                .map_err(EvalFailure::Runtime)?;
+            return self
+                .allocate(HeapEntry::Rope { left, right, len })
+                .map_err(EvalFailure::Runtime);
+        }
+        let left_slot = self.string_slot(left).expect("left is a string");
+        let right_slot = self.string_slot(right).expect("right is a string");
+        let left_text = self.flat_string(left_slot);
+        let right_text = self.flat_string(right_slot);
+        let mut builder = EcmaStringBuilder::with_capacity(len as usize);
+        for &unit in left_text.as_units() {
+            builder.push_unit(unit);
+        }
+        for &unit in right_text.as_units() {
+            builder.push_unit(unit);
+        }
+        self.allocate(HeapEntry::String(builder.finish()))
+            .map_err(EvalFailure::Runtime)
+    }
+
     pub(crate) fn coerce_number_observable(&mut self, value: Value) -> Result<Value, EvalFailure> {
         let primitive = self.coerce_primitive_observable(value, false)?;
         self.to_number(primitive)
     }
 
-    fn to_number(&self, value: Value) -> Result<Value, EvalFailure> {
+    #[expect(
+        clippy::wrong_self_convention,
+        reason = "ToNumber flattens rope operands, which needs the machine mutably"
+    )]
+    fn to_number(&mut self, value: Value) -> Result<Value, EvalFailure> {
+        if let Some(index) = self.string_slot(value) {
+            let text = self.flat_string(index);
+            return Ok(number_value(parse_number(&text)));
+        }
+        if let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
+            let elements = match &self.heap[index] {
+                HeapEntry::Array { elements, .. } => Some(elements.clone()),
+                _ => None,
+            };
+            if let Some(elements) = elements {
+                return match elements.len() {
+                    0 => Ok(Value::int32(0)),
+                    1 => self.to_number(elements[0]),
+                    _ => Ok(Value::number(f64::NAN)),
+                };
+            }
+        }
         match value.decode() {
             Some(Decoded::Number(_)) | Some(Decoded::Int32(_)) => self.to_primitive(value),
             Some(Decoded::Undefined) => Ok(Value::number(f64::NAN)),
@@ -14534,7 +14734,12 @@ impl<'a, H: Host> Machine<'a, H> {
             Some(Decoded::HeapRef(_)) => {
                 match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
                     Some(index) => match &self.heap[index] {
-                        HeapEntry::String(text) => Ok(number_value(parse_number(text))),
+                        HeapEntry::String(_) | HeapEntry::Rope { .. } => {
+                            unreachable!("string values coerce before the heap match")
+                        }
+                        HeapEntry::Array { .. } => {
+                            unreachable!("array values coerce before the heap match")
+                        }
                         HeapEntry::BigInt(_) => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                             operation: "convert bigint to number",
                         })),
@@ -14542,12 +14747,6 @@ impl<'a, H: Host> Machine<'a, H> {
                             Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                                 operation: "convert proxy to number",
                             }))
-                        }
-                        HeapEntry::Array { elements, .. } if elements.is_empty() => {
-                            Ok(Value::int32(0))
-                        }
-                        HeapEntry::Array { elements, .. } if elements.len() == 1 => {
-                            self.to_number(elements[0])
                         }
                         HeapEntry::Symbol { .. } | HeapEntry::PrivateName { .. } => {
                             Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -14559,7 +14758,6 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::AsyncGenerator { .. }
                         | HeapEntry::AsyncFromSync { .. }
                         | HeapEntry::Script { .. }
-                        | HeapEntry::Array { .. }
                         | HeapEntry::Function { .. }
                         | HeapEntry::ModuleNamespace { .. }
                         | HeapEntry::ExternalModuleNamespace { .. }
@@ -14609,6 +14807,7 @@ impl<'a, H: Host> Machine<'a, H> {
             Some(Decoded::HeapRef(_)) => match self.runtime_slot(value) {
                 Ok(Some(index)) => match &self.heap[index] {
                     HeapEntry::String(text) => !text.is_empty(),
+                    HeapEntry::Rope { len, .. } => *len != 0,
                     HeapEntry::BigInt(text) => text != "0",
                     HeapEntry::Object { .. }
                     | HeapEntry::Generator { .. }
@@ -14662,7 +14861,7 @@ impl<'a, H: Host> Machine<'a, H> {
             Some(Decoded::Boolean(_)) => "boolean",
             Some(Decoded::HeapRef(_)) => match self.runtime_slot(value) {
                 Ok(Some(index)) => match &self.heap[index] {
-                    HeapEntry::String(_) => "string",
+                    HeapEntry::String(_) | HeapEntry::Rope { .. } => "string",
                     HeapEntry::BigInt(_) => "bigint",
                     HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. } => "function",
                     HeapEntry::Symbol { .. } => "symbol",
@@ -14712,19 +14911,23 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn strict_equal(&self, left: Value, right: Value) -> bool {
+    fn strict_equal(&mut self, left: Value, right: Value) -> bool {
         match (left.decode(), right.decode()) {
             (Some(Decoded::Number(a)), Some(Decoded::Number(b))) => a == b,
             (Some(Decoded::Number(a)), Some(Decoded::Int32(b)))
             | (Some(Decoded::Int32(b)), Some(Decoded::Number(a))) => a == f64::from(b as i32),
             (Some(Decoded::Int32(a)), Some(Decoded::Int32(b))) => a == b,
             (Some(Decoded::HeapRef(_)), Some(Decoded::HeapRef(_))) => {
-                match (self.runtime_slot(left), self.runtime_slot(right)) {
-                    (Ok(Some(a)), Ok(Some(b))) => match (&self.heap[a], &self.heap[b]) {
-                        (HeapEntry::String(a), HeapEntry::String(b)) => a == b,
-                        (HeapEntry::BigInt(a), HeapEntry::BigInt(b)) => a == b,
-                        _ => left == right,
-                    },
+                let (left_slot, right_slot) =
+                    match (self.runtime_slot(left), self.runtime_slot(right)) {
+                        (Ok(Some(a)), Ok(Some(b))) => (a, b),
+                        _ => return left == right,
+                    };
+                if let (Some(a), Some(b)) = (self.string_slot(left), self.string_slot(right)) {
+                    return self.flat_string(a) == self.flat_string(b);
+                }
+                match (&self.heap[left_slot], &self.heap[right_slot]) {
+                    (HeapEntry::BigInt(a), HeapEntry::BigInt(b)) => a == b,
                     _ => left == right,
                 }
             }
@@ -14778,7 +14981,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let left = self.coerce_primitive_observable(left, false)?;
         let right = self.coerce_primitive_observable(right, false)?;
         if let (Some(left), Some(right)) = (self.string_text(left), self.string_text(right)) {
-            return Ok(Some(left.cmp(right)));
+            return Ok(Some(left.cmp(&right)));
         }
         if let Some(ordering) = intrinsics::builtins::bigint::compare(self, left, right)? {
             return Ok(ordering);
@@ -14915,9 +15118,35 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(PropertyKey::Symbol(symbol_index))
     }
 
-    fn value_to_string(&self, value: Value, depth: usize) -> Result<EcmaString, EvalFailure> {
+    fn value_to_string(&mut self, value: Value, depth: usize) -> Result<EcmaString, EvalFailure> {
         if depth >= 32 {
             return Ok(EcmaString::default());
+        }
+        if let Some(index) = self.string_slot(value) {
+            return Ok(self.flat_string(index));
+        }
+        if let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
+            let elements = match &self.heap[index] {
+                HeapEntry::Array { elements, .. } => Some(elements.clone()),
+                _ => None,
+            };
+            if let Some(elements) = elements {
+                let mut text = EcmaStringBuilder::new();
+                for (position, element) in elements.iter().copied().enumerate() {
+                    if position != 0 {
+                        text.push_unit(u16::from(b','));
+                    }
+                    if element != Value::HOLE
+                        && element != Value::NULL
+                        && element != Value::UNDEFINED
+                    {
+                        for &unit in self.value_to_string(element, depth + 1)?.as_units() {
+                            text.push_unit(unit);
+                        }
+                    }
+                }
+                return Ok(text.finish());
+            }
         }
         let ascii = |text: String| EcmaString::encode(&text);
         match value.decode() {
@@ -14934,7 +15163,9 @@ impl<'a, H: Host> Machine<'a, H> {
             Some(Decoded::HeapRef(_)) => {
                 match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
                     Some(index) => match &self.heap[index] {
-                        HeapEntry::String(text) => Ok(text.clone()),
+                        HeapEntry::String(_) | HeapEntry::Rope { .. } => {
+                            unreachable!("string values convert before the heap match")
+                        }
                         HeapEntry::BigInt(text) => Ok(EcmaString::encode(text)),
                         HeapEntry::Proxy { .. } => Ok(EcmaString::encode("[object Object]")),
                         HeapEntry::ProxyRevoker { .. } => {
@@ -15015,24 +15246,8 @@ impl<'a, H: Host> Machine<'a, H> {
                         HeapEntry::NativeFunction { .. } => {
                             Ok(EcmaString::encode("function () { [native code] }"))
                         }
-                        HeapEntry::Array { elements, .. } => {
-                            let mut text = EcmaStringBuilder::new();
-                            for (index, element) in elements.iter().copied().enumerate() {
-                                if index != 0 {
-                                    text.push_unit(u16::from(b','));
-                                }
-                                if element != Value::HOLE
-                                    && element != Value::NULL
-                                    && element != Value::UNDEFINED
-                                {
-                                    for &unit in
-                                        self.value_to_string(element, depth + 1)?.as_units()
-                                    {
-                                        text.push_unit(unit);
-                                    }
-                                }
-                            }
-                            Ok(text.finish())
+                        HeapEntry::Array { .. } => {
+                            unreachable!("array values convert before the heap match")
                         }
                         HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
                     },
@@ -15047,12 +15262,9 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn string_text(&self, value: Value) -> Option<&EcmaString> {
-        let index = self.runtime_slot(value).ok()??;
-        match &self.heap[index] {
-            HeapEntry::String(text) => Some(text),
-            _ => None,
-        }
+    fn string_text(&mut self, value: Value) -> Option<EcmaString> {
+        let index = self.string_slot(value)?;
+        Some(self.flat_string(index))
     }
 
     fn is_object(&self, value: Value) -> bool {
@@ -15060,6 +15272,7 @@ impl<'a, H: Host> Machine<'a, H> {
             Ok(Some(index)) => !matches!(
                 self.heap[index],
                 HeapEntry::String(_)
+                    | HeapEntry::Rope { .. }
                     | HeapEntry::BigInt(_)
                     | HeapEntry::Symbol { .. }
                     | HeapEntry::PrivateName { .. }
@@ -15436,7 +15649,7 @@ mod tests {
     }
 
     /// A function with no captures.
-    fn function(
+    pub(crate) fn function(
         parameters: u32,
         registers: u32,
         code: Vec<Instruction>,
@@ -15543,7 +15756,10 @@ mod tests {
         )
     }
 
-    fn verified(mut constants: Vec<Constant>, functions: Vec<Function>) -> Program<Verified> {
+    pub(crate) fn verified(
+        mut constants: Vec<Constant>,
+        functions: Vec<Function>,
+    ) -> Program<Verified> {
         let name = ConstantId::new(constants.len() as u32);
         constants.push(Constant::String(EcmaString::encode("<test>")));
         let code = Module::new(constants, functions, FunctionId::new(0))
@@ -15668,7 +15884,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct TestHost;
+    pub(crate) struct TestHost;
     impl Host for TestHost {}
 
     fn with_machine(limits: Limits, test: impl FnOnce(&mut Machine<'_, TestHost>)) {
@@ -19338,7 +19554,8 @@ mod tests {
             .get_named_property(set_constructor, "prototype")
             .unwrap();
         let mut set_index = CollectionIndex::default();
-        set_index.insert(collection_key_hash(&machine, Value::int32(7)), 0);
+        let hash = collection_key_hash(&mut machine, Value::int32(7));
+        set_index.insert(hash, 0);
         let set = machine
             .allocate(HeapEntry::Collection {
                 kind: CollectionKind::Set,
@@ -20165,16 +20382,15 @@ mod tests {
     /// Asserts `value` is an error object built on the realm's own
     /// `constructor` prototype with own `message`.
     fn assert_intrinsic_error<H: Host>(
-        machine: &Machine<'_, H>,
+        machine: &mut Machine<'_, H>,
         value: Value,
         constructor: &str,
         message: &str,
     ) {
         let slot = assert_intrinsic_prototype(machine, value, constructor);
+        let message_value = machine.own_data_property(slot, "message");
         assert_eq!(
-            machine
-                .own_data_property(slot, "message")
-                .and_then(|text| machine.string_value(text)),
+            message_value.and_then(|text| machine.string_value(text)),
             Some(EcmaString::encode(message))
         );
     }
@@ -20255,7 +20471,7 @@ mod tests {
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let value = uncaught_value(machine.evaluate().unwrap_err());
         assert_intrinsic_error(
-            &machine,
+            &mut machine,
             value,
             "ReferenceError",
             "undeclared is not defined",
@@ -20384,7 +20600,7 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let value = uncaught_value(machine.evaluate().unwrap_err());
-        assert_intrinsic_error(&machine, value, "ReferenceError", "gy is not defined");
+        assert_intrinsic_error(&mut machine, value, "ReferenceError", "gy is not defined");
         let global = machine.global_object;
         let key = PropertyKey::Named(machine.intern_str("gy"));
         assert!(!machine.has_own_property_key(global, &key).unwrap());
@@ -20494,7 +20710,7 @@ mod tests {
                 let mut host = TestHost;
                 let mut machine = Machine::new(&program, &mut host, Limits::default());
                 let caught = machine.evaluate().unwrap().value;
-                assert_intrinsic_error(&machine, caught, constructor, message);
+                assert_intrinsic_error(&mut machine, caught, constructor, message);
                 assert_eq!(machine.test_global("called"), Some(Value::int32(0)));
             }
         }
@@ -33343,5 +33559,259 @@ mod shape_property_tests {
             second.iter(&shapes).map(|(key, _)| key.clone()).collect();
         assert_eq!(former_keys, latter_keys);
         assert_eq!(former_keys, keys);
+    }
+}
+
+#[cfg(test)]
+mod rope_string_tests {
+    use super::*;
+    use crate::tests::{TestHost, function, verified};
+
+    struct XorShift64(u64);
+    impl XorShift64 {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0 | 1;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    fn rope_limits() -> Limits {
+        Limits {
+            max_heap_slots: 1 << 22,
+            max_heap_bytes: usize::MAX >> 2,
+            fuel: u64::MAX,
+            ..Limits::default()
+        }
+    }
+
+    fn with_rope_machine(test: impl FnOnce(&mut Machine<'_, TestHost>)) {
+        let program = verified(
+            vec![],
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, rope_limits());
+        test(&mut machine);
+    }
+
+    fn empty_string(machine: &mut Machine<'_, TestHost>) -> Value {
+        machine
+            .allocate(HeapEntry::String(EcmaString::default()))
+            .expect("empty string allocation succeeds")
+    }
+
+    fn push_piece(machine: &mut Machine<'_, TestHost>, text: &str) -> Value {
+        machine
+            .allocate(HeapEntry::String(EcmaString::encode(text)))
+            .expect("piece allocation succeeds")
+    }
+
+    #[test]
+    fn concat_sequence_matches_a_flat_code_unit_oracle() {
+        with_rope_machine(|machine| {
+            let mut rng = XorShift64(0x9E37_79B9_7F4A_7C15);
+            let mut oracle: Vec<u16> = Vec::new();
+            let mut value = empty_string(machine);
+            for _ in 0..10_000 {
+                let len = rng.below(7) + 1;
+                let mut piece = String::new();
+                for _ in 0..len {
+                    piece.push(char::from(b'a' + rng.below(26) as u8));
+                }
+                let piece_value = push_piece(machine, &piece);
+                oracle.extend(piece.encode_utf16());
+                value = machine
+                    .concat_string_values(value, piece_value)
+                    .expect("concatenation succeeds");
+                let slot = machine.string_slot(value).expect("result is a string");
+                assert_eq!(machine.string_len(slot), oracle.len());
+                assert_eq!(machine.type_of(value), "string");
+                let flat = machine.flat_string(slot);
+                assert_eq!(flat.as_units(), oracle.as_slice());
+                assert!(!machine.is_rope(slot));
+                let offset = rng.below(oracle.len() as u64) as usize;
+                assert_eq!(flat.unit_at(offset), oracle.get(offset).copied());
+                let oracle_value = machine
+                    .allocate(HeapEntry::String(EcmaString::from_units(&oracle)))
+                    .expect("oracle allocation succeeds");
+                assert!(machine.strict_equal(value, oracle_value));
+                let mut altered = oracle.clone();
+                let last = altered.len() - 1;
+                altered[last] = if altered[last] == u16::from(b'z') {
+                    u16::from(b'y')
+                } else {
+                    u16::from(b'z')
+                };
+                let altered_value = machine
+                    .allocate(HeapEntry::String(EcmaString::from_units(&altered)))
+                    .expect("altered allocation succeeds");
+                assert!(!machine.strict_equal(value, altered_value));
+            }
+            assert!(oracle.len() > 32);
+        });
+    }
+
+    #[test]
+    fn deep_left_and_right_leaning_ropes_flatten_without_recursion() {
+        with_rope_machine(|machine| {
+            for left_leaning in [true, false] {
+                let mut value = push_piece(machine, "a");
+                let mut expected = String::from("a");
+                for position in 1..100_000u32 {
+                    let piece_text = if position % 2 == 0 { "b" } else { "c" };
+                    let piece = push_piece(machine, piece_text);
+                    value = if left_leaning {
+                        expected.push_str(piece_text);
+                        machine
+                            .concat_string_values(value, piece)
+                            .expect("left concatenation succeeds")
+                    } else {
+                        expected.insert_str(0, piece_text);
+                        machine
+                            .concat_string_values(piece, value)
+                            .expect("right concatenation succeeds")
+                    };
+                }
+                let slot = machine.string_slot(value).expect("chain is a string");
+                assert!(machine.is_rope(slot));
+                assert_eq!(machine.string_len(slot), expected.len());
+                let flat = machine.flat_string(slot);
+                assert_eq!(flat.as_units(), expected.encode_utf16().collect::<Vec<_>>());
+                assert_eq!(flat.unit_at(0), expected.encode_utf16().next());
+                assert_eq!(
+                    flat.unit_at(expected.len() - 1),
+                    expected.encode_utf16().last()
+                );
+                assert!(!machine.is_rope(slot));
+            }
+        });
+    }
+
+    #[test]
+    fn reading_length_does_not_flatten_a_rope() {
+        with_rope_machine(|machine| {
+            let left = push_piece(machine, "0123456789abcdef");
+            let right = push_piece(machine, "0123456789abcdef");
+            let value = machine
+                .concat_string_values(left, right)
+                .expect("concatenation succeeds");
+            let slot = machine.string_slot(value).expect("result is a string");
+            assert!(machine.is_rope(slot));
+            let length_key = PropertyKey::Named(machine.intern_str("length"));
+            let found = machine.own_get(slot, &length_key);
+            let Some(Found::Value(length)) = found else {
+                panic!("a rope exposes its length as a value");
+            };
+            assert_eq!(length, number_value(32.0));
+            assert!(machine.is_rope(slot));
+            assert_eq!(machine.string_len(slot), 32);
+        });
+    }
+
+    #[test]
+    fn short_concatenations_stay_flat_and_empty_operands_reuse_the_other_value() {
+        with_rope_machine(|machine| {
+            let left = push_piece(machine, "abc");
+            let right = push_piece(machine, "de");
+            let value = machine
+                .concat_string_values(left, right)
+                .expect("short concatenation succeeds");
+            let slot = machine.string_slot(value).expect("result is a string");
+            assert!(!machine.is_rope(slot));
+            assert!(machine.flat_string(slot).eq_ascii("abcde"));
+
+            let empty = empty_string(machine);
+            assert_eq!(
+                machine
+                    .concat_string_values(left, empty)
+                    .expect("empty right succeeds"),
+                left
+            );
+            assert_eq!(
+                machine
+                    .concat_string_values(empty, right)
+                    .expect("empty left succeeds"),
+                right
+            );
+        });
+    }
+
+    #[test]
+    fn rope_values_hash_and_intern_like_their_flat_text() {
+        with_rope_machine(|machine| {
+            let left = push_piece(machine, "0123456789abcdef");
+            let right = push_piece(machine, "0123456789abcdef");
+            let rope = machine
+                .concat_string_values(left, right)
+                .expect("concatenation succeeds");
+            let flat = push_piece(machine, "0123456789abcdef0123456789abcdef");
+            assert!(machine.is_rope(machine.string_slot(rope).unwrap()));
+            assert_eq!(
+                collection_key_hash(machine, rope),
+                collection_key_hash(machine, flat)
+            );
+            assert!(machine.same_value_zero(rope, flat));
+            assert!(machine.strict_equal(rope, flat));
+            assert_eq!(
+                machine.property_key_from_value(rope).unwrap(),
+                machine.property_key_from_value(flat).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn a_long_append_chain_stays_within_the_default_heap_limit() {
+        let program = verified(
+            vec![],
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let dot = push_piece(&mut machine, ".");
+        let mut value = empty_string(&mut machine);
+        for _ in 0..10_000 {
+            value = machine
+                .concat_string_values(value, dot)
+                .expect("an append fits the default heap limit");
+        }
+        let slot = machine.string_slot(value).expect("chain is a string");
+        assert_eq!(machine.string_len(slot), 10_000);
+        let flat = machine.flat_string(slot);
+        assert!(flat.as_units().iter().all(|&unit| unit == u16::from(b'.')));
+        machine.assert_heap_ledger();
+    }
+
+    #[test]
+    fn a_rope_longer_than_the_remaining_heap_is_refused() {
+        let program = verified(
+            vec![],
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let limits = Limits {
+            max_heap_bytes: 16 << 10,
+            ..Limits::default()
+        };
+        let mut machine = Machine::new(&program, &mut host, limits);
+        let half = push_piece(&mut machine, &"a".repeat(1_500));
+        let other = push_piece(&mut machine, &"b".repeat(1_500));
+        let joined = machine
+            .concat_string_values(half, other)
+            .expect("3000 units fit in the remaining heap");
+        assert!(matches!(
+            machine.concat_string_values(joined, joined),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::HeapByteLimitExceeded { .. }
+            ))
+        ));
+        machine.assert_heap_ledger();
     }
 }

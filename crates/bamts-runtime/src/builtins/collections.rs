@@ -1002,12 +1002,13 @@ fn map_get_for<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let slot = collection_slot(machine, this, expected)?;
     let key = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let HeapEntry::Collection { entries, index, .. } = &machine.heap[slot] else {
-        unreachable!("collection brand was checked")
-    };
-    let found = index
-        .get(machine, entries, key)
-        .map_or(Value::UNDEFINED, |entry_index| entries[entry_index].value);
+    let found =
+        crate::collection_lookup(machine, slot, key).map_or(Value::UNDEFINED, |entry_index| {
+            match &machine.heap[slot] {
+                HeapEntry::Collection { entries, .. } => entries[entry_index].value,
+                _ => unreachable!("collection brand was checked"),
+            }
+        });
     Ok(BuiltinOutcome::Value(found))
 }
 
@@ -1037,11 +1038,8 @@ fn map_has_for<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let slot = collection_slot(machine, this, expected)?;
     let key = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let HeapEntry::Collection { entries, index, .. } = &machine.heap[slot] else {
-        unreachable!("collection brand was checked")
-    };
     Ok(BuiltinOutcome::Value(Value::boolean(
-        index.get(machine, entries, key).is_some(),
+        crate::collection_lookup(machine, slot, key).is_some(),
     )))
 }
 
@@ -1071,12 +1069,7 @@ fn map_delete_for<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let slot = collection_slot(machine, this, expected)?;
     let key = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let entry_index = {
-        let HeapEntry::Collection { entries, index, .. } = &machine.heap[slot] else {
-            unreachable!("collection brand was checked")
-        };
-        index.get(machine, entries, key)
-    };
+    let entry_index = crate::collection_lookup(machine, slot, key);
     let Some(entry_index) = entry_index else {
         return Ok(BuiltinOutcome::Value(Value::FALSE));
     };
@@ -1356,12 +1349,7 @@ pub(super) fn map_put<H: Host>(
     expected: CollectionKind,
 ) -> Result<(), EvalFailure> {
     let slot = collection_slot(machine, object, expected)?;
-    let existing = {
-        let HeapEntry::Collection { entries, index, .. } = &machine.heap[slot] else {
-            unreachable!("collection brand was checked")
-        };
-        index.get(machine, entries, key)
-    };
+    let existing = crate::collection_lookup(machine, slot, key);
     if let Some(entry_index) = existing {
         let HeapEntry::Collection { entries, .. } = &mut machine.heap[slot] else {
             unreachable!("collection brand was checked")
@@ -1379,12 +1367,7 @@ fn set_put<H: Host>(
     expected: CollectionKind,
 ) -> Result<(), EvalFailure> {
     let slot = collection_slot(machine, object, expected)?;
-    let exists = {
-        let HeapEntry::Collection { entries, index, .. } = &machine.heap[slot] else {
-            unreachable!("collection brand was checked")
-        };
-        index.get(machine, entries, value).is_some()
-    };
+    let exists = crate::collection_lookup(machine, slot, value).is_some();
     if exists {
         return Ok(());
     }
@@ -1596,6 +1579,7 @@ pub(super) fn require_weak_key<H: Host>(
         // Primitives and internal bookkeeping entries are not valid keys.
         HeapEntry::Vacant
         | HeapEntry::String(_)
+        | HeapEntry::Rope { .. }
         | HeapEntry::BigInt(_)
         | HeapEntry::PrivateName { .. }
         | HeapEntry::Iterator { .. }

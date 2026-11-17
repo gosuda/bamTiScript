@@ -367,13 +367,12 @@ fn upsert_key<H: Host>(
     Ok(canonical_collection_key(key))
 }
 
-fn existing_value<H: Host>(machine: &Machine<'_, H>, slot: usize, key: Value) -> Option<Value> {
-    let HeapEntry::Collection { entries, index, .. } = &machine.heap[slot] else {
-        unreachable!("collection brand was checked")
-    };
-    index
-        .get(machine, entries, key)
-        .map(|entry_index| entries[entry_index].value)
+fn existing_value<H: Host>(machine: &mut Machine<'_, H>, slot: usize, key: Value) -> Option<Value> {
+    let entry_index = crate::collection_lookup(machine, slot, key)?;
+    match &machine.heap[slot] {
+        HeapEntry::Collection { entries, .. } => Some(entries[entry_index].value),
+        _ => unreachable!("collection brand was checked"),
+    }
 }
 
 fn get_or_insert<H: Host>(
@@ -479,15 +478,16 @@ fn put_strong_entry<H: Host>(
         .runtime_slot(collection)
         .map_err(EvalFailure::Runtime)?
         .ok_or_else(|| type_error("collection method called on incompatible receiver"))?;
-    let existing = match &machine.heap[slot] {
-        HeapEntry::Collection { kind, entries, .. } if *kind == expected => entries
-            .iter()
-            .position(|entry| entry.live && machine.same_value_zero(entry.key, key)),
-        _ => {
-            return Err(type_error(
-                "collection method called on incompatible receiver",
-            ));
-        }
+    let kind_matches = matches!(
+        &machine.heap[slot],
+        HeapEntry::Collection { kind, .. } if *kind == expected
+    );
+    let existing = if kind_matches {
+        crate::collection_lookup(machine, slot, key)
+    } else {
+        return Err(type_error(
+            "collection method called on incompatible receiver",
+        ));
     };
     if let Some(entry_index) = existing {
         let HeapEntry::Collection { entries, .. } = &mut machine.heap[slot] else {
@@ -751,13 +751,11 @@ fn add_group<H: Host>(
         .runtime_slot(map)
         .map_err(EvalFailure::Runtime)?
         .ok_or_else(|| type_error("Map.groupBy result is not a Map"))?;
-    let existing = match &machine.heap[slot] {
-        HeapEntry::Collection { entries, .. } => entries
-            .iter()
-            .position(|entry| entry.live && machine.same_value_zero(entry.key, key)),
-        _ => return Err(type_error("Map.groupBy result is not a Map")),
-    };
-    if let Some(entry_index) = existing {
+    let is_map = matches!(&machine.heap[slot], HeapEntry::Collection { .. });
+    if !is_map {
+        return Err(type_error("Map.groupBy result is not a Map"));
+    }
+    if let Some(entry_index) = crate::collection_lookup(machine, slot, key) {
         let group = match &machine.heap[slot] {
             HeapEntry::Collection { entries, .. } => entries[entry_index].value,
             _ => unreachable!("Map brand checked above"),

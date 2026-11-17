@@ -1285,7 +1285,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     return Ok("Object");
                 };
                 Ok(match &self.heap[index] {
-                    HeapEntry::String(_) => "String",
+                    HeapEntry::String(_) | HeapEntry::Rope { .. } => "String",
                     HeapEntry::Array { .. } => "Array",
                     HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. } => "Function",
                     HeapEntry::RegExp { .. } => "RegExp",
@@ -1386,53 +1386,51 @@ impl<'a, H: Host> Machine<'a, H> {
 
     /// Reads the `name` property of a function at `index` without invoking
     /// user code. Returns `None` for non-functions or unnamed functions.
-    fn function_name(&self, index: usize) -> Option<EcmaString> {
-        match &self.heap[index] {
+    fn function_name(&mut self, index: usize) -> Option<EcmaString> {
+        let (name_value, code) = match &self.heap[index] {
             HeapEntry::Function {
                 module,
                 function,
                 properties,
                 ..
-            } => {
-                if let Some(Property::Data { value, .. }) =
-                    properties.get_ascii(&self.shapes, &self.atoms, "name")
-                    && let Some(text) = self.string_from_value(*value)
-                {
-                    return Some(text);
-                }
-                let metadata = &self.module_code(*module).functions()[function.get() as usize];
-                metadata
-                    .name()
-                    .map(|id| self.constant_text(*module, id).clone())
-            }
-            HeapEntry::NativeFunction { properties, .. } => {
-                if let Some(Property::Data { value, .. }) =
-                    properties.get_ascii(&self.shapes, &self.atoms, "name")
-                {
-                    self.string_from_value(*value)
-                } else {
-                    None
-                }
-            }
-            _ => None,
+            } => (
+                function_name_property(properties, &self.shapes, &self.atoms),
+                Some((*module, *function)),
+            ),
+            HeapEntry::NativeFunction { properties, .. } => (
+                function_name_property(properties, &self.shapes, &self.atoms),
+                None,
+            ),
+            _ => return None,
+        };
+        if let Some(value) = name_value
+            && let Some(text) = self.string_from_value(value)
+        {
+            return Some(text);
         }
+        let (module, function) = code?;
+        let metadata = &self.module_code(module).functions()[function.get() as usize];
+        metadata
+            .name()
+            .map(|id| self.constant_text(module, id).clone())
     }
 
-    /// Extracts an [`EcmaString`] from a [`Value`] if it holds a string
-    /// heap entry. Does not invoke user code.
-    fn string_from_value(&self, value: Value) -> Option<EcmaString> {
-        let index = self.runtime_slot(value).ok().flatten()?;
-        match &self.heap[index] {
-            HeapEntry::String(text) => Some(text.clone()),
-            _ => None,
-        }
+    /// Extracts an [`EcmaString`] from a [`Value`] if it holds a string or a
+    /// rope. Does not invoke user code.
+    fn string_from_value(&mut self, value: Value) -> Option<EcmaString> {
+        self.string_value(value)
     }
     pub fn ordinary_number_to_string(number: f64) -> String {
         crate::format_number(number)
     }
-    pub(crate) fn to_string(&self, value: Value) -> Result<EcmaString, EvalFailure> {
+    #[expect(
+        clippy::wrong_self_convention,
+        reason = "ToString flattens rope operands, which needs the machine mutably"
+    )]
+    pub(crate) fn to_string(&mut self, value: Value) -> Result<EcmaString, EvalFailure> {
         self.value_to_string(value, 0)
     }
+
     pub(crate) fn string_constructor_text(
         &mut self,
         value: Value,
@@ -1469,7 +1467,7 @@ impl<'a, H: Host> Machine<'a, H> {
     pub(crate) fn to_boolean(&self, value: Value) -> bool {
         self.truthy(value)
     }
-    pub fn same_value_zero(&self, left: Value, right: Value) -> bool {
+    pub fn same_value_zero(&mut self, left: Value, right: Value) -> bool {
         match (left.decode(), right.decode()) {
             (Some(Decoded::Number(a)), Some(Decoded::Number(b))) => {
                 a == b || (a.is_nan() && b.is_nan())
@@ -1486,6 +1484,17 @@ impl<'a, H: Host> Machine<'a, H> {
         Err(EvalFailure::Throw(ThrowOrigin::TypeError {
             operation: "cannot convert object to primitive without invoking user code",
         }))
+    }
+}
+
+fn function_name_property(
+    properties: &PropertyMap,
+    shapes: &crate::ShapeTable,
+    atoms: &crate::AtomTable,
+) -> Option<Value> {
+    match properties.get_ascii(shapes, atoms, "name") {
+        Some(Property::Data { value, .. }) => Some(*value),
+        _ => None,
     }
 }
 #[cfg(test)]

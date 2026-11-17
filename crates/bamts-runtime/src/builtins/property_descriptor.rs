@@ -280,7 +280,7 @@ pub(crate) fn complete_property_descriptor(
     descriptor
 }
 
-pub(super) fn same_value<H: Host>(machine: &Machine<'_, H>, left: Value, right: Value) -> bool {
+pub(super) fn same_value<H: Host>(machine: &mut Machine<'_, H>, left: Value, right: Value) -> bool {
     match (left.decode(), right.decode()) {
         (Some(Decoded::Number(left)), Some(Decoded::Number(right))) => {
             (left.is_nan() && right.is_nan())
@@ -300,7 +300,7 @@ pub(super) fn same_value<H: Host>(machine: &Machine<'_, H>, left: Value, right: 
 /// `current` is a descriptor record, typically converted from a stored property
 /// via [`descriptor_from_property`].
 pub(super) fn is_compatible_property_descriptor<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     extensible: bool,
     descriptor: PropertyDescriptor,
     current: Option<&PropertyDescriptor>,

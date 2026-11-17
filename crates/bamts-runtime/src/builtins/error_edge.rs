@@ -442,7 +442,7 @@ fn install_stack<H: Host>(
     )
 }
 
-fn format_frames<H: Host>(machine: &Machine<'_, H>, skip: Option<Value>) -> EcmaString {
+fn format_frames<H: Host>(machine: &mut Machine<'_, H>, skip: Option<Value>) -> EcmaString {
     let skip_target = skip.and_then(|value| {
         let index = machine.runtime_slot(value).ok().flatten()?;
         match machine.heap[index] {

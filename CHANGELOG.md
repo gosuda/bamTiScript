@@ -59,6 +59,11 @@ version has shipped, and no tag or stable package exists while any gate in
   `Any`) beside the elements. A store of a non-number, a hole or a deletion
   widens the kind, and replacing a whole element vector recomputes it. The
   kind is internal; a later array fast path reads it.
+- A string concatenation of 32 or more UTF-16 units builds a rope node that
+  keeps its halves, and a reader flattens it on first use. A rope node is
+  charged a constant. Room for the flat text is required when the rope is
+  made, and the flat size is charged when the rope is flattened, so a long
+  append chain stays inside the default heap limit.
 
 ### Known incomplete
 

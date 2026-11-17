@@ -281,6 +281,7 @@ fn build_plan<H: Host>(
         let entry = machine.heap[source_slot].clone();
         let node = match entry {
             HeapEntry::String(text) => PlannedNode::String(text),
+            HeapEntry::Rope { .. } => PlannedNode::String(machine.flat_string(source_slot)),
             HeapEntry::BigInt(text) => PlannedNode::BigInt(text),
             HeapEntry::Object {
                 properties,

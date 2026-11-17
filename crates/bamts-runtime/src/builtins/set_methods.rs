@@ -113,17 +113,12 @@ fn set_data_size(machine: &Machine<'_, impl Host>, set: Value) -> Result<usize, 
 }
 
 fn set_data_has(
-    machine: &Machine<'_, impl Host>,
+    machine: &mut Machine<'_, impl Host>,
     set: Value,
     value: Value,
 ) -> Result<bool, EvalFailure> {
     let slot = require_set_slot(machine, set)?;
-    let HeapEntry::Collection { entries, index, .. } = &machine.heap[slot] else {
-        unreachable!("Set brand was checked")
-    };
-    Ok(index
-        .get(machine, entries, canonicalize_key(value))
-        .is_some())
+    Ok(crate::collection_lookup(machine, slot, canonicalize_key(value)).is_some())
 }
 
 fn next_set_value(
@@ -194,12 +189,7 @@ fn add_to_set<H: Host>(
 ) -> Result<(), EvalFailure> {
     let value = canonicalize_key(value);
     let slot = require_set_slot(machine, set)?;
-    let exists = {
-        let HeapEntry::Collection { entries, index, .. } = &machine.heap[slot] else {
-            unreachable!("Set brand was checked")
-        };
-        index.get(machine, entries, value).is_some()
-    };
+    let exists = crate::collection_lookup(machine, slot, value).is_some();
     if !exists {
         append_collection_entry(machine, slot, value, value)?;
     }
@@ -213,12 +203,7 @@ fn delete_from_set<H: Host>(
 ) -> Result<bool, EvalFailure> {
     let slot = require_set_slot(machine, set)?;
     let value = canonicalize_key(value);
-    let entry_index = {
-        let HeapEntry::Collection { entries, index, .. } = &machine.heap[slot] else {
-            unreachable!("Set brand was checked")
-        };
-        index.get(machine, entries, value)
-    };
+    let entry_index = crate::collection_lookup(machine, slot, value);
     let Some(entry_index) = entry_index else {
         return Ok(false);
     };
@@ -233,8 +218,9 @@ fn delete_from_set<H: Host>(
     let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
         unreachable!("Set brand was checked")
     };
-    for (index, entry) in entries.iter().enumerate() {
-        rebuilt.insert(crate::collection_key_hash(machine, entry.key), index);
+    let keys: Vec<Value> = entries.iter().map(|entry| entry.key).collect();
+    for (index, key) in keys.into_iter().enumerate() {
+        rebuilt.insert(crate::collection_key_hash(machine, key), index);
     }
     let HeapEntry::Collection { index, .. } = &mut machine.heap[slot] else {
         unreachable!("Set brand was checked")

@@ -956,15 +956,17 @@ fn concat<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let mut output = EcmaStringBuilder::new();
-    append(&mut output, &text(machine, this)?);
-    for argument in args {
-        append(&mut output, &machine.coerce_string_observable(*argument)?);
+    if matches!(this.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+        return Err(type_error("String method called on null or undefined"));
     }
-    Ok(BuiltinOutcome::Value(allocate_string(
-        machine,
-        output.finish(),
-    )?))
+    let primitive = machine.coerce_primitive_observable(this, true)?;
+    let mut result = machine.coerce_string_value(primitive)?;
+    for argument in args {
+        let primitive = machine.coerce_primitive_observable(*argument, true)?;
+        let next = machine.coerce_string_value(primitive)?;
+        result = machine.concat_string_values(result, next)?;
+    }
+    Ok(BuiltinOutcome::Value(result))
 }
 fn normalize<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -1673,7 +1675,7 @@ mod split_replace_tests {
     }
 
     /// Extracts the string elements of an Array result.
-    fn array_strings(machine: &Machine<'_, TestHost>, array: Value) -> Vec<String> {
+    fn array_strings(machine: &mut Machine<'_, TestHost>, array: Value) -> Vec<String> {
         let elements = machine
             .array_elements(array)
             .unwrap()
@@ -1749,7 +1751,7 @@ mod split_replace_tests {
         let regexp = construct_regexp(&mut machine, "(?:)", "");
         let result = call_string_method(&mut machine, "split", "abc", &[regexp]);
         assert_eq!(
-            array_strings(&machine, result),
+            array_strings(&mut machine, result),
             vec!["a".to_string(), "b".to_string(), "c".to_string()],
             "empty-pattern split must preserve every character"
         );
@@ -1763,7 +1765,7 @@ mod split_replace_tests {
         let regexp = construct_regexp(&mut machine, "(?:)", "");
         let result = call_string_method(&mut machine, "split", "ab", &[regexp]);
         assert_eq!(
-            array_strings(&machine, result),
+            array_strings(&mut machine, result),
             vec!["a".to_string(), "b".to_string()],
         );
     }
@@ -1780,7 +1782,7 @@ mod split_replace_tests {
         let regexp = construct_regexp(&mut machine, "b*", "");
         let result = call_string_method(&mut machine, "split", "abc", &[regexp]);
         assert_eq!(
-            array_strings(&machine, result),
+            array_strings(&mut machine, result),
             vec!["a".to_string(), "c".to_string()],
             "split(/b*/) must not drop 'a' via the empty match at position 0"
         );
@@ -1794,7 +1796,7 @@ mod split_replace_tests {
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let regexp = construct_regexp(&mut machine, "(?:)", "u");
         let result = call_string_method(&mut machine, "split", "😀x", &[regexp]);
-        let pieces = array_strings(&machine, result);
+        let pieces = array_strings(&mut machine, result);
         assert_eq!(
             pieces.len(),
             2,
@@ -1813,7 +1815,7 @@ mod split_replace_tests {
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let regexp = construct_regexp(&mut machine, "\\d", "");
         let result = call_string_method(&mut machine, "split", "a1b2c", &[regexp]);
-        assert_eq!(array_strings(&machine, result), vec!["a", "b", "c"],);
+        assert_eq!(array_strings(&mut machine, result), vec!["a", "b", "c"],);
     }
 
     // ── Finding 3: GetSubstitution replacement patterns ─────────────────

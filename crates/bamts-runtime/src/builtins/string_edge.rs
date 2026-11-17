@@ -790,7 +790,7 @@ mod tests {
             .expect("string allocation succeeds")
     }
 
-    fn result_text(machine: &Machine<'_, TestHost>, outcome: BuiltinOutcome) -> Vec<u16> {
+    fn result_text(machine: &mut Machine<'_, TestHost>, outcome: BuiltinOutcome) -> Vec<u16> {
         let BuiltinOutcome::Value(value) = outcome else {
             panic!("String builtin returns a value")
         };
@@ -823,7 +823,7 @@ mod tests {
         );
         let repaired = to_well_formed(&mut machine, malformed, &[], false).unwrap();
         assert_eq!(
-            result_text(&machine, repaired),
+            result_text(&mut machine, repaired),
             [b'a' as u16, 0xD800, 0xDC00, 0xFFFD]
         );
     }
@@ -833,9 +833,9 @@ mod tests {
         test_machine!(program, host, machine);
         let source = string(&mut machine, &[0xD83D, 0xDE00, b'x' as u16]);
         let forward = at(&mut machine, source, &[Value::int32(1)], false).unwrap();
-        assert_eq!(result_text(&machine, forward), [0xDE00]);
+        assert_eq!(result_text(&mut machine, forward), [0xDE00]);
         let backward = at(&mut machine, source, &[crate::number_value(-1.0)], false).unwrap();
-        assert_eq!(result_text(&machine, backward), [b'x' as u16]);
+        assert_eq!(result_text(&mut machine, backward), [b'x' as u16]);
     }
 
     #[test]
@@ -846,7 +846,7 @@ mod tests {
         let dash = string(&mut machine, &[b'-' as u16]);
         let replaced = replace_all(&mut machine, source, &[empty, dash], false).unwrap();
         assert_eq!(
-            result_text(&machine, replaced),
+            result_text(&mut machine, replaced),
             [b'-' as u16, b'a' as u16, b'-' as u16, 0xD800, b'-' as u16]
         );
     }
@@ -941,7 +941,7 @@ mod tests {
                 .as_slice(),
         );
         let normalized = normalize(&mut machine, decomposed, &[nfc], false).unwrap();
-        assert_eq!(result_text(&machine, normalized), [0x00E9, 0xD800]);
+        assert_eq!(result_text(&mut machine, normalized), [0x00E9, 0xD800]);
         for form in ["NFD", "NFKC", "NFKD"] {
             let form_value = string(&mut machine, &form.encode_utf16().collect::<Vec<_>>());
             normalize(&mut machine, decomposed, &[form_value], false).unwrap();
@@ -968,7 +968,7 @@ mod tests {
         ] {
             let outcome = at(&mut machine, source, &[crate::number_value(index)], false).unwrap();
             match expected {
-                Some(unit) => assert_eq!(result_text(&machine, outcome), [unit]),
+                Some(unit) => assert_eq!(result_text(&mut machine, outcome), [unit]),
                 None => assert_eq!(result_value(outcome), Value::UNDEFINED),
             }
         }
@@ -979,7 +979,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(result_text(&machine, nan), [0xD83D]);
+        assert_eq!(result_text(&mut machine, nan), [0xD83D]);
     }
 
     #[test]
@@ -993,7 +993,7 @@ mod tests {
         );
         let replaced = replace_all(&mut machine, source, &[needle, template], false).unwrap();
         assert_eq!(
-            result_text(&machine, replaced),
+            result_text(&mut machine, replaced),
             [
                 b'a' as u16,
                 b'$' as u16,
@@ -1030,7 +1030,7 @@ mod tests {
         );
         let replaced = replace_all(&mut machine, source, &[needle, replacer], false).unwrap();
         assert_eq!(
-            result_text(&machine, replaced),
+            result_text(&mut machine, replaced),
             [b'$' as u16, b'&' as u16, b'$' as u16, b'&' as u16]
         );
     }
@@ -1138,7 +1138,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(result_text(&machine, encoded), [0xD83D, 0xDE00]);
+        assert_eq!(result_text(&mut machine, encoded), [0xD83D, 0xDE00]);
         assert!(matches!(
             from_code_point(
                 &mut machine,
@@ -1174,18 +1174,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            result_text(&machine, raw_result),
+            result_text(&mut machine, raw_result),
             [b'a' as u16, b'x' as u16, b'b' as u16]
         );
 
         let source = string(&mut machine, &[0x00A0, b'x' as u16, 0xFEFF]);
         let trimmed = trim(&mut machine, source, &[], false).unwrap();
-        assert_eq!(result_text(&machine, trimmed), [b'x' as u16]);
+        assert_eq!(result_text(&mut machine, trimmed), [b'x' as u16]);
         let fill = string(&mut machine, &[b'a' as u16, b'b' as u16]);
         let x = string(&mut machine, &[b'x' as u16]);
         let padded = pad_end(&mut machine, x, &[Value::int32(4), fill], false).unwrap();
         assert_eq!(
-            result_text(&machine, padded),
+            result_text(&mut machine, padded),
             [b'x' as u16, b'a' as u16, b'b' as u16, b'a' as u16]
         );
         let unused_filler = ordinary_object(&mut machine);
@@ -1207,13 +1207,13 @@ mod tests {
             .unwrap();
 
         let unchanged = pad_end(&mut machine, x, &[Value::int32(1), unused_filler], false).unwrap();
-        assert_eq!(result_text(&machine, unchanged), [b'x' as u16]);
+        assert_eq!(result_text(&mut machine, unchanged), [b'x' as u16]);
         let empty = string(&mut machine, &[]);
         let huge_empty =
             repeat(&mut machine, empty, &[crate::number_value(f64::MAX)], false).unwrap();
-        assert!(result_text(&machine, huge_empty).is_empty());
+        assert!(result_text(&mut machine, huge_empty).is_empty());
         let none = repeat(&mut machine, x, &[Value::int32(0)], false).unwrap();
-        assert!(result_text(&machine, none).is_empty());
+        assert!(result_text(&mut machine, none).is_empty());
         assert!(matches!(
             repeat(
                 &mut machine,

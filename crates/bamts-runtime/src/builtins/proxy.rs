@@ -319,11 +319,18 @@ fn proxy_key<H: Host>(
     let Some(index) = machine.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
         return Err(type_error("Proxy ownKeys trap returned a non-property key"));
     };
-    let text = match &machine.heap[index] {
-        HeapEntry::String(name) => name.clone(),
-        HeapEntry::Symbol { .. } => return Ok(PropertyKey::Symbol(index as u32)),
-        _ => {
-            return Err(type_error("Proxy ownKeys trap returned a non-property key"));
+    let is_string = matches!(
+        &machine.heap[index],
+        HeapEntry::String(_) | HeapEntry::Rope { .. }
+    );
+    let text = if is_string {
+        machine.flat_string(index)
+    } else {
+        match &machine.heap[index] {
+            HeapEntry::Symbol { .. } => return Ok(PropertyKey::Symbol(index as u32)),
+            _ => {
+                return Err(type_error("Proxy ownKeys trap returned a non-property key"));
+            }
         }
     };
     Ok(PropertyKey::Named(machine.intern(text)))

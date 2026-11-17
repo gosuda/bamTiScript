@@ -346,7 +346,7 @@ fn descriptor_reply<H: Host>(
     object
 }
 
-fn key_text(machine: &Machine<'_, TestHost>, value: Value) -> Option<String> {
+fn key_text(machine: &mut Machine<'_, TestHost>, value: Value) -> Option<String> {
     machine
         .string_value(value)
         .map(|name| name.to_utf8_lossy().to_string())

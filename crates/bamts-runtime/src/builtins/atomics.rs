@@ -1151,7 +1151,7 @@ mod tests {
         });
     }
 
-    fn result_is<H: Host>(machine: &Machine<'_, H>, value: Value, expected: &str) -> bool {
+    fn result_is<H: Host>(machine: &mut Machine<'_, H>, value: Value, expected: &str) -> bool {
         machine
             .string_value(value)
             .is_some_and(|text| text.eq_ascii(expected))
@@ -1356,12 +1356,20 @@ mod tests {
         machine.get_named_property(result, "value").unwrap()
     }
 
-    fn fulfilled_with<H: Host>(machine: &Machine<'_, H>, promise: Value, expected: &str) -> bool {
+    fn fulfilled_with<H: Host>(
+        machine: &mut Machine<'_, H>,
+        promise: Value,
+        expected: &str,
+    ) -> bool {
         let index = machine.runtime_slot(promise).unwrap().unwrap();
         let HeapEntry::Promise { state, .. } = &machine.heap[index] else {
             panic!("waitAsync value is a Promise");
         };
-        matches!(state, PromiseState::Fulfilled { value } if result_is(machine, *value, expected))
+        let PromiseState::Fulfilled { value } = state else {
+            return false;
+        };
+        let value = *value;
+        result_is(machine, value, expected)
     }
 
     fn notify_all<H: Host>(machine: &mut Machine<'_, H>, view: Value) -> Value {
