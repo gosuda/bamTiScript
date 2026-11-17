@@ -9,6 +9,9 @@ version has shipped, and no tag or stable package exists while any gate in
 
 ### Changed
 
+- Symbol comparison reports empty expected or actual names and source-line
+  versus symbol-row mismatches separately. Ordinary name mismatches keep
+  their existing family.
 - Property definition and reference navigation now uses the same property
   identities as rename. Package API and LSP results keep unrelated objects
   separate, and LSP reference filtering respects declaration locations.

@@ -863,11 +863,15 @@ fn canvas_difference(facet: &str, left: &[(&str, &str)], right: &[(&str, &str)])
         return "type-text";
     };
     if name_range(left, sep_left) != name_range(right, sep_right) {
-        return if facet == "symbols" {
-            "symbol-name"
-        } else {
-            "record-name"
-        };
+        if facet == "symbols" {
+            return symbol_name_difference(
+                left,
+                right,
+                name_range(left, sep_left),
+                name_range(right, sep_right),
+            );
+        }
+        return "record-name";
     }
     if facet == "symbols" && decl_skeleton(left) == decl_skeleton(right) && left != right {
         return "decl-position";
@@ -896,6 +900,28 @@ fn separator_index(tokens: &[(&str, &str)]) -> Option<usize> {
 fn name_range<'t>(tokens: &'t [(&'t str, &'t str)], sep: usize) -> &'t [(&'t str, &'t str)] {
     let start = usize::from(!tokens.is_empty() && tokens[0].1 == ">");
     &tokens[start..sep]
+}
+
+fn symbol_name_difference(
+    left: &[(&str, &str)],
+    right: &[(&str, &str)],
+    name_left: &[(&str, &str)],
+    name_right: &[(&str, &str)],
+) -> &'static str {
+    if name_right.is_empty() {
+        return "symbol-name-empty-actual";
+    }
+    if name_left.is_empty() {
+        return "symbol-name-empty-expected";
+    }
+    match (
+        left.first().is_some_and(|(_, token)| *token == ">"),
+        right.first().is_some_and(|(_, token)| *token == ">"),
+    ) {
+        (true, false) => "symbol-row-vs-source",
+        (false, true) => "source-vs-symbol-row",
+        _ => "symbol-name",
+    }
 }
 
 fn rendered_has_any(tokens: &[(&str, &str)], sep: usize) -> bool {
@@ -2857,6 +2883,65 @@ mod tests {
                 other => panic!("{label}: expected Fail, got {other:?}"),
             }
             assert!(verdict.is_fail());
+        }
+    }
+
+    #[test]
+    fn symbols_name_mismatches_split_observed_shapes() {
+        let empty_actual = compare_symbols(
+            ">arg : Symbol(arg, Decl(invalidUnicodeEscapeSequance.ts, 0, 3))\n",
+            "> : Symbol(, Decl(invalidUnicodeEscapeSequance.ts, 0, 3))\n",
+        );
+        let empty_expected = compare_symbols(
+            "> : Symbol((Missing), Decl(FunctionPropertyAssignments4_es6.ts, 0, 9))\n",
+            ">v : Symbol(v, Decl(FunctionPropertyAssignments4_es6.ts, 0, 3))\n",
+        );
+        let row_vs_source = compare_symbols(
+            ">v : Symbol(v, Decl(parservoidInQualifiedName1.ts, 0, 3))\n\
+             >x : Symbol(x, Decl(parservoidInQualifiedName1.ts, 0, 13))\n",
+            ">v : Symbol(v, Decl(parservoidInQualifiedName1.ts, 0, 3))\n\
+             var v : void.x;\n",
+        );
+        let ordinary = compare_symbols(
+            ">b : Symbol(b, Decl(aliasUsedAsNameValue_2.ts, 2, 49))\n",
+            ">mod : Symbol(mod, Decl(aliasUsedAsNameValue_2.ts, 0, 0))\n",
+        );
+        let punctuation = compare_symbols(
+            ">\"\" : Symbol(\"\", Decl(quoted.ts, 0, 4))\n",
+            ">\"?\" : Symbol(\"?\", Decl(quoted.ts, 0, 4))\n",
+        );
+        let labels = [
+            ("symbol-name-empty-actual", &empty_actual),
+            ("symbol-name-empty-expected", &empty_expected),
+            ("symbol-row-vs-source", &row_vs_source),
+            ("symbol-name", &ordinary),
+            ("symbol-name", &punctuation),
+        ];
+        for (label, verdict) in labels {
+            match verdict {
+                FacetVerdict::Fail { reason } => {
+                    assert!(
+                        reason.contains(&format!("[{label}]")),
+                        "expected [{label}] in {reason}"
+                    );
+                }
+                other => panic!("{label}: expected Fail, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn symbols_source_line_against_symbol_row_names_the_reverse() {
+        let verdict = compare_symbols(
+            "var v : void.x;\n",
+            ">v : Symbol(v, Decl(parservoidInQualifiedName1.ts, 0, 3))\n\
+             >x : Symbol(x, Decl(parservoidInQualifiedName1.ts, 0, 13))\n",
+        );
+        match &verdict {
+            FacetVerdict::Fail { reason } => {
+                assert!(reason.contains("[source-vs-symbol-row]"), "{reason}")
+            }
+            other => panic!("expected Fail, got {other:?}"),
         }
     }
 
