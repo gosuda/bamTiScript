@@ -2184,7 +2184,11 @@ pub unsafe extern "C" fn bamts_throw_intrinsic_error(
     message: u32,
     out: *mut Completion,
 ) -> u32 {
-    dispatch_simple(frame, out, HelperCall::ThrowIntrinsicError { kind, message })
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::ThrowIntrinsicError { kind, message },
+    )
 }
 
 impl NativeHelper {

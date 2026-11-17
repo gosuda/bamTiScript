@@ -18486,7 +18486,10 @@ impl<'src> Binder<'src> {
             // indexed-access rejection when strict null checks are disabled.
             // Keep the published read type unchanged; this widened view is
             // used only for the C064 decision below.
-            let rejection_object_type = if !optional && !continuation && narrowed_object_type.is_none() {
+            let rejection_object_type = if !optional
+                && !continuation
+                && narrowed_object_type.is_none()
+            {
                 match object.data() {
                     Expression::Member(member) => {
                         match enum_plan::cook_member_property_name(self.source, &member.property) {

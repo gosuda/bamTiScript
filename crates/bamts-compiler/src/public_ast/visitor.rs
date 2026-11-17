@@ -685,7 +685,9 @@ where
     V: Visitor<'ast>,
 {
     match name {
-        PropertyName::Identifier(identifier) => visit_node(NodeRef::Identifier(identifier), visitor)?,
+        PropertyName::Identifier(identifier) => {
+            visit_node(NodeRef::Identifier(identifier), visitor)?
+        }
         PropertyName::Private(private) => visit_node(NodeRef::PrivateIdentifier(private), visitor)?,
         PropertyName::String(string) => visit_node(NodeRef::StringLiteral(string), visitor)?,
         PropertyName::Computed(expression) => visit_node(NodeRef::Expression(expression), visitor)?,
@@ -703,8 +705,12 @@ where
 {
     match property {
         MemberProperty::Named(name) => visit_node(NodeRef::Identifier(name), visitor)?,
-        MemberProperty::Computed(expression) => visit_node(NodeRef::Expression(expression), visitor)?,
-        MemberProperty::Private(private) => visit_node(NodeRef::PrivateIdentifier(private), visitor)?,
+        MemberProperty::Computed(expression) => {
+            visit_node(NodeRef::Expression(expression), visitor)?
+        }
+        MemberProperty::Private(private) => {
+            visit_node(NodeRef::PrivateIdentifier(private), visitor)?
+        }
     }
     ControlFlow::Continue(())
 }

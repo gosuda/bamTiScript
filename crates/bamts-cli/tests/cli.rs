@@ -190,13 +190,18 @@ fn api_aot_execution_is_bounded_by_request_cancellation() {
     let mut stdin = child.stdin.take().expect("API child stdin is piped");
     for request in requests {
         let payload = serde_json::to_vec(&request).expect("API request serializes");
-        stdin.write_all(&framed(&payload)).expect("API request is written");
+        stdin
+            .write_all(&framed(&payload))
+            .expect("API request is written");
     }
     stdin.flush().expect("API requests are flushed");
     let published = project.path.join("cache").join("run");
     let deadline = Instant::now() + Duration::from_secs(120);
     while fs::read_dir(&published).map_or(true, |mut entries| entries.next().is_none()) {
-        assert!(Instant::now() < deadline, "the AOT image was never published");
+        assert!(
+            Instant::now() < deadline,
+            "the AOT image was never published"
+        );
         thread::sleep(Duration::from_millis(20));
     }
     let cancel = serde_json::json!({
@@ -205,7 +210,9 @@ fn api_aot_execution_is_bounded_by_request_cancellation() {
         "params": { "id": 2 },
     });
     let payload = serde_json::to_vec(&cancel).expect("cancel request serializes");
-    stdin.write_all(&framed(&payload)).expect("cancel request is written");
+    stdin
+        .write_all(&framed(&payload))
+        .expect("cancel request is written");
     drop(stdin);
     let output = wait_for_output_with_timeout(child, "bamts --api", Duration::from_secs(30));
     assert_success(&output, "bamts --api");

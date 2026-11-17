@@ -4554,8 +4554,14 @@ function check(options: Options = {}) {
              declare const prop: string;\n\
              box?.items[prop];\n\
              box?.record[prop];";
-        assert_eq!(checker_codes(&check_text(source)), ["BAMTS-C064", "BAMTS-C064"]);
-        assert_eq!(checker_codes_strict_null(source), ["BAMTS-C064", "BAMTS-C064"]);
+        assert_eq!(
+            checker_codes(&check_text(source)),
+            ["BAMTS-C064", "BAMTS-C064"]
+        );
+        assert_eq!(
+            checker_codes_strict_null(source),
+            ["BAMTS-C064", "BAMTS-C064"]
+        );
     }
 
     #[test]

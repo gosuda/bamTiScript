@@ -1356,10 +1356,9 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 },
                 Some(dst.get()),
             ),
-            Instruction::RequireGlobalBinding { name } => (
-                HelperCall::RequireGlobalBinding { name: name.get() },
-                None,
-            ),
+            Instruction::RequireGlobalBinding { name } => {
+                (HelperCall::RequireGlobalBinding { name: name.get() }, None)
+            }
             Instruction::ThrowIntrinsicError { kind, message } => (
                 HelperCall::ThrowIntrinsicError {
                     kind: kind.selector(),

@@ -801,12 +801,8 @@ impl Session {
             fuel: EXECUTE_FUEL,
             ..bamts_runtime::Limits::program()
         };
-        match driver::execute_in_context_with_cancel(
-            &args,
-            &context,
-            cancellation.clone(),
-            limits,
-        ) {
+        match driver::execute_in_context_with_cancel(&args, &context, cancellation.clone(), limits)
+        {
             Ok(outcome) => Ok(json!({
                 "stdout": String::from_utf8_lossy(&outcome.stdout),
                 "stderr": String::from_utf8_lossy(&outcome.stderr),

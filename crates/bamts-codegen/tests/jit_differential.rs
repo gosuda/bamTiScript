@@ -1012,7 +1012,10 @@ fn counter_bump(counter: u32, base: u32) -> [Instruction; 3] {
 
 /// A strict script that installs a counting accessor pair on global `x`,
 /// ends its getter with `getter_tail`, runs `assignment`, and prints `gets * 100 + sets`.
-fn global_accessor_program(getter_tail: Instruction, assignment: &[Instruction]) -> Program<Verified> {
+fn global_accessor_program(
+    getter_tail: Instruction,
+    assignment: &[Instruction],
+) -> Program<Verified> {
     let mut entry = vec![
         Instruction::LoadConst {
             dst: reg(0),
@@ -1138,7 +1141,11 @@ fn assert_uncaught(name: &str, program: &Program<Verified>, constructor: &str, m
     else {
         panic!("{name} must end in an uncaught throw: {error:?}");
     };
-    assert_eq!(constructor_name, Some(EcmaString::encode(constructor)), "{name}");
+    assert_eq!(
+        constructor_name,
+        Some(EcmaString::encode(constructor)),
+        "{name}"
+    );
     assert_eq!(thrown, Some(EcmaString::encode(message)), "{name}");
 }
 
