@@ -81,6 +81,18 @@ version has shipped, and no tag or stable package exists while any gate in
   attempt. A unit that fails eight times stays in baseline code. Indexed reads
   of arrays that hold only numbers use the new helper
   `bamts_array_get_number`. AOT images never promote.
+- Collections are generational. A slot a collection keeps becomes old, and a
+  write barrier in the new `Heap` type remembers each old slot written
+  afterwards. A scheduled collection is minor: it traces the slots allocated
+  since the last collection and the remembered old slots, and sweeps only the
+  young ones. Every eighth collection is major, as is one after a minor
+  collection that freed under a quarter of the young slots and any collection
+  once the heap passes half of its limits. Weak references, weak collections
+  and finalization cells are processed only in a major collection; a minor
+  collection keeps every weak target it reaches. A collection also waits for
+  8,192 live slots or 1 MiB of growth before the next one runs, which removed
+  a case where a program with few live objects collected every few
+  allocations.
 
 ### Known incomplete
 

@@ -284,7 +284,7 @@ fn symbol_for<H: Host>(
             unreachable!("allocated symbol has a runtime slot");
         };
         machine.refund_slot(index, symbol_bytes);
-        machine.heap[index] = HeapEntry::Vacant;
+        machine.heap.vacate(index);
         machine.vacant_count += 1;
         return Err(EvalFailure::Runtime(err));
     }
