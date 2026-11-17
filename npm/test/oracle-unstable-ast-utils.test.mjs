@@ -106,3 +106,58 @@ test("utils.narrowestContaining range equals the nearest pinned visitEachChild n
     });
   });
 });
+
+test("utils.containsRange equals ordinary UTF-16 interval containment on pinned ranges", async () => {
+  await withSession(RICH_SOURCE, async (session) => {
+    await withPinnedSourceFile(RICH_SOURCE, async ({ sf, preorder }) => {
+      const outers = preorder
+        .map((node) => pinnedRange(node, sf))
+        .filter((range) => range.start >= 1 && range.end - range.start >= 3)
+        .slice(0, 4);
+      assert.ok(outers.length > 0, "no pinned range admits boundary probes");
+      const covered = new Set();
+      for (const outer of outers) {
+        const inners = [
+          ["equal", { start: outer.start, end: outer.end }],
+          ["strict-interior", { start: outer.start + 1, end: outer.end - 1 }],
+          ["touches-start", { start: outer.start, end: outer.start + 1 }],
+          ["touches-end", { start: outer.end - 1, end: outer.end }],
+          ["empty-at-start", { start: outer.start, end: outer.start }],
+          ["empty-at-end", { start: outer.end, end: outer.end }],
+          ["empty-inside", { start: outer.start + 1, end: outer.start + 1 }],
+          ["overlap-left", { start: outer.start - 1, end: outer.start + 1 }],
+          ["overlap-right", { start: outer.end - 1, end: outer.end + 1 }],
+          ["adjacent-before", { start: outer.start - 1, end: outer.start }],
+          ["adjacent-after", { start: outer.end, end: outer.end + 1 }],
+          ["wider", { start: outer.start - 1, end: outer.end + 1 }],
+          ["empty-outside", { start: outer.end + 1, end: outer.end + 1 }],
+        ];
+        for (const [label, inner] of inners) {
+          const expected = outer.start <= inner.start && inner.end <= outer.end;
+          const actual = await utils.containsRange(session, { outer, inner });
+          assert.strictEqual(
+            actual,
+            expected,
+            `${label} ${JSON.stringify(outer)} vs ${JSON.stringify(inner)}`,
+          );
+          covered.add(`${label}:${actual}`);
+        }
+      }
+      for (const required of [
+        "equal:true",
+        "touches-start:true",
+        "touches-end:true",
+        "empty-at-start:true",
+        "empty-at-end:true",
+        "overlap-left:false",
+        "overlap-right:false",
+        "adjacent-before:false",
+        "adjacent-after:false",
+        "wider:false",
+        "empty-outside:false",
+      ]) {
+        assert.ok(covered.has(required), `no case ${required}`);
+      }
+    });
+  });
+});
