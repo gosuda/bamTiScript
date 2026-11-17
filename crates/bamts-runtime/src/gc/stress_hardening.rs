@@ -348,6 +348,7 @@ fn collections_follow_survivors_without_revisiting_vacant_slots() {
     let early = stress.object();
     stress.root("early", early);
     let early_garbage = stress.object();
+    let early_garbage_slot = stress.machine.runtime_slot(early_garbage).unwrap();
     stress.collect();
     stress.assert_live(early);
     stress.assert_dead(early_garbage);
@@ -356,23 +357,28 @@ fn collections_follow_survivors_without_revisiting_vacant_slots() {
     // A slot from before the last sweep stays tracked, and a later one is
     // picked up, whichever way each one goes.
     let late = stress.object();
+    assert_eq!(
+        stress.machine.runtime_slot(late).unwrap(),
+        early_garbage_slot,
+        "a vacated slot is reused before the heap grows"
+    );
     stress.root("late", late);
     let late_garbage = stress.object();
     stress.collect();
     stress.assert_live(early);
     stress.assert_live(late);
     stress.assert_dead(late_garbage);
-    assert_eq!(stress.machine.vacant_count, vacant_after_first + 1);
+    assert_eq!(stress.machine.vacant_count, vacant_after_first);
 
     stress.unroot("early");
     stress.collect();
     stress.assert_dead(early);
     stress.assert_live(late);
-    assert_eq!(stress.machine.vacant_count, vacant_after_first + 2);
+    assert_eq!(stress.machine.vacant_count, vacant_after_first + 1);
 
     // Nothing is reclaimed twice once it has gone.
     stress.collect();
-    assert_eq!(stress.machine.vacant_count, vacant_after_first + 2);
+    assert_eq!(stress.machine.vacant_count, vacant_after_first + 1);
 }
 
 #[test]
@@ -485,4 +491,118 @@ fn weak_collection_purge_rebuilds_index_size_and_refunds_exactly() {
     );
     stress.assert_dead(key);
     stress.assert_dead(value);
+}
+
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound as u64) as usize
+    }
+}
+
+#[test]
+fn reused_slots_keep_prior_values_and_contents() {
+    let program = blank_program();
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    let mut stress = GcStress::new(&mut machine);
+
+    let mut rng = XorShift64(0x9E37_79B9_7F4A_7C15);
+    let mut held: Vec<(String, Value, u64)> = Vec::new();
+    let mut next_stamp = 0u64;
+
+    for step in 0..10_000usize {
+        match rng.below(10) {
+            0..=5 => {
+                let value = stress.object();
+                let stamp = next_stamp;
+                next_stamp += 1;
+                stress
+                    .machine
+                    .set_data_property(value, "stamp", crate::number_value(stamp as f64))
+                    .expect("stamping generation succeeds");
+                if rng.below(3) == 0 {
+                    let name = format!("held{step}");
+                    stress.root(&name, value);
+                    held.push((name, value, stamp));
+                }
+            }
+            6..=7 => {
+                stress.collect();
+                for (name, value, expected) in &held {
+                    let stamp = stress
+                        .machine
+                        .get_named_property(*value, "stamp")
+                        .expect("reading stamp succeeds");
+                    assert_eq!(
+                        stamp,
+                        crate::number_value(*expected as f64),
+                        "held value {name} changed contents"
+                    );
+                    stress.assert_live(*value);
+                }
+            }
+            _ => {
+                if !held.is_empty() {
+                    let position = rng.below(held.len());
+                    let (name, _, _) = held.swap_remove(position);
+                    stress.unroot(&name);
+                }
+            }
+        }
+    }
+    stress.collect();
+    for (name, value, expected) in &held {
+        let stamp = stress
+            .machine
+            .get_named_property(*value, "stamp")
+            .expect("reading stamp succeeds");
+        assert_eq!(
+            stamp,
+            crate::number_value(*expected as f64),
+            "held value {name} changed contents"
+        );
+        stress.assert_live(*value);
+    }
+}
+
+#[test]
+fn churn_keeps_peak_heap_slots_bounded() {
+    let program = blank_program();
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    let mut stress = GcStress::new(&mut machine);
+
+    let mut peak = stress.machine.heap.len();
+    let mut survivors: Vec<Value> = Vec::new();
+    for i in 0..100_000usize {
+        let value = stress.object();
+        if i % 1000 == 0 {
+            survivors.push(value);
+            stress.root(&format!("survivor{i}"), value);
+        }
+        if i % 512 == 0 {
+            stress.collect();
+            peak = peak.max(stress.machine.heap.len());
+        }
+    }
+    stress.collect();
+    peak = peak.max(stress.machine.heap.len());
+    assert!(
+        peak < 5_000,
+        "peak heap slots {peak} reached the churn bound"
+    );
+    for value in &survivors {
+        stress.assert_live(*value);
+    }
 }

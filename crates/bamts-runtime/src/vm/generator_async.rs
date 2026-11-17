@@ -661,9 +661,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn await_resumes_from_one_fifo_microtask_before_settling() {
-        let program = verified(
+    fn await_program() -> Program<Verified> {
+        verified(
             vec![Constant::Int32(83)],
             vec![
                 function(0, 0, FunctionFlags::default(), vec![Instruction::Halt]),
@@ -690,11 +689,12 @@ mod tests {
                     ],
                 ),
             ],
-        );
-        let mut host = TestHost;
-        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        )
+    }
+
+    fn assert_await_settles_through_one_fifo_microtask(machine: &mut Machine<'_, TestHost>) {
         let promise = start_async_function(
-            &mut machine,
+            machine,
             RuntimeFunction {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
@@ -732,6 +732,26 @@ mod tests {
                 ..
             } if *value == number(83)
         ));
+    }
+
+    #[test]
+    fn await_resumes_from_one_fifo_microtask_before_settling() {
+        let program = await_program();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        assert_await_settles_through_one_fifo_microtask(&mut machine);
+    }
+
+    #[test]
+    fn an_async_call_survives_a_collection_at_every_safe_point() {
+        let program = await_program();
+        let mut host = TestHost;
+        let limits = Limits {
+            collect_every_allocation: true,
+            ..Limits::default()
+        };
+        let mut machine = Machine::new(&program, &mut host, limits);
+        assert_await_settles_through_one_fifo_microtask(&mut machine);
     }
 
     #[test]

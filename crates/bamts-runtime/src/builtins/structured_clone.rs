@@ -162,6 +162,9 @@ struct HeapCheckpoint {
     heap_bytes: usize,
     vacant_count: usize,
     temporaries: usize,
+    young_reused_len: usize,
+    survivors_len: usize,
+    swept_len: usize,
 }
 impl HeapCheckpoint {
     fn capture<H: Host>(machine: &Machine<'_, H>) -> Self {
@@ -171,14 +174,39 @@ impl HeapCheckpoint {
             heap_bytes: machine.heap_bytes,
             vacant_count: machine.vacant_count,
             temporaries: machine.builtin_temporaries.len(),
+            young_reused_len: machine.gc.young_reused.len(),
+            survivors_len: machine.gc.survivors.len(),
+            swept_len: machine.gc.swept_len,
         }
     }
     fn rollback<H: Host>(self, machine: &mut Machine<'_, H>) {
         machine.builtin_temporaries.truncate(self.temporaries);
+        // Slots the clone refilled from `free_slots` sit below `heap_len` and
+        // survive `truncate`; hand each back to the free list as Vacant so the
+        // byte and slot ledgers match the checkpoint again.
+        for &index in &machine.gc.young_reused[self.young_reused_len..] {
+            if index >= self.heap_len {
+                continue;
+            }
+            machine.heap[index] = HeapEntry::Vacant;
+            machine.slot_bytes[index] = 0;
+            machine.gc.free_slots.push(index);
+        }
+        machine.gc.young_reused.truncate(self.young_reused_len);
+        machine
+            .gc
+            .young_reused
+            .retain(|&index| index < self.heap_len);
         machine.heap.truncate(self.heap_len);
         machine.slot_bytes.truncate(self.slot_bytes_len);
         machine.heap_bytes = self.heap_bytes;
+        // Every reuse during the clone decremented `vacant_count` once and
+        // each such slot is vacant again, so the checkpoint count holds.
         machine.vacant_count = self.vacant_count;
+        machine.gc.free_slots.retain(|&index| index < self.heap_len);
+        machine.gc.survivors.truncate(self.survivors_len);
+        machine.gc.survivors.retain(|&index| index < self.heap_len);
+        machine.gc.swept_len = self.swept_len;
     }
 }
 pub(crate) fn clone_value_with_transfer<H: Host>(
@@ -1174,6 +1202,37 @@ mod tests {
         assert_eq!(machine.heap.len(), heap_len);
         assert_eq!(machine.heap_bytes, heap_bytes);
         assert!(!buffer.is_detached(&machine));
+        machine.assert_heap_ledger();
+    }
+
+    #[test]
+    fn rolled_back_clone_leaves_no_free_slot_at_or_above_truncation() {
+        let module = blank_program("<structured-clone-free-slots-rollback>");
+        let mut host = TestHost;
+        let mut machine = machine(&module, &mut host);
+        let root = ordinary_object(&mut machine);
+        machine.collect_garbage();
+        let truncation = machine.heap.len();
+        machine.limits.max_heap_slots = machine.live_runtime_slots() + 1;
+        assert!(matches!(
+            clone_value_with_transfer(&mut machine, root, &[]),
+            Err(StructuredCloneFailure::Evaluation(_))
+        ));
+        assert_eq!(machine.heap.len(), truncation);
+        assert!(
+            machine
+                .gc
+                .free_slots
+                .iter()
+                .all(|&index| index < truncation)
+        );
+        assert!(
+            machine
+                .gc
+                .young_reused
+                .iter()
+                .all(|&index| index < truncation)
+        );
         machine.assert_heap_ledger();
     }
 }
