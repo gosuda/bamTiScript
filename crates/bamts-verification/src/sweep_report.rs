@@ -479,7 +479,48 @@ pub fn render_recount(
         after.len()
     );
     report.push_str(&render_diff("before", "after", &diff, limit));
+    report.push_str(&render_remaining_families(after, limit));
     (report, diff.regressions().len())
+}
+
+/// The largest failure families among the rerun rows that still block, each
+/// with its first row and that row's diagnostic text.
+fn render_remaining_families(after: &[ReportRow], limit: usize) -> String {
+    let mut families: BTreeMap<String, (usize, &ReportRow)> = BTreeMap::new();
+    for row in after {
+        if let Some(family) = row.family() {
+            families.entry(family).or_insert((0, row)).0 += 1;
+        }
+    }
+    let blocked: usize = families.values().map(|(count, _)| count).sum();
+    let mut ranked: Vec<(String, (usize, &ReportRow))> = families.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+    let mut out = format!(
+        "\nstill blocking after the rerun: {blocked} row(s) in {} family(ies)\n",
+        ranked.len()
+    );
+    for (family, (count, sample)) in ranked.iter().take(limit) {
+        let _ = writeln!(
+            out,
+            "  {count:>6}  {family}\n          e.g. {}\n          {}",
+            sample.key, sample.detail
+        );
+    }
+    out
+}
+
+/// One tab-separated line per rerun row that still blocks: its key, its family
+/// and its diagnostic text with tabs and line breaks flattened to spaces.
+#[must_use]
+pub fn render_blocked_rows(after: &[ReportRow]) -> String {
+    let mut out = String::new();
+    for row in after {
+        if let Some(family) = row.family() {
+            let detail = row.detail.replace(['\t', '\n', '\r'], " ");
+            let _ = writeln!(out, "{}\t{family}\t{detail}", row.key);
+        }
+    }
+    out
 }
 
 const STATUS_SCHEMA: &str = "bamti.status/v1";
@@ -1111,6 +1152,37 @@ mod tests {
             render_recount(format_args!("family `diagnostics/x`"), &before, &before, 5);
         assert_eq!(none, 0, "{clean}");
         assert!(clean.contains("changed: 0"), "{clean}");
+    }
+
+    #[test]
+    fn a_recount_report_ranks_the_families_that_still_block() {
+        let before = vec![failing("a", "x"), failing("b", "y"), failing("c", "y")];
+        let after = vec![
+            passing("a"),
+            failing("b", "line 4 expected `}`"),
+            failing("c", "line 9 expected `}`"),
+            failing("d", "other"),
+        ];
+        let (report, _) = render_recount(format_args!("directory `d`"), &before, &after, 5);
+        assert!(
+            report.contains("still blocking after the rerun: 3 row(s) in 2 family(ies)"),
+            "{report}"
+        );
+        assert!(report.contains("2  diagnostics/"), "{report}");
+        assert!(report.contains("line 4 expected `}`"), "{report}");
+    }
+
+    #[test]
+    fn blocked_rows_list_each_failing_row_with_its_family_and_a_flat_detail() {
+        let after = vec![passing("a"), failing("b", "line 4\texpected\n`}`")];
+        let text = render_blocked_rows(&after);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let fields: Vec<&str> = lines[0].split('\t').collect();
+        assert_eq!(fields.len(), 3, "{text}");
+        assert!(fields[0].contains("/b"), "{text}");
+        assert!(fields[1].starts_with("diagnostics/"), "{text}");
+        assert_eq!(fields[2], "line 4 expected `}`");
     }
 
     #[test]
