@@ -16362,16 +16362,13 @@ mod tests {
 
             machine.collect_garbage();
 
+            let live_slots = machine.live_runtime_slots();
             assert_eq!(
                 machine.gc_watermarks_for_test(),
                 (
-                    machine
-                        .heap_bytes
-                        .saturating_mul(2)
+                    (machine.heap_bytes + machine.heap_bytes.max(gc::MIN_NURSERY_BYTES))
                         .min(machine.limits.max_heap_bytes),
-                    machine
-                        .live_runtime_slots()
-                        .saturating_mul(2)
+                    (live_slots + live_slots.max(gc::MIN_NURSERY_SLOTS))
                         .min(machine.limits.max_heap_slots),
                 )
             );
@@ -16423,8 +16420,11 @@ mod tests {
             )],
         );
         let mut host = TestHost;
-        let mut machine = Machine::new(&program, &mut host, Limits::default());
-        machine.set_gc_watermarks_for_test(usize::MAX, 1);
+        let limits = Limits {
+            collect_every_allocation: true,
+            ..Limits::default()
+        };
+        let mut machine = Machine::new(&program, &mut host, limits);
 
         let execution = machine.evaluate().unwrap();
         machine.run_to_quiescence().unwrap();
@@ -16460,8 +16460,11 @@ mod tests {
         let mut outcomes = Vec::new();
         for _ in 0..3 {
             let mut host = TestHost;
-            let mut machine = Machine::new(&program, &mut host, Limits::default());
-            machine.set_gc_watermarks_for_test(usize::MAX, 1);
+            let limits = Limits {
+                collect_every_allocation: true,
+                ..Limits::default()
+            };
+            let mut machine = Machine::new(&program, &mut host, limits);
             let execution = machine.evaluate().unwrap();
             machine.run_to_quiescence().unwrap();
             outcomes.push((execution.value, machine.heap_bytes, machine.vacant_count));

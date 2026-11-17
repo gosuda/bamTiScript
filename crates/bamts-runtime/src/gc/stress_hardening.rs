@@ -382,14 +382,14 @@ fn collections_follow_survivors_without_revisiting_vacant_slots() {
 }
 
 #[test]
-fn allocation_pressure_requests_collection_and_recomputes_watermarks() {
+fn allocation_pressure_requests_collection_and_a_small_live_set_gets_a_nursery() {
     let program = blank_program();
     let mut host = TestHost;
     let limits = Limits {
         max_heap_bytes: usize::MAX,
         ..Limits::default()
     };
-    let mut machine = Machine::new(&program, &mut host, limits.clone());
+    let mut machine = Machine::new(&program, &mut host, limits);
     let mut stress = GcStress::new(&mut machine);
     let survivor = stress.object();
     stress.root("survivor", survivor);
@@ -417,20 +417,12 @@ fn allocation_pressure_requests_collection_and_recomputes_watermarks() {
     stress.assert_dead(dead);
     assert!(!stress.machine.gc_pending());
 
-    assert_eq!(
-        stress.machine.gc_watermarks_for_test(),
-        (
-            stress
-                .machine
-                .heap_bytes
-                .saturating_mul(2)
-                .min(limits.max_heap_bytes),
-            stress
-                .machine
-                .live_runtime_slots()
-                .saturating_mul(2)
-                .min(limits.max_heap_slots),
-        )
+    for _ in 0..64 {
+        stress.object();
+    }
+    assert!(
+        !stress.machine.gc_pending(),
+        "a collection that left one live slot must not run again after a handful of allocations"
     );
 }
 
