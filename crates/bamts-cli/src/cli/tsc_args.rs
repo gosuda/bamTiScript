@@ -339,6 +339,7 @@ const DIRECT_CONSUMED: &[&str] = &[
     "esModuleInterop",
     "help",
     "ignoreConfig",
+    "importHelpers",
     "incremental",
     "init",
     "inlineSourceMap",
@@ -397,6 +398,7 @@ const PROJECT_CONSUMED: &[&str] = &[
     "emitDeclarationOnly",
     "esModuleInterop",
     "help",
+    "importHelpers",
     "incremental",
     "init",
     "inlineSourceMap",
@@ -1746,6 +1748,23 @@ mod tests {
         );
         assert_eq!(
             classify_option("strict", Direct),
+            ModeOptionClassification::Consumed
+        );
+    }
+
+    #[test]
+    fn import_helpers_is_consumed_in_direct_and_project_modes() {
+        // tsc accepts `--importHelpers`; the baselines import the helpers from
+        // `tslib` (importHelpers(target=es5).js emits `require("tslib")`), so
+        // both argv dispatch modes must consume the flag instead of failing
+        // with TS5047.
+        use TscDispatchMode::{Direct, Project};
+        assert_eq!(
+            classify_option("importHelpers", Direct),
+            ModeOptionClassification::Consumed
+        );
+        assert_eq!(
+            classify_option("importHelpers", Project),
             ModeOptionClassification::Consumed
         );
     }

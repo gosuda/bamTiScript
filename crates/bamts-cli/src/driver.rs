@@ -926,6 +926,7 @@ fn project_overrides(command: &ParsedTscCommand) -> ProjectOptionOverrides {
         incremental: boolean("incremental"),
         composite: boolean("composite"),
         es_module_interop: boolean("esModuleInterop"),
+        import_helpers: boolean("importHelpers"),
         isolated_modules: boolean("isolatedModules"),
         verbatim_module_syntax: boolean("verbatimModuleSyntax"),
         trace_resolution: boolean("traceResolution"),
@@ -3305,6 +3306,14 @@ exit 2
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).ok();
         }
+    }
+
+    #[test]
+    fn import_helpers_on_the_command_line_reaches_the_project_overrides() {
+        let with = parse_tsc_args(["--importHelpers", "--target", "es5"]).expect("flag parses");
+        assert_eq!(super::project_overrides(&with).import_helpers, Some(true));
+        let without = parse_tsc_args(["--target", "es5"]).expect("flags parse");
+        assert_eq!(super::project_overrides(&without).import_helpers, None);
     }
 
     #[test]

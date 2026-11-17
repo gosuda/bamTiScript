@@ -69,6 +69,7 @@ pub struct ProjectOptionOverrides {
     pub isolated_modules: Option<bool>,
     pub verbatim_module_syntax: Option<bool>,
     pub trace_resolution: Option<bool>,
+    pub import_helpers: Option<bool>,
     // List-valued compiler option forwarded from argv.
     pub lib: Option<Arc<[String]>>,
 }
@@ -1351,6 +1352,7 @@ fn apply_overrides(
         ("isolatedModules", overrides.isolated_modules),
         ("verbatimModuleSyntax", overrides.verbatim_module_syntax),
         ("traceResolution", overrides.trace_resolution),
+        ("importHelpers", overrides.import_helpers),
         ("resolveJsonModule", overrides.resolve_json_module),
     ] {
         if let Some(value) = value {
@@ -1974,6 +1976,28 @@ mod tests {
             project.options().always_strict(),
             "alwaysStrict inherits strict"
         );
+    }
+
+    #[test]
+    fn import_helpers_override_reaches_effective_options() {
+        // importHelpers(target=es5).js shows the authority: with the option
+        // on, emit imports the helpers from `tslib` instead of inlining them
+        // (`var tslib_1 = require("tslib");` and `tslib_1.__extends(B, _super)`).
+        // The argv override must land in the effective options the way the
+        // tsconfig value does; before `import_helpers` existed on
+        // `ProjectOptionOverrides` the override was dropped on the floor.
+        let fixture = Fixture::new();
+        fixture.write("src/a.ts", "export class A { }\n");
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["src/a.ts"],"compilerOptions":{"target":"es5","module":"commonjs"}}"#,
+        );
+        let fs = fixture.filesystem();
+        let mut request = fixture.request("tsconfig.json");
+        request.overrides.import_helpers = Some(true);
+
+        let project = EffectiveProject::load(&request, &fs).unwrap();
+        assert_eq!(project.options().import_helpers(), Some(true));
     }
 
     #[test]
