@@ -23,6 +23,7 @@
 //! Unmapped entries are first-class evidence, not invented TypeScript codes.
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
@@ -471,7 +472,8 @@ pub fn compare_diagnostics(
     if expected_rows.len() != actual_rows.len() {
         return FacetVerdict::Fail {
             reason: format!(
-                "diagnostic count mismatch: expected {} actual {}",
+                "diagnostic count mismatch{}: expected {} actual {}",
+                count_mismatch_label(&expected_rows, &actual_rows, code_map),
                 expected_rows.len(),
                 actual_rows.len()
             ),
@@ -544,6 +546,36 @@ fn diagnostic_sort_key(
         row.severity,
         correspondence_canonical_code(&row.code, code_map),
     )
+}
+
+fn count_mismatch_label(
+    expected_rows: &[FacetDiagnostic],
+    actual_rows: &[FacetDiagnostic],
+    code_map: &DiagnosticCodeMap,
+) -> String {
+    let mut expected = expected_rows
+        .iter()
+        .map(|row| diagnostic_sort_key(row, code_map));
+    let mut actual = actual_rows
+        .iter()
+        .map(|row| diagnostic_sort_key(row, code_map));
+    let mut left = expected.next();
+    let mut right = actual.next();
+    loop {
+        match (&left, &right) {
+            (Some(expected_key), Some(actual_key)) => match expected_key.cmp(actual_key) {
+                Ordering::Less => return format!(" [missing {}]", expected_key.4),
+                Ordering::Greater => return format!(" [extra {}]", actual_key.4),
+                Ordering::Equal => {
+                    left = expected.next();
+                    right = actual.next();
+                }
+            },
+            (Some(expected_key), None) => return format!(" [missing {}]", expected_key.4),
+            (None, Some(actual_key)) => return format!(" [extra {}]", actual_key.4),
+            (None, None) => return String::new(),
+        }
+    }
 }
 
 /// Map BAMTS/TS spellings onto one sortable identity when a correspondence exists.
@@ -2481,6 +2513,68 @@ mod tests {
             source_files: vec![entrypoint.to_owned()],
             compiler_args: Vec::new(),
         }
+    }
+
+    #[test]
+    fn diagnostic_count_mismatches_label_unmatched_codes_and_direction() {
+        let map = parse_diagnostic_code_map(&with_mapped("BAMTS-C002", 2304)).unwrap();
+        let diagnostic = |code| diag(1, 0, DiagnosticCategory::Error, FacetSeverity::Error, code);
+        let matched = diagnostic("BAMTS-C002");
+        let canonical = diagnostic("TS2304");
+        for code in ["TS2322", "TS2345", "BAMTS-L001"] {
+            let unmatched = diagnostic(code);
+            let expected = [unmatched.clone(), matched.clone()];
+            let actual = [canonical.clone()];
+            assert_eq!(
+                compare_diagnostics(&expected, &actual, &map),
+                FacetVerdict::Fail {
+                    reason: format!(
+                        "diagnostic count mismatch [missing {code}]: expected 2 actual 1"
+                    )
+                }
+            );
+            assert_eq!(
+                compare_diagnostics(&actual, &expected, &map),
+                FacetVerdict::Fail {
+                    reason: format!(
+                        "diagnostic count mismatch [extra {code}]: expected 1 actual 2"
+                    )
+                }
+            );
+            assert_eq!(
+                compare_diagnostics(&[unmatched], &[], &map),
+                FacetVerdict::Fail {
+                    reason: format!(
+                        "diagnostic count mismatch [missing {code}]: expected 1 actual 0"
+                    )
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_count_labels_cancel_aliases_one_for_one_and_ignore_input_order() {
+        let map = parse_diagnostic_code_map(&with_mapped("BAMTS-C002", 2304)).unwrap();
+        let diagnostic = |code| diag(1, 0, DiagnosticCategory::Error, FacetSeverity::Error, code);
+        let expected = [
+            diagnostic("BAMTS-C002"),
+            diagnostic("TS2304"),
+            diagnostic("TS9999"),
+        ];
+        let actual = [diagnostic("2304"), diagnostic("TS9999")];
+        let verdict = FacetVerdict::Fail {
+            reason: "diagnostic count mismatch [missing TS2304]: expected 3 actual 2".into(),
+        };
+        assert_eq!(compare_diagnostics(&expected, &actual, &map), verdict);
+        let mut reversed = expected.clone();
+        reversed.reverse();
+        assert_eq!(compare_diagnostics(&reversed, &actual, &map), verdict);
+        assert!(compare_diagnostics(&expected[..1], &actual[..1], &map).is_pass());
+        assert!(matches!(
+            compare_diagnostics(&expected[..1], &actual[1..], &map),
+            FacetVerdict::Fail { reason }
+                if reason == "diagnostic[0] code correspondence mismatch: `BAMTS-C002` vs `TS9999`"
+        ));
     }
 
     #[test]

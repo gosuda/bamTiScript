@@ -113,7 +113,8 @@ pub fn family_name(facet: &str, detail: &str) -> String {
 
 /// Drops what differs per case: the mode wrapper test262 workers add, backtick
 /// spans, the tail of long quoted spans, absolute paths, and the value of every
-/// number.
+/// number. A canonical diagnostic code token (`TS2304`, `BAMTS-L001`) keeps
+/// its digits so one wrong code splits from another.
 fn normalize_detail(detail: &str) -> String {
     let detail = strip_mode_wrapper(detail);
     let mut out = String::with_capacity(detail.len());
@@ -143,8 +144,15 @@ fn normalize_detail(detail: &str) -> String {
                 out.push('"');
             }
             digit if digit.is_ascii_digit() => {
-                while chars.next_if(char::is_ascii_digit).is_some() {}
-                out.push('N');
+                let number_start = out.len();
+                out.push(digit);
+                while let Some(next) = chars.next_if(char::is_ascii_digit) {
+                    out.push(next);
+                }
+                if !keeps_code_digits(&out[..number_start], chars.peek().copied()) {
+                    out.truncate(number_start);
+                    out.push('N');
+                }
             }
             other => out.push(other),
         }
@@ -153,6 +161,24 @@ fn normalize_detail(detail: &str) -> String {
         .filter(|word| !is_absolute_path(word))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+const DIAGNOSTIC_CODE_PREFIXES: [&str; 4] = ["BAMTS-L", "BAMTS-P", "BAMTS-C", "TS"];
+
+fn keeps_code_digits(normalized_before: &str, after: Option<char>) -> bool {
+    let Some(prefix) = DIAGNOSTIC_CODE_PREFIXES
+        .into_iter()
+        .find(|prefix| normalized_before.ends_with(prefix))
+    else {
+        return false;
+    };
+    let prefix_starts_cleanly = normalized_before[..normalized_before.len() - prefix.len()]
+        .chars()
+        .next_back()
+        .is_none_or(|previous| !previous.is_alphanumeric() && previous != '_');
+    let digits_end_cleanly =
+        after.is_none_or(|following| !following.is_alphanumeric() && following != '_');
+    prefix_starts_cleanly && digits_end_cleanly
 }
 
 /// A scratch directory or checkout path names the run, not the failure.
@@ -868,6 +894,38 @@ mod tests {
         assert_eq!(
             one.family().as_deref(),
             Some("diagnostics/diagnostic-count-mismatch-expected-n-actual-n")
+        );
+    }
+
+    #[test]
+    fn diagnostic_count_families_keep_codes_and_direction_but_not_counts() {
+        let family = |detail: &str| family_name("diagnostics", detail);
+        assert_eq!(
+            family("diagnostic count mismatch: expected 2 actual 1"),
+            "diagnostics/diagnostic-count-mismatch-expected-n-actual-n"
+        );
+        assert_eq!(
+            family("diagnostic count mismatch [missing TS2304]: expected 2 actual 1"),
+            family("diagnostic count mismatch [missing TS2304]: expected 17 actual 3")
+        );
+        for other in ["missing TS2322", "extra TS2304", "missing BAMTS-C002"] {
+            let detail = format!("diagnostic count mismatch [{other}]: expected 2 actual 1");
+            assert_ne!(
+                family("diagnostic count mismatch [missing TS2304]: expected 2 actual 1"),
+                family(&detail)
+            );
+        }
+    }
+
+    #[test]
+    fn only_standalone_diagnostic_codes_keep_numeric_values() {
+        assert_eq!(
+            normalize_detail("TS2304 BAMTS-L001 BAMTS-P002 BAMTS-C003 123"),
+            "TS2304 BAMTS-L001 BAMTS-P002 BAMTS-C003 N"
+        );
+        assert_eq!(
+            normalize_detail("COSTS2304 TS2304z _TS2304 TS2304_ éTS2304 TS2304é item42"),
+            "COSTSN TSNz _TSN TSN_ éTSN TSNé itemN"
         );
     }
 
