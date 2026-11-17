@@ -7,8 +7,8 @@ use bamts_bytecode::{
 use bamts_native::Value;
 
 use crate::{
-    CollectionEntry, CollectionIndex, CollectionKind, HeapEntry, Host, Limits, Machine, Property,
-    PropertyKey, PropertyMap, RuntimeErrorKind,
+    ArrayElementKind, CollectionEntry, CollectionIndex, CollectionKind, HeapEntry, Host, Limits,
+    Machine, Property, PropertyKey, PropertyMap, RuntimeErrorKind,
 };
 
 #[derive(Default)]
@@ -195,6 +195,7 @@ fn tracing_follows_composed_production_heap_edges() {
     let array = stress
         .machine
         .allocate(HeapEntry::Array {
+            kind: ArrayElementKind::for_elements(&[map]),
             elements: vec![map],
             properties: array_properties,
             prototype: Some(stress.machine.intrinsics.array_prototype),

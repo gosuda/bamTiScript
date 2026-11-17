@@ -19,8 +19,8 @@ use crate::builtins::proxy;
 use crate::builtins::test_support::{TestHost, ordinary_object};
 use crate::intrinsics::{BuiltinDef, BuiltinOutcome, native_function};
 use crate::{
-    EvalFailure, HeapEntry, Host, Limits, Machine, Property, PropertyKey, PropertyMap,
-    RuntimeErrorKind, ThrowOrigin,
+    ArrayElementKind, EvalFailure, HeapEntry, Host, Limits, Machine, Property, PropertyKey,
+    PropertyMap, RuntimeErrorKind, ThrowOrigin,
 };
 
 /// The concrete trap signature every test handler coerces to.
@@ -189,6 +189,7 @@ fn allocate_string<H: Host>(machine: &mut Machine<'_, H>, value: &str) -> Value 
 fn allocate_array<H: Host>(machine: &mut Machine<'_, H>, elements: Vec<Value>) -> Value {
     machine
         .allocate(HeapEntry::Array {
+            kind: ArrayElementKind::for_elements(&elements),
             elements,
             properties: PropertyMap::default(),
             prototype: Some(machine.intrinsics.object_prototype),

@@ -19,7 +19,8 @@ use super::{
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
-    EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey, PropertyMap,
+    ArrayElementKind, EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey,
+    PropertyMap,
 };
 
 /// What a helper does on each step.
@@ -77,6 +78,7 @@ fn hidden_array<H: Host>(
 ) -> Result<Value, EvalFailure> {
     machine
         .allocate(HeapEntry::Array {
+            kind: ArrayElementKind::for_elements(&elements),
             elements,
             properties: PropertyMap::default(),
             prototype: None,
@@ -94,10 +96,7 @@ fn slot<H: Host>(machine: &Machine<'_, H>, state: Value, index: usize) -> Value 
 }
 
 fn set_slot<H: Host>(machine: &mut Machine<'_, H>, state: Value, index: usize, value: Value) {
-    let HeapEntry::Array { elements, .. } = &mut machine.heap[heap_index(state)] else {
-        unreachable!("helper state is a hidden array")
-    };
-    elements[index] = value;
+    machine.store_element(heap_index(state), index, value);
 }
 
 fn status<H: Host>(machine: &Machine<'_, H>, state: Value) -> u32 {
@@ -480,10 +479,7 @@ fn close_open_iterators<H: Host>(
 
 fn mark_finished<H: Host>(machine: &mut Machine<'_, H>, state: Value, index: usize) {
     let list = slot(machine, state, LIST);
-    let HeapEntry::Array { elements, .. } = &mut machine.heap[heap_index(list)] else {
-        unreachable!("zip list is a hidden array")
-    };
-    elements[index * 2] = Value::NULL;
+    machine.store_element(heap_index(list), index * 2, Value::NULL);
 }
 
 fn zip_mode<H: Host>(machine: &Machine<'_, H>, state: Value) -> ZipMode {

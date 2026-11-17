@@ -55,6 +55,10 @@ version has shipped, and no tag or stable package exists while any gate in
   at load; dynamic or reassigned keys keep access-time interning.
   `bamts_bytecode::Instruction::visit_writes` is now public so the runtime can
   count register writes; nothing was removed or changed.
+- Array element storage records a monotone element kind (`Int32`, `Number`,
+  `Any`) beside the elements. A store of a non-number, a hole or a deletion
+  widens the kind, and replacing a whole element vector recomputes it. The
+  kind is internal; a later array fast path reads it.
 
 ### Known incomplete
 

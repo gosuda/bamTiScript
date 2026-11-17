@@ -774,7 +774,7 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
     use crate::intrinsics::{BuiltinDef, native_function};
-    use crate::{Limits, Property, PropertyMap, ThrowOrigin};
+    use crate::{ArrayElementKind, Limits, Property, PropertyMap, ThrowOrigin};
 
     macro_rules! test_machine {
         ($program:ident, $host:ident, $machine:ident) => {
@@ -1153,6 +1153,7 @@ mod tests {
         let literal_b = string(&mut machine, &[b'b' as u16]);
         let literals = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[literal_a, literal_b]),
                 elements: vec![literal_a, literal_b],
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),

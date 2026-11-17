@@ -12,7 +12,9 @@ use bamts_native::Value;
 use super::array_generic::tick;
 use super::{allocate_array, define_data, install_function, range_error, type_error, value_number};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey, RuntimeErrorKind};
+use crate::{
+    ArrayElementKind, EvalFailure, HeapEntry, Host, Machine, PropertyKey, RuntimeErrorKind,
+};
 
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 const MAX_ARRAY_LENGTH: usize = u32::MAX as usize;
@@ -97,6 +99,7 @@ pub(super) fn install<H: Host>(
     let target_table = crate::intrinsics::push(
         heap,
         HeapEntry::Array {
+            kind: ArrayElementKind::for_elements(&targets),
             elements: targets,
             properties: crate::PropertyMap::default(),
             prototype: None,
@@ -224,13 +227,14 @@ pub(super) fn create_data_property<H: Host>(
         return machine.create_data_property_key(array, key, value);
     }
     if index < length {
-        let HeapEntry::Array { elements, .. } = &mut machine.heap[slot] else {
-            unreachable!("array was matched above")
+        let replacing_hole = match &machine.heap[slot] {
+            HeapEntry::Array { elements, .. } => elements[index] == Value::HOLE,
+            _ => unreachable!("array was matched above"),
         };
-        if elements[index] == Value::HOLE && !extensible {
+        if replacing_hole && !extensible {
             return Err(type_error("Cannot add property to non-extensible array"));
         }
-        elements[index] = value;
+        machine.store_element(slot, index, value);
         return Ok(());
     }
     while machine.array_length(array)? < index {
@@ -1226,6 +1230,7 @@ mod tests {
                 .unwrap();
             let source = machine
                 .allocate(HeapEntry::Array {
+                    kind: ArrayElementKind::for_elements(&[Value::HOLE; 3]),
                     elements: vec![Value::HOLE; 3],
                     properties: PropertyMap::default(),
                     prototype: Some(prototype),
@@ -1462,6 +1467,7 @@ mod tests {
                 .unwrap();
             let source = machine
                 .allocate(HeapEntry::Array {
+                    kind: ArrayElementKind::for_elements(&[Value::HOLE; 3]),
                     elements: vec![Value::HOLE; 3],
                     properties: PropertyMap::default(),
                     prototype: Some(prototype),

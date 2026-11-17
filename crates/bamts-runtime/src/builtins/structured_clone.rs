@@ -3,8 +3,8 @@ use super::{
     type_error,
 };
 use crate::{
-    CollectionIndex, CollectionKind, EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey,
-    PropertyMap, intrinsics::BuiltinOutcome,
+    ArrayElementKind, CollectionIndex, CollectionKind, EvalFailure, HeapEntry, Host, Machine,
+    Property, PropertyKey, PropertyMap, intrinsics::BuiltinOutcome,
 };
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
@@ -564,15 +564,19 @@ fn materialize<H: Host>(
                     extensible: true,
                 })
                 .map_err(EvalFailure::Runtime)?,
-            PlannedNode::Array { length, .. } => machine
-                .allocate(HeapEntry::Array {
-                    elements: vec![Value::HOLE; *length],
-                    properties: PropertyMap::default(),
-                    prototype: Some(machine.intrinsics.array_prototype),
-                    extensible: true,
-                    length_writable: true,
-                })
-                .map_err(EvalFailure::Runtime)?,
+            PlannedNode::Array { length, .. } => {
+                let elements = vec![Value::HOLE; *length];
+                machine
+                    .allocate(HeapEntry::Array {
+                        kind: ArrayElementKind::for_elements(&elements),
+                        elements,
+                        properties: PropertyMap::default(),
+                        prototype: Some(machine.intrinsics.array_prototype),
+                        extensible: true,
+                        length_writable: true,
+                    })
+                    .map_err(EvalFailure::Runtime)?
+            }
             PlannedNode::Date { time, .. } => machine
                 .allocate(HeapEntry::Date {
                     time: *time,
@@ -813,6 +817,11 @@ mod tests {
         let mut machine = machine(&module, &mut host);
         let array = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[
+                    Value::int32(1),
+                    Value::HOLE,
+                    Value::int32(3),
+                ]),
                 elements: vec![Value::int32(1), Value::HOLE, Value::int32(3)],
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.array_prototype),

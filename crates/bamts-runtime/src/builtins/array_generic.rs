@@ -84,9 +84,7 @@ fn set_index<H: Host>(
             .runtime_slot(object)
             .map_err(EvalFailure::Runtime)?
             .expect("a dense element belongs to a runtime array");
-        if let HeapEntry::Array { elements, .. } = &mut machine.heap[slot] {
-            elements[index] = value;
-        }
+        machine.store_element(slot, index, value);
         return Ok(());
     }
     let key = index_key(&mut machine.atoms, index);

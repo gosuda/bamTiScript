@@ -1348,7 +1348,7 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
     use crate::intrinsics::{BuiltinDef, BuiltinHandler, native_function};
-    use crate::{Limits, ThrowOrigin};
+    use crate::{ArrayElementKind, Limits, ThrowOrigin};
 
     macro_rules! test_machine {
         ($program:ident, $host:ident, $machine:ident) => {
@@ -2108,6 +2108,7 @@ mod tests {
         let array_prototype = machine.intrinsics.array_prototype;
         let shared = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[leaf, leaf]),
                 elements: vec![leaf, leaf],
                 properties: PropertyMap::default(),
                 prototype: Some(array_prototype),
@@ -2138,6 +2139,12 @@ mod tests {
         let array_prototype = machine.intrinsics.array_prototype;
         let sparse = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[
+                    Value::HOLE,
+                    Value::UNDEFINED,
+                    function,
+                    Value::int32(5),
+                ]),
                 elements: vec![Value::HOLE, Value::UNDEFINED, function, Value::int32(5)],
                 properties: PropertyMap::default(),
                 prototype: Some(array_prototype),
@@ -2329,6 +2336,7 @@ mod tests {
         let array_prototype = machine.intrinsics.array_prototype;
         let list = machine
             .allocate(HeapEntry::Array {
+                kind: ArrayElementKind::for_elements(&[alpha, beta, duplicate]),
                 elements: vec![alpha, beta, duplicate],
                 properties: PropertyMap::default(),
                 prototype: Some(array_prototype),
