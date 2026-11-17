@@ -20,11 +20,12 @@
 pub mod declarations;
 pub mod helpers;
 pub mod sourcemap;
+mod temp_names;
 pub mod transforms;
 pub mod transpile;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Write as _,
     sync::Arc,
 };
@@ -41,6 +42,7 @@ use crate::syntax::*;
 use declarations::DeclarationOptions;
 use helpers::{HelperOptions, HelperStyle};
 use sourcemap::{LineColumn, SourceMap, SourceMapBuilder};
+use temp_names::TempNames;
 pub use transforms::ScriptTarget;
 use transforms::{LanguageFeature, TransformOptions};
 
@@ -544,6 +546,9 @@ pub(crate) struct PrintSource<'a> {
     pub(crate) synthesized_floor: u32,
     /// Raw lines that print in place of a marker statement.
     pub(crate) inline_lines: Option<&'a HashMap<NodeId, String>>,
+    /// Prelude text that prints after a leading hoisted temporary declaration:
+    /// tsc declares `var _a;` before the CommonJS `__esModule` marker.
+    pub(crate) prelude_tail: Option<&'a str>,
 }
 
 /// Print context for a braced block. Carries two tsc behaviors that split on
@@ -629,6 +634,7 @@ pub(crate) fn print(
             // gate's range check applies universally.
             synthesized_floor: u32::MAX,
             inline_lines: None,
+            prelude_tail: None,
         },
         model,
         options,
@@ -655,6 +661,7 @@ pub(crate) fn print_with_jsx_plan(
         synthesized,
         synthesized_floor,
         inline_lines,
+        prelude_tail,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
         let mut builder = SourceMapBuilder::new()
@@ -719,6 +726,8 @@ pub(crate) fn print_with_jsx_plan(
         synthesized_floor,
         emitted_module_syntax: false,
         inline_lines,
+        prelude_tail,
+        temp_names: TempNames::new(authored_identifiers(file, original_content)),
     };
     if let Some(prelude) = prelude.filter(|prelude| !prelude.is_empty()) {
         let has_trailing_newline = prelude.ends_with('\n');
@@ -777,6 +786,7 @@ pub(crate) fn print_json_value(
         synthesized,
         synthesized_floor,
         inline_lines,
+        prelude_tail: _,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
         let mut builder = SourceMapBuilder::new().with_sources_content(options.inline_sources);
@@ -836,6 +846,8 @@ pub(crate) fn print_json_value(
         synthesized_floor,
         emitted_module_syntax: false,
         inline_lines,
+        prelude_tail: None,
+        temp_names: TempNames::new(HashSet::new()),
     };
     emitter.emit_expression_prec(expression, 0);
     emitter.newline();
@@ -1012,6 +1024,26 @@ struct Emitter<'a> {
     /// An import or export reached the output.
     emitted_module_syntax: bool,
     inline_lines: Option<&'a HashMap<NodeId, String>>,
+    prelude_tail: Option<&'a str>,
+    /// Final names for the rewriter's temporary placeholders.
+    temp_names: TempNames,
+}
+
+/// The identifiers the program itself writes, which temporaries never reuse.
+fn authored_identifiers(file: &SourceFile, original_content: &str) -> HashSet<String> {
+    let authored_end = Utf16Pos::new(utf16_len(original_content));
+    let source = file.source_text();
+    file.tokens()
+        .iter()
+        .filter(|token| {
+            token.kind() == TokenKind::Identifier && token.range().end() <= authored_end
+        })
+        .filter_map(|token| {
+            let start = source.utf16_to_byte(token.range().start()).ok()?;
+            let end = source.utf16_to_byte(token.range().end()).ok()?;
+            source.as_str().get(start..end).map(str::to_owned)
+        })
+        .collect()
 }
 
 /// The source text of an enum's numeric value.
@@ -1613,10 +1645,22 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// The final name of a rewriter temporary placeholder, or `None` for any
+    /// other identifier.
+    fn temp_name(&mut self, ident: &IdentifierNode) -> Option<String> {
+        if ident.id().get() < self.synthesized_floor {
+            return None;
+        }
+        let text = self.text(ident.data().token())?;
+        TempNames::is_placeholder(text).then(|| self.temp_names.resolve(text))
+    }
+
     fn emit_ident(&mut self, ident: &IdentifierNode) {
         let range = ident.range();
         if let Some(text) = self.generated_text(ident.id()).map(str::to_owned) {
             self.raw_mapped(&text, range);
+        } else if let Some(name) = self.temp_name(ident) {
+            self.raw_mapped(&name, range);
         } else {
             self.emit_token(ident.data().token());
         }
@@ -1656,9 +1700,51 @@ impl<'a> Emitter<'a> {
 
     // ---- module drivers ---------------------------------------------------
 
+    /// Whether `statement` is the rewriter's `var <temporaries>;` for the file.
+    fn is_hoisted_temp_declaration(&self, statement: &Stmt) -> bool {
+        let Statement::Variable(declaration) = statement.data() else {
+            return false;
+        };
+        statement.id().get() >= self.synthesized_floor
+            && declaration.kind == VariableKind::Var
+            && !declaration.declarations.is_empty()
+            && declaration.declarations.iter().all(|declarator| {
+                let data = declarator.data();
+                data.initializer.is_none()
+                    && matches!(
+                        data.binding.data(),
+                        BindingPattern::Identifier(name)
+                            if self
+                                .text(name.data().token())
+                                .is_some_and(TempNames::is_placeholder)
+                    )
+            })
+    }
+
+    fn emit_prelude_tail(&mut self) {
+        if let Some(tail) = self.prelude_tail.filter(|tail| !tail.is_empty()) {
+            self.raw(tail);
+            if !tail.ends_with('\n') {
+                self.newline();
+            }
+        }
+    }
+
     fn emit_module_js(&mut self, statements: &[Stmt]) {
+        let hoisted = usize::from(
+            statements
+                .first()
+                .is_some_and(|statement| self.is_hoisted_temp_declaration(statement)),
+        );
+        if hoisted == 0 {
+            self.emit_prelude_tail();
+        }
         self.write_detached_comments();
-        self.emit_statement_list(statements);
+        self.emit_statement_list(&statements[..hoisted]);
+        if hoisted == 1 {
+            self.emit_prelude_tail();
+        }
+        self.emit_statement_list(&statements[hoisted..]);
         if self.options.module_marker && !self.emitted_module_syntax {
             self.raw("export {};");
             self.newline();
@@ -1963,6 +2049,17 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_block_with_braces(&mut self, block: &BlockNode, range: TextRange, layout: BlockLayout) {
+        let function_scope = layout != BlockLayout::Statement;
+        if function_scope {
+            self.temp_names.enter();
+        }
+        self.emit_block_body(block, range, layout);
+        if function_scope {
+            self.temp_names.exit();
+        }
+    }
+
+    fn emit_block_body(&mut self, block: &BlockNode, range: TextRange, layout: BlockLayout) {
         let map_open_brace = layout != BlockLayout::FunctionBody;
         let may_preserve = layout != BlockLayout::Statement;
         if block.data().statements.is_empty() {
@@ -3151,6 +3248,10 @@ impl<'a> Emitter<'a> {
         let range = ident.range();
         if let Some(text) = self.generated_text(ident.id()).map(str::to_owned) {
             self.raw_mapped(&text, range);
+            return;
+        }
+        if let Some(name) = self.temp_name(ident) {
+            self.raw_mapped(&name, range);
             return;
         }
         let Some(text) = self.text(ident.data().token()) else {
@@ -8052,19 +8153,19 @@ var c = () => 1;
         let cases = [
             (
                 "var o:any;\nvar { a = 1 } = o;\n",
-                "var _t0 = o.a, a = _t0 === void 0 ? 1 : _t0;",
+                "var _a = o.a, a = _a === void 0 ? 1 : _a;",
             ),
             (
                 "var o:any;\nvar { p: q = 2 } = o;\n",
-                "var _t0 = o.p, q = _t0 === void 0 ? 2 : _t0;",
+                "var _a = o.p, q = _a === void 0 ? 2 : _a;",
             ),
             (
                 "var o:any;\nvar { x: { y } = {} } = o;\n",
-                "var _t0 = o.x, _t1 = _t0 === void 0 ? {} : _t0, y = _t1.y;",
+                "var _a = o.x, _b = _a === void 0 ? {} : _a, y = _b.y;",
             ),
             (
                 "var arr:any;\nvar [c = 3, , [d = 4] = []] = arr;\n",
-                "var _t0 = arr[0], c = _t0 === void 0 ? 3 : _t0, _t1 = arr[2], _t2 = _t1 === void 0 ? [] : _t1, _t3 = _t2[0], d = _t3 === void 0 ? 4 : _t3;",
+                "var _a = arr[0], c = _a === void 0 ? 3 : _a, _b = arr[2], _c = _b === void 0 ? [] : _b, _d = _c[0], d = _d === void 0 ? 4 : _d;",
             ),
         ];
         for (src, expected) in cases {
@@ -8093,7 +8194,7 @@ var c = () => 1;
             code.contains("[4 /*yield*/, k]"),
             "suspension missing:\n{code}"
         );
-        assert!(code.contains("m = _t"), "final bind missing:\n{code}");
+        assert!(code.contains("m = _b;"), "final bind missing:\n{code}");
         assert!(live_yield_leak(&code).is_none(), "live yield leaked");
     }
 
@@ -8158,11 +8259,11 @@ var c = () => 1;
             "the key's suspension must split:\n{code}"
         );
         assert!(
-            code.contains("_t0 = _a.sent()"),
+            code.contains("_b = _c.sent()"),
             "the key temp binds from sent():\n{code}"
         );
         assert!(
-            code.contains("[_t0]()"),
+            code.contains("[_b]()"),
             "the member reads the hoisted temp:\n{code}"
         );
         assert!(live_yield_leak(&code).is_none(), "live yield leaked");
@@ -8245,12 +8346,12 @@ var c = () => 1;
             emit_es5_clean("var k:any, o:any;\nfunction* g(){ var { [k]: v, ...rest } = o; }\n");
         let code = javascript(&out).code.clone();
         assert!(
-            code.contains("typeof _t0 === \"symbol\" ? _t0 : _t0 + \"\""),
+            code.contains("typeof _a === \"symbol\" ? _a : _a + \"\""),
             "computed key must be excluded at runtime (tsc shape):\n{code}"
         );
         let out = emit_es5_clean("var k:any, o:any;\nfunction* g(){ var { [yield k]: v } = o; }\n");
         let code = javascript(&out).code.clone();
-        assert!(code.contains("var v, _t0, _t1"), "temps declared:\n{code}");
+        assert!(code.contains("var v, _a, _b"), "temps declared:\n{code}");
         assert!(live_yield_leak(&code).is_none(), "live yield leaked");
         let out = emit_es5_clean("var k:any;\nasync function h(){ var { a } = await k; }\n");
         let code = javascript(&out).code.clone();
@@ -8377,7 +8478,7 @@ var c = () => 1;
             "the body's suspension must split:\n{code}"
         );
         assert!(
-            code.contains("_t1[_t0]"),
+            code.contains("it_1[_i]"),
             "the binding reads the indexed element:\n{code}"
         );
         assert!(live_yield_leak(&code).is_none(), "live yield leaked");
