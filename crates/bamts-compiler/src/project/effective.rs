@@ -739,6 +739,7 @@ fn emit_options(options: &CompilerOptions, source_id: SourceId) -> (EmitOptions,
         options.use_define_for_class_fields(),
         options.import_helpers(),
     );
+    emit_options.es_module_interop = options.es_module_interop().unwrap_or(true);
 
     (emit_options, diagnostics)
 }

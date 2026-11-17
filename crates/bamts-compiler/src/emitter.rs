@@ -120,6 +120,10 @@ pub struct EmitOptions {
     /// Whether every source file receives a strict-mode prologue.
     pub always_strict: bool,
     pub import_helpers: bool,
+    /// `esModuleInterop`: a CommonJS import of a default or namespace binding
+    /// goes through `__importDefault` or `__importStar`. TypeScript 7 defaults
+    /// it on.
+    pub es_module_interop: bool,
     /// Assume downleveling helpers exist globally; emit no helper prelude
     /// (`noEmitHelpers`, tsc's noEmitHelpers).
     pub no_emit_helpers: bool,
@@ -160,6 +164,7 @@ impl Default for EmitOptions {
             module: None,
             always_strict: false,
             import_helpers: false,
+            es_module_interop: true,
             no_emit_helpers: false,
             remove_comments: false,
             verbatim_module_syntax: false,
@@ -289,6 +294,12 @@ impl EmitOptions {
                 };
                 self.import_helpers = import_helpers;
             }
+            "esmoduleinterop" => {
+                let Some(es_module_interop) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.es_module_interop = es_module_interop;
+            }
             "usedefineforclassfields" => {
                 let Some(use_define) = parse_bool(value) else {
                     return Some(invalid());
@@ -401,6 +412,7 @@ impl EmitOptions {
                 module_specifier: String::from("tslib"),
             },
             module_kind: self.module,
+            es_module_interop: self.es_module_interop,
             newline: self.newline,
             indent_width: self.indent_width,
             jsx: self.jsx,

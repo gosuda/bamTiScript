@@ -962,6 +962,7 @@ pub struct CompilerOptions {
     always_strict: bool,
     use_define_for_class_fields: Option<bool>,
     import_helpers: Option<bool>,
+    es_module_interop: Option<bool>,
     verbatim_module_syntax: bool,
     /// `emitDecoratorMetadata` and `reactNamespace` read imports the source scan
     /// cannot see, so emit cannot prove one unused.
@@ -1076,6 +1077,11 @@ impl CompilerOptions {
     #[must_use]
     pub const fn import_helpers(&self) -> Option<bool> {
         self.import_helpers
+    }
+
+    #[must_use]
+    pub const fn es_module_interop(&self) -> Option<bool> {
+        self.es_module_interop
     }
 
     #[must_use]
@@ -1284,6 +1290,7 @@ impl ProjectConfig {
             keeps_imports: optional_bool(compiler, "emitDecoratorMetadata")?.unwrap_or(false)
                 || compiler.is_some_and(|options| options.get("reactNamespace").is_some()),
             import_helpers: optional_bool(compiler, "importHelpers")?,
+            es_module_interop: optional_bool(compiler, "esModuleInterop")?,
             allow_js: optional_bool(compiler, "allowJs")?.unwrap_or(false),
             check_js: optional_bool(compiler, "checkJs")?.unwrap_or(false),
             resolve_json_module: optional_bool(compiler, "resolveJsonModule")?.unwrap_or(false),
@@ -2649,6 +2656,24 @@ mod tests {
         )
         .expect("silent key");
         assert_eq!(silent.options().import_helpers(), None);
+    }
+
+    #[test]
+    fn project_config_parses_es_module_interop_as_tri_state() {
+        let pinned_false = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/corpus/tsconfig.json"),
+            r#"{"compilerOptions":{"esModuleInterop":false}}"#,
+        )
+        .expect("pinned false");
+        assert_eq!(pinned_false.options().es_module_interop(), Some(false));
+        let silent = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/corpus/tsconfig.json"),
+            r#"{"compilerOptions":{"strict":true}}"#,
+        )
+        .expect("silent key");
+        assert_eq!(silent.options().es_module_interop(), None);
     }
 
     #[test]

@@ -1050,7 +1050,8 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             | "sourcemap"
             | "declarationmap"
             | "usedefineforclassfields"
-            | "importhelpers" => value.eq_ignore_ascii_case("true").to_string(),
+            | "importhelpers"
+            | "esmoduleinterop" => value.eq_ignore_ascii_case("true").to_string(),
             "lib" => {
                 let items: Vec<String> = values
                     .iter()
@@ -1076,6 +1077,7 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             "alwaysstrict" => "alwaysStrict",
             "usedefineforclassfields" => "useDefineForClassFields",
             "importhelpers" => "importHelpers",
+            "esmoduleinterop" => "esModuleInterop",
             "verbatimmodulesyntax" => "verbatimModuleSyntax",
             "exactoptionalpropertytypes" => "exactOptionalPropertyTypes",
             "nouncheckedindexedaccess" => "noUncheckedIndexedAccess",
@@ -2629,6 +2631,7 @@ pub fn emit_source_map_baseline(
             prog.use_define_for_class_fields(),
             prog.import_helpers(),
         );
+        options.es_module_interop = prog.es_module_interop().unwrap_or(true);
         options.no_emit_helpers = check.no_emit_helpers();
         options.remove_comments = check.remove_comments();
         options.verbatim_module_syntax = prog.verbatim_module_syntax();
