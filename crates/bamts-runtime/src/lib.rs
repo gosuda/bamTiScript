@@ -35,8 +35,8 @@ use crate::vm::generator_async::GeneratorCompletion;
 use bamts_bytecode::{
     AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, DisposeHint, EcmaString,
     EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IntrinsicErrorKind,
-    IteratorCloseMode, IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, ResolvedExport,
-    UnaryOp, Verified, format_number,
+    IteratorCloseMode, IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, Register,
+    ResolvedExport, UnaryOp, Verified, format_number,
 };
 pub use bamts_cancel::CancellationToken;
 use bamts_native::{Decoded, SlotId, Value};
@@ -674,6 +674,188 @@ impl AtomTable {
             .len_units()
             .saturating_mul(2)
             .saturating_add(8)
+    }
+}
+fn preintern_constant_name(atoms: &mut AtomTable, constants: &[Constant], id: ConstantId) {
+    if let Some(Constant::String(text)) = constants.get(id.get() as usize) {
+        atoms.intern(text.clone());
+    }
+}
+#[derive(Clone, Copy)]
+enum StaticDef {
+    StringConst(ConstantId),
+    Forward(Register),
+}
+fn static_key_register(instruction: &Instruction) -> Option<Register> {
+    match *instruction {
+        Instruction::GetProperty { key, .. }
+        | Instruction::SetProperty { key, .. }
+        | Instruction::DeleteProperty { key, .. }
+        | Instruction::DefineAccessor { key, .. }
+        | Instruction::DefineDataProperty { key, .. }
+        | Instruction::LoadOwnDescriptorSlot { key, .. }
+        | Instruction::DefineOwnDescriptorSlot { key, .. }
+        | Instruction::WithHasBinding { key, .. }
+        | Instruction::GetSuper { key, .. }
+        | Instruction::SetSuper { key, .. } => Some(key),
+        _ => None,
+    }
+}
+fn preintern_static_keys(atoms: &mut AtomTable, constants: &[Constant], function: &Function) {
+    let code = function.code();
+    if code.is_empty() {
+        return;
+    }
+    let registers = function.register_count() as usize;
+    if registers == 0 {
+        return;
+    }
+    if code
+        .iter()
+        .all(|instruction| static_key_register(instruction).is_none())
+    {
+        return;
+    }
+    let entry = function
+        .capture_count()
+        .saturating_add(function.parameter_count()) as usize;
+    let mut analysis = StaticKeyAnalysis {
+        rows: vec![StaticKeyRow::default(); registers],
+        path: Vec::new(),
+    };
+    analysis.count_writes(entry, code);
+    for instruction in code {
+        analysis.record_def(instruction, constants);
+    }
+    for instruction in code {
+        let Some(start) = static_key_register(instruction) else {
+            continue;
+        };
+        let Some(id) = analysis.resolve(start) else {
+            continue;
+        };
+        preintern_constant_name(atoms, constants, id);
+    }
+}
+#[derive(Clone, Copy, Default)]
+struct StaticKeyRow {
+    writes: u8,
+    def: Option<StaticDef>,
+    resolved: Option<Option<ConstantId>>,
+    in_path: bool,
+}
+struct StaticKeyAnalysis {
+    rows: Vec<StaticKeyRow>,
+    path: Vec<usize>,
+}
+impl StaticKeyAnalysis {
+    fn count_writes(&mut self, entry: usize, code: &[Instruction]) {
+        let entry = entry.min(self.rows.len());
+        for row in &mut self.rows[..entry] {
+            row.writes = 1;
+        }
+        for instruction in code {
+            instruction.visit_writes(|register| {
+                let index = register.get() as usize;
+                if let Some(row) = self.rows.get_mut(index)
+                    && row.writes < 2
+                {
+                    row.writes += 1;
+                }
+            });
+        }
+    }
+    fn record_def(&mut self, instruction: &Instruction, constants: &[Constant]) {
+        let (dst, def) = match *instruction {
+            Instruction::LoadConst { dst, constant } => {
+                if !matches!(
+                    constants.get(constant.get() as usize),
+                    Some(Constant::String(_))
+                ) {
+                    return;
+                }
+                (dst, StaticDef::StringConst(constant))
+            }
+            Instruction::Move { dst, src } => (dst, StaticDef::Forward(src)),
+            Instruction::Unary {
+                dst,
+                op: UnaryOp::ToPropertyKey,
+                operand,
+            } => (dst, StaticDef::Forward(operand)),
+            _ => return,
+        };
+        let index = dst.get() as usize;
+        if let Some(row) = self.rows.get_mut(index)
+            && row.writes == 1
+        {
+            row.def = Some(def);
+        }
+    }
+    fn resolve(&mut self, start: Register) -> Option<ConstantId> {
+        self.path.clear();
+        let mut current = start;
+        let result = loop {
+            let index = current.get() as usize;
+            let Some(row) = self.rows.get_mut(index) else {
+                break None;
+            };
+            if row.writes != 1 || row.in_path {
+                break None;
+            }
+            if let Some(cached) = row.resolved {
+                break cached;
+            }
+            match row.def {
+                None => {
+                    row.resolved = Some(None);
+                    break None;
+                }
+                Some(StaticDef::StringConst(id)) => {
+                    row.resolved = Some(Some(id));
+                    break Some(id);
+                }
+                Some(StaticDef::Forward(next)) => {
+                    row.in_path = true;
+                    self.path.push(index);
+                    current = next;
+                }
+            }
+        };
+        for path in self.path.drain(..) {
+            self.rows[path].resolved = Some(result);
+            self.rows[path].in_path = false;
+        }
+        result
+    }
+}
+fn preintern_module_code(atoms: &mut AtomTable, code: &Module<Verified>) {
+    let constants = code.constants();
+    for function in code.functions() {
+        for instruction in function.code() {
+            match instruction {
+                Instruction::LoadGlobal { name, .. } | Instruction::TypeOfGlobal { name, .. } => {
+                    preintern_constant_name(atoms, constants, *name);
+                }
+                Instruction::RequireGlobalBinding { name } => {
+                    preintern_constant_name(atoms, constants, *name);
+                }
+                Instruction::StoreGlobal { name, .. } => {
+                    preintern_constant_name(atoms, constants, *name);
+                }
+                _ => {}
+            }
+        }
+    }
+    for function in code.functions() {
+        preintern_static_keys(atoms, constants, function);
+    }
+}
+fn preintern_program_names(atoms: &mut AtomTable, program: &Program<Verified>) {
+    for module in program.modules() {
+        for export in module.exports() {
+            preintern_constant_name(atoms, module.code.constants(), export.name);
+        }
+        preintern_module_code(atoms, &module.code);
     }
 }
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -2477,6 +2659,11 @@ impl<'a, H: Host> Machine<'a, H> {
             intrinsics.object_prototype,
             script_compiler,
         );
+        if let Some(program) = program {
+            preintern_program_names(&mut atoms, program);
+        } else {
+            preintern_module_code(&mut atoms, module);
+        }
         let vm_context_marker = intrinsics::push(
             &mut heap,
             HeapEntry::PrivateName {
@@ -4913,6 +5100,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 limit: self.limits.max_dynamic_modules,
             }
         })?);
+        preintern_program_names(&mut self.atoms, &program);
         self.dynamic.push(DynamicModule { program, bytes });
         self.registry.modules.push(ModuleInstance {
             binding_cells: Vec::new(),
@@ -32242,6 +32430,95 @@ mod tests {
             }
             assert_eq!(machine.atoms.strings.len(), before);
         });
+    }
+    #[test]
+    fn static_key_preinterned_at_load_not_first_access() {
+        let program = verified(
+            vec![
+                Constant::String(EcmaString::encode("statickey")),
+                Constant::String(EcmaString::encode("decoy-unused")),
+            ],
+            vec![function(
+                0,
+                6,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::Move {
+                        dst: reg(2),
+                        src: reg(1),
+                    },
+                    Instruction::Unary {
+                        dst: reg(3),
+                        op: UnaryOp::ToPropertyKey,
+                        operand: reg(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(5),
+                        constant: cid(1),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(4),
+                        object: reg(0),
+                        key: reg(3),
+                    },
+                    Instruction::Return { value: reg(4) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        assert!(machine.atoms.find("statickey").is_some());
+        assert!(machine.atoms.find("decoy-unused").is_none());
+        let before = machine.atoms.strings.len();
+        let execution = machine.evaluate().unwrap();
+        assert_eq!(machine.atoms.strings.len(), before);
+        assert_eq!(execution.value, Value::UNDEFINED);
+    }
+    #[test]
+    fn reassigned_key_stays_access_time() {
+        let program = verified(
+            vec![
+                Constant::String(EcmaString::encode("reassigned-first")),
+                Constant::String(EcmaString::encode("reassigned-second")),
+            ],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::CreateObject { dst: reg(0) },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::GetProperty {
+                        dst: reg(2),
+                        object: reg(0),
+                        key: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        assert!(machine.atoms.find("reassigned-first").is_none());
+        assert!(machine.atoms.find("reassigned-second").is_none());
+        let before = machine.atoms.strings.len();
+        let execution = machine.evaluate().unwrap();
+        assert_eq!(execution.value, Value::UNDEFINED);
+        assert!(machine.atoms.find("reassigned-first").is_none());
+        assert!(machine.atoms.find("reassigned-second").is_some());
+        assert_eq!(machine.atoms.strings.len(), before + 1);
     }
     fn site_program() -> Program<Verified> {
         verified(
