@@ -16,7 +16,7 @@
 //!   silently emitting later syntax.
 
 use smallvec::SmallVec;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::checker::{SemanticModel, SymbolId};
@@ -799,6 +799,9 @@ struct Rewriter<'a> {
     published_aliases: BTreeMap<crate::checker::SymbolId, String>,
 }
 
+/// Exported names one `exports.a = exports.b = void 0;` statement may chain.
+const VOID_0_EXPORTS_PER_STATEMENT: usize = 50;
+
 /// Per-file CommonJS lowering plan built before the rewrite walk.
 #[derive(Default)]
 struct CjsPlan {
@@ -1124,8 +1127,8 @@ impl<'a> Rewriter<'a> {
         plan_cjs_declared_exports(file, model, &exported_locals, &mut plan);
         // Script files keep the plan too: the marker stays off until a
         // require prelude (for example the JSX runtime) forces module form.
-        plan.void_0.sort();
-        plan.void_0.dedup();
+        let mut seen = HashSet::new();
+        plan.void_0.retain(|name| seen.insert(name.clone()));
         Some(plan)
     }
 
@@ -1529,11 +1532,12 @@ impl<'a> Rewriter<'a> {
         } else {
             String::from("Object.defineProperty(exports, \"__esModule\", { value: true });\n")
         };
-        let mut names = plan.void_0.clone();
-        names.sort();
-        names.dedup();
-        if !names.is_empty() {
-            let members: Vec<String> = names.iter().map(|name| exports_member(name)).collect();
+        for chunk in plan.void_0.chunks(VOID_0_EXPORTS_PER_STATEMENT) {
+            let members: Vec<String> = chunk
+                .iter()
+                .rev()
+                .map(|name| exports_member(name))
+                .collect();
             prelude.push_str(&members.join(" = "));
             prelude.push_str(" = void 0;\n");
         }
@@ -13336,12 +13340,12 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         let code = javascript(&output);
         assert!(
             code.starts_with(
-                "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.A = exports.x = void 0;\n"
+                "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.x = exports.A = void 0;\n"
             ),
             "{code}"
         );
         let marker = code
-            .find("exports.A = exports.x = void 0;")
+            .find("exports.x = exports.A = void 0;")
             .expect("preamble");
         let class_at = code.find("class A").expect("class kept");
         let class_export = code.find("exports.A = A;").expect("class export");
@@ -13353,6 +13357,45 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
                 && class_export < variable
                 && variable < variable_export,
             "{code}"
+        );
+    }
+
+    #[test]
+    fn commonjs_void_0_preamble_chains_names_in_reverse_source_order_in_chunks_of_fifty() {
+        let mut source = String::from("export const b = 1;\nexport const a = 2;\n");
+        for index in 0..60 {
+            source.push_str(&format!("export const n{index} = {index};\n"));
+        }
+        let output = emit_with_options(
+            &source,
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        let preamble: Vec<&str> = code
+            .lines()
+            .filter(|line| line.ends_with(" = void 0;"))
+            .collect();
+        assert_eq!(preamble.len(), 2, "{code}");
+        assert!(
+            preamble[0].starts_with("exports.n47 = exports.n46 =")
+                && preamble[0].ends_with("= exports.a = exports.b = void 0;"),
+            "{}",
+            preamble[0]
+        );
+        assert_eq!(
+            preamble[1],
+            format!(
+                "{} = void 0;",
+                (48..60)
+                    .rev()
+                    .map(|index| format!("exports.n{index}"))
+                    .collect::<Vec<_>>()
+                    .join(" = ")
+            )
         );
     }
 
