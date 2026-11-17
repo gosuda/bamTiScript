@@ -154,6 +154,9 @@ pub struct TransformOptions {
     pub helpers: HelperOptions,
     /// Module kind used to decide strict prologue and JSX import style.
     pub module_kind: Option<ModuleKind>,
+    /// Default and namespace imports under CommonJS go through the interop
+    /// helpers.
+    pub es_module_interop: bool,
     /// Printer newline.
     pub newline: Newline,
     /// Printer indent width.
@@ -807,6 +810,9 @@ const VOID_0_EXPORTS_PER_STATEMENT: usize = 50;
 struct CjsPlan {
     /// The file has module syntax, so it receives the `__esModule` marker.
     is_module: bool,
+    /// Default and namespace imports and `export * as` go through the interop
+    /// helpers (`esModuleInterop`).
+    es_module_interop: bool,
     /// Exported names needing `exports.<name> = void 0;` in the prelude.
     void_0: Vec<String>,
     /// The CommonJS lines of the statement being planned.
@@ -948,7 +954,10 @@ impl<'a> Rewriter<'a> {
         model: &SemanticModel,
     ) -> Option<CjsPlan> {
         let mut names = RequireNames::new(identifier_names(file));
-        let mut plan = CjsPlan::default();
+        let mut plan = CjsPlan {
+            es_module_interop: options.es_module_interop,
+            ..CjsPlan::default()
+        };
         let module_scope = model.module_scope();
         let symbol_of = |name: &str| model.scope(module_scope).value(name);
         let hoisted_functions = hoisted_function_names(file);
@@ -979,16 +988,37 @@ impl<'a> Rewriter<'a> {
                     let Some(clause) = &clause else {
                         continue;
                     };
-                    let local = names.allocate(module);
-                    let line = format!(
-                        "{} {local} = require({quoted});",
-                        if options.target <= ScriptTarget::Es5 {
-                            "var"
-                        } else {
-                            "const"
+                    let interop = if plan.es_module_interop {
+                        import_interop(file, clause)
+                    } else {
+                        ImportInterop::Plain
+                    };
+                    let declare = if options.target <= ScriptTarget::Es5 {
+                        "var"
+                    } else {
+                        "const"
+                    };
+                    let namespace_alone = clause.default.is_none()
+                        && matches!(clause.binding, Some(ImportBinding::Namespace(_)));
+                    let local = match &clause.binding {
+                        Some(ImportBinding::Namespace(name)) if namespace_alone => {
+                            identifier_text(file, name)
                         }
-                    );
-                    plan.requires.push(line);
+                        _ => names.allocate(module),
+                    };
+                    let required = match interop {
+                        ImportInterop::Star => {
+                            plan.helpers.insert(HelperKind::ImportStar);
+                            format!("__importStar(require({quoted}))")
+                        }
+                        ImportInterop::Default => {
+                            plan.helpers.insert(HelperKind::ImportDefault);
+                            format!("__importDefault(require({quoted}))")
+                        }
+                        ImportInterop::Plain => format!("require({quoted})"),
+                    };
+                    plan.requires
+                        .push(format!("{declare} {local} = {required};"));
                     plan.require_roots.insert(local.clone());
                     if let Some(default) = &clause.default {
                         let text = identifier_text(file, default);
@@ -1010,16 +1040,23 @@ impl<'a> Rewriter<'a> {
                     match &clause.binding {
                         Some(ImportBinding::Namespace(name)) => {
                             let text = identifier_text(file, name);
+                            let root = if namespace_alone {
+                                local.clone()
+                            } else {
+                                plan.requires.push(format!("{declare} {text} = {local};"));
+                                plan.require_roots.insert(text.clone());
+                                text.clone()
+                            };
                             for exported in exported_locals.get(&text).into_iter().flatten() {
                                 plan.import_exports.insert(exported.clone());
                                 plan.requires
-                                    .push(format!("{} = {local};", exports_member(exported)));
+                                    .push(format!("{} = {root};", exports_member(exported)));
                             }
                             if let Some(symbol) = symbol_of(&text) {
                                 plan.imports.insert(
                                     symbol,
                                     CjsImportRef {
-                                        root: local.clone(),
+                                        root,
                                         property: None,
                                     },
                                 );
@@ -11145,11 +11182,14 @@ fn plan_cjs_reexport(
             match &all.exported {
                 Some(name) => {
                     let name = module_export_text(file, name);
-                    plan.helpers.insert(HelperKind::ImportStar);
-                    plan.requires.push(format!(
-                        "{} = __importStar(require({module}));",
-                        exports_member(&name)
-                    ));
+                    let required = if plan.es_module_interop {
+                        plan.helpers.insert(HelperKind::ImportStar);
+                        format!("__importStar(require({module}))")
+                    } else {
+                        format!("require({module})")
+                    };
+                    plan.requires
+                        .push(format!("{} = {required};", exports_member(&name)));
                     plan.void_0.push(name);
                 }
                 None => {
@@ -11180,8 +11220,17 @@ fn plan_cjs_reexport(
             for specifier in kept {
                 let imported = module_export_text(file, &specifier.local);
                 let exported = module_export_text(file, &specifier.exported);
-                plan.requires
-                    .push(live_export(&exported, &local, &imported));
+                if plan.es_module_interop && imported == "default" {
+                    plan.helpers.insert(HelperKind::ImportDefault);
+                    plan.requires.push(live_export(
+                        &exported,
+                        &format!("__importDefault({local})"),
+                        &imported,
+                    ));
+                } else {
+                    plan.requires
+                        .push(live_export(&exported, &local, &imported));
+                }
                 plan.void_0.push(exported);
             }
         }
@@ -11250,6 +11299,41 @@ fn default_export_name(file: &SourceFile) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// How a CommonJS import reaches its module, as tsc's esModuleInterop decides.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImportInterop {
+    Plain,
+    Default,
+    Star,
+}
+
+/// `__importStar` for a namespace, or for default and named bindings read
+/// together; `__importDefault` for a default read alone; none otherwise.
+fn import_interop(file: &SourceFile, clause: &ImportClause) -> ImportInterop {
+    let has_default = clause.default.is_some();
+    match &clause.binding {
+        Some(ImportBinding::Namespace(_)) => ImportInterop::Star,
+        Some(ImportBinding::Named(specifiers)) => {
+            let imported: Vec<String> = specifiers
+                .iter()
+                .filter(|specifier| matches!(specifier.data().mode, ImportSpecifierMode::Value))
+                .map(|specifier| module_export_text(file, &specifier.data().imported))
+                .collect();
+            let defaults = imported.iter().filter(|name| *name == "default").count();
+            let others = imported.len() - defaults;
+            if (defaults > 0 && others > 0) || (others > 0 && has_default) {
+                ImportInterop::Star
+            } else if has_default || defaults > 0 {
+                ImportInterop::Default
+            } else {
+                ImportInterop::Plain
+            }
+        }
+        None if has_default => ImportInterop::Default,
+        None => ImportInterop::Plain,
+    }
 }
 
 /// An import clause without the bindings nothing reads, or `None` if none remain.
@@ -14618,6 +14702,98 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         ] {
             assert!(code.contains(expected), "missing {expected}: {code}");
         }
+    }
+
+    #[test]
+    fn commonjs_imports_stay_plain_when_es_module_interop_is_off() {
+        // Authority: importHelpersWithImportOrExportDefault under
+        // esmoduleinterop=false prints no interop helper.
+        let output = emit_with_options(
+            "import d from './b';\nimport * as ns from './c';\nexport * as all from './d';\nexport var x = d + ns.a;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                es_module_interop: false,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        for expected in [
+            "const b_1 = require(\"./b\");",
+            "const ns = require(\"./c\");",
+            "exports.all = require(\"./d\");",
+            "exports.x = b_1.default + ns.a;",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+        assert!(!code.contains("__importDefault"), "{code}");
+        assert!(!code.contains("__importStar"), "{code}");
+    }
+
+    #[test]
+    fn a_reexported_default_reads_through_import_default() {
+        // Authority: importHelpersWithImportOrExportDefault(esmoduleinterop=true,
+        // module=commonjs): `tslib_1.__importDefault(a_1).default` in each getter.
+        let output = emit_with_options(
+            "export { default } from './a';\nexport { default as a } from './a';\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        for expected in [
+            "var a_1 = require(\"./a\");",
+            "Object.defineProperty(exports, \"default\", { enumerable: true, get: function () { return __importDefault(a_1).default; } });",
+            "var a_2 = require(\"./a\");",
+            "Object.defineProperty(exports, \"a\", { enumerable: true, get: function () { return __importDefault(a_2).default; } });",
+            "var __importDefault = (this && this.__importDefault) ||",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+    }
+
+    #[test]
+    fn commonjs_imports_follow_the_esmoduleinterop_forms() {
+        // Authority: allowSyntheticDefaultImports1 and
+        // es6ImportDefaultBindingFollowedWithNamedImport1InEs5 (default alone
+        // through __importDefault); es6ImportDefaultBindingFollowedWith
+        // NamespaceBindingInEs5 (a namespace takes its own name).
+        let output = emit_with_options(
+            "import d from './b';\n\
+             import * as ns from './c';\n\
+             import f, { g } from './e';\n\
+             import { default as h } from './f';\n\
+             import { i } from './g';\n\
+             export var x = d + ns.a + f + g + h + i;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        for expected in [
+            "const b_1 = __importDefault(require(\"./b\"));",
+            "const ns = __importStar(require(\"./c\"));",
+            "const e_1 = __importStar(require(\"./e\"));",
+            "const f_1 = __importDefault(require(\"./f\"));",
+            "const g_1 = require(\"./g\");",
+            "exports.x = b_1.default + ns.a + e_1.default + e_1.g + f_1.default + g_1.i;",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+        let create = code.find("var __createBinding").expect("createBinding");
+        let default_module = code
+            .find("var __setModuleDefault")
+            .expect("setModuleDefault");
+        let star = code.find("var __importStar").expect("importStar");
+        let default = code.find("var __importDefault").expect("importDefault");
+        assert!(
+            create < default_module && default_module < star && star < default,
+            "{code}"
+        );
     }
 
     #[test]

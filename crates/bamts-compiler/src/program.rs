@@ -253,6 +253,7 @@ pub struct ResolvedProgram {
     remove_comments: bool,
     use_define_for_class_fields: Option<bool>,
     import_helpers: Option<bool>,
+    es_module_interop: Option<bool>,
     verbatim_module_syntax: bool,
     target: crate::emitter::ScriptTarget,
     libs: crate::checker::intrinsic_environment::LibSet,
@@ -277,6 +278,11 @@ impl ResolvedProgram {
     #[must_use]
     pub const fn import_helpers(&self) -> Option<bool> {
         self.import_helpers
+    }
+
+    #[must_use]
+    pub const fn es_module_interop(&self) -> Option<bool> {
+        self.es_module_interop
     }
 
     #[must_use]
@@ -773,6 +779,7 @@ impl ProgramLoader {
             remove_comments: self.options.remove_comments(),
             use_define_for_class_fields: self.options.use_define_for_class_fields(),
             import_helpers: self.options.import_helpers(),
+            es_module_interop: self.options.es_module_interop(),
             verbatim_module_syntax: self.options.verbatim_module_syntax(),
             target,
             libs,

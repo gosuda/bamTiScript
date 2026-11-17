@@ -254,6 +254,7 @@ fn program_emit_options(program: &ResolvedProgram, mode: FrontendMode) -> Option
         program.use_define_for_class_fields(),
         program.import_helpers(),
     );
+    options.es_module_interop = program.es_module_interop().unwrap_or(true);
     options.no_emit_helpers = check.no_emit_helpers();
     options.remove_comments = check.remove_comments();
     options.verbatim_module_syntax = program.verbatim_module_syntax();
