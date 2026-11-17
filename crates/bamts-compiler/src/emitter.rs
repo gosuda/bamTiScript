@@ -1893,26 +1893,20 @@ impl<'a> Emitter<'a> {
         let machine_if = statement.id().get() >= self.synthesized_floor;
         if let Some(alternate) = &if_statement.alternate {
             let alt_range = alternate.range();
+            let else_if = matches!(alternate.data(), Statement::If(_));
+            let keyword = if else_if { "else " } else { "else" };
+            self.newline();
             if machine_if {
-                // tsc's machine output breaks before `else`.
-                self.newline();
-                if matches!(alternate.data(), Statement::If(_)) {
-                    let prev = self.anchor;
-                    self.anchor = alt_range;
-                    self.emit_if(alternate);
-                    self.anchor = prev;
-                } else {
-                    self.raw("else");
-                    self.emit_control_body(alternate);
-                }
-            } else if matches!(alternate.data(), Statement::If(_)) {
-                self.raw_mapped_pos(" else ", if_statement.consequent.range().end());
+                self.raw(keyword);
+            } else {
+                self.raw_mapped_pos(keyword, if_statement.consequent.range().end());
+            }
+            if else_if {
                 let prev = self.anchor;
                 self.anchor = alt_range;
                 self.emit_if(alternate);
                 self.anchor = prev;
             } else {
-                self.raw_mapped_pos(" else", if_statement.consequent.range().end());
                 self.emit_control_body(alternate);
             }
         }
@@ -1922,83 +1916,33 @@ impl<'a> Emitter<'a> {
         self.emit_control_body_hug(statement, true)
     }
 
-    /// Emits a brace-less control body. `hug` carries tsc's layout rule:
-    /// a fully synthesized guard (`if (!x) return [3 /*break*/, 2];`)
-    /// keeps the body on the head's line, while a translated body — an
-    /// authored test with a synthesized jump — breaks to its own line.
+    /// Emits a control body. A block hugs the head. Any other body, authored
+    /// or translated, breaks to its own indented line, an empty one printing
+    /// `;`, except that `hug` keeps a fully synthesized guard
+    /// (`if (!x) return [3 /*break*/, 2];`) on the head's line.
     fn emit_control_body_hug(&mut self, statement: &Stmt, hug: bool) {
+        let synthesized = statement.id().get() >= self.synthesized_floor;
         match statement.data() {
             Statement::Block(block) => {
                 self.raw(" ");
-                self.emit_block_with_braces(block, self.anchor, BlockLayout::Statement)
+                self.emit_block_with_braces(block, self.anchor, BlockLayout::Statement);
             }
-            Statement::Empty => self.raw(" {}"),
-            _ if self.body_authored_same_line(statement) => {
-                // tsc keeps a brace-less control body authored on the
-                // head's line bare (`if (cond) return mod;`, APISample_*).
-                self.raw(" ");
-                if self.emit_statement(statement) {
-                    self.newline();
-                }
-            }
-            _ if statement.id().get() >= self.synthesized_floor && hug => {
-                // Machine control flow keeps the bare form tsc emits for
-                // synthesized bodies (`if (!x) return [3 /*break*/, 2];`).
+            Statement::Empty if synthesized => self.raw(" {}"),
+            _ if synthesized && hug => {
                 self.raw(" ");
                 self.emit_statement(statement);
-            }
-            _ if statement.id().get() >= self.synthesized_floor => {
-                // A translated jump — authored test, synthesized body —
-                // breaks to its own line.
-                self.newline();
-                self.indent += 1;
-                self.emit_statement(statement);
-                self.indent -= 1;
             }
             _ => {
-                self.raw(" ");
-                self.raw_mapped("{", self.anchor);
                 self.newline();
                 self.indent += 1;
-                if self.emit_statement(statement) {
-                    self.newline();
+                if matches!(statement.data(), Statement::Empty) {
+                    self.raw(";");
+                } else {
+                    self.emit_statement(statement);
                 }
                 self.indent -= 1;
-                self.raw_mapped_pos("}", self.anchor.end());
             }
         }
-    }
-
-    /// Whether a brace-less control body starts on the same source line as
-    /// the `)` that precedes it — the authored-bare shape tsc preserves.
-    fn body_authored_same_line(&self, statement: &Stmt) -> bool {
-        let start = statement.range().start();
-        let index = self
-            .tokens
-            .partition_point(|token| token.range().start() < start);
-        // Walk back past trivia (whitespace and comments are tokens); the
-        // first structural token decides.
-        let mut cursor = index;
-        let before = loop {
-            let Some(candidate) = cursor.checked_sub(1).and_then(|i| self.tokens.get(i)) else {
-                return false;
-            };
-            if !matches!(
-                candidate.kind(),
-                TokenKind::Whitespace | TokenKind::LineComment | TokenKind::BlockComment
-            ) {
-                break candidate;
-            }
-            cursor -= 1;
-        };
-        before.kind() == TokenKind::RParen
-            && matches!(
-                (
-                    self.source.line_column(before.range().end()),
-                    self.source.line_column(start)
-                ),
-                (Ok((line_a, _)), Ok((line_b, _))) if line_a == line_b
-            )
     }
 
     fn emit_block(&mut self, block: &BlockNode) {
@@ -2015,16 +1959,11 @@ impl<'a> Emitter<'a> {
             } else {
                 self.raw("{");
             }
-            // Authority, re-derived per context (2026-09-04 census: 285
-            // newline-authored to two-line, 1200 same-line to `{ }`, no
-            // try-family two-line evidence): same-line-authored empty
-            // bodies print `{ }` — the space is synthesized and unmapped —
-            // while a function-family body authored across lines keeps its
-            // newline (ParameterList6: `constructor(C) {\n}`). Synthesized
-            // or out-of-text ranges keep `{ }`.
-            if may_preserve
-                && self.node_spans_authored_lines(block)
-                && self.source.spans_multiple_lines(range)
+            // Authority: forInStatement1 and catchClauseWithInitializer1 keep
+            // `{\n}` for statement blocks, ParameterList6 for function bodies;
+            // an empty block authored on one line prints `{ }`, its space
+            // synthesized and unmapped.
+            if self.node_spans_authored_lines(block) && self.source.spans_multiple_lines(block.range())
             {
                 self.newline();
             } else {
@@ -2181,7 +2120,8 @@ impl<'a> Emitter<'a> {
         if let Some(handler) = &statement.handler {
             let handler_range = handler.range();
             let handler = handler.data();
-            self.raw_mapped(" catch", handler_range);
+            self.newline();
+            self.raw_mapped("catch", handler_range);
             if let Some(binding) = &handler.binding {
                 self.raw(" (");
                 self.emit_pattern(binding);
@@ -2191,7 +2131,8 @@ impl<'a> Emitter<'a> {
             self.emit_block(&handler.body);
         }
         if let Some(finalizer) = &statement.finalizer {
-            self.raw_mapped(" finally ", finalizer.range());
+            self.newline();
+            self.raw_mapped("finally ", finalizer.range());
             self.emit_block(finalizer);
         }
     }
@@ -7116,12 +7057,7 @@ export default answer;
         assert!(code.contains("var y; // Expect no error here\n"), "{code}");
     }
 
-    #[test]
-    fn bare_control_body_authored_same_line_stays_bare() {
-        // Authority: APISample_* — `if (cond) return mod;` keeps its
-        // brace-less authored form; a body authored on the next line
-        // still wraps.
-        let input = "function f(x) {\n    if (x) return 1;\n}\n";
+    fn emit_authored_js(input: &str) -> String {
         let parsed = crate::parser::parse(crate::scanner::scan(
             SourceId::new(0),
             ScriptKind::TypeScript,
@@ -7129,8 +7065,47 @@ export default answer;
         ));
         assert!(parsed.diagnostics().is_empty());
         let output = emit_output(parsed.product(), &EmitOptions::default());
-        let code = &javascript(&output).code;
-        assert!(code.contains("if (x) return 1;"), "{code}");
+        javascript(&output).code.clone()
+    }
+
+    #[test]
+    fn brace_less_control_bodies_break_onto_an_indented_line() {
+        // Authority: APISample_jsdoc emitted `if (tags)` / `flat.push(...tags);`,
+        // typePredicateTopLevelTypeParameter, reachabilityChecks1 (`while (true);`).
+        let code = emit_authored_js(
+            "function f(x) {\n    if (x) return 1;\n    while (x);\n    for (;;) break;\n}\n",
+        );
+        assert!(
+            code.contains(
+                "    if (x)\n        return 1;\n    while (x)\n        ;\n    for (;;)\n        break;\n"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn else_catch_and_finally_start_their_own_line() {
+        // Authority: tryCatchFinally, propertyWrappedInTry (`} catch(e) {}` in
+        // the source, `}` then `catch (e) { }` emitted), inferTypePredicates.
+        let code = emit_authored_js(
+            "function f(x) {\n    if (x) { a(); } else if (x) { b(); } else { c(); }\n    try { a(); } catch (e) {} finally { b(); }\n}\n",
+        );
+        assert!(
+            code.contains(
+                "    if (x) {\n        a();\n    }\n    else if (x) {\n        b();\n    }\n    else {\n        c();\n    }\n    try {\n        a();\n    }\n    catch (e) { }\n    finally {\n        b();\n    }\n"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn empty_statement_blocks_keep_the_lines_they_were_authored_on() {
+        // Authority: forInStatement1, catchClauseWithInitializer1.
+        let code = emit_authored_js("var x: any;\nfor (var a in x) {\n}\nwhile (x) {}\n");
+        assert!(
+            code.contains("for (var a in x) {\n}\nwhile (x) { }\n"),
+            "{code}"
+        );
     }
 
     #[test]
