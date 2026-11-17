@@ -1,0 +1,28 @@
+name: Set up pinned Quint
+description: Install the pinned Quint CLI and verified Linux x64 Rust evaluator.
+
+runs:
+  using: composite
+  steps:
+    - name: Install Quint CLI
+      shell: bash
+      run: npm ci --prefix formal/quint
+    - name: Install pinned Rust evaluator
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$RUNNER_OS/$RUNNER_ARCH" = Linux/X64
+        version=$(node -p 'require("./formal/quint/node_modules/@informalsystems/quint/dist/src/rust/binaryManager.js").QUINT_EVALUATOR_VERSION')
+        test "$version" = v0.6.0
+        archive="$RUNNER_TEMP/quint-evaluator.tar.gz"
+        quint_home="$RUNNER_TEMP/quint"
+        evaluator_dir="$quint_home/rust-evaluator-$version"
+        # Provision the exact evaluator without Quint's unauthenticated release lookup.
+        curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --max-time 120 \
+          "https://github.com/quint-co/quint/releases/download/evaluator/$version/quint_evaluator-x86_64-unknown-linux-gnu.tar.gz" \
+          --output "$archive"
+        printf '61755a09d5052d93a4e75e840059edfd0d3674aeda164b9d2464be3d6e21b1c2  %s\n' "$archive" | sha256sum --check --strict
+        mkdir -p "$evaluator_dir"
+        tar -xzf "$archive" -C "$evaluator_dir" quint_evaluator
+        chmod +x "$evaluator_dir/quint_evaluator"
+        printf 'QUINT_HOME=%s\n' "$quint_home" >> "$GITHUB_ENV"

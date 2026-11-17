@@ -52,21 +52,22 @@ jobs:
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
           rustup default "$TOOLCHAIN"
 
-      - name: Sync suite
-        run: |
-          cargo run --locked -p bamts-verification --bin ts_conformance -- \
-            sync --verify-pin --write-snapshot
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
 
-      - name: Audit ledger
-        run: |
-          cargo run --locked -p bamts-verification --bin ts_conformance -- \
-            audit-ledger --require-complete
-
+      # Build one profile once; shards also reuse the snapshot tool.
       - name: Build canonical compiler receipt tools
         run: |
-          cargo build --locked --release -p bamts-verification --bin bamts-verification --bin ts_lane_worker
+          cargo build --locked --release -p bamts-verification --bin bamts-verification --bin ts_lane_worker --bin ts_conformance
           install -D -m 755 target/release/bamts-verification target/receipt-tools/bamts-verification
           install -D -m 755 target/release/ts_lane_worker target/receipt-tools/ts_lane_worker
+          install -D -m 755 target/release/ts_conformance target/receipt-tools/ts_conformance
+
+      - name: Sync suite
+        run: target/receipt-tools/ts_conformance sync --verify-pin --write-snapshot
+
+      - name: Audit ledger
+        run: target/receipt-tools/ts_conformance audit-ledger --require-complete
 
       - name: Upload canonical compiler receipt tools
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -105,15 +106,15 @@ jobs:
           TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rust-src
           rustup default "$TOOLCHAIN"
-      - name: Sync snapshot
-        run: cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
       - name: Download canonical compiler receipt tools
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: compiler-receipt-tools-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/receipt-tools
       - name: Restore receipt tool permissions
-        run: chmod +x target/receipt-tools/bamts-verification target/receipt-tools/ts_lane_worker
+        run: chmod +x target/receipt-tools/bamts-verification target/receipt-tools/ts_lane_worker target/receipt-tools/ts_conformance
+      - name: Sync snapshot
+        run: target/receipt-tools/ts_conformance sync --verify-pin --write-snapshot
       # `suite run` hashes the locked authority markers under
       # target/authority. The typescript-7.0.2 catalog reads both the
       # compiler tree and the test tree, so both must be materialized
@@ -152,7 +153,7 @@ jobs:
   conformance-x64-accounting:
     name: Nightly x64 receipt accounting
     needs: conformance-x64
-    if: always() && needs.conformance-x64.result != 'skipped'
+    if: ${{ !cancelled() && needs.conformance-x64.result != 'skipped' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -243,6 +244,8 @@ jobs:
           TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rust-src
           rustup default "$TOOLCHAIN"
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
       - name: Sync snapshot
         run: cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
       - name: Write strict AArch64 receipt
@@ -268,7 +271,7 @@ jobs:
   report-aarch64-accounting:
     name: AArch64 receipt accounting ${{ matrix.backend }}
     needs: report-aarch64
-    if: always() && needs.report-aarch64.result != 'skipped'
+    if: ${{ !cancelled() && needs.report-aarch64.result != 'skipped' }}
     runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
@@ -291,6 +294,8 @@ jobs:
           TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rust-src
           rustup default "$TOOLCHAIN"
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: nightly-test262-${{ matrix.backend }}-aarch64-${{ github.run_id }}-${{ github.run_attempt }}
@@ -351,6 +356,8 @@ jobs:
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
           rustup default "$TOOLCHAIN"
 
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
 
       - name: Corpus differential
         run: |
@@ -378,7 +385,7 @@ jobs:
           package-manager-cache: false
 
       - name: Install Quint
-        run: npm ci --prefix formal/quint
+        uses: ./.github/actions/setup-quint
 
       - name: Assert Node version
         run: test "$(node --version)" = "v24.18.0"
@@ -405,6 +412,9 @@ jobs:
           TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
           rustup default "$TOOLCHAIN"
+
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
 
       # The workspace/formal guards resolve the graph for every target and so
       # need crates the host build never downloads. `cargo fetch` without

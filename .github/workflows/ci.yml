@@ -42,6 +42,8 @@ jobs:
           rustup toolchain install $toolchain --profile minimal --component clippy
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default $toolchain
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
       - name: Test Windows cache ownership and publication
         run: cargo test --locked -p bamts-native --features cache-guard
       # Every other job runs on Linux, where the Win32 backend, the Microsoft
@@ -83,6 +85,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
+
       - name: Check workspace
         run: cargo check --workspace --locked
 
@@ -115,7 +120,7 @@ jobs:
         run: npm ci
 
       - name: Install Quint
-        run: npm ci --prefix formal/quint
+        uses: ./.github/actions/setup-quint
 
       - name: Test workspace
         run: cargo test --workspace --locked
@@ -152,21 +157,22 @@ jobs:
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
           rustup default "$TOOLCHAIN"
 
-      - name: Sync snapshot
-        run: |
-          cargo run --locked -p bamts-verification --bin ts_conformance -- \
-            sync --verify-pin --write-snapshot
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
 
-      - name: Audit ledger
-        run: |
-          cargo run --locked -p bamts-verification --bin ts_conformance -- \
-            audit-ledger --require-complete
-
+      # Build one profile once; shards also reuse the snapshot tool.
       - name: Build canonical compiler receipt tools
         run: |
-          cargo build --locked --release -p bamts-verification --bin bamts-verification --bin ts_lane_worker
+          cargo build --locked --release -p bamts-verification --bin bamts-verification --bin ts_lane_worker --bin ts_conformance
           install -D -m 755 target/release/bamts-verification target/receipt-tools/bamts-verification
           install -D -m 755 target/release/ts_lane_worker target/receipt-tools/ts_lane_worker
+          install -D -m 755 target/release/ts_conformance target/receipt-tools/ts_conformance
+
+      - name: Sync snapshot
+        run: target/receipt-tools/ts_conformance sync --verify-pin --write-snapshot
+
+      - name: Audit ledger
+        run: target/receipt-tools/ts_conformance audit-ledger --require-complete
 
       - name: Upload canonical compiler receipt tools
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -213,6 +219,9 @@ jobs:
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
           rustup default "$TOOLCHAIN"
 
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
+
       - name: Corpus differential
         run: |
           cargo test -p bamts-verification --test corpus_differential --locked -- --nocapture
@@ -238,7 +247,7 @@ jobs:
           package-manager-cache: false
 
       - name: Install Quint
-        run: npm ci --prefix formal/quint
+        uses: ./.github/actions/setup-quint
 
       - name: Assert Node version
         run: test "$(node --version)" = "v24.18.0"
@@ -265,6 +274,9 @@ jobs:
           TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
           rustup default "$TOOLCHAIN"
+
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
 
       # The workspace/formal guards resolve the graph for every target and so
       # need crates the host build never downloads. `cargo fetch` without
@@ -318,15 +330,15 @@ jobs:
           TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rust-src
           rustup default "$TOOLCHAIN"
-      - name: Sync snapshot
-        run: cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
       - name: Download canonical compiler receipt tools
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: compiler-receipt-tools-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/receipt-tools
       - name: Restore receipt tool permissions
-        run: chmod +x target/receipt-tools/bamts-verification target/receipt-tools/ts_lane_worker
+        run: chmod +x target/receipt-tools/bamts-verification target/receipt-tools/ts_lane_worker target/receipt-tools/ts_conformance
+      - name: Sync snapshot
+        run: target/receipt-tools/ts_conformance sync --verify-pin --write-snapshot
       # `suite run` hashes the locked authority markers under
       # target/authority. The typescript-7.0.2 catalog reads both the
       # compiler tree and the test tree, so both must be materialized
@@ -365,7 +377,7 @@ jobs:
   conformance-accounting:
     name: Conformance receipt accounting
     needs: conformance
-    if: always() && needs.conformance.result != 'skipped'
+    if: ${{ !cancelled() && needs.conformance.result != 'skipped' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
