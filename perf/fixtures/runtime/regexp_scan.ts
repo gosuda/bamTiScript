@@ -38,9 +38,10 @@ while (built < SIZE) {
 }
 const text: string = chunks.join("").slice(0, SIZE);
 const re: RegExp = /(\w+)@(\w+)\.com/g;
-let found: RegExpExecArray | null;
 let checksum: number = 0;
-while ((found = re.exec(text)) !== null) {
+let found = re.exec(text);
+while (found !== null) {
   checksum += found[1].length * 1009 + found[2].length * 1013 + 7;
+  found = re.exec(text);
 }
 console.log(Math.floor(checksum));
