@@ -47,6 +47,12 @@ version has shipped, and no tag or stable package exists while any gate in
   `(a: string)` and `(b: string)` spellings intern distinctly. No consumer
   reads the new surfaces yet; rendered output and relation checks are
   unchanged.
+- Static global and module-export names are interned when a program loads,
+  including dynamic module installs. Constant-string property keys reachable
+  through single-write `LoadConst`/`Move`/`ToPropertyKey` chains are interned
+  at load; dynamic or reassigned keys keep access-time interning.
+  `bamts_bytecode::Instruction::visit_writes` is now public so the runtime can
+  count register writes; nothing was removed or changed.
 
 ### Known incomplete
 

@@ -1347,7 +1347,7 @@ impl Instruction {
     /// [`Instruction::IteratorNext`], [`Instruction::IteratorResult`],
     /// [`Instruction::IteratorClose`], and [`Instruction::Suspend`] are the
     /// two-write opcodes.
-    fn visit_writes(self, mut visit: impl FnMut(Register)) {
+    pub fn visit_writes(self, mut visit: impl FnMut(Register)) {
         match self {
             Self::LoadConst { dst, .. }
             | Self::Move { dst, .. }
