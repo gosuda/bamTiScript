@@ -3631,13 +3631,15 @@ impl<'a> Emitter<'a> {
         } else {
             self.emit_expression_prec(callee, P_CALL_MEMBER);
         }
-        let open_pos = self
-            .source_pos_of(
-                TextRange::new(callee.range().end(), range.end()).unwrap_or(range),
-                '(',
-            )
-            .unwrap_or(callee.range().end());
-        self.raw_mapped_token("(", open_pos, 1);
+        let open_pos = self.source_pos_of(
+            TextRange::new(callee.range().end(), range.end()).unwrap_or(range),
+            '(',
+        );
+        let authored = range.end() <= self.authored_len;
+        if authored && new.arguments.is_empty() && open_pos.is_none() {
+            return;
+        }
+        self.raw_mapped_token("(", open_pos.unwrap_or(callee.range().end()), 1);
         self.emit_arguments(&new.arguments);
         let close_pos = self.source_pos_of_last(range, ')').unwrap_or(range.end());
         self.raw_mapped_token(")", close_pos, 1);
@@ -7117,6 +7119,19 @@ export default answer;
         let code = emit_authored_js("var x: any;\nfor (var a in x) {\n}\nwhile (x) {}\n");
         assert!(
             code.contains("for (var a in x) {\n}\nwhile (x) { }\n"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn an_authored_new_without_arguments_keeps_its_missing_parentheses() {
+        // Authority: iterableArrayPattern10 (`value: new Foo,`) and
+        // iteratorSpreadInCall (`foo(...new SymbolIterator);`) print no `()`.
+        let code = emit_authored_js(
+            "class Foo {}\nvar a = new Foo;\nvar b = new Foo();\nf(new Foo, new Foo());\n",
+        );
+        assert!(
+            code.contains("var a = new Foo;\nvar b = new Foo();\nf(new Foo, new Foo());\n"),
             "{code}"
         );
     }
