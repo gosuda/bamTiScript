@@ -37,7 +37,7 @@ use crate::{Completion, CompletionTag, ShadowFrame, Value};
 // -- The helper algebra ------------------------------------------------------
 
 /// The number of runtime helpers, `0..HELPER_COUNT`.
-pub const HELPER_COUNT: u32 = 55;
+pub const HELPER_COUNT: u32 = 56;
 
 /// A runtime helper, identified by its stable ABI index. The variant order is
 /// the canonical `external_index` order (0..52) and is byte-identical to
@@ -162,6 +162,8 @@ pub enum NativeHelper {
     RequireGlobalBinding = 53,
     /// `bamts_throw_intrinsic_error` — index 54.
     ThrowIntrinsicError = 54,
+    /// `bamts_array_get_number` — index 55 (speculative numeric element read).
+    ArrayGetNumber = 55,
 }
 
 impl NativeHelper {
@@ -225,6 +227,7 @@ impl NativeHelper {
             NativeHelper::GetTemplateObject => "bamts_get_template_object",
             NativeHelper::RequireGlobalBinding => "bamts_require_global_binding",
             NativeHelper::ThrowIntrinsicError => "bamts_throw_intrinsic_error",
+            NativeHelper::ArrayGetNumber => "bamts_array_get_number",
         }
     }
 
@@ -294,6 +297,7 @@ impl NativeHelper {
             52 => Some(NativeHelper::GetTemplateObject),
             53 => Some(NativeHelper::RequireGlobalBinding),
             54 => Some(NativeHelper::ThrowIntrinsicError),
+            55 => Some(NativeHelper::ArrayGetNumber),
             _ => None,
         }
     }
@@ -504,6 +508,10 @@ pub enum HelperCall {
     /// Throw the realm's intrinsic error of selector `kind` with string
     /// constant `message`.
     ThrowIntrinsicError { kind: u32, message: u32 },
+    /// Read `array[index]` as a number for the optimized tier: the element
+    /// word when `array` is an array whose element kind is `Int32` or `Number`
+    /// and `index` is an in-bounds array index, otherwise the speculation trap.
+    ArrayGetNumber { array: Value, index: Value },
 }
 
 impl HelperCall {
@@ -588,6 +596,7 @@ impl HelperCall {
             } => NativeHelper::GetTemplateObject,
             HelperCall::RequireGlobalBinding { .. } => NativeHelper::RequireGlobalBinding,
             HelperCall::ThrowIntrinsicError { .. } => NativeHelper::ThrowIntrinsicError,
+            HelperCall::ArrayGetNumber { .. } => NativeHelper::ArrayGetNumber,
         }
     }
 }
@@ -636,6 +645,9 @@ pub const TRAP_PANIC: u32 = 0x1002;
 pub const TRAP_INVALID_REGISTER: u32 = 0x1003;
 /// `out.value` id written when a native entry returns an unrecognized completion tag.
 pub const TRAP_INVALID_COMPLETION_TAG: u32 = 0x1004;
+/// `out.value` id written when an optimized speculation guard failed or a
+/// numeric element read could not use the array fast path.
+pub const TRAP_SPECULATION: u32 = 0x1005;
 
 // -- The safe frame view -----------------------------------------------------
 
@@ -2191,6 +2203,30 @@ pub unsafe extern "C" fn bamts_throw_intrinsic_error(
     )
 }
 
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`. Both
+/// remain valid and unaliased for the full call.
+///
+/// `bamts_array_get_number(frame, array, index, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_array_get_number(
+    frame: *mut ShadowFrame,
+    array: u64,
+    index: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::ArrayGetNumber {
+            array: Value::from_bits(array),
+            index: Value::from_bits(index),
+        },
+    )
+}
+
 impl NativeHelper {
     /// The address of the extern "C" wrapper generated code calls.
     ///
@@ -2259,6 +2295,7 @@ impl NativeHelper {
             NativeHelper::GetTemplateObject => bamts_get_template_object as *const u8,
             NativeHelper::RequireGlobalBinding => bamts_require_global_binding as *const u8,
             NativeHelper::ThrowIntrinsicError => bamts_throw_intrinsic_error as *const u8,
+            NativeHelper::ArrayGetNumber => bamts_array_get_number as *const u8,
         }
     }
 }
@@ -2356,6 +2393,8 @@ const _: unsafe extern "C" fn(*mut ShadowFrame, u32, *mut Completion) -> u32 =
     bamts_require_global_binding; // 53
 const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u32, *mut Completion) -> u32 =
     bamts_throw_intrinsic_error; // 54
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
+    bamts_array_get_number; // 55
 
 // -- Native entry invocation seam --------------------------------------------
 
@@ -2385,6 +2424,39 @@ pub trait NativeEntryTable {
         frame: &mut ShadowFrame,
         out: &mut Completion,
     ) -> Result<CompletionTag, AbiError>;
+
+    /// Compiles one optimized artifact for `(module_id, function_id)` from the
+    /// operand-kind profile the engine recorded.
+    ///
+    /// Returns `false` when the backend cannot build an optimized entry. The
+    /// default refuses, which is the correct answer for every table whose
+    /// entries are already final: a linked AOT image or a test double never
+    /// promotes, so an AOT run keeps its published code.
+    #[must_use]
+    fn promote(
+        &self,
+        program: &bamts_bytecode::Program<bamts_bytecode::Verified>,
+        module_id: u32,
+        function_id: u32,
+        profile: &[crate::tiering::SiteProfile],
+    ) -> bool {
+        let _ = (program, module_id, function_id, profile);
+        false
+    }
+
+    /// Invokes the newest optimized entry for `(module_id, function_id)`.
+    ///
+    /// The default calls [`NativeEntryTable::invoke`], so a table that never
+    /// promotes answers every request with its only entry.
+    fn invoke_optimized(
+        &self,
+        module_id: u32,
+        function_id: u32,
+        frame: &mut ShadowFrame,
+        out: &mut Completion,
+    ) -> Result<CompletionTag, AbiError> {
+        self.invoke(module_id, function_id, frame, out)
+    }
 }
 
 /// Calls a raw native entry with unique references, mapping the raw `u32` result
@@ -3048,7 +3120,7 @@ mod tests {
     /// this crate under `host-jit`, so importing it would be a cycle), so this
     /// literal is the pinned contract; it must stay byte-identical to
     /// `bamts_codegen::Helper::{external_index, symbol}`.
-    const CODEGEN_HELPERS: [(u32, &str); 55] = [
+    const CODEGEN_HELPERS: [(u32, &str); 56] = [
         (0, "bamts_load_constant"),
         (1, "bamts_unary"),
         (2, "bamts_binary"),
@@ -3104,6 +3176,7 @@ mod tests {
         (52, "bamts_get_template_object"),
         (53, "bamts_require_global_binding"),
         (54, "bamts_throw_intrinsic_error"),
+        (55, "bamts_array_get_number"),
     ];
 
     /// A recording dispatcher: captures the last call and returns a fixed
@@ -3312,6 +3385,7 @@ mod tests {
             bamts_get_template_object as *const u8,
             bamts_require_global_binding as *const u8,
             bamts_throw_intrinsic_error as *const u8,
+            bamts_array_get_number as *const u8,
         ];
         assert_eq!(expected.len(), HELPER_COUNT as usize);
         for index in 0..HELPER_COUNT {
@@ -3452,6 +3526,14 @@ mod tests {
             }
             .helper(),
             NativeHelper::WithHasBinding
+        );
+        assert_eq!(
+            HelperCall::ArrayGetNumber {
+                array: Value::NULL,
+                index: Value::int32(2),
+            }
+            .helper(),
+            NativeHelper::ArrayGetNumber
         );
     }
 

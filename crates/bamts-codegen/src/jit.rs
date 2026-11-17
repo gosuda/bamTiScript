@@ -1,11 +1,17 @@
 //! Host-native Cranelift JIT backend.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::rc::Rc;
 use std::time::Instant;
 
-use bamts_bytecode::{Program as BytecodeProgram, Verified};
+use bamts_bytecode::{
+    FunctionId as BytecodeFunctionId, ModuleId, Program as BytecodeProgram, Verified,
+};
 use bamts_cancel::{CancellationToken, Cancelled};
+use bamts_native::tiering::SiteProfile;
 use bamts_native::{
     AbiError, Completion, CompletionTag, JitEntry, NativeEntryTable, NativeHelper, ShadowFrame,
     require_frame_module_id,
@@ -17,7 +23,8 @@ use cranelift_module::{FuncId, Linkage, Module, ModuleError, default_libcall_nam
 
 use crate::jit_memory::{FinalizedMemory, WxByteTotals, WxMemoryHandle, WxMemoryProvider};
 use crate::{
-    HELPER_NAMESPACE, Helper, LoweredProgram, ProgramLowerError, lower_program_with_cancel,
+    HELPER_NAMESPACE, Helper, LoweredFunction, LoweredProgram, ProgramLowerError,
+    lower_program_with_cancel,
 };
 
 /// A typed host-JIT compilation failure.
@@ -94,10 +101,23 @@ struct JitUnit {
     function: FuncId,
 }
 
+/// One compiled optimized artifact: its own module, the receipt that proves
+/// publication, and the single function it implements.
+struct OptimizedUnit {
+    module: JITModule,
+    _memory: FinalizedMemory,
+    function: FuncId,
+}
+
 /// A finalized host-native program. It owns its [`JITModule`] *and* the
 /// `FinalizedMemory` receipt proving every owned mapping reached its exact
 /// final protection. Entries are callable only through [`NativeEntryTable`],
 /// reached through the receipt-owning program; its module remains private.
+///
+/// The optimized tier appends one [`OptimizedUnit`] per promotion. Nothing is
+/// ever removed, so an activation that is still running an older unit keeps
+/// its code mapped; the engine's speculation budget bounds the list to
+/// `deopt_budget + 1` entries per unit.
 pub struct JitProgram {
     module: JITModule,
     /// Proof that every mapping finalized before this program was published.
@@ -106,6 +126,12 @@ pub struct JitProgram {
     program_bytes: Vec<u8>,
     entry_module: u32,
     entry_function: u32,
+    /// Every optimized artifact, in promotion order.
+    optimized: RefCell<Vec<Rc<OptimizedUnit>>>,
+    /// The newest optimized artifact for each `(module_id, function_id)`.
+    newest: RefCell<BTreeMap<(u32, u32), usize>>,
+    /// Test-only: compile optimized units whose guards always fail.
+    force_guard_failure: bool,
 }
 
 impl JitProgram {
@@ -146,6 +172,48 @@ impl NativeEntryTable for JitProgram {
         let entry = &self.functions[index];
         require_frame_module_id(frame, entry.module_id)?;
         Ok(JitEntry::new(&self.module, entry.function).invoke(frame, out))
+    }
+
+    fn promote(
+        &self,
+        program: &BytecodeProgram<Verified>,
+        module_id: u32,
+        function_id: u32,
+        profile: &[SiteProfile],
+    ) -> bool {
+        match self.compile_optimized(program, module_id, function_id, profile) {
+            Ok(unit) => {
+                let mut optimized = self.optimized.borrow_mut();
+                let index = optimized.len();
+                optimized.push(Rc::new(unit));
+                self.newest
+                    .borrow_mut()
+                    .insert((module_id, function_id), index);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn invoke_optimized(
+        &self,
+        module_id: u32,
+        function_id: u32,
+        frame: &mut ShadowFrame,
+        out: &mut Completion,
+    ) -> Result<CompletionTag, AbiError> {
+        let index = self.newest.borrow().get(&(module_id, function_id)).copied();
+        let Some(index) = index else {
+            return self.invoke(module_id, function_id, frame, out);
+        };
+        // Clone the `Rc` and drop the borrow before the call: a callee can
+        // promote (and so mutate `optimized`) while this entry runs.
+        let unit = {
+            let optimized = self.optimized.borrow();
+            Rc::clone(&optimized[index])
+        };
+        require_frame_module_id(frame, module_id)?;
+        Ok(JitEntry::new(&unit.module, unit.function).invoke(frame, out))
     }
 }
 
@@ -201,6 +269,17 @@ pub fn compile_jit_with_cancel(
     compile_jit_with_telemetry_cancel(bytecode, cancel).map(|(program, _telemetry)| program)
 }
 
+/// [`compile_jit`] whose optimized artifacts fail every speculation guard they
+/// contain. Differential tests use it to force the deoptimization path of each
+/// speculated site; a program built this way is otherwise identical.
+pub fn compile_jit_with_failing_guards(
+    bytecode: &BytecodeProgram<Verified>,
+) -> Result<JitProgram, JitError> {
+    let mut program = compile_jit(bytecode)?;
+    program.force_guard_failure = true;
+    Ok(program)
+}
+
 /// [`compile_jit_with_cancel`] plus compile-wall and page-rounded W^X memory
 /// telemetry.
 pub fn compile_jit_with_telemetry_cancel(
@@ -238,9 +317,19 @@ fn build_module(
     bytecode: &BytecodeProgram<Verified>,
     cancel: &CancellationToken,
 ) -> Result<(JITModule, WxMemoryHandle, Vec<u8>), JitError> {
+    build_module_with_flags(bytecode, cancel, &[])
+}
+
+/// [`build_module`] with explicit Cranelift flags, used to compile the
+/// optimized tier at `opt_level = "speed"`.
+fn build_module_with_flags(
+    bytecode: &BytecodeProgram<Verified>,
+    cancel: &CancellationToken,
+    flags: &[(&str, &str)],
+) -> Result<(JITModule, WxMemoryHandle, Vec<u8>), JitError> {
     cancel.check()?;
     let program_bytes = bytecode.encode();
-    let mut builder = JITBuilder::new(default_libcall_names())?;
+    let mut builder = JITBuilder::with_flags(flags, default_libcall_names())?;
     let (provider, memory) = WxMemoryProvider::new();
     // Install the W^X provider before construction so no executable mapping is
     // ever created through the default `SystemMemoryProvider` ceiling.
@@ -251,27 +340,56 @@ fn build_module(
 }
 
 fn compile_lowered(
-    mut module: JITModule,
+    module: JITModule,
     memory: WxMemoryHandle,
     lowered: LoweredProgram,
     program_bytes: Vec<u8>,
     cancel: &CancellationToken,
 ) -> Result<JitProgram, JitError> {
     cancel.check()?;
-    let units = crate::validate_lowered_program(&lowered)
+    crate::validate_lowered_program(&lowered)
         .map_err(|error| JitError::InvalidLoweredModule(error.to_string()))?;
-    let mut functions = Vec::with_capacity(units.len());
-    let mut declared_functions = std::collections::HashMap::with_capacity(units.len());
-    for (module_id, function_id) in units {
+    let entry_module = lowered.entry_module.get();
+    let entry_function = lowered.entry_function.get();
+    let mut lowered_functions = Vec::new();
+    for lowered_module in lowered.modules {
+        // `validate_lowered_program` proved the id equals the vector index.
+        let module_id = lowered_module.id.get();
+        for function in lowered_module.functions {
+            lowered_functions.push((module_id, function));
+        }
+    }
+    let (module, receipt, functions) = compile_units(module, &memory, lowered_functions, cancel)?;
+    Ok(JitProgram {
+        module,
+        _memory: receipt,
+        functions,
+        program_bytes,
+        entry_module,
+        entry_function,
+        optimized: RefCell::new(Vec::new()),
+        newest: RefCell::new(BTreeMap::new()),
+        force_guard_failure: false,
+    })
+}
+
+/// Declares, defines, and finalizes `functions` in `module`, returning the
+/// publication receipt and the module-qualified entry list.
+fn compile_units(
+    mut module: JITModule,
+    memory: &WxMemoryHandle,
+    functions_in: Vec<(u32, LoweredFunction)>,
+    cancel: &CancellationToken,
+) -> Result<(JITModule, FinalizedMemory, Vec<JitUnit>), JitError> {
+    let mut functions = Vec::with_capacity(functions_in.len());
+    for (module_id, function) in &functions_in {
         cancel.check()?;
-        let function = &lowered.modules[module_id as usize].functions[function_id as usize];
         let declared =
             module.declare_function(&function.symbol, Linkage::Local, &function.signature)?;
         cancel.check()?;
-        declared_functions.insert((module_id, function_id), declared);
         functions.push(JitUnit {
-            module_id,
-            function_id,
+            module_id: *module_id,
+            function_id: function.id.get(),
             function: declared,
         });
     }
@@ -289,27 +407,14 @@ fn compile_lowered(
         )?);
     }
 
-    for lowered_module in lowered.modules {
+    for (unit, (_, function)) in functions.iter().zip(functions_in) {
         cancel.check()?;
-        for function in lowered_module.functions {
-            cancel.check()?;
-            let declared = declared_functions
-                .get(&(lowered_module.id.get(), function.id.get()))
-                .copied()
-                .ok_or_else(|| {
-                    JitError::InvalidLoweredModule(format!(
-                        "missing declaration for module {} function {}",
-                        lowered_module.id.get(),
-                        function.id.get()
-                    ))
-                })?;
-            let mut clif = function.clif;
-            rebind_helper_imports(&mut clif, &helpers)?;
-            let mut context = Context::for_function(clif);
-            cancel.check()?;
-            module.define_function(declared, &mut context)?;
-            cancel.check()?;
-        }
+        let mut clif = function.clif;
+        rebind_helper_imports(&mut clif, &helpers)?;
+        let mut context = Context::for_function(clif);
+        cancel.check()?;
+        module.define_function(unit.function, &mut context)?;
+        cancel.check()?;
     }
     cancel.check()?;
     module.finalize_definitions()?;
@@ -321,15 +426,63 @@ fn compile_lowered(
     // infallible in practice. No receipt exists in `Writable` or `Freed`, so a
     // partially-finalized module (which errors above) can never publish.
     let receipt = memory.require_finalized();
+    Ok((module, receipt, functions))
+}
 
-    Ok(JitProgram {
-        module,
-        _memory: receipt,
-        functions,
-        program_bytes,
-        entry_module: lowered.entry_module.get(),
-        entry_function: lowered.entry_function.get(),
-    })
+impl JitProgram {
+    /// Compiles one optimized artifact for `(module_id, function_id)`.
+    ///
+    /// Each promotion gets its own module and receipt, so the earlier artifact
+    /// stays mapped for any activation still running it.
+    fn compile_optimized(
+        &self,
+        program: &BytecodeProgram<Verified>,
+        module_id: u32,
+        function_id: u32,
+        profile: &[SiteProfile],
+    ) -> Result<OptimizedUnit, JitError> {
+        let cancel = CancellationToken::new();
+        let module = program.module(ModuleId::new(module_id)).ok_or_else(|| {
+            JitError::InvalidLoweredModule(format!("promotion names unknown module {module_id}"))
+        })?;
+        let function = module
+            .code
+            .functions()
+            .get(function_id as usize)
+            .ok_or_else(|| {
+                JitError::InvalidLoweredModule(format!(
+                    "promotion names unknown function {module_id}:{function_id}"
+                ))
+            })?;
+        let (jit_module, memory, _bytes) =
+            build_module_with_flags(program, &cancel, &[("opt_level", "speed")])?;
+        let lowered = crate::lower_speculative_function(
+            ModuleId::new(module_id),
+            BytecodeFunctionId::new(function_id),
+            function,
+            profile,
+            jit_module.target_config(),
+            &cancel,
+            self.force_guard_failure,
+        )
+        .map_err(|kind| {
+            JitError::Lower(ProgramLowerError {
+                module: ModuleId::new(module_id),
+                kind,
+            })
+        })?;
+        let (jit_module, receipt, units) =
+            compile_units(jit_module, &memory, vec![(module_id, lowered)], &cancel)?;
+        let unit = units
+            .into_iter()
+            .next()
+            .ok_or_else(|| JitError::InvalidLoweredModule("optimized unit is missing".into()))?;
+        Ok(OptimizedUnit {
+            module: jit_module,
+            _memory: receipt,
+            function: unit.function,
+        })
+    }
 }
 
 fn rebind_helper_imports(clif: &mut Function, helpers: &[FuncId]) -> Result<(), JitError> {
@@ -426,6 +579,7 @@ fn helper_address(helper: Helper) -> *const u8 {
         Helper::GetTemplateObject => bamts_native::bamts_get_template_object as *const u8,
         Helper::RequireGlobalBinding => bamts_native::bamts_require_global_binding as *const u8,
         Helper::ThrowIntrinsicError => bamts_native::bamts_throw_intrinsic_error as *const u8,
+        Helper::ArrayGetNumber => bamts_native::bamts_array_get_number as *const u8,
     }
 }
 
