@@ -336,7 +336,10 @@ mod tests {
             &options,
         );
         let code = output.javascript.expect("JavaScript output").code;
-        assert!(code.contains("function __assign"), "{code}");
+        assert!(
+            code.contains("var __assign = (this && this.__assign) ||"),
+            "{code}"
+        );
         assert!(code.contains("React.createElement"), "{code}");
         assert!(!code.contains("<Box"), "{code}");
     }
