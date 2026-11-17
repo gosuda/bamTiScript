@@ -2078,7 +2078,11 @@ pub fn emit_javascript_baseline(
     let mut out = format!("//// [{logical_path}] ////\n\n");
     let units: Vec<_> = case.reached_units().collect();
     for (unit, _) in &units {
-        out.push_str(&format!("//// [{}]\n", unit_basename(&unit.virtual_path)));
+        let name = unit_basename(&unit.virtual_path);
+        if name.eq_ignore_ascii_case("tsconfig.json") {
+            continue;
+        }
+        out.push_str(&format!("//// [{name}]\n"));
         out.push_str(&unit.text);
     }
     out.push_str("\n\n");
@@ -6599,6 +6603,27 @@ let x = b1;
             "framed as {emitted:?}"
         );
         assert_eq!(compare_js_emit(&emitted, &emitted), FacetVerdict::Pass);
+    }
+
+    /// Authority: `configFileExtendsAsList` and `compositeWithNodeModulesSourceFile`
+    /// echo `tsconfig1.json` and `index.ts` but not the `tsconfig.json` they run
+    /// under; no emit baseline with a `tsconfig.json` unit echoes it.
+    #[test]
+    fn javascript_baseline_leaves_the_tsconfig_unit_out_of_the_echo() {
+        let logical = "tests/cases/compiler/configPin.ts";
+        let case_text = "// @filename: /tsconfig.json\n{}\n\n// @filename: /a.ts\nvar a = 1;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case_frontend(
+            &units,
+            &entry,
+            &CasePragmas::default(),
+            FrontendMode::JavaScript,
+        )
+        .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        assert!(emitted.contains("//// [a.ts]\nvar a = 1;"), "{emitted}");
+        assert!(!emitted.contains("tsconfig.json"), "{emitted}");
     }
 
     #[test]
