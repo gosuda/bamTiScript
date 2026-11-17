@@ -549,6 +549,8 @@ pub(crate) struct PrintSource<'a> {
     /// Prelude text that prints after a leading hoisted temporary declaration:
     /// tsc declares `var _a;` before the CommonJS `__esModule` marker.
     pub(crate) prelude_tail: Option<&'a str>,
+    /// Comma sequences that print one element per line.
+    pub(crate) expanded_sequences: Option<&'a BTreeSet<NodeId>>,
 }
 
 /// Print context for a braced block. Carries two tsc behaviors that split on
@@ -635,6 +637,7 @@ pub(crate) fn print(
             synthesized_floor: u32::MAX,
             inline_lines: None,
             prelude_tail: None,
+            expanded_sequences: None,
         },
         model,
         options,
@@ -662,6 +665,7 @@ pub(crate) fn print_with_jsx_plan(
         synthesized_floor,
         inline_lines,
         prelude_tail,
+        expanded_sequences,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
         let mut builder = SourceMapBuilder::new()
@@ -727,6 +731,7 @@ pub(crate) fn print_with_jsx_plan(
         emitted_module_syntax: false,
         inline_lines,
         prelude_tail,
+        expanded_sequences,
         temp_names: TempNames::new(authored_identifiers(file, original_content)),
     };
     if let Some(prelude) = prelude.filter(|prelude| !prelude.is_empty()) {
@@ -787,6 +792,7 @@ pub(crate) fn print_json_value(
         synthesized_floor,
         inline_lines,
         prelude_tail: _,
+        expanded_sequences,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
         let mut builder = SourceMapBuilder::new().with_sources_content(options.inline_sources);
@@ -847,6 +853,7 @@ pub(crate) fn print_json_value(
         emitted_module_syntax: false,
         inline_lines,
         prelude_tail: None,
+        expanded_sequences,
         temp_names: TempNames::new(HashSet::new()),
     };
     emitter.emit_expression_prec(expression, 0);
@@ -1025,6 +1032,7 @@ struct Emitter<'a> {
     emitted_module_syntax: bool,
     inline_lines: Option<&'a HashMap<NodeId, String>>,
     prelude_tail: Option<&'a str>,
+    expanded_sequences: Option<&'a BTreeSet<NodeId>>,
     /// Final names for the rewriter's temporary placeholders.
     temp_names: TempNames,
 }
@@ -4147,15 +4155,9 @@ impl<'a> Emitter<'a> {
         let Expression::Sequence(sequence) = expression.data() else {
             unreachable!("emit_sequence takes a sequence expression");
         };
-        let lowered = self.is_synthesized(expression.id());
-        let multiline = lowered
-            && sequence.expressions.iter().any(|element| {
-                matches!(
-                    element.data(),
-                    Expression::Assignment(assignment)
-                        if matches!(assignment.right.data(), Expression::Class(_))
-                )
-            });
+        let multiline = self
+            .expanded_sequences
+            .is_some_and(|sequences| sequences.contains(&expression.id()));
         if !multiline {
             let mut previous_end: Option<Utf16Pos> = None;
             for element in sequence.expressions.iter() {
@@ -8962,7 +8964,7 @@ var c = () => 1;
         let code = &javascript(&output).code;
         assert!(code.contains("__generator(this,"), "lowers: {code}");
         assert!(
-            code.contains("*m() {"),
+            code.contains("m: function* () {"),
             "generator method cloned intact: {code}"
         );
         assert!(code.contains("yield 1;"), "method owns its yield: {code}");
@@ -8971,9 +8973,10 @@ var c = () => 1;
             1,
             "one machine resume: {code}"
         );
-        assert!(
-            !code.contains("function* ("),
-            "inner function not native: {code}"
+        assert_eq!(
+            code.matches("function* (").count(),
+            1,
+            "only the method stays native: {code}"
         );
     }
 
