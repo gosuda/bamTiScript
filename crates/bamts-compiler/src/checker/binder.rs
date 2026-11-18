@@ -9787,6 +9787,34 @@ impl<'src> Binder<'src> {
         guards
     }
 
+    /// Guards one `switch` case proves, with every guarded symbol's declared
+    /// type registered so the refinement has a base to narrow.
+    fn switch_case_guards(
+        &mut self,
+        discriminant: &'src Expr,
+        test: &'src Expr,
+        negated: bool,
+    ) -> Vec<NarrowingGuard> {
+        let resolver = BinderGuardResolver {
+            references: &self.references,
+            node_types: &self.node_types,
+            source: self.source,
+            fallback: self.types.any(),
+        };
+        let mut narrowing = NarrowingContext::new_with_cancel(
+            &mut self.types,
+            &mut self.flow_facts,
+            self.cancel.clone(),
+        );
+        let guards = narrowing.case_guards(discriminant, test, &resolver, negated);
+        for guard in &guards {
+            let symbol = guard.reference().root_symbol();
+            narrowing.declare(symbol, self.symbol_types[symbol.get() as usize]);
+        }
+        guards
+    }
+
+
     /// Forks `parent` and refines the fork by `guards`.
     fn branch_guarded(&mut self, parent: FlowNodeId, guards: &[NarrowingGuard]) -> FlowNodeId {
         let mut narrowing = NarrowingContext::new_with_cancel(
@@ -13280,9 +13308,45 @@ impl<'src> Binder<'src> {
                     self.publish_statement_class_shapes(&case.data().consequent, child);
                 }
                 let entry_super_flow = self.super_flow;
+                let parent = self.flow;
+                let mut negated_guards = Vec::new();
+                let mut case_polarities = Vec::with_capacity(statement.cases.len());
                 for case in &statement.cases {
-                    self.check_bound_statements(&case.data().consequent, child);
+                    let Some(test) = case.data().test.as_ref() else {
+                        case_polarities.push(None);
+                        continue;
+                    };
+                    let positive = self.switch_case_guards(&statement.discriminant, test, false);
+                    let negated = self.switch_case_guards(&statement.discriminant, test, true);
+                    negated_guards.extend(negated.iter().cloned());
+                    case_polarities.push(Some((positive, negated)));
+                }
+                let mut live = Vec::new();
+                let has_default = case_polarities.iter().any(Option::is_none);
+                for (case, polarity) in statement.cases.iter().zip(case_polarities) {
+                    let active: &[NarrowingGuard] = match &polarity {
+                        Some((positive, _)) => positive,
+                        None => &negated_guards,
+                    };
+                    let end = self.in_branch(parent, active, |binder| {
+                        binder.check_bound_statements(&case.data().consequent, child);
+                    });
                     self.super_flow = entry_super_flow;
+                    if !case
+                        .data()
+                        .consequent
+                        .iter()
+                        .any(|statement| Self::switch_case_diverges(statement.data()))
+                    {
+                        live.push(end);
+                    }
+                }
+                if !has_default {
+                    live.push(self.branch_guarded(parent, &negated_guards));
+                }
+                self.join_flow(parent, &live);
+                if live.is_empty() {
+                    self.flow = self.branch_guarded(parent, &negated_guards);
                 }
             }
             Statement::For(for_statement) => {
@@ -16205,6 +16269,30 @@ impl<'src> Binder<'src> {
             Statement::DoWhile(do_while) => {
                 Self::is_true_literal(do_while.test.data())
                     && !Self::loop_body_has_unlabeled_break(do_while.body.data(), 0)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a `switch` case consequent leaves the guarded function:
+    /// `break` only leaves the `switch` itself and `continue` an enclosing
+    /// loop, so both still join their narrowed facts into the code after the
+    /// `switch`.
+    fn switch_case_diverges(statement: &Statement) -> bool {
+        match statement {
+            Statement::Return(_) | Statement::Throw(_) => true,
+            Statement::Block(block) => block
+                .data()
+                .statements
+                .iter()
+                .any(|inner| Self::switch_case_diverges(inner.data())),
+            Statement::Labeled(labeled) => Self::switch_case_diverges(labeled.body.data()),
+            Statement::If(if_stmt) => {
+                Self::switch_case_diverges(if_stmt.consequent.data())
+                    && if_stmt
+                        .alternate
+                        .as_ref()
+                        .is_some_and(|alt| Self::switch_case_diverges(alt.data()))
             }
             _ => false,
         }
@@ -27875,6 +27963,46 @@ mod tests {
             })
             .count();
         assert_eq!(relevant, 3, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn switch_on_typeof_narrows_each_case() {
+        let (_, diagnostics) = bound_strict(
+            "declare function assertNumber(x: number): void;\n\
+             declare function assertNever(x: never): void;\n\
+             function test(x: number | string): void {\n\
+             switch (typeof x) {\n\
+             case 'number': assertNumber(x); return;\n\
+             case 'string': assertNumber(x); return;\n\
+             }\n\
+             assertNever(x);\n\
+             }\n",
+        );
+        let relevant = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == ARGUMENT_NOT_ASSIGNABLE)
+            .count();
+        assert_eq!(relevant, 1, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn switch_on_discriminant_narrows_union_variants() {
+        let (_, diagnostics) = bound_strict(
+            "declare function useA(x: { kind: 'A' }): void;\n\
+             declare function never(x: never): void;\n\
+             function test(c: { kind: 'A' } | { kind: 'B' }): void {\n\
+             switch (c.kind) {\n\
+             case 'A': useA(c); break;\n\
+             case 'B': useA(c); break;\n\
+             default: never(c);\n\
+             }\n\
+             }\n",
+        );
+        let relevant = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == ARGUMENT_NOT_ASSIGNABLE)
+            .count();
+        assert_eq!(relevant, 1, "{diagnostics:?}");
     }
 
     #[test]
