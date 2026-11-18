@@ -4393,6 +4393,7 @@ impl<'a> Rewriter<'a> {
         } else if let Some(heritage) = class.extends.as_mut() {
             *heritage.expression = self.rewrite_expr(&heritage.expression);
         }
+        let mut constructor_slot = 0;
         for member in &class.members {
             match member.data() {
                 ClassMember::Constructor(ctor) => {
@@ -4410,6 +4411,7 @@ impl<'a> Rewriter<'a> {
                     ctor_this_captured |= !derived && captured.is_some();
                     ctor.parameters = parameters;
                     ctor.body = self.node(ctor.body.range(), Block { statements });
+                    constructor_slot = members.len();
                     constructor = Some(self.node(member.range(), ClassMember::Constructor(ctor)));
                 }
                 ClassMember::Property(property)
@@ -4549,7 +4551,12 @@ impl<'a> Rewriter<'a> {
         );
         if matches!(mode, FieldMode::Native) {
             if let Some(ctor) = constructor {
-                members.insert(0, ctor);
+                let ctor = if derived {
+                    self.assign_parameter_properties_after_super(ctor)
+                } else {
+                    ctor
+                };
+                members.insert(constructor_slot, ctor);
             }
         } else {
             let this_receiver = (es5 && derived).then(|| self.capture_name("_this"));
@@ -4563,6 +4570,8 @@ impl<'a> Rewriter<'a> {
             ) {
                 let ctor = if ctor_this_captured {
                     self.declare_constructor_this(ctor)
+                } else if derived && !es5 {
+                    self.assign_parameter_properties_after_super(ctor)
                 } else {
                     ctor
                 };
@@ -4734,6 +4743,57 @@ impl<'a> Rewriter<'a> {
                 ))
             }
         }
+    }
+
+    /// `this.y = y;` cannot run before `super()`, so a derived constructor
+    /// takes its parameter property assignments after each super call
+    /// instead of at the head of its body.
+    fn assign_parameter_properties_after_super(
+        &mut self,
+        constructor: ClassMemberNode,
+    ) -> ClassMemberNode {
+        let ClassMember::Constructor(ctor) = constructor.data() else {
+            return constructor;
+        };
+        let mut parameters = ctor.parameters.clone();
+        let mut assignments = Vec::new();
+        for parameter in &mut parameters {
+            let data = parameter.data();
+            let modifiers = &data.modifiers;
+            if modifiers.accessibility.is_none() && !modifiers.is_readonly && !modifiers.is_override
+            {
+                continue;
+            }
+            let BindingPattern::Identifier(name) = data.binding.data() else {
+                continue;
+            };
+            let field = FieldInit {
+                name: PropertyName::Identifier(name.clone()),
+                init: self.syn_node(name.range(), Expression::Identifier(name.clone())),
+                range: parameter.range(),
+            };
+            assignments.push(self.field_statement(None, &field, FieldMode::Assign));
+            *parameter = self.syn_node(
+                parameter.range(),
+                Parameter {
+                    modifiers: ParameterModifiers::default(),
+                    ..data.clone()
+                },
+            );
+        }
+        if assignments.is_empty() {
+            return constructor;
+        }
+        let statements = self.splice_after_super(&ctor.body.data().statements, &assignments);
+        let body = self.syn_node(ctor.body.range(), Block { statements });
+        self.syn_node(
+            constructor.range(),
+            ClassMember::Constructor(ConstructorDeclaration {
+                body,
+                parameters,
+                ..ctor.clone()
+            }),
+        )
     }
 
     fn splice_after_super(&mut self, statements: &[Stmt], inits: &[Stmt]) -> Vec<Stmt> {
@@ -16231,6 +16291,17 @@ console.log(JSON.stringify([bar, bar4, log]));
         let directive = code.find("ngInject").expect("directive survives");
         let super_call = code.find("super(").expect("super call survives");
         assert!(directive < super_call, "{code}");
+    }
+    #[test]
+    fn a_parameter_property_is_assigned_after_the_super_call() {
+        let output = emit_at(
+            "class B extends A {\n    constructor(public y: number) {\n        log();\n        super();\n        log();\n    }\n}\n",
+            ScriptTarget::Es2015,
+        );
+        assert_eq!(
+            javascript(&output),
+            "class B extends A {\n    constructor(y) {\n        log();\n        super();\n        this.y = y;\n        log();\n    }\n}\n"
+        );
     }
     #[test]
     fn transformed_output_is_byte_stable() {
