@@ -254,6 +254,9 @@ pub struct ResolvedProgram {
     always_strict: bool,
     no_emit_helpers: bool,
     remove_comments: bool,
+    source_map: bool,
+    inline_source_map: bool,
+    inline_sources: bool,
     use_define_for_class_fields: Option<bool>,
     experimental_decorators: bool,
     emit_decorator_metadata: bool,
@@ -278,6 +281,21 @@ impl ResolvedProgram {
     #[must_use]
     pub const fn use_define_for_class_fields(&self) -> Option<bool> {
         self.use_define_for_class_fields
+    }
+
+    #[must_use]
+    pub const fn source_map(&self) -> bool {
+        self.source_map
+    }
+
+    #[must_use]
+    pub const fn inline_source_map(&self) -> bool {
+        self.inline_source_map
+    }
+
+    #[must_use]
+    pub const fn inline_sources(&self) -> bool {
+        self.inline_sources
     }
 
     #[must_use]
@@ -822,6 +840,9 @@ impl ProgramLoader {
             always_strict: self.options.always_strict(),
             no_emit_helpers: self.options.no_emit_helpers(),
             remove_comments: self.options.remove_comments(),
+            source_map: self.options.source_map(),
+            inline_source_map: self.options.inline_source_map(),
+            inline_sources: self.options.inline_sources(),
             use_define_for_class_fields: self.options.use_define_for_class_fields(),
             experimental_decorators: self.options.experimental_decorators(),
             emit_decorator_metadata: self.options.emit_decorator_metadata(),
