@@ -202,9 +202,18 @@ pub struct CheckedCase {
     /// Compiler options used for this compilation, retained for the trace
     /// comparator to pass to `resolve_module_name_with_trace`.
     options: bamts_compiler::project::CompilerOptions,
+    /// The directory `fullEmitPaths` prints in front of every output name.
+    emit_directory: Option<String>,
 }
 
 impl CheckedCase {
+    /// The `outDir` printed before each output section name, when the case
+    /// asks for full emit paths.
+    #[must_use]
+    pub fn emit_directory(&self) -> Option<&str> {
+        self.emit_directory.as_deref()
+    }
+
     /// The frontend output of one unit, when the program reached it.
     #[must_use]
     pub fn module_output(&self, unit: &CaseUnit) -> Option<&FrontendOutput> {
@@ -1206,6 +1215,7 @@ pub fn compile_case_frontend(
         output,
         program,
         options,
+        emit_directory: full_emit_directory(pragmas),
     })
 }
 
@@ -2071,6 +2081,60 @@ pub(crate) fn observe_javascript(
 /// then writes no `.js` baseline at all.
 const NO_JAVASCRIPT_OUTPUT: &str = "javascript emit reached no case units";
 
+/// The directory components every emitting unit shares, which tsc drops from
+/// the paths under `outDir`.
+fn common_directory<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut common: Option<Vec<&str>> = None;
+    for path in paths {
+        let mut parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        parts.pop();
+        common = Some(match common {
+            None => parts,
+            Some(previous) => previous
+                .into_iter()
+                .zip(parts)
+                .take_while(|(left, right)| left == right)
+                .map(|(left, _)| left)
+                .collect(),
+        });
+    }
+    common.unwrap_or_default()
+}
+
+/// The output path `fullEmitPaths` prints: `outDir`, the unit's directories
+/// below the common source directory, then the section name.
+fn emitted_path(directory: &str, common: &[&str], unit_path: &str, section: &str) -> String {
+    let parts: Vec<&str> = unit_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let below = parts
+        .get(common.len()..parts.len().saturating_sub(1))
+        .unwrap_or_default();
+    let mut path = String::from(directory);
+    for part in below {
+        path.push('/');
+        path.push_str(part);
+    }
+    path.push('/');
+    path.push_str(section);
+    path
+}
+
+/// The `outDir` that `fullEmitPaths` prints in front of every section name.
+fn full_emit_directory(pragmas: &CasePragmas) -> Option<String> {
+    let value = |name: &str| {
+        pragmas
+            .options
+            .iter()
+            .find(|(key, _)| key == name)
+            .and_then(|(_, values)| values.first())
+    };
+    value("fullemitpaths").filter(|flag| flag.eq_ignore_ascii_case("true"))?;
+    let directory = value("outdir")?.trim_end_matches('/');
+    Some(directory.strip_prefix("./").unwrap_or(directory).to_owned())
+}
+
 pub fn emit_javascript_baseline(
     case: &CheckedCase,
     logical_path: &str,
@@ -2106,6 +2170,17 @@ pub fn emit_javascript_baseline(
     let mut outputs = 0usize;
     let imported = runtime_imported_source_ids(case);
     let emitted = case.reached_units_in_module_order();
+    let emit_directory = case.emit_directory();
+    let common = common_directory(
+        emitted
+            .iter()
+            .filter(|(unit, _)| !is_declaration_input_name(&unit_basename(&unit.virtual_path)))
+            .map(|(unit, _)| unit.virtual_path.as_str()),
+    );
+    let placed = |section: &str, unit: &CaseUnit| match emit_directory {
+        Some(directory) => emitted_path(directory, &common, &unit.virtual_path, section),
+        None => section.to_owned(),
+    };
     if !options.emit_declaration_only() {
         for (unit, output) in &emitted {
             let name = unit_basename(&unit.virtual_path);
@@ -2137,7 +2212,7 @@ pub fn emit_javascript_baseline(
                     .and_then(|emit| emit.javascript.as_ref())
                     .map(|javascript| javascript.code.as_str())
                     .unwrap_or("");
-                push_output_section(&mut out, &name, body);
+                push_output_section(&mut out, &placed(&name, unit), body);
                 outputs += 1;
                 continue;
             }
@@ -2156,7 +2231,7 @@ pub fn emit_javascript_baseline(
             let js_name = output_section_name(&name, bundle.as_deref(), |name| {
                 output_extension(name, jsx_preserve).to_owned()
             });
-            push_output_section(&mut out, &js_name, &javascript.code);
+            push_output_section(&mut out, &placed(&js_name, unit), &javascript.code);
             outputs += 1;
         }
     }
@@ -2174,7 +2249,7 @@ pub fn emit_javascript_baseline(
             else {
                 continue;
             };
-            declarations.push((section, declaration));
+            declarations.push((placed(&section, unit), declaration));
         }
         if !declarations.is_empty() {
             // Upstream writes the `\r\n\r\n` block separator and then the
