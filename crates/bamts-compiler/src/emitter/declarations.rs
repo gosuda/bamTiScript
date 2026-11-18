@@ -94,7 +94,7 @@ pub fn emit_declarations(
     if options.isolated_declarations {
         collect_isolated_errors(file, &mut diagnostics);
     }
-    let rewritten = rewrite_file(file, &mut diagnostics);
+    let rewritten = rewrite_file(file, model, &mut diagnostics);
     let mut output = print(
         &rewritten,
         model,
@@ -119,8 +119,12 @@ pub fn emit_declarations(
     output
 }
 
-fn rewrite_file(file: &SourceFile, diagnostics: &mut Vec<Diagnostic>) -> SourceFile {
-    let statements = rewrite_statements(file.statements(), diagnostics);
+fn rewrite_file(
+    file: &SourceFile,
+    model: &SemanticModel,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> SourceFile {
+    let statements = rewrite_statements(file.statements(), model, diagnostics);
     SourceFile::new(
         file.id(),
         file.source_id(),
@@ -134,22 +138,53 @@ fn rewrite_file(file: &SourceFile, diagnostics: &mut Vec<Diagnostic>) -> SourceF
     )
 }
 
-fn rewrite_statements(statements: &[Stmt], diagnostics: &mut Vec<Diagnostic>) -> Vec<Stmt> {
+fn rewrite_statements(
+    statements: &[Stmt],
+    model: &SemanticModel,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<Stmt> {
     statements
         .iter()
-        .map(|statement| rewrite_statement(statement, diagnostics))
+        .filter(|statement| !is_overload_implementation(statement, model))
+        .map(|statement| rewrite_statement(statement, model, diagnostics))
         .collect()
 }
 
-fn rewrite_statement(statement: &Stmt, diagnostics: &mut Vec<Diagnostic>) -> Stmt {
+/// A function declaration, `export`-wrapped or plain, whose name node the
+/// checker marked as the implementation of an overload group. The `.d.ts`
+/// keeps only the overload signatures.
+fn is_overload_implementation(statement: &Stmt, model: &SemanticModel) -> bool {
+    let function = match statement.data() {
+        Statement::Function(function) => Some(&function.function),
+        Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner))) => {
+            match inner.data() {
+                Statement::Function(function) => Some(&function.function),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    function.is_some_and(|function| {
+        function
+            .name
+            .as_ref()
+            .is_some_and(|name| model.is_overload_implementation(name.id()))
+    })
+}
+
+fn rewrite_statement(
+    statement: &Stmt,
+    model: &SemanticModel,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Stmt {
     match statement.data() {
         Statement::Class(class) => Node::new(
             statement.id(),
             statement.range(),
-            Statement::Class(rewrite_class(class, diagnostics)),
+            Statement::Class(rewrite_class(class, model, diagnostics)),
         ),
         Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner))) => {
-            let inner = rewrite_statement(inner, diagnostics);
+            let inner = rewrite_statement(inner, model, diagnostics);
             Node::new(
                 statement.id(),
                 statement.range(),
@@ -161,7 +196,7 @@ fn rewrite_statement(statement: &Stmt, diagnostics: &mut Vec<Diagnostic>) -> Stm
         Statement::Export(ExportDeclaration::Default(default)) => {
             let value = match &default.value {
                 ExportDefaultValue::Class(class) => {
-                    ExportDefaultValue::Class(rewrite_class(class, diagnostics))
+                    ExportDefaultValue::Class(rewrite_class(class, model, diagnostics))
                 }
                 other => other.clone(),
             };
@@ -176,15 +211,39 @@ fn rewrite_statement(statement: &Stmt, diagnostics: &mut Vec<Diagnostic>) -> Stm
         Statement::Declare(inner) => Node::new(
             statement.id(),
             statement.range(),
-            Statement::Declare(Box::new(rewrite_statement(inner, diagnostics))),
+            Statement::Declare(Box::new(rewrite_statement(inner, model, diagnostics))),
         ),
+        Statement::Namespace(namespace) => {
+            let statements =
+                rewrite_statements(&namespace.body.data().statements, model, diagnostics);
+            let body = Node::new(
+                namespace.body.id(),
+                namespace.body.range(),
+                crate::syntax::Block { statements },
+            );
+            Node::new(
+                statement.id(),
+                statement.range(),
+                Statement::Namespace(crate::syntax::NamespaceDeclaration {
+                    name: namespace.name.clone(),
+                    body,
+                }),
+            )
+        }
         _ => statement.clone(),
     }
 }
 
-fn rewrite_class(class: &ClassDeclaration, diagnostics: &mut Vec<Diagnostic>) -> ClassDeclaration {
+fn rewrite_class(
+    class: &ClassDeclaration,
+    model: &SemanticModel,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> ClassDeclaration {
     let mut members = Vec::new();
     for member in &class.members {
+        if model.is_overload_implementation(member.id()) {
+            continue;
+        }
         match member.data() {
             ClassMember::Constructor(constructor) => {
                 let (properties, constructor) =
@@ -415,6 +474,42 @@ mod tests {
         assert_eq!(
             output.declaration.as_ref().unwrap().code,
             "export declare function f(x: number): number;\n"
+        );
+    }
+
+    #[test]
+    fn unannotated_members_print_their_inferred_return_types() {
+        let output = emit_dts(
+            "export class C {\n    m() { }\n    get p() { return 10; }\n    static get s() { return 10; }\n    set p(value: number) { }\n}\nexport function f() { }\n",
+            DeclarationOptions::default(),
+        );
+        assert_eq!(
+            output.declaration.as_ref().unwrap().code,
+            "export declare class C {\n    m(): void;\n    get p(): number;\n    static get s(): number;\n    set p(value: number);\n}\nexport declare function f(): void;\n"
+        );
+    }
+
+    #[test]
+    fn an_overload_implementation_is_left_out() {
+        let output = emit_dts(
+            "export class C {\n    constructor(a: string);\n    constructor(a: number);\n    constructor(a: any) { }\n    m(a: string): string;\n    m(a: any): any { return a; }\n}\nexport function f(a: string): string;\nexport function f(a: any): any { return a; }\n",
+            DeclarationOptions::default(),
+        );
+        assert_eq!(
+            output.declaration.as_ref().unwrap().code,
+            "export declare class C {\n    constructor(a: string);\n    constructor(a: number);\n    m(a: string): string;\n}\nexport declare function f(a: string): string;\n"
+        );
+    }
+
+    #[test]
+    fn an_untyped_rest_parameter_is_an_any_array() {
+        let output = emit_dts(
+            "export function f(a: any, ...rest): a is number { return true; }\n",
+            DeclarationOptions::default(),
+        );
+        assert_eq!(
+            output.declaration.as_ref().unwrap().code,
+            "export declare function f(a: any, ...rest: any[]): a is number;\n"
         );
     }
 

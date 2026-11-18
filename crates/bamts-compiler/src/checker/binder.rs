@@ -5661,6 +5661,13 @@ pub struct SemanticModel {
     /// bindings, used by declaration emit to resolve unqualified names
     /// inside namespace bodies.
     namespace_local_scopes: HashMap<NodeId, ScopeId>,
+    /// Inferred return types of unannotated class methods and getters, keyed
+    /// by the member syntax node (binder `inferred_member_returns`).
+    inferred_member_returns: HashMap<NodeId, TypeId>,
+    /// Syntax nodes of overload-group implementations (binder
+    /// `overload_implementations`): class members key by the member node,
+    /// function declarations by their name node.
+    overload_implementations: HashSet<NodeId>,
 }
 
 impl SemanticModel {
@@ -5914,6 +5921,24 @@ impl SemanticModel {
     #[must_use]
     pub fn namespace_local_scope(&self, id: NodeId) -> Option<ScopeId> {
         self.namespace_local_scopes.get(&id).copied()
+    }
+
+    /// Returns the checker's inferred return type for a class method or
+    /// getter that was declared without a written return annotation, keyed by
+    /// the member declaration node. Declaration emit prints it where the
+    /// baseline shows `method(): void`.
+    #[must_use]
+    pub fn member_inferred_return(&self, node: NodeId) -> Option<TypeId> {
+        self.inferred_member_returns.get(&node).copied()
+    }
+
+    /// Returns whether a function-like declaration is the implementation of
+    /// an overload group, so declaration emit can drop it and keep only the
+    /// overload signatures. Class members key by the member declaration node,
+    /// function declarations by their name node.
+    #[must_use]
+    pub fn is_overload_implementation(&self, node: NodeId) -> bool {
+        self.overload_implementations.contains(&node)
     }
 }
 
@@ -6212,6 +6237,16 @@ pub(crate) struct Binder<'src> {
     /// Declaration symbol for each named class syntax node. Duplicate names keep
     /// distinct recovery symbols while scope lookup keeps the first binding.
     class_declaration_symbols: HashMap<NodeId, SymbolId>,
+    /// Inferred return type of each class method or getter declared without a
+    /// written return annotation, keyed by the member syntax node. Feeds
+    /// declaration emit; setters are never recorded because a `.d.ts` setter
+    /// has no return type.
+    inferred_member_returns: HashMap<NodeId, TypeId>,
+    /// Syntax nodes of overload-group implementations: class members key by
+    /// the member node, function declarations by their name node. A
+    /// declaration file prints only the overload signatures, so declaration
+    /// emit drops these nodes.
+    overload_implementations: HashSet<NodeId>,
     /// Enclosing class symbol for member-access authorization, innermost last.
     class_owner_stack: Vec<SymbolId>,
     /// Direct base class symbol for each class symbol, used for protected access.
@@ -6426,6 +6461,8 @@ impl<'src> Binder<'src> {
             class_header_scopes: HashMap::new(),
             class_declaration_symbols: HashMap::new(),
             class_owner_stack: Vec::new(),
+            inferred_member_returns: HashMap::new(),
+            overload_implementations: HashSet::new(),
             class_base_symbols: HashMap::new(),
             super_member_homes: Vec::new(),
             // demand-side JSX state lives in QueryFrame entries and super::jsx.
@@ -9626,6 +9663,8 @@ impl<'src> Binder<'src> {
             enum_constructor_types: std::mem::take(&mut self.enum_constructor_types),
             class_constructor_types: std::mem::take(&mut self.class_constructor_types),
             namespace_local_scopes: std::mem::take(&mut self.namespace_local_scopes),
+            inferred_member_returns: std::mem::take(&mut self.inferred_member_returns),
+            overload_implementations: std::mem::take(&mut self.overload_implementations),
         };
         let (enum_facts, diagnostics) = if let Some(installed) = installed_enum_facts {
             (
@@ -14326,6 +14365,12 @@ impl<'src> Binder<'src> {
                     unreachable!("function type constructor must intern a function signature");
                 };
                 self.overload_signatures[symbol.get() as usize].push(signature.clone());
+            } else if is_declaration
+                && function.body.is_some()
+                && !self.overload_signatures[symbol.get() as usize].is_empty()
+                && let Some(name) = &function.name
+            {
+                self.overload_implementations.insert(name.id());
             }
         }
         if let Some(body_id) = function.body.as_ref().and_then(FunctionBody::id) {
@@ -14993,8 +15038,23 @@ impl<'src> Binder<'src> {
             let ty = self.resolve_type(implemented, scope);
             implemented_types.push((ty, implemented.range()));
         }
+        let constructor_is_overloaded = class.members.iter().any(|member| {
+            matches!(
+                member.data(),
+                ClassMember::Method(method)
+                    if method.function.body.is_none()
+                        && matches!(
+                            &method.name,
+                            PropertyName::Identifier(name)
+                                if self.identifier_text(name).as_ref() == "constructor"
+                        )
+            )
+        });
         for member in &class.members {
-            self.resolve_class_member(member.data(), scope, ambient);
+            if constructor_is_overloaded && matches!(member.data(), ClassMember::Constructor(_)) {
+                self.overload_implementations.insert(member.id());
+            }
+            self.resolve_class_member(member, scope, ambient);
         }
         let instance_type = self.class_instance_type(class, scope, owner, ClassState::Final);
         let static_type = self.class_static_type(class, scope, instance_type);
@@ -15321,6 +15381,7 @@ impl<'src> Binder<'src> {
                                     overload_state.insert(name.clone(), true);
                                 } else if overload_state.get(&name).copied().unwrap_or(false) {
                                     overload_state.insert(name.clone(), false);
+                                    self.overload_implementations.insert(member.id());
                                     continue;
                                 }
                                 let signature_scope = self.class_method_signature_scope(
@@ -16354,8 +16415,13 @@ impl<'src> Binder<'src> {
         }
     }
 
-    fn resolve_class_member(&mut self, member: &'src ClassMember, scope: ScopeId, ambient: bool) {
-        match member {
+    fn resolve_class_member(
+        &mut self,
+        member: &'src crate::syntax::ClassMemberNode,
+        scope: ScopeId,
+        ambient: bool,
+    ) {
+        match member.data() {
             ClassMember::Method(method) => {
                 self.resolve_property_name(&method.name, scope);
                 self.check_set_accessor_parameter_initializer(
@@ -16416,11 +16482,21 @@ impl<'src> Binder<'src> {
                     this_type,
                     SuperMemberHome::ClassMember { derived, is_static },
                 );
-                if let Some(key) = self.property_key(&method.name)
-                    && let Some(&symbol) = self.scopes[scope.0 as usize].values.get(&key)
-                {
+                let symbol = self
+                    .property_key(&method.name)
+                    .and_then(|key| self.scopes[scope.0 as usize].values.get(&key).copied());
+                let infers_return = method.function.return_type.is_none()
+                    && method.function.body.is_some()
+                    && method.modifier != PropertyModifier::Set;
+                if symbol.is_some() || infers_return {
                     let type_id = self.type_of_function_like(&method.function, scope);
-                    self.symbol_types[symbol.get() as usize] = type_id;
+                    if let Some(symbol) = symbol {
+                        self.symbol_types[symbol.get() as usize] = type_id;
+                    }
+                    if infers_return && let Type::Function(signature) = self.types.get(type_id) {
+                        self.inferred_member_returns
+                            .insert(member.id(), signature.return_type());
+                    }
                 }
             }
             ClassMember::Constructor(constructor) => {

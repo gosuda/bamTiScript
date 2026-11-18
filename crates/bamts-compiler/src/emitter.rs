@@ -5625,7 +5625,7 @@ impl<'a> Emitter<'a> {
             if self.class_member_emits_decl(member.data()) {
                 self.emit_jsdoc_for_range(member.range());
             }
-            if self.emit_class_member_decl(member.data()) {
+            if self.emit_class_member_decl(member) {
                 self.newline();
             }
         }
@@ -5669,8 +5669,8 @@ impl<'a> Emitter<'a> {
         None
     }
 
-    fn emit_class_member_decl(&mut self, member: &ClassMember) -> bool {
-        match member {
+    fn emit_class_member_decl(&mut self, member: &ClassMemberNode) -> bool {
+        match member.data() {
             ClassMember::Constructor(constructor) => {
                 if let Some(accessibility) = constructor.modifiers.accessibility
                     && accessibility != Accessibility::Public
@@ -5719,6 +5719,13 @@ impl<'a> Emitter<'a> {
                 if let Some(return_type) = &method.function.return_type {
                     self.raw(": ");
                     self.emit_type(&return_type.data().type_node);
+                } else if let Some(inferred) = self.model.member_inferred_return(member.id()) {
+                    let rendered =
+                        render_type_declaration(self.model, inferred, self.current_indent_spaces());
+                    if !rendered.is_empty() {
+                        self.raw(": ");
+                        self.raw(&rendered);
+                    }
                 }
                 self.raw(";");
                 true
