@@ -6759,7 +6759,7 @@ mod tests {
             },
         )));
         let file = b.finish(vec![export_stmt]);
-        assert_eq!(emit_js(&file).code, "");
+        assert_eq!(emit_js(&file).code, "export {};\n");
     }
 
     #[test]
@@ -6837,7 +6837,7 @@ export default answer;
         assert!(parsed.diagnostics().is_empty());
 
         let output = emit_output(parsed.product(), &EmitOptions::default());
-        assert_eq!(javascript(&output).code, "");
+        assert_eq!(javascript(&output).code, "export {};\n");
     }
 
     #[test]

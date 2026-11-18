@@ -501,10 +501,11 @@ pub fn emit_transformed(
             inline_sources: options.inline_sources,
             remove_comments: options.remove_comments,
             verbatim_module_syntax: options.verbatim_module_syntax,
-            module_marker: is_module
+            module_marker: runtime_prelude.is_empty()
+                && is_module
                 && matches!(
-                    options.module_kind,
-                    Some(ModuleKind::Es2015 | ModuleKind::EsNext)
+                    effective_module_kind(options),
+                    ModuleKind::Es2015 | ModuleKind::EsNext
                 ),
         },
         names,
@@ -635,6 +636,18 @@ fn quote_module_specifier(module: &str) -> String {
     format!("\"{}\"", module.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// An unset `module` resolves the way upstream resolves it, from the target:
+/// CommonJS below ES2015 and ES modules at or above it.
+fn effective_module_kind(options: &TransformOptions) -> ModuleKind {
+    options
+        .module_kind
+        .unwrap_or(if options.target < ScriptTarget::Es2015 {
+            ModuleKind::CommonJs
+        } else {
+            ModuleKind::Es2015
+        })
+}
+
 /// Builds the `"use strict";` prologue for one file.
 ///
 /// Measured over 10781 single-file TypeScript 7.0.2 baselines carrying a real
@@ -653,16 +666,7 @@ fn quote_module_specifier(module: &str) -> String {
 /// A source-level directive at the head suppresses the synthetic one.
 #[must_use]
 fn strict_prelude(file: &SourceFile, options: &TransformOptions, is_module: bool) -> String {
-    // An unset `module` resolves the way upstream resolves it, from the target:
-    // CommonJS below ES2015 and ES modules at or above it. That default decides
-    // 673 baselines on its own, so it cannot be folded into either branch.
-    let module_kind = options.module_kind.unwrap_or({
-        if options.target < ScriptTarget::Es2015 {
-            ModuleKind::CommonJs
-        } else {
-            ModuleKind::Es2015
-        }
-    });
+    let module_kind = effective_module_kind(options);
     let strict = if is_module {
         matches!(
             module_kind,
