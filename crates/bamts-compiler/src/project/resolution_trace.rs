@@ -66,6 +66,10 @@ impl ResolutionTraceLog {
             specifier,
             strategy,
         } = request;
+        if strategy.0 == ModuleResolutionKind::Classic {
+            self.render_classic(importer, specifier, explicit_kind, cached, result);
+            return;
+        }
         if !(specifier.starts_with("./") || specifier.starts_with("../")) {
             if specifier.starts_with('#') {
                 self.unsupported.insert(UnsupportedTraceKind::PackageImport);
@@ -151,6 +155,72 @@ impl ResolutionTraceLog {
         if extension.is_none() && !result.is_ok() {
             self.unsupported
                 .insert(UnsupportedTraceKind::DirectoryPackage);
+        }
+    }
+
+    /// Renders a classic-resolution request: header, kind (or cache) line, the
+    /// probed file candidates in walk order, and the final outcome line.
+    fn render_classic(
+        &mut self,
+        importer: &Path,
+        specifier: &str,
+        explicit_kind: bool,
+        cached: bool,
+        result: &Result<ResolvedModule, ResolutionError>,
+    ) {
+        let kind = ModuleResolutionKind::Classic;
+        let directory = importer.parent().unwrap_or(importer);
+        self.lines.push(format!(
+            "======== Resolving module '{specifier}' from '{}'. ========",
+            display_path(importer)
+        ));
+        if cached {
+            self.lines.push(format!(
+                "Resolution for module '{specifier}' was found in cache from location '{}'.",
+                display_path(directory)
+            ));
+        } else if explicit_kind {
+            self.lines.push(format!(
+                "Explicitly specified module resolution kind: '{}'.",
+                kind.trace_name()
+            ));
+        } else {
+            self.lines.push(format!(
+                "Module resolution kind is not specified, using '{}'.",
+                kind.trace_name()
+            ));
+        }
+        if !cached
+            && let Some(trace) = match result {
+                Ok(resolved) => Some(resolved.trace()),
+                Err(error) => error.trace(),
+            }
+        {
+            for step in trace.steps() {
+                let ResolutionTraceStep::Candidate { path, exists } = step else {
+                    continue;
+                };
+                self.lines.push(if *exists {
+                    format!(
+                        "File '{}' exists - use it as a name resolution result.",
+                        display_path(path)
+                    )
+                } else {
+                    format!("File '{}' does not exist.", display_path(path))
+                });
+                if *exists {
+                    break;
+                }
+            }
+        }
+        match result {
+            Ok(resolved) => self.lines.push(format!(
+                "======== Module name '{specifier}' was successfully resolved to '{}'. ========",
+                display_path(resolved.path())
+            )),
+            Err(_) => self.lines.push(format!(
+                "======== Module name '{specifier}' was not resolved. ========"
+            )),
         }
     }
 
