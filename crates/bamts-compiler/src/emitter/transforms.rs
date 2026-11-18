@@ -13101,7 +13101,9 @@ fn import_reads(
     // tsc rejects reading a type as a value, so a read proves the name is one,
     // whatever another file's exports appear to say. Only an export of the name
     // is legal for a type, so only exports ask.
-    let mut reads = crate::lower::value_read_names(file, model.map(SemanticModel::enum_facts));
+    let lowered_async = !options.target.supports(LanguageFeature::Generators);
+    let mut reads =
+        crate::lower::value_read_names(file, model.map(SemanticModel::enum_facts), lowered_async);
     let erased = erased_import_locals(file, options);
     let exported = exported_locals(file)
         .into_keys()
@@ -16823,6 +16825,27 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         let code = javascript(&output);
         assert!(code.contains("import { Foo } from './m';"), "{code}");
         assert!(!code.contains("Bar"), "{code}");
+    }
+
+    #[test]
+    fn an_async_return_type_keeps_its_import_only_when_generators_lower() {
+        let source = "import { Task } from './m';\n\
+                      async function f(): Task<void> {}\n";
+        let commonjs = |target| EmitOptions {
+            target,
+            module: Some(crate::emitter::ModuleKind::CommonJs),
+            ..EmitOptions::default()
+        };
+        let es5 = emit_with_options(source, commonjs(ScriptTarget::Es5));
+        let es5 = javascript(&es5);
+        assert!(es5.contains("require(\"./m\")"), "{es5}");
+        assert!(es5.contains("m_1.Task"), "{es5}");
+        let es2015 = emit_with_options(source, commonjs(ScriptTarget::Es2015));
+        assert!(
+            !javascript(&es2015).contains("require"),
+            "{}",
+            javascript(&es2015)
+        );
     }
 
     #[test]
