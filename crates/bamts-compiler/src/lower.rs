@@ -26,9 +26,9 @@ use crate::syntax::{
     NewExpression, NodeId, NodeKind, NumericLiteralNode, ObjectLiteral, ObjectMember,
     ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier, PropertyName,
     RegexLiteralNode, SourceFile, Statement, Stmt, StringLiteralNode, SwitchStatement,
-    TemplateElementNode, TemplateLiteral, TokenKind, UnaryOperator, UpdateExpression,
-    UpdateOperator, VariableDeclaration, VariableKind, WhileStatement, WithStatement,
-    YieldExpression,
+    TemplateElementNode, TemplateLiteral, TokenKind, TypeAnnotationNode, TypeNode, UnaryOperator,
+    UpdateExpression, UpdateOperator, VariableDeclaration, VariableKind, WhileStatement,
+    WithStatement, YieldExpression,
 };
 use bamts_bytecode::{
     AccessorKind, BigIntLiteral, BinaryOp, Constant, ConstantId, DescriptorSlot, DisposeHint,
@@ -495,8 +495,9 @@ struct CapturePlan {
 pub(crate) fn value_read_names(
     file: &SourceFile,
     enum_facts: Option<&'_ crate::enum_plan::EnumFacts>,
+    record_async_return_names: bool,
 ) -> BTreeSet<String> {
-    let mut scanner = FreeVarScanner::new(file, None);
+    let mut scanner = FreeVarScanner::new(file, None, record_async_return_names);
     scanner.scans_jsx = true;
     scanner.inlined_enums = enum_facts;
     for statement in file.statements() {
@@ -8134,7 +8135,7 @@ impl<'a> FunctionContext<'a> {
         body: LoweredBody<'_>,
         is_arrow: bool,
     ) -> Vec<CaptureKey> {
-        let mut scanner = FreeVarScanner::new(self.file, self.jsx_plan);
+        let mut scanner = FreeVarScanner::new(self.file, self.jsx_plan, false);
         scanner.scan_function(parameters, body, is_arrow);
         // `super(...)` in an arrow finishes the enclosing constructor's work.
         let calls_parent =
@@ -8984,10 +8985,10 @@ impl<'a> FunctionContext<'a> {
         class_elements: Option<Register>,
         home: Register,
     ) -> Vec<CaptureKey> {
-        let mut scanner = FreeVarScanner::new(self.file, self.jsx_plan);
+        let mut scanner = FreeVarScanner::new(self.file, self.jsx_plan, false);
         scan_constructor(&mut scanner, parameters, body);
         // Initializers scan alone: a constructor binding does not shadow them.
-        let mut fields = FreeVarScanner::new(self.file, self.jsx_plan);
+        let mut fields = FreeVarScanner::new(self.file, self.jsx_plan, false);
         scan_instance_init_free_vars(&mut fields, instance_steps);
         let mut captures = Vec::new();
         for name in scanner.free.union(&fields.free) {
@@ -9404,7 +9405,7 @@ impl<'a> FunctionContext<'a> {
             inner.this_cell = Some(cell);
             inner.derived_constructor = true;
             if body.is_some() {
-                let mut scanner = FreeVarScanner::new(inner.file, inner.jsx_plan);
+                let mut scanner = FreeVarScanner::new(inner.file, inner.jsx_plan, false);
                 scan_constructor(&mut scanner, parameters, body);
                 let guard = inner.alloc_register(range)?;
                 let pending = inner.load_constant(builder, Constant::Boolean(false), range)?;
@@ -10171,6 +10172,9 @@ struct FreeVarScanner<'a> {
     arrow_calls_super: bool,
     fn_boundary: u32,
     function_depth: u32,
+    /// Records async return-type root names as value reads: the __awaiter
+    /// promise-constructor argument reads them when generators are lowered.
+    record_async_return_names: bool,
 }
 impl CapturePlan {
     fn for_statements(
@@ -10178,7 +10182,7 @@ impl CapturePlan {
         jsx_plan: Option<&JsxSourceDesugarPlan>,
         statements: &[Stmt],
     ) -> Self {
-        let mut scanner = FreeVarScanner::new(file, jsx_plan);
+        let mut scanner = FreeVarScanner::new(file, jsx_plan, false);
         scanner.preseed_vars(statements);
         scanner.predeclare_immediate(statements, false);
         for statement in statements {
@@ -10195,7 +10199,7 @@ impl CapturePlan {
         parameters: &[ParameterNode],
         body: LoweredBody<'_>,
     ) -> Self {
-        let mut scanner = FreeVarScanner::new(file, jsx_plan);
+        let mut scanner = FreeVarScanner::new(file, jsx_plan, false);
         scanner.scan_function(parameters, body, false);
         Self {
             captured: scanner.captured,
@@ -10209,7 +10213,7 @@ impl CapturePlan {
         body: Option<&Block>,
         instance_steps: &[InstanceInit],
     ) -> Self {
-        let mut scanner = FreeVarScanner::new(file, jsx_plan);
+        let mut scanner = FreeVarScanner::new(file, jsx_plan, false);
         scanner.preseed_parameters(parameters);
         if let Some(block) = body {
             scanner.preseed_vars(&block.statements);
@@ -10229,7 +10233,11 @@ impl CapturePlan {
     }
 }
 impl<'a> FreeVarScanner<'a> {
-    fn new(file: &'a SourceFile, jsx_plan: Option<&'a JsxSourceDesugarPlan>) -> Self {
+    fn new(
+        file: &'a SourceFile,
+        jsx_plan: Option<&'a JsxSourceDesugarPlan>,
+        record_async_return_names: bool,
+    ) -> Self {
         Self {
             file,
             jsx_plan,
@@ -10250,6 +10258,7 @@ impl<'a> FreeVarScanner<'a> {
             arrow_calls_super: false,
             fn_boundary: 0,
             function_depth: 0,
+            record_async_return_names,
         }
     }
     fn scan_function(
@@ -10711,11 +10720,38 @@ impl<'a> FreeVarScanner<'a> {
             ForBinding::Target(target) => self.scan_assignment_target(target),
         }
     }
+    /// An async function lowered through `__awaiter` reads its return-type
+    /// name as the promise constructor when the target lacks generators, so
+    /// the name keeps its import the way a value read does.
+    fn record_async_return_name(
+        &mut self,
+        is_async: bool,
+        return_type: Option<&TypeAnnotationNode>,
+    ) {
+        if !self.record_async_return_names || !is_async {
+            return;
+        }
+        let Some(TypeNode::Reference(reference)) =
+            return_type.map(|annotation| annotation.data().type_node.data())
+        else {
+            return;
+        };
+        let mut root = &reference.name;
+        while let crate::syntax::EntityName::Qualified { left, .. } = root {
+            root = left;
+        }
+        if let crate::syntax::EntityName::Identifier(identifier) = root
+            && let Some(text) = identifier_name(self.file, identifier)
+        {
+            self.reads.insert(text);
+        }
+    }
     fn scan_function_like(&mut self, function: &FunctionLike) {
         self.fn_boundary += 1;
         self.function_depth += 1;
         self.push();
         self.function_roots.push(self.bound.len() - 1);
+        self.record_async_return_name(function.is_async, function.return_type.as_ref());
         self.preseed_parameters(&function.parameters);
         if let Some(FunctionBody::Block(block)) = &function.body {
             self.preseed_vars(&block.data().statements);
@@ -10743,6 +10779,7 @@ impl<'a> FreeVarScanner<'a> {
         self.push();
         self.function_roots.push(self.bound.len() - 1);
         self.preseed_parameters(&arrow.parameters);
+        self.record_async_return_name(arrow.is_async, arrow.return_type.as_ref());
         if let FunctionBody::Block(block) = &arrow.body {
             self.preseed_vars(&block.data().statements);
             self.predeclare_immediate(&block.data().statements, false);
@@ -17190,7 +17227,7 @@ mod tests {
             ScriptKind::TypeScript,
             Arc::new(SourceText::new(source).expect("test source fits the per-file budget")),
         ));
-        value_read_names(parsed.product(), None)
+        value_read_names(parsed.product(), None, false)
     }
 
     fn left_deep_chain(head: &str, links: &[&str]) -> String {
