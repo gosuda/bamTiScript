@@ -42,6 +42,7 @@ mod decorator_metadata;
 mod es5_class;
 mod legacy_decorators;
 mod namespaces;
+mod object_rest;
 mod system_module;
 mod using_declarations;
 
@@ -878,6 +879,9 @@ struct Rewriter<'a> {
     /// The class member being rewritten, one entry per ES5 class member.
     super_contexts: Vec<SuperContext>,
     parameter_initializer_depths: Vec<usize>,
+    /// Object-rest declarators collected while rewriting a function's
+    /// parameters, prepended to its body as one `var` statement.
+    pending_body_decls: Vec<Vec<VariableDeclaratorNode>>,
     cjs: Option<CjsPlan>,
     /// Exported function declarations a System factory prints above `return`,
     /// each followed by its export call.
@@ -1065,6 +1069,7 @@ impl<'a> Rewriter<'a> {
             alternate_layout: BTreeSet::new(),
             super_contexts: Vec::new(),
             parameter_initializer_depths: Vec::new(),
+            pending_body_decls: Vec::new(),
             tslib_helpers: binds_helpers_to_tslib(options, file),
             cjs,
             system_hoisted: Vec::new(),
@@ -2244,6 +2249,14 @@ impl<'a> Rewriter<'a> {
         self.ident(&name)
     }
 
+    /// A placeholder for a parameter that replaces a pattern; the printer
+    /// names it in the scope of the function it belongs to.
+    fn parameter_temp_ident(&mut self) -> IdentifierNode {
+        let name = format!("_tp{}", self.next_temp);
+        self.next_temp += 1;
+        self.ident(&name)
+    }
+
     /// `base_1`, `base_2`, …: tsc's name for what an identifier's value is
     /// copied into, unique within the file.
     fn source_name_ident(&mut self, base: &str) -> IdentifierNode {
@@ -2426,6 +2439,14 @@ impl<'a> Rewriter<'a> {
         } else {
             self.node(range, data)
         }
+    }
+
+    /// Rebuilds an authored block that only gained leading statements, keeping
+    /// its authored id and range: the authored content inside — including the
+    /// comments that trail it before the closing brace — stays attached to the
+    /// node the printer maps those positions onto.
+    fn kept_block(&self, block: &BlockNode, statements: Vec<Stmt>) -> BlockNode {
+        Node::new(block.id(), block.range(), Block { statements })
     }
 
     fn diag(&mut self, code: DiagnosticCode, range: TextRange, message: &'static str) {
@@ -2637,6 +2658,25 @@ impl<'a> Rewriter<'a> {
                 {
                     return self.lower_assignment_destructuring(statement.range(), assignment);
                 }
+                if Self::needs(LanguageFeature::ObjectRestSpread, self.options)
+                    && !Self::needs(LanguageFeature::Destructuring, self.options)
+                    && let Expression::Assignment(assignment) = candidate.data()
+                    && assignment.operator == AssignmentOperator::Assign
+                    && matches!(
+                        assignment.left.data(),
+                        AssignmentTarget::Object(_) | AssignmentTarget::Array(_)
+                    )
+                    && object_rest::object_rest_in_target(&assignment.left)
+                {
+                    let expression =
+                        self.lower_rest_assignment(assignment, statement.range(), false);
+                    return vec![self.node(
+                        statement.range(),
+                        Statement::Expression(ExpressionStatement {
+                            expression: Box::new(expression),
+                        }),
+                    )];
+                }
                 let expression = Box::new(self.rewrite_expr(&expr.expression));
                 vec![self.node(
                     statement.range(),
@@ -2736,16 +2776,103 @@ impl<'a> Rewriter<'a> {
                 {
                     return self.lower_resource_for_of(statement, for_of, declaration);
                 }
+                let mut for_rest_decls: Option<(VariableKind, Vec<VariableDeclaratorNode>)> = None;
+                let mut for_rest_seq: Option<Expr> = None;
                 let binding = match &for_of.binding {
                     ForBinding::Target(target) => {
-                        ForBinding::Target(self.rewrite_assignment_target(target))
+                        if self.lowers_object_rest() && object_rest::object_rest_in_target(target) {
+                            let temp = self.temp_ident();
+                            let mut parts = Vec::new();
+                            self.flatten_assignment_target_parts(
+                                target,
+                                &temp,
+                                statement.range(),
+                                &mut parts,
+                            );
+                            for_rest_seq = Some(self.rest_sequence(parts, statement.range()));
+                            ForBinding::Variable(VariableDeclaration {
+                                range: target.range(),
+                                kind: VariableKind::Let,
+                                declarations: vec![self.make_declarator(
+                                    temp,
+                                    None,
+                                    target.range(),
+                                )],
+                            })
+                        } else {
+                            ForBinding::Target(self.rewrite_assignment_target(target))
+                        }
                     }
                     ForBinding::Variable(declaration) => {
-                        ForBinding::Variable(self.rewrite_for_declaration(declaration))
+                        if self.lowers_object_rest()
+                            && let [declarator] = declaration.declarations.as_slice()
+                            && object_rest::object_rest_in_pattern(&declarator.data().binding)
+                        {
+                            let temp = self.temp_ident();
+                            let decls = self.flatten_binding_declarators(
+                                &declarator.data().binding,
+                                &temp,
+                                declaration.range,
+                            );
+                            for_rest_decls = Some((declaration.kind, decls));
+                            ForBinding::Variable(VariableDeclaration {
+                                range: declaration.range,
+                                kind: declaration.kind,
+                                declarations: vec![self.make_declarator(
+                                    temp,
+                                    None,
+                                    declaration.range,
+                                )],
+                            })
+                        } else {
+                            ForBinding::Variable(self.rewrite_for_declaration(declaration))
+                        }
                     }
                 };
                 let iterable = self.rewrite_expr(&for_of.iterable);
                 let body = self.rewrite_single_statement(&for_of.body);
+                let body = if for_rest_seq.is_some() || for_rest_decls.is_some() {
+                    let prepend = if let Some(seq) = for_rest_seq {
+                        self.node(
+                            statement.range(),
+                            Statement::Expression(ExpressionStatement {
+                                expression: Box::new(seq),
+                            }),
+                        )
+                    } else {
+                        let (kind, decls) = for_rest_decls.expect("for-of rest state");
+                        self.rest_declaration_statement(kind, decls, statement.range())
+                    };
+                    let block_statements = match body.data() {
+                        Statement::Block(block) => Some(block.data().statements.clone()),
+                        _ => None,
+                    };
+                    match block_statements {
+                        Some(mut statements) => {
+                            let index = statements
+                                .iter()
+                                .position(|s| !is_prologue_statement(s))
+                                .unwrap_or(statements.len());
+                            statements.insert(index, prepend);
+                            let Statement::Block(rewritten) = body.data() else {
+                                unreachable!("block statements imply a block body");
+                            };
+                            let block_node = self.kept_block(rewritten, statements);
+                            self.node(body.range(), Statement::Block(block_node))
+                        }
+                        None => {
+                            let block_node = self.node(
+                                statement.range(),
+                                Block {
+                                    statements: vec![prepend, body],
+                                },
+                            );
+                            self.node(statement.range(), Statement::Block(block_node))
+                        }
+                    }
+                } else {
+                    body
+                };
                 vec![self.node(
                     statement.range(),
                     Statement::ForOf(ForOfStatement {
@@ -2822,12 +2949,35 @@ impl<'a> Rewriter<'a> {
             Statement::Try(value) => {
                 let block = self.rewrite_block(&value.block);
                 let handler = value.handler.as_ref().map(|handler| {
-                    let binding = handler
-                        .data()
-                        .binding
-                        .as_ref()
-                        .map(|binding| self.rewrite_pattern(binding));
-                    let body = self.rewrite_block(&handler.data().body);
+                    let (binding, catch_decls) = match handler.data().binding.as_ref() {
+                        Some(binding)
+                            if self.lowers_object_rest()
+                                && object_rest::object_rest_in_pattern(binding) =>
+                        {
+                            let temp = self.temp_ident();
+                            let decls =
+                                self.flatten_binding_declarators(binding, &temp, handler.range());
+                            (
+                                Some(self.node(binding.range(), BindingPattern::Identifier(temp))),
+                                decls,
+                            )
+                        }
+                        other => (
+                            other.map(|binding| self.rewrite_pattern(binding)),
+                            Vec::new(),
+                        ),
+                    };
+                    let mut body = self.rewrite_block(&handler.data().body);
+                    if !catch_decls.is_empty() {
+                        let mut statements = body.data().statements.clone();
+                        self.prepend_rest_declaration(
+                            &mut statements,
+                            VariableKind::Var,
+                            catch_decls,
+                            handler.range(),
+                        );
+                        body = self.kept_block(&body, statements);
+                    }
                     self.node(handler.range(), CatchClause { binding, body })
                 });
                 let finalizer = value
@@ -3063,6 +3213,15 @@ impl<'a> Rewriter<'a> {
     ) -> Vec<Stmt> {
         if self.lowers_resources(declaration.kind) {
             return self.register_resources(statement, declaration);
+        }
+        if Self::needs(LanguageFeature::ObjectRestSpread, self.options)
+            && !Self::needs(LanguageFeature::Destructuring, self.options)
+            && declaration.declarations.iter().any(|declarator| {
+                declarator.data().initializer.is_some()
+                    && object_rest::object_rest_in_pattern(&declarator.data().binding)
+            })
+        {
+            return self.lower_rest_variable_statement(statement, declaration);
         }
         if !Self::needs(LanguageFeature::Destructuring, self.options) {
             let outer_key_prelude = std::mem::take(&mut self.key_prelude);
@@ -4424,15 +4583,24 @@ impl<'a> Rewriter<'a> {
                         is_static: false,
                         rebinds_this: derived,
                     });
-                    let ((parameters, statements), captured) =
-                        self.with_class_member(scope, |this| {
-                            let parameters = this.rewrite_parameters(&ctor.parameters);
+                    let (((parameters, rest_decls), mut statements), captured) = self
+                        .with_class_member(scope, |this| {
+                            let (parameters, rest_decls) =
+                                this.rewrite_parameters(&ctor.parameters);
                             let statements = this.rewrite_statements(&ctor.body.data().statements);
-                            (parameters, statements)
+                            ((parameters, rest_decls), statements)
                         });
                     ctor_this_captured |= !derived && captured.is_some();
                     ctor.parameters = parameters;
-                    ctor.body = self.node(ctor.body.range(), Block { statements });
+                    if !rest_decls.is_empty() {
+                        self.prepend_rest_declaration(
+                            &mut statements,
+                            VariableKind::Var,
+                            rest_decls,
+                            ctor.body.range(),
+                        );
+                    }
+                    ctor.body = self.kept_block(&ctor.body, statements);
                     constructor_slot = members.len();
                     constructor = Some(self.node(member.range(), ClassMember::Constructor(ctor)));
                 }
@@ -4720,13 +4888,22 @@ impl<'a> Rewriter<'a> {
                 };
                 let original_len = ctor.body.data().statements.len();
                 let inits_empty = inits.is_empty();
-                let statements = if derived {
+                let mut statements = if derived {
                     self.splice_after_super(&ctor.body.data().statements, &inits)
                 } else {
                     let mut statements = inits;
                     statements.extend(ctor.body.data().statements.clone());
                     statements
                 };
+                let (parameters, rest_decls) = self.rewrite_parameters(&ctor.parameters);
+                if !rest_decls.is_empty() {
+                    self.prepend_rest_declaration(
+                        &mut statements,
+                        VariableKind::Var,
+                        rest_decls,
+                        ctor.body.range(),
+                    );
+                }
                 // A body carrying no field inits and no spliced statements
                 // is authored content: keep the wrapper untainted (original
                 // id space) so the empty-body layout gate can read its
@@ -4737,7 +4914,6 @@ impl<'a> Rewriter<'a> {
                 } else {
                     self.syn_node(ctor.body.range(), Block { statements })
                 };
-                let parameters = self.rewrite_parameters(&ctor.parameters);
                 Some(self.syn_node(
                     existing.range(),
                     ClassMember::Constructor(ConstructorDeclaration {
@@ -6203,13 +6379,17 @@ impl<'a> Rewriter<'a> {
     }
 
     fn lower_function_like(&mut self, function: &FunctionLike, range: TextRange) -> FunctionLike {
-        let parameters = self.rewrite_parameters(&function.parameters);
+        let (parameters, rest_decls) = self.rewrite_parameters(&function.parameters);
+        self.pending_body_decls.push(rest_decls);
         if function.is_async && Self::needs(LanguageFeature::AsyncFunctions, self.options) {
             let mut rewritten = function.clone();
             rewritten.parameters = parameters;
-            return self.lower_async_function(&rewritten, range);
+            let lowered = self.lower_async_function(&rewritten, range);
+            self.pending_body_decls.pop();
+            return lowered;
         }
         let body = function.body.as_ref().map(|body| self.rewrite_body(body));
+        self.pending_body_decls.pop();
         let mut rewritten = FunctionLike {
             parameters,
             body,
@@ -6230,8 +6410,19 @@ impl<'a> Rewriter<'a> {
         rewritten
     }
 
-    fn rewrite_parameters(&mut self, parameters: &[ParameterNode]) -> Vec<ParameterNode> {
-        parameters
+    /// Whether this target binds destructuring natively but lacks object
+    /// rest: es2015 through es2017.
+    fn lowers_object_rest(&self) -> bool {
+        Self::needs(LanguageFeature::ObjectRestSpread, self.options)
+            && !Self::needs(LanguageFeature::Destructuring, self.options)
+    }
+
+    fn rewrite_parameters(
+        &mut self,
+        parameters: &[ParameterNode],
+    ) -> (Vec<ParameterNode>, Vec<VariableDeclaratorNode>) {
+        let mut rest_decls = Vec::new();
+        let parameters = parameters
             .iter()
             .map(|parameter| {
                 let initializer = parameter.data().initializer.as_deref().map(|initializer| {
@@ -6244,9 +6435,25 @@ impl<'a> Rewriter<'a> {
                 });
                 let depth = self.expression_temp_scopes.len();
                 self.parameter_initializer_depths.push(depth);
-                let binding = self.rewrite_pattern(&parameter.data().binding);
+                let (binding, decls) = if self.lowers_object_rest()
+                    && object_rest::object_rest_in_pattern(&parameter.data().binding)
+                {
+                    let temp = self.parameter_temp_ident();
+                    let decls = self.flatten_binding_declarators(
+                        &parameter.data().binding,
+                        &temp,
+                        parameter.range(),
+                    );
+                    (
+                        self.node(parameter.range(), BindingPattern::Identifier(temp)),
+                        decls,
+                    )
+                } else {
+                    (self.rewrite_pattern(&parameter.data().binding), Vec::new())
+                };
                 let popped = self.parameter_initializer_depths.pop();
                 debug_assert_eq!(popped, Some(depth));
+                rest_decls.extend(decls);
                 self.node(
                     parameter.range(),
                     Parameter {
@@ -6256,7 +6463,8 @@ impl<'a> Rewriter<'a> {
                     },
                 )
             })
-            .collect()
+            .collect();
+        (parameters, rest_decls)
     }
 
     fn rewrite_body(&mut self, body: &FunctionBody) -> FunctionBody {
@@ -6265,6 +6473,15 @@ impl<'a> Rewriter<'a> {
                 self.expression_temp_scopes.push(Vec::new());
                 let mut statements = self.rewrite_statements(&block.data().statements);
                 let temps = self.expression_temp_scopes.pop().unwrap_or_default();
+                let rest_decls = self.pending_body_decls.last().cloned().unwrap_or_default();
+                if !rest_decls.is_empty() {
+                    self.prepend_rest_declaration(
+                        &mut statements,
+                        VariableKind::Var,
+                        rest_decls,
+                        block.range(),
+                    );
+                }
                 let has_temps = !temps.is_empty();
                 if let Some(declaration) = self.temp_declaration(temps, block.range()) {
                     statements.insert(0, declaration);
@@ -6273,15 +6490,68 @@ impl<'a> Rewriter<'a> {
                     self.syn_node(block.range(), Block { statements })
                 } else {
                     let child_marked = self.any_marked(statements.iter().map(|s| s.id()));
-                    self.wrap_marked(block.range(), Block { statements }, child_marked)
+                    if child_marked {
+                        self.syn_node(block.range(), Block { statements })
+                    } else {
+                        self.kept_block(block, statements)
+                    }
                 };
                 FunctionBody::Block(block_node)
             }
             FunctionBody::Expression(expression) => {
-                FunctionBody::Expression(Box::new(self.rewrite_expr(expression)))
+                let rewritten = Box::new(self.rewrite_expr(expression));
+                let rest_decls = self.pending_body_decls.last().cloned().unwrap_or_default();
+                if rest_decls.is_empty() {
+                    return FunctionBody::Expression(rewritten);
+                }
+                let declaration = self.rest_declaration_statement(
+                    VariableKind::Var,
+                    rest_decls,
+                    expression.range(),
+                );
+                self.prepend_to_body(
+                    FunctionBody::Expression(rewritten),
+                    vec![declaration],
+                    expression.range(),
+                )
             }
             FunctionBody::Missing(missing) => FunctionBody::Missing(missing.clone()),
         }
+    }
+
+    /// The `var` or `let` statement carrying flattened rest-pattern
+    /// declarators.
+    fn rest_declaration_statement(
+        &mut self,
+        kind: VariableKind,
+        declarators: Vec<VariableDeclaratorNode>,
+        range: TextRange,
+    ) -> Stmt {
+        self.node(
+            range,
+            Statement::Variable(VariableDeclaration {
+                range,
+                kind,
+                declarations: declarators,
+            }),
+        )
+    }
+
+    /// Inserts a flattened rest-pattern declaration after the directive
+    /// prologue of a statement list.
+    fn prepend_rest_declaration(
+        &mut self,
+        statements: &mut Vec<Stmt>,
+        kind: VariableKind,
+        declarators: Vec<VariableDeclaratorNode>,
+        range: TextRange,
+    ) {
+        let declaration = self.rest_declaration_statement(kind, declarators, range);
+        let index = statements
+            .iter()
+            .position(|statement| !is_prologue_statement(statement))
+            .unwrap_or(statements.len());
+        statements.insert(index, declaration);
     }
 
     fn lower_async_function(&mut self, function: &FunctionLike, range: TextRange) -> FunctionLike {
@@ -9741,6 +10011,18 @@ impl<'a> Rewriter<'a> {
                 );
                 expression.clone()
             }
+            Expression::Assignment(assignment)
+                if Self::needs(LanguageFeature::ObjectRestSpread, self.options)
+                    && !Self::needs(LanguageFeature::Destructuring, self.options)
+                    && assignment.operator == AssignmentOperator::Assign
+                    && matches!(
+                        assignment.left.data(),
+                        AssignmentTarget::Object(_) | AssignmentTarget::Array(_)
+                    )
+                    && object_rest::object_rest_in_target(&assignment.left) =>
+            {
+                self.lower_rest_assignment(assignment, expression.range(), true)
+            }
             Expression::Assignment(assignment) => {
                 if assignment.operator == AssignmentOperator::ExponentiateAssign
                     && Self::needs(LanguageFeature::Exponentiation, self.options)
@@ -9875,6 +10157,15 @@ impl<'a> Rewriter<'a> {
             .iter()
             .map(|member| self.rewrite_object_member(member))
             .collect();
+        if self.lowers_object_rest()
+            && members
+                .iter()
+                .any(|member| matches!(member.data(), ObjectMember::Spread(_)))
+            && !contains_yield(expression)
+            && !contains_await(expression)
+        {
+            return self.lower_object_spread(members, range);
+        }
         if !Self::needs(LanguageFeature::ObjectLiteralMembers, self.options)
             || !members
                 .iter()
@@ -9915,6 +10206,72 @@ impl<'a> Rewriter<'a> {
             self.expanded_sequences.insert(sequence.id());
         }
         sequence
+    }
+
+    /// Object spread at es2015 through es2017 becomes a left-folded
+    /// `Object.assign` chain. Each run of plain members is one literal
+    /// argument and each spread contributes its argument expression; a
+    /// leading spread adds an empty literal as the fold's seed.
+    fn lower_object_spread(&mut self, members: Vec<ObjectMemberNode>, range: TextRange) -> Expr {
+        let leading_spread = matches!(
+            members.first().map(|member| member.data()),
+            Some(ObjectMember::Spread(_))
+        );
+        let mut args: Vec<Expr> = Vec::new();
+        let mut run: Vec<ObjectMemberNode> = Vec::new();
+        for member in members {
+            match member.data() {
+                ObjectMember::Spread(spread) => {
+                    if !run.is_empty() {
+                        args.push(self.node(
+                            range,
+                            Expression::Object(ObjectLiteral {
+                                members: std::mem::take(&mut run),
+                            }),
+                        ));
+                    }
+                    args.push(spread.argument.as_ref().clone());
+                }
+                _ => run.push(member),
+            }
+        }
+        if !run.is_empty() {
+            args.push(self.node(range, Expression::Object(ObjectLiteral { members: run })));
+        }
+        if leading_spread {
+            args.insert(
+                0,
+                self.node(range, Expression::Object(ObjectLiteral { members: vec![] })),
+            );
+        }
+        let mut args = args.into_iter();
+        let Some(mut acc) = args.next() else {
+            return self.node(range, Expression::Object(ObjectLiteral { members: vec![] }));
+        };
+        for arg in args {
+            acc = self.object_assign_call(acc, arg, range);
+        }
+        acc
+    }
+
+    /// `Object.assign(target, source)`.
+    fn object_assign_call(&mut self, target: Expr, source: Expr, range: TextRange) -> Expr {
+        let object_ident = self.ident("Object");
+        let object = self.node(range, Expression::Identifier(object_ident));
+        let assign_ident = self.ident("assign");
+        let assign = self.member_expr(&object, MemberProperty::Named(assign_ident), range);
+        self.node(
+            range,
+            Expression::Call(CallExpression {
+                callee: Box::new(assign),
+                optional: false,
+                type_arguments: None,
+                arguments: vec![
+                    CallArgument::Expression(Box::new(target)),
+                    CallArgument::Expression(Box::new(source)),
+                ],
+            }),
+        )
     }
 
     fn downlevel_object_member(&mut self, member: &ObjectMemberNode) -> ObjectMemberNode {
@@ -10913,7 +11270,8 @@ impl<'a> Rewriter<'a> {
         if lowers_to_function && let Some(scope) = self.capture_scopes.last_mut() {
             scope.arrow_depth += 1;
         }
-        let parameters = self.rewrite_parameters(&arrow.parameters);
+        let (parameters, rest_decls) = self.rewrite_parameters(&arrow.parameters);
+        self.pending_body_decls.push(rest_decls);
         if arrow.is_async && Self::needs(LanguageFeature::AsyncFunctions, self.options) {
             let previous = self.replace_await;
             self.replace_await = true;
@@ -10922,9 +11280,17 @@ impl<'a> Rewriter<'a> {
                     self.expression_temp_scopes.push(Vec::new());
                     let rewritten = self.rewrite_expr(expr);
                     let temps = self.expression_temp_scopes.pop().unwrap_or_default();
+                    let rest_decls = self.pending_body_decls.last().cloned().unwrap_or_default();
                     let mut statements = Vec::new();
                     if let Some(declaration) = self.temp_declaration(temps, expression.range()) {
                         statements.push(declaration);
+                    }
+                    if !rest_decls.is_empty() {
+                        statements.push(self.rest_declaration_statement(
+                            VariableKind::Var,
+                            rest_decls,
+                            expression.range(),
+                        ));
                     }
                     statements.push(self.syn_node(
                         expression.range(),
@@ -11016,11 +11382,13 @@ impl<'a> Rewriter<'a> {
                     return_type: None,
                     body: Some(FunctionBody::Expression(Box::new(call))),
                 };
+                self.pending_body_decls.pop();
                 return self.syn_node(
                     expression.range(),
                     Expression::Function(FunctionExpression { function }),
                 );
             }
+            self.pending_body_decls.pop();
             return self.syn_node(
                 expression.range(),
                 Expression::Arrow(ArrowFunction {
@@ -11037,23 +11405,28 @@ impl<'a> Rewriter<'a> {
                 self.expression_temp_scopes.push(Vec::new());
                 let rewritten = self.rewrite_expr(expr);
                 let temps = self.expression_temp_scopes.pop().unwrap_or_default();
-                match self.temp_declaration(temps, expression.range()) {
-                    None => FunctionBody::Expression(Box::new(rewritten)),
-                    Some(declaration) => {
-                        let returned = self.syn_node(
-                            expression.range(),
-                            Statement::Return(ReturnStatement {
-                                argument: Some(Box::new(rewritten)),
-                            }),
-                        );
-
-                        FunctionBody::Block(self.syn_node(
-                            expression.range(),
-                            Block {
-                                statements: vec![declaration, returned],
-                            },
-                        ))
+                let rest_decls = self.pending_body_decls.last().cloned().unwrap_or_default();
+                if temps.is_empty() && rest_decls.is_empty() {
+                    FunctionBody::Expression(Box::new(rewritten))
+                } else {
+                    let mut statements = Vec::new();
+                    if let Some(declaration) = self.temp_declaration(temps, expression.range()) {
+                        statements.push(declaration);
                     }
+                    if !rest_decls.is_empty() {
+                        statements.push(self.rest_declaration_statement(
+                            VariableKind::Var,
+                            rest_decls,
+                            expression.range(),
+                        ));
+                    }
+                    statements.push(self.syn_node(
+                        expression.range(),
+                        Statement::Return(ReturnStatement {
+                            argument: Some(Box::new(rewritten)),
+                        }),
+                    ));
+                    FunctionBody::Block(self.syn_node(expression.range(), Block { statements }))
                 }
             }
             other => self.rewrite_body(other),
@@ -11072,6 +11445,7 @@ impl<'a> Rewriter<'a> {
                 return_type: None,
                 body: Some(body),
             };
+            self.pending_body_decls.pop();
             return self.syn_node(
                 expression.range(),
                 Expression::Function(FunctionExpression { function }),
@@ -11082,6 +11456,7 @@ impl<'a> Rewriter<'a> {
             FunctionBody::Expression(expr) => self.synthesized_ids.contains(&expr.id()),
             FunctionBody::Missing(_) => false,
         };
+        self.pending_body_decls.pop();
         self.wrap_marked(
             expression.range(),
             Expression::Arrow(ArrowFunction {
@@ -12833,6 +13208,16 @@ fn plan_cjs_local_exports(
     }
 }
 
+/// Whether a statement is a directive-prologue member: a string-literal
+/// expression statement.
+fn is_prologue_statement(statement: &Stmt) -> bool {
+    matches!(
+        statement.data(),
+        Statement::Expression(statement)
+            if matches!(statement.expression.data(), Expression::Literal(Literal::String(_)))
+    )
+}
+
 /// Whether every declarator binds a name to an anonymous function or class.
 /// Such an initializer keeps its inferred name only while it stays in a local
 /// declaration, so the export publishes the local binding afterwards.
@@ -13671,6 +14056,120 @@ mod tests {
             &options.transform_view(),
             &names(),
         )
+    }
+    #[test]
+    fn an_object_rest_binding_becomes_a_rest_call_beside_the_kept_pattern() {
+        let output = emit_at(
+            "var { ...clone } = o;\nvar { a, ...justB } = o;\nvar { ['b']: renamed, ...justA } = o;\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.ends_with(
+                "var clone = __rest(o, []);\nvar { a } = o, justB = __rest(o, [\"a\"]);\nvar { ['b']: renamed } = o, justA = __rest(o, ['b']);\n"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn a_nested_object_rest_reads_its_parent_property_once() {
+        let output = emit_at(
+            "var { x: { ka, ...nested }, y: other, ...rest } = complex;\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.ends_with(
+                "var _a = complex.x, { ka } = _a, nested = __rest(_a, [\"ka\"]), { y: other } = complex, rest = __rest(complex, [\"x\", \"y\"]);\n"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn an_object_rest_assignment_becomes_one_comma_expression() {
+        let output = emit_at(
+            "({ x, ...fresh } = { x: 1, y: 2 });\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.ends_with(
+                "var _a;\n(_a = { x: 1, y: 2 }, { x } = _a, fresh = __rest(_a, [\"x\"]));\n"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn an_array_pattern_holding_an_object_rest_binds_its_source_directly() {
+        let output = emit_at(
+            "var { a: [{ ...nested2 }, ...y], ...rest2 } = overEmit;\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.ends_with(
+                "var [_a, ...y] = overEmit.a, nested2 = __rest(_a, []), rest2 = __rest(overEmit, [\"a\"]);\n"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn an_object_rest_parameter_is_unpacked_at_the_head_of_the_body() {
+        let output = emit_at(
+            "function cloneAgain({ a, ...clone }) {\n}\nsuddenly(({ x: a, ...rest }) => rest.y);\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.ends_with(
+                "function cloneAgain(_a) {\n    var { a } = _a, clone = __rest(_a, [\"a\"]);\n}\nsuddenly((_a) => {\n    var { x: a } = _a, rest = __rest(_a, [\"x\"]);\n    return rest.y;\n});\n"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn an_object_rest_in_a_for_of_head_is_unpacked_in_the_body() {
+        let output = emit_at(
+            "for (let { x, ...restOf } of array) {\n    [x, restOf];\n}\nfor ({ x: xx, ...rrestOff } of array) {\n    [xx, rrestOff];\n}\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.ends_with(
+                "for (let _a of array) {\n    let { x } = _a, restOf = __rest(_a, [\"x\"]);\n    [x, restOf];\n}\nfor (let _b of array) {\n    ({ x: xx } = _b, rrestOff = __rest(_b, [\"x\"]));\n    [xx, rrestOff];\n}\n"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn an_object_rest_catch_binding_is_unpacked_in_the_handler() {
+        let output = emit_at("try { }\ncatch ({ a, ...b }) {\n}\n", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(
+            code.ends_with(
+                "try { }\ncatch (_a) {\n    var { a } = _a, b = __rest(_a, [\"a\"]);\n}\n"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn an_object_spread_folds_into_object_assign_calls() {
+        let output = emit_at(
+            "let addAfter = { ...o, c: false };\nlet addBefore = { c: false, ...o };\nlet combined = { ...o, ...o2 };\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert_eq!(
+            code,
+            "let addAfter = Object.assign(Object.assign({}, o), { c: false });\nlet addBefore = Object.assign({ c: false }, o);\nlet combined = Object.assign(Object.assign({}, o), o2);\n"
+        );
     }
     #[test]
     fn json_empty_object_prints_braces_without_prologue_like_require_of_json_file_with_empty_object()

@@ -1,8 +1,9 @@
 //! tsc's names for compiler-generated temporaries.
 //!
 //! The rewriter writes every temporary as a placeholder: `_t<N>` for a
-//! variable, `_tl<N>` for a loop index and `_tr<N>` for a variable whose name
-//! nested functions must not reuse. The printer replaces each placeholder the
+//! variable, `_tl<N>` for a loop index, `_tp<N>` for a parameter that stands
+//! in for a pattern, and `_tr<N>` for a variable whose name nested functions
+//! must not reuse. The printer replaces each placeholder the
 //! first time it prints it, so names follow print order the way tsc's do:
 //! `_a`, `_b`, … per function scope, skipping `_i` and `_n`, with the first loop
 //! index of a scope named `_i`. A name the program itself writes is never
@@ -63,13 +64,24 @@ impl TempNames {
             self.scopes.pop();
         }
     }
+    /// How many scopes are open; a parameter-list scope is covered when a
+    /// function-body block opens at this depth.
+    pub(super) fn depth(&self) -> usize {
+        self.scopes.len()
+    }
 
     pub(super) fn is_placeholder(text: &str) -> bool {
-        let digits = ["_tl", "_tr", "_t"]
+        let digits = ["_tl", "_tr", "_tp", "_t"]
             .iter()
             .find_map(|prefix| text.strip_prefix(prefix))
             .unwrap_or("");
         !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    }
+
+    /// Whether `text` names a parameter temporary, which belongs to the
+    /// scope of the function it is a parameter of.
+    pub(super) fn is_parameter_placeholder(text: &str) -> bool {
+        text.starts_with("_tp") && Self::is_placeholder(text)
     }
 
     /// The final name of `placeholder`: the one a scope already gave it, else
