@@ -246,7 +246,10 @@ fn program_emit_options(program: &ResolvedProgram, mode: FrontendMode) -> Option
     let check = program.check_options();
     let target = check.target();
     let always_strict = check.always_strict();
-    let module = program.is_commonjs().then_some(ModuleKind::CommonJs);
+    let module = program
+        .is_commonjs()
+        .then_some(ModuleKind::CommonJs)
+        .or(program.wrapped_module());
     options.apply_emit_fields(
         target,
         always_strict,
