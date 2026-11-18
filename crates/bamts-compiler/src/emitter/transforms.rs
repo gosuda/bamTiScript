@@ -9381,10 +9381,13 @@ impl<'a> Rewriter<'a> {
                 )
             }
             Expression::Parenthesized(value) => {
-                let value = self.rewrite_expr(value);
+                let inner = self.rewrite_expr(value);
+                if wraps_type_assertion(value) && !opens_a_statement(asserted_operand(value)) {
+                    return inner;
+                }
                 self.node(
                     expression.range(),
-                    Expression::Parenthesized(Box::new(value)),
+                    Expression::Parenthesized(Box::new(inner)),
                 )
             }
             Expression::Sequence(value) => {
@@ -11737,6 +11740,36 @@ fn contains_yield(expression: &Expr) -> bool {
         | Expression::JsxFragment(_)
         | Expression::JsxSelfClosingElement(_) => true,
     }
+}
+
+/// Parentheses around a type assertion print as the asserted expression, with
+/// parentheses only where its precedence asks for them.
+fn wraps_type_assertion(expression: &Expr) -> bool {
+    match expression.data() {
+        Expression::Parenthesized(inner) => wraps_type_assertion(inner),
+        Expression::As(_) | Expression::Satisfies(_) | Expression::TypeAssertion(_) => true,
+        _ => false,
+    }
+}
+
+/// The expression left once parentheses and type assertions are erased.
+fn asserted_operand(expression: &Expr) -> &Expr {
+    match expression.data() {
+        Expression::Parenthesized(inner) => asserted_operand(inner),
+        Expression::As(cast) => asserted_operand(&cast.expression),
+        Expression::Satisfies(cast) => asserted_operand(&cast.expression),
+        Expression::TypeAssertion(cast) => asserted_operand(&cast.expression),
+        _ => expression,
+    }
+}
+
+/// An expression whose first token would start a declaration or a block when
+/// it leads a statement, so it keeps the parentheses it was written with.
+fn opens_a_statement(expression: &Expr) -> bool {
+    matches!(
+        expression.data(),
+        Expression::Object(_) | Expression::Function(_) | Expression::Class(_)
+    )
 }
 
 /// Every identifier the file spells, which a generated name has to avoid.
