@@ -491,10 +491,18 @@ pub fn emit_transformed(
     } else {
         String::new()
     };
-    let tail = join_preludes(
-        &join_preludes(&cjs_marker, &tslib_binding),
-        &runtime_prelude,
-    );
+    let (head, tail) = if rewriter.cjs.is_some() {
+        let tail = join_preludes(
+            &join_preludes(&cjs_marker, &tslib_binding),
+            &runtime_prelude,
+        );
+        (head, tail)
+    } else {
+        (
+            join_preludes(&head, &runtime_prelude),
+            join_preludes(&cjs_marker, &tslib_binding),
+        )
+    };
     let mut output = print_with_jsx_plan(
         PrintSource {
             file: &rewritten,
