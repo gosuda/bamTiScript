@@ -1242,6 +1242,26 @@ impl Emitter<'_> {
         self.flush_comments();
     }
 
+    /// Prints the `/// <reference ... />` style directives that lead a first
+    /// statement the output erases; tsc keeps them when it drops the rest.
+    fn write_triple_slash_directives(&mut self) {
+        let directives: Vec<TextRange> = std::mem::take(&mut self.pending_comments)
+            .into_iter()
+            .filter(|comment| self.is_triple_slash_directive(*comment))
+            .collect();
+        for comment in directives {
+            self.write_comment(comment);
+            self.newline();
+        }
+    }
+
+    fn is_triple_slash_directive(&self, comment: TextRange) -> bool {
+        self.source_slice(comment)
+            .and_then(|text| text.strip_prefix("///"))
+            .map(str::trim_start)
+            .is_some_and(|text| text.starts_with("<reference") || text.starts_with("<amd-"))
+    }
+
     fn flush_comments(&mut self) {
         for comment in std::mem::take(&mut self.pending_comments) {
             self.write_comment(comment);
@@ -1295,6 +1315,9 @@ impl Emitter<'_> {
         for (index, statement) in statements.iter().enumerate() {
             self.queue_leading_comments(statement.range().start());
             let emitted = self.emit_statement(statement);
+            if !emitted && statement.range().start() == self.first_code_position() {
+                self.write_triple_slash_directives();
+            }
             self.pending_comments.clear();
             if emitted {
                 let limit = statements
@@ -1781,11 +1804,11 @@ impl<'a> Emitter<'a> {
             self.indent += 1;
             self.emit_lines(&wrapper.inner);
         }
-        if hoisted == 0 {
-            self.emit_prelude_tail();
-        }
         if wrapper.is_none() {
             self.write_detached_comments();
+        }
+        if hoisted == 0 {
+            self.emit_prelude_tail();
         }
         self.emit_statement_list(&statements[..hoisted]);
         if hoisted == 1 {
