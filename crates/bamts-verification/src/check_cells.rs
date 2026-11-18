@@ -2240,11 +2240,14 @@ fn output_section_name(
     replace_extension(name, &extension)
 }
 
-/// Whether a unit name is itself a declaration file (`.d.ts`, `.d.mts`,
-/// `.d.cts`). Upstream's output mapping skips declaration inputs entirely:
-/// they produce no JavaScript and no declaration output.
+/// Whether a unit name is itself a declaration file: `.d.ts`, `.d.mts`,
+/// `.d.cts`, or a `.ts` file whose name contains `.d.` (`styles.d.css.ts`,
+/// an arbitrary-extension declaration). Upstream's output mapping skips
+/// declaration inputs entirely: they produce no JavaScript and no
+/// declaration output.
 fn is_declaration_input_name(name: &str) -> bool {
     is_declaration_section_name(name)
+        || (name.to_ascii_lowercase().ends_with(".ts") && name.contains(".d."))
 }
 
 /// Whether a unit name is a JSON file (`.json`). Upstream's declaration emit
@@ -6273,6 +6276,33 @@ export const t = 1;
         assert_eq!(
             heads,
             vec!["//// [data.json]", "//// [test.ts]", "//// [test.js]"],
+            "{emitted}"
+        );
+    }
+
+    #[test]
+    fn javascript_baseline_skips_arbitrary_extension_declaration_inputs() {
+        let logical = "tests/cases/compiler/arbitraryExtensionDeclarationPin.ts";
+        let case_text = "\
+// @allowArbitraryExtensions: true
+// @filename: styles.d.css.ts
+export declare const rules: string;
+// @filename: test.ts
+export const t = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let heads: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with("//// [") && !line.ends_with(" ////"))
+            .collect();
+        assert_eq!(
+            heads,
+            vec!["//// [styles.d.css.ts]", "//// [test.ts]", "//// [test.js]"],
             "{emitted}"
         );
     }
