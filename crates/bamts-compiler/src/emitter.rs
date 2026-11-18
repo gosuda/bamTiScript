@@ -6982,7 +6982,7 @@ mod tests {
     }
 
     #[test]
-    fn export_assignment_emits_default_export_in_javascript_mode() {
+    fn export_assignment_is_dropped_from_an_es_module() {
         let input = "const answer = 42;
 export = answer;";
         let parsed = crate::parser::parse(crate::scanner::scan(
@@ -6997,7 +6997,7 @@ export = answer;";
         assert_eq!(
             javascript(&output).code,
             "const answer = 42;
-export default answer;
+export {};
 "
         );
 
