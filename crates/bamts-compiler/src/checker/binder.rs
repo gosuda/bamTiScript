@@ -13585,10 +13585,9 @@ impl<'src> Binder<'src> {
                     true
                 };
                 if !compatible {
-                    let range = return_statement
-                        .argument
-                        .as_ref()
-                        .map_or_else(|| statement.range(), |argument| argument.range());
+                    let start = statement.range().start();
+                    let range = TextRange::new(start, Utf16Pos::new(start.get() + "return".len()))
+                        .expect("return keyword extends the statement start");
                     self.emit(TYPE_NOT_ASSIGNABLE, range, NOT_ASSIGNABLE_MESSAGE);
                 }
                 if let Some(body_id) = self.function_body_stack.last().copied() {
@@ -27955,6 +27954,40 @@ mod tests {
                 .any(|diagnostic| diagnostic.code() == super::STRICT_NULL_MEMBER_ACCESS),
             "{diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn return_type_error_starts_at_the_return_keyword() {
+        let source = "function f(): string {\n    return undefined;\n}";
+        let (_, diagnostics) = bound_strict(source);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == TYPE_NOT_ASSIGNABLE)
+            .collect();
+        assert_eq!(errors.len(), 1, "{diagnostics:?}");
+        let text = crate::source::SourceText::new(source).expect("test source is valid");
+        let (line, character) = text
+            .line_column(errors[0].range().start())
+            .expect("diagnostic starts inside the source");
+        assert_eq!((line, character), (1, 4), "{diagnostics:?}");
+        assert_eq!(errors[0].range().len(), "return".len(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn bare_return_type_error_spans_only_the_return_keyword() {
+        let source = "function f(): string {\n    return;\n}";
+        let (_, diagnostics) = bound_strict(source);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == TYPE_NOT_ASSIGNABLE)
+            .collect();
+        assert_eq!(errors.len(), 1, "{diagnostics:?}");
+        let text = crate::source::SourceText::new(source).expect("test source is valid");
+        let (line, character) = text
+            .line_column(errors[0].range().start())
+            .expect("diagnostic starts inside the source");
+        assert_eq!((line, character), (1, 4), "{diagnostics:?}");
+        assert_eq!(errors[0].range().len(), "return".len(), "{diagnostics:?}");
     }
 
     #[test]
