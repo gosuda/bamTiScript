@@ -1216,6 +1216,21 @@ impl Emitter<'_> {
         self.comment_cursor = self.comment_cursor.max(start);
     }
 
+    /// Queues the comments before a class or object member. One on the line of
+    /// the previous token never leads a member, even after the opening brace.
+    fn queue_member_comments(&mut self, start: Utf16Pos) {
+        self.queue_leading_comments(start);
+        let (_, previous) = self.comments_after_previous_token(start);
+        let Some(line) = previous.and_then(|token| self.source_line(token.range().end())) else {
+            return;
+        };
+        let pending = std::mem::take(&mut self.pending_comments);
+        self.pending_comments = pending
+            .into_iter()
+            .filter(|comment| self.source_line(comment.start()) != Some(line))
+            .collect();
+    }
+
     /// Prints the comments that close a file.
     fn write_closing_comments(&mut self) {
         self.queue_leading_comments(self.authored_len);
@@ -1309,8 +1324,10 @@ impl Emitter<'_> {
             .source
             .line_column(comment.start())
             .map_or(0, |(_, column)| column);
+        let is_block = text.starts_with("/*");
         for (index, line) in text.split('\n').enumerate() {
             let line = line.strip_suffix('\r').unwrap_or(line);
+            let line = if is_block { line.trim_end() } else { line };
             if index > 0 {
                 self.newline();
             }
@@ -2916,7 +2933,12 @@ impl<'a> Emitter<'a> {
             self.indent += 1;
         }
         for member in members {
-            if self.emit_class_member_js(member.data()) {
+            if self.class_member_emits_js(member.data()) {
+                self.queue_member_comments(member.range().start());
+            }
+            let emitted = self.emit_class_member_js(member.data());
+            self.pending_comments.clear();
+            if emitted {
                 self.newline();
             }
         }
@@ -3725,7 +3747,9 @@ impl<'a> Emitter<'a> {
         self.indent += 1;
         let count = object.members.len();
         for (index, member) in object.members.iter().enumerate() {
+            self.queue_member_comments(member.range().start());
             self.emit_object_member(member.data());
+            self.pending_comments.clear();
             if index + 1 < count {
                 self.raw(",");
             }
