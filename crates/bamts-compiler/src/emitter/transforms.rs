@@ -44,7 +44,7 @@ mod namespaces;
 
 use amd_module::{AmdDependency, AmdPlan};
 use es5_class::{MemberScope, SuperContext};
-use namespaces::{ContainerBinding, NamespaceFrame, is_qualified_alias};
+use namespaces::{ContainerBinding, NamespaceFrame, alias_target_bears_value, is_qualified_alias};
 
 /// Stable diagnostic identifiers produced by target transforms.
 pub mod codes {
@@ -1082,6 +1082,7 @@ impl<'a> Rewriter<'a> {
         let module_scope = model.module_scope();
         let symbol_of = |name: &str| model.scope(module_scope).value(name);
         let hoisted_functions = hoisted_function_names(file);
+        let ambient_names = ambient_declare_names(file);
         let type_imports = type_import_names(file, options);
         let reads = import_reads(file, options, Some(model));
         let exported_locals = exported_locals(file);
@@ -1251,7 +1252,14 @@ impl<'a> Rewriter<'a> {
                     let binds_type = |name: &str| {
                         type_imports.contains(name) || is_type_only_export(model, name)
                     };
-                    plan_cjs_local_exports(file, export, &hoisted_functions, binds_type, &mut plan);
+                    plan_cjs_local_exports(
+                        file,
+                        export,
+                        &hoisted_functions,
+                        &ambient_names,
+                        binds_type,
+                        &mut plan,
+                    );
                     if let ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) =
                         export
                     {
@@ -1265,9 +1273,11 @@ impl<'a> Rewriter<'a> {
                             | Statement::Interface(_)
                             | Statement::TypeAlias(_) => {}
                             Statement::ImportEquals(import) if is_qualified_alias(import) => {
-                                let name = identifier_text(file, &import.local);
-                                plan.exported_variables.extend(symbol_of(&name));
-                                plan.void_0.push(name);
+                                if alias_target_bears_value(Some(model), inner) {
+                                    let name = identifier_text(file, &import.local);
+                                    plan.exported_variables.extend(symbol_of(&name));
+                                    plan.void_0.push(name);
+                                }
                             }
                             Statement::ImportEquals(ImportEqualsDeclaration {
                                 is_type_only: false,
@@ -12528,12 +12538,33 @@ fn hoisted_function_names(file: &SourceFile) -> BTreeSet<String> {
         .collect()
 }
 
+/// The module's top-level `declare function` names, which claim no `void 0`
+/// in the export prelude.
+fn ambient_declare_names(file: &SourceFile) -> BTreeSet<String> {
+    file.statements()
+        .iter()
+        .filter_map(|statement| {
+            let Statement::Declare(inner) = statement.data() else {
+                return None;
+            };
+            let Statement::Function(declaration) = inner.data() else {
+                return None;
+            };
+            let name = declaration.function.name.as_ref()?;
+            Some(identifier_text(file, name))
+        })
+        .collect()
+}
+
 /// Plans a local export's prelude line: a function's assignment, or the
-/// `void 0` that claims a specifier's name before any star export runs.
+/// `void 0` that claims a specifier's name before any star export runs. A
+/// name only a `declare` binds claims nothing, because it has no runtime
+/// form for the prelude to claim.
 fn plan_cjs_local_exports(
     file: &SourceFile,
     export: &ExportDeclaration,
     hoisted_functions: &BTreeSet<String>,
+    ambient_names: &BTreeSet<String>,
     binds_type: impl Fn(&str) -> bool,
     plan: &mut CjsPlan,
 ) {
@@ -12570,7 +12601,7 @@ fn plan_cjs_local_exports(
                 let exported = module_export_text(file, &specifier.exported);
                 if hoisted_functions.contains(&local) {
                     plan.hoisted_exports.push((exported, local));
-                } else {
+                } else if !ambient_names.contains(&local) {
                     plan.void_0.push(exported);
                 }
             }
@@ -14285,6 +14316,20 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         assert!(code.contains("bar4 ="), "{code}");
         assert!(code.contains("[foo]"), "{code}");
         assert!(!code.contains("[{ [foo]: bar4 }] ="), "{code}");
+    }
+
+    #[test]
+    fn commonjs_export_of_an_ambient_function_claims_no_void_0() {
+        let output = emit_with_options(
+            "declare function foo(): any;\nexport { foo };\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(!code.contains("void 0"), "{code}");
     }
 
     #[test]
