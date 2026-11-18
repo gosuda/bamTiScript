@@ -11812,7 +11812,8 @@ impl<'src> Binder<'src> {
             .entry(name)
             .or_insert(symbol);
         if let Some(annotation) = &data.type_annotation {
-            self.resolve_type(&annotation.data().type_node, ctor_scope);
+            let declared = self.resolve_type(&annotation.data().type_node, ctor_scope);
+            self.symbol_types[symbol.get() as usize] = declared;
         }
         if let Some(initializer) = &data.initializer {
             self.resolve_expr(initializer, ctor_scope);
@@ -16383,6 +16384,12 @@ impl<'src> Binder<'src> {
                     this_type,
                     SuperMemberHome::ClassMember { derived, is_static },
                 );
+                if let Some(key) = self.property_key(&method.name)
+                    && let Some(&symbol) = self.scopes[scope.0 as usize].values.get(&key)
+                {
+                    let type_id = self.type_of_function_like(&method.function, scope);
+                    self.symbol_types[symbol.get() as usize] = type_id;
+                }
             }
             ClassMember::Constructor(constructor) => {
                 if ambient {
