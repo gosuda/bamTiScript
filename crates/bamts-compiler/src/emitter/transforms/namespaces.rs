@@ -31,8 +31,20 @@ pub(super) enum ContainerBinding {
     Member(String),
     /// `N || (exports.N = N = {})`
     CommonJs,
+    /// `N || (exports_1("N", N = {}))`, inside a System factory.
+    System,
     /// `export var N;` declares it, and the call is then the local one.
     Export,
+}
+
+/// Where an exported variable's flattened assignments land.
+pub(super) enum ExportSink {
+    /// `container.name = value`.
+    Container(String),
+    /// `exports_1("name", name = value)`, inside a System factory.
+    SystemExport,
+    /// `name = value`, a module-level System binding with no export call.
+    PlainLocal,
 }
 
 /// Whether an `import a = ...` aliases a name rather than requiring a module.
@@ -177,7 +189,7 @@ impl Rewriter<'_> {
             ContainerBinding::Member(parent) => {
                 self.member_assignment(&parent, &local, value, range)
             }
-            ContainerBinding::CommonJs => {
+            ContainerBinding::CommonJs | ContainerBinding::System => {
                 let left = self.cjs_export_target(&local, range);
                 self.assignment(left, value, range)
             }
@@ -211,7 +223,11 @@ impl Rewriter<'_> {
         )
     }
 
-    fn entity_expression(&mut self, name: &EntityName, range: TextRange) -> Option<Expr> {
+    pub(super) fn entity_expression(
+        &mut self,
+        name: &EntityName,
+        range: TextRange,
+    ) -> Option<Expr> {
         match name {
             EntityName::Identifier(ident) => {
                 Some(self.node(ident.range(), Expression::Identifier(ident.clone())))
@@ -225,7 +241,7 @@ impl Rewriter<'_> {
         }
     }
 
-    fn alias_is_read(&mut self, statement: &Stmt) -> bool {
+    pub(super) fn alias_is_read(&mut self, statement: &Stmt) -> bool {
         let Some(model) = self.model else {
             return true;
         };
@@ -254,7 +270,7 @@ impl Rewriter<'_> {
     /// `E[E["A"] = 0] = "A";`, or `E["A"] = "a";` for a member with no reverse
     /// mapping. A member with neither a value nor an initializer has nothing
     /// to store.
-    fn enum_member_statement(
+    pub(super) fn enum_member_statement(
         &mut self,
         object: &str,
         member: &EnumMemberNode,
@@ -309,7 +325,7 @@ impl Rewriter<'_> {
         self.assignment(left, value, range)
     }
 
-    fn lower_namespace_body(
+    pub(super) fn lower_namespace_body(
         &mut self,
         namespace: &NamespaceDeclaration,
         container: SymbolId,
@@ -377,7 +393,11 @@ impl Rewriter<'_> {
         let range = member.range();
         let exported = match inner.data() {
             Statement::Variable(declaration) => {
-                return self.namespace_export_variables(declaration, parameter, range);
+                return self.namespace_export_variables(
+                    declaration,
+                    ExportSink::Container(parameter.to_owned()),
+                    range,
+                );
             }
             Statement::Namespace(namespace) => {
                 let binding = ContainerBinding::Member(parameter.to_owned());
@@ -416,7 +436,7 @@ impl Rewriter<'_> {
     pub(super) fn namespace_export_variables(
         &mut self,
         declaration: &VariableDeclaration,
-        parameter: &str,
+        sink: ExportSink,
         range: TextRange,
     ) -> Vec<Stmt> {
         let mut assignments = Vec::new();
@@ -424,7 +444,7 @@ impl Rewriter<'_> {
             let data = declarator.data();
             if let Some(initializer) = data.initializer.as_deref() {
                 let value = self.rewrite_expr(initializer);
-                self.flatten_export(&data.binding, value, parameter, &mut assignments);
+                self.flatten_export(&data.binding, value, &sink, &mut assignments);
             }
         }
         let expression = match assignments.len() {
@@ -442,18 +462,18 @@ impl Rewriter<'_> {
 
     /// Assignments taking `pattern` apart onto the container. A pattern that
     /// reads its source more than once holds it in a temporary first.
-    fn flatten_export(
+    pub(super) fn flatten_export(
         &mut self,
         pattern: &Pattern,
         value: Expr,
-        parameter: &str,
+        sink: &ExportSink,
         out: &mut Vec<Expr>,
     ) {
         let range = pattern.range();
         match pattern.data() {
             BindingPattern::Identifier(ident) => {
                 if let Some(name) = self.identifier_name(ident) {
-                    out.push(self.member_assignment(parameter, &name, value, ident.range()));
+                    out.push(self.export_sink_assignment(&name, value, sink, ident.range()));
                 }
             }
             BindingPattern::Object(object) => {
@@ -469,7 +489,7 @@ impl Rewriter<'_> {
                         if let Expression::Identifier(held) = source.data() {
                             let excluded = self.rest_exclude_array(&keys, range);
                             let collected = self.rest_call(held, excluded, range);
-                            self.flatten_export(&rest.argument, collected, parameter, out);
+                            self.flatten_export(&rest.argument, collected, sink, out);
                         }
                         continue;
                     }
@@ -482,14 +502,14 @@ impl Rewriter<'_> {
                         let member = MemberProperty::Computed(Box::new(held));
                         let read = self.member_expr(&source, member, range);
                         let read = self.with_default(read, property.initializer.as_deref(), out);
-                        self.flatten_export(&property.binding, read, parameter, out);
+                        self.flatten_export(&property.binding, read, sink, out);
                         continue;
                     }
                     keys.extend(property_key_text(self, property).map(RestExcludeKey::Static));
                     let name = self.rewrite_property_name(&property.name);
                     let read = self.property_read(&source, name, range);
                     let read = self.with_default(read, property.initializer.as_deref(), out);
-                    self.flatten_export(&property.binding, read, parameter, out);
+                    self.flatten_export(&property.binding, read, sink, out);
                 }
             }
             BindingPattern::Array(array) => {
@@ -506,19 +526,19 @@ impl Rewriter<'_> {
                     if let BindingPattern::Rest(rest) = binding.data() {
                         if let Expression::Identifier(held) = source.data() {
                             let collected = self.slice_call(held, index, range);
-                            self.flatten_export(&rest.argument, collected, parameter, out);
+                            self.flatten_export(&rest.argument, collected, sink, out);
                         }
                         continue;
                     }
                     let index = self.number_expr(&index.to_string());
                     let property = MemberProperty::Computed(Box::new(index));
                     let read = self.member_expr(&source, property, range);
-                    self.flatten_export(binding, read, parameter, out);
+                    self.flatten_export(binding, read, sink, out);
                 }
             }
             BindingPattern::Assignment(assignment) => {
                 let read = self.with_default(value, Some(&*assignment.right), out);
-                self.flatten_export(&assignment.left, read, parameter, out);
+                self.flatten_export(&assignment.left, read, sink, out);
             }
             BindingPattern::Rest(_) | BindingPattern::Missing(_) => {}
         }
@@ -577,7 +597,7 @@ impl Rewriter<'_> {
 
     /// The parameter name for a namespace body. It is the namespace's own name
     /// unless something inside declares that name, which would shadow it.
-    fn namespace_parameter(&mut self, local: &str, body: TextRange) -> String {
+    pub(super) fn namespace_parameter(&mut self, local: &str, body: TextRange) -> String {
         if !self.declares_value_inside(local, body) {
             return local.to_owned();
         }
@@ -687,6 +707,9 @@ impl Rewriter<'_> {
             return None;
         }
         let dotted = self.starts_with_dotted_segment(declaration_start);
+        if matches!(binding, ContainerBinding::System) {
+            return None;
+        }
         let kind = if self.declared_names.len() > 1
             && !dotted
             && self.options.target >= ScriptTarget::Es2015
@@ -717,7 +740,7 @@ impl Rewriter<'_> {
         })
     }
 
-    fn container_argument(
+    pub(super) fn container_argument(
         &mut self,
         local: &str,
         binding: &ContainerBinding,
@@ -742,6 +765,12 @@ impl Rewriter<'_> {
                 let publish = self.assignment(left, create, range);
                 self.or_create(read, publish, range)
             }
+            ContainerBinding::System => {
+                let read = self.ident_expr(local);
+                let create = self.name_assignment(local, empty, range);
+                let publish = self.system_export_call_value(local, create, range);
+                self.or_create(read, publish, range)
+            }
             ContainerBinding::Member(parent) => {
                 let read = self.namespace_member(parent, local, range);
                 let create = self.member_assignment(parent, local, empty, range);
@@ -752,7 +781,7 @@ impl Rewriter<'_> {
     }
 
     /// `(function (parameter) { body })(argument);`
-    fn container_call(
+    pub(super) fn container_call(
         &mut self,
         parameter: &str,
         body: Vec<Stmt>,
@@ -847,7 +876,37 @@ impl Rewriter<'_> {
         self.assignment(left, value, range)
     }
 
-    fn assignment(&mut self, left: AssignmentTargetNode, value: Expr, range: TextRange) -> Expr {
+    /// One flattened binding's assignment, in the form its sink asks for.
+    fn export_sink_assignment(
+        &mut self,
+        name: &str,
+        value: Expr,
+        sink: &ExportSink,
+        range: TextRange,
+    ) -> Expr {
+        let value = match sink {
+            ExportSink::Container(_) => value,
+            _ => {
+                let local = self.ident(name);
+                let left = self.syn_node(range, AssignmentTarget::Identifier(local));
+                self.assignment(left, value, range)
+            }
+        };
+        match sink {
+            ExportSink::Container(container) => {
+                self.member_assignment(container, name, value, range)
+            }
+            ExportSink::SystemExport => self.system_export_call_value(name, value, range),
+            ExportSink::PlainLocal => value,
+        }
+    }
+
+    pub(super) fn assignment(
+        &mut self,
+        left: AssignmentTargetNode,
+        value: Expr,
+        range: TextRange,
+    ) -> Expr {
         self.syn_node(
             range,
             Expression::Assignment(AssignmentExpression {

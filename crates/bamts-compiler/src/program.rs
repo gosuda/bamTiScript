@@ -340,8 +340,8 @@ impl ResolvedProgram {
     }
 
     /// The module kind the module at `index` emits as, when the options give it
-    /// one: CommonJS, the AMD and UMD wrappers, or the per-file format a Node
-    /// module mode derives from extension and package type.
+    /// one: CommonJS, the AMD, UMD, and System wrappers, or the per-file format a
+    /// Node module mode derives from extension and package type.
     #[must_use]
     pub fn emit_module_kind(&self, index: usize) -> Option<crate::emitter::ModuleKind> {
         use crate::emitter::ModuleKind;
@@ -350,15 +350,9 @@ impl ResolvedProgram {
         }
         match self.module_kind? {
             ModuleKind::Node => self.node_formats.get(index).copied(),
-            kind @ (ModuleKind::Amd | ModuleKind::Umd) => Some(kind),
+            kind @ (ModuleKind::Amd | ModuleKind::Umd | ModuleKind::System) => Some(kind),
             _ => None,
         }
-    }
-
-    /// Whether `module` is a Node mode, where dynamic `import()` is never lowered.
-    #[must_use]
-    pub fn is_node_module_mode(&self) -> bool {
-        self.module_kind == Some(crate::emitter::ModuleKind::Node)
     }
 
     /// Whether `module` is a Node mode, where dynamic `import()` is never lowered.

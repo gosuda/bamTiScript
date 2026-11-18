@@ -567,17 +567,27 @@ pub(crate) struct PrintSource<'a> {
     /// Parenthesized class IIFEs, which print `/** @class */ ` first.
     pub(crate) class_iifes: Option<&'a BTreeSet<NodeId>>,
     /// The factory an AMD or UMD module's body prints inside.
-    pub(crate) module_wrapper: Option<&'a ModuleWrapper>,
+    pub(crate) module_wrapper: Option<&'a ModuleWrapper<'a>>,
 }
 
-/// The text around the body of an AMD or UMD module.
-pub(crate) struct ModuleWrapper {
+/// The text around the body of an AMD, UMD, or System module.
+pub(crate) struct ModuleWrapper<'a> {
     /// Printed first, at the left margin.
     pub(crate) head: String,
     /// Printed after the head inside the factory, one level in.
     pub(crate) inner: String,
+    /// Function declarations that print inside the factory, above `mid`, at
+    /// the factory's one level.
+    pub(crate) hoisted: Option<&'a [Stmt]>,
+    /// Printed after the hoisted declarations, one level in, right before the
+    /// module body.
+    pub(crate) mid: String,
     /// Printed last, at the left margin.
     pub(crate) tail: String,
+    /// Extra levels the module body prints under, below the factory's one
+    /// level. AMD keeps the body at the factory level; a System module's
+    /// body sits inside `execute: function () {`.
+    pub(crate) body_indent: usize,
 }
 
 /// Print context for a braced block. Carries two tsc behaviors that split on
@@ -1071,13 +1081,13 @@ struct Emitter<'a> {
     prelude_tail: Option<&'a str>,
     expanded_sequences: Option<&'a BTreeSet<NodeId>>,
     class_iifes: Option<&'a BTreeSet<NodeId>>,
-    module_wrapper: Option<&'a ModuleWrapper>,
+    module_wrapper: Option<&'a ModuleWrapper<'a>>,
     /// Final names for the rewriter's temporary placeholders.
     temp_names: TempNames,
 }
 
 /// The identifiers the program itself writes, which temporaries never reuse.
-fn authored_identifiers(file: &SourceFile, original_content: &str) -> HashSet<String> {
+pub(super) fn authored_identifiers(file: &SourceFile, original_content: &str) -> HashSet<String> {
     let authored_end = Utf16Pos::new(utf16_len(original_content));
     let source = file.source_text();
     file.tokens()
@@ -1848,6 +1858,11 @@ impl<'a> Emitter<'a> {
             self.emit_lines(&wrapper.head);
             self.indent += 1;
             self.emit_lines(&wrapper.inner);
+            if let Some(hoisted) = wrapper.hoisted {
+                self.emit_statement_list(hoisted);
+            }
+            self.emit_lines(&wrapper.mid);
+            self.indent += wrapper.body_indent;
         }
         if wrapper.is_none() {
             self.write_detached_comments();
@@ -1861,6 +1876,7 @@ impl<'a> Emitter<'a> {
         }
         self.write_closing_comments();
         if let Some(wrapper) = wrapper {
+            self.indent -= wrapper.body_indent;
             self.indent -= 1;
             self.emit_lines(&wrapper.tail);
         }
